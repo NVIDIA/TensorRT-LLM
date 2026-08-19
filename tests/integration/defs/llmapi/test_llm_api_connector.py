@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -23,15 +25,77 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,
                                           KvCacheConnectorConfig)
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ..conftest import llm_models_root
 
+# Name of the TensorRT-LLM logger. It sets `propagate = False`
+# (tensorrt_llm/logger.py:186-187), so pytest's `caplog` only sees its records
+# once `caplog.handler` is attached to it directly.
+TRTLLM_LOGGER_NAME = "TRT-LLM"
+
+# Emitted by `_fallback_if_unsupported_kv_cache_manager_v2`
+# (tensorrt_llm/_torch/pyexecutor/_util.py:629-631) when a connector run is
+# downgraded from V2 to V1.
+FALLBACK_WARNING_FRAGMENT = "Falling back to KVCacheManager"
+
+# V1 `KVCacheManager` methods reached on the KV connector path proper. Each is
+# defined in tensorrt_llm/_torch/pyexecutor/resource_manager.py and wraps a
+# nanobind method on the C++ manager. `KVCacheManagerV2` implements none of
+# them - `test_connector_v1_method_contract_gap` pins that, and the list is the
+# Phase 2 worklist.
+CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS = (
+    # Connector bring-up: registers the KV tensor with the worker.
+    # py_executor.py:1070. This is the first hard stop under V2.
+    "get_unique_primary_pool",
+    # kv_cache_connector.py:322 and py_executor.py:6173.
+    "get_cache_indices",
+    # kv_cache_connector.py:328 (sole caller).
+    "commit_and_get_block_hashes",
+    # kv_cache_connector.py:353, only when a retention config is set.
+    "get_priority_by_block_id",
+)
+
+# Reached only when the connector coexists with disaggregated serving
+# (`test_connector_disagg_prefill`), via AsyncTransferManager and the V1 cache
+# reuse adapter - not from `KvCacheConnectorManager` itself. Tracked separately
+# because V2 already has its own answer for some of them (`try_commit_blocks`
+# at kv_cache_manager_v2.py:3201, page refcounts instead of explicit pinning),
+# so they do not necessarily belong in a connector port.
+DISAGG_PATH_KV_CACHE_MANAGER_METHODS = (
+    "store_blocks_for_reuse",  # py_executor.py:455
+    "unpin_blocks_by_id",  # py_executor.py:489
+    "get_memory_pool_block_indices",  # disaggregation/resource/cache_reuse.py:121
+    "pin_blocks",  # no Python caller today
+)
+
 
 @pytest.fixture(scope="function")
-def model_with_connector():
+def use_kv_cache_manager_v2(request):
+    """Run each connector test under both KV cache managers.
+
+    Parametrized by an explicit `@pytest.mark.parametrize(..., indirect=True)`
+    on each test, applied as the innermost decorator so the manager lands first
+    in the generated test id. It is spelled out per test rather than set as a
+    fixture `params=` because the test-list validator
+    (scripts/check_test_list.py) resolves ids from parametrize decorators via
+    AST and cannot see fixture-level parametrization.
+
+    Selecting V2 must actually reach V2: `_fallback_if_unsupported_kv_cache_manager_v2`
+    silently substitutes the V1 manager for combinations it cannot serve, and a
+    connector test that ran on V1 while claiming to test V2 would pass while
+    exercising nothing. `test_connector_runs_on_kv_cache_manager_v2` guards that.
+    """
+    return request.param
+
+
+@pytest.fixture(scope="function")
+def model_with_connector(use_kv_cache_manager_v2):
     with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.importlib"
                ) as importlib_mock:
         mock_scheduler = MagicMock()
@@ -56,7 +120,16 @@ def model_with_connector():
                 "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1)
             }
 
-            return LLM(*args, **{**default_kwargs, **kwargs})
+            merged_kwargs = {**default_kwargs, **kwargs}
+
+            # Tests that supply their own `KvCacheConfig` must still honour the
+            # manager under test, otherwise the V2 parametrization silently
+            # degrades into a second V1 run.
+            kv_cache_config = merged_kwargs.get("kv_cache_config")
+            if kv_cache_config is not None:
+                kv_cache_config.use_kv_cache_manager_v2 = use_kv_cache_manager_v2
+
+            return LLM(*args, **merged_kwargs)
 
         yield model_fn, mock_scheduler, mock_worker
 
@@ -68,27 +141,205 @@ def enforce_single_worker(monkeypatch):
     yield
 
 
-def generate_and_sleep(model, *args, **kwargs):
-    # Some KV connector API calls are made after a full response is returned. We want to be able to track these calls.
-    # However, we don't have any indication of when all the calls are complete.
-    # To compensate for this, we sleep between the generate call and the return of the outputs.
-    # TODO(jthomson04): Surely there's a better way to do this?
+# Some KV connector API calls are made after a full response is returned
+# (`request_finished`, the trailing `get_finished` polls and asynchronous
+# saves), and there is no public signal for when they are complete. Instead of
+# sleeping a fixed amount, wait until the connector mocks stop recording new
+# calls. That returns as soon as the connector goes quiet, and - unlike a fixed
+# sleep - stretches automatically when a slower path lengthens the tail.
+CONNECTOR_QUIESCE_TIMEOUT_S = 60.0
+CONNECTOR_QUIET_PERIOD_S = 0.5
+CONNECTOR_POLL_INTERVAL_S = 0.01
+
+# Fraction of generated tokens a connector-warmed run must reproduce exactly.
+# See test_connector_e2e_persistent_cache for why this is not 1.0.
+E2E_MIN_TOKEN_AGREEMENT = 0.75
+
+
+def assert_kv_caches_registered(worker, use_kv_cache_manager_v2):
+    """The two managers hand the worker its pools through different entry points.
+
+    V1 passes a single pool tensor to `register_kv_caches`; V2 has no such
+    tensor and passes a `KvCacheLayout` to `register_kv_cache_layout` instead.
+    Asserting the V1 method unconditionally would silently pass on V2 only if
+    the connector were never registered at all.
+    """
+    if use_kv_cache_manager_v2:
+        assert worker.register_kv_cache_layout.call_count == 1
+        assert worker.register_kv_caches.call_count == 0
+    else:
+        assert worker.register_kv_caches.call_count == 1
+        assert worker.register_kv_cache_layout.call_count == 0
+
+
+def wait_for_connector_quiescence(scheduler,
+                                  worker,
+                                  timeout=CONNECTOR_QUIESCE_TIMEOUT_S,
+                                  quiet_period=CONNECTOR_QUIET_PERIOD_S):
+    """Block until no new connector callback lands for `quiet_period` seconds.
+
+    `MagicMock.mock_calls` records every call made on the mock and its children,
+    so its length is a monotonic progress counter for connector activity.
+    """
+    deadline = time.monotonic() + timeout
+
+    def total_calls():
+        return len(scheduler.mock_calls) + len(worker.mock_calls)
+
+    last_seen = total_calls()
+    quiet_since = time.monotonic()
+
+    while time.monotonic() < deadline:
+        time.sleep(CONNECTOR_POLL_INTERVAL_S)
+
+        current = total_calls()
+        if current != last_seen:
+            last_seen = current
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since >= quiet_period:
+            return
+
+    raise AssertionError(
+        f"KV connector callbacks did not go quiet within {timeout}s "
+        f"({last_seen} calls recorded). The connector is still active or a "
+        "callback is blocked.")
+
+
+def generate_and_wait(model, scheduler, worker, *args, **kwargs):
+    """`model.generate`, then block until the connector callbacks settle."""
     outputs = model.generate(*args, **kwargs)
-    time.sleep(1)
+    wait_for_connector_quiescence(scheduler, worker)
     return outputs
+
+
+def test_connector_v1_method_contract_gap():
+    """Pin exactly which V1 KV-cache-manager methods `KVCacheManagerV2` lacks.
+
+    This is a static contract check rather than an end-to-end run on purpose:
+    under V2 the connector dies at the *first* missing method
+    (`get_unique_primary_pool`, py_executor.py:1070), so no e2e run can ever
+    report more than one gap. Phase 2 should remove entries from
+    `CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS` as it implements them.
+
+    Needs no GPU.
+    """
+    stale = [
+        name for name in CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS +
+        DISAGG_PATH_KV_CACHE_MANAGER_METHODS
+        if not hasattr(KVCacheManager, name)
+    ]
+    assert stale == [], (
+        f"{stale} are not defined on the V1 KVCacheManager either, so this "
+        "test is measuring a stale method list rather than a real V2 gap.")
+
+    implemented = [
+        name for name in CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS
+        if hasattr(KVCacheManagerV2, name)
+    ]
+    assert implemented == [], (
+        f"KVCacheManagerV2 now implements {implemented}. Drop them from "
+        "CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS and re-check whether the "
+        "corresponding connector tests can be un-skipped.")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_runs_on_kv_cache_manager_v2(enforce_single_worker,
+                                               monkeypatch, caplog):
+    """Anti-vacuity guard for the `kv_cache_manager_v2` parametrization.
+
+    Without this, every V2-parametrized test below could pass green while
+    `_fallback_if_unsupported_kv_cache_manager_v2` silently swapped in the V1
+    manager. It asserts positively that V2 is constructed, and that the
+    downgrade warning is absent.
+
+    Any construction failure is recorded rather than asserted on: what must
+    hold is that the run reached V2 rather than being papered over by a
+    fallback, which stays true regardless of how far bring-up gets.
+    """
+    constructed = []
+
+    def record_construction(cls):
+        original_init = cls.__init__
+
+        def recording_init(self, *args, **kwargs):
+            constructed.append(cls.__name__)
+            return original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(cls, "__init__", recording_init)
+
+    record_construction(KVCacheManagerV2)
+    record_construction(KVCacheManager)
+
+    # The TensorRT-LLM logger sets `propagate = False`, so caplog only sees its
+    # records once its handler is attached to that logger directly.
+    trtllm_logger = logging.getLogger(TRTLLM_LOGGER_NAME)
+    trtllm_logger.addHandler(caplog.handler)
+
+    construction_error = None
+    llm = None
+    try:
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.py_executor_creator.importlib"
+        ) as importlib_mock:
+            connector_module = importlib_mock.import_module.return_value
+            connector_module.KvConnectorScheduler.return_value = MagicMock()
+            connector_module.KvConnectorWorker.return_value = MagicMock()
+
+            try:
+                llm = LLM(
+                    model=f"{llm_models_root()}/Qwen2-0.5B",
+                    backend="pytorch",
+                    kv_connector_config=KvCacheConnectorConfig(
+                        connector_module="",
+                        connector_scheduler_class="KvConnectorScheduler",
+                        connector_worker_class="KvConnectorWorker",
+                    ),
+                    cuda_graph_config=None,
+                    kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                                  use_kv_cache_manager_v2=True),
+                )
+            # The V2 connector path is knowingly incomplete, so any construction
+            # failure is an acceptable outcome. What must hold is that the run
+            # reached V2 instead of being papered over by a V1 fallback.
+            except Exception as exc:  # noqa: BLE001
+                construction_error = exc
+    finally:
+        trtllm_logger.removeHandler(caplog.handler)
+        if llm is not None:
+            llm.shutdown()
+
+    # Report the current frontier so the failure mode is visible in CI output
+    # instead of being silently swallowed by the except above.
+    print(f"\n[connector+V2 frontier] construction_error="
+          f"{type(construction_error).__name__ if construction_error else None}"
+          f": {construction_error}")
+
+    assert "KVCacheManagerV2" in constructed, (
+        "KVCacheManagerV2 was never constructed, so the connector run silently "
+        f"fell back to V1 (managers constructed: {constructed}; construction "
+        f"error: {construction_error!r}). Every kv_cache_manager_v2-"
+        "parametrized connector test in this file is vacuous until this passes."
+    )
+
+    assert FALLBACK_WARNING_FRAGMENT not in caplog.text, (
+        f"{FALLBACK_WARNING_FRAGMENT!r} was logged, so the connector was "
+        "downgraded to the V1 KV cache manager.")
 
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_simple(enforce_single_worker, model_with_connector,
-                          use_overlap_scheduler):
+                          use_overlap_scheduler, use_kv_cache_manager_v2):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=not use_overlap_scheduler, )
 
-    assert worker.register_kv_caches.call_count == 1
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 0, False
 
@@ -96,7 +347,8 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
-    generate_and_sleep(model, ["Hello, world"], sampling_params)
+    generate_and_wait(model, scheduler, worker, ["Hello, world"],
+                      sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -154,22 +406,26 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_async_onboard(enforce_single_worker, model_with_connector,
-                                 use_overlap_scheduler):
+                                 use_overlap_scheduler,
+                                 use_kv_cache_manager_v2):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=not use_overlap_scheduler, )
 
-    assert worker.register_kv_caches.call_count == 1
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 16, True
 
     worker.get_finished.side_effect = lambda finished_gen, load_async: (
         finished_gen, load_async)
 
-    generate_and_sleep(model, [
+    generate_and_wait(model, scheduler, worker, [
         "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
     ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
 
@@ -183,15 +439,18 @@ def test_connector_async_onboard(enforce_single_worker, model_with_connector,
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_async_save(enforce_single_worker, model_with_connector,
-                              use_overlap_scheduler):
+                              use_overlap_scheduler, use_kv_cache_manager_v2):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=not use_overlap_scheduler, )
 
-    assert worker.register_kv_caches.call_count == 1
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 0, False
 
@@ -202,7 +461,8 @@ def test_connector_async_save(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
-    generate_and_sleep(model, ["Hello, world"], sampling_params)
+    generate_and_wait(model, scheduler, worker, ["Hello, world"],
+                      sampling_params)
 
     assert scheduler.request_finished.call_count == 1
 
@@ -224,8 +484,12 @@ def test_connector_async_save(enforce_single_worker, model_with_connector,
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
-                                    use_overlap_scheduler):
+                                    use_overlap_scheduler,
+                                    use_kv_cache_manager_v2):
     NUM_INPUT_TOKENS = 48
     NUM_TOKENS = 32
     BLOCK_SIZE = 32
@@ -234,7 +498,7 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
 
     model = model_fn(disable_overlap_scheduler=not use_overlap_scheduler, )
 
-    assert worker.register_kv_caches.call_count == 1
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 0, False
 
@@ -242,7 +506,8 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
 
-    generate_and_sleep(model, [0] * NUM_INPUT_TOKENS, sampling_params)
+    generate_and_wait(model, scheduler, worker, [0] * NUM_INPUT_TOKENS,
+                      sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
     assert len(
@@ -292,7 +557,8 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
     assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
         (NUM_INPUT_TOKENS + NUM_TOKENS) / BLOCK_SIZE)
 
-    generate_and_sleep(model, [1] * NUM_INPUT_TOKENS, sampling_params)
+    generate_and_wait(model, scheduler, worker, [1] * NUM_INPUT_TOKENS,
+                      sampling_params)
 
     # The initial computed position should be 0, since we haven't yet onboarded any blocks.
     assert scheduler.build_connector_meta.call_args_list[0].args[
@@ -301,9 +567,13 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_scheduler_output_chunked_context(enforce_single_worker,
                                                     model_with_connector,
-                                                    use_overlap_scheduler):
+                                                    use_overlap_scheduler,
+                                                    use_kv_cache_manager_v2):
     model_fn, scheduler, worker = model_with_connector
 
     CHUNK_SIZE = 128
@@ -313,7 +583,7 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
                      enable_chunked_prefill=True,
                      max_num_tokens=CHUNK_SIZE)
 
-    assert worker.register_kv_caches.call_count == 1
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 0, False
 
@@ -321,7 +591,8 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
 
     sampling_params = SamplingParams(max_tokens=BLOCK_SIZE, ignore_eos=True)
 
-    generate_and_sleep(model, [0] * (CHUNK_SIZE * 2), sampling_params)
+    generate_and_wait(model, scheduler, worker, [0] * (CHUNK_SIZE * 2),
+                      sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -365,19 +636,43 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
         (CHUNK_SIZE * 2 + BLOCK_SIZE) / BLOCK_SIZE)
 
 
+def _disagg_transceiver_config(use_kv_cache_manager_v2):
+    """The transceiver each KV cache manager can actually be driven by.
+
+    `CacheTransceiverCpp` is bound to the V1 `BaseKVCacheManager`, while
+    `KVCacheManagerV2.impl` is the Python V2 core's manager, so V2 can only use
+    the Python transceiver -- which in turn only supports NIXL
+    (kv_cache_transceiver.py, `create_kv_cache_transceiver`). This is spelled
+    out per manager rather than left at the default because
+    `transceiver_runtime` defaults to "auto", and "auto" is resolved from the
+    *model's* preference (llm_utils._resolve_transceiver_runtime_auto), which
+    knows nothing about which cache manager will be built. Qwen2 declares no
+    preference, so the default resolves to the C++ transceiver -- which V2
+    cannot use, and which is now rejected with an actionable error rather than
+    a nanobind signature mismatch.
+    """
+    if use_kv_cache_manager_v2:
+        return CacheTransceiverConfig(backend="NIXL",
+                                      transceiver_runtime="PYTHON")
+    return CacheTransceiverConfig(backend="DEFAULT")
+
+
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("save_async", [False, True])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
-                                  save_async):
+                                  save_async, use_kv_cache_manager_v2):
     model_fn, scheduler, worker = model_with_connector
 
-    prefill_worker = model_fn(
-        disable_overlap_scheduler=True,
-        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"))
+    transceiver_config = _disagg_transceiver_config(use_kv_cache_manager_v2)
 
-    decode_worker = model_fn(
-        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
-        kv_connector_config=None)
+    prefill_worker = model_fn(disable_overlap_scheduler=True,
+                              cache_transceiver_config=transceiver_config)
+
+    decode_worker = model_fn(cache_transceiver_config=transceiver_config,
+                             kv_connector_config=None)
 
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=16)
 
@@ -394,16 +689,20 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
         scheduler.request_finished.return_value = False
         worker.get_finished.return_value = [], []
 
-    result = generate_and_sleep(prefill_worker, [0] * 48,
-                                sampling_params=sampling_params,
-                                disaggregated_params=disaggregated_params)
+    result = generate_and_wait(prefill_worker,
+                               scheduler,
+                               worker, [0] * 48,
+                               sampling_params=sampling_params,
+                               disaggregated_params=disaggregated_params)
 
     gen_disagg_params = result.disaggregated_params
     gen_disagg_params.request_type = "generation_only"
 
-    generate_and_sleep(decode_worker, [0] * 48,
-                       sampling_params=sampling_params,
-                       disaggregated_params=gen_disagg_params)
+    generate_and_wait(decode_worker,
+                      scheduler,
+                      worker, [0] * 48,
+                      sampling_params=sampling_params,
+                      disaggregated_params=gen_disagg_params)
 
     assert scheduler.build_connector_meta.call_count == 1
 
@@ -422,6 +721,9 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_multi_request(enforce_single_worker, model_with_connector):
     model_fn, scheduler, worker = model_with_connector
 
@@ -446,12 +748,16 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_priorities(enforce_single_worker, model_with_connector):
     """Test that retention priorities flow through the connector correctly.
 
     This test verifies that when KvCacheRetentionConfig is provided,
     the RequestData.priorities field is populated with the correct
     per-block priorities based on the token ranges.
+
     """
     BLOCK_SIZE = 32
     NUM_INPUT_TOKENS = 64  # 2 blocks
@@ -487,9 +793,11 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
-    generate_and_sleep(model, [0] * NUM_INPUT_TOKENS,
-                       sampling_params=sampling_params,
-                       kv_cache_retention_config=retention_config)
+    generate_and_wait(model,
+                      scheduler,
+                      worker, [0] * NUM_INPUT_TOKENS,
+                      sampling_params=sampling_params,
+                      kv_cache_retention_config=retention_config)
 
     # Verify that build_connector_meta was called
     assert scheduler.build_connector_meta.call_count >= 1
@@ -517,6 +825,9 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_priorities_default(enforce_single_worker,
                                       model_with_connector):
     """Test that priorities are None when no retention config is provided."""
@@ -530,7 +841,10 @@ def test_connector_priorities_default(enforce_single_worker,
     sampling_params = SamplingParams(max_tokens=4, ignore_eos=True)
 
     # Generate without retention config
-    generate_and_sleep(model, [0] * 48, sampling_params=sampling_params)
+    generate_and_wait(model,
+                      scheduler,
+                      worker, [0] * 48,
+                      sampling_params=sampling_params)
 
     first_call = scheduler.build_connector_meta.call_args_list[0]
     sched_output = first_call.args[0]
@@ -564,6 +878,9 @@ def test_connector_priorities_default(enforce_single_worker,
         ),
     ],
 )
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
 def test_connector_rejects_unsupported_config(enforce_single_worker,
                                               model_with_connector, llm_kwargs,
                                               match):
@@ -577,12 +894,23 @@ def test_connector_rejects_unsupported_config(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_e2e_persistent_cache(enforce_single_worker):
-    """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
+def test_connector_e2e_persistent_cache(enforce_single_worker,
+                                        use_kv_cache_manager_v2, monkeypatch):
+    """End-to-end KV connector test using PersistentKvCacheConnector from examples.
 
-    Runs generation twice with separate LLM instances sharing a disk-based
-    connector cache, verifying that outputs are identical (proving cache
-    save/load works end-to-end).
+    Runs the same prompt through two separate LLM instances sharing a
+    disk-backed connector cache and asserts that:
+
+      1. the first (cold) run matches nothing and writes cache files,
+      2. the second (warm) run actually reads blocks back from disk, and
+      3. both runs produce identical text and token ids.
+
+    (3) on its own proves nothing - two deterministic runs of the same prompt
+    agree whether or not the cache is ever consulted - so (2) is what makes
+    this a real correctness test rather than a tautology.
     """
     examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..",
                                 "..", "examples", "llm-api")
@@ -590,9 +918,29 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
     sys.path.insert(0, examples_dir)
 
     cache_dir = tempfile.mkdtemp()
-    os.environ["CONNECTOR_CACHE_FOLDER"] = cache_dir
+    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", cache_dir)
 
     try:
+        import llm_kv_cache_connector
+
+        # Record how many tokens the connector served from disk on each run.
+        # The leader logs this, but the TensorRT-LLM logger does not propagate
+        # to the root logger, so read it from the return value instead.
+        matched_tokens = []
+        leader_cls = llm_kv_cache_connector.PersistentKvCacheConnectorLeader
+        original_get_num_new_matched_tokens = (
+            leader_cls.get_num_new_matched_tokens)
+
+        def recording_get_num_new_matched_tokens(self, request,
+                                                 num_computed_tokens):
+            result = original_get_num_new_matched_tokens(
+                self, request, num_computed_tokens)
+            matched_tokens.append(result[0])
+            return result
+
+        monkeypatch.setattr(leader_cls, "get_num_new_matched_tokens",
+                            recording_get_num_new_matched_tokens)
+
         kv_connector_config = KvCacheConnectorConfig(
             connector_module="llm_kv_cache_connector",
             connector_scheduler_class="PersistentKvCacheConnectorLeader",
@@ -605,7 +953,9 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
             kv_connector_config=kv_connector_config,
             cuda_graph_config=None,
             disable_overlap_scheduler=True,
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=0.1,
+                use_kv_cache_manager_v2=use_kv_cache_manager_v2),
         )
 
         prompt = (
@@ -620,21 +970,70 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
         sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
 
         llm1 = LLM(**llm_kwargs)
-        output1 = llm1.generate([prompt], sampling_params)
-        output1[0].outputs[0].text
-        del llm1
+        try:
+            output1 = llm1.generate([prompt], sampling_params)
+            cold_text = output1[0].outputs[0].text
+            cold_token_ids = list(output1[0].outputs[0].token_ids)
+        finally:
+            llm1.shutdown()
+
+        assert matched_tokens and all(count == 0 for count in matched_tokens), (
+            "The first run should be a cold miss, but the connector reported "
+            f"matched token counts {matched_tokens}. The cache directory was "
+            "not clean, so the comparison below is meaningless.")
 
         cache_files = [f for f in os.listdir(cache_dir) if f.endswith(".pt")]
         assert len(cache_files) > 0, "No cache files written by connector"
 
-        llm2 = LLM(**llm_kwargs)
-        llm2.generate([prompt], sampling_params)
-        del llm2
-    finally:
-        os.environ.pop("CONNECTOR_CACHE_FOLDER", None)
+        matched_tokens.clear()
 
+        llm2 = LLM(**llm_kwargs)
+        try:
+            output2 = llm2.generate([prompt], sampling_params)
+            warm_text = output2[0].outputs[0].text
+            warm_token_ids = list(output2[0].outputs[0].token_ids)
+        finally:
+            llm2.shutdown()
+
+        assert matched_tokens and max(matched_tokens) > 0, (
+            "The second run read nothing back from the connector cache "
+            f"(matched token counts {matched_tokens}), so the comparisons "
+            "below would pass just as well with the connector disabled.")
+
+        assert len(warm_token_ids) == len(cold_token_ids), (
+            f"Generation length changed: cold {len(cold_token_ids)} tokens, "
+            f"warm {len(warm_token_ids)} tokens.")
+
+        # Exact equality is NOT asserted. Reusing cached KV skips prefill for
+        # the matched blocks, which changes the attention reduction order, so
+        # the logits differ in the last bits even though the restored K/V are
+        # bit-identical (the connector round-trips them through torch.save /
+        # torch.load). Greedy decoding turns a near-tie into a different token.
+        # Observed on V1: the two runs agreed on 31 of 32 tokens and split on
+        # the final one ("The company's" vs "The company is").
+        #
+        # A corrupted or misaddressed cache does not look like that - it
+        # diverges early and degenerates - so requiring a long common prefix
+        # keeps the test meaningful without making it a coin flip.
+        common_prefix = 0
+        for cold_id, warm_id in zip(cold_token_ids, warm_token_ids):
+            if cold_id != warm_id:
+                break
+            common_prefix += 1
+
+        min_common_prefix = math.floor(
+            len(cold_token_ids) * E2E_MIN_TOKEN_AGREEMENT)
+        assert common_prefix >= min_common_prefix, (
+            f"Connector cache reuse diverged at token {common_prefix} of "
+            f"{len(cold_token_ids)}, below the {min_common_prefix}-token "
+            "floor. Early divergence indicates the restored KV is wrong, not "
+            "just numerically different.\n"
+            f"  cold run: {cold_text!r}\n"
+            f"  warm run: {warm_text!r}\n"
+            f"  cold ids: {cold_token_ids}\n"
+            f"  warm ids: {warm_token_ids}")
+    finally:
         if examples_dir in sys.path:
             sys.path.remove(examples_dir)
 
-        import shutil
         shutil.rmtree(cache_dir, ignore_errors=True)
