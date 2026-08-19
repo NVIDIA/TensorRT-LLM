@@ -1328,11 +1328,15 @@ def _make_cos_sin(device: torch.device) -> torch.Tensor:
 def _reference(
     q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, num_heads: int
 ) -> torch.Tensor:
-    """RMS-norm over the whole 512-wide head, rotate the tail, scale for FP8."""
+    """RMS-norm, round to BF16, rotate the tail, and scale for FP8.
+
+    The BF16 round matches the unfused norm-store/RoPE-load path and is required
+    before quantization to preserve DeepSeek-V4 model accuracy.
+    """
     num_tokens = q.shape[0]
     x = q.view(num_tokens, num_heads, HEAD_DIM).float()
     inv_rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS)
-    normed = x * inv_rms
+    normed = (x * inv_rms).to(q.dtype).float()
 
     nope = normed[..., :NOPE_DIM] * QUANT_SCALE
 
@@ -1382,10 +1386,9 @@ def _assert_matches(quant_q, q_pe, reference, num_heads):
     A relative tolerance on the dequantized values has to be at least one e4m3
     step (~13%) to absorb rounding, and that is wide enough to swallow real bugs
     -- normalizing over 448 dims instead of 512 is only a 6.9% shift. So quantize
-    the reference the same way and require the codes to agree. The kernel folds
-    inv_rms and the quant scale into a single multiply where the reference uses
-    two, so a few values sit on the other side of a rounding boundary; those get
-    a small budget, capped at one FP8 step each.
+    the reference the same way and require the codes to agree. CUDA and PyTorch
+    can still choose adjacent FP8 values at exact rounding midpoints, so those
+    get a small budget capped at one FP8 step each.
     """
     num_tokens = quant_q.shape[0]
     got = quant_q.view(num_tokens, num_heads, HEAD_DIM).float()

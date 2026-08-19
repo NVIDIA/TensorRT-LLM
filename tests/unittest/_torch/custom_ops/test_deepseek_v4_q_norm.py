@@ -101,15 +101,19 @@ def _reference_q_norm_fused_fp8(
     eps: float,
     quant_scale_qkv: float,
 ):
-    """Reference: per-row RMSNorm in fp32; split last column-axis into nope/rope;
-    nope path multiplied by quant_scale_qkv then cast to fp8_e4m3; rope path cast
-    back to input dtype.
+    """Reference: per-row RMSNorm in fp32, rounded back to the input dtype;
+    split the last column-axis into nope/rope; multiply the nope path by
+    quant_scale_qkv and cast it to fp8_e4m3.
+
+    The input-dtype round matches the legacy two-kernel path's norm store and
+    reload. It is part of the model's numerical contract: skipping it changes
+    enough FP8 codes to regress DeepSeek-V4 GSM8K accuracy.
     """
     num_tokens = q.shape[0]
     rope_dim = head_dim - nope_dim
     q_view = q.view(num_tokens * num_heads, head_dim).float()
     inv_rms = torch.rsqrt(q_view.pow(2).mean(dim=-1, keepdim=True) + eps)
-    normalized = q_view * inv_rms
+    normalized = (q_view * inv_rms).to(q.dtype).float()
 
     nope_fp32 = normalized[:, :nope_dim] * quant_scale_qkv
     rope_fp32 = normalized[:, nope_dim:]
