@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import dataclasses
 import os
@@ -22,9 +23,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_flashinfer_gdn_supported_arch, is_sm_100f,
-                                 prefer_pinned, str_dtype_to_binding,
-                                 torch_dtype_to_str)
+                                 is_sm_100f, prefer_pinned,
+                                 str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -59,7 +59,7 @@ from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
-from .llm_request import ExecutorResponse, LlmRequestState
+from .llm_request import LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MambaHybridCacheManagerV2,
@@ -414,58 +414,39 @@ def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
     return reserve, int(reserve / w_bytes_per_token)
 
 
-def get_gdn_prefill_state_workspace_reserve(
-    model_config: ModelConfig,
-    mapping: Mapping,
-    max_batch_size: int,
-    max_num_tokens: int,
-    sm_version: Optional[int] = None,
+def _combine_graph_resident_profile_peak(
+    graph_resident_baseline_bytes: int,
+    eager_profile_baseline_bytes: int,
+    eager_profile_peak_bytes: int,
 ) -> int:
-    """Return the unprofiled FlashInfer GDN state workspace in bytes.
+    """Combine a resident CUDA-graph baseline with an eager peak increment."""
+    eager_increment_bytes = max(
+        eager_profile_peak_bytes - eager_profile_baseline_bytes, 0)
+    return graph_resident_baseline_bytes + eager_increment_bytes
 
-    The capacity profiling request maximizes tokens, which is normally one
-    long sequence. FlashInfer's GDN prefill kernel instead allocates one
-    gathered initial state and one output state for every sequence in the
-    forward batch. Its serving peak therefore scales with
-    ``min(max_batch_size, max_num_tokens)`` and is not represented by that
-    profiling shape.
 
-    Only Qwen hybrid ranks with a local GDN layer need this buffer. Consumer
-    Blackwell and unsupported architectures use the vendored Triton kernel,
-    which updates indexed states in place and has no equivalent allocation.
+def _await_profile_batch(py_executor: PyExecutor,
+                         expected_request_count: int) -> None:
+    """Wait for a profiling batch without using the executor communicator.
+
+    Executor worker threads use ``py_executor.dist`` to broadcast newly
+    enqueued requests. A collective from this control thread can race that
+    broadcast, especially while rank 0 serializes a wide request batch, and
+    pair collectives with different payloads across ranks. Profiling enables
+    ``gather_all_responses``, so every rank can instead wait for the same final
+    responses locally.
     """
-    config = model_config.pretrained_config
-    if (os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") != "1"
-            or not is_qwen3_hybrid(config)
-            or not is_flashinfer_gdn_supported_arch(sm_version)):
-        return 0
-
-    mamba_params = extract_mamba_kv_cache_params(
-        config,
-        quant_config=model_config.quant_config,
-    )
-    local_layer_indices = mapping.pp_layers(len(mamba_params.mamba_layer_mask))
-    if not any(mamba_params.mamba_layer_mask[layer_idx]
-               for layer_idx in local_layer_indices):
-        return 0
-
-    tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-    assert mamba_params.num_heads % tp_size == 0
-    assert mamba_params.n_groups % tp_size == 0
-    num_output_heads = max(mamba_params.num_heads,
-                           mamba_params.n_groups) // tp_size
-    state_dtype = (mamba_params.mamba_ssm_cache_dtype
-                   if is_sm_100f(sm_version) else torch.float32)
-    # This mirrors flashinfer_chunk.py's allocation: num_o_heads is the
-    # larger of Q/K and V heads, while head_size comes from Q/K.
-    state_bytes_per_sequence = (num_output_heads * mamba_params.state_size**2 *
-                                state_dtype.itemsize)
-    max_num_sequences = min(max_batch_size, max_num_tokens)
-    # flashinfer_chunk.py holds the gathered initial state until the kernel
-    # has populated a separate output-state buffer. Both have this shape.
-    num_simultaneous_state_buffers = 2
-    return (max(max_num_sequences, 0) * state_bytes_per_sequence *
-            num_simultaneous_state_buffers)
+    completed_request_ids = set()
+    while len(completed_request_ids) < expected_request_count:
+        responses = py_executor.await_responses()
+        if not responses and py_executor.is_shutdown:
+            raise RuntimeError(
+                "Executor shut down before the profiling batch completed.")
+        for response in responses:
+            if response.has_error():
+                raise RuntimeError(response.error_msg)
+            if response.result is not None and response.result.is_final:
+                completed_request_ids.add(response.request_id)
 
 
 def _normalize_attention_windows(
@@ -626,6 +607,9 @@ class KvCacheCreator:
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
+        self._dummy_req_batches = None
+        self._sequence_profile_memory_cap = None
+        self._sequence_profile_max_requests = None
         self._dummy_encoder_inputs: List[MultimodalParams] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
@@ -862,21 +846,44 @@ class KvCacheCreator:
         return int(available_kv_mem)
 
     def _create_dummy_context_requests(
-            self, input_seq_len: int) -> List[trtllm.Request]:
+        self,
+        input_seq_len: int,
+        *,
+        num_requests: Optional[int] = None,
+        token_budget: Optional[int] = None,
+    ) -> List[trtllm.Request]:
         # Keep the LLM dummy text-only so it can always fill max_num_tokens.
         # The MM encoder is profiled independently at its own token budget.
         requests = []
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
-        max_num_tokens = self._max_num_tokens
+        max_num_tokens = (self._max_num_tokens if token_budget is None else min(
+            self._max_num_tokens, token_budget))
         max_beam_width = self._max_beam_width
 
         input_seq_len = min(max_num_tokens, input_seq_len)
-        remaining_tokens = max_num_tokens
-        while remaining_tokens > 0:
-            input_seq_len = min(input_seq_len, remaining_tokens)
+        if max_num_tokens <= 0 or input_seq_len <= 0:
+            return requests
+        if num_requests is None:
+            request_lengths = []
+            remaining_tokens = max_num_tokens
+            while remaining_tokens > 0:
+                request_length = min(input_seq_len, remaining_tokens)
+                request_lengths.append(request_length)
+                remaining_tokens -= request_length
+        else:
+            num_requests = max(1, num_requests)
+            max_num_tokens = min(max_num_tokens, num_requests * input_seq_len)
+            num_requests = min(num_requests, max_num_tokens)
+            base_length, remainder = divmod(max_num_tokens, num_requests)
+            request_lengths = [
+                base_length + int(request_idx < remainder)
+                for request_idx in range(num_requests)
+            ]
+
+        for request_length in request_lengths:
             input_tokens = torch.randint(low=0,
                                          high=vocab_size,
-                                         size=(input_seq_len, )).tolist()
+                                         size=(request_length, )).tolist()
             request = trtllm.Request(input_tokens,
                                      max_tokens=1,
                                      streaming=False,
@@ -888,17 +895,79 @@ class KvCacheCreator:
                 request.py_multimodal_data = {
                     "mrope_config": {
                         "mrope_position_ids":
-                        torch.zeros(3, 1, input_seq_len, dtype=torch.int32),
+                        torch.zeros(3, 1, request_length, dtype=torch.int32),
                         "mrope_position_deltas":
                         torch.zeros(1, 1, dtype=torch.int32)
                     }
                 }
             request.py_conversation_params = None
             requests.append(request)
-            remaining_tokens -= input_seq_len
         if self._mapping.enable_attention_dp:
             requests = requests * self._mapping.tp_size
         return requests
+
+    def try_prepare_sequence_count_estimation(self) -> bool:
+        """Prepare a second profiling pass for sequence-dependent peaks.
+
+        The first pass uses a minimal temporary cache and a token-maximizing
+        request shape to obtain an upper bound for the final cache quota. A
+        hybrid V2 cache can admit many more recurrent states once constructed
+        with that quota. Existing max-shape warmup covers token-max context
+        and batch-max generation separately, so it misses context kernels
+        whose transient memory grows with the total scheduled sequence count.
+        Rebuild the cache and profile both the original long prefill and the
+        widest legal context shape. This measures the missing peak without
+        encoding backend- or model-specific workspace formulas in cache
+        sizing.
+        """
+        if not issubclass(self._kv_cache_manager_cls,
+                          MambaHybridCacheManagerV2):
+            return False
+
+        max_profile_requests = min(self._max_batch_size, self._max_num_tokens)
+        if max_profile_requests <= 1:
+            return False
+
+        self._sequence_profile_memory_cap = (
+            self._kv_cache_config.max_gpu_total_bytes)
+        self._sequence_profile_max_requests = max_profile_requests
+
+        # The second temporary manager is bounded by the preliminary byte
+        # quota. Use the final pool-shape configuration so the measured
+        # scheduled batch matches the eventual manager. ``max_tokens`` was
+        # already restored by the first pass and remains a valid user limit.
+        self._kv_cache_config.pool_ratio = self._pool_ratio_in
+        self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
+        return True
+
+    def prepare_sequence_count_profile_requests(self) -> None:
+        """Create second-pass requests after its cache has finalized shape."""
+        assert self._sequence_profile_max_requests is not None
+        input_seq_len = max(
+            1,
+            self._net_max_seq_len - 1 -
+            (self._model_engine.max_seq_len - self._max_seq_len),
+        )
+        token_budget = min(
+            self._max_num_tokens,
+            self._sequence_profile_max_requests * input_seq_len,
+        )
+        long_requests = self._create_dummy_context_requests(
+            input_seq_len,
+            token_budget=token_budget,
+        )
+        wide_requests = self._create_dummy_context_requests(
+            input_seq_len,
+            num_requests=self._sequence_profile_max_requests,
+            token_budget=token_budget,
+        )
+        self._dummy_reqs = wide_requests
+        # Run the wide shape first so retained reusable blocks from the long
+        # request cannot reduce the maximum sequence count it admits.
+        self._dummy_req_batches = [wide_requests, long_requests]
+        logger.info("Running sequence-count KV capacity profiling with "
+                    f"{self._sequence_profile_max_requests} requests and "
+                    f"{token_budget} total input tokens.")
 
     def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
         """Build one processed MM encoder batch at its scheduling limits."""
@@ -1171,8 +1240,41 @@ class KvCacheCreator:
         )
 
         profiled_output_bytes = 0
+        graph_resident_baseline_bytes = None
+        eager_profile_baseline_bytes = None
 
         if py_executor is not None and not self._skip_est:
+            graph_context = contextlib.ExitStack()
+            if self._dummy_req_batches is not None:
+                # The final runtime keeps generation CUDA graphs resident
+                # while an uncaptured mixed/context batch runs. Profiling that
+                # coexistence directly with the preliminary cache quota can
+                # OOM before its peak can be measured. Record the graph-
+                # resident baseline, release the graphs, and measure the eager
+                # batch increment independently. The two are recombined below
+                # before calculating the final cache quota.
+                graph_resident_baseline_bytes = total_used_bytes
+                for engine in (self._model_engine, self._draft_model_engine):
+                    if engine is None:
+                        continue
+                    engine._release_cuda_graphs()
+                    graph_context.enter_context(engine.no_cuda_graph())
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                eager_free_bytes, eager_total_gpu_memory = (
+                    torch.cuda.mem_get_info())
+                assert eager_total_gpu_memory == total_gpu_memory
+                eager_profile_baseline_bytes = (eager_total_gpu_memory -
+                                                eager_free_bytes)
+                model_bytes = torch.cuda.memory_stats(
+                )["allocated_bytes.all.current"]
+                torch.cuda.reset_peak_memory_stats()
+                logger.info(
+                    "Sequence-count profiling released CUDA graphs after "
+                    "recording their resident baseline: "
+                    f"{graph_resident_baseline_bytes / GB:.2f} -> "
+                    f"{eager_profile_baseline_bytes / GB:.2f} GiB.")
+
             # Run the MM encoder at its independent token budget, then keep the
             # resulting request-owned embeddings resident while the text-only
             # LLM dummy fills max_num_tokens.
@@ -1183,21 +1285,16 @@ class KvCacheCreator:
             py_executor.set_gather_responses(True)
             origin_iter_stats = py_executor.enable_iter_perf_stats
             py_executor.enable_iter_perf_stats = False
-            req_ids = []
-            if py_executor.dist.mapping.rank == 0:
-                req_ids = py_executor.enqueue_requests(self._dummy_reqs)
-            req_ids = py_executor.dist.broadcast(req_ids, root=0)
             py_executor.is_warmup = True
             py_executor.start_worker()
             try:
-                responses = py_executor.await_responses(req_ids)
-                for response_or_list in responses:
-                    response_list = [response_or_list] if isinstance(
-                        response_or_list,
-                        ExecutorResponse) else response_or_list
-                    for response in response_list:
-                        if response.has_error():
-                            raise RuntimeError(response.error_msg)
+                request_batches = (self._dummy_req_batches
+                                   if self._dummy_req_batches is not None else
+                                   [self._dummy_reqs])
+                for requests in request_batches:
+                    if py_executor.dist.mapping.rank == 0:
+                        py_executor.enqueue_requests(requests)
+                    _await_profile_batch(py_executor, len(requests))
 
                 torch_peak_memory = torch.cuda.memory_stats(
                 )["allocated_bytes.all.peak"]
@@ -1231,6 +1328,7 @@ class KvCacheCreator:
                     kv_stats_draft.allocated_bytes
                     if kv_stats_draft is not None else 0)
                 py_executor.is_warmup = False
+                graph_context.close()
                 py_executor.shutdown()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
@@ -1238,7 +1336,23 @@ class KvCacheCreator:
             total_used_bytes = total_gpu_memory - end
             activation_bytes = torch_peak_memory - model_bytes
             extra_cost = max(total_used_bytes - torch_used_bytes, 0)
-            peak_memory = torch_peak_memory + extra_cost
+            eager_peak_memory = torch_peak_memory + extra_cost
+            if graph_resident_baseline_bytes is not None:
+                assert eager_profile_baseline_bytes is not None
+                eager_increment_bytes = max(
+                    eager_peak_memory - eager_profile_baseline_bytes, 0)
+                peak_memory = _combine_graph_resident_profile_peak(
+                    graph_resident_baseline_bytes,
+                    eager_profile_baseline_bytes,
+                    eager_peak_memory,
+                )
+                logger.info(
+                    "Sequence-count profiling measured "
+                    f"{eager_increment_bytes / GB:.2f} GiB above the "
+                    "graph-free baseline; combined graph-resident peak is "
+                    f"{peak_memory / GB:.2f} GiB.")
+            else:
+                peak_memory = eager_peak_memory
             logger.info(
                 f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
             )
@@ -1306,32 +1420,13 @@ class KvCacheCreator:
                     f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
                 )
 
-        # The token-maximizing profiling request under-measures FlashInfer
-        # GDN's batch-dependent transient state buffers. Keep that workspace
-        # outside the cache quota so a large mixed context/decode batch cannot
-        # exhaust the device after cache allocation. The scheduler does not
-        # need a separate sequence cap: its existing max_batch_size and
-        # max_num_tokens limits are the bounds used for this reservation.
-        gdn_workspace_reserve = get_gdn_prefill_state_workspace_reserve(
-            self._model_engine.model.model_config,
-            self._mapping,
-            self._max_batch_size,
-            self._max_num_tokens,
-        )
-        if gdn_workspace_reserve > 0:
-            budget_before = kv_cache_max_memory
-            if gdn_workspace_reserve >= budget_before:
-                raise RuntimeError(
-                    "Insufficient GPU memory for the FlashInfer GDN prefill "
-                    f"state workspace: requires {gdn_workspace_reserve / GB:.2f} GiB, "
-                    f"but only {budget_before / GB:.2f} GiB remains for the KV cache and workspace."
-                )
-            kv_cache_max_memory = budget_before - gdn_workspace_reserve
-            logger.info(
-                f"Reserving {gdn_workspace_reserve / GB:.2f} GiB for the "
-                "FlashInfer GDN prefill state workspace: KV cache budget "
-                f"{budget_before / GB:.2f} -> {kv_cache_max_memory / GB:.2f} GiB."
-            )
+        if self._sequence_profile_memory_cap is not None:
+            # The first pass measured the long-request shape. The second pass
+            # uses its result as the temporary cache quota and measures both
+            # long and sequence-max shapes. Never let rebuilding with a larger
+            # cache increase the first pass's safe upper bound.
+            kv_cache_max_memory = min(kv_cache_max_memory,
+                                      self._sequence_profile_memory_cap)
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -1387,7 +1482,10 @@ class KvCacheCreator:
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
         if isinstance(self._profiling_stage_data, dict):
-            self._profiling_stage_data["activation_bytes"] = activation_bytes
+            self._profiling_stage_data["activation_bytes"] = max(
+                activation_bytes,
+                self._profiling_stage_data.get("activation_bytes", 0),
+            )
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(

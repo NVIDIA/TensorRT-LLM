@@ -16,7 +16,6 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
     _create_kv_cache_manager,
-    get_gdn_prefill_state_workspace_reserve,
     get_kv_cache_manager_cls,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -162,97 +161,6 @@ def _hybrid_cache_sizing_model_config(layer_types):
         torch_dtype=torch.float16,
     )
     return SimpleNamespace(pretrained_config=config, quant_config=None)
-
-
-def test_gdn_prefill_workspace_reserve_tracks_max_runtime_batch(monkeypatch):
-    monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
-    model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
-    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
-
-    # Ten sequences * two live buffers * four heads * 8x8 state * fp32.
-    assert (
-        get_gdn_prefill_state_workspace_reserve(
-            model_config,
-            mapping,
-            max_batch_size=16,
-            max_num_tokens=10,
-            sm_version=90,
-        )
-        == 10 * 2 * 4 * 8 * 8 * torch.float32.itemsize
-    )
-
-
-def test_gdn_prefill_workspace_reserve_uses_native_state_dtype_on_sm100(
-    monkeypatch,
-):
-    monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
-    model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
-    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
-
-    assert (
-        get_gdn_prefill_state_workspace_reserve(
-            model_config,
-            mapping,
-            max_batch_size=16,
-            max_num_tokens=10,
-            sm_version=100,
-        )
-        == 10 * 2 * 4 * 8 * 8 * torch.float16.itemsize
-    )
-
-
-@pytest.mark.parametrize("sm_version", [80, 120])
-def test_gdn_prefill_workspace_reserve_skips_triton_architectures(
-    monkeypatch,
-    sm_version,
-):
-    monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
-    model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
-
-    assert (
-        get_gdn_prefill_state_workspace_reserve(
-            model_config,
-            Mapping(world_size=1, tp_size=1, pp_size=1),
-            max_batch_size=16,
-            max_num_tokens=10,
-            sm_version=sm_version,
-        )
-        == 0
-    )
-
-
-def test_gdn_prefill_workspace_reserve_skips_attention_only_pp_rank(
-    monkeypatch,
-):
-    monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
-    model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
-
-    assert (
-        get_gdn_prefill_state_workspace_reserve(
-            model_config,
-            Mapping(world_size=2, rank=1, tp_size=1, pp_size=2),
-            max_batch_size=16,
-            max_num_tokens=10,
-            sm_version=90,
-        )
-        == 0
-    )
-
-
-def test_gdn_prefill_workspace_reserve_respects_disable_override(monkeypatch):
-    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "0")
-    model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
-
-    assert (
-        get_gdn_prefill_state_workspace_reserve(
-            model_config,
-            Mapping(world_size=1, tp_size=1, pp_size=1),
-            max_batch_size=16,
-            max_num_tokens=10,
-            sm_version=90,
-        )
-        == 0
-    )
 
 
 def test_mamba_kv_cache_params_separate_target_and_draft_masks():
