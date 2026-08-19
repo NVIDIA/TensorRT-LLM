@@ -150,9 +150,26 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None:
-            for future in self.futures:
-                future.result()
-            return super().__exit__(exc_type, exc_val, exc_tb)
+            # future.result() re-raises whatever the worker raised, so shut
+            # down from a finally: the pool must always be drained before the
+            # caller tears down what the workers were using, or a surviving
+            # pool thread outlives an LLM proxy and aborts in libzmq
+            # (nvbugs/6327718). On the failure path cancel first, matching the
+            # branch below, so we never block waiting on queued work that a
+            # dead engine will never complete.
+            drained = False
+            try:
+                for future in self.futures:
+                    future.result()
+                drained = True
+            finally:
+                if drained:
+                    super().__exit__(exc_type, exc_val, exc_tb)
+                else:
+                    for future in self.futures:
+                        future.cancel()
+                    self.shutdown(wait=True, cancel_futures=True)
+            return False
 
         for future in self.futures:
             future.cancel()
