@@ -36,8 +36,8 @@ OFFLOAD_TIER_BUDGET_ATTRS = ("host_cache_size", "disk_cache_size")
 def _make_creator(
     max_gpu_total_bytes: int,
     host_cache_size=None,
-    disk_cache_size=None,
-    disk_cache_path=None,
+    disk_cache_size: int | None = None,
+    disk_cache_path: str | None = None,
     total_kv_per_token: int = 100,
     target_kv_per_token: int = 80,
     total_kv_intercept: int = 0,
@@ -537,7 +537,9 @@ class TestBuildManagersBudgetGates:
     """Which splits build_managers applies, as opposed to how they divide."""
 
     @staticmethod
-    def _make_build_creator(total_offload: int, total_gpu: int, disk_path=None) -> KvCacheCreator:
+    def _make_build_creator(
+        total_offload: int, total_gpu: int, disk_path: str | None = None
+    ) -> KvCacheCreator:
         """Creator whose host and disk tiers both carry total_offload."""
         c = _make_creator(
             max_gpu_total_bytes=total_gpu,
@@ -619,3 +621,43 @@ class TestBuildManagersBudgetGates:
         target_config, _ = self._configs_passed_to_managers(c)
         assert target_config.max_gpu_total_bytes == 10 * GB
         c._needs_gpu_kv_cache_budget_split.assert_not_called()
+
+    def _make_two_model_creator(self, total_offload: int, disk_path: str) -> KvCacheCreator:
+        """V2 creator whose draft cache comes from a separate engine."""
+        c = self._make_build_creator(total_offload, total_gpu=10 * GB, disk_path=disk_path)
+        c._draft_model_engine = Mock()
+        c._should_create_separate_draft_kv_cache = Mock(return_value=False)
+        # V2 sizes two-model GPU pools per manager from the whole budget.
+        c._needs_gpu_kv_cache_budget_split = Mock(return_value=False)
+        return c
+
+    @pytest.mark.parametrize("budget_attr", OFFLOAD_TIER_BUDGET_ATTRS)
+    def test_two_model_offload_budget_is_split(self, budget_attr, tmp_path):
+        """A separate draft engine divides the offload budgets too.
+
+        Its manager lives alongside the target's, so handing both the whole
+        budget would reserve it twice.
+        """
+        total_offload = 20 * GB
+        c = self._make_two_model_creator(total_offload, str(tmp_path))
+
+        c.build_managers({}, estimating_kv_cache=False)
+
+        calls = c._create_kv_cache_manager.call_args_list
+        target_config = calls[0].kwargs["kv_cache_config_override"]
+        draft_config = calls[1].kwargs["kv_cache_config_override"]
+        target_share = getattr(target_config, budget_attr)
+        draft_share = getattr(draft_config, budget_attr)
+        assert target_share + draft_share == total_offload
+        assert 0 < draft_share < total_offload
+
+    def test_two_model_keeps_the_gpu_budget_whole(self, tmp_path):
+        """Each two-model manager sizes its GPU pools from the full budget."""
+        c = self._make_two_model_creator(20 * GB, str(tmp_path))
+
+        c.build_managers({}, estimating_kv_cache=False)
+
+        calls = c._create_kv_cache_manager.call_args_list
+        for call in calls:
+            config = call.kwargs["kv_cache_config_override"]
+            assert config.max_gpu_total_bytes == 10 * GB

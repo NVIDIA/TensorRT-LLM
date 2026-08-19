@@ -1921,8 +1921,9 @@ class KvCacheCreator:
         """Return a copy of the config with explicit offload budgets unset.
 
         Host sizing then falls to the V2 auto host tier policy, which matches
-        the tier to the manager's own device quota. The disk tier has no auto
-        policy, so dropping its budget leaves the tier out.
+        the tier to the manager's own device quota; V1 builds no secondary pool.
+        The disk tier is V2 only and has no auto policy, so dropping its budget
+        leaves the tier out.
         """
         if kv_cache_config is None:
             return kv_cache_config
@@ -1955,7 +1956,8 @@ class KvCacheCreator:
 
         # Estimation managers are throwaway probes whose pools only hold dummy
         # requests, so an explicit offload tier would reserve capacity the probe
-        # cannot fill.
+        # cannot fill. Encoder-decoder runs skip estimation, so dropping the
+        # cross budgets is defensive.
         if estimating_kv_cache:
             self_kv_cache_config = self._drop_explicit_offload_tier_budgets(
                 self_kv_cache_config)
@@ -1979,15 +1981,11 @@ class KvCacheCreator:
                     self._split_kv_cache_budget_for_draft(
                         "max_gpu_total_bytes", self_kv_cache_config,
                         draft_kv_cache_config))
-            # KVCacheManagerV2 does not support two-model draft budget splitting.
-            v2_two_model = (self._is_kv_cache_manager_v2
-                            and self._draft_model_engine is not None)
-            if not v2_two_model:
-                for budget_attr in self._OFFLOAD_TIER_BUDGET_ATTRS:
-                    self_kv_cache_config, draft_kv_cache_config = (
-                        self._split_kv_cache_budget_for_draft(
-                            budget_attr, self_kv_cache_config,
-                            draft_kv_cache_config))
+            for budget_attr in self._OFFLOAD_TIER_BUDGET_ATTRS:
+                self_kv_cache_config, draft_kv_cache_config = (
+                    self._split_kv_cache_budget_for_draft(
+                        budget_attr, self_kv_cache_config,
+                        draft_kv_cache_config))
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,
@@ -2013,10 +2011,14 @@ class KvCacheCreator:
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
-            if self._is_kv_cache_manager_v2:
-                assert draft_kv_cache_config is None, (
-                    "KVCacheManagerV2 does not support two-model speculative "
-                    "decoding with separate draft KV cache budget splitting.")
+            if (self._is_kv_cache_manager_v2
+                    and draft_kv_cache_config is not None):
+                # Offload budgets are divided per manager, GPU budgets are not.
+                assert (draft_kv_cache_config.max_gpu_total_bytes ==
+                        self_kv_cache_config.max_gpu_total_bytes), (
+                            "KVCacheManagerV2 does not support two-model "
+                            "speculative decoding with separate draft GPU "
+                            "budgets.")
             draft_kv_cache_manager = self._create_kv_cache_manager(
                 self._draft_model_engine,
                 estimating_kv_cache,
