@@ -42,6 +42,21 @@ constexpr bool shouldUseCompactHeads(int batchSize, int numHeads, int numValueHe
         && batchSize <= kCompactHeadsWorkThreshold / numHeads;
 }
 
+//! Batch-row strides for the decode step's per-token inputs.
+//!
+//! The head and channel axes remain packed. A separate row stride lets the
+//! kernel consume column views of fused projection outputs without first
+//! materializing each view as a contiguous tensor.
+struct KdaDecodeIoLayout
+{
+    int xQRowStride;
+    int xKRowStride;
+    int xVRowStride;
+    int gateRowStride;
+    int betaRowStride;
+    int outputNormGateRowStride;
+};
+
 //! Parameters for the fused, single-token KDA decode kernel.
 struct KdaDecodeParams
 {
@@ -68,6 +83,7 @@ struct KdaDecodeParams
     int const* cuSeqlens;
     float* state;
     int64_t stateSlotStride;
+    int64_t convStateSlotStride;
     void* output;
     int batchSize;
     int numHeads;
@@ -76,9 +92,11 @@ struct KdaDecodeParams
     bool updateConvCache;
     bool useLowerBound;
     bool applyBetaSigmoid;
+    bool enablePdl;
     float lowerBound;
     float scale;
     float outputNormEps;
+    KdaDecodeIoLayout layout;
 };
 
 //! Launches the tuned KDA decode kernel on the supplied CUDA stream.

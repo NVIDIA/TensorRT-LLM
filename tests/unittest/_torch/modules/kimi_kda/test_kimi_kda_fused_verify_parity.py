@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime-level parity: KimiKDARuntime fused verify vs sequential verify.
+"""Runtime-level parity: KimiKDALinearAttention fused verify vs sequential verify.
 
 Simulates two chained speculative-verification rounds through
-``KimiKDARuntime._forward_verify`` in both worlds:
+``KimiKDALinearAttention.forward_verify`` in both worlds:
 
 * Sequential world: the legacy intermediate-buffer path
-  (``_forward_verify_sequential``) plus the manager's legacy promotion
+  (``forward_verify_sequential``) plus the manager's legacy promotion
   (copy the accepted step's conv window / SSM state into the live pools).
 * Fused world: the ``trtllm::kda_mtp_decode`` replay path
-  (``_forward_verify_fused``) with per-slot replay caches, in-place state
+  (``forward_verify_fused``) with per-slot replay caches, in-place state
   commit after the golden token, and only the accepted-draft count
   recorded between rounds.
 
@@ -50,7 +50,7 @@ try:
     # The model module transitively imports the optional deps above, so it
     # must stay behind the guard too or collection fails instead of skipping.
     from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
-    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
+    from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 except ImportError as e:
     _HAVE_DEPS = False
     _DEP_ERR = str(e)
@@ -96,7 +96,7 @@ def _make_runtime(seed, aux_stream=None):
             gate_lower_bound=LB,
         ),
     )
-    rt = KimiKDARuntime(cfg, layer_idx=0, aux_stream=aux_stream).to("cuda")
+    rt = KimiKDALinearAttention(cfg, layer_idx=0, aux_stream=aux_stream).to("cuda")
     gen = torch.Generator(device="cuda").manual_seed(seed)
     for name, p in rt.named_parameters():
         if name.endswith("A_log"):
@@ -120,7 +120,7 @@ def _make_pools(B, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     d = H * K
     conv_pool = (
-        torch.randn(B, 3 * d, W, generator=gen, device="cuda", dtype=torch.float32) * 0.5
+        torch.randn(B, 3 * d, W - 1, generator=gen, device="cuda", dtype=torch.float32) * 0.5
     ).to(torch.bfloat16)
     ssm_pool = torch.randn(B, H, K, K, generator=gen, device="cuda", dtype=torch.float32)
     ssm_pool *= torch.linspace(0.5, 1.5, K, device="cuda").view(1, 1, K, 1)
@@ -130,13 +130,13 @@ def _make_pools(B, seed):
 def _make_fused_layer_cache(B, conv_pool):
     """Replay caches shaped like PythonMambaCacheManager's KDA allocation,
     with the committed conv window seeded from the base pool (the prefill
-    seeding contract: FLA window columns [1, W) -> committed columns)."""
+    seeding contract: the base pool stores committed columns directly)."""
     d = H * K
     S = W - 1 + M
 
     def _conv_cache(section):
         cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d, 1:].float()
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
         return cache
 
     return SimpleNamespace(
@@ -157,7 +157,7 @@ def _make_seq_layer_cache(B):
     return SimpleNamespace(
         kda_qkg_cache=None,
         intermediate_conv_window=torch.zeros(
-            B, M + 1, 3 * d, W, device="cuda", dtype=torch.bfloat16
+            B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
         ),
         intermediate_ssm=torch.zeros(B, M + 1, H, K, K, device="cuda", dtype=torch.float32),
     )
@@ -177,6 +177,56 @@ def _rep(name, a, b):
     rel = ((a - b).norm() / (b.norm() + 1e-12)).item()
     print(f"  {name}: cos={cos:.6f} rel_l2={rel:.3e}")
     return cos > 0.999 and rel < 3e-2
+
+
+def test_plain_decode_direct_pool_matches_fallback():
+    """The production decode path updates packed live pools by slot."""
+    torch.manual_seed(4)
+    batch, slots = 4, 7
+    runtime = _make_runtime(seed=5)
+    runtime.finalize_decode_weights()
+    slot_indices = torch.tensor([6, 1, 4, 2], dtype=torch.long, device="cuda")
+    state_indices = slot_indices.to(torch.int32)
+    conv_direct, ssm_direct = _make_pools(slots, seed=6)
+    conv_fallback = conv_direct.clone()
+    ssm_fallback = ssm_direct.clone()
+    hidden = torch.randn(batch, HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    with torch.no_grad():
+        expected = runtime.forward_decode_fallback(
+            hidden,
+            conv_fallback,
+            ssm_fallback,
+            slot_indices,
+        )
+        actual = runtime.forward_decode(
+            hidden,
+            conv_direct,
+            ssm_direct,
+            slot_indices,
+            mamba_metadata=SimpleNamespace(
+                _arange_buffer=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+            ),
+            ssm_state_indices=state_indices,
+        )
+
+    assert _rep("plain decode output", actual, expected)
+    torch.testing.assert_close(
+        conv_direct.index_select(0, slot_indices),
+        conv_fallback.index_select(0, slot_indices),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        ssm_direct.index_select(0, slot_indices),
+        ssm_fallback.index_select(0, slot_indices),
+        rtol=2e-4,
+        atol=2e-4,
+    )
+    untouched = torch.ones(slots, dtype=torch.bool, device="cuda")
+    untouched[slot_indices] = False
+    assert torch.equal(conv_direct[untouched], conv_fallback[untouched])
+    assert torch.equal(ssm_direct[untouched], ssm_fallback[untouched])
 
 
 @torch.no_grad()
@@ -209,11 +259,11 @@ def test_fused_vs_sequential_two_rounds():
     ok = True
     # ---- Round 1 (no pending drafts) ----
     x1 = tokens()
-    out1_seq = rt_seq._forward_verify_sequential(
+    out1_seq = rt_seq.forward_verify_sequential(
         x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
     )
     with with_multi_stream(True):
-        out1_fused = rt_fused._forward_verify(
+        out1_fused = rt_fused.forward_verify(
             x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
     print("round 1:")
@@ -226,11 +276,11 @@ def test_fused_vs_sequential_two_rounds():
 
     # ---- Round 2 (fused path replays the accepted drafts) ----
     x2 = tokens()
-    out2_seq = rt_seq._forward_verify_sequential(
+    out2_seq = rt_seq.forward_verify_sequential(
         x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
     )
     with with_multi_stream(True):
-        out2_fused = rt_fused._forward_verify(
+        out2_fused = rt_fused.forward_verify(
             x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
     print("round 2 (mixed replay):")
