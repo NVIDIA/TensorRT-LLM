@@ -232,6 +232,11 @@ void BounceReceiver::startWorkers()
 
 void BounceReceiver::wake()
 {
+    // Take mJobMu so the notify is ordered against a worker's predicate check. The wait predicate
+    // reads mCtx.stop, which shutdown() sets WITHOUT holding mJobMu — a naked notify_all can then
+    // fire in the window between a worker evaluating the predicate false and parking, and is lost
+    // forever (no later notifier exists once the IO thread is joined), hanging joinWorkers().
+    std::lock_guard<std::mutex> lk(mJobMu);
     mJobCv.notify_all();
 }
 
@@ -300,6 +305,19 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     }
     if (!reversePathReady)
     {
+        return;
+    }
+    // A non-empty WANT has no retransmission path (submit() sends it exactly once per fresh rid),
+    // so one for an already-tracked flow is a replay or rid collision. Re-queueing would re-grant
+    // over the still-held regions — the sender never writes the extras, so they leak — and the
+    // lease refresh inside onWant would keep the flow forever off staleFlows(), defeating the
+    // reclaim path that exists for exactly this state. Drop it, mirroring the duplicate-DATA and
+    // stale-ACK handling. (Check-then-act is safe: all flow-state mutation happens on this IO
+    // thread; app threads only acquireLocal().)
+    if (mCtx.scheduler.knowsFlow(key))
+    {
+        TLLM_LOG_WARNING("BounceTransport(%s): dropped duplicate WANT from peer %s rid=%llu", mCtx.selfName.c_str(),
+            peer.c_str(), static_cast<unsigned long long>(h.requestId));
         return;
     }
     mCtx.sendGrants(mCtx.scheduler.onWant(key, chunkBytes));
@@ -580,6 +598,18 @@ void BounceReceiver::scatterWorkerLoop()
                 srcInBounds = srcInBounds && e.count >= 1 && e.bounceOffset <= job.regionBytes
                     && span <= job.regionBytes - e.bounceOffset;
                 rawPieces += std::max<std::uint32_t>(e.count, 1);
+            }
+            // Reject an oversized run list BEFORE the exact-count pass below: that pass iterates
+            // once per PIECE, so a hostile/corrupt DATA (per-run count near 2^32 passes the span
+            // check when bounceStride is 0) could otherwise pin this worker — and its region —
+            // for days. piecesFor() emits at least one entry per piece, so rawPieces > maxEntries
+            // implies the nTotal <= maxEntries check would reject the job anyway.
+            if (srcInBounds && rawPieces > maxEntries)
+            {
+                TLLM_LOG_WARNING("BounceTransport(%s): rejected scatter with %llu pieces (max %zu) rid=%llu chunk=%u",
+                    mCtx.selfName.c_str(), static_cast<unsigned long long>(rawPieces), maxEntries,
+                    static_cast<unsigned long long>(job.rid), job.chunkIdx);
+                srcInBounds = false;
             }
             std::size_t nTotal = 0;
             std::uint64_t seen = 0;
@@ -1504,8 +1534,21 @@ BounceTransport::BounceTransport(std::string selfName, BounceConfig cfg, int dev
             mCtx.selfName.c_str(), static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes), cap, cap);
         mCtx.cfg.maxChunkSizeBytes = cap;
     }
-    mReceiver.startWorkers();
-    mIoThread = std::thread(&BounceTransport::ioLoop, this);
+    try
+    {
+        mReceiver.startWorkers();
+        mIoThread = std::thread(&BounceTransport::ioLoop, this);
+    }
+    catch (...)
+    {
+        // Thread creation failed partway (resource exhaustion). The destructor won't run — the
+        // constructor is throwing — so join any scatter workers already spawned here, or their
+        // std::thread destructors call std::terminate.
+        mCtx.stop.store(true, std::memory_order_release);
+        mReceiver.wake();
+        mReceiver.joinWorkers();
+        throw;
+    }
 }
 
 BounceTransport::~BounceTransport()

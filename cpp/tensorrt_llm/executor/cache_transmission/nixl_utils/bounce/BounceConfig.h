@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstddef>
@@ -216,8 +217,12 @@ struct BounceConfig
         cfg.requestTimeoutMs = envInt("TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS", cfg.requestTimeoutMs);
         // Lease/quarantine derive from the one user-visible timeout (see the field comments): the
         // lease must exceed the peers' request timeout, and time is the only write barrier for a
-        // reclaimed region. Disabling the request timeout (<=0) disables both.
-        cfg.receiverFlowTimeoutMs = cfg.requestTimeoutMs > 0 ? 2 * cfg.requestTimeoutMs : 0;
+        // reclaimed region. Disabling the request timeout (<=0) disables both. The doubling is done
+        // in 64-bit and clamped: envInt admits values up to INT_MAX, and a signed overflow here
+        // would wrap the lease negative — silently disabling the dead-sender reclaim it drives.
+        cfg.receiverFlowTimeoutMs = cfg.requestTimeoutMs > 0 ? static_cast<int>(std::min<std::int64_t>(
+                                        std::int64_t{2} * cfg.requestTimeoutMs, std::numeric_limits<int>::max()))
+                                                             : 0;
         cfg.quarantineMs = cfg.requestTimeoutMs;
         cfg.disableFabricMemory = envBool("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", cfg.disableFabricMemory);
         cfg.useZeroCopyArguments = envBool("TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS", cfg.useZeroCopyArguments);

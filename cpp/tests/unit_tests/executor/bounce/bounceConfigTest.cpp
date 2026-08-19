@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -161,4 +162,18 @@ TEST(BounceConfig, InvalidResourceCountsFallBackToDefaults)
     EXPECT_EQ(cfg.copyStreamCount, defaults.copyStreamCount);
     EXPECT_EQ(cfg.maxInflightChunksPerRequest, defaults.maxInflightChunksPerRequest);
     EXPECT_EQ(cfg.requestTimeoutMs, defaults.requestTimeoutMs);
+}
+
+// envInt admits any timeout up to INT_MAX, so the 2x lease derivation must clamp instead of
+// overflowing: a wrapped-negative receiverFlowTimeoutMs reads as "lease disabled" and silently
+// turns off the dead-sender region reclaim.
+TEST(BounceConfig, LeaseDerivationClampsInsteadOfOverflowing)
+{
+    ScopedEnv env;
+    env.set("TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS", "2000000000"); // valid, but > INT_MAX / 2
+
+    auto const cfg = b::BounceConfig::fromEnv();
+    EXPECT_EQ(cfg.requestTimeoutMs, 2000000000);
+    EXPECT_EQ(cfg.receiverFlowTimeoutMs, std::numeric_limits<int>::max());
+    EXPECT_EQ(cfg.quarantineMs, 2000000000);
 }

@@ -392,6 +392,12 @@ bool CreditScheduler::heldByFlow(std::string const& flow, std::uint64_t offset) 
     return it != mFlows.end() && it->second.held.count(offset) > 0;
 }
 
+bool CreditScheduler::knowsFlow(std::string const& flow) const
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    return mFlows.find(flow) != mFlows.end();
+}
+
 std::vector<Grant> CreditScheduler::freeOrphanRegion(std::uint64_t offset)
 {
     std::lock_guard<std::mutex> lk(mMu);
