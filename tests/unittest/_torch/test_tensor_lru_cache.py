@@ -19,7 +19,11 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import torch
 
-from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
+from tensorrt_llm._torch.tensor_lru_cache import (
+    CacheAllocationResult,
+    CacheEntryState,
+    TensorLRUCache,
+)
 
 
 def test_rejects_non_positive_capacity() -> None:
@@ -52,6 +56,26 @@ def test_put_get_pop_and_clear_update_byte_accounting() -> None:
     assert len(cache) == 0
     assert cache.current_bytes == 0
     assert cache.get("a") is None
+
+
+def test_clear_rejects_live_references_and_reservations() -> None:
+    cache = TensorLRUCache[str](max_bytes=32)
+
+    assert cache.allocate("key", 8) is CacheAllocationResult.NEW_RESERVATION
+    with pytest.raises(RuntimeError, match="live references or reservations"):
+        cache.clear()
+
+    assert cache.put(
+        "key",
+        torch.ones(2, dtype=torch.float32),
+        expected_state=CacheEntryState.RESERVED,
+    )
+    with pytest.raises(RuntimeError, match="live references or reservations"):
+        cache.clear()
+
+    assert cache.release("key") is None
+    cache.clear()
+    assert len(cache) == 0
 
 
 def test_stats_track_hits_misses_insertions_and_replacements() -> None:
@@ -180,6 +204,118 @@ def test_parallel_operations_keep_cache_metadata_consistent() -> None:
         hit = cache.get(index)
         if hit is not None:
             assert hit.numel() * hit.element_size() == 8
+
+
+def test_shared_reservation_stores_one_output_and_keeps_reusable_entry() -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+    value = torch.ones(2, dtype=torch.float32)
+
+    assert cache.allocate("key", 8) is CacheAllocationResult.NEW_RESERVATION
+    assert cache.allocate("key", 8) is CacheAllocationResult.RESERVATION_HIT
+    assert cache.current_bytes == 0
+    assert cache.stats().reserved_bytes == 8
+    assert cache.stats().pinned_bytes == 0
+
+    assert cache.make_space_for("key") == []
+    assert cache.put("key", value, expected_state=CacheEntryState.RESERVED)
+    assert cache.current_bytes == 8
+    assert cache.stats().reserved_bytes == 0
+    assert cache.stats().pinned_bytes == 8
+    cached = cache.get("key", record_stats=False)
+    assert cached is not None
+    torch.testing.assert_close(cached, value)
+
+    assert cache.release("key") is None
+    assert cache.release("key") is None
+    assert cache.stats().pinned_bytes == 0
+    assert cache.current_bytes == 8
+    assert cache.allocate("key", 8) is CacheAllocationResult.READY_HIT
+    assert cache.release("key") is None
+
+    stats = cache.stats()
+    assert stats.hits == 1
+    assert stats.misses == 1
+    assert stats.producer_misses == 1
+    assert stats.inflight_deduplications == 1
+
+
+def test_non_retained_entries_are_removed_on_their_final_release() -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+
+    assert (
+        cache.allocate("reserved", 8, retain_after_release=False)
+        is CacheAllocationResult.NEW_RESERVATION
+    )
+    assert cache.release("reserved") is None
+    assert len(cache) == 0
+    assert cache.stats().reserved_bytes == 0
+
+    assert (
+        cache.allocate("ready", 8, retain_after_release=False)
+        is CacheAllocationResult.NEW_RESERVATION
+    )
+    assert cache.put(
+        "ready",
+        torch.ones(2, dtype=torch.float32),
+        expected_state=CacheEntryState.RESERVED,
+    )
+    assert cache.release("ready") == "ready"
+    assert len(cache) == 0
+    assert cache.current_bytes == 0
+    assert cache.stats().pinned_bytes == 0
+
+
+def test_reservation_limit_and_output_space_are_checked_separately() -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+    assert cache.put("old-1", torch.ones(2, dtype=torch.float32))
+    assert cache.put("old-2", torch.ones(2, dtype=torch.float32))
+
+    assert cache.allocate("new-1", 8) is CacheAllocationResult.NEW_RESERVATION
+    assert cache.allocate("new-2", 8) is CacheAllocationResult.NEW_RESERVATION
+    assert cache.allocate("old-1", 8) is None
+    assert cache.stats().blocked_allocations == 1
+
+    assert cache.make_space_for("new-1") == ["old-1"]
+    assert cache.make_space_for("new-2", pending_output_bytes=8) == ["old-2"]
+    assert cache.current_bytes == 0
+    assert cache.put(
+        "new-1",
+        torch.ones(2, dtype=torch.float32),
+        expected_state=CacheEntryState.RESERVED,
+    )
+    assert cache.put(
+        "new-2",
+        torch.ones(2, dtype=torch.float32),
+        expected_state=CacheEntryState.RESERVED,
+    )
+    assert cache.current_bytes == 16
+
+
+def test_remote_cache_put_and_removal_require_the_expected_state() -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+    value = torch.ones(2, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="requires expected_bytes"):
+        cache.put("key", value, expected_state=CacheEntryState.ABSENT)
+    assert cache.put(
+        "key",
+        value,
+        expected_state=CacheEntryState.ABSENT,
+        expected_bytes=8,
+    )
+    with pytest.raises(RuntimeError, match="expected CacheEntryState.ABSENT"):
+        cache.put(
+            "key",
+            value,
+            expected_state=CacheEntryState.ABSENT,
+            expected_bytes=8,
+        )
+
+    popped = cache.pop("key", expected_state=CacheEntryState.READY)
+    assert popped is not None
+    torch.testing.assert_close(popped, value)
+    with pytest.raises(RuntimeError, match="target is absent"):
+        cache.pop("key", expected_state=CacheEntryState.READY)
 
 
 def test_stream_aware_mode_leaves_cpu_cache_behavior_unchanged() -> None:

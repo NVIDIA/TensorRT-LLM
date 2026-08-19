@@ -592,12 +592,16 @@ class MultimodalParams:
         if input_data is None:
             return None
 
-        # Handle list case - recursively process each element
-        if isinstance(input_data, list):
-            return [
+        # Handle sequence case - recursively process each element. Preserve
+        # tuples because item-scheduled encoder outputs use tuple to mark
+        # immutable cache-owned segments rather than legacy chunk buffers.
+        if isinstance(input_data, list) or type(input_data) is tuple:
+            transformed = [
                 self._apply_tensor_operation(item, operation, **kwargs)
                 for item in input_data
             ]
+            return tuple(transformed) if type(
+                input_data) is tuple else transformed
 
         # Handle dictionary case
         if isinstance(input_data, dict):
