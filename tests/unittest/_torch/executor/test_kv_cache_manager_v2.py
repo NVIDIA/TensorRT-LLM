@@ -972,18 +972,11 @@ class TestSwaScratchFlatIndexRotation:
         layers would read and write each other's cache. With scale == 40 layers
         x kv_factor, all 40 layers must land on 40 distinct K sub-pages.
         """
+        per_layer = [
+            self._indices(layer_idx).tolist() for layer_idx in range(GEMMA4_NUM_SWA_LAYERS)
+        ]
         for position in range(self.NUM_BLOCKS):
-            seen = {
-                _reference_flat_index(
-                    position,
-                    GEMMA4_SCRATCH_PAGES_PER_BLOCK,
-                    GEMMA4_SCALE,
-                    _k_layer_offset(layer_idx),
-                    self.SLOT_IDS,
-                    1,
-                )
-                for layer_idx in range(GEMMA4_NUM_SWA_LAYERS)
-            }
+            seen = {indices[position] for indices in per_layer}
             assert len(seen) == GEMMA4_NUM_SWA_LAYERS, (
                 f"block position {position}: only {len(seen)} distinct pages for "
                 f"{GEMMA4_NUM_SWA_LAYERS} layers -- layers alias each other's KV"

@@ -25,7 +25,8 @@ from ..quantization.modelopt_config import (is_modelopt_quant_config,
                                             read_modelopt_quant_config,
                                             warn_if_inline_diverges)
 # yapf: disable
-from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
+from .llm_args import (SWA_SCRATCH_CAPABLE_ATTN_BACKENDS, CalibConfig,
+                       CudaGraphConfig, DecodeCudaGraphConfig,
                        DraftTargetDecodingConfig, Eagle3DecodingConfig,
                        EagleDecodingConfig, EncodeCudaGraphConfig,
                        KvCacheConfig, LlmArgs, LookaheadDecodingConfig,
@@ -675,14 +676,6 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
     return use_v2
 
 
-# Attention backends that can address a scratch block. TRTLLM consumes
-# copy_batch_block_offsets, which carries separate K and V page indices;
-# FlashInfer builds a flat page table and uses the PER_LAYER addressing path.
-# Every other backend reads raw base page indices, where a scratch block --
-# which owns no per-block page -- appears as an invalid page.
-_SWA_SCRATCH_CAPABLE_ATTN_BACKENDS = ("TRTLLM", "FLASHINFER")
-
-
 def _resolve_swa_scratch_reuse_auto(llm_args: 'TorchLlmArgs',
                                     model_cls: Optional[type] = None,
                                     pretrained_config: Any = None) -> bool:
@@ -719,7 +712,7 @@ def _resolve_swa_scratch_reuse_auto(llm_args: 'TorchLlmArgs',
                    and get_preferred(pretrained_config) == "V2")
 
     enable = (uses_v2
-              and llm_args.attn_backend in _SWA_SCRATCH_CAPABLE_ATTN_BACKENDS)
+              and llm_args.attn_backend in SWA_SCRATCH_CAPABLE_ATTN_BACKENDS)
     kv_cache_config.enable_swa_scratch_reuse = enable
     return enable
 

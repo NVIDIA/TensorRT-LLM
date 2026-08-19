@@ -470,8 +470,12 @@ class KVCacheManager(BaseResourceManager):
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
 
         # Only an explicit request is worth a warning: the default resolves to
-        # False whenever the V1 manager is selected.
-        if kv_cache_config.enable_swa_scratch_reuse is True:
+        # False whenever the V1 manager is selected. Read through getattr:
+        # this constructor is also handed the bindings `executor.KvCacheConfig`,
+        # which mirrors the C++ fields only and carries none of the Python-only
+        # ones, and a legacy config that cannot express the request is a
+        # request that was never made.
+        if getattr(kv_cache_config, "enable_swa_scratch_reuse", False) is True:
             logger.warning(
                 "kv_cache_config.enable_swa_scratch_reuse is set but the V1 KV cache "
                 "manager is in use; SWA scratch reuse is a V2-only feature and is "

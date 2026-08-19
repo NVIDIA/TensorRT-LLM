@@ -3534,11 +3534,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return 0
 
     def get_buffers(
-        self,
-        layer_idx: int,
-        kv_layout: str = "NHD",
-        index_mode: PageIndexMode = PageIndexMode.SHARED
+            self,
+            layer_idx: int,
+            kv_layout: str = "NHD",
+            index_mode: Optional[PageIndexMode] = None
     ) -> Optional[torch.Tensor]:
+        # `None` (not SHARED) mirrors KVCacheManagerV2.get_buffers: the base
+        # resolves it to `page_index_mode`, so a caller that omits the mode --
+        # FlashInfer does -- still gets the buffer that matches the indices
+        # this manager produces. Defaulting to SHARED here would hand a SHARED
+        # buffer to PER_LAYER indices once scratch reuse is on.
         local_layer_idx = self.layer_offsets[layer_idx]
         if self._is_local_mamba_layer(local_layer_idx):
             return None
