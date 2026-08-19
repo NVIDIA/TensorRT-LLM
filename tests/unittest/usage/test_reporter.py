@@ -689,9 +689,7 @@ class TestBackgroundReporterOptOut:
 
         send.assert_not_called()
 
-    def test_opt_out_after_initial_claim_cancels_delivery(
-        self, monkeypatch, enable_telemetry
-    ):
+    def test_opt_out_after_initial_claim_cancels_delivery(self, monkeypatch, enable_telemetry):
         """Opt-out between claiming and sending the initial event wins."""
         assert usage_lib.apply_usage_session_config()
         session = usage_lib._SESSION
@@ -746,9 +744,7 @@ class TestBackgroundReporterOptOut:
         ):
             usage_lib._background_reporter(None, None, "")
 
-        assert [payload["events"][0]["name"] for payload in sent] == [
-            "trtllm_initial_report"
-        ]
+        assert [payload["events"][0]["name"] for payload in sent] == ["trtllm_initial_report"]
 
 
 # ---------------------------------------------------------------------------
