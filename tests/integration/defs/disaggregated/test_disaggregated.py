@@ -1061,6 +1061,7 @@ def run_disaggregated_test(example_dir,
 
     server_host = config.get("hostname", "localhost")
 
+    success = False
     try:
         server_url = f"http://{server_host}:{server_port}"
 
@@ -1105,9 +1106,14 @@ def run_disaggregated_test(example_dir,
                 f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
                 f"but none of {len(logs)} log(s) contained it "
                 f"(the intended code path did not engage)")
+        success = True
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # When the marker assertion is active the worker logs are file-based
+        # (save_log=True). Preserve work_dir on the failure path so the first
+        # failures on the newly enabled stages arrive with logs to read.
+        if success or assert_gen_log_contains is None:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -2065,6 +2071,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
 
 
 @skip_arm
+@pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
