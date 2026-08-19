@@ -106,7 +106,7 @@ class TerminalOutcome:
             reporting_source=observation.reporting_source,
             exit_code_known=exit_code_known,
             exit_code=exit_code,
-            signal_number=observation.signal_number,
+            signal_number=observation.signal_number or self.signal_number,
         )
 
 
@@ -1144,9 +1144,15 @@ def apply_usage_session_config(
         _ensure_process_state()
         if _SESSION_DISABLED:
             return False
-        if isinstance(telemetry_config, dict) and telemetry_config.get("disabled") is not True:
-            # Defer until Pydantic has validated this user-supplied config.
-            return False
+        if telemetry_config is not None:
+            if isinstance(telemetry_config, dict):
+                if telemetry_config.get("disabled") is not True:
+                    # Defer until Pydantic has validated this user-supplied config.
+                    return False
+            elif not isinstance(getattr(telemetry_config, "disabled", None), bool):
+                # Invalid objects are rejected later by Pydantic. Do not turn
+                # that validation failure into a permanent process opt-out.
+                return False
         disabled, usage_context = _telemetry_settings(
             telemetry_config,
             default_usage_context,

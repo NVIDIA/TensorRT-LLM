@@ -48,6 +48,17 @@ def _make_cli(callback=None):
 
 
 @pytest.fixture
+def isolated_telemetry_opt_out_env():
+    """Restore the process-wide disaggregated opt-out after each test."""
+    previous = os.environ.get(_telemetry._TELEMETRY_OPT_OUT_ENV)
+    os.environ.pop(_telemetry._TELEMETRY_OPT_OUT_ENV, None)
+    yield
+    os.environ.pop(_telemetry._TELEMETRY_OPT_OUT_ENV, None)
+    if previous is not None:
+        os.environ[_telemetry._TELEMETRY_OPT_OUT_ENV] = previous
+
+
+@pytest.fixture
 def captured_exit_payloads(monkeypatch, enable_telemetry):
     """Capture real terminal payloads while isolating process-global state."""
     usage_lib._SESSION = None
@@ -180,16 +191,16 @@ class TestTelemetryGroup:
     )
     def test_disaggregated_opt_out_precedence(
         self,
-        monkeypatch,
         tmp_path,
         yaml_config,
         telemetry,
         expected_disabled,
+        isolated_telemetry_opt_out_env,
     ):
         """An opt-out from either supported ingress disables the process tree."""
+        del isolated_telemetry_opt_out_env
         config_path = tmp_path / "disagg.yaml"
         config_path.write_text(yaml_config, encoding="utf-8")
-        monkeypatch.delenv(_telemetry._TELEMETRY_OPT_OUT_ENV, raising=False)
 
         with patch.object(_telemetry.usage, "apply_usage_session_config") as apply_config:
             disabled = _telemetry.apply_disaggregated_telemetry_config(
@@ -205,14 +216,37 @@ class TestTelemetryGroup:
             assert _telemetry._TELEMETRY_OPT_OUT_ENV not in os.environ
             apply_config.assert_not_called()
 
+    @pytest.mark.parametrize("config_contents", [None, "telemetry_config: ["])
+    def test_disaggregated_opt_out_precheck_defers_file_errors(
+        self,
+        tmp_path,
+        config_contents,
+        isolated_telemetry_opt_out_env,
+    ):
+        """The authoritative parser, not telemetry, reports invalid files."""
+        del isolated_telemetry_opt_out_env
+        config_path = tmp_path / "disagg.yaml"
+        if config_contents is not None:
+            config_path.write_text(config_contents, encoding="utf-8")
+
+        with patch.object(_telemetry.usage, "apply_usage_session_config") as apply_config:
+            disabled = _telemetry.apply_disaggregated_telemetry_config(
+                str(config_path),
+                telemetry=True,
+            )
+
+        assert disabled is False
+        assert _telemetry._TELEMETRY_OPT_OUT_ENV not in os.environ
+        apply_config.assert_not_called()
+
     def test_disaggregated_opt_out_deactivates_and_propagates(
         self,
-        monkeypatch,
         tmp_path,
         captured_exit_payloads,
+        isolated_telemetry_opt_out_env,
     ):
         """A YAML opt-out stops the coordinator session and reaches children."""
-        del captured_exit_payloads
+        del captured_exit_payloads, isolated_telemetry_opt_out_env
         config_path = tmp_path / "disagg.yaml"
         config_path.write_text(
             "telemetry_config:\n  disabled: true\n",

@@ -173,6 +173,26 @@ class TestProcessLifecycleCounters:
         with patch.object(BaseLLM, "_shutdown_resources"):
             llm.shutdown()
 
+    def test_invalid_config_does_not_disable_later_session(self, enable_telemetry):
+        """A rejected config object cannot poison later valid telemetry."""
+        with pytest.raises(ValueError):
+            LLM_torch(model="unused", telemetry_config=object())
+
+        assert usage_lib._SESSION is None
+        assert usage_lib._SESSION_DISABLED is False
+
+        with (
+            patch.object(BaseLLM, "__init__", return_value=None),
+            patch.object(BaseLLM, "_start_usage_reporting"),
+        ):
+            llm = LLM_torch(model="unused")
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 1
+        assert snapshot["llmInstancesCreated"] == 1
+        with patch.object(BaseLLM, "_shutdown_resources"):
+            llm.shutdown()
+
     def test_completion_tracking_failure_is_fail_silent(self, enable_telemetry):
         """A telemetry completion error must not fail LLM construction."""
         with (
