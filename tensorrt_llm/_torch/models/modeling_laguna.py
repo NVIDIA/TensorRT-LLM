@@ -74,6 +74,11 @@ class LagunaGate(nn.Module):
         super().__init__()
         self.top_k = top_k
         self.moe_backend_cls = moe_backend_cls
+        if scoring_func not in ("sigmoid", "sqrtsoftplus"):
+            raise ValueError(
+                f"Unsupported moe_router_score_func={scoring_func!r}; "
+                'expected "sigmoid" or "sqrtsoftplus".'
+            )
         self.scoring_func = scoring_func
         self.weight = nn.Parameter(
             torch.empty((num_experts, hidden_size), dtype=dtype),
