@@ -255,9 +255,15 @@ class NcclEP(Communication):
         )
         # The v0.2-gated capability path asks the kernel to emit global
         # expert ids directly; v0.1 retains the default local-id contract
-        # and uses the translation below.
+        # and uses the translation below. Track whether THIS dispatch
+        # actually requested global ids: under HT layout_info is None, so
+        # the request is never made and the kernel writes LOCAL ids even
+        # when the binding capability exists — the pass-through below must
+        # key on the configured kind, not the capability flag.
+        dispatch_writes_global_ids = False
         if layout_info is not None and ctx._expert_id_kind_global is not None:
             layout_info._lowpp.recv_topk_idx_kind = ctx._expert_id_kind_global
+            dispatch_writes_global_ids = True
 
         topk_idx_dev = token_selected_slots.to(ctx.topk_idx_dtype).contiguous()
         topk_nd = Tensor(topk_idx_dev)
@@ -294,7 +300,7 @@ class NcclEP(Communication):
         recv_topk_idx_flat = ctx.recv_topk_idx_buf.reshape(
             self.max_recv_tokens, self.max_top_k
         )
-        if ctx.kernel_writes_global_ids:
+        if dispatch_writes_global_ids:
             recv_slots_global = recv_topk_idx_flat
         else:
             recv_slots_global = torch.where(
