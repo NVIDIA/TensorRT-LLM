@@ -51,6 +51,7 @@ from ..distributed import AllReduceParams
 from ..modules.linear import Linear
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
+from ..speculative.interface import SpeculativeDecodingMode
 from ..utils import AuxStreamType
 from .dspark.attention import (
     _rmsnorm,
@@ -71,6 +72,7 @@ from .modeling_deepseekv4 import (
     _rename_deepseek_v4_attn_subkey,
     _rename_deepseek_v4_ffn_subkey,
 )
+from .modeling_utils import register_draft_model
 
 # Matches the draft namespace ``mtp.<stage>.<rest>`` in the V4-Pro-DSpark
 # checkpoint. Each draft stage is a full DeepSeek-V4 block stored under this
@@ -1239,6 +1241,32 @@ class DSparkForCausalLM(nn.Module):
         if self.lm_head is None:
             self.lm_head = target_model.lm_head
             self.dspark_model.lm_head = target_model.lm_head
+
+
+@register_draft_model(SpeculativeDecodingMode.DSPARK)
+def _build_dspark_draft(model_config, draft_config, lm_head, model):
+    """Build the DSpark drafter, reusing the target's aux streams.
+
+    The draft stage count (``n_mtp_layers``) is not in the HF config, so it is
+    derived from the checkpoint's ``mtp.*`` namespace.
+
+    Args:
+        model_config: the target engine's ``ModelConfig``.
+        draft_config: the drafter's own ``ModelConfig``.
+        lm_head: unused; DSpark shares the target's head at weight-load time.
+        model: the target model, whose aux streams the draft stages reuse.
+
+    Returns:
+        The ``DSparkForCausalLM`` draft module.
+    """
+    num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
+    validate_dspark_eplb_layer_base(model_config, draft_config)
+    return DSparkForCausalLM(
+        draft_config,
+        getattr(model, "aux_stream_dict", None),
+        num_stages=num_stages,
+        block_size=model_config.spec_config.block_size,
+    )
 
 
 __all__ = [

@@ -6,11 +6,13 @@ Model implementations register themselves via ``@register_auto_model`` as an
 import side effect. The zoo is imported lazily, so these tables record, without
 importing anything, which ``modeling_*`` module provides which architecture
 (``MODEL_ARCH_TO_MODULE``), which public class (``MODEL_CLASS_TO_MODULE``),
-and which multimodal ``model_type`` (``MULTIMODAL_MODEL_TYPE_TO_MODULE``).
+which multimodal ``model_type`` (``MULTIMODAL_MODEL_TYPE_TO_MODULE``), and
+which speculative-decoding mode (``SPEC_MODE_TO_MODULE``).
 
 Regenerate after adding/moving a model: add the new entry by hand next to its
 neighbors, mirroring the ``@register_auto_model("<arch>")`` /
-``@register_input_processor(..., model_type="<type>")`` decorators and the
+``@register_input_processor(..., model_type="<type>")`` /
+``@register_draft_model(SpeculativeDecodingMode.<MODE>)`` decorators and the
 public class name. ``test_lazy_model_zoo.py`` fails on any drift between these
 tables and the decorators.
 """
@@ -222,4 +224,59 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
     "qwen3_vl_moe": "modeling_qwen3vl_moe",
     "step3p7": "modeling_step3p7vl",
     "whisper": "modeling_whisper",
+}
+
+# ``SpeculativeDecodingMode`` member name -> module providing that mode's draft
+# model builder (registered via ``@register_draft_model``). Keyed by the enum
+# member *name* rather than the enum itself so this module keeps importing
+# nothing. Modes absent from this table have no one-engine draft model to build
+# (two-model / drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
+#
+# Adding a speculative decoding mode
+# ----------------------------------
+# 1. Write the builder in *your own* ``modeling_*.py``, next to the draft model
+#    it constructs -- never in ``modeling_speculative.py``. Keeping builders out
+#    of the factory file is the entire point of this table: ``get_draft_model``
+#    imports no concrete draft implementation, which is what let DSpark drop the
+#    lazy import it needed while ``modeling_dspark`` imports back into
+#    ``modeling_speculative`` through ``modeling_deepseekv4``.
+# 2. Decorate it with ``@register_draft_model(SpeculativeDecodingMode.<MODE>)``.
+#    Stack the decorator to serve several modes with one builder.
+# 3. Add the ``"<MODE>": "modeling_<yours>"`` row below.
+# 4. ``test_lazy_model_zoo.py`` and
+#    ``tests/unittest/_torch/speculative/hw_agnostic/test_draft_model_registry.py``
+#    fail in both directions on any drift between decorators and this table.
+#
+# The builder signature is fixed at
+# ``(model_config, draft_config, lm_head, model) -> nn.Module`` -- byte-for-byte
+# the arguments of ``get_draft_model``, so the factory is pure forwarding with
+# no per-mode glue. Everything a builder needs is reachable from those four
+# (``model_config.pretrained_config.num_hidden_layers``, ``model.aux_stream_dict``,
+# ``model_config.spec_config.*``). Do not widen it: an extra parameter has to be
+# populated by the factory, which puts mode-specific knowledge straight back
+# into the shared file this table exists to keep generic.
+#
+# Three rules the registry inherits from ``register_auto_model`` (see
+# ``modeling_utils.py``), each written down because it was learned the hard way:
+#   - Look up only through ``get_registered_draft_model_builder``. It triggers
+#     the on-demand import before reading the mapping; a raw ``.get()`` silently
+#     misses every provider that has not been imported yet, and the zoo is
+#     imported lazily.
+#   - Built-in builders only fill empty slots, never overwrite. Lazy loading
+#     means a built-in's decorator can run *after* an external registration
+#     (``--custom_module_dirs``), so last-wins would let the built-in clobber a
+#     user's drafter.
+#   - Map a builder back to its modes via its ``_registered_spec_modes``
+#     attribute, not by scanning the mapping for it. A built-in that lost its
+#     slot to an external registration is absent from the mapping but still has
+#     the attribute, so an identity scan reports it as unregistered.
+SPEC_MODE_TO_MODULE = {
+    "DFLASH": "modeling_speculative",
+    "DRAFT_TARGET_ONE_MODEL": "modeling_speculative",
+    "DSPARK": "modeling_dspark",
+    "EAGLE3_ONE_MODEL": "modeling_speculative",
+    "MTP": "modeling_speculative",
+    "MTP_EAGLE": "modeling_speculative",
+    "MTP_EAGLE_ONE_MODEL": "modeling_speculative",
+    "PARD": "modeling_speculative",
 }
