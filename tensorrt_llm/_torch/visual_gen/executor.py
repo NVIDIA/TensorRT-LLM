@@ -261,6 +261,9 @@ class DiffusionRequest:
     # Set only between the two ends of the coordinator -> rank0 hop; see
     # ``refs_to_handles``.
     ref_handles: Optional[List[Dict[str, Any]]] = field(default=None, repr=False)
+    # Set only while the request is in flight on the rank0 -> N-rank hop; see
+    # ``refs_detach``.
+    ref_sizes: Optional[List[int]] = field(default=None, repr=False)
 
     def refs_to_handles(self) -> None:
         """Move reference payloads into shared memory, in place (producer side).
@@ -293,6 +296,31 @@ class DiffusionRequest:
             container = SharedTensorContainer.from_dict(entry["handle"])
             ref.content = container.get_local_view().numpy().tobytes()
         self.ref_handles = None
+
+    def _refs(self):
+        for slot in ("image_reference", "video_reference", "audio_reference"):
+            yield from getattr(self.params, slot, None) or []
+
+    def refs_detach(self) -> List[bytes]:
+        """Take the reference payloads out of the request and record their sizes.
+
+        Broadcasting them inside the request object would make
+        ``broadcast_object_list`` serialize every reference byte into a tensor
+        first, which costs more than the collective that follows.
+        """
+        if self.params is None:
+            return []
+        payloads = [ref.content for ref in self._refs()]
+        for ref in self._refs():
+            ref.content = b""
+        self.ref_sizes = [len(p) for p in payloads]
+        return payloads
+
+    def refs_attach(self, payloads: List[bytes]) -> None:
+        """Put the separately broadcast payloads back, in place."""
+        for ref, payload in zip(self._refs(), payloads):
+            ref.content = payload
+        self.ref_sizes = None
 
 
 @dataclass
@@ -347,6 +375,7 @@ class DiffusionExecutor:
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
         self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
         self.response_queue = queue.Queue()
         self.sender_thread = None
 
@@ -426,6 +455,33 @@ class DiffusionExecutor:
                 )
             )
 
+    def _broadcast_request(self, req: Optional[DiffusionRequest]) -> Optional[DiffusionRequest]:
+        """Send one request from rank0 to every rank.
+
+        Reference payloads ride as raw uint8 tensors alongside the request
+        rather than inside it, because ``broadcast_object_list`` pickles the
+        object into a tensor first and that copy dominates the collective.
+        """
+        payloads = req.refs_detach() if self.rank == 0 and req is not None else []
+        obj_list = [req]
+        dist.broadcast_object_list(obj_list, src=0)
+        req = obj_list[0]
+        if req is None:
+            return None
+
+        if self.rank == 0:
+            # bytearray() because a tensor over an immutable buffer is read-only.
+            buffers = [torch.frombuffer(bytearray(p), dtype=torch.uint8) for p in payloads]
+        else:
+            buffers = [torch.empty(n, dtype=torch.uint8) for n in req.ref_sizes or []]
+        for buffer in buffers:
+            dist.broadcast(buffer, src=0)
+
+        if self.rank != 0:
+            payloads = [b.numpy().tobytes() for b in buffers]
+        req.refs_attach(payloads)
+        return req
+
     def serve_forever(self):
         """Main execution loop."""
         while True:
@@ -439,10 +495,11 @@ class DiffusionExecutor:
             # Broadcast to all ranks. ``req.params.seed`` is already a
             # concrete int — resolved once on the coordinator process at
             # :meth:`VisualGen.generate_async` entry — so the broadcast
-            # propagates the same value to every rank.
-            obj_list = [req]
-            dist.broadcast_object_list(obj_list, src=0)
-            req = obj_list[0]
+            # propagates the same value to every rank. Single-rank runs skip
+            # it: there is no peer, and the object broadcast would still
+            # serialize the whole request to a tensor before discovering that.
+            if self.world_size > 1:
+                req = self._broadcast_request(req)
 
             if req is None:
                 logger.info(f"Worker {self.device_id}: Shutdown signal received")

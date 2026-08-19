@@ -1084,3 +1084,56 @@ class TestReferenceHandleTransport:
         req.refs_to_bytes()
         req.refs_to_bytes()
         assert req.params.image_reference[0].content == payload
+
+
+class TestReferenceBroadcastSplit:
+    """Reference payloads leave the object before the rank0 -> N-rank hop.
+
+    ``broadcast_object_list`` serializes whatever it is handed into a tensor,
+    so leaving the bytes inside the request would copy every reference byte
+    before the collective even starts.
+    """
+
+    @staticmethod
+    def _request(*payloads: bytes):
+        from tensorrt_llm._torch.visual_gen import DiffusionRequest
+        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
+
+        params = VisualGenParams(
+            image_reference=[MediaRef(content=p, format="bytes") for p in payloads],
+            video_reference=MediaRef(content=b"\x00\x00\x00\x18ftypmp42", format="bytes"),
+        )
+        return DiffusionRequest(request_id=1, prompt=["x"], params=params)
+
+    def test_detach_empties_the_object_and_records_sizes(self):
+        payloads = (os.urandom(4096), os.urandom(64))
+        req = self._request(*payloads)
+
+        detached = req.refs_detach()
+
+        assert detached[:2] == list(payloads)
+        assert req.ref_sizes == [len(p) for p in detached]
+        assert all(r.content == b"" for r in req.params.image_reference)
+        assert payloads[0] not in pickle.dumps(req)
+
+    def test_attach_restores_every_slot_in_order(self):
+        payloads = (os.urandom(2048), os.urandom(128))
+        req = self._request(*payloads)
+
+        detached = req.refs_detach()
+        req.refs_attach(detached)
+
+        assert tuple(r.content for r in req.params.image_reference) == payloads
+        assert req.params.video_reference[0].content == b"\x00\x00\x00\x18ftypmp42"
+        assert req.ref_sizes is None
+
+    def test_sizes_let_a_peer_size_its_buffers(self):
+        """Non-source ranks allocate from ``ref_sizes`` alone, so it has to
+        survive the object hop and match the payloads exactly."""
+        payloads = (os.urandom(1024), os.urandom(7))
+        req = self._request(*payloads)
+        req.refs_detach()
+
+        peer = pickle.loads(pickle.dumps(req))
+        assert peer.ref_sizes == req.ref_sizes
+        assert peer.ref_sizes[:2] == [1024, 7]
