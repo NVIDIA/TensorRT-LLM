@@ -256,11 +256,6 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
 {
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
-    if (g_cft_manager && g_cft_manager->isInitialized())
-    {
-        return;
-    }
-
     // Validate inputs
     CHECK_TH_CUDA(workspace);
     CHECK_TYPE(workspace, torch::kUInt8);
@@ -278,6 +273,14 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
 
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
+
+    if (g_cft_manager && g_cft_manager->isInitialized())
+    {
+        TORCH_CHECK(g_cft_manager->getLocalBackingPtr() == workspaceRankPtr,
+            "CFT logical endpoints are already bound to a different workspace. Only one workspace "
+            "per process may use CFT counted writes.");
+        return;
+    }
 
     g_cft_manager = std::make_unique<tensorrt_llm::kernels::moe_comm::CftLeManager>();
 

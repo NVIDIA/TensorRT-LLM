@@ -352,6 +352,7 @@ class MoeAlltoAll:
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
+                "cft_initialized": False,
             }
             MoeAlltoAll._WORKSPACES[workspace_key] = workspace_entry
         else:
@@ -378,6 +379,7 @@ class MoeAlltoAll:
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
         workspace_state = workspace_entry
+        self._workspace_state = workspace_state
         metainfo_index = self._METAINFO_INDEX
         assert metainfo_index is not None
         self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
@@ -478,10 +480,10 @@ class MoeAlltoAll:
         can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
             can_use_cft_for_dispatch, input_payloads)
         # Auto-initialize CFT LEs on first dispatch only
-        if self.can_use_cft_counted_writes and not getattr(
-                MoeAlltoAll, '_cft_initialized', False):
+        if self.can_use_cft_counted_writes and not self._workspace_state.get(
+                'cft_initialized', False):
             self.cft_initialize()
-            MoeAlltoAll._cft_initialized = True
+            self._workspace_state['cft_initialized'] = True
         if eplb_local_stats is not None:
             assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
             assert eplb_local_stats.dim(
