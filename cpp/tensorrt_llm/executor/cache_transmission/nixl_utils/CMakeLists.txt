@@ -42,6 +42,19 @@ if(NIXL_ROOT)
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
 
+  # ------------------------------------------------------------------------
+  # Bounce v2 mechanism layer (Python-driven transport): arena, batched-copy
+  # kernel + stream pool, completion poller. Data plane is NIXL only — no zmq
+  # dependency here (the control plane lives in Python via pyzmq).
+  # ------------------------------------------------------------------------
+  target_sources(
+    ${NIXL_WRAPPER_TARGET}
+    PRIVATE bounce_v2/BounceArena.cpp bounce_v2/BatchedCopyPool.cpp
+            bounce_v2/CompletionPoller.cpp bounce_v2/GatherScatterKernel.cu)
+  # The .cu device symbols must resolve into this shared lib.
+  set_target_properties(${NIXL_WRAPPER_TARGET}
+                        PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
   set(NIXL_ENABLED TRUE)
 else()
   set(NIXL_ENABLED FALSE)
@@ -66,6 +79,11 @@ if(NIXL_ENABLED OR MOONCAKE_ENABLED)
   # Collect binding source files
   set(AGENT_BINDING_SOURCES "")
   list(APPEND AGENT_BINDING_SOURCES agentBindings.cpp)
+  if(NIXL_ENABLED)
+    # Bounce v2 bindings need the bounce_v2 classes, which live in the NIXL
+    # wrapper.
+    list(APPEND AGENT_BINDING_SOURCES bounceV2Bindings.cpp)
+  endif()
 
   # NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
   if(ENABLE_BOLT_COMPATIBLE)
