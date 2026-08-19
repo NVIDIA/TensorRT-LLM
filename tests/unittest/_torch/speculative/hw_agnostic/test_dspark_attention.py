@@ -27,16 +27,20 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import tensorrt_llm._torch.models.dspark.attention as dspark_attention
 import tensorrt_llm._torch.models.modeling_dspark as modeling_dspark
-from tensorrt_llm._torch.models.dspark.attention import (
+from tensorrt_llm._torch.models.modeling_dspark import (
+    DSparkDraftModel,
     apply_dspark_rotary,
     dspark_attention_forward,
     dspark_sparse_attn,
     get_dspark_topk_idxs,
     precompute_dspark_freqs_cis,
 )
-from tensorrt_llm._torch.models.modeling_dspark import DSparkDraftModel
+
+# The captured-context attention primitives were folded into
+# modeling_dspark; keep the historical alias so monkeypatch targets
+# below read unchanged.
+dspark_attention = modeling_dspark
 
 
 def test_rmsnorm_rope_fallback_applies_weight_without_rmsnorm(monkeypatch):
