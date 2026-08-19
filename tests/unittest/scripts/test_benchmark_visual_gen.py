@@ -338,6 +338,37 @@ def test_shell_argument_construction_with_spaces_and_json(tmp_path: Path) -> Non
     }
 
 
+def test_shell_gpu_count_ignores_import_banner(tmp_path: Path) -> None:
+    config_path = tmp_path / "four gpu config.yaml"
+    config_path.write_text("parallel_config: {}\n", encoding="utf-8")
+    python_wrapper = tmp_path / "python-with-banner"
+    python_wrapper.write_text(
+        f"""#!{sys.executable}
+import os
+import sys
+
+if any("get_visual_gen_num_gpus" in argument for argument in sys.argv):
+    print("[TensorRT-LLM] TensorRT LLM version: test")
+    print("4")
+else:
+    os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
+
+    result = _run_shell(
+        tmp_path,
+        SERVER_CONFIG=str(config_path),
+        NUM_GPUS="",
+        PYTHON_BIN=str(python_wrapper),
+    )
+
+    assert result.returncode == 0, result.stderr
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["num_gpus"] == 4
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

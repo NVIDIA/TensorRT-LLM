@@ -202,7 +202,7 @@ NUM_GPUS_EXPLICIT=false
 if [ -n "$NUM_GPUS_VALUE" ]; then
     NUM_GPUS_EXPLICIT=true
 elif [ -n "$SERVER_CONFIG" ]; then
-    NUM_GPUS_VALUE=$(
+    NUM_GPUS_OUTPUT=$(
         "$PYTHON_BIN" -c '
 import sys
 import yaml
@@ -213,6 +213,9 @@ with open(sys.argv[1], encoding="utf-8") as config_file:
 print(get_visual_gen_num_gpus(config))
 ' "$SERVER_CONFIG"
     )
+    # TensorRT-LLM may print an import-time version banner to stdout. The
+    # resolver's integer is deliberately the final line.
+    NUM_GPUS_VALUE=${NUM_GPUS_OUTPUT##*$'\n'}
 else
     NUM_GPUS_VALUE=1
 fi
