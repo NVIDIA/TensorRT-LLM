@@ -1359,16 +1359,12 @@ def report_exit(
         if not isinstance(signal_number, int) or not 0 <= signal_number <= schema._UINT32_MAX:
             signal_number = 0
 
-        event_lifecycle_phase = lifecycle_phase or snapshot["lifecyclePhase"]
-        if outcome.termination_kind == "clean":
-            event_lifecycle_phase = "shutdown"
-
         event = schema.TrtllmExitReport(
             exitCodeKnown=exit_code_known,
             exitCode=exit_code,
             signalNumber=signal_number,
             terminationKind=outcome.termination_kind,
-            lifecyclePhase=event_lifecycle_phase,
+            lifecyclePhase=lifecycle_phase or snapshot["lifecyclePhase"],
             component=outcome.component or snapshot["component"],
             reportingSource=outcome.reporting_source,
             **_session_event_fields(snapshot),
