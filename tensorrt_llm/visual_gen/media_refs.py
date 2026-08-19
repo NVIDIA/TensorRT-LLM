@@ -12,20 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reference-media resolve / materialize / cleanup, shared by serve and engine.
+"""Reference-media resolution, shared by serve and engine.
 
-Verb convention: ``resolve`` -> bytes, ``materialize`` -> path. These are used
-by both the serve boundary (``tensorrt_llm/serve``) and the engine frontend
-(``VisualGen.generate_async``), so they live here rather than under ``serve`` to
-avoid an engine -> serve import.
+Every declared wire form resolves to raw bytes, the canonical form carried all
+the way to the pipeline. Used by both the serve boundary
+(``tensorrt_llm/serve``) and the engine frontend (``VisualGen.generate_async``),
+so this lives here rather than under ``serve`` to avoid an engine -> serve
+import.
 """
 
 from __future__ import annotations
 
 import base64
-import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from tensorrt_llm.inputs.media_io import (
     _normalize_file_uri,
@@ -99,10 +99,8 @@ def _resolve_reference(content: Any, content_format: str) -> bytes:
     raise ValueError(f"unsupported reference format: {content_format!r}")
 
 
-def _materialize_reference(
-    payload: bytes, *, modality: str, ref_id: str, media_storage_path: Optional[str]
-) -> str:
-    """Content-validate a reference payload and persist it, returning its path.
+def _validate_reference_payload(payload: bytes, *, modality: str) -> None:
+    """Reject a payload whose container does not match the declared modality.
 
     HEIF/AVIF images are rejected on signature alone (Pillow support depends
     on optional plugins the worker need not share). Video acceptance beyond the
@@ -126,90 +124,32 @@ def _materialize_reference(
             )
     # audio: no signature sniffing (sniff_media_kind detects only image/video);
     # the consuming pipeline validates the audio codec in its worker.
-    if media_storage_path is None:
-        raise ValueError(f"media_storage_path is required to store the {modality}_reference.")
-    ref_path = os.path.join(media_storage_path, ref_id)
-    with open(ref_path, "wb") as f:
-        f.write(payload)
-    return ref_path
 
 
-def cleanup_reference_files(media_storage_path: Optional[str], request_id: str) -> None:
-    """Remove the materialized reference inputs for one request.
-
-    References are materialized as ``{request_id}_{modality}_ref_{i}`` (and the
-    deprecated ``{request_id}_input_ref``) under ``media_storage_path``. They are
-    input-only — unneeded once the pipeline has consumed them — so the request
-    owner removes them by the ``request_id`` prefix, covering image/video/audio
-    and the deprecated single reference regardless of count. Output files
-    (``{request_id}_{i}.<ext>``) carry no ``ref`` and are left untouched.
-    Best-effort: already-removed files are ignored.
-    """
-    if media_storage_path is None:
-        return
-    for path in Path(media_storage_path).glob(f"{request_id}_*ref*"):
-        try:
-            path.unlink()
-        except OSError:
-            pass
-
-
-def resolve_media_storage_path() -> Path:
-    """Resolve the media storage directory, creating it if needed.
-
-    Reads ``TRTLLM_MEDIA_STORAGE_PATH`` (default ``/tmp/trtllm_generated``),
-    shared by the serve boundary and the engine so both write materialized
-    references to the same place.
-    """
-    path = Path(os.getenv("TRTLLM_MEDIA_STORAGE_PATH", "/tmp/trtllm_generated"))  # nosec B108
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def prepare_reference_slots(
-    params: Any, *, request_id: str, media_storage_path: Optional[str]
-) -> None:
-    """Resolve + materialize each reference to a local path, in place.
+def prepare_reference_slots(params: Any) -> None:
+    """Resolve every reference to raw bytes, in place.
 
     The single reference choke point, used by the engine (``generate_async``)
     so serve and the standalone Python API share one path. Dispatch is on each
-    reference's declared ``format``, never on the shape of its content. A
-    ``path`` reference is the caller's own file: it passes through — not
-    materialized, not cleaned up — with a ``file://`` URI normalized to a plain
-    path so the pipeline, which opens paths, can read it. Every other form
-    (``url`` / ``base64`` / ``bytes``) resolves to bytes and materializes to
-    ``media_storage_path``; those files are reclaimed by
-    :func:`cleanup_reference_files` keyed on ``request_id``.
+    reference's declared ``format``, never on the shape of its content: the
+    declared form is resolved to bytes, content-validated against the slot's
+    modality, and written back with ``format`` set to ``"bytes"``.
 
-    ``format`` is rewritten alongside ``content``: the mutated params object is
-    what gets broadcast to the workers, so a stale format would send e.g.
-    ``base64`` to a worker holding a filesystem path.
+    ``format`` is rewritten alongside ``content`` because the mutated params
+    object is what gets broadcast to the workers; a stale format would tell a
+    worker it is holding base64 when it is holding raw bytes.
+
+    Bytes are the canonical form all the way to the pipeline, so a reference
+    never touches the filesystem: there is nothing to clean up afterwards, and
+    a worker needs no shared filesystem to read what the coordinator resolved.
 
     Runs before the coordinator broadcasts the request, so a bad reference
-    raises ``ValueError`` synchronously (serve keeps its immediate 400). If a
-    later slot fails mid-materialize, the files earlier slots wrote are
-    reclaimed here so a rejected request leaves nothing on disk.
+    raises ``ValueError`` synchronously and serve keeps its immediate 400.
     """
-    try:
-        for slot in ("image_reference", "video_reference", "audio_reference"):
-            modality = slot.split("_", 1)[0]
-            for i, ref in enumerate(getattr(params, slot, None) or []):
-                if ref.format == "path":
-                    path = _local_path(ref.content)
-                    if not path.exists():
-                        raise ValueError(f"reference file does not exist: {ref.content}")
-                    ref.content = str(path)
-                    continue
-                data = _resolve_reference(ref.content, ref.format)
-                ref.content = _materialize_reference(
-                    data,
-                    modality=modality,
-                    ref_id=f"{request_id}_{modality}_ref_{i}",
-                    media_storage_path=media_storage_path,
-                )
-                ref.format = "path"
-    except Exception:
-        # The terminal on_finish hook is not wired yet (the request is never
-        # enqueued on failure), so reclaim any files earlier slots wrote here.
-        cleanup_reference_files(media_storage_path, request_id)
-        raise
+    for slot in ("image_reference", "video_reference", "audio_reference"):
+        modality = slot.split("_", 1)[0]
+        for ref in getattr(params, slot, None) or []:
+            data = _resolve_reference(ref.content, ref.format)
+            _validate_reference_payload(data, modality=modality)
+            ref.content = data
+            ref.format = "bytes"
