@@ -92,6 +92,7 @@ struct KdaDecodeParams
     bool updateConvCache;
     bool useLowerBound;
     bool applyBetaSigmoid;
+    bool enablePdl;
     float lowerBound;
     float scale;
     float outputNormEps;

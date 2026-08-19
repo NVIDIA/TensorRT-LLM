@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 _DUMMY_CACHE: dict = {}
@@ -221,5 +223,6 @@ def run_kda_decode_fusion_cuda(
         lower_bound_value,
         float(scale),
         float(onorm_eps),
+        os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1",
     )
     return torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)

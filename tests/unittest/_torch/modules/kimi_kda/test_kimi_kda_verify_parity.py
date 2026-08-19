@@ -25,7 +25,6 @@ import torch
 pytest.importorskip("fla")
 
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
-from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (
     get_production_decode_kernel_path,
 )
@@ -106,7 +105,7 @@ def _prefill_metadata(
 
 
 @torch.no_grad()
-def test_kda_fused_qkvg_prefill_matches_separate_projections():
+def test_kda_prefill_matches_reference():
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
@@ -166,59 +165,12 @@ def test_kda_fused_qkvg_prefill_matches_separate_projections():
 
 
 @torch.no_grad()
-def test_kda_qkvg_multistream_decode_matches_separate_projections():
+@pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl_off", "pdl_on"])
+def test_kda_decode_matches_reference(monkeypatch, enable_pdl):
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
-    torch.manual_seed(0)
-    device = "cuda"
-    cfg = _K3Cfg()
-    lin = cfg.linear_attn_config
-    h = lin["num_heads"]
-    head_dim = lin["head_dim"]
-    d = h * head_dim
-    w = lin["short_conv_kernel_size"]
-
-    runtime = KimiKDALinearAttention(cfg, layer_idx=0, aux_stream=torch.cuda.Stream()).to(device)
-    if get_production_decode_kernel_path(runtime) != "optimized":
-        pytest.skip("needs an SM100/SM103 GPU")
-    for param in runtime.parameters():
-        if param.is_floating_point():
-            torch.nn.init.normal_(param, std=0.02)
-
-    reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
-    reference.load_state_dict(runtime.state_dict())
-    runtime.finalize_decode_weights()
-    assert runtime._qkvg_proj_weight is not None
-    assert runtime._bfa_proj_weight is not None
-
-    batch = 3
-    slots = batch + 2
-    slot_indices = torch.tensor([2, 0, 4], device=device, dtype=torch.long)
-    hidden_states = torch.randn(batch, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
-    state_seed = (
-        torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
-    )
-
-    expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
-    expected = reference(hidden_states, _decode_metadata(expected_cache, slot_indices))
-
-    actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
-    with with_multi_stream(True):
-        actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-2, atol=2e-2)
-
-
-@torch.no_grad()
-def test_kda_decode_pdl_module_parity():
-    """Run in separate processes with TRTLLM_ENABLE_PDL=0 and 1."""
-    if not torch.cuda.is_available():
-        pytest.skip("needs a GPU")
-
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", str(int(enable_pdl)))
     torch.manual_seed(0)
     device = "cuda"
     cfg = _K3Cfg()
