@@ -36,6 +36,19 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from ...._utils import is_sm_100f
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ...custom_ops.dspark_attention_custom_op import (
+        cute_dsl_dspark_attention,
+        is_fused_dspark_attention_supported,
+    )
+    from ...custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
 __all__ = [
     "get_dspark_topk_idxs",
     "get_dspark_topk_idxs_batched",
@@ -165,6 +178,7 @@ def get_dspark_topk_idxs_batched(
     window_size: int,
     block_size: int,
     start_pos: torch.Tensor,
+    valid_len: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sync-free, fixed-size (CUDA-graph-safe) batched ``get_dspark_topk_idxs``.
 
@@ -173,19 +187,18 @@ def get_dspark_topk_idxs_batched(
     ``start_pos``), this always returns the **fixed** width ``window_size +
     block_size`` and masks the unfilled context slots with ``-1``. The masked
     slots are excluded by :func:`dspark_sparse_attn` exactly as if they were
-    absent, so the result is numerically identical to gathering only the
-    ``min(window_size, start_pos+1)`` valid context positions — but the shape no
-    longer depends on the data, which is what CUDA-graph capture requires.
+    absent while the shape remains CUDA-graph safe.
 
-    Every query position attends to the same set: context window slots
-    ``0..window_size-1`` (slot ``c`` valid iff ``c <= start_pos[g]``, i.e. it has
-    been written) followed by the ``block_size`` block positions at offset
-    ``window_size`` (always valid).
+    Every query attends to the actually written circular-window suffix, followed
+    by the current-block positions. Without ``valid_len`` this preserves the
+    legacy ``start_pos``-only behavior.
 
     Args:
         window_size: sliding-window length of the captured-context KV cache.
         block_size: number of draft positions per request.
         start_pos: ``[G]`` int tensor of per-request absolute decode positions.
+        valid_len: optional ``[G]`` count of actually written rolling-window
+            entries. When omitted, preserve the legacy ``start_pos`` mask.
 
     Returns:
         int32 tensor ``[G, block_size, window_size + block_size]``.
@@ -193,9 +206,14 @@ def get_dspark_topk_idxs_batched(
     device = start_pos.device
     g = start_pos.shape[0]
     ctx_cols = torch.arange(window_size, device=device)  # [win]
-    # Context slot c holds a written key iff c <= start_pos (slots 0..start_pos
-    # filled; for start_pos >= window_size-1 the whole rolling window is filled).
-    valid = ctx_cols.unsqueeze(0) <= start_pos.unsqueeze(1)  # [G, win]
+    if valid_len is None:
+        valid = ctx_cols.unsqueeze(0) <= start_pos.unsqueeze(1)  # [G, win]
+    else:
+        # The valid entries are the contiguous logical suffix ending at
+        # start_pos, but their physical slots wrap modulo window_size.
+        valid_len = valid_len.clamp(min=0, max=window_size)
+        age = torch.remainder(start_pos.unsqueeze(1) - ctx_cols.unsqueeze(0), window_size)
+        valid = age < valid_len.unsqueeze(1)
     ctx_idx = torch.where(
         valid, ctx_cols.unsqueeze(0).expand(g, -1), torch.full_like(valid, -1, dtype=torch.long)
     )
@@ -280,6 +298,46 @@ def _rope_last_dims_batched(
     nope = t[..., :-rope_head_dim]
     rope = apply_dspark_rotary_batched(t[..., -rope_head_dim:], freqs_cis, inverse=inverse)
     return torch.cat([nope, rope], dim=-1)
+
+
+def _rmsnorm_rope_batched(
+    t: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    rope_head_dim: int,
+    freqs_cis: torch.Tensor,
+    *,
+    num_heads: int = 1,
+    apply_weight: bool = True,
+    apply_rmsnorm: bool = True,
+    inverse_rope: bool = False,
+) -> torch.Tensor:
+    """Fuse DSpark RMSNorm and last-dimension RoPE when supported."""
+    if IS_CUTLASS_DSL_AVAILABLE and is_sm_100f():
+        freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
+        if is_fused_dspark_rmsnorm_rope_supported(t, weight, freqs_real, num_heads, rope_head_dim):
+            return cute_dsl_dspark_rmsnorm_rope(
+                t,
+                weight,
+                freqs_real,
+                num_heads,
+                rope_head_dim,
+                eps,
+                apply_weight,
+                apply_rmsnorm,
+                inverse_rope,
+            )
+
+    if apply_rmsnorm:
+        if apply_weight:
+            t = _rmsnorm(t, weight, eps)
+        else:
+            t = t * torch.rsqrt(t.square().mean(-1, keepdim=True) + eps)
+    elif apply_weight:
+        t = (t.float() * weight.float()).to(t.dtype)
+    if rope_head_dim > 0:
+        t = _rope_last_dims_batched(t, rope_head_dim, freqs_cis, inverse=inverse_rope)
+    return t
 
 
 def dspark_attention_forward(
@@ -371,6 +429,7 @@ def dspark_attention_forward_batched(
     start_pos: torch.Tensor,
     kv_cache: torch.Tensor,
     slots: torch.Tensor,
+    valid_len: torch.Tensor | None = None,
     *,
     wq_a: torch.Tensor,
     q_norm_w: torch.Tensor,
@@ -415,6 +474,9 @@ def dspark_attention_forward_batched(
         kv_cache: ``[N, window_size, head_dim]`` rolling captured-context windows
             (``N`` rows indexed by ``slots``; ``N == G`` for single-shot callers).
         slots: ``[G]`` int tensor mapping each request to its ``kv_cache`` row.
+        valid_len: optional ``[G]`` count of actually written context entries;
+            masks holes left when absolute positions are bootstrapped without
+            receiving the corresponding DSpark rolling-window state.
         freqs_cis: ``[maxlen, rope_head_dim // 2]`` precomputed plain-RoPE table;
             must satisfy ``maxlen > start_pos.max() + block_size``.
 
@@ -422,6 +484,10 @@ def dspark_attention_forward_batched(
         ``[G, block, dim]`` attention output (residual stream contribution).
     """
     g, block, _ = x.shape
+    if kv_cache.shape[1] != window_size:
+        raise ValueError(
+            f"kv_cache window extent {kv_cache.shape[1]} does not match window_size {window_size}"
+        )
     rd = rope_head_dim
     # Per-request RoPE phases gathered from the fixed table (no host-int slicing).
     main_freqs = freqs_cis[start_pos].unsqueeze(1)  # [G, 1, rd//2]
@@ -429,31 +495,70 @@ def dspark_attention_forward_batched(
     blk_freqs = freqs_cis[blk_pos]  # [G, block, rd//2]
 
     # Captured-context K/V from main_x (MQA, shared across heads).
-    main_kv = _rmsnorm(F.linear(main_x, wkv), kv_norm_w, eps)  # [G, 1, head_dim]
-    main_kv = _rope_last_dims_batched(main_kv, rd, main_freqs)
+    main_kv = _rmsnorm_rope_batched(F.linear(main_x, wkv), kv_norm_w, eps, rd, main_freqs)
 
     # Query: low-rank + per-head RMS + RoPE.
-    q = _rmsnorm(F.linear(x, wq_a), q_norm_w, eps)
+    q = _rmsnorm_rope_batched(F.linear(x, wq_a), q_norm_w, eps, 0, blk_freqs)
     q = F.linear(q, wq_b).unflatten(-1, (n_heads, head_dim))  # [G, block, h, head_dim]
-    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
-    q = _rope_last_dims_batched(q, rd, blk_freqs)
+    q = _rmsnorm_rope_batched(
+        q,
+        kv_norm_w,
+        eps,
+        rd,
+        blk_freqs,
+        num_heads=n_heads,
+        apply_weight=False,
+    )
 
     # Block K/V.
-    kv = _rmsnorm(F.linear(x, wkv), kv_norm_w, eps)  # [G, block, head_dim]
-    kv = _rope_last_dims_batched(kv, rd, blk_freqs)
+    kv = _rmsnorm_rope_batched(F.linear(x, wkv), kv_norm_w, eps, rd, blk_freqs)
 
     # Write the context K/V into the rolling window at slot start_pos%window_size,
     # then attend over [window context | block]. ``persist=True`` writes through to
     # the worker-owned buffer (cross-step decode); otherwise clone so single-shot
-    # callers stay pure. Indexed scatter/gather by (slots, slot_pos) is graph-safe.
+    # callers stay pure.
     write_target = kv_cache if persist else kv_cache.clone()
-    slot_pos = start_pos % window_size  # [G]
-    write_target[slots, slot_pos] = main_kv.squeeze(1).to(write_target.dtype)
-    cache_rows = write_target[slots]  # [G, window, head_dim]
-    kv_full = torch.cat([cache_rows, kv], dim=1)  # [G, window + block, head_dim]
-    topk = get_dspark_topk_idxs_batched(window_size, block, start_pos)
-    o = dspark_sparse_attn(q, kv_full, attn_sink, topk, softmax_scale)  # [G, block, h, head_dim]
-    o = _rope_last_dims_batched(o, rd, blk_freqs, inverse=True)
+    main_kv_flat = main_kv.squeeze(1).to(write_target.dtype)
+    if (
+        valid_len is None
+        and IS_CUTLASS_DSL_AVAILABLE
+        and is_fused_dspark_attention_supported(
+            q, main_kv_flat, kv, write_target, slots, start_pos, attn_sink
+        )
+    ):
+        # One custom op performs the rolling-cache write/read, validity handling,
+        # QK, attention-sink online softmax, and PV. In particular it creates no
+        # topk index, gathered KV, score, or probability tensors.
+        o = cute_dsl_dspark_attention(
+            q,
+            main_kv_flat,
+            kv,
+            write_target,
+            slots,
+            start_pos,
+            attn_sink,
+            softmax_scale,
+        )
+    else:
+        slot_pos = start_pos % window_size  # [G]
+        write_target[slots, slot_pos] = main_kv_flat
+        cache_rows = write_target[slots]  # [G, window, head_dim]
+        kv_full = torch.cat([cache_rows, kv], dim=1)  # [G, window + block, head_dim]
+        topk = get_dspark_topk_idxs_batched(window_size, block, start_pos, valid_len)
+        o = dspark_sparse_attn(
+            q, kv_full, attn_sink, topk, softmax_scale
+        )  # [G, block, h, head_dim]
+    o = _rmsnorm_rope_batched(
+        o,
+        kv_norm_w,
+        eps,
+        rd,
+        blk_freqs,
+        num_heads=n_heads,
+        apply_weight=False,
+        apply_rmsnorm=False,
+        inverse_rope=True,
+    )
 
     # Grouped low-rank O projection.
     o = o.reshape(g, block, n_groups, -1)
