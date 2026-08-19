@@ -223,9 +223,11 @@ def _make_layout(tmp_path, source: str, list_lines: list[str]):
 def test_validate_flags_invalid_id(mod, tmp_path):
     source = 'import pytest\n@pytest.mark.parametrize("x", ["a", "b"])\ndef test_f(x): pass\n'
     lists_dir, base = _make_layout(tmp_path, source, ["test_sample.py::test_f[zzz]"])
-    errors, unverifiable = mod.validate_test_lists(lists_dir, base)
+    errors, unverifiable, accepted, rejected = mod.validate_test_lists(lists_dir, base)
     assert any("INVALID PARAMETRIZE ID" in e for e in errors)
     assert unverifiable == []
+    assert accepted == []
+    assert rejected == [("test_sample.py", None, "test_f", "zzz")]
 
 
 def test_validate_accepts_valid_id(mod, tmp_path):
@@ -236,9 +238,11 @@ def test_validate_accepts_valid_id(mod, tmp_path):
         "def test_f(x): pass\n"
     )
     lists_dir, base = _make_layout(tmp_path, source, ["test_sample.py::test_f[a]"])
-    errors, unverifiable = mod.validate_test_lists(lists_dir, base)
+    errors, unverifiable, accepted, rejected = mod.validate_test_lists(lists_dir, base)
     assert errors == []
     assert unverifiable == []
+    assert accepted == [("test_sample.py", None, "test_f", "a")]
+    assert rejected == []
 
 
 def test_validate_reports_unverifiable(mod, tmp_path):
@@ -248,12 +252,16 @@ def test_validate_reports_unverifiable(mod, tmp_path):
         "def test_f(x): pass\n"
     )
     lists_dir, base = _make_layout(tmp_path, source, ["test_sample.py::test_f[1]"])
-    errors, unverifiable = mod.validate_test_lists(lists_dir, base)
+    errors, unverifiable, accepted, rejected = mod.validate_test_lists(lists_dir, base)
     assert errors == []
     assert len(unverifiable) == 1
     rel, cls, func, pid, reason, _refs = unverifiable[0]
     assert func == "test_f" and pid == "1"
     assert reason == "ids=callable-or-nonliteral"
+    # An unverifiable entry is neither accepted nor rejected -- it has no static
+    # verdict, so it must not enter the parity buckets.
+    assert accepted == []
+    assert rejected == []
 
 
 def test_write_unverifiable_report(mod, tmp_path):
@@ -265,3 +273,65 @@ def test_write_unverifiable_report(mod, tmp_path):
     text = out.read_text(encoding="utf-8")
     assert "argvalues=call-result" in text
     assert "dir/test_a.py::test_f[p1]" in text
+
+
+# --------------------------------------------------------------------------
+# validate <-> collection parity (compute_parity / load_collectable_entries)
+# --------------------------------------------------------------------------
+
+
+def test_compute_parity_all_collectable(mod):
+    accepted = [("test_a.py", None, "test_f", "a"), ("test_a.py", "TestC", "test_g", "b")]
+    collectable = set(accepted)
+    false_confidence, false_alarm = mod.compute_parity(accepted, [], collectable)
+    assert false_confidence == []
+    assert false_alarm == []
+
+
+def test_compute_parity_false_confidence(mod):
+    # Accepted by --validate but pytest cannot collect it -> gate-worthy.
+    accepted = [("test_a.py", None, "test_f", "a"), ("test_a.py", None, "test_f", "ghost")]
+    collectable = {("test_a.py", None, "test_f", "a")}
+    false_confidence, false_alarm = mod.compute_parity(accepted, [], collectable)
+    assert false_confidence == [("test_a.py", None, "test_f", "ghost")]
+    assert false_alarm == []
+
+
+def test_compute_parity_false_alarm(mod):
+    # Rejected by --validate but pytest does collect it -> resolver too strict.
+    rejected = [("test_a.py", None, "test_f", "real")]
+    collectable = {("test_a.py", None, "test_f", "real")}
+    false_confidence, false_alarm = mod.compute_parity([], rejected, collectable)
+    assert false_confidence == []
+    assert false_alarm == [("test_a.py", None, "test_f", "real")]
+
+
+def test_compute_parity_rejected_not_collectable_is_silent(mod):
+    # Rejected and genuinely not collectable -> validator was right; no parity
+    # finding in either bucket.
+    rejected = [("test_a.py", None, "test_f", "zzz")]
+    false_confidence, false_alarm = mod.compute_parity([], rejected, set())
+    assert false_confidence == []
+    assert false_alarm == []
+
+
+def test_load_collectable_entries_reads_both_lists(mod, tmp_path):
+    (tmp_path / "l0_test.txt").write_text(
+        "accuracy/test_x.py::TestA::test_f[a]\n"
+        "# a comment line\n"
+        "full:GH200/accuracy/test_x.py::test_g[b] TIMEOUT 90\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "qa_test.txt").write_text("accuracy/test_y.py::test_h[c]\n", encoding="utf-8")
+    collectable = mod.load_collectable_entries(str(tmp_path))
+    assert collectable == {
+        ("accuracy/test_x.py", "TestA", "test_f", "a"),
+        # full:GH200/ hardware prefix and the trailing TIMEOUT marker are
+        # normalized away by parse_test_entry, matching the validator's tuples.
+        ("accuracy/test_x.py", None, "test_g", "b"),
+        ("accuracy/test_y.py", None, "test_h", "c"),
+    }
+
+
+def test_load_collectable_entries_missing_returns_none(mod, tmp_path):
+    assert mod.load_collectable_entries(str(tmp_path)) is None

@@ -21,6 +21,10 @@ Options:
             argvalues/ids) to PATH (default: stdout). Use to sweep them.
 --strict-param-ids: With --validate, fail if any active entry has an
             unverifiable parametrize ID. Off by default (sweep, then gate).
+--parity:   With --validate (run alongside --l0/--qa so the runtime lists exist),
+            fail if any statically-verified parametrize ID is not collectable by
+            pytest -- i.e. assert validate-accepts is a subset of collectable.
+            Catches resolver soundness bugs and stale entries.
 
 Note:
 All the perf tests will be excluded since they are generated dynamically.
@@ -527,6 +531,12 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
     # default. Each item: (rel_path, class_name, func_name, param_id, reason,
     # refs).
     unverifiable = []
+    # Active entries whose parametrize ID the static resolver positively verified
+    # (param_id in valid_ids) or positively rejected (INVALID PARAMETRIZE ID).
+    # Feed the validate<->collection parity check. Each item is an entry tuple
+    # (rel_path, class_name, func_name, param_id).
+    accepted_param = []
+    rejected_param = []
 
     active_malformed_set = set(active_malformed)
     for ref in active_malformed + [
@@ -642,6 +652,12 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
                                       sorted(valid_ids)[:8],
                                       "\n".join(f"  -> {r}" for r in refs[:3]),
                                   ))
+                    if not is_waive_only:
+                        rejected_param.append(
+                            (rel_path, class_name, func_name, param_id))
+                elif not is_waive_only:
+                    accepted_param.append(
+                        (rel_path, class_name, func_name, param_id))
             elif not is_waive_only:
                 # Active entry whose ID we could not resolve statically. Record
                 # it for the sweep/gate rather than silently passing it (which
@@ -662,7 +678,7 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
                     "\n".join(f"  -> {r}" for r in refs[:3]),
                 ))
 
-    return errors, unverifiable
+    return errors, unverifiable, accepted_param, rejected_param
 
 
 def _format_unverifiable(unverifiable) -> list[str]:
@@ -696,6 +712,76 @@ def write_unverifiable_report(unverifiable, dest) -> None:
         with open(dest, "w", encoding="utf-8") as f:
             f.write(body)
         print(f"Wrote {len(unverifiable)} unverifiable entries to {dest}")
+
+
+# =============================================================================
+# validate <-> collection parity
+# =============================================================================
+
+
+def _format_entry_tuple(entry) -> str:
+    """Render an (rel_path, class, func, param_id) tuple as a test node id."""
+    rel_path, class_name, func_name, param_id = entry
+    cls = f"::{class_name}" if class_name else ""
+    param = f"[{param_id}]" if param_id else ""
+    return f"{rel_path}{cls}::{func_name}{param}"
+
+
+def _entry_sort_key(entry):
+    rel_path, class_name, func_name, param_id = entry
+    return (rel_path, class_name or "", func_name, param_id or "")
+
+
+def load_collectable_entries(llm_src):
+    """Return the entry tuples the runtime stage proved collectable, or None.
+
+    Reads the l0_test.txt / qa_test.txt lists written by verify_l0_test_lists /
+    verify_qa_test_lists. Those files are emitted only after `pytest --co`
+    confirmed every listed id collects, so a tuple's presence here means pytest
+    can collect it. Both these lines and the validator's entries are parsed by
+    the same parse_test_entry, so the tuple forms are directly comparable.
+
+    Returns None if neither list exists (parity cannot be computed without the
+    runtime lists, e.g. --validate --parity run without --l0/--qa).
+    """
+    collectable = set()
+    found_any = False
+    for name in ("l0_test.txt", "qa_test.txt"):
+        path = os.path.join(llm_src, name)
+        if not os.path.isfile(path):
+            continue
+        found_any = True
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                entry = parse_test_entry(line)
+                if entry is None or entry[0] == "MALFORMED":
+                    continue
+                collectable.add(entry)
+    return collectable if found_any else None
+
+
+def compute_parity(accepted, rejected, collectable):
+    """Pure set logic for the validate <-> collection parity check.
+
+    Args:
+        accepted: entry tuples whose parametrize ID the static resolver
+            positively verified (param_id in valid_ids).
+        rejected: entry tuples the static resolver rejected (INVALID PARAMETRIZE
+            ID).
+        collectable: set of entry tuples pytest proved collectable.
+
+    Returns (false_confidence, false_alarm):
+        false_confidence: accepted entries that are NOT collectable -- the fast
+            check passed something the runtime stage would reject. This is the
+            gate-worthy class (violates accepted subset-of collectable).
+        false_alarm: rejected entries that ARE collectable -- the resolver was
+            wrong to reject; report to tighten it, but not fatal.
+    """
+    false_confidence = sorted((t for t in accepted if t not in collectable),
+                              key=_entry_sort_key)
+    false_alarm = sorted((t for t in rejected if t in collectable),
+                         key=_entry_sort_key)
+    return false_confidence, false_alarm
 
 
 # =============================================================================
@@ -952,6 +1038,14 @@ def main():
         help="With --validate: fail if any active entry has an unverifiable "
         "parametrize ID. Off by default (sweep first, then gate).",
     )
+    parser.add_argument(
+        "--parity",
+        action="store_true",
+        help="With --validate (run alongside --l0/--qa): fail if any "
+        "statically-verified parametrize ID is not collectable by pytest, i.e. "
+        "assert validate-accepts is a subset of collectable. Catches resolver "
+        "soundness bugs and stale entries.",
+    )
     args = parser.parse_args()
     script_dir = os.path.dirname(os.path.realpath(__file__))
     llm_src = os.path.abspath(os.path.join(script_dir, "../"))
@@ -998,8 +1092,8 @@ def main():
     if args.validate:
         print("-----------Starting AST test list validation...-----------",
               flush=True)
-        errors, unverifiable = validate_test_lists(args.test_lists_dir,
-                                                   args.test_base_dir)
+        errors, unverifiable, accepted_param, rejected_param = (
+            validate_test_lists(args.test_lists_dir, args.test_base_dir))
         if errors:
             print(f"Found {len(errors)} validation error(s):\n",
                   file=sys.stderr)
@@ -1032,6 +1126,46 @@ def main():
                     "entries as errors.",
                     file=sys.stderr)
                 pass_flag = False
+
+        # Parity: cross-check the statically-verified param IDs against the ids
+        # the runtime stage proved collectable (l0_test.txt / qa_test.txt). Only
+        # meaningful when those lists were generated in this run (--l0/--qa).
+        if args.parity:
+            collectable = load_collectable_entries(llm_src)
+            if collectable is None:
+                print(
+                    "PARITY: skipped -- no l0_test.txt/qa_test.txt found "
+                    "(run --parity alongside --l0/--qa).",
+                    file=sys.stderr)
+            else:
+                false_confidence, false_alarm = compute_parity(
+                    accepted_param, rejected_param, collectable)
+                if false_alarm:
+                    n = len(false_alarm)
+                    print(
+                        f"PARITY false alarm: {n} "
+                        f"{'entry' if n == 1 else 'entries'} rejected by "
+                        f"--validate but collectable by pytest (resolver too "
+                        f"strict -- please report to tighten it):",
+                        file=sys.stderr)
+                    for entry in false_alarm:
+                        print(f"  {_format_entry_tuple(entry)}",
+                              file=sys.stderr)
+                if false_confidence:
+                    n = len(false_confidence)
+                    print(
+                        f"PARITY VIOLATION: {n} "
+                        f"{'entry' if n == 1 else 'entries'} passed --validate "
+                        f"but pytest cannot collect (stale entry or resolver "
+                        f"soundness bug):",
+                        file=sys.stderr)
+                    for entry in false_confidence:
+                        print(f"  {_format_entry_tuple(entry)}",
+                              file=sys.stderr)
+                    pass_flag = False
+                if not false_confidence and not false_alarm:
+                    print(f"PARITY OK: {len(accepted_param)} "
+                          f"statically-verified param IDs all collectable.")
 
     invalid_json_file = os.path.join(llm_src, "invalid_tests.json")
     if os.path.isfile(invalid_json_file) and os.path.getsize(
