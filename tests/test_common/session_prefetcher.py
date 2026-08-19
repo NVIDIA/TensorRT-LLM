@@ -297,6 +297,34 @@ def _prefetched_workers_alive(session: object) -> bool:
     )
 
 
+def _reap_dead_pool(session: object) -> None:
+    """Abandon a part-dead pool and SIGKILL whichever workers are still up.
+
+    ``abandon()`` only disconnects the parent side. With a rank already gone the
+    manager thread stays wedged in MPI, so the survivors are never told to exit
+    and keep their GPU memory while the replacement pool spawns on top of them.
+    Mirrors ``MpiPoolSession._teardown_unidentified_pool``, recycling guard
+    included.
+    """
+    import signal
+
+    try:
+        session.abandon()
+    except Exception:
+        pass
+    mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
+    process_start_time = getattr(mpi_session, "_process_start_time", None)
+    if process_start_time is None:
+        return
+    for pid, start_time in getattr(session, "_worker_identities", ()):
+        if start_time is None or process_start_time(pid) != start_time:
+            continue  # already gone, or the PID was recycled
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 class SessionPrefetcher:
     def __init__(self):
         self._lock = threading.Lock()
@@ -529,7 +557,12 @@ class SessionPrefetcher:
                 "[session-prefetch] discarding prefetched pool with dead worker",
                 flush=True,
             )
-            built.session.abandon()
+            threading.Thread(
+                target=_reap_dead_pool,
+                args=(built.session,),
+                daemon=True,
+                name="session-prefetch-discard-dead",
+            ).start()
             return None
         if built.spec == spec and built.snapshot == _spawn_snapshot():
             # An instant handover is safe against the previous worker's GPU

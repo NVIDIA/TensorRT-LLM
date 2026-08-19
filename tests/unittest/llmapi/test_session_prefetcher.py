@@ -317,6 +317,11 @@ def test_factory_dead_shadow_builds_fresh_pool(prefetcher, monkeypatch) -> None:
 
     assert replacement is not dead
     assert replacement.wait_shutdown
+    # The discard is backgrounded so the replacement spawn is not stuck behind a
+    # 30s wait on workers that will never answer; join it before asserting.
+    for thread in threading.enumerate():
+        if thread.name == "session-prefetch-discard-dead":
+            thread.join(timeout=10)
     assert dead.abandoned and dead.shut
     assert prefetcher.stats["pools_discarded_dead"] == 1
     assert prefetcher.stats["pools_handed_over"] == 0
