@@ -6735,24 +6735,26 @@ class PyExecutor:
     # which no peer will ask.
     _CTX_PEER_WAIT_TIMEOUT_MULTIPLIER = 3
 
-    def _context_transfer_peer_wait_is_within_ceiling(self, req: LlmRequest,
-                                                      current_time: float,
-                                                      timeout_ms: int) -> bool:
+    def _context_transfer_peer_wait_is_within_ceiling(
+            self, req: LlmRequest, current_time: float,
+            ceiling_ms: float) -> bool:
         """Whether a context send may keep rebasing its transfer deadline.
 
         The clock is stamped when the send session is created, but the write
         only starts once the peer requests the data, so charging the peer wait
-        to the transfer times out transfers that never got to run.  Rebasing is
-        bounded by the ceiling above so a peer that never asks still expires.
+        to the transfer times out transfers that never got to run.  The local
+        stamps are checked first: the transceiver query walks per-request peer
+        bookkeeping under a lock, and a request past the ceiling cannot be
+        rebased regardless of what it reports.
         """
-        if not self.kv_cache_transceiver.context_transfer_is_waiting_for_peer(
-                req):
-            return False
         if req.py_kv_transfer_peer_wait_start is None:
             return False
         peer_wait_ms = (current_time -
                         req.py_kv_transfer_peer_wait_start) * 1000
-        return peer_wait_ms <= timeout_ms * self._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER
+        if peer_wait_ms > ceiling_ms:
+            return False
+        return self.kv_cache_transceiver.context_transfer_is_waiting_for_peer(
+            req)
 
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
@@ -6763,6 +6765,7 @@ class PyExecutor:
             return
 
         current_time = time.monotonic()
+        peer_wait_ceiling_ms = timeout_ms * self._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER
 
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
             if req.py_kv_transfer_start_time is None:
@@ -6780,7 +6783,7 @@ class PyExecutor:
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
             if self._context_transfer_peer_wait_is_within_ceiling(
-                    req, current_time, timeout_ms):
+                    req, current_time, peer_wait_ceiling_ms):
                 req.py_kv_transfer_start_time = current_time
                 continue
             flag_if_kv_transfer_timed_out(req, "context")
@@ -7493,9 +7496,9 @@ class PyExecutor:
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-                        req.py_kv_transfer_start_time = time.monotonic()
-                        req.py_kv_transfer_peer_wait_start = (
-                            req.py_kv_transfer_start_time)
+                        transfer_start = time.monotonic()
+                        req.py_kv_transfer_start_time = transfer_start
+                        req.py_kv_transfer_peer_wait_start = transfer_start
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
