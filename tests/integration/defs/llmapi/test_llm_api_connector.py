@@ -758,6 +758,15 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     the RequestData.priorities field is populated with the correct
     per-block priorities based on the token ranges.
 
+    KNOWN GAP -- this fails on `kv_cache_manager_v2`, deliberately left failing.
+    `KvCacheRetentionConfig` does not reach KVCacheManagerV2 at all: V2's
+    per-page priority comes from `custom_priority_callback`
+    (kv_cache_manager_v2/_core/_kv_cache_manager.py), which KVCacheManagerV2
+    never overrides, so every page carries the default priority and the
+    connector reports `priorities=None`. A user who sets a retention config on
+    V2 silently gets none of it -- not only through the connector. The
+    assertions below are the correct expectation for both managers and are kept
+    that way so the gap stays visible rather than being asserted away.
     """
     BLOCK_SIZE = 32
     NUM_INPUT_TOKENS = 64  # 2 blocks
