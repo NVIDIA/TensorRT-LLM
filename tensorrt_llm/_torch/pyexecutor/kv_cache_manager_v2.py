@@ -800,10 +800,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
+        self.kv_connector_manager = kv_connector_manager
 
-        assert kv_connector_manager is None, (
-            "kv_connector_manager is not supported for KVCacheManagerV2"
-        )
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
         assert not (mapping.cp_config.get("cp_type") == CpType.STAR), (
             "Star attention is not supported for KVCacheManagerV2"
@@ -1016,7 +1014,21 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
-        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
+        if kv_connector_manager is not None and kv_cache_config.host_cache_size is None:
+            # A KV connector registers device addresses for its pages, and a
+            # page evicted to another tier has its GPU slot reassigned. The
+            # automatic host tier below exists only to give the MAX_UTILIZATION
+            # scheduler's suspend/resume somewhere to spill to, and a connector
+            # run cannot use that policy (py_executor_creator requires
+            # GUARANTEED_NO_EVICT), so skip it rather than silently migrating
+            # pages out from under the connector. An explicitly configured
+            # host_cache_size is left alone and rejected loudly at bring-up.
+            host_quota = 0
+            logger.info(
+                "KV cache manager v2 host tier disabled: a KV connector is attached "
+                "and registers GPU page addresses that tier migration would invalidate."
+            )
+        elif kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to

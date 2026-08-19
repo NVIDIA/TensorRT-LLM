@@ -116,6 +116,21 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
         assert self.kv_cache_tensor is None, "KV cache tensor already registered"
         self.kv_cache_tensor = kv_cache_tensor
 
+    def register_kv_cache_layout(self, layout):
+        # KVCacheManagerV2 describes its pools rather than handing over one
+        # tensor. This example targets the uniform case, where a layer group's
+        # buffers coalesce into a single whole-slot region; indexing that
+        # region by page slot is the direct analogue of indexing a pool by
+        # block id, so the load/save paths below need no change.
+        assert self.kv_cache_tensor is None, "KV cache tensor already registered"
+        if len(layout.groups) != 1 or len(layout.groups[0].regions) != 1:
+            raise NotImplementedError(
+                "This example connector handles a single layer group with a "
+                "single coalesced region (uniform attention, one pool). Got "
+                f"{len(layout.groups)} layer group(s) and "
+                f"{sum(len(g.regions) for g in layout.groups)} region(s).")
+        self.kv_cache_tensor = layout.groups[0].regions[0].as_tensor()
+
     def start_load_kv(self, stream: torch.cuda.Stream):
         # Do all loads synchronously, and blockwise.
         for path, block_id in self._metadata.load:

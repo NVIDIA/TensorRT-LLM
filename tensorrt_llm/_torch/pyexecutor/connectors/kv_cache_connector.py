@@ -54,6 +54,7 @@ from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from ..resource_manager import KVCacheManager
+    from .kv_cache_layout import KvCacheLayout
 
 
 # Used to store data for a single inflight request.
@@ -134,6 +135,30 @@ class KvCacheConnectorWorker(ABC):
         Args:
             kv_cache_tensor: The contiguous KV cache tensor.
         """
+
+    def register_kv_cache_layout(self, layout: "KvCacheLayout") -> None:
+        """
+        Register the KV cache pools described by ``layout``.
+
+        Called instead of ``register_kv_caches`` when the KV cache manager is
+        ``KVCacheManagerV2``, whose memory cannot be expressed as a single
+        tensor: there is one slot address space per pool and one page-index
+        space per layer group.
+
+        The bytes for page slot ``i`` of a region live at
+        ``region.base + region.stride * i`` for ``region.size`` bytes, or
+        equivalently at ``region.as_tensor()[i]``. Page indices arriving in
+        ``RequestData.new_block_ids`` are scoped to a layer group and index the
+        regions of that group.
+
+        Args:
+            layout: Description of the KV cache pools; see ``KvCacheLayout``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement register_kv_cache_layout, so it "
+            "cannot run against KVCacheManagerV2. Implement it, or select the V1 KV "
+            "cache manager with kv_cache_config.use_kv_cache_manager_v2=False."
+        )
 
     @abstractmethod
     def start_load_kv(self, stream: torch.cuda.Stream):

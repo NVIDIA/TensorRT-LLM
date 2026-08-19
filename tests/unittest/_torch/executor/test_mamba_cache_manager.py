@@ -933,8 +933,13 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     "max_beam_width, has_connector, expected",
     [
         (2, False, "max_beam_width > 1"),
-        (1, True, "kv_connector_manager"),
-        (2, True, "kv_connector_manager, max_beam_width > 1"),
+        # A KV connector alone no longer forces a V1 fallback: it is supported on
+        # KVCacheManagerV2 through the pool-layout registration path, so V2 is
+        # returned unchanged and nothing is raised.
+        (1, True, None),
+        # With beam search still incompatible, the connector must not appear in
+        # the reason list -- it is not what makes this configuration unsupported.
+        (2, True, "max_beam_width > 1"),
     ],
 )
 def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
@@ -952,6 +957,15 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
+
+    if expected is None:
+        assert (
+            creator._fallback_if_unsupported_kv_cache_manager_v2(
+                MambaHybridCacheManagerV2, model_config, KvCacheConfig()
+            )
+            is MambaHybridCacheManagerV2
+        )
+        return
 
     with pytest.raises(NotImplementedError, match=expected):
         creator._validate_or_fallback_kv_cache_manager_v2(
