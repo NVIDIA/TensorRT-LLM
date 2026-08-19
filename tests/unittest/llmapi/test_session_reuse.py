@@ -400,15 +400,29 @@ def test_kill_recorded_workers_skips_recycled_pid(
 def test_kill_recorded_workers_signals_through_pidfd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The pidfd handle is pinned before the identity recheck, and closed after."""
+    """The pidfd handle is pinned BEFORE the identity recheck, and closed after.
+
+    The ordering is the whole invariant: opening the pidfd first pins the process
+    so the start-time recheck cannot be invalidated by the PID being recycled
+    before the signal lands. One ordered event log is what proves that. Separate
+    per-call lists record only that each call happened, so a regression that
+    rechecks first and opens the handle afterwards still satisfies them.
+    """
     pool = _FakePool(1)
     pool._reuse_worker_pids = ((123, b"owned"),)
-    opened, signalled, closed = [], [], []
-    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"owned")
-    monkeypatch.setattr(
-        session_reuse.os, "pidfd_open", lambda pid: opened.append(pid) or 77, raising=False
-    )
-    monkeypatch.setattr(session_reuse.os, "close", lambda fd: closed.append(fd))
+    events: list[tuple] = []
+
+    def _start_time(pid):
+        events.append(("start_time", pid))
+        return b"owned"
+
+    def _pidfd_open(pid):
+        events.append(("open", pid))
+        return 77
+
+    monkeypatch.setattr(session_reuse, "_worker_start_time", _start_time)
+    monkeypatch.setattr(session_reuse.os, "pidfd_open", _pidfd_open, raising=False)
+    monkeypatch.setattr(session_reuse.os, "close", lambda fd: events.append(("close", fd)))
     monkeypatch.setattr(
         session_reuse.os,
         "kill",
@@ -419,14 +433,17 @@ def test_kill_recorded_workers_signals_through_pidfd(
     monkeypatch.setattr(
         _signal,
         "pidfd_send_signal",
-        lambda fd, sig: signalled.append((fd, sig)),
+        lambda fd, sig: events.append(("signal", fd, sig)),
         raising=False,
     )
 
     assert session_reuse._kill_recorded_workers(pool) == 1
-    assert opened == [123]
-    assert signalled == [(77, _signal.SIGKILL)]
-    assert closed == [77]
+    assert events == [
+        ("open", 123),
+        ("start_time", 123),
+        ("signal", 77, _signal.SIGKILL),
+        ("close", 77),
+    ]
 
 
 def test_kill_recorded_workers_falls_back_without_pidfd(
