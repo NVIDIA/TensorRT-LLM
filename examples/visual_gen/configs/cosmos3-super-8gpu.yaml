@@ -13,22 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 4-GPU Cosmos3-Super with (CFG + Ulysses + parallel VAE).
+# 8-GPU Cosmos3-Super with (CFG + Ulysses + parallel VAE).
 # Model: nvidia/Cosmos3-Super
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 #
-# trtllm-serve spawns the 4 workers itself — do not wrap it in torchrun/mpirun.
+# trtllm-serve spawns the 8 workers itself — do not wrap it in torchrun/mpirun.
 #
-# GPU layout: cfg_size=2 (positive | negative) x ulysses_size=2 (sequence split).
-# This split was measured against the alternatives on 4xB300; keep it unless a
-# new measurement says otherwise:
-#   cfg_size=1, ulysses_size=4     +3.4% slower  (CFG is worth two ranks)
-#   parallel_vae_size=1           +14.6% slower  (parallel VAE is load-bearing)
-#   ring_size=2                    unsupported   (Cosmos3 cross-attention)
+# GPU layout: cfg_size=2 (positive | negative) x ulysses_size=4 (sequence split).
+# Measured on 8xB300 at 1280x720 x 189 frames; keep this split unless a new
+# measurement says otherwise:
+#   cfg_size=1, ulysses_size=8      +4.5% slower  (CFG is worth two ranks)
+#   ring_size                        unsupported  (Cosmos3 cross-attention)
+# For reference, the 4-GPU config reaches 28.7 s on the same shape, so this
+# scales 1.90x on 2x the GPUs.
 attention_config:
   backend: VANILLA
 parallel_config:
   cfg_size: 2
-  ulysses_size: 2
+  ulysses_size: 4
   async_ulysses: true
-  parallel_vae_size: 4
+  parallel_vae_size: 8
