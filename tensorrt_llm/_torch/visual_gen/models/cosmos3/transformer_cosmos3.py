@@ -59,6 +59,27 @@ def apply_pretrained_config_compat_defaults(
     return pretrained_config
 
 
+def uses_static_fp8(model_config: DiffusionModelConfig) -> bool:
+    """Whether this run consumes a statically quantized (calibrated) FP8 checkpoint.
+
+    Such checkpoints store a separate calibrated scale per projection. Fusing
+    q/k/v or gate/up into one Linear forces a single scale on the group and
+    re-quantizes the other members onto it, discarding their calibration, so
+    those groups are kept as separate projections here instead.
+
+    Dynamic quantization derives scales at load or per call, so it has no
+    calibration to preserve and keeps the fused topology.
+    """
+    quant_config = model_config.quant_config
+    if quant_config is None or getattr(quant_config, "layer_quant_mode", None) is None:
+        return False
+    return (
+        quant_config.layer_quant_mode.has_fp8_qdq()
+        and not model_config.force_dynamic_quantization
+        and not model_config.dynamic_weight_quant
+    )
+
+
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 
 
@@ -418,6 +439,7 @@ class Cosmos3CausalAttention(Attention):
             layer_idx=layer_idx,
             module_name=module_name,
             enable_sequence_parallel=False,
+            share_qkv_input_quant=uses_static_fp8(model_config),
         )
         # Attention Q/K norms run the fp32-weight-multiply flavor in both
         # recipes (this path has always been F.rms_norm); only the layernorms
@@ -521,12 +543,14 @@ class Cosmos3CrossAttention(Attention):
                 key=(type(self).__name__, original_backend, "VANILLA"),
             )
 
+        static_fp8 = uses_static_fp8(model_config)
+
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=QKVMode.SEPARATE_QKV if static_fp8 else QKVMode.FUSE_QKV,
             qk_norm=False,
             qk_norm_mode="per_head",
             bias=False,
@@ -534,6 +558,7 @@ class Cosmos3CrossAttention(Attention):
             layer_idx=layer_idx,
             module_name=module_name,
             enable_sequence_parallel=True,
+            share_qkv_input_quant=static_fp8,
         )
         model_config.attention.backend = original_backend
 
@@ -624,6 +649,7 @@ def _build_cosmos3_mlp(
             config=model_config,
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
+            split_gate_up=uses_static_fp8(model_config),
         )
     return MLP(
         hidden_size=hidden_size,
@@ -1002,6 +1028,27 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             raise NotImplementedError(
                 "Ring parallelism is not supported for Cosmos3 cross-attention."
             )
+
+        if uses_static_fp8(model_config):
+            # Static FP8 puts cross-attention on SEPARATE_QKV, which the parallel
+            # wrappers treat differently from a fused QKV: Attention2D silently
+            # falls back off Ulysses rather than failing. Reject the untested
+            # combinations outright instead of degrading quietly.
+            # cp_size unifies ring and Attention2D; ring is already rejected above.
+            unsupported = {
+                "tp_size": tp_size,
+                "ulysses_size": ulysses_size,
+                "cfg_size": vgm.cfg_size if vgm else 1,
+                "cp_size": vgm.cp_size if vgm else 1,
+                "parallel_vae_size": vgm.parallel_vae_size if vgm else 1,
+            }
+            engaged = {k: v for k, v in unsupported.items() if v > 1}
+            if engaged:
+                raise NotImplementedError(
+                    "Static FP8 Cosmos3 is supported on one GPU only (each of "
+                    f"{sorted(unsupported)} must be 1); got {engaged}. Use the "
+                    "BF16 checkpoint for multi-GPU."
+                )
 
         self.language_model = Cosmos3LanguageModel(model_config, self.recipe)
 
@@ -1620,4 +1667,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         for _, module in self.named_modules():
             if isinstance(module, Linear) or isinstance(module, Qwen3VLTextRMSNorm):
+                module.post_load_weights()
+
+        # Second pass: GatedMLP and Attention validate invariants across their
+        # own projections, so they must run after those projections finalize.
+        # named_modules() yields parents before children, so folding this into
+        # the loop above would check the scales too early.
+        for _, module in self.named_modules():
+            if isinstance(module, (GatedMLP, Attention)):
                 module.post_load_weights()

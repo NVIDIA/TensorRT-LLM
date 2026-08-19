@@ -122,6 +122,8 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/test_swiglu_2in.py
+  - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
@@ -259,8 +261,10 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
+  - unittest/_torch/visual_gen/test_attention_qkv_share.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
+  - unittest/_torch/visual_gen/test_cosmos3_fp8.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_transformer.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_pipeline.py
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
@@ -398,6 +402,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_fp8_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_v2v_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_lpips_against_golden TIMEOUT (20)

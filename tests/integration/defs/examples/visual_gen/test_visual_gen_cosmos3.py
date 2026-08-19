@@ -76,7 +76,9 @@ COSMOS3_I2V_4STEP_LPIPS_GUIDANCE_SCALE = 1.0
 # golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json.
 COSMOS3_I2V_4STEP_LPIPS_THRESHOLD = 0.10
 
-
+# Statically quantized (ModelOpt FP8) Cosmos3 builds. They ship inside a dated
+# subdirectory, hence the multi-component paths.
+COSMOS3_NANO_FP8_MODEL_SUBPATH = ("Cosmos3-Nano-FP8", "cosmos3-nano-fp8-14072026")
 COSMOS3_FEATURE_LPIPS_THRESHOLD = 0.05
 COSMOS3_QUANTIZATION_IGNORE = [
     "language_model.*",
@@ -128,13 +130,33 @@ def _build_cosmos3_accuracy_cases():
 COSMOS3_ACCURACY_CASES = _build_cosmos3_accuracy_cases()
 
 
-def _run_cosmos3_lpips_pipeline(num_frames, video=None):
-    """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
+def _run_cosmos3_lpips_pipeline(
+    num_frames,
+    video=None,
+    image=None,
+    model_subpath=(COSMOS3_NANO_MODEL_SUBPATH,),
+    label="Cosmos3-Nano checkpoint",
+    height=COSMOS3_LPIPS_HEIGHT,
+    width=COSMOS3_LPIPS_WIDTH,
+    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+    output_type="video",
+):
+    """Run a Cosmos3 pipeline (default setting, VANILLA attn, compile-off).
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
-    or ``None`` if generation produced no video.  ``num_frames=1`` yields the
-    single-frame text-to-image path; passing ``video`` (encoded MP4 bytes,
-    decoded on the worker's NVDEC) yields the video-to-video path.
+    or ``None`` if generation produced no video. Passing ``video`` (encoded MP4
+    bytes, decoded on the worker's NVDEC) yields the video-to-video path;
+    passing ``image`` yields the image-to-video path.
+
+    ``output_type="image"`` selects the real text-to-image path and returns
+    ``(B, H, W, C)`` instead. It is not the same as ``num_frames=1``: the
+    pipeline keys T2I off ``output_type``, which also swaps in
+    ``COSMOS3_T2I_PARAMS``, the T2I system prompt and the image resolution
+    template, so a one-frame video run exercises none of that.
+
+    ``model_subpath`` selects the checkpoint under ``LLM_MODELS_ROOT`` and is a
+    tuple of path components, so nested checkpoints (the FP8 builds ship inside
+    a dated subdirectory) address the same way as top-level ones.
     """
     # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
@@ -149,8 +171,8 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
             VisualGenArgs,
         )
 
-        model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+        model_path = _lpips_model_path(*model_subpath)
+        _skip_if_missing(model_path, label, is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -167,18 +189,24 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
                     # so pin it rather than inheriting the video-mode default.
                     negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
-                    height=COSMOS3_LPIPS_HEIGHT,
-                    width=COSMOS3_LPIPS_WIDTH,
+                    height=height,
+                    width=width,
                     num_frames=num_frames,
-                    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+                    num_inference_steps=num_inference_steps,
                     guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
                     frame_rate=COSMOS3_LPIPS_FRAME_RATE,
                     use_guardrails=False,
                     video=video,
+                    image=image,
+                    output_type=output_type,
                 )
-            if result is None or result.video is None:
+            if result is None:
                 return None
-            return result.video.detach().cpu()
+            # T2I returns image (B, H, W, C) and leaves video unset.
+            produced = result.image if output_type == "image" else result.video
+            if produced is None:
+                return None
+            return produced.detach().cpu()
         finally:
             del pipeline
             _cleanup_cuda()
@@ -647,6 +675,92 @@ def test_cosmos3_i2v_4step_lpips_against_golden(_visual_gen_deps, request, tmp_p
     _assert_lpips_below_threshold(score, COSMOS3_I2V_4STEP_LPIPS_THRESHOLD)
 
 
+# Self-golden for the static-FP8 path, in the shape of the fp8-blockwise and
+# nvfp4 goldens: the checkpoint's own output pinned once, then gated for drift.
+# It is deliberately NOT referenced against BF16 -- diffusion sampling is chaotic,
+# so an FP8 rounding difference at step 0 compounds into a different (equally
+# valid) sample, and a BF16-referenced threshold would either reject good FP8
+# output or be too loose to catch anything. Against its own golden at a fixed
+# seed with deterministic algorithms, that problem does not arise.
+#
+# A scale that loads subtly wrong still renders a plausible image, so a
+# pixel-spread check cannot see it; LPIPS against a pinned render can.
+COSMOS3_NANO_FP8_GOLDEN_IMAGE = "cosmos3_nano_fp8_static_lpips_golden.png"
+# Deliberately tiny. The gate only has to run every quantized projection in
+# every layer once -- it is not judging image quality, so it does not need the
+# deployed shape. 256x256 is the smallest legal size (VAE spatial factor 16 x
+# latent patch 2 => multiples of 32) and 4 steps is enough to move the output
+# well clear of the initial noise. Together that is ~14x fewer patches and ~9x
+# fewer steps than the 720x1280/35-step goldens next to it.
+COSMOS3_FP8_GOLDEN_HEIGHT = 256
+COSMOS3_FP8_GOLDEN_WIDTH = 256
+COSMOS3_FP8_GOLDEN_STEPS = 4
+# Cross-host kernel drift, not FP8 noise: the same headroom the sibling Cosmos3
+# goldens carry (see _preserve_lpips_candidate_on_failure).
+COSMOS3_FP8_GOLDEN_LPIPS_THRESHOLD = 0.05
+
+
+def _generate_cosmos3_nano_fp8_lpips_image(output_path):
+    """Render the static-FP8 T2I golden sample under deterministic algorithms.
+
+    Mirrors _generate_cosmos3_feature_image rather than the BF16 T2I generator:
+    a quantized path needs determinism pinned during *generation* for its golden
+    to be reproducible at all.
+    """
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.media.encoding import save_image
+    from tensorrt_llm.visual_gen.args import (
+        AttentionConfig,
+        CompilationConfig,
+        TorchCompileConfig,
+        VisualGenArgs,
+    )
+
+    guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
+    previous_guardrails_env = os.environ.get(guardrails_env_key)
+    os.environ[guardrails_env_key] = "1"
+    pipeline = None
+    try:
+        model_path = _lpips_model_path(*COSMOS3_NANO_FP8_MODEL_SUBPATH)
+        _skip_if_missing(model_path, "Cosmos3-Nano-FP8 checkpoint", is_dir=True)
+        _disable_inductor_compile_worker_quiesce()
+        with _lpips_deterministic_algorithms():
+            args = VisualGenArgs(
+                model=model_path,
+                compilation_config=CompilationConfig(skip_warmup=True),
+                torch_compile_config=TorchCompileConfig(enable=False),
+                attention_config=AttentionConfig(backend="VANILLA"),
+            )
+            try:
+                pipeline = PipelineLoader(args).load(skip_warmup=True)
+                _assert_static_fp8_topology_engaged(pipeline)
+                result = pipeline.forward(
+                    prompt=COSMOS3_LPIPS_PROMPT,
+                    seed=COSMOS3_LPIPS_SEED,
+                    height=COSMOS3_FP8_GOLDEN_HEIGHT,
+                    width=COSMOS3_FP8_GOLDEN_WIDTH,
+                    num_frames=1,
+                    num_inference_steps=COSMOS3_FP8_GOLDEN_STEPS,
+                    guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
+                    frame_rate=COSMOS3_LPIPS_FRAME_RATE,
+                    use_guardrails=False,
+                    output_type="image",
+                )
+                assert result is not None and result.image is not None, (
+                    "Cosmos3-Nano-FP8 T2I LPIPS run produced no image"
+                )
+                generated_image = result.image[0].detach().cpu()
+            finally:
+                del pipeline
+                _cleanup_cuda()
+        save_image(generated_image, output_path)
+    finally:
+        if previous_guardrails_env is None:
+            os.environ.pop(guardrails_env_key, None)
+        else:
+            os.environ[guardrails_env_key] = previous_guardrails_env
+
+
 def _write_cosmos3_edge_conditioning_image(path):
     """Deterministic 832x480 conditioning image (Edge's native 480p 16:9)."""
     from PIL import Image, ImageDraw
@@ -780,6 +894,60 @@ def _run_cosmos3_edge_lpips_pipeline(**forward_kwargs):
             os.environ.pop(guardrails_env_key, None)
         else:
             os.environ[guardrails_env_key] = previous_guardrails_env
+
+
+def _assert_static_fp8_topology_engaged(pipeline):
+    """Fail loudly if the golden would be rendered by the fused topology.
+
+    Without this the test still passes when static FP8 silently reverts to
+    fused: the image would differ only subtly, and a golden regenerated in that
+    state would quietly enshrine the re-quantized weights this feature exists to
+    avoid.
+    """
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
+    split = [
+        name
+        for name, module in pipeline.transformer.named_modules()
+        if isinstance(module, GatedMLP) and module.gate_up_proj is None
+    ]
+    assert split, (
+        "static FP8 did not engage: no GatedMLP has split gate/up projections, "
+        "so this render came from the fused topology"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_nano_fp8_t2i_lpips_against_golden(request, _visual_gen_deps, tmp_path):
+    """Gate the static-FP8 path against its own pinned output.
+
+    The decode smokes only reject a collapsed frame, which a subtly misloaded
+    scale would clear. This is the drift gate, matching how the fp8-blockwise
+    and nvfp4 features are covered.
+    """
+    generated_path = tmp_path / "cosmos3_nano_fp8_t2i_generated.png"
+    golden_path = _golden_media_path(
+        tmp_path,
+        COSMOS3_NANO_FP8_GOLDEN_IMAGE,
+        "Cosmos3-Nano-FP8 static T2I LPIPS golden image",
+    )
+    _generate_cosmos3_nano_fp8_lpips_image(generated_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_nano_fp8_t2i",
+        "image",
+        COSMOS3_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        COSMOS3_FP8_GOLDEN_LPIPS_THRESHOLD,
+        generated_path,
+        COSMOS3_NANO_FP8_GOLDEN_IMAGE,
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_FP8_GOLDEN_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
