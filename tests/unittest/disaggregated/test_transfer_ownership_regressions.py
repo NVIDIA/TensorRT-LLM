@@ -21,17 +21,23 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgpack
+import numpy as np
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
+    KVSendTask,
     MessageType,
     Receiver,
+    RecvReqInfo,
     RxSession,
+    Sender,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -107,23 +113,41 @@ class _ReceiverProbe:
     def __init__(self) -> None:
         self._bounce = _BounceProbe()
         self._enforce_physical_ownership = True
+        self._physical_ownership_fault: BaseException | None = None
+        self._physical_ownership_fault_lock = threading.Lock()
         self._session: RxSession | None = None
+        self._next_owner_generation = 1
         self.clear_count = 0
         self.cancel_count = 0
 
     def setup_session(self, session: RxSession) -> None:
         self._session = session
 
+    def allocate_owner_generation(self) -> int:
+        generation = self._next_owner_generation
+        self._next_owner_generation += 1
+        return generation
+
     def dispatch_task(self, task: KVRecvTask) -> None:
         assert self._session is not None
         task.expected_transfers = 2
-        self._session.mark_transferring(task.slice_id)
+        assert self._session.try_begin_transfer(task.slice_id, set(), {0, 1})
 
     def send_cancel_to_senders(self, _unique_rid: int, _sender_endpoints: set[str]) -> None:
         self.cancel_count += 1
 
     def clear_session(self, _unique_rid: int) -> None:
         self.clear_count += 1
+
+    def _record_physical_ownership_fault(self, error: BaseException) -> None:
+        with self._physical_ownership_fault_lock:
+            if self._physical_ownership_fault is None:
+                self._physical_ownership_fault = error
+
+    @property
+    def physical_ownership_fault(self) -> BaseException | None:
+        with self._physical_ownership_fault_lock:
+            return self._physical_ownership_fault
 
 
 class _OneSlotAllocator:
@@ -141,6 +165,26 @@ class _OneSlotAllocator:
         if safe_to_reuse and self.owner is not None:
             self.owner = None
             self.release_count += 1
+
+
+def _make_rank_info(
+    physical_ownership_protocol: int,
+    *,
+    sender_endpoints: list[str] | None = None,
+) -> RankInfo:
+    return RankInfo(
+        instance_name="peer",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[1],
+        sender_endpoints=sender_endpoints or [],
+        self_endpoint="tcp://peer",
+        transfer_engine_info=b"agent",
+        physical_ownership_protocol=physical_ownership_protocol,
+    )
 
 
 def _make_rx_session(receiver: object, rid: int) -> RxSession:
@@ -244,6 +288,9 @@ def test_pre_cancelled_rx_session_never_publishes_destination(
     receiver._pre_cancelled_rids = {rid}
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
+    receiver._physical_ownership_fault = None
+    receiver._physical_ownership_fault_lock = threading.Lock()
+    receiver._next_owner_generation = 1
     receiver._shutdown = True
     receiver.dispatch_task = Mock()
     receiver.send_cancel_to_senders = Mock()
@@ -377,6 +424,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
             cp_size=1,
             dp_size=1,
             attention=None,
+            physical_ownership_protocol=1,
         )
     )
 
@@ -463,3 +511,337 @@ def test_cancel_before_dispatch_releases_late_idle_reservation() -> None:
     )
     assert session.status == SessionStatus.CANCELLED
     assert task.resources_drained
+
+
+@pytest.mark.cpu_only
+def test_recv_req_info_generation_wire_extension_is_component_gated() -> None:
+    kwargs = {
+        "sender_req_id": 1,
+        "instance_name": "gen",
+        "instance_rank": 0,
+        "block_ids_per_layer_groups": [np.array([1, 2], dtype=np.int64)],
+        "unique_rid": 81,
+    }
+    legacy = RecvReqInfo(**kwargs)
+    owned = RecvReqInfo(**kwargs, owner_generation=7)
+
+    legacy_payload = msgpack.unpackb(legacy.to_bytes(), raw=False)
+    owned_payload = msgpack.unpackb(owned.to_bytes(), raw=False)
+
+    assert "owner_generation" not in legacy_payload
+    assert owned_payload["owner_generation"] == 7
+    assert RecvReqInfo.from_bytes(legacy.to_bytes()).owner_generation is None
+    assert RecvReqInfo.from_bytes(owned.to_bytes()).owner_generation == 7
+
+
+@pytest.mark.cpu_only
+def test_owner_generation_result_wire_extension_is_component_gated() -> None:
+    legacy = transfer_mod._make_kv_result_msg(0, 81, 0, True, AgentResult.FAILED)
+    owned = transfer_mod._make_kv_result_msg(
+        0,
+        81,
+        0,
+        True,
+        AgentResult.FAILED,
+        owner_generation=7,
+    )
+
+    assert len(legacy[1]) == transfer_mod._KV_RESULT_PREFIX.size
+    assert len(owned[1]) == transfer_mod._KV_RESULT_PREFIX_V1.size
+    assert transfer_mod._KV_RESULT_PREFIX_V1.unpack(owned[1])[3] == 7
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("enforce_ownership", "owner_generation"),
+    [(False, None), (True, 7)],
+    ids=["legacy", "owned"],
+)
+def test_result_parser_preserves_component_wire_contract(
+    enforce_ownership: bool,
+    owner_generation: int | None,
+) -> None:
+    session = SimpleNamespace(process_kv_agent_result=Mock())
+    receiver = object.__new__(Receiver)
+    receiver._enforce_physical_ownership = enforce_ownership
+    receiver._get_session = Mock(return_value=session)
+    message = transfer_mod._make_kv_result_msg(
+        0,
+        82,
+        0,
+        True,
+        AgentResult.SUCCESS,
+        owner_generation=owner_generation,
+    )
+
+    receiver._process_kv_agent_result(b"peer", message)
+
+    assert session.process_kv_agent_result.call_args.kwargs["owner_generation"] == owner_generation
+
+
+@pytest.mark.cpu_only
+def test_stale_terminal_generation_cannot_settle_current_receive_owner() -> None:
+    receiver = _ReceiverProbe()
+    receiver._next_owner_generation = 2
+    session = _make_rx_session(receiver, rid=83)
+    session.receive(KVSlice(is_last_slice=True))
+    task = session._kv_tasks[0]
+    assert task.owner_generation == 2
+
+    session.process_kv_agent_result(
+        peer_rank=0,
+        sender_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.FAILED,
+        owner_generation=1,
+    )
+
+    assert task.status == transfer_mod.TaskStatus.TRANSFERRING
+    assert not task.resources_drained
+    assert receiver.physical_ownership_fault is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("owner_generation", [0, 3], ids=["non-positive", "future"])
+def test_unmatchable_generation_poison_retains_destination(owner_generation: int) -> None:
+    receiver = _ReceiverProbe()
+    receiver._next_owner_generation = 2
+    session = _make_rx_session(receiver, rid=84)
+    session.receive(KVSlice(is_last_slice=True))
+
+    with pytest.raises((ValueError, RuntimeError), match="owner generation|owner_generation"):
+        session.process_kv_agent_result(
+            peer_rank=0,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            owner_generation=owner_generation,
+        )
+
+    assert receiver.physical_ownership_fault is not None
+    assert not session.resources_drained()
+    assert not session.close()
+
+
+@pytest.mark.cpu_only
+def test_duplicate_writer_result_cannot_substitute_for_missing_sibling() -> None:
+    receiver = _ReceiverProbe()
+    session = _make_rx_session(receiver, rid=85)
+    session.receive(KVSlice(is_last_slice=True))
+    generation = session._kv_tasks[0].owner_generation
+
+    for _ in range(2):
+        session.process_kv_agent_result(
+            peer_rank=0,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.FAILED,
+            owner_generation=generation,
+        )
+
+    assert not session.resources_drained()
+    assert receiver.physical_ownership_fault is None
+
+    session.process_kv_agent_result(
+        peer_rank=1,
+        sender_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.SUCCESS,
+        owner_generation=generation,
+    )
+    assert session.resources_drained()
+
+
+@pytest.mark.cpu_only
+def test_contradictory_writer_result_poison_retains_destination() -> None:
+    receiver = _ReceiverProbe()
+    session = _make_rx_session(receiver, rid=86)
+    session.receive(KVSlice(is_last_slice=True))
+    generation = session._kv_tasks[0].owner_generation
+
+    session.process_kv_agent_result(
+        peer_rank=0,
+        sender_slice_id=0,
+        is_last_slice=True,
+        status=AgentResult.FAILED,
+        owner_generation=generation,
+    )
+    with pytest.raises(RuntimeError, match="contradictory terminal evidence"):
+        session.process_kv_agent_result(
+            peer_rank=0,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            owner_generation=generation,
+        )
+
+    assert receiver.physical_ownership_fault is not None
+    assert not session.resources_drained()
+    assert not session.close()
+
+
+@pytest.mark.cpu_only
+def test_out_of_cohort_writer_result_poison_retains_destination() -> None:
+    receiver = _ReceiverProbe()
+    session = _make_rx_session(receiver, rid=87)
+    session.receive(KVSlice(is_last_slice=True))
+
+    with pytest.raises(RuntimeError, match="outside the sealed cohort"):
+        session.process_kv_agent_result(
+            peer_rank=99,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            owner_generation=session._kv_tasks[0].owner_generation,
+        )
+
+    assert receiver.physical_ownership_fault is not None
+    assert not session.resources_drained()
+    assert not session.close()
+
+
+@pytest.mark.cpu_only
+def test_sticky_receive_fault_rejects_later_publication() -> None:
+    receiver = _ReceiverProbe()
+    first = _make_rx_session(receiver, rid=88)
+    first.receive(KVSlice(is_last_slice=True))
+    with pytest.raises(RuntimeError, match="owner generation mismatch"):
+        first.process_kv_agent_result(
+            peer_rank=0,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            owner_generation=first._kv_tasks[0].owner_generation + 1,
+        )
+
+    second = _make_rx_session(receiver, rid=89)
+    with pytest.raises(RuntimeError, match="poisoned"):
+        second.receive(KVSlice(is_last_slice=True))
+
+    assert second.has_failed()
+    assert second.resources_drained()
+
+
+@pytest.mark.cpu_only
+def test_sender_dispatch_rejects_missing_generation_before_pointer_build() -> None:
+    rid = 90
+    task = KVSendTask(
+        KVSlice(is_last_slice=True),
+        DisaggregatedParams(disagg_request_id=rid),
+        slice_id=0,
+    )
+    task._unique_rid = rid
+    sender = object.__new__(Sender)
+    sender._enforce_physical_ownership = True
+    sender._build_kv_write_meta = Mock()
+    sender._enqueue = Mock()
+    info = SimpleNamespace(unique_rid=rid, instance_rank=0, owner_generation=None)
+
+    with pytest.raises(ValueError, match="positive integer owner_generation"):
+        sender.dispatch_task(task, {0: info})
+
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    sender._build_kv_write_meta.assert_not_called()
+    sender._enqueue.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_request_data_rejects_invalid_generation_before_saving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sender = object.__new__(Sender)
+    sender._enforce_physical_ownership = True
+    sender._save_peer_req_info = Mock()
+    info = SimpleNamespace(unique_rid=91, instance_rank=0, owner_generation=0)
+    monkeypatch.setattr(RecvReqInfo, "from_bytes", Mock(return_value=info))
+
+    with pytest.raises(ValueError, match="positive integer owner_generation"):
+        sender._respond_with_kv(b"peer", [MessageType.REQUEST_DATA, b"malformed"])
+
+    sender._save_peer_req_info.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_receiver_protocol_mismatch_stops_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer_info = _make_rank_info(0, sender_endpoints=["tcp://sender"])
+    info_messenger = SimpleNamespace(
+        send=Mock(),
+        receive=Mock(return_value=[peer_info.to_bytes()]),
+        stop=Mock(),
+    )
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", Mock(return_value=info_messenger))
+    receiver = object.__new__(Receiver)
+    receiver._enforce_physical_ownership = True
+    receiver._sender_ep_instance_map = {}
+    receiver._incompatible_peers = {}
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=_make_rank_info(1),
+        self_extractor=SimpleNamespace(page_table=None),
+    )
+    receiver._get_or_connect_dealer = Mock()
+
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        receiver._get_sender_info(SimpleNamespace(ctx_info_endpoint="tcp://info"))
+
+    receiver._get_or_connect_dealer.assert_not_called()
+    assert receiver._sender_ep_instance_map == {}
+
+
+@pytest.mark.cpu_only
+def test_receiver_matching_protocol_registers_before_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer_info = _make_rank_info(1, sender_endpoints=["tcp://sender"])
+    info_messenger = SimpleNamespace(
+        send=Mock(),
+        receive=Mock(return_value=[peer_info.to_bytes()]),
+        stop=Mock(),
+    )
+    registration_dealer = SimpleNamespace(send=Mock())
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", Mock(return_value=info_messenger))
+    monkeypatch.setattr(transfer_mod.MambaPolicy, "validate_peer_compatible", Mock())
+    receiver = object.__new__(Receiver)
+    receiver._enforce_physical_ownership = True
+    receiver._sender_ep_instance_map = {}
+    receiver._incompatible_peers = {}
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=_make_rank_info(1),
+        self_extractor=SimpleNamespace(page_table=None),
+    )
+    receiver._get_or_connect_dealer = Mock(return_value=registration_dealer)
+
+    resolved_peer = receiver._get_sender_info(SimpleNamespace(ctx_info_endpoint="tcp://info"))
+
+    registration_dealer.send.assert_called_once()
+    assert resolved_peer.physical_ownership_protocol == 1
+    assert receiver._sender_ep_instance_map["tcp://info"] is resolved_peer
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peer_protocol", [0, True], ids=["legacy", "boolean"])
+def test_sender_protocol_mismatch_stops_before_agent_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    peer_protocol: int | bool,
+) -> None:
+    sender = object.__new__(Sender)
+    sender._shutdown = False
+    sender._device_id = 0
+    sender._enforce_physical_ownership = True
+    sender._registrar = SimpleNamespace(register=Mock())
+    sender._agent = SimpleNamespace(load_remote_agent=Mock())
+    sender._loaded_remote_agents_lock = threading.Lock()
+    sender._loaded_remote_agents = set()
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", Mock(return_value=0))
+    monkeypatch.setattr(transfer_mod, "CUASSERT", Mock())
+
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        sender._register_peer_rank(
+            b"peer",
+            [MessageType.REGISTER_RANK_INFO, _make_rank_info(peer_protocol).to_bytes()],
+        )
+
+    sender._registrar.register.assert_not_called()
+    sender._agent.load_remote_agent.assert_not_called()

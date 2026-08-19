@@ -108,24 +108,28 @@ class RecvReqInfo:
     mamba_state_index: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # Process-local receive-owner generation. Present only under ownership
+    # protocol v1 so disabled workers retain the legacy wire schema.
+    owner_generation: Optional[int] = None
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(
-            {
-                "sender_req_id": self.sender_req_id,
-                "instance_name": self.instance_name,
-                "instance_rank": self.instance_rank,
-                "block_ids_per_layer_groups": [
-                    arr.tobytes() for arr in self.block_ids_per_layer_groups
-                ],
-                "unique_rid": self.unique_rid,
-                "dst_start_token": self.dst_start_token,
-                "aux_slot": self.aux_slot,
-                "mamba_state_index": self.mamba_state_index,
-                "slice_id": self.slice_id,
-                "bounce_dst_base": self.bounce_dst_base,
-            }
-        )
+        payload = {
+            "sender_req_id": self.sender_req_id,
+            "instance_name": self.instance_name,
+            "instance_rank": self.instance_rank,
+            "block_ids_per_layer_groups": [
+                arr.tobytes() for arr in self.block_ids_per_layer_groups
+            ],
+            "unique_rid": self.unique_rid,
+            "dst_start_token": self.dst_start_token,
+            "aux_slot": self.aux_slot,
+            "mamba_state_index": self.mamba_state_index,
+            "slice_id": self.slice_id,
+            "bounce_dst_base": self.bounce_dst_base,
+        }
+        if self.owner_generation is not None:
+            payload["owner_generation"] = self.owner_generation
+        return msgpack.packb(payload)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
@@ -164,6 +168,7 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    owner_generation: Optional[int] = None
 
 
 class MessageType:
@@ -184,6 +189,39 @@ class PeerIncompatibleError(ValueError):
     fail only the requests targeting that peer instead of crashing the
     executor loop.
     """
+
+
+_PHYSICAL_OWNERSHIP_PROTOCOL_VERSION = 1
+
+
+def _validate_physical_ownership_protocol(
+    enforce_physical_ownership: bool,
+    peer_protocol: object,
+    boundary: str,
+) -> None:
+    local_protocol = _PHYSICAL_OWNERSHIP_PROTOCOL_VERSION if enforce_physical_ownership else 0
+    if (
+        isinstance(peer_protocol, bool)
+        or not isinstance(peer_protocol, int)
+        or peer_protocol != local_protocol
+    ):
+        raise ValueError(
+            f"KV transfer physical-ownership protocol mismatch {boundary}: "
+            f"local={local_protocol}, peer={peer_protocol!r}"
+        )
+
+
+def _validate_owner_generation(owner_generation: object, boundary: str) -> int:
+    if (
+        isinstance(owner_generation, bool)
+        or not isinstance(owner_generation, int)
+        or owner_generation <= 0
+    ):
+        raise ValueError(
+            "physical-ownership protocol v1 requires a positive integer "
+            f"owner_generation {boundary}, got {owner_generation!r}"
+        )
+    return owner_generation
 
 
 class TaskStatus(Enum):
@@ -282,6 +320,11 @@ class _ReceiveOperationOwner:
         with self._lock:
             self._local_completion_pending = False
 
+    def invalidate_evidence(self) -> None:
+        """Prevent reuse after evidence cannot be matched to this owner."""
+        with self._lock:
+            self._invalid_evidence = True
+
     @property
     def resources_drained(self) -> bool:
         with self._lock:
@@ -305,27 +348,45 @@ class AgentResult(Enum):
 # GIL per slice per writer): instance_rank, unique_rid, slice_id, is_last, status,
 # transfer_size. The optional bounce tail follows at message[2:].
 _KV_RESULT_PREFIX = struct.Struct("<qqq?Bq")
+_KV_RESULT_PREFIX_V1 = struct.Struct("<qqqq?Bq")
 _AGENT_RESULT_CODE = {AgentResult.SUCCESS: 0, AgentResult.FAILED: 1}
 _AGENT_RESULT_BY_CODE = {0: AgentResult.SUCCESS, 1: AgentResult.FAILED}
 
 
 def _make_kv_result_msg(
-    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0, tail=None
+    instance_rank,
+    unique_rid,
+    slice_id,
+    is_last_slice,
+    agent_result,
+    transfer_size=0,
+    tail=None,
+    owner_generation=None,
 ):
     """Build a KV_AGENT_RESULT message. ALL result sends (success AND failed/cancelled) must go
     through this single binary frame so the receiver's _KV_RESULT_PREFIX.unpack never hits a stale
     ascii payload (which would fail to decode and leave the RX task stuck forever)."""
-    msg = [
-        MessageType.KV_AGENT_RESULT,
-        _KV_RESULT_PREFIX.pack(
+    if owner_generation is None:
+        prefix = _KV_RESULT_PREFIX.pack(
             int(instance_rank),
             int(unique_rid),
             int(slice_id),
             bool(is_last_slice),
             _AGENT_RESULT_CODE[agent_result],
             int(transfer_size),
-        ),
-    ]
+        )
+    else:
+        generation = _validate_owner_generation(owner_generation, "while encoding a result")
+        prefix = _KV_RESULT_PREFIX_V1.pack(
+            int(instance_rank),
+            int(unique_rid),
+            int(slice_id),
+            generation,
+            bool(is_last_slice),
+            _AGENT_RESULT_CODE[agent_result],
+            int(transfer_size),
+        )
+    msg = [MessageType.KV_AGENT_RESULT, prefix]
     if tail:
         msg += tail
     return msg
@@ -407,11 +468,15 @@ class Sender(SenderBase):
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
         bounce=None,
+        enforce_physical_ownership: bool = False,
     ):
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._bounce = bounce
+        # Component-only gate. TransferWorker does not enable or advertise the
+        # protocol until the Phase 1 activation PR.
+        self._enforce_physical_ownership = enforce_physical_ownership
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -533,6 +598,13 @@ class Sender(SenderBase):
             logger.warning(f"TxSession {unique_rid} has been garbage collected")
             return None
         return session
+
+    @staticmethod
+    def _validate_owned_recv_req_info(info: RecvReqInfo) -> None:
+        _validate_owner_generation(
+            getattr(info, "owner_generation", None),
+            f"for request {getattr(info, 'unique_rid', None)}",
+        )
 
     def _enqueue(self, write_meta: WriteMeta):
         # Route by (unique_rid, peer_rank) so that:
@@ -683,6 +755,7 @@ class Sender(SenderBase):
                     write_meta.slice_id,
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
+                    owner_generation=write_meta.owner_generation,
                 )
             )
             return
@@ -713,6 +786,7 @@ class Sender(SenderBase):
                         write_meta.slice_id,
                         True,  # is_last_slice — ensures receiver resolves its task future
                         AgentResult.FAILED,
+                        owner_generation=write_meta.owner_generation,
                     )
                 )
                 return
@@ -759,6 +833,7 @@ class Sender(SenderBase):
             agent_result,
             transfer_size=transfer_size,
             tail=tail,
+            owner_generation=write_meta.owner_generation,
         )
         self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
 
@@ -1066,6 +1141,7 @@ class Sender(SenderBase):
             slice_id=task.slice_id,
             is_last_slice=task._slice.is_last_slice,
             bounce_dst_base=req_info.bounce_dst_base,
+            owner_generation=req_info.owner_generation,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1126,6 +1202,15 @@ class Sender(SenderBase):
         # critical section small.  When not provided, we fetch it here (legacy / standalone path).
         if req_info_snapshot is None:
             req_info_snapshot = dict(self._get_req_info(task._unique_rid) or {})
+        if self._enforce_physical_ownership and isinstance(task, KVSendTask):
+            try:
+                for info in req_info_snapshot.values():
+                    self._validate_owned_recv_req_info(info)
+            except ValueError as error:
+                # Reject an unidentifiable destination before deriving source
+                # pointers or submitting any backend operation.
+                task.fail(error)
+                raise
         for info in req_info_snapshot.values():
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(info.instance_rank)
@@ -1171,6 +1256,11 @@ class Sender(SenderBase):
         torch.cuda.set_device(self._device_id)
         CUASSERT(cudart.cudaSetDevice(self._device_id))
         ri: RankInfo = RankInfo.from_bytes(message[1])
+        _validate_physical_ownership_protocol(
+            self._enforce_physical_ownership,
+            ri.physical_ownership_protocol,
+            "while registering the receiver",
+        )
 
         self._registrar.register(ri.instance_name, ri.instance_rank, ri)
 
@@ -1205,6 +1295,8 @@ class Sender(SenderBase):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock serializes _enqueue calls from both paths.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        if self._enforce_physical_ownership:
+            self._validate_owned_recv_req_info(info)
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
@@ -1238,6 +1330,7 @@ class Sender(SenderBase):
                     slice_id,
                     True,  # is_last_slice
                     AgentResult.FAILED,
+                    owner_generation=info.owner_generation,
                 )
             )
         except Exception as e:
@@ -1643,6 +1736,7 @@ class KVRecvTask:
         slice_id: int,
         params: DisaggregatedParams,
         aux_slot: Optional[int],
+        owner_generation: Optional[int] = None,
     ):
         self._event = threading.Event()
         self.slice_id = slice_id
@@ -1655,6 +1749,7 @@ class KVRecvTask:
         self._params = params
         self._exception: Optional[Exception] = None
         self._aux_slot = aux_slot
+        self.owner_generation = owner_generation
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_owner: Optional[_ReceiveOperationOwner] = None
         self._ownership_state_lock: Optional[threading.Lock] = None
@@ -1722,6 +1817,9 @@ class KVRecvTask:
     def finish_local_completion(self) -> None:
         self._get_physical_owner().finish_local_completion()
 
+    def invalidate_physical_evidence(self) -> None:
+        self._get_physical_owner().invalidate_evidence()
+
     @property
     def resources_drained(self) -> bool:
         return self._get_physical_owner().resources_drained
@@ -1753,6 +1851,8 @@ class Receiver(ReceiverBase):
         # Internal component gate only. Production wiring is added after the
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
+        self._physical_ownership_fault: Optional[BaseException] = None
+        self._physical_ownership_fault_lock = threading.Lock()
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -1765,6 +1865,7 @@ class Receiver(ReceiverBase):
         self._sessions = {}  # unique_rid -> RxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         self._pre_cancelled_rids: set[int] = set()
+        self._next_owner_generation = 1
         self._shutdown = False
 
         self._start_listener()
@@ -1773,6 +1874,25 @@ class Receiver(ReceiverBase):
     @property
     def endpoint(self):
         return self._messenger.endpoint
+
+    def allocate_owner_generation(self) -> int:
+        """Return a process-local generation under the receive-session gate."""
+        with self._sessions_lock:
+            generation = self._next_owner_generation
+            self._next_owner_generation += 1
+            return generation
+
+    def _record_physical_ownership_fault(self, error: BaseException) -> None:
+        if not self._enforce_physical_ownership:
+            return
+        with self._physical_ownership_fault_lock:
+            if self._physical_ownership_fault is None:
+                self._physical_ownership_fault = error
+
+    @property
+    def physical_ownership_fault(self) -> Optional[BaseException]:
+        with self._physical_ownership_fault_lock:
+            return self._physical_ownership_fault
 
     def shutdown(self):
         if getattr(self, "_shutdown", False):
@@ -1852,6 +1972,7 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             mamba_state_index=task._kv_slice.mamba_state_index,
             slice_id=task.slice_id,
+            owner_generation=task.owner_generation,
         )
 
     @staticmethod
@@ -1922,6 +2043,11 @@ class Receiver(ReceiverBase):
             task.fail(e)
             return
 
+        _validate_physical_ownership_protocol(
+            self._enforce_physical_ownership,
+            getattr(peer_infos, "physical_ownership_protocol", 0),
+            "before destination publication",
+        )
         if sender_dp_rank is not None:
             # Normal path: ctx_dp_rank is known, send to overlapping ranks.
             peer_overlap = self._registrar.get_peer_overlap(peer_infos, sender_dp_rank)
@@ -2067,6 +2193,12 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
+            _validate_physical_ownership_protocol(
+                self._enforce_physical_ownership,
+                sender_info.physical_ownership_protocol,
+                "before receiver registration",
+            )
+
             # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
             # The sender-side check (PeerRegistrar.register) runs in the
             # sender's listener thread, where exceptions are only logged, so
@@ -2125,6 +2257,7 @@ class Receiver(ReceiverBase):
                     try:
                         self._process_kv_agent_result(send_id, msg)
                     except Exception as e:
+                        self._record_physical_ownership_fault(e)
                         logger.error(f"Receiver: error handling KV_AGENT_RESULT: {e}")
                 case MessageType.AUX_AGENT_RESULT:
                     try:
@@ -2135,8 +2268,12 @@ class Receiver(ReceiverBase):
                     try:
                         self._handle_cancel_session(msg)
                     except Exception as e:
+                        self._record_physical_ownership_fault(e)
                         logger.error(f"Receiver: error handling CANCEL_SESSION: {e}")
                 case _:
+                    self._record_physical_ownership_fault(
+                        RuntimeError(f"Receiver received unknown message type: {msg[0]}")
+                    )
                     logger.error(f"Receiver received unknown message type: {msg[0]}")
             return True
 
@@ -2162,9 +2299,27 @@ class Receiver(ReceiverBase):
                 f"_process_kv_agent_result: unexpected msg_type={message[0]!r}, expected KV_AGENT_RESULT"
             )
             return
-        peer_rank, unique_rid, sender_slice_id, is_last_slice, status_code, transfer_size = (
-            _KV_RESULT_PREFIX.unpack(message[1])
-        )
+        if self._enforce_physical_ownership:
+            (
+                peer_rank,
+                unique_rid,
+                sender_slice_id,
+                owner_generation,
+                is_last_slice,
+                status_code,
+                transfer_size,
+            ) = _KV_RESULT_PREFIX_V1.unpack(message[1])
+            _validate_owner_generation(owner_generation, "while decoding a result")
+        else:
+            (
+                peer_rank,
+                unique_rid,
+                sender_slice_id,
+                is_last_slice,
+                status_code,
+                transfer_size,
+            ) = _KV_RESULT_PREFIX.unpack(message[1])
+            owner_generation = None
         from .bounce import decode_result_tail
 
         dst_ptrs, sizes, src_base = decode_result_tail(message)
@@ -2179,6 +2334,7 @@ class Receiver(ReceiverBase):
             sender_slice_id,
             is_last_slice,
             _AGENT_RESULT_BY_CODE[status_code],
+            owner_generation=owner_generation,
             dst_ptrs=dst_ptrs,
             sizes=sizes,
             src_base=src_base,
@@ -2291,10 +2447,20 @@ class RxSession(RxSessionBase):
         with self.lock:
             if self._closed or self._terminal_status is not None:
                 return False
-            task = self._kv_tasks[slice_id]
-            task.seal_writer_cohort(writer_cohort)
-            task.status = TaskStatus.TRANSFERRING
-            self._sender_endpoints.update(sender_endpoints)
+            # Serialize publication admission with the sticky receive fault.
+            # A cohort admitted before a fault remains owned; later cohorts
+            # fail before exposing their destination.
+            with self._receiver._physical_ownership_fault_lock:
+                fault = self._receiver._physical_ownership_fault
+                if fault is not None:
+                    raise RuntimeError(
+                        "KV transfer physical ownership is poisoned; "
+                        "refusing destination publication"
+                    ) from fault
+                task = self._kv_tasks[slice_id]
+                task.seal_writer_cohort(writer_cohort)
+                task.status = TaskStatus.TRANSFERRING
+                self._sender_endpoints.update(sender_endpoints)
             if publish is not None:
                 publish()
             return True
@@ -2341,6 +2507,7 @@ class RxSession(RxSessionBase):
                 len(self._kv_tasks),
                 params,
                 aux_slot=self.aux_slot,
+                owner_generation=self._receiver.allocate_owner_generation(),
             )
             task.begin_publication()
             self._kv_tasks.append(task)
@@ -2366,6 +2533,7 @@ class RxSession(RxSessionBase):
         sender_slice_id: int,
         is_last_slice: bool,
         status: AgentResult,
+        owner_generation: Optional[int] = None,
         dst_ptrs=None,
         sizes=None,
         src_base=None,
@@ -2378,18 +2546,71 @@ class RxSession(RxSessionBase):
                 f"Sender/receiver slice count mismatch."
             )
             task = self._kv_tasks[sender_slice_id]
+            if owner_generation is None:
+                # Direct component callers predate the wire generation. The
+                # protocol-v1 parser always supplies an explicit generation.
+                owner_generation = task.owner_generation
+            if self._enforce_physical_ownership:
+                try:
+                    generation = _validate_owner_generation(
+                        owner_generation,
+                        f"for request {self.request_id} slice={sender_slice_id}",
+                    )
+                except ValueError as error:
+                    task.invalidate_physical_evidence()
+                    self._receiver._record_physical_ownership_fault(error)
+                    task.fail(error)
+                    if self._terminal_status is None:
+                        self._terminal_status = SessionStatus.ERROR
+                    raise
+                assert task.owner_generation is not None
+                if generation < task.owner_generation:
+                    logger.warning(
+                        "Ignoring stale KV result for request %s slice=%s: "
+                        "owner_generation=%s current=%s",
+                        self.request_id,
+                        sender_slice_id,
+                        generation,
+                        task.owner_generation,
+                    )
+                    return
+                if generation > task.owner_generation:
+                    error = RuntimeError(
+                        f"KV result owner generation mismatch for request {self.request_id} "
+                        f"slice={sender_slice_id}: got {generation}, "
+                        f"expected {task.owner_generation}"
+                    )
+                    task.invalidate_physical_evidence()
+                    self._receiver._record_physical_ownership_fault(error)
+                    task.fail(error)
+                    if self._terminal_status is None:
+                        self._terminal_status = SessionStatus.ERROR
+                    raise error
             if status not in (AgentResult.SUCCESS, AgentResult.FAILED):
                 raise ValueError(
                     f"Session {self.request_id} received unknown task status: {status.value}"
                 )
             if self._enforce_physical_ownership:
                 if status == AgentResult.FAILED or is_last_slice:
-                    accepted, all_succeeded = task.record_writer_result(
-                        peer_rank,
-                        status == AgentResult.SUCCESS,
-                        wait_for_local_completion=(status == AgentResult.SUCCESS),
-                    )
+                    try:
+                        accepted, all_succeeded = task.record_writer_result(
+                            peer_rank,
+                            status == AgentResult.SUCCESS,
+                            wait_for_local_completion=(status == AgentResult.SUCCESS),
+                        )
+                    except RuntimeError as error:
+                        self._receiver._record_physical_ownership_fault(error)
+                        task.fail(error)
+                        if self._terminal_status is None:
+                            self._terminal_status = SessionStatus.ERROR
+                        raise
                     if not accepted:
+                        logger.warning(
+                            "Ignoring duplicate KV result for request %s slice=%s peer_rank=%s",
+                            self.request_id,
+                            sender_slice_id,
+                            peer_rank,
+                        )
                         return
                 else:
                     all_succeeded = False
