@@ -672,6 +672,12 @@ class TestCosmos3T2V:
     def test_native_wan_vae_is_default(self, cosmos3_pipeline):
         assert isinstance(cosmos3_pipeline.vae, WanVAE)
 
+        config = cosmos3_pipeline.vae.config
+        assert len(config.latents_mean) == config.z_dim
+        assert len(config.latents_std) == config.z_dim
+        assert config.scale_factor_spatial == cosmos3_pipeline.vae_scale_factor_spatial
+        assert config.scale_factor_temporal == cosmos3_pipeline.vae_scale_factor_temporal
+
     def test_t2v_smoke(self, cosmos3_pipeline):
         result = _run_forward(cosmos3_pipeline, image=None, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
