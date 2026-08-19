@@ -182,6 +182,8 @@ class HNDHeadMismatchMapper(RegionMapperBase):
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int,
         peer_buffers_per_layer: int,
+        self_hnd_token_groups: int = 1,
+        peer_hnd_token_groups: int = 1,
     ):
         self._ri = self_ri
         self._peer_ri = peer_ri
@@ -217,11 +219,25 @@ class HNDHeadMismatchMapper(RegionMapperBase):
             buffers_per_layer=peer_buffers_per_layer,
             side="peer",
         )
-        bytes_per_head = self._bytes_per_head(
-            src_buffer_bytes, self._ri.attention.kv_heads_per_rank, side="local"
+        if self_hnd_token_groups != peer_hnd_token_groups:
+            raise ValueError(
+                "HND token-group count mismatch: "
+                f"local={self_hnd_token_groups}, peer={peer_hnd_token_groups}"
+            )
+        token_groups = int(self_hnd_token_groups)
+        if token_groups <= 0:
+            raise ValueError(f"HND token-group count must be positive, got {token_groups}")
+        bytes_per_head = self._bytes_per_head_group(
+            src_buffer_bytes,
+            self._ri.attention.kv_heads_per_rank,
+            token_groups,
+            side="local",
         )
-        peer_bytes_per_head = self._bytes_per_head(
-            dst_buffer_bytes, peer_ri.attention.kv_heads_per_rank, side="peer"
+        peer_bytes_per_head = self._bytes_per_head_group(
+            dst_buffer_bytes,
+            peer_ri.attention.kv_heads_per_rank,
+            token_groups,
+            side="peer",
         )
         if bytes_per_head != peer_bytes_per_head:
             raise ValueError(
@@ -242,29 +258,33 @@ class HNDHeadMismatchMapper(RegionMapperBase):
             bytes_per_head=bytes_per_head,
         )
 
-        # Pre-compute flat 1D offset arrays: one fragment per (layer, buffer)
-        # where buffers are the layer's K/V (or scale) buffers laid out
-        # back-to-back within the layer's region. Layer starts come from the
-        # view's buffer entries, so interleaved role classes (non-uniform
-        # layer strides) are handled the same way as everywhere else. At
-        # map() time a single np.add.outer(bases, flat_offsets) expands the
-        # per-block base pointers.
+        # Pre-compute one offset per (layer, buffer, token group). Ordinary
+        # HND has one group. A flat subpage alias has multiple independently
+        # head-major groups, so the selected logical heads must be sliced in
+        # every group. At map() time np.add.outer expands these offsets over
+        # the per-block base pointers.
         self._src_flat_offsets = self._build_flat_offsets(
             layer_offsets=src_offsets,
             buffers_per_layer=self_buffers_per_layer,
             buffer_bytes=src_buffer_bytes,
+            token_groups=token_groups,
+            heads=self._ri.attention.kv_heads_per_rank,
+            bytes_per_head=bytes_per_head,
             head_offset=self._src_head_off,
         )
         self._dst_flat_offsets = self._build_flat_offsets(
             layer_offsets=dst_offsets,
             buffers_per_layer=peer_buffers_per_layer,
             buffer_bytes=dst_buffer_bytes,
+            token_groups=token_groups,
+            heads=peer_ri.attention.kv_heads_per_rank,
+            bytes_per_head=peer_bytes_per_head,
             head_offset=self._dst_head_off,
         )
 
     @property
     def frags_per_block(self) -> int:
-        """One fragment per (layer, buffer): the head-mismatch descriptor explosion."""
+        """One fragment per layer, buffer, and HND token group."""
         return int(self._src_flat_offsets.size)
 
     @staticmethod
@@ -273,11 +293,19 @@ class HNDHeadMismatchMapper(RegionMapperBase):
         layer_offsets: np.ndarray,
         buffers_per_layer: int,
         buffer_bytes: int,
+        token_groups: int,
+        heads: int,
+        bytes_per_head: int,
         head_offset: int,
     ) -> np.ndarray:
         buffer_indices = np.arange(buffers_per_layer, dtype=np.int64)
+        group_indices = np.arange(token_groups, dtype=np.int64)
+        group_bytes = heads * bytes_per_head
         return (
-            layer_offsets[:, None] + buffer_bytes * buffer_indices[None, :] + head_offset
+            layer_offsets[:, None, None]
+            + buffer_bytes * buffer_indices[None, :, None]
+            + group_bytes * group_indices[None, None, :]
+            + head_offset
         ).ravel()
 
     @nvtx_range("HNDHeadMismatchMapper.map")
@@ -335,31 +363,35 @@ class HNDHeadMismatchMapper(RegionMapperBase):
         return bytes_per_layer // buffers_per_layer
 
     @staticmethod
-    def _bytes_per_head(layer_kv_bytes: int, heads: int, *, side: str) -> int:
-        """Bytes of one head's rows within a K/V buffer.
+    def _bytes_per_head_group(
+        buffer_bytes: int, heads: int, token_groups: int, *, side: str
+    ) -> int:
+        """Bytes of one head within one independently head-major group.
 
         Byte-granular head slicing is only valid when a head lands on a byte
         boundary; sub-byte dtypes (e.g. NVFP4) satisfy this whenever the
         per-head element count covers whole bytes, which this divisibility
         check enforces without any fractional arithmetic.
         """
-        if heads <= 0 or layer_kv_bytes % heads != 0:
+        divisor = heads * token_groups
+        if divisor <= 0 or buffer_bytes % divisor != 0:
             raise ValueError(
-                f"HND head slicing is not byte-aligned ({side}): "
-                f"layer_kv_bytes={layer_kv_bytes}, kv_heads={heads}"
+                f"HND grouped head slicing is not byte-aligned ({side}): "
+                f"buffer_bytes={buffer_bytes}, kv_heads={heads}, "
+                f"hnd_token_groups={token_groups}"
             )
-        return layer_kv_bytes // heads
+        return buffer_bytes // divisor
 
 
 class NHDHeadMismatchMapper(HNDHeadMismatchMapper):
     """Map heterogeneous KV heads stored token-major as ``[N, H, D]``.
 
-    ``HNDHeadMismatchMapper`` selects one contiguous head range per K/V buffer,
-    which is correct for HND storage. In NHD storage, the selected head range
-    is contiguous only within one token, so this mapper emits one fragment per
-    ``(layer, K/V, token)``. Only offset precomputation differs from the
-    parent; the inherited :meth:`map` consumes ``_src_flat_offsets``,
-    ``_dst_flat_offsets``, and ``_bytes_cont_heads``.
+    ``HNDHeadMismatchMapper`` selects one contiguous head range per K/V buffer
+    and token group, which is correct for HND storage. In NHD storage, the
+    selected head range is contiguous only within one token, so this mapper
+    emits one fragment per ``(layer, K/V, token)``. Only offset precomputation
+    differs from the parent; the inherited :meth:`map` consumes
+    ``_src_flat_offsets``, ``_dst_flat_offsets``, and ``_bytes_cont_heads``.
     """
 
     def __init__(
@@ -511,12 +543,14 @@ class AttentionPolicy:
 
     @staticmethod
     def _uses_exact_tpb_mapper(ri: RankInfo) -> bool:
-        """NHD / replicated pools address bytes inside a block, so their
-        geometry only lines up when both sides use the same tokens_per_block."""
+        """NHD, replicated, and grouped-HND pools address bytes inside a
+        block, so their geometry only lines up when both sides use the same
+        tokens_per_block."""
         if ri.page_table is None:
             return False
         return any(
             pool_view.mapper_kind in (MapperKind.NHD, MapperKind.REPLICATED)
+            or pool_view.hnd_token_groups != 1
             for layer_group in ri.page_table.layer_groups
             for pool_view in getattr(layer_group, "pool_views", ())
         )
@@ -527,7 +561,7 @@ class AttentionPolicy:
         if self._uses_exact_tpb_mapper(self._ri) or self._uses_exact_tpb_mapper(peer_ri):
             logger.warning(
                 "AttentionPolicy: incompatible: tokens_per_block mismatch for "
-                "NHD/replicated pools; local=%d peer=%d",
+                "NHD/replicated/grouped-HND pools; local=%d peer=%d",
                 local,
                 peer,
             )
@@ -618,6 +652,8 @@ class AttentionPolicy:
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int = 1,
         peer_buffers_per_layer: int = 1,
+        self_hnd_token_groups: int = 1,
+        peer_hnd_token_groups: int = 1,
     ) -> RegionMapperBase:
         """Pick the mapper for one view pair.
 
@@ -629,7 +665,8 @@ class AttentionPolicy:
         - REPLICATED skips head matching entirely (bytes are identical on
           every TP rank; fan-in ownership is decided upstream).
         - Under head mismatch, HND (INDEXED) slices one contiguous head
-          range per K/V buffer, while NHD must slice inside every token.
+          range per K/V buffer and token group, while NHD must slice inside
+          every token.
 
         Head-matched views of any kind collapse into IntactMapper,
         whose run merging degrades to a single whole-region copy per block
@@ -674,4 +711,6 @@ class AttentionPolicy:
             peer_bytes_per_layer=peer_bytes_per_layer,
             self_buffers_per_layer=self_buffers_per_layer,
             peer_buffers_per_layer=peer_buffers_per_layer,
+            self_hnd_token_groups=self_hnd_token_groups,
+            peer_hnd_token_groups=peer_hnd_token_groups,
         )

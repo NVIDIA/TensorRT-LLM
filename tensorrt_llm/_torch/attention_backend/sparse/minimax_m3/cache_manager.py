@@ -268,6 +268,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         super().__init__(*args, **kwargs)
 
+        self._shared_draft_local_layer_ids = frozenset(
+            self.layer_offsets[layer_id]
+            for layer_id in self._shared_draft_layer_ids
+            if layer_id in self.layer_offsets
+        )
+
         self._draft_subpage_view_obj: Optional["MiniMaxM3DraftSubpageView"] = None
         if self._shared_draft_layer_ids and self.sparse_layer_ids and not self.is_draft:
             # Paired with the "view active" log at first dispatch.
@@ -317,10 +323,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if self.is_draft or not self._shared_draft_layer_ids:
             return None
         if self._draft_subpage_view_obj is None:
-            subpage_tokens = (
-                int(os.environ.get("TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK", 0) or 0)
-                or self.draft_manager_tokens_per_block
-            )
+            subpage_tokens = self._get_draft_subpage_tokens()
             self._draft_subpage_view_obj = MiniMaxM3DraftSubpageView(
                 self,
                 self._shared_draft_layer_ids,
@@ -332,6 +335,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 f"flat_page_bound={self._draft_subpage_view_obj.blocks_in_primary_pool})"
             )
         return self._draft_subpage_view_obj
+
+    def _get_draft_subpage_tokens(self) -> int:
+        return (
+            int(os.environ.get("TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK", 0) or 0)
+            or self.draft_manager_tokens_per_block
+        )
 
     def add_dummy_requests(self, *args, **kwargs):
         """Drop the draft sub-page view before delegating.
@@ -374,6 +383,22 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             Role.ALL: main_kv_mapper,
             Role.INDEX_KEY: MapperKind.REPLICATED,
         }
+
+    def get_disagg_hnd_token_groups(self, local_layer_id: int, role: DataRole) -> int:
+        """Describe the shared draft layer's topology-dependent HND view."""
+        if (
+            self._main_kv_layout == "HND"
+            and local_layer_id in self._shared_draft_local_layer_ids
+            and role in (Role.KEY, Role.VALUE)
+        ):
+            subpage_tokens = self._get_draft_subpage_tokens()
+            if self.tokens_per_block % subpage_tokens != 0:
+                raise ValueError(
+                    f"draft subpage size {subpage_tokens} must divide "
+                    f"tokens_per_block={self.tokens_per_block}"
+                )
+            return self.tokens_per_block // subpage_tokens
+        return 1
 
     def _compute_num_total_slots(self) -> int:
         """Total token slots across all blocks in the main K pool.

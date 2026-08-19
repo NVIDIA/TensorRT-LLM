@@ -257,6 +257,13 @@ class PeerRegistrar:
                             f"(local={self_pv.mapper_kind.name}, "
                             f"peer={peer_pv.mapper_kind.name}, peer_pool={peer_pi})"
                         )
+                    if peer_pv.hnd_token_groups != self_pv.hnd_token_groups:
+                        raise ValueError(
+                            "PeerRegistrar.get_pool_mapping: incompatible HND token "
+                            f"groups for pool role {sorted(self_pv.pool_role)} "
+                            f"(local={self_pv.hnd_token_groups}, "
+                            f"peer={peer_pv.hnd_token_groups}, peer_pool={peer_pi})"
+                        )
                     matched_peer_pi = peer_pi
                     break
 
@@ -362,6 +369,8 @@ class PeerRegistrar:
             peer_bytes_per_layer=peer_bytes_per_layer,
             self_buffers_per_layer=self_buffers_per_layer,
             peer_buffers_per_layer=peer_buffers_per_layer,
+            self_hnd_token_groups=self_pv.hnd_token_groups,
+            peer_hnd_token_groups=peer_pv.hnd_token_groups,
         )
 
         self._kv_map_cache[cache_key] = mapper

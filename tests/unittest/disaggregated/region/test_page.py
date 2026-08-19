@@ -76,7 +76,7 @@ def test_pool_view_roundtrip():
 
 
 def test_pool_view_kind_roundtrip():
-    """REPLICATED / NHD kinds survive serialization; default stays INDEXED."""
+    """Mapper kind and grouped-HND metadata survive serialization."""
     entries = _make_buffer_entries()
     for kind in (MapperKind.REPLICATED, MapperKind.NHD):
         view = PoolView(
@@ -89,8 +89,14 @@ def test_pool_view_kind_roundtrip():
         assert restored.mapper_kind == kind
         assert restored.pool_role == frozenset({"index_key"})
 
+    grouped = PoolView(pool_idx=0, buffer_entries=entries, hnd_token_groups=4)
+    assert PoolView.from_dict(grouped.to_dict()).hnd_token_groups == 4
+
     legacy = PoolView(pool_idx=0, buffer_entries=entries).to_dict()
-    assert PoolView.from_dict(legacy).mapper_kind == MapperKind.INDEXED
+    legacy.pop("hnd_token_groups")
+    restored = PoolView.from_dict(legacy)
+    assert restored.mapper_kind == MapperKind.INDEXED
+    assert restored.hnd_token_groups == 1
 
 
 def test_local_layer_roundtrip():

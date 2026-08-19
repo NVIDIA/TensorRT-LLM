@@ -1161,6 +1161,76 @@ def test_indexed_head_mismatch_subbyte_geometry_is_entries_derived():
     assert pair.dst.memory.ptrs.dtype == np.int64
 
 
+def test_indexed_head_mismatch_slices_each_hnd_subpage():
+    """A smaller HND view makes subpages, not physical heads, contiguous.
+
+    This models MiniMax M3's TP2 context (two local KV heads) transferring
+    into attention-DP generation (four local KV heads). Each 8-token physical
+    block is consumed as four 2-token draft pages, so every page needs its own
+    head-range descriptor.
+    """
+    self_ri = make_rankinfo(
+        tp_size=2,
+        tp_rank=1,
+        kv_heads_per_rank=2,
+        tokens_per_block=8,
+        dims_per_head=1,
+        element_bytes=1,
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=2,
+        tp_rank=0,
+        dp_size=2,
+        dp_rank=0,
+        kv_heads_per_rank=4,
+        tokens_per_block=8,
+        dims_per_head=1,
+        element_bytes=1,
+        enable_attention_dp=True,
+    )
+    mapper = HNDHeadMismatchMapper(
+        src_layer_offsets=[0],
+        dst_layer_offsets=[0],
+        self_ri=self_ri,
+        peer_ri=peer_ri,
+        self_bytes_per_layer=32,
+        peer_bytes_per_layer=64,
+        self_buffers_per_layer=2,
+        peer_buffers_per_layer=2,
+        self_hnd_token_groups=4,
+        peer_hnd_token_groups=4,
+    )
+
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=32)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=64)),
+    )
+
+    assert pair.src.memory.ptrs.tolist() == [
+        1000,
+        1004,
+        1008,
+        1012,
+        1016,
+        1020,
+        1024,
+        1028,
+    ]
+    assert pair.dst.memory.ptrs.tolist() == [
+        2004,
+        2012,
+        2020,
+        2028,
+        2036,
+        2044,
+        2052,
+        2060,
+    ]
+    assert pair.src.memory.bytes_per_region == 4
+    assert mapper.frags_per_block == 8
+
+
 def test_indexed_head_mismatch_inconsistent_slot_geometry_raises():
     self_ri = make_rankinfo(tp_size=1, kv_heads_per_rank=2)
     peer_ri = make_rankinfo(instance_name="peer", tp_size=2, kv_heads_per_rank=1)
