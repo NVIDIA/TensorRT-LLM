@@ -39,11 +39,14 @@ from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.dflash_attention import (get_dflash_flash_attention,
                                             get_dflash_trtllm_gen_ops)
+from ..speculative.interface import SpeculativeDecodingMode
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
-                             get_model_architecture, register_auto_model)
+                             get_model_architecture,
+                             get_registered_draft_model_builder,
+                             register_auto_model, register_draft_model)
 
 _SPECULATIVE_POSITION_HEADROOM = "_speculative_position_headroom"
 
@@ -2433,81 +2436,122 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
     return kwargs
 
 
-def get_draft_model(model_config, draft_config, lm_head, model):
-    """Construct the draft model for the configured speculative-decoding mode
-    (EAGLE3 / MTP / PARD / DFlash). The DFlash branch selects the Laguna drafter
-    by detecting its architecture in the draft checkpoint's own config."""
-    assert getattr(model_config, 'spec_config', None) is not None
+@register_draft_model(SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
+def _build_eagle3_one_model_draft(model_config, draft_config, lm_head, model):
+    """Build the EAGLE3 one-model drafter for the configured draft arch."""
     spec_dec_mode = model_config.spec_config.spec_dec_mode
-    if spec_dec_mode.is_eagle3_one_model():
-        if model_config.spec_config.eagle3_model_arch == "llama3":
-            # Eagle3ForCausalLM handles both Llama3 and DeepSeekV3 architectures
-            return Eagle3ForCausalLM(
-                draft_config, model_config.pretrained_config.num_hidden_layers)
-        elif model_config.spec_config.eagle3_model_arch == "mistral_large3":
-            return MistralLarge3EagleForCausalLM(
-                draft_config, model_config.pretrained_config.num_hidden_layers,
-                model.aux_stream_dict)
-        else:
-            raise ValueError(
-                f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
-            )
+    if model_config.spec_config.eagle3_model_arch == "llama3":
+        # Eagle3ForCausalLM handles both Llama3 and DeepSeekV3 architectures
+        return Eagle3ForCausalLM(
+            draft_config, model_config.pretrained_config.num_hidden_layers)
+    elif model_config.spec_config.eagle3_model_arch == "mistral_large3":
+        return MistralLarge3EagleForCausalLM(
+            draft_config, model_config.pretrained_config.num_hidden_layers,
+            model.aux_stream_dict)
+    else:
+        raise ValueError(
+            f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
+        )
 
-    elif model_config.spec_config.uses_external_draft_model:
+
+@register_draft_model(SpeculativeDecodingMode.MTP)
+@register_draft_model(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
+def _build_mtp_one_model_draft(model_config, draft_config, lm_head, model):
+    """Build the one-model MTP drafter (vanilla MTP and MTP-Eagle share it)."""
+    return MTPForCausalLM(model_config,
+                          model_config.pretrained_config.num_hidden_layers,
+                          lm_head, model)
+
+
+@register_draft_model(SpeculativeDecodingMode.MTP_EAGLE)
+def _build_mtp_eagle_draft(model_config, draft_config, lm_head, model):
+    """Build the two-model MTP-Eagle drafter."""
+    return MTPDraftModelForCausalLM(model_config)
+
+
+@register_draft_model(SpeculativeDecodingMode.PARD)
+def _build_pard_draft(model_config, draft_config, lm_head, model):
+    """Build the PARD drafter."""
+    return PARDForCausalLM(draft_config)
+
+
+@register_draft_model(SpeculativeDecodingMode.DFLASH)
+def _build_dflash_draft(model_config, draft_config, lm_head, model):
+    """Build the DFlash drafter.
+
+    Selects the Laguna variant by detecting its architecture in the draft
+    checkpoint's own config.
+    """
+    draft_arches = getattr(draft_config.pretrained_config, "architectures",
+                           None) or []
+    dflash_attention_backend = model_config.spec_config.attention_backend
+    if any("Laguna" in arch for arch in draft_arches):
+        return DFlashLagunaForCausalLM(
+            draft_config,
+            dflash_attention_backend=dflash_attention_backend,
+        )
+    return DFlashForCausalLM(
+        draft_config,
+        dflash_attention_backend=dflash_attention_backend,
+    )
+
+
+@register_draft_model(SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL)
+def _build_draft_target_one_model_draft(model_config, draft_config, lm_head,
+                                        model):
+    """Build the one-model draft-target drafter from its own checkpoint."""
+    # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
+    # lighter TP gather (see SpecWorkerBase.greedy_sample_draft_with_tp_gather).
+    was_frozen = draft_config._frozen
+    draft_config._frozen = False
+    draft_config.lm_head_gather_output = False
+    draft_config._frozen = was_frozen
+    return AutoModelForCausalLM.from_config(draft_config)
+
+
+def get_draft_model(model_config, draft_config, lm_head, model):
+    """Construct the draft model for the configured speculative-decoding mode.
+
+    Dispatch is registry-based: each mode's builder lives next to the draft
+    model it constructs and registers itself via ``@register_draft_model``, so
+    this function never imports a concrete draft implementation (which is what
+    used to force a lazy import for DSpark, whose provider imports back into
+    this module through modeling_deepseekv4).
+
+    Args:
+        model_config: the target engine's ``ModelConfig``, carrying spec_config.
+        draft_config: the drafter's own ``ModelConfig``, or None when the mode
+            builds its draft from the target config alone.
+        lm_head: the target's LM head, shared by the one-model MTP drafter.
+        model: the target model, for drafters reusing its aux streams.
+
+    Returns:
+        The draft ``nn.Module`` for this mode.
+    """
+    assert getattr(model_config, 'spec_config', None) is not None
+    spec_config = model_config.spec_config
+    spec_dec_mode = spec_config.spec_dec_mode
+    # An external draft model is loaded straight from its own checkpoint, so it
+    # has no mode-specific builder to register: this stays an explicit pre-check
+    # ahead of the registry lookup rather than becoming a registry key.
+    #
+    # No mode guard is needed. `uses_external_draft_model` already implies
+    # `is_mtp_one_model()` (llm_args), which is disjoint from every other mode,
+    # so this branch cannot divert a drafter that a builder would have claimed.
+    # Pinned by test_draft_model_registry.py::
+    # test_external_draft_model_bypasses_the_registry.
+    if spec_config.uses_external_draft_model:
         if draft_config is None:
             raise ValueError(
                 "MTP speculative decoding with an external draft model requires "
                 "its model config.")
         return AutoModelForCausalLM.from_config(draft_config)
-    elif spec_dec_mode.is_mtp_one_model():
-        return MTPForCausalLM(model_config,
-                              model_config.pretrained_config.num_hidden_layers,
-                              lm_head, model)
-    elif spec_dec_mode.is_mtp_eagle():
-        return MTPDraftModelForCausalLM(model_config)
-    elif spec_dec_mode.is_pard():
-        return PARDForCausalLM(draft_config)
-    elif spec_dec_mode.is_dflash():
-        draft_arches = getattr(draft_config.pretrained_config, "architectures",
-                               None) or []
-        dflash_attention_backend = model_config.spec_config.attention_backend
-        if any("Laguna" in arch for arch in draft_arches):
-            return DFlashLagunaForCausalLM(
-                draft_config,
-                dflash_attention_backend=dflash_attention_backend,
-            )
-        return DFlashForCausalLM(
-            draft_config,
-            dflash_attention_backend=dflash_attention_backend,
-        )
-    elif spec_dec_mode.is_dspark():
-        # Lazy import to avoid a cycle (modeling_dspark -> modeling_deepseekv4 ->
-        # modeling_speculative). The DSpark draft reuses the target's aux streams.
-        # The draft stage count (n_mtp_layers) is not in the HF config, so derive
-        # it from the checkpoint's mtp.* namespace.
-        from .modeling_dspark import (DSparkForCausalLM, count_dspark_stages,
-                                      validate_dspark_eplb_layer_base)
-        num_stages = count_dspark_stages(
-            model_config.spec_config.speculative_model)
-        validate_dspark_eplb_layer_base(model_config, draft_config)
-        return DSparkForCausalLM(
-            draft_config,
-            getattr(model, "aux_stream_dict", None),
-            num_stages=num_stages,
-            block_size=model_config.spec_config.block_size,
-        )
-    elif spec_dec_mode.is_draft_target_one_model():
-        # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
-        # lighter TP gather (see SpecWorkerBase.greedy_sample_draft_with_tp_gather).
-        was_frozen = draft_config._frozen
-        draft_config._frozen = False
-        draft_config.lm_head_gather_output = False
-        draft_config._frozen = was_frozen
-        return AutoModelForCausalLM.from_config(draft_config)
-    else:
+    builder = get_registered_draft_model_builder(spec_dec_mode)
+    if builder is None:
         raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
         )
+    return builder(model_config, draft_config, lm_head, model)
 
 
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
