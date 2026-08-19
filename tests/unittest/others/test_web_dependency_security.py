@@ -24,13 +24,13 @@ pytestmark = pytest.mark.cpu_only
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _requirement(name: str) -> Requirement:
-    for line in (REPO_ROOT / "requirements.txt").read_text().splitlines():
+def _requirement(name: str, manifest: str = "requirements.txt") -> Requirement:
+    for line in (REPO_ROOT / manifest).read_text().splitlines():
         if line.startswith(f"{name}"):
             requirement = Requirement(line)
             if requirement.name == name:
                 return requirement
-    raise AssertionError(f"Missing requirement for {name}")
+    raise AssertionError(f"Missing requirement for {name} in {manifest}")
 
 
 def _minimum_version(requirement: Requirement) -> Version:
@@ -49,5 +49,16 @@ def test_web_framework_security_floors() -> None:
 
     assert _minimum_version(fastapi) >= Version("0.136.3")
     assert Version("0.121.3") not in fastapi.specifier
+    # Starlette 1.3.x needs fastapi < 0.137, so the upper bound is load-bearing.
+    assert Version("0.137.0") not in fastapi.specifier
+    assert _minimum_version(starlette) >= Version("1.3.1")
+    assert Version("0.50.0") not in starlette.specifier
+
+
+def test_starlette_constraint_floor() -> None:
+    # constraints.txt carries the GHSA-82w8-qh3p-5jfq WAR. It must stay active
+    # (uncommented) at the patched floor, which is what this PR turns back on.
+    starlette = _requirement("starlette", "constraints.txt")
+
     assert _minimum_version(starlette) >= Version("1.3.1")
     assert Version("0.50.0") not in starlette.specifier
