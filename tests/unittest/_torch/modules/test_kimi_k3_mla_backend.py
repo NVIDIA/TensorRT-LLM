@@ -59,25 +59,26 @@ def test_select_kimi_k3_mla_generation_backend_uses_trtllm_gen_for_fp8_kv_cache(
         "num_contexts",
         "num_generations",
         "num_gen_tokens",
+        "num_heads",
         "expected_backend",
     ),
     [
-        ("cute-dsl", 0, 4, 4, "cute-dsl"),
-        ("cute-dsl", 1, 3, 3, "trtllm-gen"),
-        ("cute-dsl", 0, 4, 8, "trtllm-gen"),
-        ("trtllm-gen", 1, 3, 3, "trtllm-gen"),
+        ("cute-dsl", 0, 4, 4, 96, "cute-dsl"),
+        ("cute-dsl", 1, 3, 3, 12, "trtllm-gen"),
+        ("cute-dsl", 1, 3, 3, 96, "cute-dsl"),
+        ("cute-dsl", 0, 4, 8, 96, "trtllm-gen"),
+        ("trtllm-gen", 1, 3, 3, 96, "trtllm-gen"),
     ],
 )
-def test_kimi_k3_mla_decode_backend_policy_falls_back_for_mixed_batches(
+def test_kimi_k3_mla_decode_backend_policy_by_batch_shape(
     requested_backend: str,
     num_contexts: int,
     num_generations: int,
     num_gen_tokens: int,
+    num_heads: int,
     expected_backend: str,
 ) -> None:
-    """K3's per-batch policy keeps CuTe-DSL only for generation-only,
-    one-token-per-request batches; mixed or multi-token batches fall back
-    to trtllm-gen."""
+    """K3 falls back outside plain decode except for unsafe H=96 mixed batches."""
     assert (
         _kimi_k3_mla_decode_backend_policy(
             requested_backend,
@@ -86,6 +87,7 @@ def test_kimi_k3_mla_decode_backend_policy_falls_back_for_mixed_batches(
                 num_generations=num_generations,
             ),
             num_gen_tokens,
+            num_heads=num_heads,
         )
         == expected_backend
     )

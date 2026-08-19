@@ -58,6 +58,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .interface import _CuteDslMlaStagingKey
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -502,10 +503,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (576, 512),
     }
 
-    def __init__(self, attn: "TrtllmAttention"):
+    def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
         self._layout = self.DEFAULT_KV_LAYOUT
-        requested_mla_backend = _get_mla_backend(attn.flashinfer_mla_backend)
+        requested_mla_backend = _get_mla_backend(attn.flashinfer_mla_backend or "trtllm-gen")
         if requested_mla_backend == "cute-dsl" and attn.is_mla_enable and attn.has_fp8_kv_cache:
             raise ValueError(
                 "flashinfer_mla_backend='cute-dsl' does not support FP8 KV cache device scales; "
@@ -1404,15 +1405,15 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             # intervening prepare(), and the capture pass MUST re-record the
             # staging copies (a skip would freeze stale page tables into the
             # graph).
-            staging_key = (
-                torch.cuda.is_current_stream_capturing(),
-                params.workspace.data_ptr(),
-                block_tables.data_ptr(),
-                tuple(block_tables.shape),
-                params.sequence_lengths.data_ptr(),
-                params.seq_offset,
-                batch_beam,
-                padded_num_pages,
+            staging_key = _CuteDslMlaStagingKey(
+                is_capturing=torch.cuda.is_current_stream_capturing(),
+                workspace_ptr=params.workspace.data_ptr(),
+                block_tables_ptr=block_tables.data_ptr(),
+                block_tables_shape=tuple(block_tables.shape),
+                sequence_lengths_ptr=params.sequence_lengths.data_ptr(),
+                sequence_lengths_offset=params.seq_offset,
+                batch_beam=batch_beam,
+                padded_num_pages=padded_num_pages,
             )
             skip_staging_copy = (
                 meta.num_contexts == 0

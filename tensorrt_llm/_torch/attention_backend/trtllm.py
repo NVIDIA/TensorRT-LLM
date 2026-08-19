@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend.fmha import (
     Fmha, get_enabled_fmha_lib_classes)
+from tensorrt_llm._torch.attention_backend.fmha.interface import (
+    MlaBackendPolicy, _CuteDslMlaStagingKey)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -183,9 +185,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # copies and later layers skip. Reset whenever kv lens can change so
     # eager forwards always re-stage (under CUDA graphs the first layer's
     # captured copies replay once per step).
-    _cute_dsl_mla_staging_key: Optional[tuple] = field(default=None,
-                                                       init=False,
-                                                       repr=False)
+    _cute_dsl_mla_staging_key: Optional[_CuteDslMlaStagingKey] = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
@@ -1427,9 +1431,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
-        flashinfer_mla_backend: str = "trtllm-gen",
+        flashinfer_mla_backend: Optional[str] = None,
         **kwargs,
-    ):
+    ) -> None:
         """
         Initialize the backend.
         Args:
@@ -1443,8 +1447,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
-            flashinfer_mla_backend (str): FlashInfer MLA generation backend selected for
-                                         this attention instance.
+            flashinfer_mla_backend (Optional[str]): FlashInfer MLA generation backend
+                                                    selected for this attention instance.
+                                                    None preserves the ordered FMHA-library
+                                                    dispatch.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -1458,8 +1464,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # installs a policy on the attention instances it owns; it lives on
         # the backend object rather than the FMHA lib instances because
         # ``create_fmha_libs`` may recreate those after model construction.
-        self.mla_backend_policy: Optional[Callable[
-            [str, "TrtllmAttentionMetadata", int], str]] = None
+        self.mla_backend_policy: Optional[MlaBackendPolicy] = None
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
