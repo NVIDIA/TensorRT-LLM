@@ -96,7 +96,7 @@ fails earlier can send a terminal report without an initial report.
 | `featuresJson` | string | Legacy JSON-serialized summary of feature flags. See [featuresJson keys](#featuresjson-keys). | `'{"lora":false,...}'` |
 | `llmApiConfigJson` | string | JSON-serialized sanitized, type-driven effective LLM API configuration. See [LLM API config capture](#llm-api-config-capture). | `'{"tensor_parallel_size":2,...}'` |
 | `llmApiConfigMetaJson` | string | JSON-serialized metadata for LLM API configuration capture. | `'{"capture_succeeded":true,...}'` |
-| `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"` |
+| `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"`, `"coordinator"`, `"server_coordinator"`, `"ctx0"`, `"gen0"` |
 | `deploymentId` | ShortString | Shared ID across disaggregated workers. Empty if not disaggregated. | `""`, `"dep-abc123"` |
 
 #### Aggregate LLM lifecycle counters
@@ -122,7 +122,7 @@ heartbeats per session.
 |-------|------|-------------|---------|
 | `seq` | PositiveInt | Zero-based heartbeat sequence number. | `0`, `1`, `42` |
 | `ingressPoint` | ShortString | Invocation boundary for the process session. | `"cli_serve"` |
-| `disaggRole` | ShortString | Disaggregated role, including compatible legacy values such as `ctx0`/`gen0`. | `"context"` |
+| `disaggRole` | ShortString | Disaggregated role: `context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`. | `"context"` |
 | `deploymentId` | ShortString | Optional shared disaggregated deployment ID. | `"dep-abc123"` |
 
 Every heartbeat also contains the five aggregate LLM lifecycle counters above.
@@ -142,7 +142,7 @@ outcome. Missing terminal events remain unknown; they are not confirmed crashes.
 | `component` | enum | `llm`, `server`, `engine_worker`, `disagg_worker`, or `unknown`. |
 | `reportingSource` | enum | `self`, `supervisor`, or `executor_proxy`. |
 | `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |
-| `disaggRole` | ShortString | Disaggregated role, or empty when unavailable/not applicable. |
+| `disaggRole` | ShortString | Disaggregated role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy `ctx0`/`gen0`), or empty when unavailable/not applicable. |
 | `deploymentId` | ShortString | Optional shared disaggregated deployment ID. |
 
 Every terminal report also contains the five aggregate LLM lifecycle counters
@@ -270,7 +270,7 @@ over time.
 | `TRTLLM_USAGE_STATS_SERVER` | `https://events.gfe.nvidia.com/v1.1/events/json` | Override the GXT endpoint URL. Use for staging. |
 | `TRTLLM_USAGE_HEARTBEAT_INTERVAL` | `600` | Heartbeat interval in seconds. |
 | `TRTLLM_USAGE_FORCE_ENABLED` | `0` | Set to `1` to force-enable telemetry in CI/test environments. |
-| `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context`, `generation`, or compatible legacy values such as `ctx0`/`gen0`). |
+| `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`). |
 | `TRTLLM_DISAGG_DEPLOYMENT_ID` | unset | Shared deployment ID across disaggregated workers. |
 
 ## For Developers: Adding a New Field
