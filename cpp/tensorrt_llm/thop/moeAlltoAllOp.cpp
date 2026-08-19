@@ -92,54 +92,54 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 {
     // TODO: Use lambdas to encapsulate offset and alignment for each entry, which is less error prone and easier to
     // read.
-    constexpr size_t SIZEOF_INT32 = 4;
+    constexpr size_t kSizeOfInt32 = sizeof(int32_t);
 
     MoeA2ADataOffsets offsets{};
     size_t offset = 0;
 
     // flag_val
     offsets[FLAG_VAL_OFFSET_INDEX] = offset;
-    offset += SIZEOF_INT32;
+    offset += kSizeOfInt32;
 
     // local_token_counter
     offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX] = offset;
-    offset += SIZEOF_INT32;
+    offset += kSizeOfInt32;
 
     // send_counters
     offsets[SEND_COUNTERS_OFFSET_INDEX] = offset;
-    offset += epSize * SIZEOF_INT32;
+    offset += epSize * kSizeOfInt32;
 
     // recv_counters[parity][source_rank] stores the token count received from source_rank.
     // The two parity banks alternate between A2A rounds.
     offsets[RECV_COUNTERS_OFFSET_INDEX] = offset;
-    offset += 2 * epSize * SIZEOF_INT32;
+    offset += 2 * epSize * kSizeOfInt32;
 
     // dispatch completion flags
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX] = offset;
-    offset += epSize * SIZEOF_INT32;
+    offset += epSize * kSizeOfInt32;
 
     // combine completion flags
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[COMBINE_COMPLETION_FLAGS_OFFSET_INDEX] = offset;
-    offset += epSize * SIZEOF_INT32;
+    offset += epSize * kSizeOfInt32;
 
     // topk_target_ranks: [maxNumTokens, kMaxTopK]
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[TOPK_TARGET_RANKS_OFFSET_INDEX] = offset;
     offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
-        * SIZEOF_INT32;
+        * kSizeOfInt32;
 
     // topk_send_indices: [maxNumTokens, kMaxTopK]
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[TOPK_SEND_INDICES_OFFSET_INDEX] = offset;
     offset += static_cast<size_t>(maxNumTokens) * static_cast<size_t>(tensorrt_llm::kernels::moe_comm::kMaxTopK)
-        * SIZEOF_INT32;
+        * kSizeOfInt32;
 
     // eplb gathered stats: [epSize, eplbStatsNumExperts]
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     offsets[EPLB_GATHERED_STATS_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(epSize) * static_cast<size_t>(eplbStatsNumExperts) * SIZEOF_INT32;
+    offset += static_cast<size_t>(epSize) * static_cast<size_t>(eplbStatsNumExperts) * kSizeOfInt32;
 
     // Counted write counters: each 8B counter must be kCftCounterStride-aligned, so that
     // concurrent counter updates do not contend for the same L2 port.
