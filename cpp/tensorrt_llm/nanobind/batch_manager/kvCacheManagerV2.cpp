@@ -51,6 +51,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -61,11 +62,14 @@ namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
 namespace tensorrt_llm::nanobind::batch_manager
 {
 
-// Helper: convert a Python iterable of int|bytes to vector<TokenIdExt>.
-// nanobind's variant caster can't auto-convert bytes → DigestToken.
-static std::vector<kv::TokenIdExt> castTokenIterable(nb::handle tokens)
+// Helper: convert a Python iterable of int|bytes to a token vector, and report
+// whether it is digest-free (knownNoDigest). A normal int becomes a 31-bit token id
+// (range-checked); 32 bytes become a digest. The digest-free flag is computed for free
+// here while iterating, feeding the hashing fast path. Python contract: `int | bytes(32)`.
+static std::pair<std::vector<kv::TokenIdExt>, bool> castTokenIterable(nb::handle tokens)
 {
     std::vector<kv::TokenIdExt> vec;
+    bool knownNoDigest = true;
     for (auto item : nb::cast<nb::iterable>(tokens))
     {
         if (nb::isinstance<nb::bytes>(item))
@@ -75,16 +79,54 @@ static std::vector<kv::TokenIdExt> castTokenIterable(nb::handle tokens)
             {
                 throw std::invalid_argument("Token bytes must have length kDIGEST_LEN");
             }
-            kv::Digest d;
-            std::memcpy(d.data(), b.c_str(), kv::kDIGEST_LEN);
-            vec.emplace_back(kv::DigestToken(d));
+            kv::Digest digest;
+            std::memcpy(digest.data(), b.c_str(), kv::kDIGEST_LEN);
+            vec.emplace_back(digest);
+            knownNoDigest = false;
         }
         else
         {
-            vec.emplace_back(nb::cast<kv::TokenId>(item));
+            auto const tokenId = nb::cast<int64_t>(item);
+            if (tokenId < 0 || tokenId > static_cast<int64_t>(kv::TokenIdExt::kMaxValue))
+            {
+                throw std::invalid_argument("Token id out of range [0, 2^31)");
+            }
+            vec.emplace_back(static_cast<kv::TokenId>(tokenId));
         }
     }
-    return vec;
+    return {std::move(vec), knownNoDigest};
+}
+
+// Zero-copy-friendly token ingestion. Invokes fn(TokenSpan, knownNoDigest) with a non-owning
+// view of the tokens; fn must consume it synchronously (it may release the GIL — the backing
+// buffer must outlive the call).
+//
+// Fast path: a contiguous 1-D int32 CPU buffer (numpy view, memoryview, array.array, torch CPU
+// tensor) is reinterpret_cast to TokenIdExt const* — no copy, no per-token boxing — since a normal
+// token id is bit-identical to a 4-byte TokenIdExt (see tokenIdExt.h). convert=false keeps it
+// strictly zero-copy; a non-int32 / non-contiguous input falls through.
+//
+// Fallback: any int|bytes(32) iterable via castTokenIterable — the multimodal/digest path.
+template <class Fn>
+static auto withTokens(nb::handle tokens, Fn&& fn)
+{
+    nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> arr;
+    if (nb::try_cast(tokens, arr, /*convert=*/false))
+    {
+        auto const count = static_cast<int32_t>(arr.shape(0));
+        auto const* raw = arr.data();
+        // Every element must be a normal id (high/digest bit clear); a negative int32 would look
+        // like a pooled digest (see tokenIdExt.h) and corrupt the hash. Digests never reach here —
+        // they take the fallback — so knownNoDigest=true holds; this asserts it in debug builds.
+        TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(raw, raw + count, [](int32_t id) { return id >= 0; }),
+            "token id must be in [0, 2^31) for the zero-copy path");
+        // Sound reinterpret: TokenIdExt is bit-identical to its int32 id (tokenIdExt.h) and this
+        // buffer is only ever read const (never written through the alias).
+        auto const* data = reinterpret_cast<kv::TokenIdExt const*>(raw);
+        return fn(kv::TokenSpan{data, count}, /*knownNoDigest=*/true);
+    }
+    auto [vec, knownNoDigest] = castTokenIterable(tokens);
+    return fn(kv::toSpan(vec), knownNoDigest);
 }
 
 static kv::TypedVec<kv::PoolIndex, size_t> typedPoolSizeList(std::vector<size_t> const& slotSizeList)
@@ -165,14 +207,14 @@ static nb::list tokenList(std::vector<kv::TokenIdExt> const& tokens)
     nb::list result;
     for (auto const& tok : tokens)
     {
-        if (auto* id = std::get_if<kv::TokenId>(&tok))
+        if (!tok.isDigest())
         {
-            result.append(*id);
+            result.append(tok.tokenId());
         }
         else
         {
-            auto const& d = std::get<kv::DigestToken>(tok);
-            result.append(nb::bytes(reinterpret_cast<char const*>(d.data()), d.size()));
+            auto const& digest = tok.digest();
+            result.append(nb::bytes(reinterpret_cast<char const*>(digest.data()), digest.size()));
         }
     }
     return result;
@@ -498,6 +540,85 @@ static kv::ReuseScope castReuseScope(nb::object reuseScope)
     throw std::invalid_argument(
         "reuse_scope must be None, ReuseScope, an int lora_task_id, or an object with lora_id and salt");
 }
+
+class EventManagerTestBlock
+{
+public:
+    EventManagerTestBlock(kv::SharedPtr<kv::Block> block_, std::vector<kv::SharedPtr<kv::CommittedPage>> pages_)
+        : block(std::move(block_))
+        , pages(std::move(pages_))
+    {
+    }
+
+    ~EventManagerTestBlock()
+    {
+        try
+        {
+            close();
+        }
+        catch (...)
+        {
+        }
+    }
+
+    void close()
+    {
+        for (auto const& page : pages)
+        {
+            block->unlinkPage(page->lifeCycle, page.get());
+        }
+        pages.clear();
+    }
+
+    kv::SharedPtr<kv::Block> block;
+    std::vector<kv::SharedPtr<kv::CommittedPage>> pages;
+};
+
+// Lazy Python iterator over a token sequence's blockchain keys. Each __next__ pulls
+// one key from the C++ generator (one SHA-256 hash), so a caller that stops early
+// (e.g. on the first cache-key mismatch) skips the remaining hashing. Yields
+// (token_block, key) pairs matching Python's sequence_to_blockchain_keys: root
+// ([], reuseScope digest) first, then one per tokensPerBlock chunk.
+class BlockchainKeyIterator
+{
+public:
+    BlockchainKeyIterator(
+        int tokensPerBlock, kv::ReuseScope const& reuseScope, std::vector<kv::TokenIdExt> tokens, bool knownNoDigest)
+        : mTokens(std::move(tokens))
+        , mGen(kv::sequenceToBlockchainKeys(tokensPerBlock, reuseScope, mTokens.data(), mTokens.size(), knownNoDigest))
+    {
+    }
+
+    nb::object next()
+    {
+        std::optional<kv::BlockchainKeyStep> const step = mGen();
+        if (!step)
+        {
+            throw nb::stop_iteration();
+        }
+        nb::bytes keyBytes(reinterpret_cast<char const*>(step->key.data()), step->key.size());
+        // The step carries its token range, so the root naturally yields the empty [0,0) block.
+        std::vector<kv::TokenIdExt> block(mTokens.begin() + static_cast<ptrdiff_t>(step->tokens.beg),
+            mTokens.begin() + static_cast<ptrdiff_t>(step->tokens.end));
+        return nb::make_tuple(tokenList(block), std::move(keyBytes));
+    }
+
+private:
+    // Concrete generator (closure) type — sequenceToBlockchainKeys's return type is
+    // fixed, so decltype deduces it directly, avoiding std::function's type erasure and
+    // per-iterator heap allocation (the closure captures a 32-byte key, over the SBO limit).
+    using KeyGen = decltype(kv::sequenceToBlockchainKeys(std::declval<int>(), std::declval<kv::ReuseScope>(),
+        std::declval<kv::TokenIdExt const*>(), std::declval<size_t>(), std::declval<bool>()));
+
+    std::vector<kv::TokenIdExt> mTokens; // owned; mGen holds a stable pointer into it
+    KeyGen mGen;                         // declared after mTokens (init order)
+};
+
+// nanobind move-constructs the iterator from the factory return; that must stay valid,
+// since mGen captures mTokens.data() and vector-move preserves the buffer address. Adding
+// a non-movable member would silently force a copy and dangle that pointer — forbid it.
+static_assert(std::is_move_constructible_v<BlockchainKeyIterator>,
+    "BlockchainKeyIterator must be move-constructible (mGen captures mTokens.data())");
 
 void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 {
@@ -1337,7 +1458,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::list layers, float maxUtilForResume, bool enablePartialReuse,
                 std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
                 std::optional<std::vector<float>> initialPoolRatio,
-                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats)
+                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
+                bool textOnly)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1358,6 +1480,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->swaScratchReuse = std::move(swaScratchReuse);
                 cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
+                cfg->textOnly = textOnly;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1366,7 +1489,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("swa_scratch_reuse").none() = std::nullopt,
-            nb::arg("commit_min_snapshot") = false, nb::arg("enable_stats") = true)
+            nb::arg("commit_min_snapshot") = false, nb::arg("enable_stats") = true, nb::arg("text_only") = false)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1378,6 +1501,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
+        .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
@@ -1417,7 +1541,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
             {
-                auto vec = castTokenIterable(acceptedInputTokens);
                 if (!beamSearchIndices.is_none())
                 {
                     PyErr_SetString(PyExc_AssertionError, "beam_search_indices must be None");
@@ -1425,8 +1548,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 }
                 // Note: an empty token list with is_end=True must still stop committing,
                 // so we do not early-return on empty; commit() handles it.
-                nb::gil_scoped_release release;
-                self.commit(vec, isEnd);
+                withTokens(acceptedInputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        // commit() sources knownNoDigest from the KvCache's text_only flag. Guard
+                        // that claim against the actual tokens: a text_only sequence committing a
+                        // digest would silently corrupt the block-key hash.
+                        TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
+                            "commit() received a digest token on a text_only sequence — hashing would be corrupted");
+                        nb::gil_scoped_release release;
+                        self.commit(view, isEnd);
+                    });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
             nb::arg("is_end") = false)
@@ -1464,6 +1596,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("has_scratch_slots", &kv::KvCache::hasScratchSlots)
         .def_prop_rw("enable_swa_scratch_reuse", &kv::KvCache::isSwaScratchReuseEnabled,
             [](kv::KvCache& self, bool enable) { self.setEnableSwaScratchReuse(enable); })
+        .def_prop_rw(
+            "text_only", &kv::KvCache::textOnly, [](kv::KvCache& self, bool textOnly) { self.setTextOnly(textOnly); })
         .def("supports_index_mode", &kv::KvCache::supportsIndexMode, nb::arg("mode"))
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
@@ -1484,6 +1618,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
+        .def("_get_num_tokens_before_hybrid_pruning", &kv::KvCache::numTokensBeforeHybridPruning)
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
             [](kv::KvCache& self, int hist) { self.setHistoryLength(hist); })
         .def_prop_rw("capacity", &kv::KvCache::capacity, [](kv::KvCache& self, int cap) { self.setCapacity(cap); })
@@ -1545,6 +1680,79 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- Introspection -------------------------------------------------------
     auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
+
+    nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
+    mIntrospection.def(
+        "make_test_block",
+        [](kv::KvCacheManager& manager, nb::object tokenObject, std::vector<int> coveragePerLc, nb::object parentObject,
+            nb::object reuseScopeObject)
+        {
+            auto [tokens, knownNoDigest] = castTokenIterable(tokenObject);
+            if (tokens.empty())
+            {
+                throw std::invalid_argument("make_test_block requires at least one token");
+            }
+            if (coveragePerLc.size() != static_cast<size_t>(manager.lifeCycles().size().value()))
+            {
+                throw std::invalid_argument("coverage_per_lc length must match the manager lifecycle count");
+            }
+            for (int coverage : coveragePerLc)
+            {
+                if (coverage < 0 || coverage > static_cast<int>(tokens.size()))
+                {
+                    throw std::invalid_argument("lifecycle coverage must be between zero and the block token count");
+                }
+            }
+
+            kv::NodeBase* parent = nullptr;
+            if (parentObject.is_none())
+            {
+                parent = &manager.radixTree().addOrGetExisting(castReuseScope(std::move(reuseScopeObject)));
+            }
+            else
+            {
+                parent = nb::cast<EventManagerTestBlock&>(parentObject).block.get();
+            }
+            auto block = kv::addOrGetExistingBlock(parent, std::move(tokens), knownNoDigest);
+
+            kv::TypedVec<kv::LifeCycleId, kv::SlotCount> counts(manager.lifeCycles().size(), 0);
+            for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
+            {
+                counts[lifeCycle] = coveragePerLc.at(lifeCycle.value()) > 0 ? 1 : 0;
+            }
+            auto slots = manager.storage().newGpuSlots(counts);
+            std::vector<kv::SharedPtr<kv::CommittedPage>> pages;
+            pages.reserve(coveragePerLc.size());
+            for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
+            {
+                int const coverage = coveragePerLc.at(lifeCycle.value());
+                if (coverage == 0)
+                {
+                    continue;
+                }
+                auto page = kv::makeShared<kv::CommittedPage>(
+                    &manager.storage(), block, lifeCycle, kv::kGpuLevel, coverage, kv::kPriorityDefault);
+                page->setSlot(slots[lifeCycle].front());
+                block->storage[lifeCycle] = page.get();
+                pages.push_back(std::move(page));
+            }
+            return std::make_unique<EventManagerTestBlock>(std::move(block), std::move(pages));
+        },
+        nb::arg("manager"), nb::arg("tokens"), nb::arg("coverage_per_lc"), nb::arg("parent").none() = nb::none(),
+        nb::arg("reuse_scope").none() = nb::none(), nb::keep_alive<0, 1>(), nb::keep_alive<0, 4>());
+    mIntrospection.def(
+        "test_block_key", [](EventManagerTestBlock const& block) { return digestBytes(block.block->key); },
+        nb::arg("block"));
+    mIntrospection.def(
+        "event_manager_add_stored_block",
+        [](kv::EventManager& eventManager, EventManagerTestBlock const& block)
+        { eventManager.addStoredBlock(*block.block); },
+        nb::arg("event_manager"), nb::arg("block"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "event_manager_add_stored_life_cycle",
+        [](kv::EventManager& eventManager, EventManagerTestBlock const& block, int lifeCycleId)
+        { eventManager.addStoredLifeCycle(*block.block, kv::LifeCycleId{lifeCycleId}); },
+        nb::arg("event_manager"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
     nb::class_<kv::StorageStatistics>(mIntrospection, "StorageStatistics")
         .def_prop_ro("slot_sizes", [](kv::StorageStatistics const& self) { return self.slotSizes.raw(); })
         .def_ro("total", &kv::StorageStatistics::total)
@@ -1656,26 +1864,28 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](kv::KvCacheManager& manager, nb::object reuseScope, nb::object tokens, int lcId, bool enablePartial)
         {
             auto rs = castReuseScope(reuseScope);
-            auto vec = castTokenIterable(tokens);
             int numTokens = 0;
             std::vector<std::optional<std::pair<int, int>>> pages;
-            {
-                nb::gil_scoped_release release;
-                auto matchResult = manager.radixTree().match(rs, vec, enablePartial);
-                numTokens = matchResult.numTokens;
-                kv::LifeCycleId lc{lcId};
-                pages.reserve(matchResult.blocks.stdSize());
-                for (auto* block : matchResult.blocks)
+            withTokens(tokens,
+                [&](kv::TokenSpan view, bool knownNoDigest)
                 {
-                    auto* page = block->getPage(lc);
-                    if (page == nullptr)
+                    nb::gil_scoped_release release;
+                    auto matchResult = manager.radixTree().match(rs, view, knownNoDigest, enablePartial);
+                    numTokens = matchResult.numTokens;
+                    kv::LifeCycleId lc{lcId};
+                    pages.reserve(matchResult.blocks.stdSize());
+                    for (auto* block : matchResult.blocks)
                     {
-                        pages.emplace_back(std::nullopt);
-                        continue;
+                        auto* page = block->storage.at(lc);
+                        if (page == nullptr)
+                        {
+                            pages.emplace_back(std::nullopt);
+                            continue;
+                        }
+                        int const slotId = page->slotId().value();
+                        pages.emplace_back(std::make_pair(slotId, page->numTokensInBlock));
                     }
-                    pages.emplace_back(std::make_pair(page->slotId().value(), page->numTokensInBlock));
-                }
-            }
+                });
             return std::make_tuple(numTokens, std::move(pages));
         },
         nb::arg("manager"), nb::arg("reuse_scope"), nb::arg("tokens"), nb::arg("lc_id"),
@@ -1687,24 +1897,25 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](kv::KvCacheManager& manager, nb::object reuseScope, nb::object tokens, int lcId, bool enablePartial)
         {
             auto rs = castReuseScope(reuseScope);
-            auto vec = castTokenIterable(tokens);
             int numTokens = 0;
             std::vector<std::optional<int>> counts;
-            {
-                nb::gil_scoped_release release;
-                auto matchResult = manager.radixTree().match(rs, vec, enablePartial);
-                numTokens = matchResult.numTokens;
-                kv::LifeCycleId lc{lcId};
-                counts.reserve(matchResult.blocks.stdSize());
-                for (auto* block : matchResult.blocks)
+            withTokens(tokens,
+                [&](kv::TokenSpan view, bool knownNoDigest)
                 {
-                    auto* page = block->storage.at(lc);
-                    if (page == nullptr)
-                        counts.emplace_back(std::nullopt);
-                    else
-                        counts.emplace_back(page->plannedDropCount);
-                }
-            }
+                    nb::gil_scoped_release release;
+                    auto matchResult = manager.radixTree().match(rs, view, knownNoDigest, enablePartial);
+                    numTokens = matchResult.numTokens;
+                    kv::LifeCycleId lc{lcId};
+                    counts.reserve(matchResult.blocks.stdSize());
+                    for (auto* block : matchResult.blocks)
+                    {
+                        auto* page = block->storage.at(lc);
+                        if (page == nullptr)
+                            counts.emplace_back(std::nullopt);
+                        else
+                            counts.emplace_back(page->plannedDropCount);
+                    }
+                });
             return std::make_tuple(numTokens, std::move(counts));
         },
         nb::arg("manager"), nb::arg("reuse_scope"), nb::arg("tokens"), nb::arg("lc_id"),
@@ -1792,38 +2003,53 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
-                std::optional<int> expectedPromptLength)
+                std::optional<int> expectedPromptLength, std::optional<bool> textOnly)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
-                std::vector<kv::TokenIdExt> tokens;
-                bool const hasInputTokens = !inputTokens.is_none();
-                if (!inputTokens.is_none())
-                {
-                    tokens = castTokenIterable(inputTokens);
-                }
-                if (!expectedPromptLength.has_value() && hasInputTokens)
-                {
-                    expectedPromptLength = static_cast<int>(tokens.size());
-                }
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
-                nb::gil_scoped_release release;
-                return self->createKvCache(
-                    std::move(reuseScope), tokens, id, std::move(priorityCb), expectedPromptLength);
+                if (inputTokens.is_none())
+                {
+                    nb::gil_scoped_release release;
+                    return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
+                        expectedPromptLength, textOnly);
+                }
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        // Guard the text_only claim against the actual input tokens (see commit()).
+                        bool const resolvedTextOnly = textOnly.value_or(self->textOnly());
+                        TLLM_CHECK_WITH_INFO(!(resolvedTextOnly && !knownNoDigest),
+                            "create_kv_cache received digest input_tokens on a text_only sequence — hashing would be "
+                            "corrupted");
+                        std::optional<int> promptLen = expectedPromptLength;
+                        if (!promptLen.has_value() && view.size() != 0)
+                        {
+                            promptLen = static_cast<int>(view.size());
+                        }
+                        nb::gil_scoped_release release;
+                        return self->createKvCache(
+                            std::move(reuseScope), view, id, std::move(priorityCb), promptLen, textOnly);
+                    });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
-            nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt)
+            nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
+            nb::arg("text_only") = std::nullopt)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
-                std::vector<kv::TokenIdExt> tokens;
-                if (!inputTokens.is_none())
+                if (inputTokens.is_none())
                 {
-                    tokens = castTokenIterable(inputTokens);
+                    nb::gil_scoped_release release;
+                    return self->probeReuse(std::move(reuseScope), kv::TokenSpan{}, /*knownNoDigest=*/true);
                 }
-                nb::gil_scoped_release release;
-                return self->probeReuse(std::move(reuseScope), tokens);
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        nb::gil_scoped_release release;
+                        return self->probeReuse(std::move(reuseScope), view, knownNoDigest);
+                    });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
@@ -1934,6 +2160,34 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return self(baseIndices, indexMode, scratch);
             },
             nb::arg("base_indices"), nb::arg("index_mode") = nb::none(), nb::arg("scratch") = nb::none());
+
+    m.def(
+        "gen_multimodal_cache_key_tokens",
+        [](int idOffset, nb::bytes multiModalDataDigest, int numTokens, int tokenOffset)
+        {
+            auto const digestSize = nb::len(multiModalDataDigest);
+            if (digestSize != kv::kDIGEST_LEN)
+            {
+                throw std::invalid_argument("multi_modal_data_digest must have length kDIGEST_LEN");
+            }
+            auto const* first = reinterpret_cast<uint8_t const*>(multiModalDataDigest.c_str());
+            std::vector<uint8_t> digest(first, first + digestSize);
+            return tokenList(kv::genMultimodalCacheKeyTokens(idOffset, digest, numTokens, tokenOffset));
+        },
+        nb::arg("id_offset"), nb::arg("multi_modal_data_digest"), nb::arg("num_tokens"), nb::arg("token_offset") = 0);
+    // Lazy iterator yielding (token_block, key) pairs; hashes one block per __next__.
+    nb::class_<BlockchainKeyIterator>(m, "_BlockchainKeyIterator")
+        .def("__iter__", [](nb::handle self) { return self; })
+        .def("__next__", &BlockchainKeyIterator::next);
+    m.def(
+        "sequence_to_blockchain_keys",
+        [](int tokensPerBlock, nb::object reuseScopeObj, nb::object tokensObj)
+        {
+            auto const rs = castReuseScope(std::move(reuseScopeObj));
+            auto [vec, knownNoDigest] = castTokenIterable(tokensObj);
+            return BlockchainKeyIterator(tokensPerBlock, rs, std::move(vec), knownNoDigest);
+        },
+        nb::arg("tokens_per_block"), nb::arg("reuse_scope"), nb::arg("tokens"));
 }
 
 } // namespace tensorrt_llm::nanobind::batch_manager

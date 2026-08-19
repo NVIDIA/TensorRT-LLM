@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -63,6 +63,7 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..utils import (
     ActivationType,
     AuxStreamType,
@@ -158,6 +159,25 @@ def get_text_model_config(
     text_cfg = get_text_config(cfg.pretrained_config)
     cfg = dataclasses.replace(cfg, pretrained_config=text_cfg)
     return cfg
+
+
+def _validate_sparse_attention_runtime_config(
+    model_config: "ModelConfig[PretrainedConfig]",
+) -> None:
+    """Require the runtime backend that owns M3's metadata and index cache.
+
+    Both dense and sparse M3 layers use that cache manager, independent of
+    checkpoint precision or GPU architecture. Backend-specific constraints,
+    such as MSA requiring SM100, are validated by the backend itself.
+    """
+    sparse_config = model_config.sparse_attention_config
+    if sparse_config is None or sparse_config.algorithm != "minimax_m3":
+        raise ValueError(
+            "MiniMax-M3 requires sparse_attention_config.algorithm='minimax_m3' "
+            "to create its KV-cache manager and prepare attn_metadata.minimax_m3. "
+            "Set the following in the LLM API configuration:\n"
+            "sparse_attention_config:\n  algorithm: minimax_m3"
+        )
 
 
 def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
@@ -659,6 +679,9 @@ def minimax_m3_attn_custom_op_inplace(
         attn_metadata,
         output[:num_tokens],
     )
+
+
+maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(minimax_m3_attn_custom_op_inplace)
 
 
 class MiniMaxM3Attention(Attention):
@@ -1321,8 +1344,8 @@ class MiniMaxM3Attention(Attention):
         output = q.new_empty(
             (q.shape[0], self.num_heads * self.head_dim), dtype=self.attn_activation_dtype
         )
-        if self.register_to_config and is_torch_compiling():
-            minimax_m3_attn_custom_op_inplace(
+        if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
+            maybe_bcg_minimax_m3_attn_custom_op_inplace(
                 q,
                 k,
                 v,
@@ -1856,6 +1879,7 @@ class MiniMaxM3Model(DecoderModel):
     """M3 text decoder model."""
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
+        _validate_sparse_attention_runtime_config(model_config)
         super().__init__(model_config)
         quant_config = model_config.quant_config
         if quant_config is None or (
@@ -2003,6 +2027,27 @@ def _fold_gemma_boundary_norm_weights(weights):
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax-M3.
+
+        Sparse attention already routes M3 to a V2-core manager
+        unconditionally; declaring the preference keeps
+        ``kv_cache_config.use_kv_cache_manager_v2`` consistent with the
+        manager actually in use.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config: Any = None) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        M3 runs a V2-core cache manager, which the C++ transceiver cannot
+        drive; the KV-transfer unit test exercises the Python transceiver
+        directly. This routes the fully-'auto' path to that combination.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config

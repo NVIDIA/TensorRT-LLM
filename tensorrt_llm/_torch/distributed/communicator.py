@@ -30,7 +30,7 @@ from tensorrt_llm.mapping import Mapping
 try:
     import ray
 except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
+    from tensorrt_llm.executor.ray import stub as ray
 
 
 class ReduceOp(IntEnum):

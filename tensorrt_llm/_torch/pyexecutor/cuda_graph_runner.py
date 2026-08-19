@@ -48,6 +48,7 @@ class KeyType(NamedTuple):
     num_contexts: int = 0
     context_query_len: int = 0
     num_encoder_tokens: int = 0
+    peft_cache_data_type: Optional[torch.dtype] = None
 
 
 def _save_spec_decode_capture_state(
@@ -313,7 +314,8 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
         spec_metadata: Optional[SpecMetadata] = None,
-        promoted_context_request_ids: frozenset[int] = frozenset()
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+        peft_cache_data_type: Optional[torch.dtype] = None,
     ) -> Optional[KeyType]:
         batch_size = batch.batch_size
 
@@ -339,7 +341,8 @@ class CUDAGraphRunner:
                           draft_len=draft_len,
                           is_first_draft=spec_resource_manager.is_first_draft,
                           short_seq_len_mode=short_seq_len_mode,
-                          is_all_greedy_sample=is_all_greedy_sample)
+                          is_all_greedy_sample=is_all_greedy_sample,
+                          peft_cache_data_type=peft_cache_data_type)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -368,7 +371,8 @@ class CUDAGraphRunner:
                           is_all_greedy_sample=is_all_greedy_sample,
                           num_contexts=num_contexts,
                           context_query_len=context_query_len,
-                          num_encoder_tokens=num_encoder_tokens)
+                          num_encoder_tokens=num_encoder_tokens,
+                          peft_cache_data_type=peft_cache_data_type)
         return key
 
     def _get_compatible_mixed_encoder_decoder_key(self,
@@ -429,6 +433,7 @@ class CUDAGraphRunner:
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
+        peft_cache_data_type: Optional[torch.dtype] = None,
     ) -> Tuple[Optional[Any], Optional[Any], Optional[KeyType]]:
         """
         Determines if the current batch can be run with a CUDA graph.
@@ -474,7 +479,8 @@ class CUDAGraphRunner:
         # callers pass the empty default and retain generation-only behavior.
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata,
-                                 promoted_context_request_ids)
+                                 promoted_context_request_ids,
+                                 peft_cache_data_type)
         if key is None:
             return None, None, None
         if is_mixed_encoder_decoder:
@@ -866,6 +872,56 @@ class CUDAGraphRunner:
             spec_res_mgr.add_dummy_requests([dummy_request_id])
         self.padding_dummy_requests[runtime_draft_len] = dummy_request
         return dummy_request
+
+    def _padding_dummy_managers(
+            self,
+            resource_manager: ResourceManager) -> List[BaseResourceManager]:
+        """The managers ``_get_or_create_padding_dummy`` registers a dummy with.
+
+        Kept next to the creation path so the two stay in step.  Duplicates are
+        dropped by identity: freeing the same manager twice for one request is
+        not safe in general.
+        """
+        candidates = [
+            resource_manager.get_resource_manager(
+                self.config.kv_cache_manager_key),
+            get_draft_kv_cache_manager(self.spec_config, resource_manager),
+            resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER),
+        ]
+        if self.is_encoder_decoder:
+            candidates.append(
+                resource_manager.get_resource_manager(
+                    ResourceManagerType.CROSS_KV_CACHE_MANAGER))
+
+        managers: List[BaseResourceManager] = []
+        for manager in candidates:
+            if manager is not None and not any(manager is seen
+                                               for seen in managers):
+                managers.append(manager)
+        return managers
+
+    def release_padding_dummy(self, resource_manager: ResourceManager,
+                              runtime_draft_len: int) -> bool:
+        """Releases the padding dummy for ``runtime_draft_len`` from every
+        manager that allocated part of it, and drops it from the runner so a
+        later padded step re-creates it.
+
+        One dummy request ID is spread across up to four managers -- the main
+        KV cache manager, the one-model draft KV cache manager, the
+        speculative resource manager slot and the encoder-decoder cross-KV
+        cache manager.  Releasing only the main one leaves the others holding
+        the ID, and re-creation reuses the same
+        ``CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len``.
+
+        Returns True if a dummy was held for that draft length.
+        """
+        dummy_request = self.padding_dummy_requests.pop(runtime_draft_len, None)
+        if dummy_request is None:
+            return False
+        for manager in self._padding_dummy_managers(resource_manager):
+            manager.free_resources(dummy_request)
+        return True
 
     def _can_pad_any_batch(self, runtime_draft_len: int) -> bool:
         """Returns True when _get_padded_batch can pad at least one feasible

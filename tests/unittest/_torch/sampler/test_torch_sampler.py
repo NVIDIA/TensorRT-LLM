@@ -38,6 +38,7 @@ from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_
 
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
+    LlmRequestState,
     convert_wordlist,
     get_draft_token_length,
 )
@@ -146,6 +147,9 @@ class TestStrategySelection:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
         py_sampling_strategy: Strategy | None
+        # Read by the row_stride query in sampler_common; these tests are
+        # single-beam, so the static admission width is 1.
+        py_beam_width: int
 
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
@@ -169,6 +173,7 @@ class TestStrategySelection:
         request.sampling_config = SamplingConfig(params._get_sampling_config())
         request.is_context_init_state = False  # Not used in this test
         request.py_sampling_strategy = None  # used for caching
+        request.py_beam_width = 1
         return cast(LlmRequest, request)
 
     def test_defaults(self):
@@ -561,6 +566,8 @@ def test_select_generated_logits(
             def __init__(self, draft_len: int):
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
+                # Read by the row_stride query in sampler_common.
+                self.py_beam_width = 1
 
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
@@ -954,8 +961,8 @@ class TestFinishReasons:
                 new_tokens=new_tokens,
                 finish_reasons=None,
                 first_finish_reasons=None,
+                single_step_greedy=True,
             ),
-            single_step_greedy=True,
         )
 
         sampler.update_requests(state)
@@ -1418,6 +1425,125 @@ class TestFinishReasons:
         )
         run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
 
+    @staticmethod
+    def _all_beams_finished_reference(row: torch.Tensor, beam_width: int) -> bool:
+        """The per-request reduction the batched prefix count replaces."""
+        return bool(
+            (row[:beam_width] != FinishReason.NOT_FINISHED.value).sum().item() == beam_width
+        )
+
+    def test_finished_beam_prefix_lengths_matches_per_request_reduction(self):
+        """The batched prefix count answers the per-request question for every width."""
+        store_width = 4
+        reasons = [
+            FinishReason.NOT_FINISHED.value,
+            FinishReason.END_ID.value,
+            FinishReason.STOP_WORDS.value,
+            FinishReason.LENGTH.value,
+        ]
+        rows = list(product(reasons, repeat=store_width))
+        finish_reasons = torch.tensor(rows, dtype=torch.int32)
+
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+
+        assert len(prefix_lengths) == len(rows)
+        for row, prefix_length in zip(finish_reasons, prefix_lengths):
+            for beam_width in range(1, store_width + 1):
+                assert (prefix_length >= beam_width) == self._all_beams_finished_reference(
+                    row, beam_width
+                ), f"row={row.tolist()} beam_width={beam_width}"
+
+    def test_finished_beam_prefix_lengths_ignores_columns_past_beam_width(self):
+        """Reasons beyond a request's beam width must not complete it, or vice versa."""
+        # Slot 0 uses 2 beams and both finished; the padding columns are unfinished.
+        # Slot 1 uses 2 beams, only the second finished; the padding columns are set.
+        finish_reasons = torch.tensor(
+            [
+                [FinishReason.END_ID.value, FinishReason.LENGTH.value, 0, 0],
+                [
+                    0,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                ],
+            ],
+            dtype=torch.int32,
+        )
+
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+
+        assert prefix_lengths[0] >= 2
+        assert prefix_lengths[1] < 2
+
+    def test_handle_first_finish_reasons_completes_only_fully_finished_requests(self):
+        """Requests are completed, and their per-beam reasons recorded, only when all
+        of their own beams finished -- across differing beam widths in one batch."""
+        sampler = object.__new__(TorchSampler)
+        store_width = 4
+        # Slot 0: beam_width 2, both finished -> completes.
+        # Slot 1: beam_width 4, first beam unfinished -> stays running.
+        # Slot 2: beam_width 1, finished -> completes.
+        finish_reasons = torch.tensor(
+            [
+                [FinishReason.END_ID.value, FinishReason.LENGTH.value, 0, 0],
+                [
+                    0,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                    FinishReason.END_ID.value,
+                ],
+                [FinishReason.STOP_WORDS.value, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        assert finish_reasons.size(1) == store_width
+        prefix_lengths = TorchSampler._finished_beam_prefix_lengths(finish_reasons)
+        finish_reasons_list = finish_reasons.tolist()
+
+        class RecordingLlmRequest(LlmRequest):
+            """LlmRequest that records the per-beam reasons the sampler sets."""
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.recorded_reasons: list[tuple[int, FinishReason]] = []
+
+            def set_finished_reason(self, finish_reason: FinishReason, beam: int) -> None:
+                self.recorded_reasons.append((beam, finish_reason))
+                super().set_finished_reason(finish_reason, beam)
+
+        requests = []
+        for seq_slot, beam_width in enumerate([2, 4, 1]):
+            # The beam width must come from the sampling config: it sizes the
+            # request's C++ per-beam state, which set_finished_reason indexes.
+            request = RecordingLlmRequest(
+                request_id=seq_slot,
+                seq_slot=seq_slot,
+                input_tokens=[1],
+                max_new_tokens=10,
+                end_id=2,
+                sampling_config=SamplingConfig(beam_width=beam_width),
+                is_streaming=False,
+            )
+            assert request.py_beam_width == beam_width
+            requests.append(request)
+
+        completed = [
+            sampler._handle_first_finish_reasons(request, prefix_lengths, finish_reasons_list)
+            for request in requests
+        ]
+
+        assert completed == [True, False, True]
+        assert requests[0].state == LlmRequestState.GENERATION_COMPLETE
+        assert requests[1].state != LlmRequestState.GENERATION_COMPLETE
+        assert requests[2].state == LlmRequestState.GENERATION_COMPLETE
+        # Only the request's own beams are reported, in beam order.
+        assert requests[0].recorded_reasons == [
+            (0, FinishReason.END_ID),
+            (1, FinishReason.LENGTH),
+        ]
+        assert requests[1].recorded_reasons == []
+        assert requests[2].recorded_reasons == [(0, FinishReason.STOP_WORDS)]
+
 
 @pytest.mark.parametrize("min_p", [0.0, 0.1, 0.5, 0.9])
 def test_min_p_renorm_probs(min_p: float):
@@ -1860,7 +1986,7 @@ class TestBatchedSampling:
             sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
             host_new_tokens = sample_state.host.new_tokens
-            if sample_state.single_step_greedy:
+            if sample_state.host.single_step_greedy:
                 # The stable greedy path copies one token per active request instead of
                 # the full [step, slot, beam] buffer. This fixture uses dense sequence
                 # slots, so restore that layout before comparing sampling results.
@@ -3455,6 +3581,9 @@ class TestTopPDecay:
             is_context_init_state=False,
             py_sampling_strategy=None,
             py_draft_tokens=draft_tokens,
+            # Read by the row_stride query in sampler_common; these tests are
+            # single-beam, so the static admission width is 1.
+            py_beam_width=1,
         )
         req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
         return cast(LlmRequest, req)

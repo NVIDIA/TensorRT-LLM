@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import nn
@@ -276,6 +276,13 @@ class Gemma3TextModel(DecoderModel):
 class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                                 Gemma3TextConfig]):
 
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
+
     def __init__(
         self,
         model_config: ModelConfig[Gemma3TextConfig],
@@ -284,6 +291,17 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Gemma3's VSWA layout.
+
+        V2 sizes the sliding-window and full-attention pools independently
+        instead of statically dividing memory between them.
+        """
+        return "V2"
 
     def _get_token_type_mask(self, image_token_mask: torch.BoolTensor):
         device = image_token_mask.device
