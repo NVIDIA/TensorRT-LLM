@@ -198,7 +198,7 @@ def run_with_terminal_reporting(
 
         if signal_number:
             termination_kind = "signal"
-        elif exit_code == 0:
+        elif exit_code_known and exit_code == 0:
             termination_kind = "clean"
             usage.set_lifecycle_phase("shutdown")
         else:
