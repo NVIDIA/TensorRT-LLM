@@ -305,11 +305,20 @@ def test_mapping_and_materialization_failures_never_retry(tmp_path, monkeypatch)
 
     loader = _rank_striped_loader()
     native_load = mock.Mock(side_effect=AssertionError("must not reload"))
+    error_log = mock.Mock()
     monkeypatch.setattr(loader, "_load_weights_native", native_load)
+    monkeypatch.setattr(weight_loader_module.logger, "error", error_log)
     with pytest.raises(RuntimeError, match="materialization failed"):
         with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()):
             raise RuntimeError("materialization failed")
     native_load.assert_not_called()
+    status = loader.last_checkpoint_io_status
+    assert status.effective == "none"
+    assert status.fallback_reason == (
+        "model materialization failed: RuntimeError: materialization failed"
+    )
+    assert "model materialization failed" in error_log.call_args.args[0]
+    assert "cleanup failure" not in error_log.call_args.args[0]
 
 
 def test_native_and_rank_striped_outputs_match(tmp_path, monkeypatch):

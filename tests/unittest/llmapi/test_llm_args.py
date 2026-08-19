@@ -141,7 +141,7 @@ def test_rank_striped_checkpoint_io_warns_and_falls_back_for_autodeploy(
             model=llama_model_path,
             checkpoint_io_policy="rank_striped_read_ahead",
         )
-    assert args.checkpoint_io_policy == "rank_striped_read_ahead"
+    assert args.checkpoint_io_policy == "native"
     assert any("selected=native" in call.args[0]
                for call in warning.call_args_list)
 

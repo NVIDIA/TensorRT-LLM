@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Any, Iterator, Literal
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,7 +21,9 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("loader_cls", [MistralCheckpointLoader, MXCheckpointLoader])
-def test_hf_subclasses_keep_polymorphic_load_weights(loader_cls):
+def test_hf_subclasses_keep_polymorphic_load_weights(
+    loader_cls: type[MistralCheckpointLoader] | type[MXCheckpointLoader],
+) -> None:
     checkpoint_loader = loader_cls.__new__(loader_cls)
     checkpoint_loader.load_weights = MagicMock(return_value={"subclass.weight": object()})
     mapping = object()
@@ -36,7 +39,9 @@ def test_hf_subclasses_keep_polymorphic_load_weights(loader_cls):
 
 
 @pytest.mark.parametrize("requested", ["auto", "rank_striped_read_ahead"])
-def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(requested):
+def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(
+    requested: Literal["auto", "rank_striped_read_ahead"],
+) -> None:
     loader = _construct_checkpoint_loader(
         "pytorch",
         None,
@@ -60,8 +65,10 @@ def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(request
     ],
 )
 def test_construct_checkpoint_loader_falls_back_before_incompatible_request(
-    monkeypatch, kwargs, reason
-):
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs: dict[str, Any],
+    reason: str,
+) -> None:
     warning = MagicMock()
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
     options = dict(kwargs)
@@ -84,7 +91,9 @@ def test_construct_checkpoint_loader_falls_back_before_incompatible_request(
     assert "selected=native" in warning.call_args.args[0]
 
 
-def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(monkeypatch):
+def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provided_loader = HfCheckpointLoader(
         weight_loader=HfWeightLoader(checkpoint_io_policy="rank_striped_read_ahead")
     )
@@ -117,7 +126,9 @@ def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(monke
     active_communicator.assert_not_called()
 
 
-def test_auto_selects_native_for_incompatible_config_without_warning(monkeypatch):
+def test_auto_selects_native_for_incompatible_config_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     warning = MagicMock()
     info = MagicMock()
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
@@ -137,7 +148,9 @@ def test_auto_selects_native_for_incompatible_config_without_warning(monkeypatch
     assert any("selected=native" in call.args[0] for call in info.call_args_list)
 
 
-def test_static_native_selection_skips_rank_striped_setup(monkeypatch):
+def test_static_native_selection_skips_rank_striped_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     loader = _construct_checkpoint_loader(
         "pytorch",
         None,
@@ -158,9 +171,11 @@ def test_static_native_selection_skips_rank_striped_setup(monkeypatch):
     active_communicator.assert_not_called()
 
 
-def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(monkeypatch):
+def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _CustomWeightLoader:
-        def __init__(self):
+        def __init__(self) -> None:
             self.load_weights = MagicMock(return_value={"custom.weight": object()})
 
     monkeypatch.setattr(
@@ -187,7 +202,9 @@ def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(monkeypat
     assert "selected=native" in warning.call_args.args[0]
 
 
-def test_construct_checkpoint_loader_detects_custom_hf_wrapper(monkeypatch):
+def test_construct_checkpoint_loader_detects_custom_hf_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _CustomCheckpointLoader(HfCheckpointLoader):
         pass
 
@@ -215,12 +232,14 @@ def test_construct_checkpoint_loader_detects_custom_hf_wrapper(monkeypatch):
 class _SessionCheckpointLoader:
     checkpoint_format = "HF"
 
-    def __init__(self, events, checkpoint_dir="/checkpoint"):
+    def __init__(self, events: list[str], checkpoint_dir: str = "/checkpoint") -> None:
         self.events = events
         self.checkpoint_dir = checkpoint_dir
 
     @contextmanager
-    def open_weight_session(self, checkpoint_dir, **kwargs):
+    def open_weight_session(
+        self, checkpoint_dir: str, **kwargs: Any
+    ) -> Iterator[dict[str, object]]:
         assert checkpoint_dir == self.checkpoint_dir
         assert "mapping" in kwargs
         self.events.append("session_enter")
@@ -229,16 +248,16 @@ class _SessionCheckpointLoader:
         finally:
             self.events.append("session_exit")
 
-    def is_weights_preloaded(self):
+    def is_weights_preloaded(self) -> bool:
         return False
 
-    def get_initialized_weight_mapper(self, model, config):
+    def get_initialized_weight_mapper(self, model: object, config: object) -> object:
         del model, config
         self.events.append("mapper_init")
         return object()
 
 
-def test_model_loader_session_spans_mapper_and_materialization():
+def test_model_loader_session_spans_mapper_and_materialization() -> None:
     events = []
     model = MagicMock()
     checkpoint_loader = _SessionCheckpointLoader(events)
@@ -263,7 +282,9 @@ def test_model_loader_session_spans_mapper_and_materialization():
     ]
 
 
-def test_draft_session_spans_mapper_and_materialization(monkeypatch):
+def test_draft_session_spans_mapper_and_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     events = []
     checkpoint_loader = _SessionCheckpointLoader(events, "/draft")
     model = MagicMock()
@@ -292,7 +313,7 @@ def test_draft_session_spans_mapper_and_materialization(monkeypatch):
     ]
 
 
-def test_mtp_draft_session_reuses_target_mapper_during_materialization():
+def test_mtp_draft_session_reuses_target_mapper_during_materialization() -> None:
     events = []
     checkpoint_loader = _SessionCheckpointLoader(events, "/draft")
     model = MagicMock()
