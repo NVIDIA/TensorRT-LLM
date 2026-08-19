@@ -1094,6 +1094,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/weight_sharing/",
         "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
         "tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py",
         "tensorrt_llm/_torch/visual_gen/modules/vae/",
@@ -1126,6 +1127,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/openai_server.py",
         "tensorrt_llm/serve/router.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
+        "tests/integration/defs/model_express/",
         "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
@@ -1155,6 +1157,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
         "tests/unittest/auto_deploy/multigpu",
@@ -1595,6 +1598,19 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
 
     def logger = new Logger(pipeline)
     def (jenkinsURL, buildStatus) = JobBuilder.build(pipeline, logger, jobName, parameters, 1, false)
+    // Infra-scoped fail-fast (parent half). A downstream sub-job returns UNSTABLE
+    // when it saw only infra aborts and no genuine test/build failure (see
+    // runBranchesWithInfraDefer in L0_Test.groovy). That is incomplete coverage,
+    // not a failure: throwing here is exactly what trips the per-arch failFast and
+    // cancels the healthy sibling architecture, so do NOT throw. Mark the build
+    // UNSTABLE (visible + re-runnable) and let the sibling finish. FAILURE and
+    // ABORTED still throw below, so real failures fail-fast exactly as before.
+    if (buildStatus == "UNSTABLE") {
+        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+            error "Downstream job ${jobName} is infra-incomplete (UNSTABLE); sibling not cancelled"
+        }
+        return buildStatus
+    }
     if (buildStatus != "SUCCESS") {
         error "Downstream job did not succeed"
     }
@@ -1643,6 +1659,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                 testStageName = "[Test-x86_64-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
+                def singleGpuInfraIncomplete = false
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
@@ -1657,7 +1674,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob(pipeline, "L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        // launchJob returns UNSTABLE (without throwing) when the single-GPU
+                        // sub-job was infra-incomplete: only infra aborts, no real failure.
+                        def singleGpuStatus = launchJob(pipeline, "L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        singleGpuInfraIncomplete = (singleGpuStatus == "UNSTABLE")
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1694,6 +1714,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
+                        }
+                        return
+                    }
+                }
+
+                // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
+                // prerequisite for multi-GPU. In pre-merge, skip multi-GPU rather than
+                // spend scarce multi-GPU resource on a partially-unverified premise --
+                // the single-GPU sub-job should be re-run first. Keep the build UNSTABLE
+                // (already set by launchJob); do NOT escalate to FAILURE. Post-merge keeps
+                // running multi-GPU for max signal, mirroring the single-GPU-failed policy.
+                if (singleGpuInfraIncomplete) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-x86_64-Multi-GPU] Skipped - single-GPU infra-incomplete") {
+                            echo "x86_64 single-GPU was infra-incomplete (UNSTABLE); skipping multi-GPU (premise not fully validated). Build stays UNSTABLE."
                         }
                         return
                     }
@@ -1774,6 +1811,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
+                def singleGpuInfraIncomplete = false
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
@@ -1787,7 +1825,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
-                        launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        // launchJob returns UNSTABLE (without throwing) when the single-GPU
+                        // sub-job was infra-incomplete: only infra aborts, no real failure.
+                        def singleGpuStatus = launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        singleGpuInfraIncomplete = (singleGpuStatus == "UNSTABLE")
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1825,6 +1866,23 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
                             error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
+                        }
+                        return
+                    }
+                }
+
+                // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
+                // prerequisite for multi-GPU. In pre-merge, skip multi-GPU rather than
+                // spend scarce multi-GPU resource on a partially-unverified premise --
+                // the single-GPU sub-job should be re-run first. Keep the build UNSTABLE
+                // (already set by launchJob); do NOT escalate to FAILURE. Post-merge keeps
+                // running multi-GPU for max signal, mirroring the single-GPU-failed policy.
+                if (singleGpuInfraIncomplete) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-SBSA-Multi-GPU] Skipped - single-GPU infra-incomplete") {
+                            echo "SBSA single-GPU was infra-incomplete (UNSTABLE); skipping multi-GPU (premise not fully validated). Build stays UNSTABLE."
                         }
                         return
                     }

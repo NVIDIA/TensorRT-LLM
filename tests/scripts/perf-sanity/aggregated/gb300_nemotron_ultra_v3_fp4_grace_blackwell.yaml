@@ -1,0 +1,155 @@
+# Nemotron-Ultra-V3 (mixed NVFP4/FP8) — aggregated 50k/2k perf-sanity points on GB300.
+# All three run on 4 GPUs as a single trtllm-serve instance (prefill+decode colocated).
+#
+#   con1   TEP4 bs1   MTP6      81.0 tok/s/GPU   498.0 tok/s/user   min latency
+#   con128 DEP4 bs32  MTP3     508.2 tok/s/GPU    19.7 tok/s/user   balanced
+#   con512 DEP4 bs128 MTP-off  539.6 tok/s/GPU     5.6 tok/s/user   max throughput
+#
+# Container: gitlab-master.nvidia.com:5005/compute/anna/infrastructure/
+#            benchmarking_toolkit/trt-llm/main_aarch:52497853  (sha 90694fec72a4)
+# Model:     /lustre/fsw/coreai_comparch_infbench/lingjiew/nemotron/model/
+#            Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k
+#
+# Key mapping — these become trtllm-serve CLI flags, the rest go into the
+# generated extra_llm_api_options.yaml:
+#   max_batch_size / max_num_tokens / max_seq_len -> --max_*
+#   tensor_parallel_size -> --tp_size    moe_expert_parallel_size -> --ep_size
+#   concurrency -> --max-concurrency     concurrency * iterations -> --num-prompts
+#   isl / osl / random_range_ratio -> --random-input-len / -output-len / -range-ratio
+#
+# Per-point evidence (config, commands, log, sbatch, result) in runs/<point>/.
+metadata:
+  model_name: nemotron_ultra_v3_fp4
+  precision: fp4
+  model_dir_name: Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k
+  supported_gpus:
+  - GB300
+  benchmark_type: 50k2k
+hardware:
+  gpus_per_node: 4
+server_configs:
+  # ---- min latency: TEP4 (no attention DP), batch 1, MTP6 ----
+  - name: "nemotron_ultra_v3_fp4_tep4_mtp6_50k2k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3 TRTLLM_USE_MAMBA_REPLAY=1"
+    model_name: "nemotron_ultra_v3_fp4"
+    gpus: 4
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    enable_attention_dp: false
+    max_batch_size: 1
+    max_num_tokens: 50048
+    max_seq_len: 52096
+    print_iter_log: true
+    stream_interval: 10
+    num_postprocess_workers: 4
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 1
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.5
+      mamba_ssm_cache_dtype: float16
+      mamba_ssm_stochastic_rounding: true
+      mamba_ssm_philox_rounds: 5
+    moe_config:
+      backend: 'TRTLLM'
+      max_num_tokens: 16384
+      use_low_precision_moe_combine: true
+    speculative_config:
+      decoding_type: 'MTP'
+      max_draft_len: 6
+    client_configs:
+      - name: "con1_iter4_50k2k"
+        concurrency: 1
+        iterations: 4
+        isl: 50000
+        osl: 2048
+        random_range_ratio: 0.0
+        backend: "openai"
+        streaming: true
+        dataset_file: <dataset_file>
+
+  # ---- balanced: DEP4 (attention DP), batch 32, MTP3 ----
+  - name: "nemotron_ultra_v3_fp4_dep4_mtp3_50k2k"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2 TRTLLM_USE_MAMBA_REPLAY=1"
+    model_name: "nemotron_ultra_v3_fp4"
+    gpus: 4
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    enable_attention_dp: true
+    max_batch_size: 32
+    max_num_tokens: 50176
+    max_seq_len: 52096
+    print_iter_log: true
+    stream_interval: 10
+    num_postprocess_workers: 4
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 32
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+      mamba_ssm_cache_dtype: float16
+      mamba_ssm_stochastic_rounding: true
+      mamba_ssm_philox_rounds: 5
+    moe_config:
+      backend: 'CUTEDSL'
+      max_num_tokens: 16384
+      use_low_precision_moe_combine: true
+    speculative_config:
+      decoding_type: 'MTP'
+      max_draft_len: 3
+    client_configs:
+      - name: "con128_iter4_50k2k"
+        concurrency: 128
+        iterations: 4
+        isl: 50000
+        osl: 2048
+        random_range_ratio: 0.0
+        backend: "openai"
+        streaming: true
+        dataset_file: <dataset_file>
+
+  # ---- max throughput: DEP4 (attention DP), batch 128, speculation OFF ----
+  - name: "nemotron_ultra_v3_fp4_dep4_mtp0_50k2k"
+    server_env_var: "TRTLLM_USE_MAMBA_REPLAY=1"
+    model_name: "nemotron_ultra_v3_fp4"
+    gpus: 4
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    pipeline_parallel_size: 1
+    enable_attention_dp: true
+    max_batch_size: 128
+    max_num_tokens: 50128
+    max_seq_len: 52096
+    print_iter_log: true
+    stream_interval: 10
+    num_postprocess_workers: 4
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 128
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      mamba_ssm_cache_dtype: float16
+      mamba_ssm_stochastic_rounding: true
+      mamba_ssm_philox_rounds: 5
+    moe_config:
+      backend: 'CUTEDSL'
+      max_num_tokens: 65536
+      use_low_precision_moe_combine: true
+    client_configs:
+      - name: "con512_iter4_50k2k"
+        concurrency: 512
+        iterations: 4
+        isl: 50000
+        osl: 2048
+        random_range_ratio: 0.0
+        backend: "openai"
+        streaming: true
+        dataset_file: <dataset_file>

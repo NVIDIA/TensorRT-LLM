@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -353,26 +353,6 @@ _allowed_configs = {
                vocab_size=49152,
                hidden_act='gelu',
                n_positions=8192,
-           )),
-    "starcoder2_3b":
-    Config(name="starcoder2_3b",
-           family="gpt",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=256,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=30,
-               num_heads=24,
-               num_kv_heads=2,
-               hidden_size=3072,
-               vocab_size=49152,
-               hidden_act='gelu',
-               n_positions=16384,
-               position_embedding_type='rope_gpt_neox',
-               rotary_pct=1.0,
            )),
     "llama_13b":
     Config(name="llama_13b",
@@ -1568,45 +1548,7 @@ _allowed_configs = {
                inter_size=16384,
                moe_num_experts=8,
                moe_top_k=2,
-           )),
-    "phi_3_mini_4k_instruct":
-    Config(name="phi_3_mini_4k_instruct",
-           family="phi3",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=1024,
-               max_seq_len=2048,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               num_kv_heads=32,
-               hidden_size=3072,
-               vocab_size=32064,
-               hidden_act='silu',
-               n_positions=4096,
-               inter_size=8192,
-           )),
-    "phi_3_mini_128k_instruct":
-    Config(name="phi_3_mini_128k_instruct",
-           family="phi3",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=1024,
-               max_seq_len=2048,
-           ),
-           model_config=ModelConfig(
-               num_layers=32,
-               num_heads=32,
-               num_kv_heads=8,
-               hidden_size=4096,
-               vocab_size=128256,
-               hidden_act='silu',
-               n_positions=131072,
-               inter_size=14336,
-           )),
+           ))
 }
 
 

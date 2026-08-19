@@ -70,6 +70,8 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
+    supports_image_edit: bool = False
+
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
@@ -1227,7 +1229,7 @@ class BasePipeline(nn.Module):
                 stats = self.cache_accelerator.get_stats()
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
-                        logger.info("Cache-DiT stats: %s", stats)
+                        logger.info(f"Cache-DiT stats: {stats}")
                     elif self.pipeline_config.cache_backend == "teacache":
                         first_val = next(iter(stats.values()), None)
                         if isinstance(first_val, dict):
