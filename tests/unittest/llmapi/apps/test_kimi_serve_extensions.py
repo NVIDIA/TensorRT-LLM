@@ -45,6 +45,10 @@ from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import (
     _unescape_attr,
 )
 
+# The L0 CPU stage invokes registered files with `-m cpu_only`; without this
+# marker every test is deselected and pytest exits with code 5.
+pytestmark = pytest.mark.cpu_only
+
 WEATHER_TOOL = {
     "type": "function",
     "function": {
