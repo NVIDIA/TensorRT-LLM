@@ -2273,6 +2273,13 @@
       "converter": "",
       "kind": "value",
       "path": "use_cute_dsl_blockscaling_mm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_fine_grained_sync"
     }
   ]
 }

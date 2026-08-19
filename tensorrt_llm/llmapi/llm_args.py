@@ -5548,6 +5548,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
         status="prototype")
 
+    use_fine_grained_sync: bool = Field(
+        default=False,
+        description=
+        "Enable fine-grained synchronization for MoE kernels. When enabled, uses fine-grained-sync kernel variants "
+        "that overlap communication with computation for improved performance on multi-GPU setups.",
+        status="prototype")
+
     enable_layerwise_nvtx_marker: bool = Field(
         default=False,
         description="If true, enable layerwise nvtx marker.",
