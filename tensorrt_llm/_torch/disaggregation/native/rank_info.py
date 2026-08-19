@@ -48,6 +48,10 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    # bounce_v2 control handshake blob (None when bounce_v2 is disabled).
+    # Optional with a None default so rank info from peers that predate the
+    # field still deserializes.
+    bounce_v2_handshake: Optional[bytes] = None
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -60,6 +64,12 @@ class RankInfo:
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
+        # Omit the key entirely when bounce_v2 is disabled: peers that predate
+        # the field decode with cls(**unpacked) and would crash on an unknown
+        # key, so a NEW rank with bounce off must emit an OLD-style blob
+        # (from_bytes stays tolerant of both shapes).
+        if data.get("bounce_v2_handshake") is None:
+            data.pop("bounce_v2_handshake", None)
         return msgpack.packb(data)
 
     @classmethod
