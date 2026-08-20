@@ -109,6 +109,16 @@ def is_power():
 
 
 def get_linux_distribution() -> tuple[str, str, str]:
+    """Return Linux distribution metadata.
+
+    The ``distro`` package is preferred when available, with ``os-release`` as
+    a dependency-free fallback.
+
+    Returns:
+        The distribution ID, version ID, and version codename, in that order.
+        Missing ``os-release`` fields are returned as ``"na"``; if the file
+        cannot be read, all three values are ``"na"``.
+    """
     try:
         import distro
     except ImportError:
