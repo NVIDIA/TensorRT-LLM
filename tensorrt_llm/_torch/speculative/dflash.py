@@ -238,8 +238,12 @@ class DFlashWorker(SpecWorkerBase):
                 f"DFlash: acceptance-statistics recording enabled -> {self._accept_stats.path}"
             )
 
+        # type(self), not a literal: DSparkWorker does not override
+        # __init__, so a hardcoded name reports the base class and the log
+        # cannot evidence which worker a run actually used.
         logger.info(
-            f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
+            f"{type(self).__name__} initialized with "
+            f"use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
 
     @property
