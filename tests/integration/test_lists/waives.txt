@@ -353,8 +353,6 @@ test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/
 test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (bug pending, tracked in PR 17414)
 test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b] SKIP (https://nvbugs/6568058)
 unittest/_torch/attention/sparse/dsa/test_req_idx_per_token.py::test_on_update_kv_lens_rebuilds_stale_map SKIP (https://nvbugs/6574939)
-unittest/_torch/attention/sparse/rocketkv/test_rocketkv.py::test_model[TRTLLM-llama-3.1-model/Llama-3.1-8B-Instruct-pytorch] SKIP (https://nvbugs/6602094)
-unittest/_torch/attention/sparse/rocketkv/test_rocketkv.py::test_model[VANILLA-llama-3.1-model/Llama-3.1-8B-Instruct-pytorch] SKIP (https://nvbugs/6602094)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[deepseekv3_mla-gen-bf16-HND-p32-v1] SKIP (https://nvbugs/6507109)
 unittest/_torch/executor/test_kv_pool_rebalance.py::TestPpLoopDrainWiring::test_drain_length_follows_the_ring_depth SKIP (https://nvbugs/6627197)
 unittest/_torch/executor/test_kv_pool_rebalance.py::TestPpLoopDrainWiring::test_drain_suppresses_queueing_then_rebalances_and_resumes SKIP (https://nvbugs/6627197)
