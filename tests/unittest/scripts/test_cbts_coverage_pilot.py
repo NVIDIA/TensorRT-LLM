@@ -25,6 +25,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 PILOT_PATH = REPO_ROOT / "jenkins" / "scripts" / "cbts" / "coverage_pilot.py"
 PR_API_URL = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/pulls/123"
+TEST_PILOT_USERS = frozenset({"pilot-user"})
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +55,7 @@ class _Response:
 @pytest.mark.parametrize(
     ("pr_info", "expected"),
     (
-        ({"user": {"login": " CrazyDemo "}}, (True, "crazydemo", "author is allowlisted")),
+        ({"user": {"login": " Pilot-User "}}, (True, "pilot-user", "author is allowlisted")),
         (
             {"user": {"login": "someone-else"}},
             (False, "someone-else", "author is not allowlisted"),
@@ -65,7 +66,7 @@ class _Response:
     ),
 )
 def test_evaluate_pr_info(pilot_module: ModuleType, pr_info: object, expected: tuple) -> None:
-    assert pilot_module.evaluate_pr_info(pr_info) == expected
+    assert pilot_module.evaluate_pr_info(pr_info, pilot_users=TEST_PILOT_USERS) == expected
 
 
 def test_check_pilot_eligibility_uses_token(
@@ -75,13 +76,15 @@ def test_check_pilot_eligibility_uses_token(
         assert request.full_url == PR_API_URL
         assert request.get_header("Authorization") == "Bearer token"
         assert timeout == 15
-        return _Response({"user": {"login": "crazydemo"}})
+        return _Response({"user": {"login": "pilot-user"}})
 
     monkeypatch.setattr(pilot_module.urllib.request, "urlopen", urlopen)
 
-    assert pilot_module.check_pilot_eligibility(PR_API_URL, token="token") == (
+    assert pilot_module.check_pilot_eligibility(
+        PR_API_URL, token="token", pilot_users=TEST_PILOT_USERS
+    ) == (
         True,
-        "crazydemo",
+        "pilot-user",
         "author is allowlisted",
     )
 
@@ -125,13 +128,15 @@ def test_main_reads_bot_trigger_payload(
     trigger_phrase = json.dumps({"github_pr_api_url": PR_API_URL})
     monkeypatch.setenv("gitlabTriggerPhrase", trigger_phrase)
     monkeypatch.setenv("GITHUB_API_TOKEN", "token")
-    monkeypatch.setattr(
-        pilot_module.urllib.request,
-        "urlopen",
-        lambda _request, *, timeout: _Response({"user": {"login": "crazydemo"}}),
-    )
+
+    def check_pilot_eligibility(pr_api_url, *, token):
+        assert pr_api_url == PR_API_URL
+        assert token == "token"
+        return True, "pilot-user", "author is allowlisted"
+
+    monkeypatch.setattr(pilot_module, "check_pilot_eligibility", check_pilot_eligibility)
 
     assert pilot_module.main([]) == 0
     captured = capsys.readouterr()
     assert captured.out == "true\n"
-    assert "pr_author=crazydemo, eligible=true" in captured.err
+    assert "pr_author=pilot-user, eligible=true" in captured.err
