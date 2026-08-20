@@ -197,8 +197,10 @@ def reject_unsupported_inkling_kv_cache_features(
     Block reuse is refused only when no snapshot policy is configured:
     ``periodic_snapshot_interval`` commits the conv window with the block at
     each snapshot ordinal, which is what gives a prefix hit a window to restore.
-    Disaggregated serving moves a request without its conv windows at all, and
-    stays refused. Neither raises on its own; both emit wrong logits silently.
+    Disaggregated serving stays refused: the conv windows are V2 SSM-layer
+    memory, but the transfer path finds state pools by manager class, and
+    Inkling's is not the Mamba one, so they would never be described to it.
+    Neither raises on its own; both emit wrong logits silently.
 
     Chunked prefill is no longer refused: ``_run_context`` routes a request with
     cached history to ``inkling_chunked_prefill_attention``, which reads the
@@ -235,11 +237,14 @@ def reject_unsupported_inkling_kv_cache_features(
         # KvCacheTransceiverV2 is not: it would move the paged KV and leave the
         # conv windows behind, so the decode instance convolves against zeros.
         raise NotImplementedError(
-            "Inkling does not support disaggregated serving. The four "
-            "short-conv windows per layer are per-request state outside the "
-            "paged KV cache (InklingConvStateCache), so they are not part of "
-            "any cache transfer; the generation instance would resume from a "
-            "zeroed window and silently emit wrong output. Unset "
+            "Inkling does not support disaggregated serving. Its four "
+            "short-conv windows per layer are per-request recurrent state, "
+            "held as KV cache manager V2 SSM layers -- but the cache-transfer "
+            "path enumerates state pools by cache-manager class, and "
+            "InklingHybridCacheManager is not MambaHybridCacheManagerV2, so "
+            "they are described to it as ordinary paged attention memory. The "
+            "generation instance would resume from a window that was never "
+            "transferred and silently emit wrong output. Unset "
             "cache_transceiver_config to run Inkling.")
 
 
