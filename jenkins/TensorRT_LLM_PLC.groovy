@@ -400,7 +400,7 @@ def processScanResults(ref) {
             ]) {
                 sh """
                     python3 -m venv venv
-                    venv/bin/pip install 'requests>=2.32.2,<3' elasticsearch==7.13.4
+                    venv/bin/pip install 'requests>=2.32.4,<3' elasticsearch==7.13.4
                 """
                 def skipArgs = ""
                 def sbomExists = fileExists("${pwd()}/scan_report/source_code/sbom.json")

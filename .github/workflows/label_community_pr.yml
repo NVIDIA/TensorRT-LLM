@@ -25,7 +25,7 @@ jobs:
           python-version: '3.x'
 
       - name: Install dependencies
-        run: pip install 'requests>=2.32.2,<3'
+        run: pip install 'requests>=2.32.4,<3'
 
       - name: Run labeling script
         env:
