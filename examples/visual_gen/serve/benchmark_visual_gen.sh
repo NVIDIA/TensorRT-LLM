@@ -490,11 +490,14 @@ else:
 print(f"  Request Latency (s): {result['mean_latency']:.4f}")
 if "mean_total_pipeline_time" in result:
     print(
-        "  Avg. Total Pipeline Time (s): "
+        "  Total Pipeline Time (s/request), mean: "
         f"{result['mean_total_pipeline_time']:.4f} (server log)"
     )
 else:
-    print("  Avg. Total Pipeline Time (s): unavailable; inspect the server log")
+    print(
+        "  Total Pipeline Time (s/request), mean: "
+        "unavailable; inspect the server log"
+    )
 PY
 
 echo "Benchmark complete. Artifacts:"
