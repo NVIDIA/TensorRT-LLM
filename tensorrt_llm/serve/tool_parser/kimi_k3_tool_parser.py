@@ -232,9 +232,11 @@ class KimiK3ToolParser(BaseToolParser):
         if not buffer:
             return StreamingParseResult()
         if self.bot_token not in buffer:
-            # Only a partial bot_token prefix could be held back here; the
-            # stream is over, so it is plain text after all.
-            return StreamingParseResult(normal_text=buffer)
+            # The buffer holds either a partial bot_token prefix or the
+            # structural residue left after a completed tools section; the
+            # stream is over, so it is plain text after stripping any
+            # trailing structural tokens (matching detect_and_parse).
+            return StreamingParseResult(normal_text=self._trailing_structural.sub("", buffer))
         logger.warning(
             f"kimi_k3 tool parser: stream ended before {self.eot_token}; "
             "parsing the partial tools section"
