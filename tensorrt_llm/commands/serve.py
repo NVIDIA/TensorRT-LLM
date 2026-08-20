@@ -1876,8 +1876,9 @@ def disaggregated(
     if "--config_file" in sys.argv:
         logger.warning("--config_file is deprecated, use --config instead.")
 
-    disagg_cfg = parse_disagg_config_file(
-        config_file, schedule_style_override=schedule_style)
+    disagg_cfg = parse_disagg_config_file(config_file)
+    if schedule_style:
+        disagg_cfg.schedule_style = schedule_style
 
     # Generate a shared deployment ID for all workers in this disagg deployment.
     # Inherited by child processes via env var; used for deduplication at query time.
