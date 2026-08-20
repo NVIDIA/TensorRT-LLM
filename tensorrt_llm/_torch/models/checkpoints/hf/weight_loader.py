@@ -68,6 +68,10 @@ class _LazySafetensorsWeights(ConsumableWeightsDict):
         super().__init__(weights)
         self._handles = handles
 
+    def clear(self) -> None:
+        super().clear()
+        self._handles.clear()
+
 
 @register_checkpoint_weight_loader("MX")
 @register_checkpoint_weight_loader("mistral")
