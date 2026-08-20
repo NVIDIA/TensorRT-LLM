@@ -70,47 +70,6 @@ def _resolve_conv_dtype(pretrained_config) -> torch.dtype:
     )
 
 
-class _InklingConvGeometry:
-    """Everything ``_build_cache_config`` needs to size the conv state.
-
-    Split out because it has to be computed *before* ``super().__init__()`` --
-    ``_build_cache_config`` runs inside it -- and every input is already an
-    argument of the manager's constructor.
-    """
-
-    def __init__(self, pretrained_config, mapping, max_batch_size, *, spec_config=None):
-        config = getattr(pretrained_config, "text_config", pretrained_config)
-        self.config = config
-        self.dtype = _resolve_conv_dtype(pretrained_config)
-        self.kwin = config.sconv_kernel_size - 1
-        # k/v width follows the attention kv-head split, so this takes the
-        # attention TP, not the global one -- as V2 does for the paged pool.
-        self.tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-        # One row per resident sequence; each pipeline stage holds a microbatch.
-        self.num_request_slots = max_batch_size * mapping.pp_size
-        self.reserve_attention_dp_slot = bool(mapping.enable_attention_dp)
-        self.max_draft_len = int(getattr(spec_config, "max_draft_len", 0) or 0)
-        # Asked of the pool rather than re-derived: the two counts must agree or
-        # slots_for indexes the V2 buffer out of bounds.
-        self.num_reserved_slots = InklingConvStateCache.reserved_slot_count(
-            reserve_attention_dp_slot=self.reserve_attention_dp_slot
-        )
-
-    def channels(self, global_layer_idx: int) -> List[int]:
-        """Per-conv channel counts for one layer, in ``InklingConvState`` order."""
-        kv_dim = (
-            self.config.layer_num_kv_heads(global_layer_idx)
-            * self.config.layer_head_dim(global_layer_idx)
-        ) // self.tp_size
-        hidden = self.config.hidden_size
-        return [kv_dim, kv_dim, hidden, hidden]
-
-    def bytes_per_slot(self, global_layer_idx: int) -> List[int]:
-        """Bytes one request occupies in each of the layer's four conv states."""
-        itemsize = torch.empty((), dtype=self.dtype).element_size()
-        return [c * self.kwin * itemsize for c in self.channels(global_layer_idx)]
-
-
 class InklingHybridCacheManager(KVCacheManagerV2):
     """Paged KV (V2, per-layer geometry) + the short-conv state pool.
 
@@ -121,14 +80,12 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     """
 
     def __init__(self, *args, pretrained_config, mapping, max_batch_size, **kwargs):
-        # Geometry is computed before super().__init__() because
-        # _build_cache_config runs inside it and must size the SSM buffers.
-        self._conv_geometry = _InklingConvGeometry(
-            pretrained_config,
-            mapping,
-            max_batch_size,
-            spec_config=kwargs.get("spec_config"),
-        )
+        # The only thing that must be resolved before super().__init__(): the
+        # base does not keep ``pretrained_config``, and _build_cache_config runs
+        # inside it. Everything else the conv sizing needs (mapping,
+        # max_batch_size, pp_layers, max_draft_len) is on ``self`` by then.
+        self._conv_config = getattr(pretrained_config, "text_config", pretrained_config)
+        self._conv_dtype = _resolve_conv_dtype(pretrained_config)
         super().__init__(
             *args,
             pretrained_config=pretrained_config,
@@ -136,23 +93,58 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             max_batch_size=max_batch_size,
             **kwargs,
         )
-        geo = self._conv_geometry
         self._conv_cache = InklingConvStateCache(
             pretrained_config,
-            geo.tp_size,
-            geo.num_request_slots,
+            self._conv_tp_size,
+            self._num_conv_request_slots,
             torch.device("cuda", torch.cuda.current_device()),
-            geo.dtype,
-            reserve_attention_dp_slot=geo.reserve_attention_dp_slot,
-            max_draft_len=geo.max_draft_len,
+            self._conv_dtype,
+            reserve_attention_dp_slot=self._reserve_attention_dp_slot,
+            max_draft_len=self.max_draft_len,
             allocate=self._conv_state_buffer,
         )
         logger.info(
             f"Inkling short-conv state pool: {self._conv_cache.num_slots} rows "
-            f"({geo.num_request_slots} request + {geo.num_reserved_slots} reserved), "
+            f"({self._num_conv_request_slots} request + "
+            f"{self._num_reserved_conv_slots} reserved), "
             f"{self._conv_cache.conv_state_bytes() / (1 << 20):.1f} MiB, "
             "backed by V2 SSM layers"
         )
+
+    # ---- conv geometry, all derived from what the base already resolved -----
+    @property
+    def _conv_tp_size(self) -> int:
+        """k/v conv width follows the attention kv-head split, so this takes the
+        attention TP, not the global one -- as V2 does for the paged pool."""
+        return 1 if self.mapping.enable_attention_dp else self.mapping.tp_size
+
+    @property
+    def _reserve_attention_dp_slot(self) -> bool:
+        return bool(self.mapping.enable_attention_dp)
+
+    @property
+    def _num_conv_request_slots(self) -> int:
+        """One row per resident sequence; each pipeline stage holds a microbatch."""
+        return self.max_batch_size * self.mapping.pp_size
+
+    @property
+    def _num_reserved_conv_slots(self) -> int:
+        """Asked of the pool rather than re-derived: the two counts must agree or
+        slots_for indexes the V2 buffer out of bounds."""
+        return InklingConvStateCache.reserved_slot_count(
+            reserve_attention_dp_slot=self._reserve_attention_dp_slot
+        )
+
+    def _conv_bytes_per_slot(self, global_layer_idx: int) -> List[int]:
+        """Bytes one request occupies in each of the layer's four conv states, in
+        ``InklingConvState`` order."""
+        config = self._conv_config
+        kv_dim = (
+            config.layer_num_kv_heads(global_layer_idx) * config.layer_head_dim(global_layer_idx)
+        ) // self._conv_tp_size
+        window = config.sconv_kernel_size - 1
+        itemsize = torch.empty((), dtype=self._conv_dtype).element_size()
+        return [c * window * itemsize for c in (kv_dim, kv_dim, config.hidden_size, config.hidden_size)]
 
     # ---- V2 configuration -------------------------------------------------
     def _conv_layer_id(self, local_layer_idx: int) -> LayerId:
@@ -166,7 +158,6 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         exactly: an Inkling layer needs both KV and conv state, and a
         ``LayerConfig`` is one or the other, so appending is the only way.
         """
-        geo = self._conv_geometry
         layers = list(config.layers)
         num_attention_layers = len(layers)
         # _conv_layer_id derives SSM ids arithmetically from this count.
@@ -181,15 +172,16 @@ class InklingHybridCacheManager(KVCacheManagerV2):
                     buffers=[
                         BufferConfig(role=role, size=nbytes)
                         for role, nbytes in zip(
-                            CONV_ROLES, geo.bytes_per_slot(self.pp_layers[local_idx])
+                            CONV_ROLES, self._conv_bytes_per_slot(self.pp_layers[local_idx])
                         )
                     ],
                 )
             )
 
+        num_reserved = self._num_reserved_conv_slots
         # Non-request rows as zero-capacity requests, like Mamba: no attention
         # pages, one state slot each -- exactly their effect on the pool.
-        dummies = [KVCacheDesc(capacity=0, history_length=0) for _ in range(geo.num_reserved_slots)]
+        dummies = [KVCacheDesc(capacity=0, history_length=0) for _ in range(num_reserved)]
         constraints = [
             replace(batch, kv_caches=[*batch.kv_caches, *dummies]) for batch in config.constraints
         ]
@@ -199,7 +191,7 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             BatchDesc(
                 [
                     KVCacheDesc(capacity=0, history_length=0)
-                    for _ in range(geo.num_request_slots + geo.num_reserved_slots)
+                    for _ in range(self._num_conv_request_slots + num_reserved)
                 ]
             )
         )
@@ -238,7 +230,7 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         addr = self.impl.get_mem_pool_base_address(layer_id, role, PageIndexMode.SHARED)
         num_pages = self.impl.get_page_index_upper_bound(layer_id, role)
         raw = convert_to_torch_tensor(
-            TensorWrapper(addr, self._conv_geometry.dtype, [num_pages] + list(state_shape))
+            TensorWrapper(addr, self._conv_dtype, [num_pages] + list(state_shape))
         )
         scale = self.impl.get_page_index_scale(layer_id, role)
         num_slots = (num_pages + scale - 1) // scale
@@ -256,9 +248,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     def get_conv_states(self, layer_idx: int) -> InklingConvState:
         """The four short-conv state buffers of ``layer_idx``.
 
-        Named after ``BaseMambaCacheManager.get_conv_states`` but not implementing
-        it: that hook's one tensor per layer cannot express four convs at two
-        widths.
+        Named after ``BaseMambaCacheManager.get_conv_states`` but deliberately not
+        implementing it: that hook returns one tensor per layer, which cannot
+        express four convs at two widths, and Inkling backs no SSM state at all.
         """
         return self._conv_cache.layer_state(layer_idx)
 

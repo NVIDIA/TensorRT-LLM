@@ -27,6 +27,7 @@ from .kernels import (
     write_kv_cache_hnd,
 )
 from .metadata import InklingAttentionMetadata
+from .page_table import gen_page_table, gen_seq_lens, page_div, validate_decode_layout
 from .params import InklingBackendForwardArgs
 
 
@@ -34,11 +35,12 @@ class InklingTritonAttention(TrtllmAttention):
     """Runs Inkling's Triton attention over the paged KV cache.
 
     Inkling's two private forward inputs (``rel_logits``, ``allow_mixed``) ride
-    ``AttentionForwardArgs.sparse_backend_args``. Subclasses ``TrtllmAttention``
-    so :class:`InklingAttentionMetadata` can reuse its ``prepare()``.
-    ``sm_scale`` / ``rel_extent`` / ``window_left`` are assigned by
-    ``InklingAttention`` after construction, since ``create_attention()`` has a
-    fixed kwarg list.
+    ``AttentionForwardArgs.sparse_backend_args``. The metadata adds nothing but
+    the conv pool's pre-capture slot write; the decode kernel's seq lens and page
+    table are slices of buffers the base already keeps graph-stable (see
+    ``page_table.py``). ``sm_scale`` / ``rel_extent`` / ``window_left`` are
+    assigned by ``InklingAttention`` after construction, since
+    ``create_attention()`` has a fixed kwarg list.
     """
 
     Metadata = InklingAttentionMetadata
@@ -198,19 +200,20 @@ class InklingTritonAttention(TrtllmAttention):
         # new K/V with an in-graph scatter whose indices are derived on-GPU.
         num_req = q.shape[0]
         if (
-            isinstance(attn_metadata, InklingAttentionMetadata)
+            getattr(attn_metadata, "kv_cache_block_offsets", None) is not None
             and attn_metadata.num_generations == num_req
         ):
-            sl = attn_metadata.ink_gen_seq_lens(num_req)
-            pt = attn_metadata.ink_gen_page_table(cache_layer)[:num_req]
-            page_div = attn_metadata.ink_page_div
+            validate_decode_layout(attn_metadata, cache_layer, num_req)
+            sl = gen_seq_lens(attn_metadata, num_req)
+            pt = gen_page_table(attn_metadata, cache_layer)[:num_req]
+            div = page_div(attn_metadata)
             pos = (sl - 1).long()  # write slot = total_kv_len - 1 = num_cached
             page_row = torch.div(pos, page_size, rounding_mode="floor")
             offs = pos - page_row * page_size
             # Divide after the gather: [num_req] elements, not [num_req, blocks].
             pages = pt.gather(1, page_row.unsqueeze(1)).squeeze(1).long()
-            if page_div > 1:
-                pages = torch.div(pages, page_div, rounding_mode="floor")
+            if div > 1:
+                pages = torch.div(pages, div, rounding_mode="floor")
             # Paired advanced indices select one (page, slot) per request ->
             # [num_req, num_kv_heads, head_dim], matching the new k/v.
             k_cache[pages, :, offs, :] = k.to(k_cache.dtype)
@@ -226,21 +229,22 @@ class InklingTritonAttention(TrtllmAttention):
                 rel_logits,
                 self.rel_extent,
                 self.window_left,
-                page_div=page_div,
+                page_div=div,
             )
-        # Eager fallback: the decode metadata was not published, so build it here
-        # from the host block table. Illegal under CUDA graph.
+        # Eager fallback: no paged page table to borrow, so build one here from
+        # the host block table. Illegal under CUDA graph.
         if getattr(attn_metadata, "is_cuda_graph", False):
             raise RuntimeError(
                 "Inkling decode metadata is unusable for a CUDA-graph batch: "
                 f"attn_metadata is {type(attn_metadata).__name__} with "
-                f"num_generations="
-                f"{getattr(attn_metadata, 'num_generations', None)}, expected an "
-                f"InklingAttentionMetadata with {num_req}. "
-                "Inkling's backend is selected through sparse/registry.py under "
-                "the TRTLLM backend family; remove any attn_backend override "
-                "from --extra_llm_api_options / LLM(attn_backend=...) so the "
-                "default applies."
+                f"num_generations={getattr(attn_metadata, 'num_generations', None)} "
+                f"and kv_cache_block_offsets="
+                f"{'set' if getattr(attn_metadata, 'kv_cache_block_offsets', None) is not None else 'None'}, "
+                f"expected a TrtllmAttentionMetadata with {num_req} generation "
+                "rows and an allocated page table. Inkling's backend is selected "
+                "through sparse/registry.py under the TRTLLM backend family; "
+                "remove any attn_backend override from --extra_llm_api_options / "
+                "LLM(attn_backend=...) so the default applies."
             )
         num_req = len(request_ids)
         block_ids = mgr.get_batch_cache_indices(request_ids, cache_layer)

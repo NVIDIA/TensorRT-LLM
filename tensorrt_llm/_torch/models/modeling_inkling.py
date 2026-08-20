@@ -810,18 +810,18 @@ class InklingModel(DecoderModel):
         inputs_embeds_prenormed: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        """Decoder stack. The context/generation split over the short-conv pool
-        comes from ``attn_metadata``, the pool itself from its cache manager; a
-        metadata without them keeps the stateless conv.
+        """Decoder stack. The short-conv pool comes from the cache manager and its
+        per-forward split from the state metadata the base ``prepare()`` built; a
+        metadata without one keeps the stateless conv.
 
         ``inputs_embeds_prenormed`` is set on the multimodal path, where the
         wrapper has already applied ``embed_norm`` to the text embeddings before
         scattering the raw tower rows in."""
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        # conv_rt is the gate: it is published only when the manager owns a pool
-        # and this batch has requests to map onto it.
-        conv_rt = getattr(attn_metadata, "ink_conv_rt", None)
+        # Views only, no copy: the slot write happened in prepare(), outside the
+        # captured region. conv_rt is the gate for the pool path.
+        conv_rt = InklingConvRuntime.from_metadata(attn_metadata)
         conv_cache = (
             getattr(attn_metadata.kv_cache_manager, "conv_state_cache", None)
             if conv_rt is not None
@@ -882,9 +882,8 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
                 f"{backend!r}). Its backend is registered in "
                 "attention_backend/sparse/registry.py under that family only, "
                 "and its Triton decode kernel reads per-step seq_lens and page "
-                "tables from InklingAttentionMetadata, which extends "
-                "TrtllmAttentionMetadata. Remove the attn_backend override from "
-                "--extra_llm_api_options / LLM(attn_backend=...)."
+                "tables off TrtllmAttentionMetadata. Remove the attn_backend "
+                "override from --extra_llm_api_options / LLM(attn_backend=...)."
             )
 
     @staticmethod

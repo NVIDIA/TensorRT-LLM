@@ -12,12 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inkling attention: Triton kernels, per-step metadata, backend, cache manager.
+"""Inkling attention: Triton kernels, backend, cache manager, conv-state pool.
 
 Inkling's attention is dense (full causal, sliding window on local layers, plus a
 learned relative-bias ``score_mod``), not sparse. It lives under ``sparse/``
 because that is where every model-specific attention backend already lives, and
 selection goes through ``sparse/registry.py`` like its neighbours.
+
+The attention metadata adds one thing to the base: the conv pool's per-step slot
+write, which has to run outside the CUDA-graph capture region. Everything else the
+decode kernel needs is a view of the base's own buffers (``page_table.py``).
 """
 
 from .backend import InklingTritonAttention
@@ -37,6 +41,7 @@ from .kernels import (
     write_kv_cache_hnd,
 )
 from .metadata import InklingAttentionMetadata
+from .page_table import gen_page_table, gen_seq_lens, page_div
 from .params import (
     InklingBackendForwardArgs,
     InklingSparseAttentionConfig,
@@ -57,8 +62,11 @@ __all__ = [
     "InklingTritonAttention",
     "apply_short_conv",
     "build_page_table",
+    "gen_page_table",
+    "gen_seq_lens",
     "inkling_forward_args",
     "inkling_decode_attention",
     "inkling_prefill_attention",
+    "page_div",
     "write_kv_cache_hnd",
 ]

@@ -196,7 +196,7 @@ def reject_unsupported_inkling_kv_cache_features(
     **2. The short-conv window is not carried either.** The four depthwise short
     convolutions per layer hold a ``kernel_size - 1`` window as per-request
     state outside the KV cache, in ``InklingConvStateCache``.
-    ``InklingConvRuntime.build`` seeds every context request with
+    ``InklingConvRuntime`` seeds every context request with
     ``has_initial_state=False``. ``slots_for`` does keep a request's pool row
     across chunks and ``causal_conv1d_fn`` does write the trailing window into
     it, so the state is there -- it is simply never declared, and so never

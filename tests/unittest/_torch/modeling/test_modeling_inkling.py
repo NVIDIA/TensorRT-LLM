@@ -106,7 +106,7 @@ def test_model_defaults_pin_v2_and_disable_block_reuse():
     V2 because the per-layer KV-head split (local 16 / global 8) needs
     per-layer geometry V1 cannot represent; block reuse off because the four
     depthwise short convs per layer hold a ``kernel_size - 1`` window outside
-    the KV cache, and ``InklingConvRuntime.build`` seeds every context request
+    the KV cache, and ``InklingConvRuntime`` seeds every context request
     with ``has_initial_state=False`` -- a reused prefix would restart the
     convolutions from zeros while attention resumed from real history.
     """
@@ -124,7 +124,7 @@ def test_model_defaults_pin_v2_and_disable_block_reuse():
 # Both leave a CONTEXT request with history it should attend to and convolve
 # against, and Inkling gets that wrong twice: _run_context attends only to the
 # tokens of its own call (inkling_prefill_attention has no paged-KV argument),
-# and InklingConvRuntime.build seeds every context request with
+# and InklingConvRuntime seeds every context request with
 # has_initial_state=False. Neither raises on its own -- both emit wrong logits.
 # ---------------------------------------------------------------------------
 def test_block_reuse_is_rejected_not_merely_defaulted_off():
@@ -359,11 +359,11 @@ def test_checkpoint_tensor_shapes_match_geometry(ckpt_config):
 
 
 # ---------------------------------------------------------------------------
-# InklingAttentionMetadata: the per-step decode publish
+# Decode inputs: views into the stock TrtllmAttentionMetadata
 # ---------------------------------------------------------------------------
 #: Pages per logical slot, i.e. ``num_pool_layers * kv_factor``. Arbitrary here;
 #: what matters is that it is > 1 and even, so a test that forgot to apply
-#: ``ink_page_div`` produces a visibly wrong page id rather than an off-by-a-bit.
+#: ``page_div`` produces a visibly wrong page id rather than an off-by-a-bit.
 _FAKE_INDEX_SCALE = 6
 
 
@@ -421,6 +421,36 @@ def _fake_block_offsets(num_pools, num_seqs, max_blocks, index_scale=_FAKE_INDEX
     return offs
 
 
+def _ptmod():
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import page_table
+
+    return page_table
+
+
+def _gen_page_table(md, layer):
+    return _ptmod().gen_page_table(md, layer)
+
+
+def _gen_seq_lens(md, num_gen):
+    return _ptmod().gen_seq_lens(md, num_gen)
+
+
+def _page_div(md):
+    return _ptmod().page_div(md)
+
+
+def _pt_row(md, layer):
+    return _ptmod().pt_row(md, layer)
+
+
+def _validate(md):
+    """What the backend runs per layer before touching the borrowed buffers."""
+    pt = _ptmod()
+    num_gen = len(md.request_ids) - md.num_contexts
+    for layer in pt.owned_layers(md):
+        pt.validate_decode_layout(md, layer, num_gen)
+
+
 def _ink_metadata(
     num_contexts=0,
     request_ids=(7, 9),
@@ -432,11 +462,11 @@ def _ink_metadata(
     index_scale=_FAKE_INDEX_SCALE,
     mgr=None,
 ):
-    """An InklingAttentionMetadata with prepare()'s inputs stubbed in.
+    """An InklingAttentionMetadata with prepare()'s outputs stubbed in.
 
     Builds the object without running AttentionMetadata's dataclass __init__ so
     the test stays CPU-only and independent of the KV-cache stack; only the
-    fields _prepare_inkling_decode reads are populated.
+    fields the Inkling page-table helpers read are populated.
     """
     import torch
 
@@ -479,15 +509,15 @@ def test_metadata_reads_both_decode_inputs_from_the_base_buffers():
     """
     md = _ink_metadata()
 
-    md._prepare_inkling_decode()
+    _validate(md)
 
     # num_cached + 1, straight off the base buffer.
-    assert md.ink_gen_seq_lens(2).tolist() == [4, 131]
-    pt = md.ink_gen_page_table(0)
+    assert _gen_seq_lens(md, 2).tolist() == [4, 131]
+    pt = _gen_page_table(md, 0)
     # Same storage as the base tensor: a view, not a copy.
     assert pt.untyped_storage().data_ptr() == md.kv_cache_block_offsets.untyped_storage().data_ptr()
     # Plane 0 of pool 0, generation rows. Encoded values, not block indices --
-    # the kernel divides by ink_page_div.
+    # the kernel divides by page_div.
     assert pt.tolist() == md.kv_cache_block_offsets[0, 0:2, 0].tolist()
     assert pt.tolist() == [[1 * 6, 0, 0, 0], [101 * 6, 102 * 6, 0, 0]]
 
@@ -497,39 +527,40 @@ def test_metadata_page_div_recovers_the_block_index():
 
     Entries count pages (K and V separately); the kernel's K/V views are the two
     planes of a ``[blocks, kv_factor, ...]`` buffer and count blocks. So
-    ``entry // ink_page_div`` must be ``base_page_index * num_pool_layers``, and
-    ``ink_page_div`` must be the manager's ``kv_factor`` -- not a hardcoded 2.
+    ``entry // page_div`` must be ``base_page_index * num_pool_layers``, and
+    ``page_div`` must be the manager's ``kv_factor`` -- not a hardcoded 2.
     """
     md = _ink_metadata()
-    md._prepare_inkling_decode()
+    _validate(md)
 
-    assert md.ink_page_div == md.kv_cache_manager.kv_factor == 2
-    pt = md.ink_gen_page_table(0)
+    assert _page_div(md) == md.kv_cache_manager.kv_factor == 2
+    pt = _gen_page_table(md, 0)
     # index_scale=6, kv_factor=2 -> block index is base_page_index * 3.
-    assert (pt // md.ink_page_div).tolist() == [[3, 0, 0, 0], [303, 306, 0, 0]]
+    assert (pt // _page_div(md)).tolist() == [[3, 0, 0, 0], [303, 306, 0, 0]]
 
     md.kv_cache_manager.kv_factor = 1
-    assert md.ink_page_div == 1
+    assert _page_div(md) == 1
 
 
-def test_metadata_stages_nothing_and_asks_the_manager_for_nothing():
+def test_metadata_stages_no_page_table_of_its_own():
     """Regression on the reason for this refactor.
 
     The previous version built a pinned host table, filled it in a Python loop
     over requests and blocks, and issued one non-blocking H2D per KV geometry --
     every decode step, on the host-bound path. Assert that per-step work is gone:
-    no staging buffer survives, and the manager is queried only while the static
-    row mapping is being built (once), not on the steps after it.
+    nothing is staged on the metadata, and the manager is asked only for the
+    cheap row-mapping constants, never for the block table that drove the copy.
     """
     md = _ink_metadata(pp_layers=(0, 1), layer_pools={0: 0, 1: 0})
 
-    md._prepare_inkling_decode()
-    md.kv_cache_manager.calls.clear()
-    md._prepare_inkling_decode()  # a second step, mapping already cached
+    _validate(md)
 
-    assert md.kv_cache_manager.calls == []
     assert not hasattr(md, "_ink_pt_host")
     assert not hasattr(md, "ink_page_table")
+    # The row lookup is host arithmetic over manager constants, recomputed per
+    # layer rather than cached; get_batch_cache_indices -- the accessor the H2D
+    # path needed -- is never reached.
+    assert {kind for kind, _ in md.kv_cache_manager.calls} == {"scale"}
 
 
 def test_metadata_shares_one_page_table_row_per_kv_geometry():
@@ -544,15 +575,15 @@ def test_metadata_shares_one_page_table_row_per_kv_geometry():
         layer_pools={0: 0, 1: 0, 2: 1, 3: 1},
     )
 
-    md._prepare_inkling_decode()
+    _validate(md)
 
-    assert {layer: md._ink_pt_row(layer) for layer in (0, 1, 2, 3)} == {0: 0, 1: 0, 2: 1, 3: 1}
+    assert {layer: _pt_row(md, layer) for layer in (0, 1, 2, 3)} == {0: 0, 1: 0, 2: 1, 3: 1}
     # Layers sharing a pool address the same memory...
-    assert md.ink_gen_page_table(0).data_ptr() == md.ink_gen_page_table(1).data_ptr()
-    assert md.ink_gen_page_table(2).data_ptr() == md.ink_gen_page_table(3).data_ptr()
+    assert _gen_page_table(md, 0).data_ptr() == _gen_page_table(md, 1).data_ptr()
+    assert _gen_page_table(md, 2).data_ptr() == _gen_page_table(md, 3).data_ptr()
     # ...and the two geometries do not.
-    assert md.ink_gen_page_table(0).data_ptr() != md.ink_gen_page_table(2).data_ptr()
-    assert md.ink_gen_page_table(0).tolist() != md.ink_gen_page_table(2).tolist()
+    assert _gen_page_table(md, 0).data_ptr() != _gen_page_table(md, 2).data_ptr()
+    assert _gen_page_table(md, 0).tolist() != _gen_page_table(md, 2).tolist()
 
 
 def test_metadata_rows_are_per_layer_under_swa_scratch_reuse():
@@ -566,11 +597,11 @@ def test_metadata_rows_are_per_layer_under_swa_scratch_reuse():
     # One row per layer now, not per pool.
     md.kv_cache_block_offsets = _fake_block_offsets(4, 2, 4)
 
-    md._prepare_inkling_decode()
+    _validate(md)
 
-    assert {layer: md._ink_pt_row(layer) for layer in (0, 1, 2, 3)} == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert {layer: _pt_row(md, layer) for layer in (0, 1, 2, 3)} == {0: 0, 1: 1, 2: 2, 3: 3}
     # Every layer distinct -- no sharing in this mode.
-    ptrs = {md.ink_gen_page_table(layer).data_ptr() for layer in (0, 1, 2, 3)}
+    ptrs = {_gen_page_table(md, layer).data_ptr() for layer in (0, 1, 2, 3)}
     assert len(ptrs) == 4
 
 
@@ -579,11 +610,11 @@ def test_metadata_skips_the_context_slice():
     kernel and are excluded by num_contexts."""
     md = _ink_metadata(num_contexts=1, request_ids=(7, 9), num_cached=(0, 130))
 
-    md._prepare_inkling_decode()
+    _validate(md)
 
-    assert md.ink_gen_seq_lens(1).tolist() == [131]
+    assert _gen_seq_lens(md, 1).tolist() == [131]
     # Row 1 of the base tensor, not row 0 -- the context request's row is skipped.
-    assert md.ink_gen_page_table(0).tolist() == md.kv_cache_block_offsets[0, 1:2, 0].tolist()
+    assert _gen_page_table(md, 0).tolist() == md.kv_cache_block_offsets[0, 1:2, 0].tolist()
 
 
 def test_metadata_yields_no_generation_rows_for_a_context_only_batch():
@@ -596,17 +627,17 @@ def test_metadata_yields_no_generation_rows_for_a_context_only_batch():
     the property the counter was there to provide.
     """
     md = _ink_metadata()
-    md._prepare_inkling_decode()
-    assert md.ink_gen_page_table(0).shape[0] == 2
+    _validate(md)
+    assert _gen_page_table(md, 0).shape[0] == 2
 
     # Same object, now a context-only batch. model_engine sets both of these
     # from one scheduled batch, so the fake moves both.
     md._num_contexts = 2
     md._num_generations = 0
-    md._prepare_inkling_decode()
+    _validate(md)
 
-    assert md.ink_gen_page_table(0).shape[0] == 0
-    assert md.ink_gen_seq_lens(0).shape[0] == 0
+    assert _gen_page_table(md, 0).shape[0] == 0
+    assert _gen_seq_lens(md, 0).shape[0] == 0
 
 
 def test_metadata_refuses_a_cuda_graph_batch_carrying_contexts():
@@ -617,7 +648,7 @@ def test_metadata_refuses_a_cuda_graph_batch_carrying_contexts():
     md.is_cuda_graph = True
 
     with pytest.raises(RuntimeError, match="context requests"):
-        md._prepare_inkling_decode()
+        _validate(md)
 
 
 def test_metadata_rejects_a_batch_wider_than_the_borrowed_block_offsets():
@@ -629,7 +660,7 @@ def test_metadata_rejects_a_batch_wider_than_the_borrowed_block_offsets():
     md.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=[3, 130, 5])
 
     with pytest.raises(RuntimeError, match="sequence rows"):
-        md._prepare_inkling_decode()
+        _validate(md)
 
 
 def test_metadata_rejects_a_layer_whose_scale_disagrees_with_its_pool():
@@ -641,7 +672,7 @@ def test_metadata_rejects_a_layer_whose_scale_disagrees_with_its_pool():
     md.kv_cache_manager.index_scales = [_FAKE_INDEX_SCALE * 2]
 
     with pytest.raises(RuntimeError, match="page-index scale"):
-        md._prepare_inkling_decode()
+        _validate(md)
 
 
 def test_metadata_rejects_a_missing_block_offsets_tensor():
@@ -651,7 +682,7 @@ def test_metadata_rejects_a_missing_block_offsets_tensor():
     md.kv_cache_block_offsets = None
 
     with pytest.raises(RuntimeError, match="kv_cache_block_offsets"):
-        md._prepare_inkling_decode()
+        _validate(md)
 
 
 def test_backend_and_cache_manager_both_resolve_from_the_sparse_registry():
@@ -869,6 +900,7 @@ def test_inkling_selects_the_hybrid_cache_manager():
 
     from tensorrt_llm._torch.attention_backend.sparse import get_sparse_attn_kv_cache_manager
     from tensorrt_llm._torch.attention_backend.sparse.inkling import (
+        InklingAttentionMetadata,
         InklingHybridCacheManager,
         InklingSparseAttentionConfig,
     )
@@ -938,37 +970,87 @@ def test_conv_pool_dtype_refuses_to_guess():
             csm._resolve_conv_dtype(cfg)
 
 
-def test_metadata_builds_the_runtime_itself_from_the_managers_pool():
-    """prepare() must react to a manager that owns a conv pool, and the split
-    it builds is metadata work: the manager is asked for the pool, not for a
-    per-forward runtime object."""
-    from tensorrt_llm._torch.attention_backend.sparse.inkling import conv_state as cs
+def test_prepare_publishes_the_pool_rows_and_nothing_else():
+    """The metadata subclass exists for exactly one line.
 
-    class _FakeConvManager(_FakeKvManager):
-        conv_state_cache = "POOL"
+    The slot write is a host->device copy into a buffer the captured decode graph
+    aliases, so it has to run every step and outside that region; ``prepare()`` is
+    the only hook that qualifies. Everything else the decode path needs is a view
+    of the base's buffers, so the subclass must add no fields of its own.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
-    md = _ink_metadata()
-    md.kv_cache_manager = _FakeConvManager(md.kv_cache_manager.pp_layers)
-    built = {}
+    pool = _conv_pool(tp_size=1, num_request_slots=4)
+    md = object.__new__(InklingAttentionMetadata)
+    md.kv_cache_manager = SimpleNamespace(conv_state_cache=pool)
+    md.request_ids = [7, 9]
 
-    def _build(attn_metadata, cache):
-        built["args"] = (attn_metadata, cache)
-        return "RUNTIME"
+    # Only prepare() is overridden, and it declares no state of its own.
+    assert set(vars(InklingAttentionMetadata)) - set(vars(TrtllmAttentionMetadata)) <= {
+        "prepare",
+        "__doc__",
+        "__module__",
+        "__qualname__",
+    }
 
-    with mock.patch.object(cs.InklingConvRuntime, "build", _build):
-        md._prepare_inkling_conv()
+    with mock.patch.object(TrtllmAttentionMetadata, "prepare", lambda self: None):
+        md.prepare()
 
-    assert built["args"] == (md, "POOL")
-    assert md.ink_conv_rt == "RUNTIME"
+    assert pool.state_indices[:2].tolist() == pool.slots_for([7, 9])
 
 
-def test_metadata_ignores_a_plain_kv_manager():
-    """A non-Inkling manager gets no conv publish -- other models pay nothing."""
-    md = _ink_metadata()
+def test_prepare_leaves_a_plain_kv_manager_alone():
+    """A manager with no conv pool gets no publish -- other models pay nothing."""
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
-    md._prepare_inkling_conv()
+    md = object.__new__(InklingAttentionMetadata)
+    md.kv_cache_manager = SimpleNamespace()
+    md.request_ids = [7, 9]
 
-    assert md.ink_conv_rt is None
+    with mock.patch.object(TrtllmAttentionMetadata, "prepare", lambda self: None):
+        md.prepare()  # must not raise
+
+
+def test_the_conv_runtime_slices_the_published_rows():
+    """Built inside model.forward, so the pool rows must come back as a view of
+    the buffer prepare() already refreshed -- copying them would go stale under
+    CUDA-graph replay."""
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingConvRuntime
+
+    pool = _conv_pool(tp_size=1, num_request_slots=4)
+    md = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(conv_state_cache=pool),
+        request_ids=[7, 9, 11, 13],
+        num_contexts=2,
+        seq_lens=torch.tensor([3, 4, 1, 1], dtype=torch.int32),
+    )
+    pool.write_state_indices(md.request_ids)
+
+    rt = InklingConvRuntime.from_metadata(md)
+
+    assert rt.num_ctx_tokens == 7
+    assert rt.ctx_indices.tolist() == pool.state_indices[:2].tolist()
+    assert rt.gen_indices.tolist() == pool.state_indices[2:4].tolist()
+    # Views of the pool's own buffer, not copies.
+    for view in (rt.ctx_indices, rt.gen_indices):
+        assert (
+            view.untyped_storage().data_ptr() == pool.state_indices.untyped_storage().data_ptr()
+        )
+    # Varlen offsets over the context prefix only, and no carried conv window.
+    assert rt.query_start_loc.tolist() == [0, 3, 7]
+    assert rt.has_initial_state.tolist() == [False, False]
+
+
+def test_the_conv_runtime_is_absent_without_a_pool():
+    """No pool on the manager is the stateless short-conv path."""
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingConvRuntime
+
+    assert InklingConvRuntime.from_metadata(SimpleNamespace(kv_cache_manager=None)) is None
+    assert InklingConvRuntime.from_metadata(SimpleNamespace()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1322,11 +1404,11 @@ def test_conv_pool_zeroes_a_row_even_when_the_allocator_hands_back_garbage():
 
 
 def test_reserved_slot_count_is_defined_once_and_asked_for():
-    """The pool and _InklingConvGeometry must agree on the row count exactly:
-    the geometry declares a min-slots floor to V2, and a V2 buffer sized from a
-    smaller number is indexed out of bounds by slots_for. Two independent copies
-    of `1 + int(adp)` would drift silently, so the layout owner exposes it and
-    the geometry asks."""
+    """The pool and the manager must agree on the row count exactly: the manager
+    declares a min-slots floor to V2, and a V2 buffer sized from a smaller number
+    is indexed out of bounds by slots_for. Two independent copies of
+    `1 + int(adp)` would drift silently, so the layout owner exposes it and the
+    manager asks."""
     import inspect
 
     from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingConvStateCache
@@ -1335,10 +1417,10 @@ def test_reserved_slot_count_is_defined_once_and_asked_for():
     assert InklingConvStateCache.reserved_slot_count(reserve_attention_dp_slot=False) == 1
     assert InklingConvStateCache.reserved_slot_count(reserve_attention_dp_slot=True) == 2
 
-    # The geometry calls it rather than recomputing the formula.
-    src = inspect.getsource(cm._InklingConvGeometry.__init__)
+    # The manager calls it rather than recomputing the formula.
+    src = inspect.getsource(cm.InklingHybridCacheManager._num_reserved_conv_slots.fget)
     assert "reserved_slot_count(" in src
-    assert "1 + int(" not in src, "geometry re-derived the count instead of asking"
+    assert "1 + int(" not in src, "the manager re-derived the count instead of asking"
 
     # And the pool actually sizes itself by it.
     for adp in (False, True):
@@ -1349,8 +1431,8 @@ def test_reserved_slot_count_is_defined_once_and_asked_for():
 
 
 def test_conv_pool_refuses_an_allocator_that_returns_too_few_slots():
-    """The row count is declared twice -- here and in _InklingConvGeometry, which
-    feeds V2 the min-slots constraint. They must agree; a V2 buffer sized from a
+    """The row count is declared twice -- here and in the manager, which feeds V2
+    the min-slots constraint. They must agree; a V2 buffer sized from a
     smaller count would be indexed out of bounds by slots_for."""
     import torch
 
@@ -1561,7 +1643,7 @@ def _patch_pool(monkeypatch, cm):
     class _FakePool:
         num_slots = 0
 
-        # Delegated, not reimplemented: _InklingConvGeometry asks the pool class
+        # Delegated, not reimplemented: the manager asks the pool class
         # for this, and a hand-rolled copy in the double would let the real
         # formula drift without any test noticing.
         reserved_slot_count = InklingConvStateCache.reserved_slot_count
@@ -1572,7 +1654,14 @@ def _patch_pool(monkeypatch, cm):
         def conv_state_bytes(self):
             return 0
 
-    monkeypatch.setattr(cm.KVCacheManagerV2, "__init__", lambda self, *a, **k: None)
+    def _fake_base_init(self, *args, **kwargs):
+        # The manager derives its conv sizing from what the base resolves before
+        # _build_cache_config runs, so the double has to provide exactly those.
+        self.mapping = kwargs["mapping"]
+        self.max_batch_size = kwargs["max_batch_size"]
+        self.max_draft_len = getattr(kwargs.get("spec_config"), "max_draft_len", 0) or 0
+
+    monkeypatch.setattr(cm.KVCacheManagerV2, "__init__", _fake_base_init)
     monkeypatch.setattr(cm, "InklingConvStateCache", _FakePool)
     return seen
 

@@ -16,8 +16,9 @@
 and the helper that runs one short convolution through them.
 
 This is runtime state, not model weights: it has the lifetime of the paged KV
-cache, is owned by :class:`~.cache_manager.InklingHybridCacheManager`, and is
-published each step from :meth:`~.metadata.InklingAttentionMetadata.prepare`.
+cache, is owned by :class:`~.cache_manager.InklingHybridCacheManager`, and its
+rows are published each step from
+:meth:`~.metadata.InklingAttentionMetadata.prepare`, before the captured region.
 """
 
 from collections import namedtuple
@@ -79,7 +80,7 @@ class InklingConvStateCache:
         """Rows sitting above the per-request ones: one shared by every CUDA-graph
         padding sentinel, plus one for the attention-DP idle dummy when enabled.
 
-        Static because ``_InklingConvGeometry`` needs the same count to declare
+        Static because the cache manager needs the same count to declare
         V2's min-slots floor, and the two must agree exactly.
         """
         return 1 + int(reserve_attention_dp_slot)
@@ -207,7 +208,8 @@ class InklingConvStateCache:
         ``state_indices`` CUDA buffer, in packed batch order (contexts first).
 
         A captured decode graph aliases ``state_indices``, so this must run every
-        forward from eager input-prep, not inside ``model.forward``.
+        forward from eager input-prep -- it is reached from the manager's
+        ``get_state_indices``, which the base ``prepare()`` calls.
         """
         slots = self.slots_for(request_ids)
         n = len(slots)
@@ -246,28 +248,29 @@ class InklingConvRuntime:
     has_initial_state: Optional[torch.Tensor]  # bool [n_ctx]
 
     @classmethod
-    def build(cls, attn_metadata, cache: InklingConvStateCache) -> "InklingConvRuntime":
-        """Publish this batch's pool rows, then build the context/generation split.
+    def from_metadata(cls, attn_metadata) -> Optional["InklingConvRuntime"]:
+        """Build this forward's split, or ``None`` for the stateless conv path.
 
-        Called from ``InklingAttentionMetadata.prepare()`` so the host->device
-        slot write lands outside the captured ``model.forward``.
+        Called from ``model.forward``. The pool-row slice is a view of the buffer
+        ``InklingAttentionMetadata.prepare`` already refreshed, so the captured
+        decode path allocates nothing and copies nothing. The varlen offsets below
+        do allocate, but only when the batch carries context requests, and a
+        captured batch never does -- decode graphs are generation-only, which
+        ``page_table.validate_decode_layout`` also enforces.
         """
-        slots = cache.write_state_indices(list(attn_metadata.request_ids))
-        seq_lens = attn_metadata.seq_lens.tolist()
+        mgr = getattr(attn_metadata, "kv_cache_manager", None)
+        cache = getattr(mgr, "conv_state_cache", None)
+        if cache is None or attn_metadata.request_ids is None:
+            return None
         num_contexts = attn_metadata.num_contexts
+        batch_size = len(attn_metadata.request_ids)
         state_indices = cache.state_indices
         device = state_indices.device
-        num_ctx_tokens = sum(seq_lens[:num_contexts])
-        ctx_indices = state_indices[:num_contexts] if num_contexts else None
-        gen_indices = (
-            state_indices[num_contexts : len(slots)] if num_contexts < len(slots) else None
-        )
         query_start_loc = has_initial_state = None
         if num_contexts:
+            seq_lens = attn_metadata.seq_lens.tolist()[:num_contexts]
             cu = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
-            cu[1:] = torch.tensor(seq_lens[:num_contexts], dtype=torch.int32, device=device).cumsum(
-                0
-            )
+            cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
             query_start_loc = cu
             # Fresh prefill carries no prior conv window -- correct only because
             # KV block reuse and chunked prefill are refused by
@@ -276,9 +279,11 @@ class InklingConvRuntime:
             # attends only to its own call's tokens.
             has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
         return cls(
-            num_ctx_tokens=num_ctx_tokens,
-            ctx_indices=ctx_indices,
-            gen_indices=gen_indices,
+            num_ctx_tokens=sum(attn_metadata.seq_lens.tolist()[:num_contexts]),
+            ctx_indices=state_indices[:num_contexts] if num_contexts else None,
+            gen_indices=(
+                state_indices[num_contexts:batch_size] if num_contexts < batch_size else None
+            ),
             query_start_loc=query_start_loc,
             has_initial_state=has_initial_state,
         )
