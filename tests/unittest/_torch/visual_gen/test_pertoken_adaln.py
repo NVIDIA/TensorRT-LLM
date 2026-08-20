@@ -24,6 +24,10 @@ from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (
     fused_pertoken_adaln,
     fused_pertoken_adaln_residual,
 )
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln.pertoken_adaln import (
+    WARP_SIZE,
+    PerTokenAdaLN,
+)
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import WanPerTokenAdaLN
 
 _EPS = 1e-6
@@ -238,3 +242,14 @@ def test_fused_pertoken_adaln_rejects_invalid_contracts() -> None:
     misaligned_x = torch.empty(x.numel() + 1, dtype=x.dtype, device=x.device)[1:].view_as(x)
     with pytest.raises(ValueError, match="data pointer must be 32-byte aligned"):
         fused_pertoken_adaln(misaligned_x, shift, scale, table[0], table[1], _EPS)
+
+
+def test_pertoken_adaln_rejects_num_warps_above_warp_size() -> None:
+    # cta_reduce_sum gathers per-warp partials with a single warp, so a
+    # direct construction past the dispatch guards (D <= 8192, vec >= 8)
+    # must fail loudly instead of silently dropping partials.
+    with pytest.raises(AssertionError, match="cta_reduce_sum"):
+        PerTokenAdaLN(D=16384, vec=8)  # 64 warps
+
+    # D=8192 at vec=8 sits exactly at the WARP_SIZE-warp limit and is valid.
+    assert PerTokenAdaLN(D=8192, vec=8).num_warps == WARP_SIZE

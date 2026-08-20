@@ -164,6 +164,15 @@ class PerTokenAdaLN:
         self.D = D
         self.vec = vec
         self.num_warps = D // (WARP_SIZE * vec)
+        # cta_reduce_sum gathers the per-warp partials with a SINGLE warp
+        # (one lane per partial), so > WARP_SIZE warps would silently drop
+        # partials. The dispatch guards (_check_d: D <= 8192, vec in (8, 16))
+        # already imply this; assert it here so a direct construction that
+        # relaxes either bound fails loudly instead of corrupting the reduce.
+        assert self.num_warps <= WARP_SIZE, (
+            f"num_warps={self.num_warps} exceeds {WARP_SIZE}: cta_reduce_sum "
+            f"reduces at most one partial per lane of warp 0 (D={D}, vec={vec})"
+        )
         self.num_threads = self.num_warps * WARP_SIZE
 
     @cute.jit
