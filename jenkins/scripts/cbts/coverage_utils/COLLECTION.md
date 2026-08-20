@@ -52,18 +52,22 @@ spawn, plus Ray infrastructure processes (`default_worker.py` and friends).
 
 ## 4. Persistence and merge
 
-Every process writes its own SQLite (`.cbtscov.<stage>.<host>.X<rand>.pid<N>.sqlite`), on a 5s
-periodic snapshot plus `atexit`:
+Every process writes its own compact SQLite (`.cbtscov.<stage>.<host>.X<rand>.pid<N>.sqlite`), on a
+5s periodic snapshot plus `atexit`. Leaf, platform-level, and final databases share schema version
+3, so the same reducer can merge every level:
 
 | Table | Contents |
 |---|---|
-| `touch(test, file, qualname)` | everything this process recorded |
-| `proc_meta(stage)` | the stage name |
-| `test_meta(test, outcome, expected_workers)` | coordinator only: pytest outcome + how many workers it spawned |
+| `stage`, `case_stage` | interned stage names and bare test contexts |
+| `file`, `symbol` | interned product paths and qualnames |
+| `touch(case_stage_id, symbol_id)` | which test context entered each symbol |
+| `process`, `process_case` | stable process identity and the test contexts each process saved |
+| `test_result` | coordinator outcome and expected-worker observations |
 
-The merge (`pystart_report.py`) unions across processes and derives `saved_procs` — how many
-per-process files contributed rows for that `(test, stage)`. Final artifact:
-`cbts_touchmap.sqlite`.
+The merge (`pystart_report.py`) resolves each input's local IDs by its natural keys and unions the
+relations. `saved_procs` is derived from distinct process identities, so repeated intermediate
+inputs do not inflate completeness. The final artifact is `cbts_touchmap.sqlite`; the
+`touch_rows` and `test_case_meta` views reconstruct its logical query rows.
 
 ---
 
@@ -126,7 +130,7 @@ phase is what would let those changes narrow again.
 
 ## 6. The completeness signal the data carries
 
-`test_meta` lets the consumer decide whether a record can be trusted:
+`test_case_meta` lets the consumer decide whether a record can be trusted:
 
 ```sql
 outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1
@@ -146,7 +150,7 @@ stays large, `py_executor` rows are still there).
 `L0_MergeRequest.groovy` decides pipeline-level eligibility and `isCbtsStage()` decides each
 stage:
 
-- official post-merge pipeline only (`ENABLE_CBTS_COVERAGE && JOB_NAME ==~ /.*PostMerge.*/`)
+- temporarily enabled for all pipelines through `ENABLE_CBTS_COVERAGE` for CI validation
 - not a perf stage, not a TensorRT / CPP / AutoDeploy stage
 - single-GPU stages only (name carries no `-<N>_GPUs` / `-<N>_Nodes`)
 - not listed in `CBTS_EXCLUDE_STAGES`
