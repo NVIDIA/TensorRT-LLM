@@ -301,6 +301,7 @@ def _scan_gen_worker_device_step_time(
         post_all_mean = 0.0
         seen_requests = 0
         post_rows_seen = 0
+        skipped_post_boundary_dts: List[float] = []
         with open(log_path, errors="replace") as f:
             if seek_to:
                 f.seek(seek_to)
@@ -330,7 +331,9 @@ def _scan_gen_worker_device_step_time(
                         seen_requests = max(seen_requests, int(req_m.group(1)))
                     if seen_requests > skip_leading_requests:
                         post_rows_seen += 1
-                        if post_rows_seen > _REQUEST_BOUNDARY_SETTLE_ROWS:
+                        if post_rows_seen <= _REQUEST_BOUNDARY_SETTLE_ROWS:
+                            skipped_post_boundary_dts.append(dt)
+                        else:
                             post_all_count += 1
                             post_all_mean += (dt - post_all_mean) / post_all_count
                             if ngen is not None:
@@ -340,8 +343,17 @@ def _scan_gen_worker_device_step_time(
                                 post_by_ngen[ngen] = (count, mean)
         boundary_seen = seen_requests > skip_leading_requests
         if boundary_seen:
+            print_info(
+                f"Dropped {len(skipped_post_boundary_dts)} post-boundary "
+                f"device-step rows from {log_path}: {skipped_post_boundary_dts}"
+            )
             if post_all_count:
                 per_file_scans.append((post_by_ngen, post_all_count, post_all_mean))
+            else:
+                print_info(
+                    f"No device-step rows remain after request-boundary settling for "
+                    f"{log_path}: all_count={all_count}, post_rows_seen={post_rows_seen}"
+                )
         elif all_count:
             per_file_scans.append((by_ngen, all_count, all_mean))
     return per_file_scans, total_count

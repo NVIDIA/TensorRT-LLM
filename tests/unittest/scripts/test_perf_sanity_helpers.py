@@ -114,7 +114,10 @@ def _write_gen_worker_log(path: Path, rows: list[tuple[int, float, int]]) -> Non
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def test_skip_leading_requests_excludes_warmup_and_boundary_stall(tmp_path: Path) -> None:
+def test_skip_leading_requests_excludes_warmup_and_boundary_stall(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Only measured steady rows enter the mean on a warmup lane.
 
     The warmup request, the inter-request stall (row +1 after the request
@@ -138,6 +141,9 @@ def test_skip_leading_requests_excludes_warmup_and_boundary_stall(tmp_path: Path
     )
 
     assert measured_only == pytest.approx(20.0)
+    output = capsys.readouterr().out
+    assert "Dropped 5 post-boundary device-step rows" in output
+    assert "[10.0, 500.0, 50.0, 30.0, 30.0]" in output
     # The full window folds in the warmup rows and the 500ms stall.
     assert blended != pytest.approx(20.0)
 
@@ -156,7 +162,10 @@ def test_skip_leading_requests_without_boundary_falls_back(tmp_path: Path) -> No
     ) == pytest.approx(10.0)
 
 
-def test_skip_leading_requests_with_empty_measured_window_returns_none(tmp_path: Path) -> None:
+def test_skip_leading_requests_with_empty_measured_window_returns_none(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """A detected boundary must not fall back when no measured row survives."""
     rows = [(i, 10.0, 1) for i in range(5, 15)]
     rows += [(i, 500.0, 2) for i in range(15, 20)]
@@ -166,6 +175,9 @@ def test_skip_leading_requests_with_empty_measured_window_returns_none(tmp_path:
         perf_sanity.parse_gen_worker_device_step_time(str(tmp_path), 1, skip_leading_requests=1)
         is None
     )
+    output = capsys.readouterr().out
+    assert "all_count=15" in output
+    assert "post_rows_seen=5" in output
 
 
 def test_skip_leading_requests_zero_keeps_full_window(tmp_path: Path) -> None:
