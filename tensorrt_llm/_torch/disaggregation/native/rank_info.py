@@ -51,6 +51,13 @@ class RankInfo:
     # bounce_v2 control handshake blob (None when bounce_v2 is disabled).
     # Optional with a None default so rank info from peers that predate the
     # field still deserializes.
+    # DEPLOYMENT CONSTRAINT: the tolerance is one-directional. With bounce_v2
+    # DISABLED the key is omitted from the wire blob (see to_bytes), so old
+    # peers decode fine — but with TRTLLM_BOUNCE_V2_ENABLE=1 the key IS
+    # emitted, and an OLD-version peer (whose dataclass lacks this field)
+    # TypeErrors on the unknown key in cls(**unpacked). When the flag is on,
+    # ALL ranks of a disaggregated deployment must run the same
+    # (field-aware) version.
     bounce_v2_handshake: Optional[bytes] = None
 
     @property

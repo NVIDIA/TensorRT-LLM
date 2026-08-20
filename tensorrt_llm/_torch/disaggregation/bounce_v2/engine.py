@@ -52,7 +52,13 @@ from tensorrt_llm.logger import logger
 from .arena import BounceArena
 from .codec import BOUNCE_VERSION
 from .config import BounceV2Config
-from .reactor import FAIL_REACTOR_DEAD, FAIL_SHUTDOWN, BounceReactor, BounceResult
+from .reactor import (
+    FAIL_REACTOR_DEAD,
+    FAIL_REACTOR_STALLED,
+    FAIL_SHUTDOWN,
+    BounceReactor,
+    BounceResult,
+)
 from .scheduler import CreditScheduler
 
 __all__ = [
@@ -64,6 +70,11 @@ __all__ = [
 ]
 
 #: Opt-in gate for the transceiver integration (no llm_args field yet).
+#: DEPLOYMENT CONSTRAINT: with this flag on, every rank's rank-info blob
+#: carries the ``bounce_v2_handshake`` field; a peer running a TensorRT-LLM
+#: version that predates the field crashes decoding it (see
+#: native/rank_info.py). All ranks of a disaggregated deployment must run the
+#: same version when the flag is enabled.
 BOUNCE_V2_ENV = "TRTLLM_BOUNCE_V2_ENABLE"
 
 # Handshake blob: magic 'BV2H', u16 wire version, u16 control kind (1 = zmq),
@@ -76,19 +87,28 @@ _CONTROL_KIND_ZMQ = 1
 
 #: Watchdog wait slice: how often a blocked wait() re-checks reactor health.
 _WAIT_SLICE_S = 1.0
+#: Floor for the reactor-stall watchdog (heartbeat_age_s threshold).
+_STALL_LIMIT_FLOOR_S = 60.0
 
 
 class BounceTransferStatus:
     """``TransferStatus``-shaped adapter over the reactor future.
 
     ``wait()`` resolves on every reactor terminal path (R5) and ADDITIONALLY
-    polls the reactor watchdog in 1 s slices, so even a hard reactor-thread
-    death cannot hang a caller (design risk #2).
+    polls the reactor watchdog in 1 s slices, so neither a hard reactor-thread
+    death nor a reactor WEDGED inside a C++ call (alive but no heartbeat for
+    ``stall_limit_s``) can hang a caller (design risk #2).
     """
 
-    def __init__(self, future: "Future[BounceResult]", reactor: Optional[BounceReactor]) -> None:
+    def __init__(
+        self,
+        future: "Future[BounceResult]",
+        reactor: Optional[BounceReactor],
+        stall_limit_s: float = _STALL_LIMIT_FLOOR_S,
+    ) -> None:
         self._future = future
         self._reactor = reactor
+        self._stall_limit_s = stall_limit_s
         self._result: Optional[BounceResult] = None
 
     def is_completed(self) -> bool:
@@ -113,12 +133,32 @@ class BounceTransferStatus:
                 self._result = self._future.result(timeout=max(remaining, 0.0))
                 return self._result.ok
             except FutureTimeoutError:
-                if self._reactor is not None and not self._reactor.alive():
+                if self._reactor is None:
+                    continue
+                if self._reactor.alive():
+                    if self._reactor.heartbeat_age_s() <= self._stall_limit_s:
+                        continue
+                    # Reactor thread alive but WEDGED (e.g. stuck inside a
+                    # C++ call): fail only THIS wait so the upper layer can
+                    # fall back — the reactor is not killed and the future
+                    # stays pending in case it eventually recovers. Note the
+                    # sender request also keeps its staging regions until the
+                    # sender sweep or shutdown reaps them — indefinitely when
+                    # request_timeout_ms=0.
+                    reason = FAIL_REACTOR_STALLED
+                else:
                     # Dead reactor: its exception boundary normally resolves
                     # every future, but never trust a dead thread to have
                     # gotten there — resolve locally.
-                    self._result = BounceResult(False, FAIL_REACTOR_DEAD)
-                    return False
+                    reason = FAIL_REACTOR_DEAD
+                if self._future.done():
+                    # The future resolved while we were timing out (the
+                    # reactor died/stalled AFTER finishing this request):
+                    # trust the real result over the watchdog verdict.
+                    self._result = self._future.result()
+                    return self._result.ok
+                self._result = BounceResult(False, reason)
+                return False
 
     def last_status_str(self) -> str:
         if self._result is None:
@@ -160,6 +200,11 @@ class BounceEngine:
             )
         self._cfg = config
         self._device_id = device_id
+        # Stall watchdog threshold for wait(): generous — a reactor that has
+        # not completed a tick for this long is treated as wedged.
+        self._stall_limit_s = max(
+            _STALL_LIMIT_FLOOR_S, 2.0 * max(config.request_timeout_ms, 0) / 1000.0
+        )
         self._shutdown_done = False
         self._peer_mu = threading.Lock()
         self._handshaked_peers: set[str] = set()
@@ -348,7 +393,9 @@ class BounceEngine:
             future.set_result(BounceResult(False, FAIL_SHUTDOWN))
             return BounceTransferStatus(future, None)
         return BounceTransferStatus(
-            self._reactor.submit(src_ptrs, dst_ptrs, sizes, dst_device_id, peer), self._reactor
+            self._reactor.submit(src_ptrs, dst_ptrs, sizes, dst_device_id, peer),
+            self._reactor,
+            self._stall_limit_s,
         )
 
     # ----------------------------- teardown ---------------------------- #

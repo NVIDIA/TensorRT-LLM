@@ -316,6 +316,12 @@ class CreditScheduler:
         carry an oversized chunk.
         """
         with self._mu:
+            # Internal last-line guard on top of the caller-side validation
+            # above: an unallocatable chunk (<= 0 or beyond the arena) would
+            # age into drain mode and stall ALL remote granting, so reject the
+            # whole announcement regardless of the caller contract.
+            if any(int(b) <= 0 or int(b) > self._arena.capacity for b in chunk_bytes):
+                return []
             st = self._flows.setdefault(flow, _FlowState())
             st.pending = deque(int(b) for b in chunk_bytes)
             st.blocked_at_grant_sequence = None
@@ -441,7 +447,9 @@ class CreditScheduler:
         then reap expired quarantined regions.
 
         Convenience composition of :meth:`stale_flows`, :meth:`forget` and
-        :meth:`reap_quarantine` for the reactor's timeout tick. When
+        :meth:`reap_quarantine`. NOTE: the reactor open-codes this composition
+        in its lease sweep instead of calling it, so the stale set can also
+        drive its scatter-backlog purge before the busy set is computed. When
         ``idle_limit_s <= 0`` the lease sweep is disabled (mirrors the C++
         "request_timeout_ms <= 0 disables timeouts") and only the quarantine
         is reaped.

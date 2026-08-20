@@ -110,6 +110,19 @@ std::vector<CompletionPoller::Completion> CompletionPoller::drain(int timeoutMs)
     return out;
 }
 
+std::size_t CompletionPoller::unregisterEvents(std::vector<cudaEvent_t> const& events)
+{
+    // Taking mMu synchronizes with pollLoop's sweep (pollOnceLocked runs under it): once this
+    // returns, no removed entry can be cudaEventQuery'd or have its onTerminal invoked.
+    std::lock_guard<std::mutex> lk(mMu);
+    auto const before = mEvents.size();
+    mEvents.erase(std::remove_if(mEvents.begin(), mEvents.end(),
+                      [&events](EventEntry const& e)
+                      { return std::find(events.begin(), events.end(), e.event) != events.end(); }),
+        mEvents.end());
+    return before - mEvents.size();
+}
+
 void CompletionPoller::shutdown() noexcept
 {
     // Serializes concurrent shutdown() callers (join + cleanup must run exactly once).

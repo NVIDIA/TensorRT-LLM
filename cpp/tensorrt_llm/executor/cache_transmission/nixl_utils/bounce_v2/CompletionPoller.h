@@ -83,6 +83,15 @@ public:
     /// (0 = non-blocking; may return empty). Never blocks after shutdown().
     [[nodiscard]] std::vector<Completion> drain(int timeoutMs);
 
+    /// Remove every still-pending event entry whose event handle is in `events`, WITHOUT running
+    /// its onTerminal or publishing a completion (the ids simply never report — acceptable only at
+    /// the event owner's teardown, e.g. ~BatchedCopyPool detaching before destroying its events).
+    /// Synchronizes with the poll sweep via the internal mutex, so no removed entry is being
+    /// queried or called back concurrently. Never blocks on anything that needs the GIL (the poll
+    /// thread never takes it), so it is safe from a nanobind tp_dealloc. Returns the number of
+    /// entries removed.
+    std::size_t unregisterEvents(std::vector<cudaEvent_t> const& events);
+
     /// Stop the poll thread and terminate every still-pending entry with ok=0 (running its
     /// onTerminal / releasing its handle). Idempotent.
     void shutdown() noexcept;

@@ -105,6 +105,7 @@ __all__ = [
     "FAIL_PLAN_REJECTED",
     "FAIL_PROTOCOL",
     "FAIL_REACTOR_DEAD",
+    "FAIL_REACTOR_STALLED",
     "FAIL_SHUTDOWN",
     "FAIL_WRITE",
     "BounceReactor",
@@ -133,6 +134,7 @@ FAIL_WRITE = "bounce: RDMA write failed"
 FAIL_PROTOCOL = "bounce: protocol error (GRANT mispair/plan overflow)"
 FAIL_SHUTDOWN = "bounce: transport shut down while pending"
 FAIL_REACTOR_DEAD = "bounce: reactor thread died"
+FAIL_REACTOR_STALLED = "bounce: reactor stalled (no tick within the stall limit)"
 
 
 @dataclass(frozen=True)
@@ -311,7 +313,8 @@ class BounceReactor:
         return self._thread.is_alive() and not self._dead
 
     def heartbeat_age_s(self) -> float:
-        """Seconds since the reactor last completed a tick."""
+        """Seconds since the reactor last began a tick (the heartbeat is
+        written at the top of the loop; equivalent for wedge detection)."""
         return time.monotonic() - self._heartbeat
 
     def add_peer(self, peer: str, endpoint: str) -> bool:
@@ -730,13 +733,21 @@ class BounceReactor:
             req = self._requests.get(rid)
             if req is None:
                 return
-            if not ok:
-                self._fail_request_locked(rid, req, FAIL_GATHER)
-                return
             # Route by the completion id: gathers of one request may finish
             # OUT OF ORDER across copy streams, so "oldest gathering" would
             # be wrong (it could post a write for an unfinished gather).
             target = next((p for p in req.posted if p.copy_id == copy_id), None)
+            if not ok:
+                # The failed gather's completion id was already consumed by
+                # the drain and the kernel is DONE with the staging region:
+                # advance the chunk to a terminal state BEFORE failing, so
+                # _fail_request_locked releases its region now instead of
+                # re-registering the consumed id as an orphan_gather that
+                # would never fire (poller ids report exactly once).
+                if target is not None and target.state == _PostState.GATHERING:
+                    target.state = _PostState.GATHERED
+                self._fail_request_locked(rid, req, FAIL_GATHER)
+                return
             if target is None or target.state != _PostState.GATHERING:
                 return
             target.state = _PostState.GATHERED
@@ -753,6 +764,16 @@ class BounceReactor:
             if target is None:
                 return
             if not ok:
+                # The failed write's completion id was already consumed by the
+                # drain and the NIC is DONE with the staging region: advance
+                # the chunk to a terminal state BEFORE failing, so
+                # _fail_request_locked releases its region now and does not
+                # count it as an orphan write (its consumed id would never
+                # fire again, wedging _orphan_writes and the deferred cancel).
+                # Guarded like the gather path: a duplicate delivery must not
+                # relabel a chunk that is no longer WRITING.
+                if target.state == _PostState.WRITING:
+                    target.state = _PostState.SENT
                 self._fail_request_locked(rid, req, FAIL_WRITE)
                 return
             chunk = req.plan.chunks[target.chunk_idx]
@@ -855,9 +876,13 @@ class BounceReactor:
         a WRITING chunk's region defers until its RDMA completion (the NIC
         may still read it); a GATHERING chunk's region defers until its copy
         event fires (the kernel may still write it); GATHERED/SENT recycle
-        now. The cancel-WANT to the receiver is deferred while any write is
-        in flight (it is landing on the receiver's region; an early cancel
-        would let the receiver re-grant that region under the write)."""
+        now. The chunk whose FAILED completion triggered this call must be
+        advanced to a terminal state (GATHERED/SENT) by its handler first:
+        its completion id was already consumed by the drain, so registering
+        it as an orphan here would never fire and leak the region. The
+        cancel-WANT to the receiver is deferred while any write is in flight
+        (it is landing on the receiver's region; an early cancel would let
+        the receiver re-grant that region under the write)."""
         if req.abandon_reason:
             reason = req.abandon_reason
         # Latch the terminal reason on the (now-dead) request object: callers
@@ -931,6 +956,11 @@ class BounceReactor:
         if is_cancel_want(chunk_sizes):
             # Sender-initiated cancel: it drained its in-flight writes before
             # sending this, so non-busy regions free immediately (quarantine 0).
+            # Purge the flow's queued scatters BEFORE computing the busy set
+            # (see _purge_scatter_backlog's ordering contract): their regions
+            # then free exactly once through the flow's held set, and a stale
+            # job can no longer scatter into KV addresses freed by this cancel.
+            self._purge_scatter_backlog(lambda job: job.key == key)
             grants, deferred = self._sched.forget(key, busy=set(self._scattering))
             for off in deferred:
                 self._scattering[off] = True
@@ -1103,6 +1133,28 @@ class BounceReactor:
             did_work = True
         return did_work
 
+    def _purge_scatter_backlog(self, drop: Callable[[_ScatterJob], bool]) -> None:
+        """Drop every queued (never-launched) scatter job matching ``drop``,
+        un-tracking its region from ``_scattering``. A stale backlog job of a
+        reclaimed flow would otherwise be submitted later and scatter into
+        final KV addresses that may already be freed/reused (silent KV
+        corruption). ORDERING CONTRACT: this MUST run BEFORE the caller
+        snapshots ``busy=set(self._scattering)`` for the scheduler reclaim —
+        the dropped regions are then reclaimed exactly once through their
+        flow's held set (freed or quarantined by the reclaim) instead of
+        being deferred as busy orphans whose scatter completion never comes
+        (a leak) or being both orphaned and flow-freed (a double release).
+        Reactor-thread-only."""
+        if not self._scatter_backlog:
+            return
+        keep: deque[_ScatterJob] = deque()
+        for job in self._scatter_backlog:
+            if drop(job):
+                self._scattering.pop(job.offset, None)
+            else:
+                keep.append(job)
+        self._scatter_backlog = keep
+
     def _finish_scatter(self, job: _ScatterJob, ok: bool) -> None:
         """Scatter reached a terminal state: free/settle the region, batch
         the ACK. A failed scatter sends NO ACK (the sender must time out, not
@@ -1155,20 +1207,36 @@ class BounceReactor:
             self._next_lease_sweep = now + 1.0
             return
         self._next_lease_sweep = now + min(max(smallest / 10000.0, 0.05), 1.0)
-        reclaimed, grants, deferred = self._sched.check_timeouts(
-            idle_limit_s=lease_ms / 1000.0,
-            quarantine_s=quarantine_ms / 1000.0,
-            busy=set(self._scattering),
-        )
-        for off in deferred:
-            self._scattering[off] = True
-        for flow in reclaimed:
+        # Open-coded composition of stale_flows + forget + reap_quarantine
+        # (instead of the scheduler's check_timeouts convenience) so the stale
+        # set is computed EXACTLY ONCE and reused for both the backlog purge
+        # and the reclaim — a flow turning stale between two separate sweeps
+        # could otherwise be reclaimed with its stale backlog job left behind.
+        stale = self._sched.stale_flows(lease_ms / 1000.0) if lease_ms > 0 else []
+        if stale:
+            # Purge the stale flows' queued scatters BEFORE computing the busy
+            # set (see _purge_scatter_backlog's ordering contract): their
+            # regions are then quarantined exactly once through each flow's
+            # held set below, never stranded as orphans, and never scattered
+            # into KV addresses freed after the reclaim.
+            stale_set = set(stale)
+            self._purge_scatter_backlog(lambda job: job.key in stale_set)
+        quarantine_s = quarantine_ms / 1000.0
+        grants: list[Grant] = []
+        for flow in stale:
+            flow_grants, deferred = self._sched.forget(
+                flow, busy=set(self._scattering), quarantine_s=quarantine_s
+            )
+            grants.extend(flow_grants)
+            for off in deferred:
+                self._scattering[off] = True
             self._rx_flows.pop(flow, None)
             logger.warning(
                 f"bounce_v2({self._self_name}): flow lease expired (no progress within "
                 f"{lease_ms} ms) flow={flow!r} -> reclaimed (regions quarantined "
                 f"{quarantine_ms} ms before reuse)"
             )
+        grants.extend(self._sched.reap_quarantine())
         self._send_grants(grants)
 
     def _do_forget_peer(self, peer: str, victim_rids: list[int]) -> None:
@@ -1200,14 +1268,9 @@ class BounceReactor:
                 req = self._requests.get(rid)
                 if req is not None and req.peer == peer:
                     self._fail_request_locked(rid, req, FAIL_PEER_DROPPED)
-        if self._scatter_backlog:
-            keep: deque[_ScatterJob] = deque()
-            for job in self._scatter_backlog:
-                if job.peer == peer:
-                    self._scattering.pop(job.offset, None)
-                else:
-                    keep.append(job)
-            self._scatter_backlog = keep
+        # Purge the peer's queued scatters BEFORE computing the busy set (see
+        # _purge_scatter_backlog's ordering contract).
+        self._purge_scatter_backlog(lambda job: job.peer == peer)
         quarantine_s = (self._cfg.quarantine_ms or 0) / 1000.0
         grants, deferred = self._sched.forget_prefix(
             peer + _FLOW_SEP, busy=set(self._scattering), quarantine_s=quarantine_s

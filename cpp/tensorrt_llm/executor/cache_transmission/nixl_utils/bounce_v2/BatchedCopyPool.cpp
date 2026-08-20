@@ -143,21 +143,38 @@ BatchedCopyPool::BatchedCopyPool(
 BatchedCopyPool::~BatchedCopyPool()
 {
     // A context in flight has its event registered with the CompletionPoller, which queries it from
-    // the poll thread — destroying the event/stream now would hand CUDA a dangling handle. Every
-    // in-flight context comes back through the poller's onTerminal (event fired, CUDA error, or
-    // poller shutdown), so wait for the free list to fill up. Bounded: warn and proceed rather than
-    // hang teardown forever if the poller is wedged.
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (freeCount() < mCtxs.size())
+    // the poll thread — destroying the event/stream now would hand CUDA a dangling handle and route
+    // onTerminal into a destructed pool (use-after-free). Give in-flight contexts a short bounded
+    // window to drain normally (event fires -> onTerminal returns the context), then UNREGISTER
+    // every event of this pool from the poller BEFORE destroying anything: unregisterEvents holds
+    // the poller's sweep mutex, so after it returns no entry of ours is being queried or called
+    // back. The unregistered ids simply never report to Python — acceptable at teardown.
+    // NOTE: this destructor may run under the GIL (nanobind tp_dealloc); the poll thread never
+    // takes the GIL, so waiting on the poller mutex here cannot deadlock.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (freeCount() < mCtxs.size() && std::chrono::steady_clock::now() < deadline)
     {
-        if (std::chrono::steady_clock::now() >= deadline)
-        {
-            TLLM_LOG_WARNING("BatchedCopyPool: %zu context(s) still in flight at destruction; destroying anyway",
-                mCtxs.size() - freeCount());
-            break;
-        }
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
+    if (freeCount() < mCtxs.size())
+    {
+        std::vector<cudaEvent_t> events;
+        events.reserve(mCtxs.size());
+        for (auto const& c : mCtxs)
+        {
+            if (c.event != nullptr)
+            {
+                events.push_back(c.event);
+            }
+        }
+        auto const removed = mPoller.unregisterEvents(events);
+        TLLM_LOG_WARNING(
+            "BatchedCopyPool: %zu context(s) still in flight at destruction; unregistered %zu pending "
+            "event(s) from the CompletionPoller before teardown",
+            mCtxs.size() - freeCount(), removed);
+    }
+    // destroyContexts() stream-synchronizes each context before freeing its pinned plan buffer, so
+    // a still-running kernel of an unregistered entry cannot read freed memory.
     destroyContexts();
 }
 
