@@ -200,22 +200,40 @@ def test_forward_with_lse_gqa(make_te_attn):
     assert torch.isfinite(lse).all()
 
 
-def test_attn_op_rebuilt_on_trait_change(make_te_attn):
+def test_attn_op_cached_per_trait(make_te_attn):
+    """Each distinct trait tuple keeps its own DotProductAttention instance.
+
+    DotProductAttention carries the DelayedScaling amax history, so alternating
+    mask types must not rebuild -- a rebuild would reset FP8 scaling every switch.
+    """
     attn = make_te_attn(num_heads=4, head_dim=64)
     B, S = 1, 64
     q = torch.randn(B, S, 4, 64, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(B, S, 4, 64, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(B, S, 4, 64, device="cuda", dtype=torch.bfloat16)
+
     with torch.no_grad():
-        attn(q, k, v)
-    op_first = attn._attn_op
+        attn(q, k, v, attention_mask=PredefinedAttentionMask.FULL)
+    assert len(attn._attn_ops) == 1
+    op_full = next(iter(attn._attn_ops.values()))
 
     with torch.no_grad():
         attn(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL)
-    op_causal = attn._attn_op
+    assert len(attn._attn_ops) == 2, "causal mask must get its own attention op"
+    op_causal = attn._get_attn_op(None, "causal")
+    assert op_causal is not op_full
 
-    assert op_first is not op_causal
-
+    # Repeats reuse, and switching back returns the original instance rather
+    # than rebuilding it (which is what the single-slot cache used to do).
     with torch.no_grad():
         attn(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL)
-    assert attn._attn_op is op_causal
+        attn(q, k, v, attention_mask=PredefinedAttentionMask.FULL)
+    assert len(attn._attn_ops) == 2
+    assert attn._get_attn_op(None, "causal") is op_causal
+    assert attn._get_attn_op(None, "no_mask") is op_full
+
+
+def test_quant_attention_config_rejected():
+    """TE drives its own FP8 recipe; a forwarded quant config must not be swallowed."""
+    with pytest.raises(NotImplementedError, match="quant_attention_config"):
+        TEAttention(num_heads=4, head_dim=64, quant_attention_config=object())

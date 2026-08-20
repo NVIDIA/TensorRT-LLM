@@ -59,12 +59,22 @@ class TEAttention(AttentionBackend):
         head_dim: int = 64,
         num_kv_heads: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
+        quant_attention_config: Optional[Any] = None,
+        fp8_group: Optional[Any] = None,
         **kwargs,
     ):
         if not _TE_AVAILABLE:
             raise ImportError(
                 "TransformerEngine is required for the TE attention backend. "
                 "Install transformer_engine before using backend='TE'."
+            )
+        if quant_attention_config is not None:
+            # create_attention forwards this for every backend; TE drives its own
+            # FP8 recipe, so silently swallowing it would hide a config mistake.
+            raise NotImplementedError(
+                "TE attention backend does not honor quant_attention_config -- it always "
+                "runs FP8 via its own DelayedScaling recipe. Drop quant_attention_config "
+                "or pick a backend that applies it."
             )
         self.layer_idx = layer_idx
         self.num_heads = num_heads
@@ -73,15 +83,20 @@ class TEAttention(AttentionBackend):
         self.dtype = dtype
         self.scale = 1.0 / math.sqrt(head_dim)
         self.recipe = DelayedScaling(fp8_dpa=True, fp8_mha=True)
-        # DotProductAttention is stateful (amax history). Rebuild only when
-        # (num_heads, head_dim, num_gqa_groups, attn_mask_type) changes.
-        self._attn_op: Optional[Any] = None
-        self._traits: Optional[tuple] = None
+        # Amax reduction group for fp8_autocast. Left as None, TE reduces amax over
+        # the default process group on every autocast exit -- a world-wide collective
+        # per attention call, and a hang if ranks ever take different paths. Diffusion
+        # inference wants per-rank scales, so default to no reduction.
+        self.fp8_group = fp8_group
+        # DotProductAttention is stateful (amax history), and rebuilding one throws
+        # that history away. Key a cache on the traits that force a new module so
+        # alternating mask types or GQA shapes reuse their own instance.
+        self._attn_ops: dict[tuple, Any] = {}
 
     def _get_attn_op(self, num_gqa_groups: Optional[int], attn_mask_type: str) -> Any:
         traits = (self.num_heads, self.head_dim, num_gqa_groups, attn_mask_type)
-        if traits != self._traits:
-            self._attn_op = DotProductAttention(
+        if traits not in self._attn_ops:
+            self._attn_ops[traits] = DotProductAttention(
                 self.num_heads,
                 self.head_dim,
                 num_gqa_groups=num_gqa_groups,
@@ -89,8 +104,7 @@ class TEAttention(AttentionBackend):
                 softmax_scale=self.scale,
                 qkv_format="bshd",
             )
-            self._traits = traits
-        return self._attn_op
+        return self._attn_ops[traits]
 
     def _parse_inputs(
         self,
@@ -128,7 +142,7 @@ class TEAttention(AttentionBackend):
         """FP8 self/cross attention. q/k/v shape: [B, S, H, D]. Returns [B, S, H, D]."""
         num_gqa_groups, attn_mask_type = self._parse_inputs(q, k, attention_mask, key_padding_mask)
         attn_op = self._get_attn_op(num_gqa_groups, attn_mask_type)
-        with fp8_autocast(enabled=True, fp8_recipe=self.recipe):
+        with fp8_autocast(enabled=True, fp8_recipe=self.recipe, fp8_group=self.fp8_group):
             # TE returns [B, S, H*D]; restore to [B, S, H, D].
             out = attn_op(q, k, v, attention_mask=None)
         return out.unflatten(-1, (self.num_heads, self.head_dim))
@@ -160,7 +174,7 @@ class TEAttention(AttentionBackend):
         num_gqa_groups, attn_mask_type = self._parse_inputs(q, k, attention_mask, key_padding_mask)
         attn_op = self._get_attn_op(num_gqa_groups, attn_mask_type)
         B, S = q.shape[0], q.shape[1]
-        with fp8_autocast(enabled=True, fp8_recipe=self.recipe):
+        with fp8_autocast(enabled=True, fp8_recipe=self.recipe, fp8_group=self.fp8_group):
             out = attn_op(q, k, v, attention_mask=None)
         # out: [B, S, H*D] -> [B, S, H, D]
         out = out.unflatten(-1, (self.num_heads, self.head_dim))

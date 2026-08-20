@@ -28,7 +28,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 from .interface import AttentionBackend
-from .te import TEAttention
 
 
 def get_visual_gen_attention_backend(
@@ -57,6 +56,7 @@ def get_visual_gen_attention_backend(
     # Lazy imports to avoid circular dependency
     from .cute_dsl import CuTeDSLAttention
     from .flash_attn4 import FlashAttn4Attention
+    from .te import TEAttention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
 
