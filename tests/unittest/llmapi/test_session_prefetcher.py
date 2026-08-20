@@ -76,6 +76,7 @@ class _FakePool:
         self.n_workers = n_workers
         self.wait_shutdown = wait_shutdown
         self.shut = False
+        self.abandoned = False
 
     def shutdown(self):
         self.shut = True
