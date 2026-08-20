@@ -17,16 +17,18 @@
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
-file(GLOB_RECURSE ROUTING_SRC_CPP routing/*.cpp)
-file(GLOB_RECURSE ROUTING_SRC_CU routing/*.cu)
+set(ROUTING_CUSTOM_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomBlock.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomCluster.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomClusterLarge.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/routing/RoutingCustomEntry.cu)
 
-list(REMOVE_ITEM SRC_CPP ${ROUTING_SRC_CPP})
-list(REMOVE_ITEM SRC_CU ${ROUTING_SRC_CU})
+list(REMOVE_ITEM SRC_CU ${ROUTING_CUSTOM_SRC_CU})
 
 # Build routing as multiple translation units without NVCC's internal parallel
 # split pipeline.
-add_library(trtllm_gen_fp8_block_scale_moe_routing OBJECT ${ROUTING_SRC_CPP}
-                                                          ${ROUTING_SRC_CU})
+add_library(trtllm_gen_fp8_block_scale_moe_routing OBJECT
+            ${ROUTING_CUSTOM_SRC_CU})
 set_property(TARGET trtllm_gen_fp8_block_scale_moe_routing
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe_routing
