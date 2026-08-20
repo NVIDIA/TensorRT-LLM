@@ -105,7 +105,7 @@ def test_load_wan_vae_defaults_to_native(monkeypatch):
     assert isinstance(wan_vae, WanVAE)
 
 
-def test_load_wan_vae_honors_diffusers_fallback(monkeypatch):
+def test_load_wan_vae_honors_diffusers_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     checkpoint_dir = _require_wan22_ti2v_checkpoint()
 
     monkeypatch.setenv(TRTLLM_USE_DIFFUSER_VAE_ENV, "1")

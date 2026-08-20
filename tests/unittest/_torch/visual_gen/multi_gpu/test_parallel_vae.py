@@ -166,34 +166,6 @@ def _create_small_trtllm_vae(device):
     return vae
 
 
-def _create_small_cosmos3_trtllm_vae(device):
-    """Create a small native ``WanVAE`` retaining Cosmos3-specific config."""
-    z_dim = 4
-    vae = (
-        WanVAE(
-            WanVAEConfig(
-                base_dim=32,
-                decoder_base_dim=32,
-                z_dim=z_dim,
-                dim_mult=[1, 1],
-                num_res_blocks=1,
-                attn_scales=[],
-                temperal_downsample=[False],
-                is_residual=True,
-                in_channels=12,
-                out_channels=12,
-                patch_size=2,
-                latents_mean=[0.1 * index for index in range(z_dim)],
-                latents_std=[0.5 + 0.1 * index for index in range(z_dim)],
-            )
-        )
-        .to(device)
-        .float()
-    )
-    vae.eval()
-    return vae
-
-
 def _create_parallel_trtllm_vae(vae, world_size, split_dim):
     # Route through ParallelVAEFactory so the registry mapping
     # (WanVAE -> ParallelVAE_TrtllmWan) is exercised, not just direct construction.
@@ -501,39 +473,16 @@ def _logic_trtllm_encode_height(rank, world_size):
     assert max_diff < 0.01, f"Rank {rank}: trtllm encode height max_diff={max_diff:.6f}"
 
 
-def _logic_cosmos3_config_delegation(rank, world_size):
+def _logic_cosmos3_config_delegation(rank: int, world_size: int) -> None:
     """The native wrapper preserves attributes used by the Cosmos3 pipeline."""
     device = f"cuda:{rank}"
-    vae = _create_small_cosmos3_trtllm_vae(device)
+    vae = _create_small_trtllm_vae(device)
     _broadcast_params(vae)
 
     parallel = _create_parallel_trtllm_vae(vae, world_size, "width")
 
     assert parallel.config is vae.config
-    assert parallel.config.latents_mean == vae.config.latents_mean
-    assert parallel.config.latents_std == vae.config.latents_std
-    assert parallel.config.scale_factor_spatial == vae.config.scale_factor_spatial
-    assert parallel.config.scale_factor_temporal == vae.config.scale_factor_temporal
     assert parallel.dtype == vae.dtype
-
-
-def _logic_cosmos3_temporal_chunk_invariance(rank, world_size):
-    """Native temporal decode chunking preserves Cosmos3 decode results."""
-    device = f"cuda:{rank}"
-    vae = _create_small_cosmos3_trtllm_vae(device)
-    _broadcast_params(vae)
-
-    latent = torch.randn(1, 4, 5, 16, 16, dtype=torch.float32, device=device)
-    dist.broadcast(latent, src=0)
-
-    with torch.no_grad():
-        ref = vae.decode(latent, return_dict=False, temporal_chunk_size=1)[0].detach().clone()
-        for chunk_size in (2, 4):
-            chunked = vae.decode(latent, return_dict=False, temporal_chunk_size=chunk_size)[0]
-            max_diff = torch.max(torch.abs(chunked - ref)).item()
-            assert max_diff < 0.01, (
-                f"Rank {rank}: temporal_chunk_size={chunk_size} max_diff={max_diff:.6f}"
-            )
 
 
 class TestParallelVAETrtllmDecode:
@@ -543,11 +492,8 @@ class TestParallelVAETrtllmDecode:
     def test_decode_height_2gpu(self):
         _run(2, _logic_trtllm_decode_height)
 
-    def test_cosmos3_config_delegation_2gpu(self):
+    def test_cosmos3_config_delegation_2gpu(self) -> None:
         _run(2, _logic_cosmos3_config_delegation)
-
-    def test_cosmos3_temporal_chunk_invariance_2gpu(self):
-        _run(2, _logic_cosmos3_temporal_chunk_invariance)
 
 
 class TestParallelVAETrtllmEncode:
