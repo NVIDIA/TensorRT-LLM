@@ -65,11 +65,12 @@ if IS_FLASHINFER_AVAILABLE:
 
     @torch.library.custom_op("trtllm::flashinfer_fused_add_add_rmsnorm",
                              mutates_args=("input", "residual"))
-    def flashinfer_fused_add_add_rmsnorm(input: torch.Tensor,
-                                         additional: torch.Tensor,
-                                         residual: torch.Tensor,
-                                         weight: torch.Tensor,
-                                         eps: float) -> None:
+    def flashinfer_fused_add_add_rmsnorm(
+            input: torch.Tensor,  # noqa: A002 - part of the public op schema
+            additional: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float) -> None:
         """Fuse a BF16 MoE add, residual add, and RMSNorm in place.
 
         Args:
@@ -98,8 +99,12 @@ if IS_FLASHINFER_AVAILABLE:
                                    enable_pdl=get_env_enable_pdl())
 
     @flashinfer_fused_add_add_rmsnorm.register_fake
-    def _(input: torch.Tensor, additional: torch.Tensor, residual: torch.Tensor,
-          weight: torch.Tensor, eps: float) -> None:
+    def _(
+            input: torch.Tensor,  # noqa: A002 - mirrors the public op schema
+            additional: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float) -> None:
         pass
 
     @torch.library.custom_op("trtllm::flashinfer_fused_add_rmsnorm_quant",
