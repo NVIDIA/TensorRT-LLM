@@ -19,10 +19,16 @@ import unittest
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(_ROOT / "jenkins/scripts/cbts/coverage_utils"))
+_CBTS = _ROOT / "jenkins/scripts/cbts"
+sys.path[:0] = [
+    str(_CBTS),
+    str(_CBTS / "coverage_utils"),
+    str(_CBTS / "coverage_selection"),
+]
 
 from compact_db import merge_databases, validate_database, write_leaf_database  # noqa: E402
 from pystart_report import merge_to_sqlite  # noqa: E402
+from touch_db import TouchDB  # noqa: E402
 
 
 def _rows(path: Path, query: str) -> list[tuple]:
@@ -40,6 +46,29 @@ def _merge(inputs: list[Path], output: Path) -> None:
 
 
 class CompactDatabaseTest(unittest.TestCase):
+    def test_touch_db_rejects_missing_completeness_view(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            leaf = Path(temp_dir) / "leaf.sqlite"
+            write_leaf_database(
+                leaf,
+                stage="stage",
+                process_uid="stage/process",
+                touches={
+                    "stage/test_a.py::test_one": {
+                        ("/workspace/tensorrt_llm/a.py", "run"),
+                    }
+                },
+                outcomes={"stage/test_a.py::test_one": "passed"},
+                expected_workers={"stage/test_a.py::test_one": 0},
+            )
+            connection = sqlite3.connect(leaf)
+            connection.execute("DROP VIEW test_case_meta")
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(ValueError, "test_meta_columns=\\[\\]"):
+                TouchDB.open(leaf)
+
     def test_report_glob_ignores_in_progress_database(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -110,12 +139,14 @@ class CompactDatabaseTest(unittest.TestCase):
             x86_worker = root / "x86-worker.sqlite"
             sbsa_coordinator = root / "sbsa-coordinator.sqlite"
 
-            x86_test = "x86_64/test_a.py::test_one"
-            sbsa_test = "SBSA/test_b.py::test_two"
+            x86_stage = "A10-PyTorch-1"
+            sbsa_stage = "GH200-PyTorch-1"
+            x86_test = f"{x86_stage}/test_a.py::test_one"
+            sbsa_test = f"{sbsa_stage}/test_b.py::test_two"
             write_leaf_database(
                 x86_coordinator,
-                stage="x86_64",
-                process_uid="x86_64/coordinator",
+                stage=x86_stage,
+                process_uid=f"{x86_stage}/coordinator",
                 touches={
                     x86_test: {
                         ("/workspace/tensorrt_llm/a.py", "run"),
@@ -127,8 +158,8 @@ class CompactDatabaseTest(unittest.TestCase):
             )
             write_leaf_database(
                 x86_worker,
-                stage="x86_64",
-                process_uid="x86_64/worker-0",
+                stage=x86_stage,
+                process_uid=f"{x86_stage}/worker-0",
                 touches={
                     x86_test: {
                         ("/workspace/tensorrt_llm/worker.py", "helper"),
@@ -139,8 +170,8 @@ class CompactDatabaseTest(unittest.TestCase):
             )
             write_leaf_database(
                 sbsa_coordinator,
-                stage="SBSA",
-                process_uid="SBSA/coordinator",
+                stage=sbsa_stage,
+                process_uid=f"{sbsa_stage}/coordinator",
                 touches={
                     sbsa_test: {
                         ("/workspace/tensorrt_llm/b.py", "run"),
@@ -180,11 +211,60 @@ class CompactDatabaseTest(unittest.TestCase):
             self.assertEqual(
                 direct_metadata,
                 [
-                    (sbsa_test, "SBSA", "incomplete", 0, 1),
-                    (x86_test, "x86_64", "passed", 1, 2),
+                    (x86_test, x86_stage, "passed", 1, 2),
+                    (sbsa_test, sbsa_stage, "incomplete", 0, 1),
                 ],
             )
             self.assertEqual(_rows(duplicated, "SELECT COUNT(*) FROM process"), [(3,)])
+
+            with TouchDB.open(duplicated) as database:
+                self.assertEqual(database.schema_version(), "3")
+                self.assertEqual(database.known_tests(), {x86_test, sbsa_test})
+                self.assertEqual(
+                    database.known_by_stage(),
+                    {
+                        x86_stage: {"test_a.py::test_one"},
+                        sbsa_stage: {"test_b.py::test_two"},
+                    },
+                )
+                self.assertEqual(
+                    database.known_by_family(),
+                    {
+                        "A10-PyTorch": {"test_a.py::test_one"},
+                        "GH200-PyTorch": {"test_b.py::test_two"},
+                    },
+                )
+                self.assertEqual(
+                    database.per_test_footprint(),
+                    {x86_test: 3, sbsa_test: 2},
+                )
+                self.assertEqual(
+                    database.tests_touching_file("tensorrt_llm/shared.py"),
+                    {x86_test, sbsa_test},
+                )
+                self.assertEqual(
+                    database.tests_touching_func("tensorrt_llm/worker.py", "helper"),
+                    {x86_test},
+                )
+                self.assertTrue(database.file_has_touch_rows("tensorrt_llm/a.py"))
+                self.assertFalse(database.file_has_touch_rows("tensorrt_llm/missing.py"))
+                self.assertEqual(
+                    set(database.files_touched_by(sbsa_test)),
+                    {
+                        ("tensorrt_llm/b.py", "run"),
+                        ("tensorrt_llm/shared.py", "shared"),
+                    },
+                )
+                self.assertEqual(database.incomplete_capture_tests(), {sbsa_test})
+                self.assertEqual(
+                    database.untrusted_tests(
+                        "tensorrt_llm/worker.py",
+                        (("tensorrt_llm/a.py", "run"),),
+                        (),
+                        2,
+                    ),
+                    {sbsa_test},
+                )
 
 
 if __name__ == "__main__":
