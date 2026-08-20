@@ -89,8 +89,8 @@ def _epilogue_activation_name(moe) -> str:
 
     The SiTU request can be dropped for reasons the spec cannot see (wrong
     backend, wrong quant, upstream fallback), so read it back rather than
-    reporting what was asked for. The two backends expose it differently:
-    MegaMoE stores the resolved name, TRTLLM-Gen a predicate.
+    reporting what was asked for. MegaMoE DeepGEMM / CuteDSL store the
+    resolved name; TRTLLM-Gen exposes a predicate.
     """
     backend = getattr(moe, "backend", None) or moe
     if getattr(backend, "activation", None) == "situ" or getattr(
@@ -119,21 +119,24 @@ def _situ_kwargs(model: ModelSpec, moe_backend: str, quant_algo: Optional[QuantA
 
     Each backend takes SiTU through its own parameters and ``create_moe``
     REJECTS them on any other backend, so this dispatches instead of passing
-    one set everywhere. Both paths also hard-require W4A8_MXFP4_MXFP8, so a
-    spec carrying SiTU constants falls back to the SwiGLU proxy elsewhere
-    rather than failing the case -- SiTU is gated, so the GEMM shapes and comm
-    volume are the same either way.
+    one set everywhere. Quant is paired with the backend that actually
+    implements the epilogue; a spec carrying SiTU constants falls back to
+    the SwiGLU proxy elsewhere rather than failing the case -- SiTU is
+    gated, so the GEMM shapes and comm volume are the same either way.
     """
-    if model.situ_beta is None or quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8:
+    if model.situ_beta is None:
         return {}
     backend = moe_backend.upper()
-    if backend == "MEGAMOE_DEEPGEMM":
-        return {
-            "activation": "situ",
-            "situ_beta": model.situ_beta,
-            "situ_linear_beta": model.situ_linear_beta,
-        }
-    if backend == "TRTLLM":
+    mega_situ = {
+        "activation": "situ",
+        "situ_beta": model.situ_beta,
+        "situ_linear_beta": model.situ_linear_beta,
+    }
+    if backend == "MEGAMOE_DEEPGEMM" and quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        return mega_situ
+    if backend == "MEGAMOE_CUTEDSL" and quant_algo == QuantAlgo.NVFP4:
+        return mega_situ
+    if backend == "TRTLLM" and quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
         # Cubin alpha is the gate-side beta, cubin beta the linear-side one.
         return {
             "trtllm_gen_activation_type": ActType_TrtllmGen.SiTu,
