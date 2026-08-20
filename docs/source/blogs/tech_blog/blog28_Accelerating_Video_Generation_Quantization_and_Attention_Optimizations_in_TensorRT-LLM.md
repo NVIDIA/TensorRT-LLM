@@ -8,18 +8,16 @@ Video diffusion transformers repeatedly process long spatiotemporal token sequen
 denoising steps. Linear layers and attention therefore dominate much of the compute, making them
 the two most direct targets for reducing generation latency.
 
-Wan 2.2 T2V-A14B provides a representative example. It refines an 81-frame, 1280×720 video over
-50 denoising steps with separate high-noise and low-noise transformers. In one compiled BF16
-profile on NVIDIA B200, attention accounts for 71.7% of pipeline-forward time and linear-layer
-GEMMs for another 20.8%. These percentages describe this workload, not video-generation models in
-general.
+For example, the figure below demonstrates the breakdown of pipeline-forward time for Wan 2.2 T2V-A14B on a single NVIDIA B200. For an 81-frame, 1280×720 video with 50 denoising
+steps, attention and linear-layer GEMMs account for 71.7% and 20.8% of compiled BF16
+pipeline-forward time, respectively.
 
 <p align="center">
   <img src="../media/tech_blog28_bf16_time_breakdown.png" alt="Pie chart showing that a compiled dense BF16 path spends 71.7% of pipeline-forward time in attention, 20.8% in GEMMs, and 7.5% in other work" width="1080">
 </p>
 
-<p align="center"><sub><em>Figure 1. Representative pipeline-forward breakdown for compiled dense
-BF16 on B200.</em></sub></p>
+<p align="center"><sub><em>Figure 1. Pipeline-forward breakdown for compiled dense BF16 on
+B200.</em></sub></p>
 
 Our earlier post,
 [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md),
@@ -27,9 +25,7 @@ focused on scale-out. This post covers three complementary acceleration techniqu
 transformer pipeline: linear-layer quantization, quantized attention, and sparse attention. On
 the Wan 2.2 workload above, the combination of NVFP4 linear layers, SAGE quantized attention, and
 a conservative Skip Softmax setting reduces pipeline-forward latency from **525.0 to 374.9
-seconds**, a **1.40× speedup**. The fastest measured setting reaches **348.0 seconds, or 1.51×**.
-We report the associated quality measurements and their limitations instead of treating speedup
-alone as evidence that video quality is preserved.
+seconds**, a **1.40× speedup**. In this blog, we introduce these optimization techniques and discuss the trade off between quality and speed.
 
 ## Table of Contents
 
@@ -43,74 +39,42 @@ alone as evidence that video quality is preserved.
 ## Quantization
 
 Linear-layer quantization reduces the precision of eligible weights and activations so their GEMMs
-can use higher-throughput Tensor Core paths. BF16 is the unquantized reference in this article; it
-is not a quantization option. The measured quantized families are `FP8_BLOCK_SCALES` and `NVFP4`.
+can use higher-throughput Tensor Core paths. The available and upcoming VisualGen paths differ in
+both numeric precision and scale granularity:
 
-The measurements in this article use dynamic quantization: VisualGen converts eligible BF16 linear
-weights while loading the model, without a separately prequantized checkpoint. This makes the
-workflow reproducible from the public BF16 checkpoint, but the resulting numbers characterize only
-this load-time quantization path.
+| Linear-layer path | Weight / activation precision | Scale granularity | Dynamic from high-precision weights | Static checkpoint |
+| :--- | :--- | :--- | :---: | :---: |
+| FP8 per-tensor | FP8 E4M3 / FP8 E4M3 | One scale per tensor | Yes | Yes |
+| FP8 blockwise | FP8 E4M3 / FP8 E4M3 | 128×128 weight blocks; 1×128 activation blocks | Yes | Yes |
+| FP8 row-wise | FP8 E4M3 / FP8 E4M3 | Per-output-channel weights; per-token activations | Yes ([WIP](https://github.com/NVIDIA/TensorRT-LLM/pull/16847)) | Yes ([WIP](https://github.com/NVIDIA/TensorRT-LLM/pull/16847)) |
+| NVFP4 | FP4 E2M1 / FP4 E2M1 | 16-element blocks with FP8 scale factors | Yes | Yes |
 
-A static checkpoint produced by
-[NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) can instead carry calibrated
-scales and a model-specific recipe that leaves sensitive layers at a higher precision. This
-selective treatment is especially useful when an all-NVFP4 recipe does not meet an application's
-quality target. Dynamic and static recipes are not interchangeable; benchmark a static checkpoint
-separately when a matching one is available.
+Here, *dynamic* means converting high-precision weights while loading the model, while *static*
+means loading a prequantized checkpoint with its scales. Static checkpoints can be produced with
+[NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer), whose offline calibration can
+apply model-aware choices such as calibrated scales and keeping sensitive layers at higher
+precision. At the same target format, these algorithmic choices generally preserve accuracy
+better than quantizing every eligible layer dynamically at load time. This distinction describes
+how weights are prepared; activations are quantized as the model runs. All FP8 blockwise and
+NVFP4 results below use dynamic quantization from the public BF16 checkpoint. NVFP4 pushes
+precision lower for more throughput.
 
 ## Attention Optimizations
 
-Attention offers two separate controls. Quantized attention reduces the precision of the QK and PV
-matrix multiplications. Sparse attention reduces the amount of softmax and PV work performed.
+Attention offers two complementary levers: quantization makes its matrix multiplications cheaper,
+while sparsity avoids work that contributes little to the output.
 
 ### Quantized Attention
 
-VisualGen exposes two quantized-attention recipe families through
-`attention_config.quant_attention_config`:
+An attention layer performs two matrix multiplications around softmax. QK16PV8 keeps Q and K in
+BF16 and quantizes V to FP8, accelerating the second multiplication while retaining full-precision
+inputs for the first. SAGE goes further by quantizing Q/K as well as V, allowing both
+multiplications to run through an 8-bit path. TensorRT-LLM's SAGE recipe follows the
+[SageAttention2](https://arxiv.org/abs/2411.10958) line of work, using INT8 or FP8 Q/K and FP8 V
+rather than the paper's per-thread INT4 Q/K recipe.
 
-| Recipe | Backend | QK computation | PV computation | When it is useful |
-| :--- | :--- | :--- | :--- | :--- |
-| QK16PV8 | `CUTEDSL` | BF16 Q/K | FP8 V with a tensor-wide scale | Reduce the cost of the second attention matrix multiplication while retaining BF16 QK |
-| SAGE | `TRTLLM` | INT8 or FP8 Q/K with token-block scales | FP8 V with channel-oriented blocking | Run both attention matrix multiplications through an 8-bit path |
-
-QK16PV8 does not require offline calibration because its V scale is derived at runtime. The SAGE
-recipe used in this article takes BF16 inputs, quantizes Q/K to INT8 and V to FP8, and uses Q/K/V
-block sizes of 1/16/1. It is part of the same quantized-attention line of work as
-[SageAttention2](https://arxiv.org/abs/2411.10958), but it is an 8-bit TensorRT-LLM recipe rather
-than the paper's per-thread INT4 Q/K recipe.
-
-The current QK16PV8 kernel targets Blackwell `sm_100a` and `sm_103a` with head dimension 128. The
-current TensorRT-LLM SAGE path requires Blackwell `sm_100`.
-
-The two recipes use the same configuration field but different backends. For example:
-
-```yaml
-# QK16PV8
-attention_config:
-  backend: CUTEDSL
-  quant_attention_config:
-    qk_dtype: bf16
-    v_dtype: fp8
-    q_block_size: 0
-    k_block_size: 0
-    v_block_size: 0
-```
-
-```yaml
-# SAGE recipe used in this article
-attention_config:
-  backend: TRTLLM
-  quant_attention_config:
-    qk_dtype: int8
-    v_dtype: fp8
-    q_block_size: 1
-    k_block_size: 16
-    v_block_size: 1
-```
-
-In the current implementation, SAGE can be stacked with Skip Softmax because both use the
-`TRTLLM` backend. QK16PV8 uses `CUTEDSL`, while Skip Softmax requires `TRTLLM`, so that pair cannot
-be enabled together.
+This post uses SAGE, which can be layered with Skip Softmax to combine quantization and sparsity in
+the same attention path.
 
 ### Sparse Attention with Skip Softmax
 
@@ -119,38 +83,31 @@ also called BLASST, keeps the QK calculation but rejects score blocks sufficient
 running maximum. Rejected blocks skip exponentiation and the corresponding value accumulation;
 the sparsity pattern is determined dynamically rather than stored with the model.
 
-Users control the operating point with two fields. `target_sparsity` requests a calibrated target
-rather than fixing the runtime skip rate. Each transformer maps the target to its own
-`threshold_scale_factor`, and the kernel uses the scale factor together with the sequence length
-to derive its threshold. Scores vary by layer and timestep, so achieved sparsity can differ from
-the target. `disabled_until_timestep` controls when skipping begins: denoising timesteps descend
-from near 1 to 0, so a lower cutoff retains more dense denoising; `0` disables skipping and `1`
-enables it from the first step.
-
-Calibration also determines where sparse attention is unsafe. Each Wan transformer checkpoint
-contains its own `ignore` patterns. Matching attention layers fall back to dense attention, while
-the remaining layers use Skip Softmax. This layer-selective fallback is specific to the VisualGen
-calibration path; the high-noise and low-noise transformers can have different formulas and ignore
-lists. The [VisualGen sparse-attention guide](../../visual-gen/features/sparse-attention.md) and
-[Wan 2.2 example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b)
-document the checkpoint metadata and user overrides.
+Two controls shape the tradeoff: how aggressively to skip and how far into denoising to begin.
+Calibration also protects sensitive layers by leaving them on dense attention. Together, these
+controls turn Skip Softmax into a final tuning knob after linear-layer and attention quantization
+have established the main operating point.
 
 ## Results
 
-### Workload and measurement boundary
+### Experimental setup
 
-We keep the generation workload fixed while varying linear-layer precision, attention precision,
-target sparsity, and the point in denoising at which skipping begins.
+We evaluate the three techniques on a fixed Wan 2.2 workload while varying linear-layer precision,
+attention precision, and Skip Softmax settings.
 
 | Item | Setting |
 | :--- | :--- |
-| Checkpoint | [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers), dynamically quantized for the current draft results |
+| Checkpoint | [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) |
 | Accelerator | NVIDIA B200 |
 | Generated video | 1280×720, 81 frames at 16 FPS |
 | Denoising | 50 steps; guidance 5.0 for the high-noise expert and 4.0 for the low-noise expert; maximum text sequence length 512 |
+| Linear-layer paths | BF16 baseline, dynamic `FP8_BLOCK_SCALES`, dynamic `NVFP4` |
+| Attention paths | Dense, or SAGE with INT8 Q/K, FP8 V, and Q/K/V block sizes of 1/16/1 |
 
 Classifier-free guidance runs at every step by batching the positive and negative branches
 together; CFG parallelism is disabled.
+
+For the FP8 and NVFP4 runs, VisualGen quantizes eligible BF16 weights while loading the model.
 
 The 96 configurations are a characterization sweep, not a recommended per-model tuning cost:
 
@@ -163,13 +120,9 @@ The 96 configurations are a characterization sweep, not a recommended per-model 
 ```
 
 Every setting uses the same seven prompt-and-seed pairs. Speedup is relative to compiled dense
-BF16. LPIPS compares each video with an eager BF16 generation from the same prompt and seed.
-
-The measured latency covers one complete 50-step pipeline forward after compilation warmup. It
-does not include model loading, HTTP request handling, or video encoding, so the values are not
-client-observed end-to-end latency. Figure 1 breaks down the measured pipeline-forward scope; a
-client-side end-to-end breakdown should additionally report request, generation, and encoding
-time from the same reproduction command.
+BF16, and LPIPS compares each video with an eager BF16 generation from the same prompt and seed.
+Latency covers one complete 50-step pipeline forward after compilation warmup; model loading, HTTP
+handling, and video encoding are outside the measurement.
 
 ### Quality-speed frontier
 
@@ -191,17 +144,13 @@ identify the operating points below.</em></sub></p>
 | ③ | Highest measured speed | NVFP4 + SAGE + Skip (target 0.75, cutoff 1.00) | 348.0s | 1.51× | 0.523 |
 
 At point ②, Skip Softmax moves the NVFP4 + SAGE path from 1.28× to 1.40×. Its mean LPIPS is close
-to the matching no-skip anchor (0.504 versus 0.506), which suggests that this conservative Skip
-setting adds little incremental drift within that precision family on these seven prompt-and-seed
-pairs.
-
-That narrow comparison is not a claim of preserved output quality. An absolute LPIPS near 0.5
-indicates substantial distance from the eager BF16 reference, and LPIPS becomes less informative
-when videos already differ in structure or motion. The 0.002 difference is also too small to
-interpret without run-to-run variation. Before selecting either point ② or ③, inspect synchronized
-videos and evaluate prompt adherence, motion, temporal consistency, and application-specific human
-preference on a broader prompt set. Across this limited sweep, the denoising cutoff changes output
-similarity more strongly than target sparsity, so tune the cutoff first.
+to the matching no-skip anchor (0.504 versus 0.506), so the conservative Skip setting adds little
+incremental drift within that precision family on these seven prompt-and-seed pairs. The larger
+quality shift has already happened between BF16 and the quantized family: at an LPIPS near 0.5,
+synchronized video review becomes more useful than the metric alone. Check prompt adherence,
+motion, and temporal consistency before choosing between points ② and ③. In this sweep, the
+denoising cutoff influences similarity more strongly than target sparsity, making it the better
+parameter to tune first.
 
 ### Pipeline-forward latency
 
@@ -224,8 +173,8 @@ The full 96-run sweep explains the interactions between the three techniques, bu
 recipe to another model should use a staged search:
 
 1. Establish a compiled BF16 latency and quality reference.
-2. Compare the available prequantized ModelOpt checkpoints with dense attention, then retain only
-   precision families that pass the quality gate.
+2. Compare the supported linear-layer quantization paths with dense attention, treating dynamic
+   and static weights as separate candidates, then retain only families that pass the quality gate.
 3. Compare dense and supported quantized-attention recipes for those families.
 4. Starting from `target_sparsity=0.65`, sweep a few conservative denoising cutoffs first.
 5. Sweep target sparsity only around the best cutoff, expand locally near the Pareto frontier, and
@@ -280,12 +229,33 @@ Return:
 </details>
 
 The [Wan 2.2 Skip Softmax example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b)
-packages the component-specific calibration overlays and current VisualGen configuration. The
-measurements in this draft use the TensorRT-LLM release image
+packages the component-specific calibration overlays and VisualGen configuration. The
+measurements in this post use the TensorRT-LLM release image
 `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19`; set `MODEL_DIR` and `TRTLLM_ROOT` to local paths in
 that environment.
 
-### Enable the current measured path
+### Configuration details
+
+VisualGen selects a quantized-attention recipe through
+`attention_config.quant_attention_config`. QK16PV8 and SAGE occupy the same field, but use
+different backends and scaling layouts:
+
+| Recipe | Backend | Q/K precision | V precision | Q/K/V block sizes | Combines with Skip Softmax |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| QK16PV8 | `CUTEDSL` | BF16 | FP8 | 0/0/0 (tensor-wide V scale) | No |
+| SAGE used here | `TRTLLM` | INT8 | FP8 | 1/16/1 | Yes |
+
+The current QK16PV8 kernel targets Blackwell `sm_100a` and `sm_103a` with head dimension 128; the
+current SAGE path requires Blackwell `sm_100`. Skip Softmax also uses the `TRTLLM` backend, which
+is why it composes with SAGE but not the `CUTEDSL` QK16PV8 path.
+
+For Skip Softmax, `target_sparsity` is converted to a threshold through each transformer's
+calibration formula; achieved sparsity can therefore vary by layer and timestep.
+`disabled_until_timestep` controls when skipping begins as denoising descends from near 1 to 0: a
+lower value keeps more early steps dense. Calibration also supplies an `ignore` list for layers
+that should stay dense.
+
+### Reproduce point ②
 
 Apply the high-noise and low-noise calibration overlays to their matching transformer configs:
 
@@ -301,10 +271,9 @@ The helper merges the matching `sparse_attention_config` overlay into each trans
 leaves all other fields unchanged. Each overlay carries 44 layer names in `ignore`; those layers
 remain dense. The packaged
 [`visual_gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b/visual_gen.yaml)
-selects the currently measured point ②: `target_sparsity=0.65`,
+selects point ②: `target_sparsity=0.65`,
 `disabled_until_timestep=0.86`, dynamic NVFP4 linear-layer quantization, and the INT8/FP8 SAGE
-recipe. This command reproduces the draft's dynamic path, not the static ModelOpt checkpoint that
-would need to be characterized separately.
+recipe.
 
 Start VisualGen with the packaged configuration:
 
@@ -334,8 +303,7 @@ seven prompts. Treat LPIPS as one diagnostic rather than a complete video-qualit
 For the measured Wan 2.2 workload, linear-layer quantization first shifts the dense operating
 point, SAGE quantized attention reduces attention cost, and Skip Softmax provides a final
 quality-speed control. The conservative Skip setting within the NVFP4 + SAGE family reaches
-**1.40×**, while the fastest measured point reaches **1.51×**. These results are scoped to the
-dynamic-quantization path measured here and should not be generalized to static checkpoints.
+**1.40×**, while the fastest measured point reaches **1.51×**.
 
 The practical sequence is to select a calibrated linear-layer precision, then select an attention
 recipe, and finally tune the Skip Softmax denoising cutoff before increasing target sparsity. These
