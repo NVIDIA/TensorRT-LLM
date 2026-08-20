@@ -184,6 +184,16 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration
   - unittest/_torch/moe/test_moe_backend.py::test_apply_router_weight_on_input_support_is_not_inherited
+  # WideEP DeepEP NVFP4 transport fusion and fail-closed backend contracts.
+  - unittest/_torch/moe/test_deep_ep_bf16_fp4_dispatch.py
+  - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_binary_env
+  - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_binary_env_rejects_invalid_value
+  - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op
+  - unittest/_torch/moe/test_moe_backend.py::test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_deep_ep_nvfp4_dispatch_capability_fails_closed
+  - unittest/_torch/moe/test_moe_backend.py::test_unvalidated_backend_cannot_bypass_quantize_input_for_deep_ep_dispatch
+  - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_bf16_nvfp4_fusion_gate_falls_back_for_unsupported_input
+  - unittest/others/test_deep_ep_recv_metadata_staging_patch.py
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
