@@ -194,7 +194,7 @@ commands:
         flags:
         - "--grpc"
       grpc_protocol:
-        type: Choice(['smg', 'openengine'])
+        type: Choice(['openengine', 'smg'])
         default: smg
         status: prototype
         required: false
