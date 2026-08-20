@@ -78,7 +78,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -394,7 +394,7 @@ class MegaMoECuteDsl(MoE):
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         """Check static eligibility; runtime providers and tensor values are validated later."""
-        if not (is_sm_100f(d.env.sm) or d.env.sm == 107):
+        if d.env.sm not in (100, 103, 107):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
                 f"MegaMoECuteDsl requires SM100, SM103, or SM107; got SM{d.env.sm}.",
