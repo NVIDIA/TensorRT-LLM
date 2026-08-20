@@ -79,6 +79,50 @@ server_configs:
         backend: "openai"
         dataset_file: datasets/perf-ci/deepseek_r1-8k1k-20480-ratio-1_for_serve.json
 
+  # Short DEP16 integration smoke that must remain on DeepEP Low Latency.
+  - name: "r1_fp4_v2_dep16_cutedsl_deepepll_smoke"
+    server_env_var: >-
+      TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1
+      TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY
+      TRTLLM_MOE_POST_QUANT_ALLTOALLV=1
+      TRTLLM_DEEP_EP_NVFP4_FUSED_OUTPUT_SCALE=1
+      TRTLLM_DEEP_EP_NVFP4_FUSED_BF16_DISPATCH=1
+      TRTLLM_DEEP_EP_LP_COMBINE_RECV_METADATA_STAGING=1
+    expected_communication_strategy: "DeepEPLowLatency"
+    model_name: "deepseek_r1_0528_fp4_v2"
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    pipeline_parallel_size: 1
+    max_batch_size: 8
+    max_num_tokens: 128
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    attention_dp_config:
+      batching_wait_iters: 0
+      enable_balance: true
+      timeout_iters: 60
+    moe_config:
+      backend: "CUTEDSL"
+      max_num_tokens: 128
+      use_low_precision_moe_combine: true
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 8
+    kv_cache_config:
+      dtype: "fp8"
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+    speculative_config:
+      decoding_type: "MTP"
+      max_draft_len: 1
+    client_configs:
+      - name: "con2_iter1_32x16"
+        concurrency: 2
+        iterations: 1
+        isl: 32
+        osl: 16
+        backend: "openai"
+
   # 1k1k configs - TEP16 with TRTLLM, MTP3
   - name: "r1_fp4_v2_tep16_mtp3"
     server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"

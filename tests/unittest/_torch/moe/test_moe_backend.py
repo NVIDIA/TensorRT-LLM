@@ -262,7 +262,7 @@ def _run_deep_ep_dispatch_scheduler(
 
 def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeypatch):
     monkeypatch.setattr(
-        "tensorrt_llm._torch.modules.fused_moe.moe_scheduler.get_calibrator",
+        "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.get_calibrator",
         lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
     )
     x = torch.empty(4, 8, dtype=torch.bfloat16)
@@ -327,7 +327,7 @@ def test_unvalidated_backend_cannot_bypass_quantize_input_for_deep_ep_dispatch(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.modules.fused_moe.moe_scheduler.get_calibrator",
+        "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.get_calibrator",
         lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
     )
     x = torch.empty(4, 8, dtype=torch.bfloat16)

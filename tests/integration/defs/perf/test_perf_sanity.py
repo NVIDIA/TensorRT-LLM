@@ -808,6 +808,9 @@ class ServerConfig:
         self.enable_lm_head_tp_in_adp = server_config_data.get("enable_lm_head_tp_in_adp", False)
         self.backend = server_config_data.get("backend", "pytorch")
         self.extra_llm_api_config_path = server_config_data.get("extra_llm_api_config_path", "")
+        self.expected_communication_strategy = server_config_data.get(
+            "expected_communication_strategy", ""
+        )
 
         # attention_dp_config
         attention_dp_config = server_config_data.get("attention_dp_config", {})
@@ -906,6 +909,7 @@ class ServerConfig:
             "backend",
             "extra_llm_api_config_path",
             "server_env_var",
+            "expected_communication_strategy",
         ]
         self.extra_llm_api_config_data = {
             k: v for k, v in server_config_data.items() if k not in exclude_keys
@@ -942,6 +946,31 @@ class ServerConfig:
 
     def to_env(self) -> Dict[str, str]:
         return to_env_dict(self.env_vars)
+
+    def assert_expected_communication_strategy(self, server_log_path: str) -> None:
+        """Assert that the configured communication strategy stayed active."""
+        if not self.expected_communication_strategy:
+            return
+
+        with open(server_log_path, "r", encoding="utf-8", errors="replace") as log_file:
+            server_log = log_file.read()
+
+        selected_pattern = (
+            f"Selected communication strategy: {self.expected_communication_strategy}"
+        )
+        fallback_pattern = (
+            f"Communication strategy {self.expected_communication_strategy} cannot be used"
+        )
+        if selected_pattern not in server_log:
+            raise RuntimeError(
+                f"Server did not select the expected communication strategy "
+                f"{self.expected_communication_strategy}; see {server_log_path}."
+            )
+        if fallback_pattern in server_log:
+            raise RuntimeError(
+                f"Server selected {self.expected_communication_strategy} but fell back at runtime; "
+                f"see {server_log_path}."
+            )
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""
@@ -2747,6 +2776,11 @@ class PerfSanityTestConfig:
                 server_outputs = commands.run_cmd(server_idx)
                 for output in server_outputs:
                     self._check_benchmark_errors(output)
+                if isinstance(commands, AggrTestCmds) and server_idx < len(commands.server_configs):
+                    server_log_path = commands.get_server_logs(server_idx)[0]
+                    commands.server_configs[server_idx].assert_expected_communication_strategy(
+                        server_log_path
+                    )
                 outputs[server_idx] = server_outputs
 
             except Exception as e:

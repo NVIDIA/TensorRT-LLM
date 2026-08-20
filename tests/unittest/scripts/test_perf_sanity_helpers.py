@@ -83,6 +83,54 @@ def test_benchmark_log_is_included_in_report_logs(tmp_path: Path) -> None:
     assert str(benchmark_log) in disagg_commands.get_server_logs(0)
 
 
+def test_expected_communication_strategy_accepts_selected_strategy(tmp_path: Path) -> None:
+    server_log = tmp_path / "trtllm-serve.0.log"
+    server_log.write_text(
+        "Selected communication strategy: DeepEPLowLatency "
+        "(TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY)\n",
+        encoding="utf-8",
+    )
+    server_config = perf_sanity.ServerConfig(
+        {
+            "model_name": "deepseek_r1_0528_fp4_v2",
+            "expected_communication_strategy": "DeepEPLowLatency",
+        }
+    )
+
+    server_config.assert_expected_communication_strategy(str(server_log))
+    assert "expected_communication_strategy" not in server_config.generate_extra_llm_api_config()
+
+
+@pytest.mark.parametrize(
+    "server_log_text,error_match",
+    [
+        ("Selected communication strategy: AllGatherReduceScatter\n", "did not select"),
+        (
+            "Selected communication strategy: DeepEPLowLatency\n"
+            "Communication strategy DeepEPLowLatency cannot be used "
+            "(num_chunks=2, max_num_tokens=1024). Falling back to AllGatherReduceScatter.\n",
+            "fell back at runtime",
+        ),
+    ],
+)
+def test_expected_communication_strategy_rejects_missing_or_fallback(
+    tmp_path: Path,
+    server_log_text: str,
+    error_match: str,
+) -> None:
+    server_log = tmp_path / "trtllm-serve.0.log"
+    server_log.write_text(server_log_text, encoding="utf-8")
+    server_config = perf_sanity.ServerConfig(
+        {
+            "model_name": "deepseek_r1_0528_fp4_v2",
+            "expected_communication_strategy": "DeepEPLowLatency",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        server_config.assert_expected_communication_strategy(str(server_log))
+
+
 def test_sentinel_timeout_falls_back_to_current_gen_logs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
