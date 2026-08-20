@@ -2325,7 +2325,7 @@ class PyExecutor:
             if item.request is None:
                 continue
             try:
-                token_count = len(item.request.input_token_ids)
+                token_count = item.request.num_input_tokens
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
                 # exclude from all queued counters so downstream consumers
