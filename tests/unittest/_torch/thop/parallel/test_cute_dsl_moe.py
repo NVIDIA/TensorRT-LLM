@@ -100,6 +100,23 @@ def test_grouped_gemm_inputs_helper(top_k: int, ep_size: int, tile_size: int):
 
 
 @pytest.mark.parametrize("tile_size", [128, 256])
+def test_grouped_gemm_inputs_helper_fixed_expert_capacity(tile_size: int):
+    helper = GroupedGemmInputsHelper(
+        num_experts=256,
+        top_k=1,
+        num_local_experts=8,
+        local_expert_offset=0,
+        tile_size=tile_size,
+    )
+
+    assert helper.get_expert_capacity_num_permuted_tokens(1) == 8 * tile_size
+    assert helper.get_expert_capacity_num_permuted_tokens(tile_size) == 8 * tile_size
+    assert helper.get_expert_capacity_num_permuted_tokens(tile_size + 1) == 16 * tile_size
+    with pytest.raises(ValueError, match="capacity must be positive"):
+        helper.get_expert_capacity_num_permuted_tokens(0)
+
+
+@pytest.mark.parametrize("tile_size", [128, 256])
 def test_count_native_tile_plan_empty_and_boundary_experts(tile_size: int):
     """Count-native scheduling must preserve expert-major rows at M boundaries."""
     capacity = 2 * tile_size + 1

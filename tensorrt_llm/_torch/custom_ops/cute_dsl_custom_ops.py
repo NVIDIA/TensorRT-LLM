@@ -157,6 +157,14 @@ class GroupedGemmInputsHelper:
     def get_max_num_permuted_tokens(self, num_tokens: int) -> int:
         return self.get_max_num_tiles(num_tokens) * self.tile_size
 
+    def get_expert_capacity_num_permuted_tokens(self,
+                                                expert_capacity: int) -> int:
+        """Return padded rows for a fixed-capacity expert layout."""
+        if expert_capacity <= 0:
+            raise ValueError("Expert capacity must be positive")
+        return (self.num_local_experts *
+                ceil_div(expert_capacity, self.tile_size) * self.tile_size)
+
     def infer_num_tokens(self, max_num_permuted_tokens: int) -> int:
         """Infer the maximum possible number of tokens given the max_num_permuted_tokens.
         """
@@ -3481,7 +3489,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.local_expert_offset,
                     self.tile_size,
                 )
-                m = helper.get_max_num_permuted_tokens(inputs[0].size(0))
+                m = helper.get_expert_capacity_num_permuted_tokens(
+                    self.expert_capacity)
             else:
                 # m is the permuted size from permuted_idx_to_expanded_idx, not from a.
                 m = inputs[7].size(0)
@@ -3595,7 +3604,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.local_expert_offset,
                     self.tile_size,
                 )
-                m = helper.get_max_num_permuted_tokens(orig_m)
+                m = helper.get_expert_capacity_num_permuted_tokens(
+                    self.expert_capacity)
             else:
                 m = permuted_idx_to_expanded_idx.size(0)
             l, n = b.size(0), b.size(1)  # noqa: E741
@@ -3862,7 +3872,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             helper = GroupedGemmInputsHelper(num_experts, top_k,
                                              num_local_experts,
                                              local_expert_offset, tile_size)
-            m = helper.get_max_num_permuted_tokens(input.size(0))
+            m = helper.get_expert_capacity_num_permuted_tokens(expert_capacity)
         else:
             m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)
