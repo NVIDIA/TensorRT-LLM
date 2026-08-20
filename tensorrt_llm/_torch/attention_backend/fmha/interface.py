@@ -15,6 +15,7 @@
 
 import weakref
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -26,6 +27,13 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
+
+
+class FmhaPhase(str, Enum):
+    """Attention phase checked by a phased FMHA library."""
+
+    CONTEXT = "context"
+    GENERATION = "generation"
 
 
 class Fmha(ABC):
@@ -52,7 +60,10 @@ class Fmha(ABC):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        """Return whether this library supports the request or requested phase."""
         return True
 
     @abstractmethod
