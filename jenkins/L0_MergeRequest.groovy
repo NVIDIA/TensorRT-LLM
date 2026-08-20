@@ -156,9 +156,9 @@ def DISABLE_CBTS = "disable_cbts"
 @Field
 def ENABLE_CBTS_COVERAGE = true
 // Rollout switch for pre-merge Tier 2 coverage-based narrowing. Keep collection
-// enabled above while this remains off so a later pilot allowlist has fresh data.
+// enabled above so the pilot allowlist has fresh data.
 @Field
-def ENABLE_CBTS_COVERAGE_TIER = false
+def ENABLE_CBTS_COVERAGE_TIER = true
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
 
@@ -937,7 +937,8 @@ def _cbtsCoverageDb(pipeline)
     return _cbtsCoverageAudit(pipeline)
 }
 
-// Fetch the touch DB and audit it; artifact.py's {path, meta} verbatim, or null on failure.
+// Check pilot eligibility, then fetch and audit the touch DB; artifact.py's
+// {path, meta} verbatim, or null on failure.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
@@ -946,12 +947,23 @@ def _cbtsCoverageAudit(pipeline)
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
         def readyJson = ""
+        def pilotEligible = false
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
-            readyJson = sh(
-                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+            pilotEligible = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
-            ).trim()
+            ).trim() == "true"
+            if (pilotEligible) {
+                readyJson = sh(
+                    script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                            "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                    returnStdout: true,
+                ).trim()
+            }
+        }
+        if (!pilotEligible) {
+            pipeline.echo("CBTS: coverage tier disabled for this PR — running Tier 1 only")
+            return null
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — skipping Tier 2")
