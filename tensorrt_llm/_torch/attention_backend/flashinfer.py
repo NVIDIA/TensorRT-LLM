@@ -210,6 +210,7 @@ class MLAPlanParams:
 @dataclass(kw_only=True)
 class FlashInferWrappers:
     is_planned: bool
+    workspace_buffer: torch.Tensor = field(repr=False)
     decode_wrapper: Optional[
         flashinfer.BatchDecodeWithPagedKVCacheWrapper] = None
     prefill_wrapper: Optional[
@@ -244,6 +245,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _cached_token_lens: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
+    _plan_params_to_workspace: Dict[PlanParams,
+                                    torch.Tensor] = field(init=False,
+                                                          repr=False)
 
     # MLA wrappers and stable buffers.
     # Cached plan params + is-planned flag let prepare() refresh the plan
@@ -288,6 +292,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         wrappers = self._plan_params_to_wrappers[plan_params]
         return not wrappers.is_planned
+
+    def _get_plan_workspace(self, plan_params: PlanParams) -> torch.Tensor:
+        persistent_plan = (plan_params.attention_mask_data is None
+                           and plan_params.multi_item_params is None)
+        if not self.is_cuda_graph or not persistent_plan:
+            assert self.workspace_buffer is not None
+            return self.workspace_buffer
+
+        workspace_buffer = self._plan_params_to_workspace.get(plan_params)
+        if workspace_buffer is None:
+            assert self.workspace_buffer is not None
+            if not self._plan_params_to_workspace:
+                workspace_buffer = self.workspace_buffer
+            else:
+                workspace_buffer = torch.empty_like(self.workspace_buffer)
+            self._plan_params_to_workspace[plan_params] = workspace_buffer
+        return workspace_buffer
 
     def get_prefill_wrapper(
         self, plan_params: PlanParams
@@ -900,6 +921,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                       dtype=torch.int,
                                       device='cuda')
         self._plan_params_to_wrappers = {}
+        # CUDA-graph metadata instances are shallow copies. Keep their plan
+        # workspace registry shared so graph batch-size replicas reuse the
+        # same stable addresses instead of allocating per replica.
+        if not hasattr(self, '_plan_params_to_workspace'):
+            self._plan_params_to_workspace = {}
 
         # Host-side state for sync-free trtllm-gen decode plans, retained by
         # prepare(): a host mirror of _paged_kv_indices (kept in lockstep
@@ -1521,16 +1547,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        # Multi-wrapper case (Gemma4 hybrid: different head_dim per layer)
-        # shares one workspace_buffer; eager plan() would overwrite earlier
-        # wrappers' workspace, so defer plan() to forward_impl. Single-wrapper
-        # case (e.g., Llama, Gemma3 uniform head_dim) needs eager plan() here
-        # because forward_impl cannot plan() during cuda-graph stream capture.
+        # Eager multi-wrapper execution shares one workspace_buffer, so defer
+        # plan() to forward_impl to avoid overwriting an earlier plan. CUDA
+        # graph wrappers have isolated persistent workspaces and must all be
+        # planned here, outside stream capture.
         active_wrappers = [
             pp for pp in self._plan_params_to_wrappers
             if pp.attention_mask_data is None
         ]
-        defer_plan = len(active_wrappers) > 1
+        defer_plan = len(active_wrappers) > 1 and not self.is_cuda_graph
         if not (self._is_separate_kv_draft_view and self.is_cuda_graph):
             self._clean_cached_plans(defer_plan=defer_plan)
 
@@ -1742,11 +1767,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 # NB: https://github.com/sgl-project/sglang/pull/10979 also uses the paged-KV kernels.
                 ragged_builder = self._page_size_one_prefill_wrapper_builder
             if plan_params in self._plan_params_to_wrappers:
-                ragged_prefill_wrapper = self._plan_params_to_wrappers[
-                    plan_params].ragged_prefill_wrapper
+                wrappers = self._plan_params_to_wrappers[plan_params]
+                ragged_prefill_wrapper = wrappers.ragged_prefill_wrapper
                 assert ragged_prefill_wrapper is not None
                 assert ragged_prefill_wrapper._backend == ragged_flashinfer_backend
+                workspace_buffer = wrappers.workspace_buffer
             else:
+                workspace_buffer = self._get_plan_workspace(plan_params)
                 wrapper_kwargs: Dict[str, Any] = {}
                 if plan_params.multi_item_params is None:
                     qo_indptr_buf = self._ragged_qo_indptr_buf[:self.
@@ -1759,7 +1786,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         kv_indptr_buf=kv_indptr_buf,
                     )
                 ragged_prefill_wrapper = ragged_builder(
-                    self.workspace_buffer,
+                    workspace_buffer,
                     "NHD",  # ragged KVs use always NHD
                     backend=ragged_flashinfer_backend,
                     **wrapper_kwargs,
@@ -1774,6 +1801,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 flashinfer_backend=ragged_flashinfer_backend)
             self._plan_params_to_wrappers[plan_params] = FlashInferWrappers(
                 is_planned=True,
+                workspace_buffer=workspace_buffer,
                 ragged_prefill_wrapper=ragged_prefill_wrapper,
             )
             return plan_params
@@ -1787,13 +1815,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # device buffer address must survive replans for CUDA graphs.
         wrappers = self._plan_params_to_wrappers.get(plan_params)
         if wrappers is None:
-            wrappers = FlashInferWrappers(is_planned=False)
+            wrappers = FlashInferWrappers(
+                is_planned=False,
+                workspace_buffer=self._get_plan_workspace(plan_params),
+            )
             self._plan_params_to_wrappers[plan_params] = wrappers
+        workspace_buffer = wrappers.workspace_buffer
 
         if wrappers.prefill_wrapper is None:
             wrappers.prefill_wrapper = \
                 flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
+                    workspace_buffer,
                     self.kv_layout,
                     backend=flashinfer_backend,
                     qo_indptr_buf=self.qo_indptr,
@@ -1841,7 +1873,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
             wrappers.decode_wrapper = \
                 flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
+                    workspace_buffer,
                     self.kv_layout,
                     use_cuda_graph=self.is_cuda_graph,
                     paged_kv_indptr_buffer=self.paged_kv_indptr_decode,

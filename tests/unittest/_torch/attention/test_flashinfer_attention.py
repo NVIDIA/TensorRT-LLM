@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import random
 import unittest
 from collections import defaultdict
@@ -14,8 +28,8 @@ from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
 from tensorrt_llm._torch.attention_backend import \
     flashinfer as flashinfer_backend
 from tensorrt_llm._torch.attention_backend.flashinfer import PlanParams
-from tensorrt_llm._torch.attention_backend.interface import \
-    PredefinedAttentionMask
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs, PredefinedAttentionMask)
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import prefer_pinned
@@ -59,12 +73,71 @@ class Scenario:
 class CUDAGraphTestScenario:
     batch_size: int
     num_heads: int
-    num_kv_heads: int
+    num_kv_heads: Union[int, List[int]]
     head_dim: int
     dtype: torch.dtype
+    attention_window_sizes: Optional[List[Optional[int]]] = None
 
 
 class TestFlashInferAttention(unittest.TestCase):
+
+    def test_cuda_graph_plan_workspaces_reused_across_batch_sizes(self) -> None:
+        workspace = torch.empty(1024, dtype=torch.uint8, device="cuda")
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.ones(2, dtype=torch.int32),
+            num_contexts=0,
+            workspace_buffer=workspace,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=2,
+            max_num_tokens=2,
+        )
+        batch_size_one = metadata.create_cuda_graph_metadata(1)
+        batch_size_two = metadata.create_cuda_graph_metadata(2)
+        global_plan = PlanParams(
+            num_heads=2,
+            num_kv_heads=2,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            attention_mask_type=AttentionMaskType.causal,
+            window_left=-1,
+        )
+        sliding_window_plan = PlanParams(
+            num_heads=2,
+            num_kv_heads=2,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            attention_mask_type=AttentionMaskType.causal,
+            window_left=127,
+        )
+
+        self.assertIs(batch_size_one._plan_params_to_workspace,
+                      batch_size_two._plan_params_to_workspace)
+        with mock.patch.object(torch, "empty_like",
+                               wraps=torch.empty_like) as allocate_workspace:
+            first_global = batch_size_one._get_plan_workspace(global_plan)
+            self.assertEqual(allocate_workspace.call_count, 0)
+            first_sliding = batch_size_one._get_plan_workspace(
+                sliding_window_plan)
+            second_global = batch_size_two._get_plan_workspace(global_plan)
+            second_sliding = batch_size_two._get_plan_workspace(
+                sliding_window_plan)
+
+        self.assertEqual(allocate_workspace.call_count, 1)
+        self.assertEqual(first_global.data_ptr(), workspace.data_ptr())
+        self.assertNotEqual(first_global.data_ptr(), first_sliding.data_ptr())
+        self.assertEqual(first_global.data_ptr(), second_global.data_ptr())
+        self.assertEqual(first_sliding.data_ptr(), second_sliding.data_ptr())
+
+        # Eager execution continues to share the original workspace.
+        self.assertEqual(
+            metadata._get_plan_workspace(global_plan).data_ptr(),
+            workspace.data_ptr())
+        self.assertEqual(
+            metadata._get_plan_workspace(sliding_window_plan).data_ptr(),
+            workspace.data_ptr())
 
     def test_separate_kv_draft_metadata_uses_draft_manager(self):
         if not torch.cuda.is_available():
@@ -558,6 +631,14 @@ class TestFlashInferAttention(unittest.TestCase):
             head_dim=128,
             dtype=torch.bfloat16,
         ),
+        CUDAGraphTestScenario(
+            batch_size=16,
+            num_heads=32,
+            num_kv_heads=[32, 32],
+            head_dim=128,
+            dtype=torch.bfloat16,
+            attention_window_sizes=[None, 64],
+        ),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     def test_attention_with_cuda_graphs(
@@ -583,6 +664,12 @@ class TestFlashInferAttention(unittest.TestCase):
         num_blocks = 16
         max_seq_len = tokens_per_block * num_blocks
         num_layers = 1 if isinstance(num_kv_heads, int) else len(num_kv_heads)
+        attention_window_sizes = (test_scenario.attention_window_sizes
+                                  or [None] * num_layers)
+        forward_args = [
+            AttentionForwardArgs(attention_window_size=window_size)
+            for window_size in attention_window_sizes
+        ]
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
 
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
@@ -682,7 +769,24 @@ class TestFlashInferAttention(unittest.TestCase):
             k = torch.cat(gen_ks[i])
             v = torch.cat(gen_vs[i])
             layer = layers[i]
-            results_ref.append(layer.forward(q, k, v, attn_metadata_ref))
+            results_ref.append(
+                layer.forward(q,
+                              k,
+                              v,
+                              attn_metadata_ref,
+                              forward_args=forward_args[i]))
+
+        if num_layers > 1:
+            attn_metadata_ref.prepare()
+            eager_wrappers = list(
+                attn_metadata_ref._plan_params_to_wrappers.values())
+            self.assertTrue(
+                all(not wrappers.is_planned for wrappers in eager_wrappers))
+            self.assertEqual(
+                len({
+                    wrappers.workspace_buffer.data_ptr()
+                    for wrappers in eager_wrappers
+                }), 1)
 
         graph = torch.cuda.CUDAGraph()
         for i in range(num_layers):
@@ -692,7 +796,33 @@ class TestFlashInferAttention(unittest.TestCase):
             v = torch.cat(gen_vs[i])
             # Warmup run, required by PT
             for _ in range(2):
-                layer.forward(q, k, v, attn_metadata_cuda_graph)
+                layer.forward(q,
+                              k,
+                              v,
+                              attn_metadata_cuda_graph,
+                              forward_args=forward_args[i])
+
+        # All persistent graph plans must be refreshed before capture.
+        attn_metadata_cuda_graph.prepare()
+        graph_wrappers = list(
+            attn_metadata_cuda_graph._plan_params_to_wrappers.values())
+        self.assertTrue(all(wrappers.is_planned for wrappers in graph_wrappers))
+        graph_workspace_ptrs = {
+            wrappers.workspace_buffer.data_ptr()
+            for wrappers in graph_wrappers
+        }
+        if num_layers == 1:
+            self.assertEqual(graph_workspace_ptrs, {workspace.data_ptr()})
+        else:
+            self.assertEqual(len(graph_workspace_ptrs), num_layers)
+        if test_scenario.attention_window_sizes is not None:
+            workspace_by_window = {
+                plan_params.window_left: wrappers.workspace_buffer.data_ptr()
+                for plan_params, wrappers in
+                attn_metadata_cuda_graph._plan_params_to_wrappers.items()
+            }
+            self.assertNotEqual(workspace_by_window[-1],
+                                workspace_by_window[63])
 
         results_actual = []
         with torch.cuda.graph(graph):
@@ -702,7 +832,11 @@ class TestFlashInferAttention(unittest.TestCase):
                 k = torch.cat(gen_ks[i])
                 v = torch.cat(gen_vs[i])
                 results_actual.append(
-                    layer.forward(q, k, v, attn_metadata_cuda_graph))
+                    layer.forward(q,
+                                  k,
+                                  v,
+                                  attn_metadata_cuda_graph,
+                                  forward_args=forward_args[i]))
 
         graph.replay()
 
