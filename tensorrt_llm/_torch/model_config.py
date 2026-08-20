@@ -1178,6 +1178,18 @@ class ModelConfig(Generic[TConfig]):
                             window_size=window_size,
                             indexer_k_dtype=indexer_k_dtype,
                             **indexer_config)
+                elif (pretrained_config.architectures
+                      and pretrained_config.architectures[0]
+                      in _INKLING_ARCHITECTURES
+                      and kwargs.get('sparse_attention_config') is None):
+                    # Derived from the architecture, never user-supplied: Inkling
+                    # has one correct backend and no alternative to choose
+                    # between.
+                    from .attention_backend.sparse.inkling import \
+                        InklingSparseAttentionConfig
+                    kwargs[
+                        'sparse_attention_config'] = InklingSparseAttentionConfig(
+                        )
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -1333,18 +1345,6 @@ class ModelConfig(Generic[TConfig]):
         if architecture in _MINIMAX_M3_ARCHITECTURES:
             layer_quant_config = cls._set_minimax_m3_layer_quant_config(
                 pretrained_config, layer_quant_config)
-
-        if (architecture in _INKLING_ARCHITECTURES
-                and kwargs.get('sparse_attention_config') is None):
-            # Derived from the architecture, never user-supplied: Inkling has one
-            # correct backend and no alternative to choose between. Injected here
-            # rather than assigned afterwards because the instance is frozen on
-            # the next line and `sparse_attention_config` is not on
-            # `__setattr__`'s allow-list; this is the same seam DeepSeek-V4 uses
-            # to derive its own config from the checkpoint.
-            from .attention_backend.sparse.inkling import \
-                InklingSparseAttentionConfig
-            kwargs['sparse_attention_config'] = InklingSparseAttentionConfig()
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

@@ -15,7 +15,7 @@
 """Per-step decode metadata for the Inkling Triton attention path."""
 
 import os
-from typing import Dict, List
+from typing import List
 
 import torch
 
@@ -51,9 +51,6 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.kv_layout = "HND"
-        # Layer -> row of kv_cache_block_offsets. Static, so built once.
-        self._ink_pt_rows: Dict[int, int] = {}
         # Short-conv pool and this forward's context/generation split: per-step
         # host work that must land in stable buffers before graph capture.
         self.ink_conv_cache = None
@@ -64,8 +61,8 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         the local slice; the cache is addressed by global index)."""
         return list(getattr(self.kv_cache_manager, "pp_layers", []))
 
-    def _ink_build_pt_rows(self, layers: List[int]) -> Dict[int, int]:
-        """Map each owned layer to its row in ``kv_cache_block_offsets``.
+    def _ink_pt_row(self, layer: int) -> int:
+        """Row of ``kv_cache_block_offsets`` holding ``layer``'s page table.
 
         That tensor's leading axis is per *pool* by default, but per attention-op
         *layer* under ``enable_swa_scratch_reuse`` (scratch pages are per layer);
@@ -77,27 +74,22 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         mismatch would be a wrong address rather than a crash.
         """
         mgr = self.kv_cache_manager
-        per_layer = bool(getattr(mgr, "enable_swa_scratch_reuse", False))
-        rows: Dict[int, int] = {}
-        for layer in layers:
-            offset = mgr.layer_offsets[layer]
-            if per_layer:
-                rows[layer] = int(offset)
-                continue
-            pool_id = int(mgr.layer_to_pool_mapping_dict[offset])
-            layer_scale = int(mgr.get_layer_page_index_scale(layer))
-            pool_scale = int(mgr.index_scales[pool_id])
-            if layer_scale != pool_scale:
-                raise RuntimeError(
-                    f"Inkling layer {layer} (offset {offset}) has page-index "
-                    f"scale {layer_scale} but its pool {pool_id} is encoded with "
-                    f"{pool_scale}; kv_cache_block_offsets cannot be reused as "
-                    "this layer's page table because the recovered page address "
-                    "would be wrong. Give the layer its own pool, or stage a "
-                    "private table for it."
-                )
-            rows[layer] = pool_id
-        return rows
+        offset = mgr.layer_offsets[layer]
+        if getattr(mgr, "enable_swa_scratch_reuse", False):
+            return int(offset)
+        pool_id = int(mgr.layer_to_pool_mapping_dict[offset])
+        layer_scale = int(mgr.get_layer_page_index_scale(layer))
+        pool_scale = int(mgr.index_scales[pool_id])
+        if layer_scale != pool_scale:
+            raise RuntimeError(
+                f"Inkling layer {layer} (offset {offset}) has page-index "
+                f"scale {layer_scale} but its pool {pool_id} is encoded with "
+                f"{pool_scale}; kv_cache_block_offsets cannot be reused as "
+                "this layer's page table because the recovered page address "
+                "would be wrong. Give the layer its own pool, or stage a "
+                "private table for it."
+            )
+        return pool_id
 
     # ---- backend-facing ---------------------------------------------------
     def ink_gen_page_table(self, layer: int) -> torch.Tensor:
@@ -106,7 +98,7 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         :attr:`ink_page_div`. A captured graph reads a fixed offset here because
         :meth:`_prepare_inkling_decode` refuses a graph batch with contexts.
         """
-        row = self._ink_pt_rows[layer]
+        row = self._ink_pt_row(layer)
         start = self.num_contexts
         return self.kv_cache_block_offsets[row, start : start + self.num_generations, 0]
 
@@ -153,8 +145,7 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
 
     def _prepare_inkling_decode(self) -> None:
         # Publishes nothing -- the accessors read buffers the base refreshes each
-        # step. This only validates the borrowed layout and caches the row map.
-        # The early returns mean "no decode work in this batch"; none is
+        # step. This only validates the borrowed layout. The early returns mean "no decode work in this batch"; none is
         # reachable from the backend, which needs a manager, generation rows and
         # owned layers to get there at all.
         mgr = self.kv_cache_manager
@@ -186,15 +177,13 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                 "cache manager is attached, so this means prepare() ran "
                 "against a metadata object built without one."
             )
-        if not self._ink_pt_rows:
-            self._ink_pt_rows = self._ink_build_pt_rows(layers)
-        max_row = max(self._ink_pt_rows.values())
+        max_row = max(self._ink_pt_row(layer) for layer in layers)
         if max_row >= offsets.shape[0]:
             raise RuntimeError(
                 f"Inkling needs row {max_row} of kv_cache_block_offsets but it "
                 f"has only {offsets.shape[0]} (num_attention_op_pools). The "
                 "leading axis is per-pool by default and per-attention-op-layer "
-                "under enable_swa_scratch_reuse; _ink_build_pt_rows and the "
+                "under enable_swa_scratch_reuse; _ink_pt_row and the "
                 "manager disagree about which."
             )
         if num_contexts + num_gen > offsets.shape[1]:
@@ -267,18 +256,3 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                 f"get_batch_cache_indices) over {len(layers)} layers and "
                 f"{len(gen_ids)} generation rows"
             )
-
-    def create_cuda_graph_metadata(
-        self, max_batch_size: int, *args, **kwargs
-    ) -> "InklingAttentionMetadata":
-        md = super().create_cuda_graph_metadata(max_batch_size, *args, **kwargs)
-        if md is self or md.kv_cache_manager is None:
-            return md
-        # No private buffers to re-point: this is a shallow copy, and both
-        # tensors the decode path reads are the base's, which already hands the
-        # graph metadata its own capture-pool copies. Only short-conv state is
-        # reset; _ink_pt_rows is rebuilt because the manager may differ.
-        md.ink_conv_cache = None
-        md.ink_conv_rt = None
-        md._ink_pt_rows = {}
-        return md

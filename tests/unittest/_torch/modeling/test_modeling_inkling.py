@@ -443,7 +443,6 @@ def _ink_metadata(
     from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
 
     md = object.__new__(InklingAttentionMetadata)
-    md._ink_pt_rows = {}
     md.is_cuda_graph = False
     md.request_ids = list(request_ids)
     md._num_contexts = num_contexts
@@ -547,7 +546,7 @@ def test_metadata_shares_one_page_table_row_per_kv_geometry():
 
     md._prepare_inkling_decode()
 
-    assert md._ink_pt_rows == {0: 0, 1: 0, 2: 1, 3: 1}
+    assert {layer: md._ink_pt_row(layer) for layer in (0, 1, 2, 3)} == {0: 0, 1: 0, 2: 1, 3: 1}
     # Layers sharing a pool address the same memory...
     assert md.ink_gen_page_table(0).data_ptr() == md.ink_gen_page_table(1).data_ptr()
     assert md.ink_gen_page_table(2).data_ptr() == md.ink_gen_page_table(3).data_ptr()
@@ -569,7 +568,7 @@ def test_metadata_rows_are_per_layer_under_swa_scratch_reuse():
 
     md._prepare_inkling_decode()
 
-    assert md._ink_pt_rows == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert {layer: md._ink_pt_row(layer) for layer in (0, 1, 2, 3)} == {0: 0, 1: 1, 2: 2, 3: 3}
     # Every layer distinct -- no sharing in this mode.
     ptrs = {md.ink_gen_page_table(layer).data_ptr() for layer in (0, 1, 2, 3)}
     assert len(ptrs) == 4
