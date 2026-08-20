@@ -9,6 +9,8 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -436,9 +438,13 @@ def test_gpu_count_resolution(
     assert benchmark._resolve_num_gpus(args) == expected_num_gpus
 
 
-def _run_shell(tmp_path: Path, **overrides: str) -> subprocess.CompletedProcess[str]:
+def _run_shell(
+    tmp_path: Path,
+    script_name: str = "benchmark_visual_gen.sh",
+    **overrides: str,
+) -> subprocess.CompletedProcess[str]:
     project_root = Path(__file__).resolve().parents[3]
-    script = project_root / "examples/visual_gen/serve/benchmark_visual_gen.sh"
+    script = project_root / f"examples/visual_gen/serve/{script_name}"
     env = os.environ.copy()
     env.update(
         {
@@ -458,6 +464,35 @@ def _run_shell(tmp_path: Path, **overrides: str) -> subprocess.CompletedProcess[
         text=True,
         env=env,
     )
+
+
+def test_composed_shell_delegates_to_standalone_parts(tmp_path: Path) -> None:
+    result = _run_shell(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "VisualGen Serving Benchmark (server + client)" in result.stdout
+    assert "VisualGen Benchmark Server" in result.stdout
+    assert "VisualGen Benchmark Client" in result.stdout
+
+
+def test_server_shell_is_standalone(tmp_path: Path) -> None:
+    result = _run_shell(tmp_path, script_name="benchmark_visual_gen_server.sh")
+
+    assert result.returncode == 0, result.stderr
+    assert "VisualGen Benchmark Server" in result.stdout
+    assert "Server command:" in result.stdout
+    assert "Benchmark command:" not in result.stdout
+    assert not (tmp_path / "results/metadata.json").exists()
+
+
+def test_client_shell_is_standalone(tmp_path: Path) -> None:
+    result = _run_shell(tmp_path, script_name="benchmark_visual_gen_client.sh")
+
+    assert result.returncode == 0, result.stderr
+    assert "VisualGen Benchmark Client" in result.stdout
+    assert "Benchmark command:" in result.stdout
+    assert "Server command:" not in result.stdout
+    assert (tmp_path / "results/metadata.json").is_file()
 
 
 def test_shell_argument_construction_with_spaces_and_json(tmp_path: Path) -> None:
@@ -593,6 +628,87 @@ touch "$TRTLLM_MEDIA_STORAGE_PATH/generated.mp4"
     assert server_media_dir.parent == tmp_path / "results"
     assert server_media_dir.name.startswith(".server-media.")
     assert not server_media_dir.exists()
+
+
+def test_client_uses_existing_server_without_owning_it(tmp_path: Path) -> None:
+    model = "nvidia/Cosmos3-Nano"
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/health":
+                payload = b"ok"
+            elif self.path == "/v1/models":
+                payload = json.dumps({"data": [{"id": model}]}).encode("utf-8")
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    python_wrapper = tmp_path / "fake-benchmark-python"
+    python_wrapper.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+if sys.argv[1:3] == ["-m", "tensorrt_llm.serve.scripts.benchmark_visual_gen"]:
+    arguments = sys.argv[3:]
+    result_dir = Path(arguments[arguments.index("--result-dir") + 1])
+    result_filename = arguments[arguments.index("--result-filename") + 1]
+    num_prompts = int(arguments[arguments.index("--num-prompts") + 1])
+    num_gpus = int(arguments[arguments.index("--num-gpus") + 1])
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result = {{
+        "completed": num_prompts,
+        "total_requests": num_prompts,
+        "num_gpus": num_gpus,
+        "mean_denoise": 1.0,
+        "mean_generation": 1.1,
+        "mean_latency": 1.2,
+    }}
+    (result_dir / result_filename).write_text(
+        json.dumps(result) + "\\n", encoding="utf-8"
+    )
+    raise SystemExit(0)
+
+os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
+
+    try:
+        result = _run_shell(
+            tmp_path,
+            script_name="benchmark_visual_gen_client.sh",
+            DRY_RUN="false",
+            HOST="127.0.0.1",
+            PORT=str(server.server_port),
+            SERVER_TIMEOUT="1",
+            PYTHON_BIN=str(python_wrapper),
+            SAVE_DETAILED="false",
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "Verified existing server model" in result.stdout
+        assert "unavailable; provide SERVER_LOG_PATH" in result.stdout
+        assert server_thread.is_alive()
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
 
 
 @pytest.mark.parametrize(
