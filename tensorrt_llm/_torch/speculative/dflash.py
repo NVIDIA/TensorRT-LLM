@@ -706,6 +706,9 @@ class DFlashWorker(SpecWorkerBase):
                 # resolved through _draft_slot_ids.
                 block_size = self._compute_block_size
                 gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
+                # Shields only the last request: at block_size == K with
+                # shift_label off, slots run 1..K, so every request reads the
+                # next one's slot 0 and the last overruns. Degrades, never raises.
                 gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
 
                 gen_logits = draft_model.logits_processor(
