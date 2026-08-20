@@ -391,11 +391,16 @@ if [ ! -f "$RESULT_JSON" ]; then
 fi
 
 "$PYTHON_BIN" - "$RESULT_JSON" "$SERVER_LOG" "$SERVER_LOG_START_LINE" \
-    "$NUM_PROMPTS" "$NUM_GPUS_VALUE" "$SAVE_DETAILED" <<'PY'
+    "$NUM_PROMPTS" "$NUM_GPUS_VALUE" "$SAVE_DETAILED" \
+    2>&1 <<'PY' | tee -a "$BENCHMARK_LOG"
 import json
 import re
 import sys
 from pathlib import Path
+
+from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
+    _summarize_denoising_step_times,
+)
 
 result_path = Path(sys.argv[1])
 server_log_path = Path(sys.argv[2])
@@ -441,10 +446,12 @@ if resolved_steps:
         step_count = measured_steps[0]
         result["resolved_num_inference_steps"] = step_count
         result["mean_seconds_per_denoising_step"] = result["mean_denoise"] / step_count
-        if save_detailed and "denoises" in result:
-            result["seconds_per_denoising_step"] = [
-                denoise / step_count for denoise in result["denoises"]
-            ]
+        step_timing_summary = _summarize_denoising_step_times(
+            run_lines, expected_requests, step_count
+        )
+        result.update(step_timing_summary)
+        if not save_detailed:
+            result.pop("denoising_step_times", None)
 
 temp_path = result_path.with_suffix(result_path.suffix + ".tmp")
 temp_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
@@ -460,6 +467,16 @@ if "mean_seconds_per_denoising_step" in result:
         "  Avg. Seconds per Denoising Step (s/it): "
         f"{result['mean_seconds_per_denoising_step']:.4f}"
     )
+if "mean_denoising_step_time" in result:
+    step_percentiles = result["percentiles_denoising_step_time"]
+    print(
+        "  Denoising Step Time Mean (s/it): "
+        f"{result['mean_denoising_step_time']:.4f}"
+    )
+    print(f"  Denoising Step Time P95 (s/it): {step_percentiles['p95']:.4f}")
+    print(f"  Denoising Step Time P99 (s/it): {step_percentiles['p99']:.4f}")
+else:
+    print("  Denoising Step Time P95/P99: unavailable; inspect the server log")
 if "mean_vision_decode" in result:
     print(f"  Avg. Vision Decode Time (s): {result['mean_vision_decode']:.4f}")
 else:

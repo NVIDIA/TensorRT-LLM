@@ -228,7 +228,7 @@ def test_initial_and_measured_requests_have_identical_payloads(
         )
 
     monkeypatch.setitem(benchmark.VISUAL_GEN_REQUEST_FUNCS, "openai-videos", fake_request)
-    asyncio.run(
+    result = asyncio.run(
         benchmark.benchmark(
             backend="openai-videos",
             api_url="http://localhost:8000/v1/videos/generations",
@@ -253,6 +253,49 @@ def test_initial_and_measured_requests_have_identical_payloads(
     )
     assert seen_inputs[0].input_reference == seen_inputs[1].input_reference
     assert [request.validate_audio for request in seen_inputs] == [True, True]
+    assert result["mean_seconds_per_denoising_step"] == pytest.approx(0.375)
+    assert "percentiles_seconds_per_denoising_step" not in result
+
+
+def test_denoising_step_percentiles_use_individual_measured_steps() -> None:
+    log_lines = [
+        "Step 1/4 | 9.00s (validation)",
+        "Step 2/4 | 8.00s (validation)",
+        "Step 3/4 | 7.00s (validation)",
+        "Step 4/4 | 6.00s (validation)",
+        "Step 1/4 | 3.82s",
+        "Step 2/4 | 2.78s",
+        "Step 3/4 | 2.78s",
+        "Step 4/4 | 2.78s",
+    ]
+
+    result = benchmark._summarize_denoising_step_times(
+        log_lines, expected_requests=1, step_count=4
+    )
+
+    assert result["denoising_step_times"] == [3.82, 2.78, 2.78, 2.78]
+    assert result["mean_denoising_step_time"] == pytest.approx(3.04)
+    assert result["percentiles_denoising_step_time"] == {
+        "p95": pytest.approx(3.664),
+        "p99": pytest.approx(3.7888),
+    }
+
+
+def test_denoising_step_percentiles_require_complete_measured_request() -> None:
+    assert (
+        benchmark._summarize_denoising_step_times(
+            [
+                "Step 1/4 | 9.00s (validation)",
+                "Step 2/4 | 8.00s (validation)",
+                "Step 3/4 | 7.00s (validation)",
+                "Step 4/4 | 6.00s (validation)",
+                "Step 1/4 | 3.82s",
+            ],
+            expected_requests=1,
+            step_count=4,
+        )
+        == {}
+    )
 
 
 @pytest.mark.parametrize(
