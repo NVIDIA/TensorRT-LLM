@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -83,6 +84,22 @@ def _comm_method_name(moe) -> str:
     return type(comm).__name__
 
 
+def _epilogue_activation_name(moe) -> str:
+    """Return the epilogue the built module actually runs: ``"situ"`` or ``"swiglu"``.
+
+    The SiTU request can be dropped for reasons the spec cannot see (wrong
+    backend, wrong quant, upstream fallback), so read it back rather than
+    reporting what was asked for. The two backends expose it differently:
+    MegaMoE stores the resolved name, TRTLLM-Gen a predicate.
+    """
+    backend = getattr(moe, "backend", None) or moe
+    if getattr(backend, "activation", None) == "situ" or getattr(
+        backend, "is_situ_activation", False
+    ):
+        return "situ"
+    return "swiglu"
+
+
 def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[int]:
     """Best-effort lookup of ``num_chunks`` for the case we are about to time."""
     scheduler = getattr(moe, "scheduler", None)
@@ -95,6 +112,35 @@ def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[
         return int(fn(all_rank_num_tokens))
     except Exception:
         return None
+
+
+def _situ_kwargs(model: ModelSpec, moe_backend: str, quant_algo: Optional[QuantAlgo]) -> Dict:
+    """``create_moe`` kwargs that switch the epilogue to SiTU, or ``{}``.
+
+    Each backend takes SiTU through its own parameters and ``create_moe``
+    REJECTS them on any other backend, so this dispatches instead of passing
+    one set everywhere. Both paths also hard-require W4A8_MXFP4_MXFP8, so a
+    spec carrying SiTU constants falls back to the SwiGLU proxy elsewhere
+    rather than failing the case -- SiTU is gated, so the GEMM shapes and comm
+    volume are the same either way.
+    """
+    if model.situ_beta is None or quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8:
+        return {}
+    backend = moe_backend.upper()
+    if backend == "MEGAMOE_DEEPGEMM":
+        return {
+            "activation": "situ",
+            "situ_beta": model.situ_beta,
+            "situ_linear_beta": model.situ_linear_beta,
+        }
+    if backend == "TRTLLM":
+        # Cubin alpha is the gate-side beta, cubin beta the linear-side one.
+        return {
+            "trtllm_gen_activation_type": ActType_TrtllmGen.SiTu,
+            "trtllm_gen_activation_alpha": model.situ_beta,
+            "trtllm_gen_activation_beta": model.situ_linear_beta,
+        }
+    return {}
 
 
 def _create_moe_for_benchmark(**kwargs):
@@ -288,6 +334,7 @@ def _build_moe_module(
         swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
         swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
         activation_type=activation_type,
+        **_situ_kwargs(model, moe_backend, quant_algo),
     )
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
