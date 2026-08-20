@@ -685,9 +685,7 @@ class Indexer(nn.Module):
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-        # Fork/join pair for the aux-stream heuristic prev_topk write-back:
-        # [0] orders the copy after the top-k kernel, [1] is waited on by
-        # maybe_join_prev_topk_copy() in the owning MLA layer.
+        # Fork/join events for the aux-stream prev_topk write-back.
         self.prev_topk_copy_events = [torch.cuda.Event(), torch.cuda.Event()]
         self._prev_topk_copy_pending = False
         self.use_cute_dsl_topk = sparse_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
