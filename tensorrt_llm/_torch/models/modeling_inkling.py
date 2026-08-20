@@ -56,6 +56,7 @@ from tensorrt_llm._torch.attention_backend.sparse.inkling import (
 )
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import InklingHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModel,
     DecoderModelForCausalLM,
@@ -1311,10 +1312,6 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         if self.audio_tower is not None:
             audio_weights = {k: v for k, v in weights.items() if k.startswith("model.audio.")}
             self.audio_tower.load_weights(audio_weights)
-        from tensorrt_llm._torch.models.checkpoints.hf.inkling_weight_mapper import (
-            InklingHfWeightMapper,
-        )
-
         if weight_mapper is None:
             weight_mapper = InklingHfWeightMapper()
             weight_mapper.init_model_and_config(self, self.model_config)

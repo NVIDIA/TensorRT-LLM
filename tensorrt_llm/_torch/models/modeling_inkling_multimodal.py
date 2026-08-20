@@ -626,10 +626,9 @@ class InklingAudioPreprocessor:
         if isinstance(audio, np.ndarray):
             wav = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
             return wav.mean(dim=-1) if wav.ndim > 1 else wav.reshape(-1)
-        # Raw file bytes / path: decode lazily.
-        import io as _io
-
-        import soundfile as sf  # lazy: only real-file decode needs it
+        # soundfile is an optional dependency: only a raw file/bytes input needs
+        # it, so a caller passing a decoded waveform never imports it.
+        import soundfile as sf
 
         if isinstance(audio, (bytes, bytearray, memoryview)):
             raw = bytes(audio)
@@ -641,7 +640,7 @@ class InklingAudioPreprocessor:
                 raw = f.read()
         else:
             raise TypeError(f"Unsupported audio input type: {type(audio)!r}")
-        samples, src_sr = sf.read(_io.BytesIO(raw), dtype="float32", always_2d=True)
+        samples, src_sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
         mono = samples.mean(axis=1)
         wav = torch.from_numpy(np.ascontiguousarray(mono, dtype=np.float32))
         if int(src_sr) != self.sample_rate:
