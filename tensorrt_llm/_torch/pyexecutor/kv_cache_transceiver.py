@@ -13,6 +13,7 @@ from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
                                           CacheTransceiverConfig)
 from tensorrt_llm.mapping import Mapping
 
+from .config_utils import resolve_cache_transceiver_config
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
@@ -131,59 +132,6 @@ def _validate_disagg_inflight_cancel_config(
         f"layerwise={layerwise!r}, try_zcopy={try_zcopy!r}.")
 
 
-def resolve_cache_transceiver_config(
-        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> None:
-    """Resolve defaults and validate runtime-independent configuration."""
-    if cache_transceiver_config is None or cache_transceiver_config.backend is None:
-        return
-
-    # "auto" is normally resolved against the model's preference at config load
-    # time (ModelLoader.load_config_and_apply_defaults); paths that skip that
-    # step (e.g. AutoDeploy) fall back to the C++ transceiver. Collapse it to
-    # None here so every consumer below - including the pipelined-transfer
-    # auto-selection - sees a resolved runtime.
-    if cache_transceiver_config.transceiver_runtime == "auto":
-        cache_transceiver_config.transceiver_runtime = None
-
-    # Resolved for the checks below only; "DEFAULT" is deliberately left on the
-    # config so that _validate_disagg_inflight_cancel_config() can still reject
-    # it as an ambiguous backend. create_kv_cache_transceiver() commits the
-    # resolved value after that validation runs.
-    effective_backend = cache_transceiver_config.backend
-    if effective_backend == "DEFAULT":
-        effective_backend, _ = cache_transceiver_config._resolve_default_backend(
-        )
-
-    runtime = cache_transceiver_config.transceiver_runtime
-    enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
-    if runtime is None and enable_pipelined_transfer:
-        if effective_backend != "NIXL":
-            raise ValueError(
-                f"enable_pipelined_transfer is set but backend "
-                f"'{effective_backend}' requires the C++ "
-                f"transceiver, which does not support pipelined transfer. Use NIXL backend to "
-                f"enable pipelined transfer.")
-        logger.warning(
-            "enable_pipelined_transfer is set; auto-selecting the Python "
-            "transceiver instead of the C++ transceiver to enable "
-            "pipelined KV cache transfer. "
-            "Set transceiver_runtime='CPP' to disable this auto-selection.")
-        cache_transceiver_config.transceiver_runtime = "PYTHON"
-    elif runtime == "CPP" and enable_pipelined_transfer:
-        raise ValueError(
-            "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
-            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer."
-        )
-
-    if (cache_transceiver_config.transceiver_runtime == "PYTHON"
-            and effective_backend != "NIXL"):
-        raise ValueError(
-            f"Python transceiver currently only supports NIXL backend, "
-            f"got {effective_backend}. "
-            f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
-        )
-
-
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
     return WorldConfig(tensor_parallelism=mapping.tp_size,
@@ -207,8 +155,6 @@ def create_kv_cache_transceiver(
         logger.info("cache_transceiver is disabled")
         return None
 
-    # transceiver_runtime is already resolved by resolve_cache_transceiver_config
-    # above; these checks need the cache managers, so they cannot move there.
     if (cache_transceiver_config.transceiver_runtime != "PYTHON"
             and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
         raise ValueError(
