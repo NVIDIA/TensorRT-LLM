@@ -3,16 +3,11 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 """LTX-2.3 modality bundle.
 
-Extends the LTX-2 ``Modality`` with an explicit ``sigma`` field. The two are
-kept distinct on purpose:
-
-* ``timesteps`` may vary per latent token (conditioned / masked generation) and
-  drives the per-token AdaLN modulation (MSA / MLP / text-CA query).
-* ``sigma`` is the *global* current denoising value. It derives the
-  ``prompt_timestep`` that drives the sigma-dependent text-context (K/V)
-  modulation via ``prompt_scale_shift_table``. This is the LTX-2.3-specific
-  conditioning that makes text K/V step-varying (so it cannot be cached like
-  LTX-2's static text K/V).
+This is the LTX-2 Modality plus an explicit sigma field, kept distinct from
+timesteps because they drive different conditioning: timesteps may vary per
+latent token and drives the per-token AdaLN modulation, while sigma is the
+global denoising value that derives the prompt_timestep behind the text-context
+K/V modulation.
 """
 
 from dataclasses import dataclass

@@ -34,10 +34,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 from tensorrt_llm.logger import logger
 
-
-# --- LTX-2.3 ("V2") detection (added for LTX23Pipeline) ---------------------
+# --- LTX-2.3 detection (added for LTX23Pipeline) ----------------------------
 # LTX-2.3 text-projection signature. All keys must match and cross_attention_adaln
-# must be True. LTX-2 ("V1") has none of these keys.
+# must be True. LTX-2 has none of these keys.
 _LTX23_TEXT_CONFIG = {
     "caption_proj_before_connector": True,
     "caption_projection_first_linear": False,
@@ -73,7 +72,7 @@ def _detect_native_ltx_pipeline(config: dict) -> str:
         )
     if transformer.get("cross_attention_adaln") is not True:
         raise ValueError(
-            "LTX V2 text projection found without cross_attention_adaln=True."
+            "LTX-2.3 text projection found without cross_attention_adaln=True."
         )
     return "LTX23Pipeline"
 # --- end LTX-2.3 detection ---------------------------------------------------

@@ -1,38 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2.3 vocoder: BigVGAN-v2 (AMP1) + bandwidth-extension (BWE) -> 48 kHz.
+"""LTX-2.3 vocoder: BigVGAN-v2 (AMP1) plus bandwidth extension to 48 kHz.
 
-LTX-2 ships a HiFi-GAN vocoder (``ResBlock1`` + LeakyReLU, 24 kHz). LTX-2.3
-replaces it with a BigVGAN-v2 generator using SnakeBeta activations and
-anti-aliased ``Activation1d`` resampling, wrapped in a ``VocoderWithBWE`` that
-re-analyzes the 16 kHz output with a causal mel-STFT, predicts a residual with a
-second BigVGAN generator, and adds a Hann-sinc-resampled skip to reach 48 kHz.
+LTX-2 ships a HiFi-GAN vocoder (ResBlock1 + LeakyReLU, 24 kHz), so none of the
+BigVGAN pieces here have an LTX-2 counterpart. LTX-2.3 uses a BigVGAN-v2
+generator with SnakeBeta activations and anti-aliased Activation1d resampling,
+wrapped in a VocoderWithBWE that re-analyzes the 16 kHz output with a causal
+mel-STFT, predicts a residual with a second generator, and adds a
+Hann-sinc-resampled skip to reach 48 kHz. Pre-2.3 flat configs are delegated to
+LTX-2's VocoderConfigurator.
 
-This is a faithful port of the upstream Lightricks ``ltx_core`` vocoder
-(``packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py``) restricted to
-the AMP1 path LTX-2.3 uses. Every module name matches the checkpoint's
-``vocoder.vocoder.*`` / ``vocoder.bwe_generator.*`` / ``vocoder.mel_stft.*``
-keys so weights load without remapping.
+Module names match the checkpoint's vocoder.vocoder.*, vocoder.bwe_generator.*
+and vocoder.mel_stft.* keys so weights load without remapping.
 
-Numerical contract (do not "optimize" away):
-* SnakeBeta is log-scale: ``alpha=exp(alpha)``, ``beta=exp(beta)``.
-* The whole ``VocoderWithBWE`` forward runs in fp32 (bf16 accumulation
-  degrades spectral metrics 40-90% across the ~108 sequential convs).
-* The BWE generator has ``apply_final_activation=False`` (residual, no clamp).
+Two numerical constraints: SnakeBeta is log-scale (alpha=exp(alpha)), and the
+whole forward runs in fp32 because bf16 accumulation degrades spectral metrics
+40-90% across the roughly 108 sequential convs.
 """
 
-import contextlib
 import math
-from collections.abc import Iterator
 from typing import List
 
 import einops
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-LRELU_SLOPE = 0.1
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -45,20 +38,6 @@ def _check_config_value(cfg: dict, key: str, expected) -> None:
         raise ValueError(
             f"LTX-2.3 vocoder config mismatch: expected {key}={expected!r}, got {actual!r}"
         )
-
-
-@contextlib.contextmanager
-def _module_in_fp32(module: nn.Module, *, enabled: bool) -> Iterator[None]:
-    """Temporarily cast *module* to float32, restoring its dtype on exit (MPS path)."""
-    if not enabled:
-        yield
-        return
-    module_dtype = next(module.parameters()).dtype
-    module.float()
-    try:
-        yield
-    finally:
-        module.to(module_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -217,29 +196,6 @@ class Activation1d(nn.Module):
         return self.downsample(x)
 
 
-class Snake(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        alpha: float = 1.0,
-        alpha_trainable: bool = True,
-        alpha_logscale: bool = True,
-    ) -> None:
-        super().__init__()
-        self.alpha_logscale = alpha_logscale
-        self.alpha = nn.Parameter(
-            torch.zeros(in_features) if alpha_logscale else torch.ones(in_features) * alpha
-        )
-        self.alpha.requires_grad = alpha_trainable
-        self.eps = 1e-9
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
-        if self.alpha_logscale:
-            alpha = torch.exp(alpha)
-        return x + (1.0 / (alpha + self.eps)) * torch.sin(x * alpha).pow(2)
-
-
 class SnakeBeta(nn.Module):
     def __init__(
         self,
@@ -277,10 +233,8 @@ class AMPBlock1(nn.Module):
         channels: int,
         kernel_size: int = 3,
         dilation: tuple[int, int, int] = (1, 3, 5),
-        activation: str = "snake",
     ) -> None:
         super().__init__()
-        act_cls = SnakeBeta if activation == "snakebeta" else Snake
         self.convs1 = nn.ModuleList(
             [
                 nn.Conv1d(
@@ -302,8 +256,12 @@ class AMPBlock1(nn.Module):
                 for _ in range(3)
             ]
         )
-        self.acts1 = nn.ModuleList([Activation1d(act_cls(channels)) for _ in range(len(self.convs1))])
-        self.acts2 = nn.ModuleList([Activation1d(act_cls(channels)) for _ in range(len(self.convs2))])
+        self.acts1 = nn.ModuleList(
+            [Activation1d(SnakeBeta(channels)) for _ in range(len(self.convs1))]
+        )
+        self.acts2 = nn.ModuleList(
+            [Activation1d(SnakeBeta(channels)) for _ in range(len(self.convs2))]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for c1, c2, a1, a2 in zip(self.convs1, self.convs2, self.acts1, self.acts2, strict=True):
@@ -315,24 +273,11 @@ class AMPBlock1(nn.Module):
         return x
 
 
-def _make_resblock(
-    resblock: str,
-    ch: int,
-    kernel_size: int,
-    dilations: List[int],
-    activation: str,
-) -> nn.Module:
-    if resblock == "AMP1":
-        return AMPBlock1(ch, kernel_size, dilations, activation=activation)
-    # HiFi-GAN fallback (unused by LTX-2.3, kept for parity); lazily import to
-    # avoid a hard dependency on the ltx2 audio_vae package.
-    from ...ltx2.ltx2_core.audio_vae.resnet import ResBlock1
-
-    return ResBlock1(ch, kernel_size, dilations)
-
-
 class Vocoder(nn.Module):
-    """Mel-spectrogram -> waveform generator (HiFi-GAN "1" or BigVGAN "AMP1")."""
+    """Mel-spectrogram to waveform generator, BigVGAN AMP1 only.
+
+    LTX-2.3 uses AMP1 with snakebeta for both the base and the BWE generator.
+    """
 
     def __init__(  # noqa: PLR0913
         self,
@@ -341,14 +286,21 @@ class Vocoder(nn.Module):
         upsample_kernel_sizes: List[int] | None = None,
         resblock_dilation_sizes: List[List[int]] | None = None,
         upsample_initial_channel: int = 1024,
-        resblock: str = "1",
+        resblock: str = "AMP1",
         output_sampling_rate: int = 24000,
-        activation: str = "snake",
+        activation: str = "snakebeta",
         use_tanh_at_final: bool = True,
         apply_final_activation: bool = True,
         use_bias_at_final: bool = True,
     ) -> None:
         super().__init__()
+
+        if resblock != "AMP1" or activation != "snakebeta":
+            raise ValueError(
+                f"LTX-2.3 Vocoder supports resblock='AMP1' with activation="
+                f"'snakebeta' only, got {resblock!r} / {activation!r}. Use LTX-2's "
+                "Vocoder for HiFi-GAN checkpoints."
+            )
 
         if resblock_kernel_sizes is None:
             resblock_kernel_sizes = [3, 7, 11]
@@ -364,7 +316,6 @@ class Vocoder(nn.Module):
         self.num_upsamples = len(upsample_rates)
         self.use_tanh_at_final = use_tanh_at_final
         self.apply_final_activation = apply_final_activation
-        self.is_amp = resblock == "AMP1"
 
         # Stereo checkpoints: 128 input channels (2 stereo x 64 mel), 2 out.
         self.conv_pre = nn.Conv1d(
@@ -395,14 +346,9 @@ class Vocoder(nn.Module):
             for kernel_size, dilations in zip(
                 resblock_kernel_sizes, resblock_dilation_sizes, strict=True
             ):
-                self.resblocks.append(
-                    _make_resblock(resblock, ch, kernel_size, dilations, activation)
-                )
+                self.resblocks.append(AMPBlock1(ch, kernel_size, dilations))
 
-        if self.is_amp:
-            self.act_post: nn.Module = Activation1d(SnakeBeta(final_channels))
-        else:
-            self.act_post = nn.LeakyReLU()
+        self.act_post = Activation1d(SnakeBeta(final_channels))
 
         self.conv_post = nn.Conv1d(
             in_channels=final_channels,
@@ -423,8 +369,6 @@ class Vocoder(nn.Module):
         x = self.conv_pre(x)
 
         for i in range(self.num_upsamples):
-            if not self.is_amp:
-                x = F.leaky_relu(x, LRELU_SLOPE)
             x = self.ups[i](x)
             start = i * self.num_kernels
             end = start + self.num_kernels
@@ -510,22 +454,14 @@ class VocoderWithBWE(nn.Module):
         self.input_sampling_rate = input_sampling_rate
         self.output_sampling_rate = output_sampling_rate
         self.hop_length = hop_length
-        # Sinc skip filter is not stored in the checkpoint (persistent=False);
-        # materialize on CPU so it exists even under meta-device construction.
+        # The skip filter is not in the checkpoint, so materialize it on CPU to
+        # survive meta-device construction.
         with torch.device("cpu"):
             self.resampler = UpSample1d(
                 ratio=output_sampling_rate // input_sampling_rate,
                 persistent=False,
                 window_type="hann",
             )
-
-    @property
-    def conv_pre(self) -> nn.Conv1d:
-        return self.vocoder.conv_pre
-
-    @property
-    def conv_post(self) -> nn.Conv1d:
-        return self.vocoder.conv_post
 
     def _compute_mel(self, audio: torch.Tensor) -> torch.Tensor:
         batch, n_channels, _ = audio.shape
@@ -535,15 +471,7 @@ class VocoderWithBWE(nn.Module):
 
     def forward(self, mel_spec: torch.Tensor) -> torch.Tensor:
         input_dtype = mel_spec.dtype
-        device_type = mel_spec.device.type
-        module_dtype = next(self.parameters()).dtype
-        fp32_ctx = (
-            _module_in_fp32(self, enabled=module_dtype != torch.float32)
-            if device_type == "mps"
-            else torch.autocast(device_type=device_type, dtype=torch.float32)
-        )
-
-        with fp32_ctx:
+        with torch.autocast(device_type=mel_spec.device.type, dtype=torch.float32):
             x = self.vocoder(mel_spec.float())
             _, _, length_low_rate = x.shape
             output_length = (
@@ -576,13 +504,13 @@ def _vocoder_from_config(
             "resblock_dilation_sizes", [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
         ),
         upsample_initial_channel=cfg.get("upsample_initial_channel", 1024),
-        resblock=cfg.get("resblock", "1"),
+        resblock=cfg.get("resblock", "AMP1"),
         output_sampling_rate=(
             output_sampling_rate
             if output_sampling_rate is not None
             else cfg.get("output_sampling_rate", 24000)
         ),
-        activation=cfg.get("activation", "snake"),
+        activation=cfg.get("activation", "snakebeta"),
         use_tanh_at_final=cfg.get("use_tanh_at_final", True),
         apply_final_activation=apply_final_activation,
         use_bias_at_final=cfg.get("use_bias_at_final", True),
@@ -590,10 +518,10 @@ def _vocoder_from_config(
 
 
 class LTX23VocoderConfigurator:
-    """Build the LTX-2.3 ``VocoderWithBWE`` from the native checkpoint config.
+    """Build the LTX-2.3 VocoderWithBWE from the native checkpoint config.
 
-    Auto-detects: a nested ``vocoder`` + ``bwe`` config => VocoderWithBWE (2.3);
-    a flat config => plain HiFi-GAN Vocoder (pre-2.3, kept for parity).
+    A nested vocoder plus bwe config selects VocoderWithBWE; a flat config is a
+    pre-2.3 HiFi-GAN checkpoint and is delegated to LTX-2.
     """
 
     @classmethod
@@ -603,7 +531,9 @@ class LTX23VocoderConfigurator:
         if "bwe" not in cfg:
             _check_config_value(cfg, "resblock", "1")
             _check_config_value(cfg, "stereo", True)
-            return _vocoder_from_config(cfg)
+            from ...ltx2.ltx2_core.audio_vae.model_configurator import VocoderConfigurator
+
+            return VocoderConfigurator.from_config(config)
 
         vocoder_cfg = cfg.get("vocoder", {})
         bwe_cfg = cfg["bwe"]
