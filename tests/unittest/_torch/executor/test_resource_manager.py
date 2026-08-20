@@ -16,6 +16,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
@@ -29,7 +30,6 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1,

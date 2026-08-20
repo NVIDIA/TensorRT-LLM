@@ -29,7 +29,8 @@ from unittest.mock import MagicMock, patch
 import torch
 from safetensors.torch import save_file
 
-from tensorrt_llm.lora_manager import HfLoraLoader, LoraManager
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
+from tensorrt_llm._torch.peft.lora.manager import LoraManager
 from tensorrt_llm.mapping import Mapping
 
 

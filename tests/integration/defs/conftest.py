@@ -985,10 +985,6 @@ def llm_lora_model_root(request):
         elif item == "Upcycled-Qwen1.5-MoE2.7B-LoRA":
             model_root_list.append(
                 os.path.join(models_root, "Upcycled-Qwen1.5-MoE2.7B-LoRA"))
-        elif item == "Phi-3-mini-4k-instruct-ru-lora":
-            model_root_list.append(
-                os.path.join(models_root, "lora", "phi",
-                             "Phi-3-mini-4k-instruct-ru-lora"))
         elif item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
@@ -1109,26 +1105,6 @@ def llm_gptneox_model_root(llm_venv):
     gptneox_model_root = os.path.join(workspace, "gpt-neox-20b")
 
     return gptneox_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_phi_model_root(request):
-    "return phi model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if "Phi-3.5" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3.5/" + request.param)
-    elif "Phi-3" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3/" + request.param)
-    else:
-        phi_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        phi_model_root
-    ), f"{phi_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return phi_model_root
 
 
 @pytest.fixture(scope="module")
