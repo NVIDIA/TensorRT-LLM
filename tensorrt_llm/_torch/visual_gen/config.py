@@ -14,6 +14,7 @@
 # limitations under the License.
 """Internal VisualGen pipeline and model configuration helpers."""
 
+import fnmatch
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -144,11 +145,15 @@ class DiffusionModelConfig(_VisualGenConfigBase):
         return torch.bfloat16
 
     def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:
-        """Get quantization config for a layer or global. Resembles LLM ModelConfig.get_quant_config."""
+        """Get quantization config for a layer or global. Resembles LLM ModelConfig.get_quant_config.
+
+        Keys in quant_config_dict are fnmatch patterns; first match wins.
+        """
         if name is None or self.quant_config_dict is None:
             return self.quant_config
-        if name in self.quant_config_dict:
-            return self.quant_config_dict[name]
+        for pattern, cfg in self.quant_config_dict.items():
+            if fnmatch.fnmatch(name, pattern):
+                return cfg
         return self.quant_config
 
 
@@ -318,8 +323,29 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             exclude_modules=quant_config_dict.get("ignore"),
         )
 
-        # TODO: Per-layer config (None for now - future: parse mixed precision settings)
+        # Parse per-layer overrides for mixed-precision quantization.
+        # Format: {"per_layer": {"blocks.*.attn1.*": "FP8_BLOCK_SCALES", ...}}
+        # Keys are fnmatch patterns; values are quant_algo strings.
+        # Layers not matching any pattern use the global quant_config.
         layer_quant_config = None
+        per_layer_dict = quant_config_dict.get("per_layer")
+        if per_layer_dict:
+            layer_quant_config = {}
+            for pattern, layer_algo_str in per_layer_dict.items():
+                layer_algo = algo_map.get(layer_algo_str)
+                if layer_algo is None:
+                    raise ValueError(
+                        f"Unknown quant_algo in per_layer['{pattern}']: {layer_algo_str!r}. "
+                        f"Valid values: {list(algo_map)}"
+                    )
+                layer_group_size = None
+                if layer_algo == QuantAlgo.NVFP4:
+                    layer_group_size = 16
+                elif layer_algo == QuantAlgo.FP8_BLOCK_SCALES:
+                    layer_group_size = 128
+                layer_quant_config[pattern] = QuantConfig(
+                    quant_algo=layer_algo, group_size=layer_group_size
+                )
 
         return quant_config, layer_quant_config, dynamic_weight_quant, dynamic_activation_quant
 
@@ -603,7 +629,12 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
         # Enable tunable FP4 quantize for visual gen: larger activation
         # tensors (full image/video latents) amortize the AutoTuner overhead.
-        if quant_config.quant_algo == QuantAlgo.NVFP4:
+        # Check both the global algo and any per-layer overrides for NVFP4.
+        uses_nvfp4 = quant_config.quant_algo == QuantAlgo.NVFP4 or (
+            quant_config_dict is not None
+            and any(cfg.quant_algo == QuantAlgo.NVFP4 for cfg in quant_config_dict.values())
+        )
+        if uses_nvfp4:
             from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
 
             NVFP4LinearMethod.use_tunable_quantize = True
