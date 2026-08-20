@@ -105,6 +105,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             max_batch_size=max_batch_size,
             **kwargs,
         )
+        # The layer group the conv buffers live in; V2 reports a request's slot
+        # within it. Taken from the first conv layer, as Mamba does.
+        self._conv_layer_group_id = self.impl.get_layer_group_id(self._conv_layer_id(0))
         self._conv_cache = InklingConvStateCache(
             pretrained_config,
             self._conv_tp_size,
@@ -114,6 +117,7 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             reserve_attention_dp_slot=self._reserve_attention_dp_slot,
             max_draft_len=self.max_draft_len,
             allocate=self._conv_state_buffer,
+            resolve_slot=self._conv_slot_for_request,
         )
         logger.info(
             f"Inkling short-conv state pool: {self._conv_cache.num_slots} rows "
@@ -122,6 +126,24 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             f"{self._conv_cache.conv_state_bytes() / (1 << 20):.1f} MiB, "
             "backed by V2 SSM layers"
         )
+
+    def _conv_slot_for_request(self, request_id: int):
+        """V2's recurrent-state slot for ``request_id``, or None if it has none.
+
+        The pool must be indexed the way V2 indexes it, because V2 writes into
+        it: a reuse hit copies the snapshot into the slot it assigned
+        (``_KVCache.commit``), and a transfer would read from there too. A
+        private numbering over the same buffer means the kernels read a row
+        nobody restored, or one another live request is using.
+
+        None for the CUDA-graph padding sentinels, which have no cache entry;
+        those keep the reserved rows.
+        """
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None:
+            return None
+        slot = kv_cache.get_ssm_block_base_index(self._conv_layer_group_id)
+        return None if slot < 0 else int(slot)
 
     # ========================= KV cache block reuse =========================
     # Everything down to "end KV cache block reuse" exists only for

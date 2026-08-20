@@ -90,6 +90,7 @@ class InklingConvStateCache:
         reserve_attention_dp_slot: bool = False,
         max_draft_len: int = 0,
         allocate: Optional[Callable[[int, object, List[int]], torch.Tensor]] = None,
+        resolve_slot: Optional[Callable[[int], Optional[int]]] = None,
     ):
         # Accept either the text config or the top-level multimodal one.
         config = getattr(pretrained_config, "text_config", pretrained_config)
@@ -142,6 +143,8 @@ class InklingConvStateCache:
         self.state_indices_cpu = torch.zeros(
             num_slots, dtype=torch.int32, pin_memory=prefer_pinned()
         )
+        # Set by the cache manager to V2's slot for the request; see slots_for.
+        self._resolve_slot = resolve_slot
         self._slot_of = {}
         self._free = list(range(num_request_slots - 1, -1, -1))
 
@@ -169,15 +172,36 @@ class InklingConvStateCache:
         return None
 
     def slots_for(self, request_ids: List[int]) -> List[int]:
-        """Map request ids to their (stable) pool rows, allocating new ones.
+        """Map request ids to their pool rows.
 
-        Fresh requests get a zero-initialised row; existing ones keep theirs so
-        their conv windows persist across decode steps. Padding sentinels and the
-        attention-DP dummy alias their reserved rows. Raises on exhaustion rather
-        than handing out a row another request is still carrying state in.
+        With a ``resolve_slot`` callback -- what the cache manager installs --
+        the row is V2's, and this class allocates nothing. That is not a style
+        choice: V2 writes a restored recurrent state into the slot IT assigned
+        (``_KVCache.commit``/reuse copies into ``new_slot.slot_id``), and the
+        kernels read the row published here, so a second numbering over the same
+        buffer means the model reads a row nobody restored -- or another live
+        request's.
+
+        Without the callback (standalone use and the unit tests) it falls back
+        to a private free list, which is self-consistent as long as nothing
+        outside this class touches the pool -- true only with reuse off.
         """
         slots = []
         for r in request_ids:
+            if self._resolve_slot is not None:
+                slot = self._resolve_slot(r)
+                if slot is None:
+                    slot = self._reserved_slot_for(r)
+                if slot is None:
+                    raise RuntimeError(
+                        f"Inkling short-conv pool: request {r} has no V2 "
+                        "recurrent-state slot and is not a padding sentinel. "
+                        "Every resident sequence gets one when its KV cache is "
+                        "created; reaching here means the request was never "
+                        "added to the cache manager."
+                    )
+                slots.append(slot)
+                continue
             slot = self._slot_of.get(r)
             if slot is None:
                 slot = self._reserved_slot_for(r)
@@ -191,6 +215,8 @@ class InklingConvStateCache:
                         )
                     slot = self._free.pop()
                 self._slot_of[r] = slot
+                # Only the private path zeroes: a V2 slot may hold a window V2
+                # just restored into it, and zeroing would throw that away.
                 for st in self._layers:
                     for t in st:
                         t[slot].zero_()

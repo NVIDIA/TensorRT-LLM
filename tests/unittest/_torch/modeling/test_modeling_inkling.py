@@ -290,6 +290,66 @@ def test_no_snapshot_points_when_reuse_cannot_run(interval, reuse):
     assert reqs[0].expect_snapshot_points == []
 
 
+def _manager_with_caches(caches):
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
+        InklingHybridCacheManager,
+    )
+
+    mgr = object.__new__(InklingHybridCacheManager)
+    mgr.kv_cache_map = caches
+    mgr._conv_layer_group_id = 4
+    return mgr
+
+
+def test_the_conv_slot_comes_from_v2_not_a_private_counter():
+    """V2 writes into the slot it assigned -- a reuse hit copies the snapshot
+    there -- so the pool has to be indexed V2's way. A second numbering over
+    the same buffer reads a row nobody restored, or another live request's."""
+    seen = []
+
+    class _Cache:
+        def get_ssm_block_base_index(self, group_id):
+            seen.append(group_id)
+            return 3
+
+    assert _manager_with_caches({7: _Cache()})._conv_slot_for_request(7) == 3
+    assert seen == [4], "the conv layer group id must be the one queried"
+
+
+def test_a_request_without_a_v2_slot_falls_back():
+    """Padding sentinels have no cache entry, and V2 reports a negative index
+    for a request whose recurrent state is not resident. Both must read as
+    "no slot" so the caller can use a reserved row instead of index -1."""
+
+    class _NoBlock:
+        def get_ssm_block_base_index(self, group_id):
+            return -1
+
+    mgr = _manager_with_caches({9: _NoBlock()})
+    assert mgr._conv_slot_for_request(9) is None
+    assert mgr._conv_slot_for_request(12345) is None
+
+
+def test_the_pool_allocates_nothing_when_v2_resolves_slots():
+    """The private free list must not run in parallel with V2's allocation:
+    whichever row it handed out would be the wrong one."""
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.conv_state import (
+        InklingConvStateCache,
+    )
+
+    cache = object.__new__(InklingConvStateCache)
+    cache._resolve_slot = {5: 2, 6: 0}.get
+    cache._free = []  # empty: the private path would raise if it ran
+    cache._slot_of = {}
+    cache._padding_slot = 8
+    cache._attention_dp_dummy_slot = None
+    cache._max_draft_len = 0
+    cache.num_request_slots = 8
+
+    assert cache.slots_for([5, 6, 5]) == [2, 0, 2]
+    assert cache._slot_of == {}, "nothing may be recorded in the private map"
+
+
 def test_py_executor_finds_the_snapshot_hook_by_name():
     """py_executor reaches this through hasattr, so the NAME is the contract --
     a rename would silently stop forcing chunk boundaries rather than fail."""
