@@ -229,9 +229,7 @@ class InklingConvStateCache:
 def _context_num_cached(attn_metadata, num_contexts):
     """Per-context-request cached token counts, or None when unavailable.
 
-    Non-zero only for a later chunk of a chunked prefill. None when the metadata
-    carries no KV cache params at all (the cache-free unit-test path), which
-    callers read as "everything is fresh".
+    None on the cache-free unit-test path, which callers read as "all fresh".
     """
     params = getattr(attn_metadata, "kv_cache_params", None)
     if params is None:
@@ -280,17 +278,10 @@ class InklingConvRuntime:
             cu = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
             cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
             query_start_loc = cu
-            # A context request that already has tokens in the KV cache -- a
-            # later chunk of a chunked prefill -- also has the conv window they
-            # left behind: slots_for keeps its pool row and causal_conv1d_fn
-            # wrote the trailing window there on the preceding call. Declaring it
-            # is what makes that state get consumed rather than ignored (the
-            # Mamba2Metadata pattern).
-            #
-            # Only *sufficient* because _run_context routes such requests to the
-            # chunked-context kernel, which reads the cached KV back. Alone, this
-            # would leave attention losing history while the convs kept it -- a
-            # subtler wrong answer than before. The two land together.
+            # A later chunk still holds the window its predecessor left in the
+            # pool row, and declaring it is what gets it consumed. Sufficient
+            # only because _run_context routes those requests to the chunked
+            # kernel; alone, attention would lose what the convs kept.
             cached = _context_num_cached(attn_metadata, num_contexts)
             if cached is None:
                 has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)

@@ -14,22 +14,15 @@
 # limitations under the License.
 """GPU parity tests for Inkling's chunked-context prefill attention.
 
-The oracle is the existing packed prefill kernel, which is what every Inkling
-accuracy number on record was produced with. Two properties matter:
+The oracle is the packed prefill kernel every Inkling accuracy number on record
+was produced with. Two properties matter: degeneracy (at ``num_cached == 0`` the
+chunked kernel reads the same keys in the same tile order, so a gap means the
+paged indexing or the absolute-position arithmetic is wrong) and chunk
+invariance (splitting a prompt must not change the answer -- the property the
+feature exists to provide, and the one that silently failed before).
 
-1. **Degeneracy.** With ``num_cached == 0`` the chunked kernel reads the same
-   keys in the same tile order as the packed kernel, just through the page
-   table. It must agree to within accumulation noise -- if it does not, the
-   paged indexing or the absolute-position arithmetic is wrong.
-2. **Chunk invariance.** Splitting a prompt must not change the answer. The
-   output for tokens ``[c:]`` computed as a second chunk on top of ``c`` cached
-   tokens must match the tail of the one-shot result. This is the property the
-   feature exists to provide, and the one that silently failed before: the
-   packed kernel simply ignored everything before the chunk.
-
-Both run over the local (sliding-window) and global (full-causal) layer shapes
-and with the relative-position bias on, since the bias indexing is the part
-most likely to be wrong across a chunk boundary.
+Both run over the local and global layer shapes and with the relative-position
+bias on, since the bias indexing is likeliest to be wrong across a boundary.
 """
 
 import pytest
@@ -51,8 +44,7 @@ HEAD_DIM = 128
 NUM_HEADS = 8
 PAGE_SIZE = 32
 DTYPE = torch.bfloat16
-# The real model uses 512; a smaller window keeps the tests fast while still
-# forcing the kernel's whole-tile skip path (lo > 0) to run.
+# Smaller than the model's 512, but still forces the whole-tile skip path.
 WINDOW = 96
 REL_EXTENT = 8
 
@@ -87,8 +79,7 @@ def _run_chunk(q, k, v, rel, num_cached, k_cache, v_cache, block_ids, window):
     nc = torch.tensor([num_cached], dtype=torch.int32, device="cuda")
     total = num_cached + new_len
     max_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-    # build_page_table writes len(blocks) entries into a row of width
-    # max_pages, so hand it exactly the pages this request spans.
+    # build_page_table writes len(blocks) entries into a row of width max_pages.
     page_table = build_page_table([block_ids[:max_pages]], max_pages, "cuda")
     return inkling_chunked_prefill_attention(
         q,
@@ -156,14 +147,10 @@ def test_degenerates_to_the_packed_kernel_with_no_cached_tokens(window, has_rel,
 @pytest.mark.parametrize("has_rel", [False, True], ids=["norel", "rel"])
 @pytest.mark.parametrize("split", [1, 2, 7, 32, 64, 65, 128])
 def test_a_split_prompt_matches_one_shot_prefill(window, has_rel, split):
-    """The property the feature exists for.
-
-    Splitting at ``split`` must not change the answer for the tokens after the
-    split. Before the chunked kernel these differed wildly: the packed kernel
-    saw only the second chunk's own tokens.
-
-    ``total_len`` 200 with WINDOW 96 and REL_EXTENT 8 puts splits on both sides
-    of the window edge and of the bias extent, and 64/65 straddle BLOCK_M.
+    """The property the feature exists for: splitting must not change the
+    answer for the tokens after the split, which the packed kernel got wildly
+    wrong. total_len 200 with WINDOW 96 and REL_EXTENT 8 puts splits either side
+    of the window edge and the bias extent; 64/65 straddle BLOCK_M.
     """
     total_len = 200
     num_kv_heads = 8
@@ -265,13 +252,9 @@ def test_grouped_query_attention_maps_heads_correctly():
     _assert_close(got, want, "gqa split")
 
 
-# ---------------------------------------------------------------------------
-# The conv half of the same property. Attention is only one of the two places
-# a split prompt can lose its history; the four depthwise short convs are the
-# other. causal_conv1d_fn writes the trailing kernel-1 window into the state
-# pool on every context call, so a later chunk only has to DECLARE that it has
-# one (has_initial_state) for it to be consumed.
-# ---------------------------------------------------------------------------
+# The conv half of the same property: causal_conv1d_fn writes the trailing
+# window into the pool on every context call, so a later chunk only has to
+# declare it (has_initial_state) for it to be consumed.
 SCONV_KERNEL = 4
 SCONV_CHANNELS = 256
 
@@ -302,12 +285,9 @@ def _run_conv_chunk(x, conv_w, state, has_initial):
 @requires_gpu
 @pytest.mark.parametrize("split", [1, 2, 3, 4, 17, 64])
 def test_the_short_conv_carries_its_window_across_a_chunk_boundary(split):
-    """Splitting must not change the conv output either.
-
-    Splits at 1..3 are the interesting ones: they are shorter than the
-    kernel-1 window, so the second chunk's first outputs depend on tokens the
-    first chunk owned. With has_initial_state=False these were convolved
-    against zeros -- the defect the review named.
+    """Splitting must not change the conv output either. Splits at 1..3 are
+    shorter than the kernel-1 window, so the second chunk's first outputs depend
+    on tokens the first owned -- convolved against zeros before this fix.
     """
     total_len = 128
     x = _rand(total_len, SCONV_CHANNELS, seed=41)
@@ -344,13 +324,9 @@ def test_declaring_no_initial_state_on_a_later_chunk_is_visibly_wrong():
 
 
 def test_the_package_re_exports_the_chunked_entry_point():
-    """modeling_inkling imports from the PACKAGE, not from .kernels.
-
-    This test exists because the tests above import from
-    ``...inkling.kernels`` directly and so could not see that
-    ``inkling/__init__.py`` never re-exported the new entry point. The whole
-    unit suite passed while the model could not import it -- an end-to-end run
-    (job 6044664) was what surfaced it. No GPU needed: it is an import.
+    """modeling_inkling imports from the PACKAGE, not from .kernels. The tests
+    above import from ``...inkling.kernels`` directly, so the whole suite passed
+    once while the model itself could not import the entry point.
     """
     import tensorrt_llm._torch.attention_backend.sparse.inkling as pkg
 
@@ -358,15 +334,9 @@ def test_the_package_re_exports_the_chunked_entry_point():
     assert "inkling_chunked_prefill_attention" in pkg.__all__
 
 
-# ---------------------------------------------------------------------------
-# The gap the rest of this file leaves open. Every test above hands the kernel
-# block_ids = range(16): contiguous, zero-based, ascending. A real
-# KVCacheManagerV2 hands out whatever pages are free -- sparse, unordered, and
-# never starting at 0 in a warm pool. The end-to-end runs (jobs 6046462 /
-# 6047277) show the head of the distribution shifting by ~0.35 logprob when a
-# prompt is actually split, and the real page table is the prime suspect
-# precisely because nothing here has ever exercised it.
-# ---------------------------------------------------------------------------
+# The gap the rest of this file leaves open: every test above hands the kernel
+# block_ids = range(16), while a real KVCacheManagerV2 hands out whatever pages
+# are free -- sparse, unordered, and never starting at 0 in a warm pool.
 @requires_gpu
 @pytest.mark.parametrize(
     "blocks",
@@ -378,12 +348,9 @@ def test_the_package_re_exports_the_chunked_entry_point():
     ids=["unordered", "high_descending", "strided"],
 )
 def test_chunk_invariance_holds_on_a_realistic_page_layout(blocks):
-    """Split a prompt across pages the KV manager could plausibly hand out.
-
-    write_kv_cache_hnd and the kernel must agree on the SAME mapping from
-    absolute token position to (page, offset). A disagreement shows up here and
-    nowhere else in this file: with range(16) a bug that ignores the page table
-    and treats pages as contiguous still passes everything above.
+    """Split across pages the KV manager could plausibly hand out. Writer and
+    kernel must agree on the same position -> (page, offset) mapping; with
+    range(16) a bug that treats pages as contiguous passes everything above.
     """
     total_len, num_kv_heads, split, window = 200, 8, 37, WINDOW
     q, k, v, rel = _make_case(total_len, num_kv_heads, has_rel=True, seed=71)
@@ -458,17 +425,10 @@ def test_a_contiguous_page_assumption_would_be_caught():
 def test_report_the_per_layer_split_divergence_magnitude():
     """Measure, do not just bound.
 
-    The end-to-end runs show the head of the distribution moving ~0.35 logprob
-    when a prompt is split (jobs 6046462 / 6047277), and the standing
-    explanation is that a correct chunked kernel still re-aligns query tiles at
-    the chunk boundary, so the online-softmax accumulation order differs and
-    bf16 rounding compounds over 66 layers.
-
-    That explanation is only credible if the PER-LAYER difference is actually
-    rounding-sized. The other tests bound it at 2e-2 and stop; this one prints
-    it, so the claim rests on a number. Compare against the same measurement
-    with num_cached == 0, where the kernels are bit-identical -- that is the
-    floor for this measurement.
+    A correct chunked kernel still re-aligns query tiles at the boundary, so the
+    accumulation order differs and bf16 rounding compounds over 66 layers. That
+    explanation is only credible if the per-layer difference is rounding-sized,
+    so this prints it rather than bounding it at 2e-2 like the others.
     """
     total_len, num_kv_heads, window = 200, 8, WINDOW
     q, k, v, rel = _make_case(total_len, num_kv_heads, has_rel=True, seed=91)

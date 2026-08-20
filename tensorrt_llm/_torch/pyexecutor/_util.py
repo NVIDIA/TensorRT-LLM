@@ -623,11 +623,8 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
-        # Inkling's short-conv window is per-request state outside the KV
-        # cache, and a reused prefix has none to restore unless a snapshot
-        # policy is configured. Checked here because this is the one place that
-        # sees the resolved kv_cache_config -- model defaults already
-        # deep-merged with the user's settings.
+        # Checked here because this is the one place that sees the resolved
+        # kv_cache_config -- model defaults already deep-merged with the user's.
         reject_unsupported_inkling_kv_cache_features(
             model_config.pretrained_config,
             enable_block_reuse=kv_cache_config.enable_block_reuse,

@@ -36,10 +36,9 @@ from .params import InklingBackendForwardArgs
 def _needs_chunked_context(num_cached) -> bool:
     """True when the context path must read cached KV back from the pages.
 
-    ``INKLING_FORCE_CHUNKED_ATTN=1`` forces it for all-fresh requests too.
-    Test-only: this model's sampled output is not reproducible between two
-    generate() calls unless the autotuner is off, so the knob is the only way to
-    exercise both kernels against one set of weights in one process.
+    ``INKLING_FORCE_CHUNKED_ATTN=1`` forces it for all-fresh requests too --
+    test-only, and the only way to reach both kernels in one process, since this
+    model's sampled output is not reproducible across generate() calls.
     """
     if os.environ.get("INKLING_FORCE_CHUNKED_ATTN", "0") == "1":
         return True
@@ -184,13 +183,11 @@ class InklingTritonAttention(TrtllmAttention):
         cu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
         cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
         max_seqlen = max(seq_lens)
-        # A request carrying cached history must attend to tokens it did not
-        # bring with it, which inkling_prefill_attention cannot do: it takes no
-        # paged-KV argument. The chunked kernel reads every key from the page
-        # table instead, and needs no gather because the write above already put
-        # this chunk's K/V in the same pages. All-fresh keeps the packed kernel
-        # -- common case, no page indirection -- and the two must agree exactly
-        # at num_cached == 0, which test_inkling_chunked_prefill pins.
+        # A request carrying cached history attends to tokens it did not bring
+        # with it, which inkling_prefill_attention cannot do -- it takes no
+        # paged-KV argument. The chunked kernel reads the page table instead,
+        # needing no gather because the write above already put this chunk's K/V
+        # there. All-fresh keeps the packed kernel; the two agree at 0.
         if _needs_chunked_context(num_cached):
             max_total = max(int(c) + int(sl) for c, sl in zip(num_cached, seq_lens))
             max_pages = (max_total + page_size - 1) // page_size

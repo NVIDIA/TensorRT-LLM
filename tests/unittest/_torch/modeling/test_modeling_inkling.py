@@ -171,11 +171,8 @@ def test_the_rejection_is_scoped_to_inkling():
 
 def test_block_reuse_is_rejected_without_a_snapshot_policy():
     """An explicit enable_block_reuse=True wins the deep-merge over the model
-    default, so the default alone cannot be the guarantee.
-
-    Reuse is servable only once a snapshot policy puts the short-conv window in
-    the block lifecycle; without one there is still nothing to restore on a
-    prefix hit, which is what this refusal protects against."""
+    default, so the default alone cannot be the guarantee. Without a snapshot
+    policy a prefix hit still has no conv window to restore."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         reject_unsupported_inkling_kv_cache_features,
     )
@@ -197,9 +194,8 @@ def test_block_reuse_is_allowed_once_snapshots_are_configured():
 def _warnings_from_guard(**kwargs):
     """Run the guard and return what it warned.
 
-    The warnings are captured off tensorrt_llm's logger rather than with caplog:
-    that logger sets propagate=False, so nothing reaches pytest's root handler
-    and a caplog-based assertion would pass while asserting nothing.
+    Captured off tensorrt_llm's logger, not with caplog: that logger sets
+    propagate=False, so a caplog assertion would pass while asserting nothing.
     """
     from tensorrt_llm._torch.pyexecutor import config_utils
 
@@ -210,9 +206,8 @@ def _warnings_from_guard(**kwargs):
 
 
 def test_enabling_reuse_warns_that_it_is_text_only():
-    """Said at startup from the resolved config, because the per-request warning
-    in the cache manager needs a multimodal request to arrive first, and rides
-    on the same py_multimodal_data probe as the rule it describes."""
+    """The manager's per-request warning needs a multimodal request to arrive,
+    and rides on the same probe as the rule it describes."""
     assert "text prompts only" in _warnings_from_guard(
         enable_block_reuse=True, periodic_snapshot_interval=256
     )
@@ -225,10 +220,9 @@ def test_no_text_only_warning_when_reuse_is_off():
 
 
 def test_the_multimodal_probe_field_still_exists():
-    """The reuse guard reaches py_multimodal_data through getattr, so the NAME
-    is the contract: a rename makes the probe return None, every multimodal
-    request look like a text one, and reuse go back to serving one image's KV
-    for another's -- silently, with nothing else failing."""
+    """The guard reaches py_multimodal_data through getattr, so the NAME is the
+    contract: a rename makes every multimodal request look like a text one and
+    silently restores the defect, with nothing else failing."""
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
     assert "py_multimodal_data" in inspect.getsource(LlmRequest.__init__)
@@ -248,19 +242,12 @@ def test_inkling_needs_block_aligned_chunks_without_being_hybrid_linear():
     assert not is_hybrid_linear(cfg)
 
 
-# ---------------------------------------------------------------------------
-# Snapshot points: where a short-conv window may be captured, and therefore
-# where a reuse hit may land.
-# ---------------------------------------------------------------------------
+# Snapshot points: where a window may be captured, so where a hit may land.
 
 
 def _snapshot_manager(interval, reuse=True):
-    """A manager stub for prepare_expect_snapshot_points.
-
-    Built with object.__new__ rather than a real manager: the method reads two
-    attributes and writes one field per request, so standing up a C++ pool and
-    a GPU would test the framework, not this policy.
-    """
+    """A stub: the method reads two attributes and writes one field per
+    request, so a real manager would test the framework, not this policy."""
     from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
         InklingHybridCacheManager,
     )
@@ -335,11 +322,8 @@ def test_the_snapshot_commit_behaviour_is_shared_with_mamba():
         ), f"{name} is not the shared copy"
 
 
-# ---------------------------------------------------------------------------
-# Multimodal requests must not share the radix tree. Their image spans carry no
-# content digest, so a shared prefix would be matched on placeholder token ids
-# alone -- measured as MMMU 81.3% -> 31.3% over the same 32 items with reuse on.
-# ---------------------------------------------------------------------------
+# Multimodal requests must not share the radix tree: their image spans carry no
+# content digest, measured as MMMU 81.3% -> 31.3% over the same 32 items.
 
 
 def _reuse_manager(reuse=True):
@@ -421,9 +405,8 @@ def test_multimodal_request_with_digests_is_left_to_the_base(passthrough_base):
 
 
 def test_continuation_chunks_are_not_salted(passthrough_base):
-    """Only the chunk holding position 0 needs it: the radix tree chains a
-    block's key through its parent, so salting every chunk would be redundant
-    and would change keys the first chunk already committed."""
+    """The radix tree chains a block's key through its parent, so salting a
+    later chunk would only change keys the first chunk already committed."""
     tokens = [5, 6, 7]
     assert (
         _reuse_manager()._augment_tokens_for_block_reuse(
@@ -444,13 +427,9 @@ def test_nothing_is_salted_when_reuse_is_off(passthrough_base):
 
 
 def test_chunked_prefill_is_supported_and_no_longer_refused():
-    """The raise came out once the feature was validated, not before.
-
-    Evidence: the chunked-context kernel is bit-identical to one-shot prefill at
-    the layer level (job 6048348), 63 GPU parity tests including realistic page
-    layouts, and GSM8K at n=500 -- 0.940 with chunking on against 0.932 off,
-    indistinguishable at that sample size.
-    """
+    """The raise came out once the feature was validated: bit-identical to
+    one-shot prefill at the layer level, 63 GPU parity tests, and GSM8K over the
+    full 1319 questions at -0.08 pt with exact McNemar p=1.000."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         reject_unsupported_inkling_kv_cache_features,
     )
@@ -459,13 +438,9 @@ def test_chunked_prefill_is_supported_and_no_longer_refused():
 
 
 def test_the_routing_predicate_picks_the_kernel_by_cached_tokens(monkeypatch):
-    """One request with history is enough to switch the whole batch: the batch
-    runs one kernel, and the packed one would drop that request's prefix. The
-    all-fresh case must keep the packed kernel and not pay for page indirection.
-
-    int() coercion is load-bearing -- num_cached arrives from kv_cache_params as
-    a tensor or a list of numpy ints, not python ints.
-    """
+    """One request with history switches the whole batch, since the batch runs
+    one kernel. The int() coercion is load-bearing: num_cached arrives as a
+    tensor or numpy ints, not python ints."""
     import torch
 
     from tensorrt_llm._torch.attention_backend.sparse.inkling.backend import _needs_chunked_context

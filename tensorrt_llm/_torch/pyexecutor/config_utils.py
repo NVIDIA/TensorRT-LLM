@@ -92,14 +92,11 @@ def is_hybrid_linear(config):
 def needs_block_aligned_context_chunks(config) -> bool:
     """True for models that snapshot per-request recurrent state for reuse.
 
-    Named for the property, not the model family. A reuse hit can only land
-    where a snapshot exists, a snapshot can only be taken where an iteration
-    ends, and only the chunking policy decides where iterations end -- so these
-    models need FORCE_CHUNK rather than whatever chunk size the operator picked.
-    Inkling qualifies through its short-conv window without being a Mamba model:
-    folding it into ``is_hybrid_linear`` would also route it through
-    ``extract_mamba_kv_cache_params`` and the Mamba conv-state layouts, neither
-    of which it can satisfy.
+    Named for the property, not the model family: a reuse hit can only land
+    where a snapshot exists, and only the chunking policy decides where
+    iterations -- and therefore snapshots -- may end. Inkling qualifies without
+    being a Mamba model, so it is not folded into ``is_hybrid_linear``, which
+    would also route it through Mamba conv-state layouts it cannot satisfy.
     """
     return is_hybrid_linear(config) or is_inkling(config)
 
@@ -220,11 +217,9 @@ def reject_unsupported_inkling_kv_cache_features(
             "a positive number of tokens, which puts the window in the block "
             "lifecycle and makes the hit servable.")
     if enable_block_reuse and periodic_snapshot_interval:
-        # Said once at startup, from the resolved config, because the
-        # equivalent warning in InklingHybridCacheManager only fires when a
-        # multimodal request actually arrives -- and it rides on the same
-        # py_multimodal_data probe as the rule it describes, so if that
-        # detection ever breaks the warning goes quiet with it.
+        # Said at startup because the manager's equivalent warning needs a
+        # multimodal request to arrive, and rides on the same probe as the rule
+        # it describes -- if that breaks, the warning goes quiet with it.
         logger.warning(
             "Inkling: KV cache block reuse is enabled, and applies to text "
             "prompts only. A request carrying image, video or audio input gets "
