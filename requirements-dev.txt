@@ -4,7 +4,7 @@
 # package files. 0.39.0 matches the runtime floor in requirements.txt.
 diffusers==0.39.0
 # Workaround main broken due to external dependency changes
-distro
+distro==1.9.0
 boto3
 einops
 # Reference implementation for KDA kernel parity tests.
