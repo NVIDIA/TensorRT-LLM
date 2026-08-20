@@ -110,7 +110,7 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 | `/v1/videos/sync` | POST | Synchronous video generation |
 | `/v1/videos/generations` | POST | Deprecated alias of `/v1/videos/sync` (kept for back-compat) |
 | `/v1/videos/{id}` | GET | Video status / metadata |
-| `/v1/videos/{id}/content` | GET | Download generated video (or path JSON under `response_format="path"`) |
+| `/v1/videos/{id}/content` | GET | Download generated video |
 | `/v1/videos/{id}` | DELETE | Delete generated video |
 | `/v1/videos` | GET | List all videos |
 
