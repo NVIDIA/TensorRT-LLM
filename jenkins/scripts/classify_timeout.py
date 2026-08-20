@@ -42,6 +42,7 @@ import json
 import os
 import re
 import sys
+import time
 
 # Regex patterns for banner line detection.
 # The first banner contains the nodeid; the second is a plain separator.
@@ -143,7 +144,7 @@ def _scan_log(log_path, unfinished):
             if truncated:
                 snippet += _TRUNCATED_MARKER
 
-            records.append({"nodeid": nodeid, "snippet": snippet})
+            records.append({"type": "timeout", "nodeid": nodeid, "snippet": snippet})
 
     return records
 
@@ -163,6 +164,17 @@ def _append_records(out_path, records):
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError as exc:
         print(f"classify_timeout: WARNING: could not write {out_path}: {exc}", file=sys.stderr)
+
+
+def _append_unfinished_end_times(out_path, unfinished):
+    """Record the wall-clock end time for tests left unfinished by pytest."""
+    if not out_path:
+        return
+    end_time = time.time()
+    _append_records(
+        out_path,
+        [{"type": "end", "nodeid": nodeid, "end_time": end_time} for nodeid in sorted(unfinished)],
+    )
 
 
 def main() -> None:
@@ -185,6 +197,7 @@ def main() -> None:
         # Nothing to match against; exit cleanly without touching --out.
         return
 
+    _append_unfinished_end_times(args.out, unfinished)
     records = _scan_log(args.log, unfinished)
     if not records:
         return

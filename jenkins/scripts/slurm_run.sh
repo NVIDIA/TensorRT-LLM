@@ -137,6 +137,7 @@ perf_report_exit_code=0
 
 # Every rank captures its own stdout+stderr via tee for post-run timeout
 # classification.
+export TRTLLM_TIMEOUT_DATA_FILE="${TIMEOUT_DATA_RANK}"
 if eval "$pytestCommand" 2>&1 | tee "${PYTEST_LOG}"; then
     pytest_exit_code=0
 else

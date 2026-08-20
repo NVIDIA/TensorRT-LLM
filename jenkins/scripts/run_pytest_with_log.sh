@@ -71,7 +71,7 @@ trap 'cleanup_and_exit 143' TERM
 # Jenkins console.  tee's exit code is discarded; we read pytest's via
 # PIPESTATUS immediately after the pipeline completes.
 # ---------------------------------------------------------------------------
-bash "${CMD_SCRIPT}" 2>&1 | tee "${LOG}"
+TRTLLM_TIMEOUT_DATA_FILE="${TIMEOUT_DATA}" bash "${CMD_SCRIPT}" 2>&1 | tee "${LOG}"
 PYTEST_RC=${PIPESTATUS[0]}
 
 # ---------------------------------------------------------------------------

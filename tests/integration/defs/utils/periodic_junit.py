@@ -20,6 +20,7 @@ pytest's built-in junitxml plugin for simplified test result handling.
 """
 
 import faulthandler
+import json
 import os
 import platform
 import signal
@@ -460,6 +461,26 @@ class PeriodicJUnitXML:
         completed test can never produce a dump. This also makes ``func_only``
         irrelevant: any phase overrunning the timeout dumps.
         """
+        if self.save_unfinished_test:
+            try:
+                timeout_data_path = os.environ.get("TRTLLM_TIMEOUT_DATA_FILE")
+                if timeout_data_path:
+                    os.makedirs(os.path.dirname(
+                        os.path.abspath(timeout_data_path)),
+                                exist_ok=True)
+                    with open(timeout_data_path, "a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps({
+                                "type": "start",
+                                "nodeid": item.nodeid,
+                                "start_time": time.time(),
+                                "timeout": self._effective_timeout(item),
+                            }) + "\n")
+            except (AttributeError, OSError, TypeError, ValueError) as exc:
+                self._log_warning(
+                    f"Could not record timeout metadata for {item.nodeid}: {exc}"
+                )
+
         if not self.dump_hang_traceback or self._hang_file is None:
             return
         self._cancel_hang_timer()  # never leave a stale timer armed
