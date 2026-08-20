@@ -26,6 +26,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 def _requirement(name: str, manifest: str = "requirements.txt") -> Requirement:
     for line in (REPO_ROOT / manifest).read_text().splitlines():
+        # Trailing comments are common in these manifests and are not part of
+        # the PEP 508 grammar, so Requirement() would reject the whole line.
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
         if line.startswith(f"{name}"):
             requirement = Requirement(line)
             if requirement.name == name:
