@@ -33,6 +33,9 @@ from .page_table import gen_page_table, gen_seq_lens, page_div, validate_decode_
 from .params import InklingBackendForwardArgs
 
 
+# =============================== Chunked prefill ==============================
+# This predicate and the branch it guards in _run_context are the whole of the
+# chunked-prefill support in this file; the kernel itself is in kernels.py.
 def _needs_chunked_context(num_cached) -> bool:
     """True when the context path must read cached KV back from the pages.
 
@@ -183,6 +186,7 @@ class InklingTritonAttention(TrtllmAttention):
         cu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
         cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
         max_seqlen = max(seq_lens)
+        # --- chunked prefill ---
         # A request carrying cached history attends to tokens it did not bring
         # with it, which inkling_prefill_attention cannot do -- it takes no
         # paged-KV argument. The chunked kernel reads the page table instead,
@@ -209,6 +213,7 @@ class InklingTritonAttention(TrtllmAttention):
                 self.rel_extent,
                 self.window_left,
             )
+        # --- end chunked prefill ---
         return inkling_prefill_attention(
             q, k, v, cu, max_seqlen, self.sm_scale, rel_logits, self.rel_extent, self.window_left
         )

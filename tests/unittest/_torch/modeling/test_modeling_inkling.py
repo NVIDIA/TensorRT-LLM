@@ -300,26 +300,60 @@ def test_py_executor_finds_the_snapshot_hook_by_name():
     assert hasattr(InklingHybridCacheManager, "prepare_expect_snapshot_points")
 
 
-def test_the_snapshot_commit_behaviour_is_shared_with_mamba():
-    """The three commit-at-snapshot-points methods were lifted out of
-    MambaHybridCacheManagerV2; both managers must inherit the one copy, or
-    Inkling silently commits nothing at its snapshot points."""
+def test_the_snapshot_commit_methods_override_the_base():
+    """The base commits as prefill advances and never sets history_length,
+    which the SSM commit path asserts on. These overrides are what maintain
+    that contract."""
     from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
         InklingHybridCacheManager,
     )
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import ReusableStateSnapshotMixin
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+    for name in ("try_commit_blocks", "update_context_resources"):
+        assert getattr(InklingHybridCacheManager, name) is not getattr(KVCacheManagerV2, name), (
+            f"{name} no longer overrides the base"
+        )
+    assert hasattr(InklingHybridCacheManager, "_mark_context_position_as_history")
+
+
+def test_the_snapshot_commit_methods_match_mambas():
+    """They are a copy of MambaHybridCacheManagerV2's, kept in Inkling's own
+    file so that no shared manager code has to change. A copy drifts, so this
+    compares them -- as ASTs, since the two files are on different formatters,
+    with docstrings dropped and string constants blanked (the error messages
+    name the model)."""
+    import ast
+    import textwrap
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
+        InklingHybridCacheManager,
+    )
     from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2
 
-    assert issubclass(InklingHybridCacheManager, ReusableStateSnapshotMixin)
-    assert issubclass(MambaHybridCacheManagerV2, ReusableStateSnapshotMixin)
+    def body(cls, name):
+        fn = ast.parse(textwrap.dedent(inspect.getsource(getattr(cls, name)))).body[0]
+        stmts = fn.body
+        if (
+            stmts
+            and isinstance(stmts[0], ast.Expr)
+            and isinstance(stmts[0].value, ast.Constant)
+            and isinstance(stmts[0].value.value, str)
+        ):
+            stmts = stmts[1:]
+        module = ast.Module(body=stmts, type_ignores=[])
+        for node in ast.walk(module):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                node.value = "<msg>"
+        return ast.dump(module)
+
     for name in (
         "try_commit_blocks",
         "update_context_resources",
         "_mark_context_position_as_history",
     ):
-        assert getattr(InklingHybridCacheManager, name) is getattr(
-            MambaHybridCacheManagerV2, name
-        ), f"{name} is not the shared copy"
+        assert body(InklingHybridCacheManager, name) == body(MambaHybridCacheManagerV2, name), (
+            f"{name} has drifted from the Mamba copy it was taken from"
+        )
 
 
 # Multimodal requests must not share the radix tree: their image spans carry no

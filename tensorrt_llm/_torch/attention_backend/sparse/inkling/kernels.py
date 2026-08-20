@@ -540,6 +540,10 @@ def write_kv_cache_hnd(
 # by the PACKED query row: it is built per query token from that token's own
 # hidden state, and only new tokens are queries.
 # ---------------------------------------------------------------------------
+# =============================== Chunked prefill ==============================
+# The kernel below is the prefill kernel's BLOCK_M query tiling with the decode
+# kernel's paged KV reads, at absolute positions. Everything above it serves the
+# all-fresh path and is unchanged by chunked prefill.
 @triton.jit
 def _inkling_chunked_prefill_kernel(
     Q,

@@ -35,6 +35,7 @@ import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    DEFAULT_BEAM_INDEX,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -45,7 +46,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 from .....logger import logger
-from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, ReusableStateSnapshotMixin
+from ....pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+from ....pyexecutor.llm_request import LlmRequest
+from ....pyexecutor.scheduler import ScheduledRequests
 from .conv_state import CONV_ROLES, InklingConvState, InklingConvStateCache
 
 
@@ -71,7 +74,7 @@ def _resolve_conv_dtype(pretrained_config) -> torch.dtype:
     )
 
 
-class InklingHybridCacheManager(ReusableStateSnapshotMixin, KVCacheManagerV2):
+class InklingHybridCacheManager(KVCacheManagerV2):
     """Paged KV (V2, per-layer geometry) + the short-conv state pool.
 
     Folding the pool into the manager -- ``CppMambaHybridCacheManager``'s shape
@@ -120,7 +123,10 @@ class InklingHybridCacheManager(ReusableStateSnapshotMixin, KVCacheManagerV2):
             "backed by V2 SSM layers"
         )
 
-    # ---- reusable snapshots -------------------------------------------------
+    # ========================= KV cache block reuse =========================
+    # Everything down to "end KV cache block reuse" exists only for
+    # enable_block_reuse. With it off, none of it runs and the manager is the
+    # conv-state pool plus paged KV.
     def prepare_expect_snapshot_points(self, requests) -> None:
         """Where this batch's requests may snapshot their short-conv window.
 
@@ -137,6 +143,101 @@ class InklingHybridCacheManager(ReusableStateSnapshotMixin, KVCacheManagerV2):
                 request.expect_snapshot_points = []
                 continue
             request.expect_snapshot_points = list(range(interval, request.prompt_len + 1, interval))
+
+    # The three methods below mirror MambaHybridCacheManagerV2's. They are
+    # copied rather than shared because the only two ways to share them both
+    # cost more than the duplication: lifting them into kv_cache_manager_v2.py
+    # edits a file every model depends on, and inheriting the Mamba manager
+    # drags in BaseMambaCacheManager's SSM-state interface, which four short
+    # convs at two widths cannot satisfy. Every ``self`` reference here is a
+    # KVCacheManagerV2 member, so nothing Mamba-specific comes with them.
+    def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
+        """Advance history without making later recurrent state reusable."""
+        history_length = request.context_current_position
+        if history_length <= kv_cache.history_length:
+            return
+        capacity = max(kv_cache.capacity, history_length)
+        if not kv_cache.resize(capacity, history_length=history_length):
+            raise ValueError(
+                "Failed to resize history length of the Inkling V2 cache for "
+                f"request {request.py_request_id} to {history_length} tokens"
+            )
+
+    def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
+        """Commit at each declared snapshot point, not only at the end.
+
+        The base commits once as prefill advances, which is enough when
+        everything reusable lives in the KV pages. The conv window does not: V2
+        attaches it to the block committed at a snapshot ordinal, so a commit
+        has to happen there or a later hit has no window to restore.
+        """
+        should_block_reuse = (
+            self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
+        )
+        if not should_block_reuse:
+            return
+
+        if kv_cache is None:
+            kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return
+
+        snapshot_points = request.expect_snapshot_points
+        commit_limit = (
+            min(max(snapshot_points), request.prompt_len) if snapshot_points else request.prompt_len
+        )
+        commit_end = min(request.context_current_position, commit_limit)
+        if (
+            request.context_current_position in request.expect_snapshot_points
+            and commit_end > kv_cache.num_committed_tokens
+        ):
+            tokens = self._augment_tokens_for_block_reuse(
+                request.get_tokens(DEFAULT_BEAM_INDEX),
+                request,
+                start=kv_cache.num_committed_tokens,
+                end=commit_end,
+            )
+            kv_cache.commit(tokens)
+        if request.context_current_position >= commit_limit:
+            self._mark_context_position_as_history(request, kv_cache)
+        if request.context_remaining_length == 0:
+            kv_cache.stop_committing()
+
+    def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        for request in scheduled_batch.context_requests:
+            kv_cache = self.kv_cache_map.get(request.py_request_id)
+            if kv_cache is None or not kv_cache.is_active:
+                continue
+
+            should_block_reuse = (
+                self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
+            )
+            is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            is_snapshot_boundary = (
+                request.context_current_position in request.expect_snapshot_points
+            )
+            has_pending_snapshot = any(
+                point > request.context_current_position for point in request.expect_snapshot_points
+            )
+            should_resize = not should_block_reuse or (
+                not is_all_reusable and not has_pending_snapshot
+            )
+            should_commit = (
+                is_all_reusable or is_snapshot_boundary or request.context_remaining_length == 0
+            )
+
+            if should_resize and not kv_cache.resize(None, request.context_current_position):
+                raise ValueError(
+                    "Failed to resize history length of the Inkling V2 cache "
+                    f"for request {request.py_request_id} to "
+                    f"{request.context_current_position} tokens at context update"
+                )
+            if should_commit:
+                self.try_commit_blocks(request, kv_cache)
+            if request.context_remaining_length == 0:
+                if self.conversation_manager is not None:
+                    self.conversation_manager.save_drop_plan(request, kv_cache)
+                kv_cache.enable_swa_scratch_reuse = False
 
     def _augment_tokens_for_block_reuse(self, tokens, req, start=0, end=None):
         """Keep multimodal requests out of the shared radix tree.
@@ -176,69 +277,7 @@ class InklingHybridCacheManager(ReusableStateSnapshotMixin, KVCacheManagerV2):
         poisoned[0] = salt
         return poisoned
 
-    def prepare_context(self, req):
-        """Observation only: count how much prefix each request actually reused.
-
-        ``get_kv_cache_stats`` reports zero for this configuration whether reuse
-        works or never runs, and nothing else separates the two. Only the FIRST
-        context chunk counts: a continuation chunk also arrives with
-        ``context_current_position > 0``, from its own earlier chunks.
-        """
-        first = bool(getattr(req, "is_first_context_chunk", True))
-        ok = super().prepare_context(req)
-        if not first:
-            return ok
-        d = getattr(self, "_reuse_dbg", None)
-        if d is None:
-            d = self._reuse_dbg = {"n": 0, "hits": 0, "best": 0, "total": 0}
-        d["n"] += 1
-        pos = int(getattr(req, "context_current_position", 0) or 0)
-        if pos > 0:
-            d["hits"] += 1
-            d["total"] += pos
-            d["best"] = max(d["best"], pos)
-        if d["n"] % 64 == 0:
-            logger.info(
-                f"Inkling prefix reuse: {d['hits']}/{d['n']} requests, "
-                f"longest={d['best']} tokens, total={d['total']}"
-            )
-        return ok
-
-    # ---- conv geometry, all derived from what the base already resolved -----
-    @property
-    def _conv_tp_size(self) -> int:
-        # The attention TP, not the global one: the k/v convs follow the kv-head
-        # split, as V2 does for the paged pool.
-        return 1 if self.mapping.enable_attention_dp else self.mapping.tp_size
-
-    @property
-    def _reserve_attention_dp_slot(self) -> bool:
-        return bool(self.mapping.enable_attention_dp)
-
-    @property
-    def _num_conv_request_slots(self) -> int:
-        # One row per resident sequence; each pipeline stage holds a microbatch.
-        return self.max_batch_size * self.mapping.pp_size
-
-    @property
-    def _num_reserved_conv_slots(self) -> int:
-        # Asked of the pool rather than re-derived: the two counts must agree or
-        # slots_for indexes the V2 buffer out of bounds.
-        return InklingConvStateCache.reserved_slot_count(
-            reserve_attention_dp_slot=self._reserve_attention_dp_slot
-        )
-
-    def _conv_bytes_per_slot(self, global_layer_idx: int) -> List[int]:
-        """Bytes one request occupies in each of the layer's four conv states."""
-        config = self._conv_config
-        kv_dim = (
-            config.layer_num_kv_heads(global_layer_idx) * config.layer_head_dim(global_layer_idx)
-        ) // self._conv_tp_size
-        window = config.sconv_kernel_size - 1
-        itemsize = torch.empty((), dtype=self._conv_dtype).element_size()
-        return [
-            c * window * itemsize for c in (kv_dim, kv_dim, config.hidden_size, config.hidden_size)
-        ]
+    # ======================= end KV cache block reuse =======================
 
     # ---- V2 configuration -------------------------------------------------
     def _conv_layer_id(self, local_layer_idx: int) -> LayerId:

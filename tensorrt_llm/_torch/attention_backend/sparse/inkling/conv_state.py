@@ -226,6 +226,10 @@ class InklingConvStateCache:
                 self._free.append(slot)
 
 
+# =============================== Chunked prefill ==============================
+# A prompt split across iterations leaves its conv window in the pool row; this
+# helper and its use in InklingConvRuntime.build are what get it declared, and
+# therefore consumed, on the next chunk.
 def _context_num_cached(attn_metadata, num_contexts):
     """Per-context-request cached token counts, or None when unavailable.
 

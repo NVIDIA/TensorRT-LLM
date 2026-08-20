@@ -89,6 +89,9 @@ def is_hybrid_linear(config):
         is_kimi_linear(config)
 
 
+# Added for Inkling KV cache block reuse: a reuse hit can only land where a
+# snapshot exists, so the chunking policy has to be able to end an iteration
+# there. Consumed by py_executor_creator to select FORCE_CHUNK.
 def needs_block_aligned_context_chunks(config) -> bool:
     """True for models that snapshot per-request recurrent state for reuse.
 
