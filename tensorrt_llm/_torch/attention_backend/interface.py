@@ -942,6 +942,12 @@ class AttentionForwardArgs:
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
     enable_dsv4_epilogue_fusion: bool = False
 
+    # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
+    # RAW kv_a_proj output and the context RoPE kernel norms it before RoPE + quant +
+    # paged write, so the caller drops its own RMSNorm and concat.
+    kv_norm_weight: Optional[torch.Tensor] = None
+    kv_norm_eps: float = 1e-6
+
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0

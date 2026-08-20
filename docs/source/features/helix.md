@@ -63,11 +63,20 @@ Please set the following parameters for the generation servers in disaggregated 
 
 ### Unit Test: MLA Module Correctness
 
+This developer test is not included in TensorRT-LLM release containers. Follow the
+[build-from-source workflow](../installation/build-from-source.md), then install the test dependencies:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+```
+
+The test requires at least two Blackwell GPUs; pytest skips it on unsupported hardware.
+
 The simplest correctness test validates the [MLA attention module](../../../tensorrt_llm/_torch/modules/attention.py) with Helix enabled:
 
 ```bash
 # Run the MLA Helix unit test
-pytest tests/unittest/_torch/modules/test_mla_helix.py -v
+python3 -m pytest tests/unittest/_torch/modules/test_mla_helix.py -v
 ```
 
 This test verifies that attention outputs match between single-GPU and Helix-parallelized execution.

@@ -7,7 +7,7 @@ from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
-from .fused_moe_wide_ep import WideEPMoE
+from .impl_base import MoEImplBase
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import (MoeLoadBalancer,
                                 moe_load_balancer_set_repeated_for_next_layer)
@@ -22,6 +22,7 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       SigmoidRenormMoeRoutingMethod,
                       SparseMixerMoeRoutingMethod, StaticMoeRoutingMethod,
                       create_load_balanced_logits)
+from .weight_owner import is_moe_weight_owner
 
 # yapf: enable
 
@@ -36,6 +37,7 @@ __all__ = [
     "DeepSeekV3MoeRoutingMethod",
     "DefaultMoeRoutingMethod",
     "FusedMoEQuantScalesFP8",
+    "is_moe_weight_owner",
     "resolve_moe_cls",
     "resolve_moe_impl",
     "Llama4RenormalizeMoeRoutingMethod",
@@ -43,6 +45,7 @@ __all__ = [
     "LoadBalancedMoeRoutingMethod",
     "moe_load_balancer_set_repeated_for_next_layer",
     "MoE",
+    "MoEImplBase",
     "MoeLoadBalancer",
     "MoEWeightLoadingMode",
     "MiniMaxM2MoeRoutingMethod",
@@ -57,5 +60,4 @@ __all__ = [
     "TritonFusedMoE",
     "TRTLLMGenFusedMoE",
     "VanillaMoE",
-    "WideEPMoE",
 ]
