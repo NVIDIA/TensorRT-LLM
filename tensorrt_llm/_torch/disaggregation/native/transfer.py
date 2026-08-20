@@ -200,6 +200,7 @@ class _ReceiveOperationOwner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._publication_pending = False
+        self._cancelled_unpublished = False
         self._expected_writers: Optional[int] = None
         self._writer_cohort: Optional[frozenset[int]] = None
         self._writer_results: dict[int, bool] = {}
@@ -237,7 +238,8 @@ class _ReceiveOperationOwner:
         """Close a publication that did not authorize a remote writer."""
         with self._lock:
             if self._expected_writers is not None:
-                return False
+                return self._cancelled_unpublished
+            self._cancelled_unpublished = True
             self._expected_writers = 0
             self._writer_cohort = frozenset()
             self._publication_pending = False
