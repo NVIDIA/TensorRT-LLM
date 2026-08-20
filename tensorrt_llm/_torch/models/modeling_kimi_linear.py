@@ -549,6 +549,16 @@ def _swap_linear_to_fp8_weight_read(
     return 1
 
 
+def _has_weights(module: nn.Module) -> bool:
+    """False once ``modeling_utils.remove_weights()`` has stripped a module.
+
+    Post-load finalization walks every decoder layer, so it must skip layers
+    whose parameters were dropped — the layer-wise benchmarks keep only the
+    profiled slice resident.
+    """
+    return not getattr(module, "_weights_removed", False)
+
+
 def _convert_moe_mlps_to_fp8_weight_read(
     model: nn.Module, include_fused_gate_up: bool = True
 ) -> int:
@@ -563,6 +573,8 @@ def _convert_moe_mlps_to_fp8_weight_read(
     count = 0
 
     for layer in model.layers:
+        if not _has_weights(layer):
+            continue
         moe = getattr(layer, "block_sparse_moe", None)
         if moe is None:
             continue
@@ -623,7 +635,7 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
     count = 0
 
     for layer in model.layers:
-        if not getattr(layer, "is_kda", False):
+        if not getattr(layer, "is_kda", False) or not _has_weights(layer):
             continue
         mixer = getattr(getattr(layer, "self_attn", None), "mixer", None)
         if mixer is None:
@@ -693,7 +705,7 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     for layer in model.layers:
         # MLA layers are the non-KDA layers (each layer is exactly one of the
         # two); their projections live on the KimiK3MLAAttention mixer.
-        if getattr(layer, "is_kda", False):
+        if getattr(layer, "is_kda", False) or not _has_weights(layer):
             continue
         mixer = getattr(getattr(layer, "self_attn", None), "mixer", None)
         if mixer is None:
@@ -2235,6 +2247,20 @@ class KimiLinearDecoderLayer(nn.Module):
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
 
+    def skip_forward(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """No-op stand-in for ``forward``, matching ``DecoderLayer.skip_forward``.
+
+        ``modeling_utils.skip_forward()`` only drops a module's weights when it
+        finds this attribute, so without it the layer-wise benchmarks would
+        allocate all 93 layers instead of the profiled slice.
+        """
+        return hidden_states, block_residual
+
 
 # ---------------------------------------------------------------------------
 # Model.
@@ -2472,7 +2498,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # when the routed MoE is TP-sharded (moe_ep=1 -> ids 0..num_experts)).
         expert_jobs = []
         for layer_idx, layer in enumerate(self.model.layers):
-            if not getattr(layer, "is_moe", False):
+            if not getattr(layer, "is_moe", False) or not _has_weights(layer):
                 continue
             moe = layer.block_sparse_moe
             base = f"{prefix}model.layers.{layer_idx}.block_sparse_moe.experts"
@@ -2541,7 +2567,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         mla_mixers = [
             layer.self_attn.mixer
             for layer in self.model.layers
-            if not getattr(layer, "is_kda", True)
+            if not getattr(layer, "is_kda", True) and _has_weights(layer)
         ]
         mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
         mla_head_shard_linears = {}
@@ -2864,7 +2890,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # This must run after every KDA parameter is loaded and sharded.
         num_kda_fused = 0
         for layer in self.model.layers:
-            if getattr(layer, "is_kda", False):
+            if getattr(layer, "is_kda", False) and _has_weights(layer):
                 if not kda_fp8:
                     layer.self_attn.finalize_decode_weights()
                 num_kda_fused += int(
@@ -2919,7 +2945,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     # in BF16.
                     n_glue = 0
                     for layer in self.model.layers:
-                        if getattr(layer, "is_kda", False):
+                        if getattr(layer, "is_kda", False) and _has_weights(layer):
                             layer.self_attn.finalize_decode_weights_fp8()
                             n_glue += int(layer.self_attn._bfa_proj_weight is not None)
                     logger.info(

@@ -188,6 +188,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
+  - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests
   # ------------- KV Cache V2 Scheduler IT ---------------
@@ -230,6 +231,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_fa4_key_padding_mask.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
