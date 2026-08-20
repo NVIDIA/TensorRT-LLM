@@ -1418,8 +1418,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
+        "AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM", "DENSEGEMM",
+        "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"] = Field(
             default='AUTO',
             description="MoE backend to use. "
@@ -1848,6 +1848,17 @@ class DecodingBaseConfig(StrictBaseModel):
         "Deploy-time specialization of the one-model advanced sampler that skips disabled "
         "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
         "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
+
+    enable_penalty: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, enables the occurrence penalties (repetition / presence / frequency) "
+        "for one-model speculative decoding. Off by default because the penalties need a "
+        "[num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front "
+        "(CUDA graphs capture fixed buffer addresses). While off, a request that asks for "
+        "any of these penalties is rejected at admission rather than silently decoded "
+        "without them.")
 
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
