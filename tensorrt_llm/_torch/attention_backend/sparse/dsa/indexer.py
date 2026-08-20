@@ -704,7 +704,10 @@ class Indexer(nn.Module):
         self._use_self_sampling_topk = (
             os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") == "1"
             and IS_CUTLASS_DSL_AVAILABLE
-            and get_sm_version() >= 100
+            # validated datacenter Blackwell only (B200/B300); consumer
+            # Blackwell (sm_120/121) lacks thread-block clusters and is
+            # not a supported target for these kernels
+            and get_sm_version() in (100, 103)
             and sparse_params.index_topk in (512, 1024, 2048)
             and compress_ratio in (1, 4)
         )

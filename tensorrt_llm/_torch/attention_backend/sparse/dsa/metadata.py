@@ -298,8 +298,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
             return
         # same hardware gates as the dispatch flag (indexer __init__): never
-        # compile Blackwell kernels on unsupported stacks during warmup
-        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() < 100:
+        # compile these kernels on unsupported stacks during warmup
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
             return
         if not self.enable_heuristic_topk or self.kv_cache_manager is None:
             return
