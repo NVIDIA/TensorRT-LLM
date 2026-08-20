@@ -509,6 +509,32 @@ def _summarize_metric(
 _DENOISING_STEP_PATTERN = re.compile(
     r"Step ([0-9]+)/([0-9]+)\s*\|\s*([0-9]+(?:\.[0-9]+)?)s"
 )
+_TOTAL_PIPELINE_PATTERN = re.compile(
+    r"Total pipeline time:\s*([0-9]+(?:\.[0-9]+)?)s"
+)
+
+
+def _summarize_total_pipeline_times(
+    log_lines: list[str], expected_requests: int
+) -> dict[str, Any]:
+    """Summarize measured total-pipeline times emitted by the server log."""
+    if expected_requests <= 0:
+        return {}
+
+    pipeline_times = [
+        float(match.group(1))
+        for line in log_lines
+        if (match := _TOTAL_PIPELINE_PATTERN.search(line))
+    ]
+    # The wrapper always issues one validation request before measurements.
+    if len(pipeline_times) < expected_requests + 1:
+        return {}
+
+    measured_pipeline_times = pipeline_times[-expected_requests:]
+    return {
+        "mean_total_pipeline_time": float(np.mean(measured_pipeline_times)),
+        "total_pipeline_times": measured_pipeline_times,
+    }
 
 
 def _summarize_denoising_step_times(

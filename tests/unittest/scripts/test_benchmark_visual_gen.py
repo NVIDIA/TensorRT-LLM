@@ -298,6 +298,35 @@ def test_denoising_step_percentiles_require_complete_measured_request() -> None:
     )
 
 
+def test_total_pipeline_time_uses_only_measured_requests() -> None:
+    result = benchmark._summarize_total_pipeline_times(
+        [
+            "[TRT-LLM] [_torch] Total pipeline time: 9.00s (validation)",
+            "[TRT-LLM] [_torch] Total pipeline time: 3.00s",
+            "[TRT-LLM] [_torch] Total pipeline time: 4.00s",
+        ],
+        expected_requests=2,
+    )
+
+    assert result == {
+        "mean_total_pipeline_time": pytest.approx(3.5),
+        "total_pipeline_times": [3.0, 4.0],
+    }
+
+
+def test_total_pipeline_time_requires_complete_measured_requests() -> None:
+    assert (
+        benchmark._summarize_total_pipeline_times(
+            [
+                "Total pipeline time: 9.00s (validation)",
+                "Total pipeline time: 3.00s",
+            ],
+            expected_requests=2,
+        )
+        == {}
+    )
+
+
 @pytest.mark.parametrize(
     ("parallel_config", "expected_num_gpus"),
     [

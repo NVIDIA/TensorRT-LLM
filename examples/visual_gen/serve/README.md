@@ -160,14 +160,16 @@ directory by default and retains:
 The result reports average diffusion (`mean_denoise`), generation
 (`mean_generation`), request latency (`mean_latency`), seconds per denoising
 step when the resolved step count is known, and Cosmos3 vision-decode time when
-the server log exposes it. The wrapper also parses the individual measured
-`Step i/N` log lines into `mean_denoising_step_time` and
+the server log exposes it. The wrapper parses the measured server-log entries
+for `Total pipeline time` into `mean_total_pipeline_time`; this is a log-derived
+extension rather than an exact benchmark-schema field. `SAVE_DETAILED=true`
+also retains the raw `total_pipeline_times` samples. The wrapper also parses the
+individual measured `Step i/N` log lines into `mean_denoising_step_time` and
 `percentiles_denoising_step_time` (`p95` and `p99`); `SAVE_DETAILED=true` also
 retains the raw `denoising_step_times` samples. These are per-step tail timings,
 not percentiles across whole requests. The log-derived mean can differ slightly
-from `mean_seconds_per_denoising_step` because step log lines are rounded.
-`Total pipeline time` has no exact benchmark-schema equivalent and remains only
-in `server.log`.
+from `mean_seconds_per_denoising_step` because step log lines are rounded. The
+original total-pipeline timing lines remain in `server.log`.
 
 ## Examples
 
