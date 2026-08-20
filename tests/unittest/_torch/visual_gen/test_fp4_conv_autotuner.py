@@ -31,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
     NVFP4WanCausalConv3d,
     WanCausalConv3d,
     _fp4_compile_cache,
+    _supports_nvfp4_device,
 )
 
 
@@ -248,8 +249,8 @@ def test_selected_tactic_fast_cache_obeys_tuning_and_capture(monkeypatch):
 
 
 def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("NVFP4 Conv3d autotuning requires a Blackwell GPU")
+    if not _supports_nvfp4_device(torch.device("cuda")):
+        pytest.skip("NVFP4 Conv3d autotuning requires an SM100-family GPU")
 
     AutoTuner.get().clear_cache()
     clear_fp4_conv_tactic_cache()
@@ -302,8 +303,8 @@ def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
 
 
 def test_fixed_fp4_conv_residual_tactic_matches_bf16_reference():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("NVFP4 Conv3d requires a Blackwell GPU")
+    if not _supports_nvfp4_device(torch.device("cuda")):
+        pytest.skip("NVFP4 Conv3d requires an SM100-family GPU")
 
     AutoTuner.get().clear_cache()
     clear_fp4_conv_tactic_cache()
