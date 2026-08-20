@@ -3001,7 +3001,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     @torch.library.register_fake(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell")
     def _(
-        input: torch.Tensor,
+        input_tensor: torch.Tensor,
         weight: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
