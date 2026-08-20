@@ -23,6 +23,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "build_wheel.py"
 MSA_INTERFACE = Path("python/fmha_sm100/cute/interface.py")
+MSA_API = Path("python/fmha_sm100/api.py")
+MSA_LOAD_HEADER = Path("python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp")
+MSA_MAINLOOP_HEADER = Path(
+    "python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"
+)
+MSA_SELECTED_STAGE = Path("python/fmha_sm100/cute/src/sm100/fwd_decode/selected_nvfp4_to_fp8.py")
 MSA_PATCH = Path("3rdparty/patches/msa_strided_paged_kv.patch")
 
 _SPEC = importlib.util.spec_from_file_location("build_wheel", SCRIPT_PATH)
@@ -53,10 +59,17 @@ def _stage_project(tmp_path: Path) -> Path:
 
 def test_apply_msa_patch_is_idempotent_in_place(tmp_path):
     project_dir = _stage_project(tmp_path)
-    patched_interface = project_dir / "3rdparty" / "MSA" / MSA_INTERFACE
+    patched_msa = project_dir / "3rdparty" / "MSA"
+    patched_interface = patched_msa / MSA_INTERFACE
 
     apply_msa_patch(project_dir)
     assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+    assert "kv_physical_block_indexes" in (patched_msa / MSA_API).read_text()
+    assert "kv_physical_block_indexes" in (patched_msa / MSA_LOAD_HEADER).read_text()
+    assert "sparse_custom_mask" in (patched_msa / MSA_MAINLOOP_HEADER).read_text()
+    selected_stage = (patched_msa / MSA_SELECTED_STAGE).read_text()
+    assert "def stage_selected_nvfp4_to_fp8" in selected_stage
+    assert "direct_q2k_topk=topk" not in selected_stage
 
     # A second call must short-circuit via the reverse-check guard rather than
     # raise, leaving the patched content in place.
