@@ -2998,6 +2998,48 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         runner(inputs, tactic=best_tactic)
 
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+        expert_counts: Optional[torch.Tensor] = None,
+        expert_capacity: int = 0,
+    ) -> None:
+        num_tokens = token_final_scales.size(0)
+        n = weight.size(1)
+        if output.shape != (num_tokens, n):
+            raise ValueError(
+                "CuTeDSL grouped GEMM finalize output shape must be "
+                f"{(num_tokens, n)}, got {tuple(output.shape)}")
+        if output.dtype != output_dtype:
+            raise ValueError(
+                "CuTeDSL grouped GEMM finalize output dtype must match "
+                f"output_dtype={output_dtype}, got {output.dtype}")
+        if expert_counts is None and expert_capacity != 0:
+            raise ValueError(
+                "expert_capacity must be zero when expert_counts is absent")
+        if expert_counts is not None and expert_capacity <= 0:
+            raise ValueError(
+                "expert_capacity must be positive when expert_counts is provided"
+            )
+
     @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
         mutates_args=(),

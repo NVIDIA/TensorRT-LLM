@@ -1063,6 +1063,7 @@ class CuteDslFusedMoE(MoEImplBase):
         use_direct_expert_metadata = (
             use_deep_ep_direct_metadata
             and recv_expert_count is not None
+            and self.use_fused_finalize
             and not use_locality_domain
             and is_sm_100f())
 
@@ -1141,11 +1142,24 @@ class CuteDslFusedMoE(MoEImplBase):
         slot_start = weight_view.slot_start
 
         if recv_expert_count is not None:
-            assert deep_ep_expert_capacity is not None
-            assert effective_top_k == 1
-            assert recv_expert_count.dim() == 1
-            assert recv_expert_count.numel() == esp
-            assert x.size(0) == esp * deep_ep_expert_capacity
+            if deep_ep_expert_capacity is None or deep_ep_expert_capacity <= 0:
+                raise ValueError(
+                    "deep_ep_expert_capacity must be positive when "
+                    "recv_expert_count is provided")
+            if effective_top_k != 1:
+                raise ValueError(
+                    "count-native DeepEP metadata requires effective_top_k == 1"
+                )
+            if recv_expert_count.dim() != 1 or recv_expert_count.numel() != esp:
+                raise ValueError(
+                    "recv_expert_count must be a 1D tensor with one count per "
+                    f"local expert; expected {esp} elements, got shape "
+                    f"{tuple(recv_expert_count.shape)}")
+            expected_rows = esp * deep_ep_expert_capacity
+            if x.size(0) != expected_rows:
+                raise ValueError(
+                    "expert-major DeepEP input has the wrong row count; "
+                    f"expected {expected_rows}, got {x.size(0)}")
             if use_count_native_expert_metadata:
                 # The custom-op schema is shared with the direct-metadata path.
                 # Count-native runners interpret each metadata argument as the
@@ -1154,16 +1168,16 @@ class CuteDslFusedMoE(MoEImplBase):
                 tile_idx_to_mn_limit = recv_expert_count
                 expanded_idx_to_permuted_idx = recv_expert_count
                 permuted_idx_to_expanded_idx = recv_expert_count
-                total_num_padded_tokens = None
+                _total_num_padded_tokens = None
                 num_non_exiting_tiles = recv_expert_count
             else:
-                tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_metadata_from_expert_counts(
+                tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, _total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_metadata_from_expert_counts(
                     expert_counts=recv_expert_count,
                     capacity=deep_ep_expert_capacity,
                     tile_size=tile_size,
                 )
         else:
-            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
+            tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, _total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
                 num_experts=self.num_slots,

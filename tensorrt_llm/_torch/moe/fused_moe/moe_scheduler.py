@@ -238,6 +238,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
             and not moe.backend.disable_deep_ep_direct_metadata
             and moe.backend.has_nvfp4
             and supports_post_quant
+            and moe.backend.use_fused_finalize
+            and moe.routing_method.experts_per_token == 1
         )
 
     # ------------------------------------------------------------------

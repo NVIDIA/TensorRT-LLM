@@ -265,6 +265,7 @@ def test_moe_sort(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize("slot_start", [0, 13])
 @pytest.mark.parametrize("all_zero", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_moe_metadata_from_expert_counts_matches_sort_and_permute_output(
     tile_size: int, slot_start: int, all_zero: bool
 ):
@@ -303,7 +304,7 @@ def test_moe_metadata_from_expert_counts_matches_sort_and_permute_output(
         tile_size=tile_size,
     )
 
-    for old_tensor, direct_tensor in zip(old_metadata, direct_metadata):
+    for old_tensor, direct_tensor in zip(old_metadata, direct_metadata, strict=True):
         assert direct_tensor.shape == old_tensor.shape
         assert direct_tensor.dtype == old_tensor.dtype
 
@@ -372,6 +373,7 @@ def test_moe_metadata_from_expert_counts_matches_sort_and_permute_output(
     torch.testing.assert_close(direct_output, old_output)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_moe_metadata_from_expert_counts_rejects_int32_padded_size_overflow():
     int32_max = torch.iinfo(torch.int32).max
     counts = torch.zeros(2, dtype=torch.int32, device="cuda")

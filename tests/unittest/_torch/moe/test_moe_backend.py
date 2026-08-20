@@ -329,6 +329,7 @@ def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
     backend.disable_deep_ep_direct_metadata = disabled
+    backend.use_fused_finalize = True
     backend._weights_created = True
     backend.quant_config = SimpleNamespace(
         layer_quant_mode=SimpleNamespace(
@@ -336,7 +337,11 @@ def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
         ),
     )
     scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
-    scheduler.moe = SimpleNamespace(backend=backend, comm=comm)
+    scheduler.moe = SimpleNamespace(
+        backend=backend,
+        comm=comm,
+        routing_method=SimpleNamespace(experts_per_token=1),
+    )
 
     assert scheduler._use_cutedsl_deep_ep_direct_metadata(supports_post_quant) is expected
 
@@ -356,6 +361,33 @@ def test_scheduler_rejects_direct_metadata_for_other_backend_or_communication():
     assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False
 
 
+@pytest.mark.parametrize(
+    "use_fused_finalize,experts_per_token",
+    [(False, 1), (True, 2)],
+)
+def test_scheduler_rejects_direct_metadata_without_finalize_or_top1(
+    use_fused_finalize: bool, experts_per_token: int
+):
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.disable_deep_ep_direct_metadata = False
+    backend.use_fused_finalize = use_fused_finalize
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=MagicMock(return_value=True),
+        ),
+    )
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        backend=backend,
+        comm=comm,
+        routing_method=SimpleNamespace(experts_per_token=experts_per_token),
+    )
+
+    assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False
+
+
 @pytest.mark.parametrize("disabled,expected", [(False, True), (True, False)])
 def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(disabled: bool, expected: bool):
     recv_expert_count = torch.tensor([3, 0, 5], dtype=torch.int32)
@@ -365,8 +397,10 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(disabled: bool, ex
         "recv_expert_count": recv_expert_count,
         "expert_capacity": expert_capacity,
     }
+    comm.enable_postquant_alltoall = False
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
     backend.disable_deep_ep_direct_metadata = disabled
+    backend.use_fused_finalize = True
     backend._weights_created = True
     backend.quant_config = SimpleNamespace(
         layer_quant_mode=SimpleNamespace(
@@ -378,12 +412,16 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(disabled: bool, ex
         backend=backend,
         comm=comm,
         enable_alltoall=False,
+        routing_method=SimpleNamespace(experts_per_token=1),
     )
+
+    use_direct_metadata = scheduler._use_cutedsl_deep_ep_direct_metadata(True)
+    assert use_direct_metadata is expected
 
     plan = scheduler._build_comm_plan(
         all_rank_num_tokens=None,
         output_dtype=torch.bfloat16,
-        use_deep_ep_direct_metadata=expected,
+        use_deep_ep_direct_metadata=use_direct_metadata,
     )
 
     assert plan.recv_expert_count is recv_expert_count
