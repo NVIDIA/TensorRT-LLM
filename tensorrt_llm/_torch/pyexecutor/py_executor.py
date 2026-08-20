@@ -4348,6 +4348,11 @@ class PyExecutor:
                 if not can_queue and scheduled_batch.encoder_requests:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
+                if not can_queue:
+                    # Nothing runs this iteration; only a KV transfer completing
+                    # can unblock it, so pace the loop instead of spinning.
+                    time.sleep(0.001)
+
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
@@ -5178,6 +5183,11 @@ class PyExecutor:
 
                 if not can_queue and scheduled_batch.encoder_requests:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
+
+                if not can_queue:
+                    # Nothing runs this iteration; only a KV transfer completing
+                    # can unblock it, so pace the loop instead of spinning.
+                    time.sleep(0.001)
 
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
