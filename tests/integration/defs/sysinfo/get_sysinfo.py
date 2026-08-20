@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -108,15 +108,20 @@ def is_power():
     return platform.processor() == "ppc64le"
 
 
-def get_linux_distribution():
+def get_linux_distribution() -> tuple[str, str, str]:
     try:
-        import distro
-        return (distro.id(), distro.version(), distro.codename())
-    except:
+        os_release = platform.freedesktop_os_release()
+    except OSError as error:
         logger.warning(
-            "Unable to use distro module, defaulting operating system to ('na', 'na', 'na')"
-        )
+            "Unable to read OS release information, defaulting operating system "
+            "to ('na', 'na', 'na'): %s", error)
         return ("na", "na", "na")
+
+    return (
+        os_release.get("ID", "na"),
+        os_release.get("VERSION_ID", "na"),
+        os_release.get("VERSION_CODENAME", "na"),
+    )
 
 
 def is_windows():

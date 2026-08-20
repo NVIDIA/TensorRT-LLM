@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pathlib
+import sys
+
+import pytest
+
+_SYSINFO_DIR = pathlib.Path(__file__).resolve().parents[2] / "integration" / "defs" / "sysinfo"
+sys.path.insert(0, str(_SYSINFO_DIR))
+
+import get_sysinfo  # noqa: E402
+
+
+def test_get_linux_distribution_from_os_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        get_sysinfo.platform,
+        "freedesktop_os_release",
+        lambda: {
+            "ID": "ubuntu",
+            "VERSION_ID": "24.04",
+            "VERSION_CODENAME": "noble",
+        },
+    )
+
+    assert get_sysinfo.get_linux_distribution() == ("ubuntu", "24.04", "noble")
+
+
+def test_get_linux_distribution_without_os_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_os_error() -> dict[str, str]:
+        raise OSError("os-release is unavailable")
+
+    monkeypatch.setattr(get_sysinfo.platform, "freedesktop_os_release", raise_os_error)
+
+    assert get_sysinfo.get_linux_distribution() == ("na", "na", "na")
