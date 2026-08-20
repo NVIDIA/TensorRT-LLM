@@ -94,8 +94,93 @@ class OpenSearchDB:
     logger = logging.getLogger(__name__)
     query_build_id_cache: dict = {}
 
+    # Structured log prefixes for OpenSearch DB access.  External log
+    # aggregation systems can filter on [OpenSearchDB][ERROR] without
+    # relying on the DB itself.  Each log line is guaranteed single-line
+    # (newlines replaced) so grep always captures the full message.
+    #
+    # Tag format after the level: (op=query|post, cat=<category>, db=<project>[, status=N][, attempt=M/N])
+    _LOG_TAG = "[OpenSearchDB]"
+
     def __init__(self) -> None:
         pass
+
+    @staticmethod
+    def _sanitize_log(msg: str, max_len: int = 1000) -> str:
+        """Collapse newlines and cap length for single-line log output."""
+        return msg.replace("\n", " | ").replace("\r", "")[:max_len]
+
+    @staticmethod
+    def _log(
+        level: str,
+        op: str,
+        db: str,
+        msg: str,
+        *,
+        cat: str | None = None,
+        status: int | None = None,
+        attempt: int | None = None,
+        total: int | None = None,
+        url: str | None = None,
+    ) -> None:
+        """Emit a single-line structured log entry for an OpenSearch DB operation.
+
+        :param level: Logging level: 'debug', 'info', 'warning', or 'error'.
+        :param op: Operation type, e.g. 'query' or 'post'.
+        :param db: Target project/index name (sanitized automatically).
+        :param msg: Human-readable message body (newlines collapsed automatically).
+        :param cat: Error category, e.g. 'config', 'network', 'exhausted'.
+        :param status: HTTP status code, if applicable.
+        :param attempt: Current retry attempt number (pair with total).
+        :param total: Total retry count (pair with attempt).
+        :param url: Request URL appended at the end of the message (sanitized).
+        """
+        _LEVEL_TAG = {
+            "debug": "DEBUG",
+            "info": "INFO",
+            "warning": "WARN",
+            "error": "ERROR",
+        }
+        try:
+            level_lower = level.lower()
+            log_method = getattr(OpenSearchDB.logger, level_lower, None)
+            if log_method is None:
+                OpenSearchDB.logger.error(
+                    f"[OpenSearchDB][ERROR] _log() called with invalid level={level!r}; "
+                    f"op={op!r}, db={db!r}, msg={msg!r}")
+                log_method = OpenSearchDB.logger.error
+                level_lower = "error"
+
+            parts = [f"op={op}"]
+            if cat is not None:
+                parts.append(f"cat={cat}")
+            if status is not None:
+                parts.append(f"status={status}")
+            parts.append(f"db={OpenSearchDB._sanitize_log(db, max_len=200)}")
+            if attempt is not None and total is not None:
+                parts.append(f"attempt={attempt}/{total}")
+            elif attempt is not None or total is not None:
+                OpenSearchDB.logger.error(
+                    f"[OpenSearchDB][ERROR] _log() requires both attempt and total, "
+                    f"or neither; got attempt={attempt!r}, total={total!r}")
+
+            body = OpenSearchDB._sanitize_log(msg)
+            if url is not None:
+                body += f", url: {OpenSearchDB._sanitize_log(url)}"
+
+            tag = _LEVEL_TAG.get(level_lower, level_lower.upper())
+            log_line = (f"{OpenSearchDB._LOG_TAG}[{tag}]"
+                        f"({', '.join(parts)}) {body}")
+            log_method(log_line)
+        except Exception as exc:
+            # _log itself must never raise — emit a raw fallback record
+            try:
+                OpenSearchDB.logger.error(
+                    f"[OpenSearchDB][ERROR] _log() internal error "
+                    f"({type(exc).__name__}: {exc}); "
+                    f"original: level={level!r} op={op!r} db={db!r}")
+            except Exception:
+                pass  # absolute last resort
 
     @staticmethod
     def typeCheckForOpenSearchDB(json_data) -> bool:
@@ -232,105 +317,236 @@ class OpenSearchDB:
         :param json_data: Data to post, type dict or list.
         :param project: Name of the project.
         :return: bool, True if post successful, False otherwise.
+                 This function never raises exceptions.
         """
         use_poc_db = "sandbox" in project
+
+        if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
+            OpenSearchDB._log("info", "post", project,
+                              "disabled for local test, skipping")
+            return True
+
         if not OPEN_SEARCH_DB_BASE_URL:
-            OpenSearchDB.logger.info("OPEN_SEARCH_DB_BASE_URL is not set")
+            OpenSearchDB._log("error",
+                              "post",
+                              project,
+                              "OPEN_SEARCH_DB_BASE_URL is not set",
+                              cat="config")
             return False
         if not use_poc_db and (not OPEN_SEARCH_DB_USERNAME
                                or not OPEN_SEARCH_DB_PASSWORD):
-            OpenSearchDB.logger.info(
-                "OPEN_SEARCH_DB_USERNAME or OPEN_SEARCH_DB_PASSWORD is not set")
+            OpenSearchDB._log(
+                "error",
+                "post",
+                project,
+                "OPEN_SEARCH_DB_USERNAME or OPEN_SEARCH_DB_PASSWORD is not set",
+                cat="config")
             return False
         if not use_poc_db and project not in WRITE_ACCESS_PROJECT_NAME:
-            OpenSearchDB.logger.info(
-                f"project {project} is not in write access project list: {json.dumps(WRITE_ACCESS_PROJECT_NAME)}"
+            OpenSearchDB._log(
+                "error",
+                "post",
+                project,
+                f"project not in write access list: {json.dumps(WRITE_ACCESS_PROJECT_NAME)}",
+                cat="config",
             )
             return False
         if not OpenSearchDB.typeCheckForOpenSearchDB(json_data):
-            OpenSearchDB.logger.info(
-                f"OpenSearchDB type check failed! json_data:{json_data}")
+            OpenSearchDB._log("error",
+                              "post",
+                              project,
+                              "data type check failed",
+                              cat="type_check")
             return False
 
-        json_data_dump = json.dumps(json_data)
-
-        if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
-            OpenSearchDB.logger.info(
-                f"OpenSearchDB is disabled for local test, skip posting to OpenSearchDB: {json_data_dump}"
-            )
-            return True
+        try:
+            json_data_dump = json.dumps(json_data)
+        except (TypeError, ValueError) as e:
+            OpenSearchDB._log("error", "post", project, str(e), cat="serialize")
+            return False
 
         url = f"{OPEN_SEARCH_DB_BASE_URL}/dataflow2/{project}/posting"
         headers = {
             "Content-Type": "application/json",
-            "Accept-Charset": "UTF-8"
+            "Accept-Charset": "UTF-8",
         }
 
-        last_text = "N/A"
-        for attempt in range(DEFAULT_RETRY_COUNT):
+        last_error = "N/A"
+        for attempt in range(1, DEFAULT_RETRY_COUNT + 1):
             try:
                 status_code, last_text = OpenSearchDB._postOnce(
                     url, json_data_dump, headers, use_poc_db)
                 if status_code in (200, 201, 202):
                     if status_code != 200 and project == JOB_PROJECT_NAME:
-                        OpenSearchDB.logger.info(
-                            f"OpenSearchDB post not 200, log:{status_code} {last_text}"
-                        )
+                        OpenSearchDB._log(
+                            "info", "post", project,
+                            f"accepted with status {status_code}")
                     return True
-                else:
-                    OpenSearchDB.logger.info(
-                        f"OpenSearchDB post failed, will retry, error:{status_code} {last_text}"
-                    )
+
+                last_error = f"HTTP {status_code}: {last_text[:200]}"
+
+                if OpenSearchDB._is_non_retryable(status_code):
+                    OpenSearchDB._log("error",
+                                      "post",
+                                      project,
+                                      last_error,
+                                      cat="non_retryable",
+                                      status=status_code,
+                                      url=url)
+                    return False
+
+                if attempt < DEFAULT_RETRY_COUNT:
+                    OpenSearchDB._log("warning",
+                                      "post",
+                                      project,
+                                      "will retry",
+                                      cat="transient",
+                                      status=status_code,
+                                      attempt=attempt,
+                                      total=DEFAULT_RETRY_COUNT)
             except Exception as e:
-                OpenSearchDB.logger.info(
-                    f"OpenSearchDB post exception, attempt {attempt + 1} error: {e}"
-                )
-        OpenSearchDB.logger.info(
-            f"Fail to postToOpenSearchDB after {DEFAULT_RETRY_COUNT} tries: {url}, json: {json_data_dump}, last error: {last_text}"
+                last_error = f"{type(e).__name__}: {e}"
+                OpenSearchDB._log("warning",
+                                  "post",
+                                  project,
+                                  last_error,
+                                  cat="network",
+                                  attempt=attempt,
+                                  total=DEFAULT_RETRY_COUNT,
+                                  url=url)
+
+            if attempt < DEFAULT_RETRY_COUNT:
+                time.sleep(min(attempt * 2, 10))
+
+        OpenSearchDB._log(
+            "error",
+            "post",
+            project,
+            f"failed after {DEFAULT_RETRY_COUNT} attempts, last error: {last_error}",
+            cat="exhausted",
+            url=url,
         )
         return False
 
+    # HTTP status codes where retry makes sense (transient server/network issues)
+    _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+    # Any 4xx except 429 is a client error — the request itself is wrong, retry won't help.
+    # Use _is_non_retryable() rather than checking this set directly.
+    _NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 405, 413, 414}
+
     @staticmethod
-    def queryFromOpenSearchDB(json_data, project) -> dict:
+    def _is_non_retryable(status_code: int) -> bool:
+        """Return True for 4xx client errors (except 429 Too Many Requests)."""
+        return 400 <= status_code < 500 and status_code != 429
+
+    @staticmethod
+    def queryFromOpenSearchDB(json_data, project):
         """
         Query data from OpenSearchDB.
 
         :param json_data: Data to query, type dict or list.
         :param project: Name of the project.
-        :return: dict, query result.
+        :return: requests.Response on success, None on failure.
+                 This function never raises exceptions.
         """
+        if requests is None:
+            OpenSearchDB._log("error",
+                              "query",
+                              project,
+                              "requests package is not available",
+                              cat="config")
+            return None
+
         use_poc_db = "sandbox" in project
         if not OPEN_SEARCH_DB_BASE_URL:
-            OpenSearchDB.logger.info("OPEN_SEARCH_DB_BASE_URL is not set")
+            OpenSearchDB._log("error",
+                              "query",
+                              project,
+                              "OPEN_SEARCH_DB_BASE_URL is not set",
+                              cat="config")
             return None
         if not use_poc_db and project not in READ_ACCESS_PROJECT_NAME:
-            OpenSearchDB.logger.info(
-                f"project {project} is not in read access project list: {json.dumps(READ_ACCESS_PROJECT_NAME)}"
+            OpenSearchDB._log(
+                "error",
+                "query",
+                project,
+                f"project not in read access list: {json.dumps(READ_ACCESS_PROJECT_NAME)}",
+                cat="config",
             )
             return None
-        if not isinstance(json_data, str):
-            json_data_dump = json.dumps(json_data)
-        else:
-            json_data_dump = json_data
+        try:
+            if not isinstance(json_data, str):
+                json_data_dump = json.dumps(json_data)
+            else:
+                json_data_dump = json_data
+        except (TypeError, ValueError) as e:
+            OpenSearchDB._log("error",
+                              "query",
+                              project,
+                              str(e),
+                              cat="serialize")
+            return None
+
         url = f"{OPEN_SEARCH_DB_BASE_URL}/opensearch/df-{project}-*/_search"
         headers = {
             "Content-Type": "application/json",
-            "Accept-Charset": "UTF-8"
+            "Accept-Charset": "UTF-8",
         }
-        retry_time = DEFAULT_RETRY_COUNT
-        while retry_time:
-            res = requests.get(url,
-                               data=json_data_dump,
-                               headers=headers,
-                               timeout=QUERY_TIMEOUT_SECONDS)
-            if res.status_code in [200, 201, 202]:
-                return res
-            OpenSearchDB.logger.info(
-                f"OpenSearchDB query failed, will retry, error:{res.status_code} {res.text}"
-            )
-            retry_time -= 1
-        OpenSearchDB.logger.info(
-            f"Fail to queryFromOpenSearchDB after {retry_time} retry: {url}, json: {json_data_dump}, error: {res.text}"
+        last_error = "N/A"
+        for attempt in range(1, DEFAULT_RETRY_COUNT + 1):
+            try:
+                res = requests.get(url,
+                                   data=json_data_dump,
+                                   headers=headers,
+                                   timeout=QUERY_TIMEOUT_SECONDS)
+                if res.status_code in (200, 201, 202):
+                    return res
+
+                last_error = f"HTTP {res.status_code}: {res.text[:200]}"
+
+                # Client errors (4xx except 429) — input is wrong, retry won't help
+                if OpenSearchDB._is_non_retryable(res.status_code):
+                    OpenSearchDB._log("error",
+                                      "query",
+                                      project,
+                                      last_error,
+                                      cat="non_retryable",
+                                      status=res.status_code,
+                                      url=url)
+                    return None
+
+                # Server errors (5xx, 429) — transient, worth retrying
+                if attempt < DEFAULT_RETRY_COUNT:
+                    OpenSearchDB._log("warning",
+                                      "query",
+                                      project,
+                                      "will retry",
+                                      cat="transient",
+                                      status=res.status_code,
+                                      attempt=attempt,
+                                      total=DEFAULT_RETRY_COUNT)
+            except requests.exceptions.RequestException as e:
+                last_error = f"{type(e).__name__}: {e}"
+                OpenSearchDB._log("warning",
+                                  "query",
+                                  project,
+                                  last_error,
+                                  cat="network",
+                                  attempt=attempt,
+                                  total=DEFAULT_RETRY_COUNT,
+                                  url=url)
+
+            if attempt < DEFAULT_RETRY_COUNT:
+                time.sleep(min(attempt * 2, 10))
+
+        OpenSearchDB._log(
+            "error",
+            "query",
+            project,
+            f"failed after {DEFAULT_RETRY_COUNT} attempts, last error: {last_error}",
+            cat="exhausted",
+            url=url,
         )
         return None
 
