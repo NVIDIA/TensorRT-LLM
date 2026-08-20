@@ -23,8 +23,17 @@ cannot serve a case (dtype/layout/feature) are skipped via the capability matrix
 
 import pytest
 import torch
-from backend_case import BACKENDS_UNDER_TEST, BackendCase, generate_inputs, run_backend, run_case
+from backend_case import (
+    BACKENDS_UNDER_TEST,
+    BackendCase,
+    _assert_sparse_end_to_end_matches_golden,
+    _assert_sparse_indexer_matches_golden,
+    generate_inputs,
+    run_backend,
+    run_case,
+)
 from model_attn_config import MODEL_CONFIGS, ModelAttnConfig
+from utils.util import getSMVersion
 
 # Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
 # fp8 KV cache with bf16 compute.
@@ -50,8 +59,8 @@ def get_long_seq_len(window: int) -> int:
     return window + 17
 
 
-def _phases_from_window(window: int) -> dict:
-    long_len = get_long_seq_len(window)
+def _phases(long_len: int, gen_len: int) -> dict:
+    """The ctx/gen/mix batch shapes, parameterized by context and generation len."""
     return {
         "ctx": dict(
             seq_lens=[long_len, 73, 41],
@@ -59,16 +68,20 @@ def _phases_from_window(window: int) -> dict:
             num_contexts=3,
         ),
         "gen": dict(
-            seq_lens=[1, 1, 1],
+            seq_lens=[gen_len] * 3,
             num_cached_tokens=[long_len, 73, 41],
             num_contexts=0,
         ),
         "mix": dict(
-            seq_lens=[long_len, 1, 1],
+            seq_lens=[long_len, gen_len, gen_len],
             num_cached_tokens=[0, long_len, 73],
             num_contexts=1,
         ),
     }
+
+
+def _phases_from_window(window: int) -> dict:
+    return _phases(get_long_seq_len(window), gen_len=1)
 
 
 # Standard self-attention batch phases. Non-sliding cases use a nominal window
@@ -77,7 +90,130 @@ def _phases_from_window(window: int) -> dict:
 _PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 
 
+# Model-agnostic sparse sweep dimensions, shared by every sparse config.
+_SPARSE_COMPUTE_DTYPE = "bfloat16"
+_SPARSE_KV_LAYOUT = "HND"
+_SPARSE_PAGE_SIZE = 64
+_SPARSE_USE_KVM_V2 = False
+
+
+def test_sparse_indexer_golden_validation():
+    case = BackendCase(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=8,
+        seq_lens=[20],
+        num_cached_tokens=[0],
+        num_contexts=1,
+    )
+    golden_topk = torch.full((20, 20), -1, dtype=torch.int32)
+    for row in range(20):
+        golden_topk[row, : row + 1] = torch.arange(row + 1, dtype=torch.int32)
+    golden = {"context": golden_topk}
+
+    # Selection order and padding position are not part of the contract.
+    _assert_sparse_indexer_matches_golden(
+        {"context": golden_topk.flip(1)}, golden, case=case, compress_ratio=1
+    )
+
+    duplicate = golden_topk.clone()
+    duplicate[-1, -1] = duplicate[-1, -2]
+    with pytest.raises(AssertionError, match="repeats index"):
+        _assert_sparse_indexer_matches_golden(
+            {"context": duplicate}, golden, case=case, compress_ratio=1
+        )
+
+    bad_padding = golden_topk.clone()
+    bad_padding[0, 1] = -2
+    with pytest.raises(AssertionError, match="invalid padding"):
+        _assert_sparse_indexer_matches_golden(
+            {"context": bad_padding}, golden, case=case, compress_ratio=1
+        )
+
+    future = golden_topk.clone()
+    future[0, 0] = 1
+    with pytest.raises(AssertionError, match="future index"):
+        _assert_sparse_indexer_matches_golden(
+            {"context": future}, golden, case=case, compress_ratio=1
+        )
+
+    missing = golden_topk.clone()
+    missing[-1, -1] = -1
+    with pytest.raises(AssertionError, match="valid entries"):
+        _assert_sparse_indexer_matches_golden(
+            {"context": missing}, golden, case=case, compress_ratio=1
+        )
+
+
+@pytest.mark.parametrize(
+    "phase,seq_lens,num_cached_tokens,num_contexts,valid_counts,future_row",
+    [
+        pytest.param(
+            "context",
+            [8],
+            [0],
+            1,
+            [0, 0, 0, 1, 1, 1, 1, 2],
+            3,
+            id="context",
+        ),
+        pytest.param(
+            "generation",
+            [3],
+            [5],
+            0,
+            [1, 1, 2],
+            0,
+            id="generation-cached-prefix",
+        ),
+    ],
+)
+def test_sparse_indexer_golden_validation_uses_compressed_coordinates(
+    phase,
+    seq_lens,
+    num_cached_tokens,
+    num_contexts,
+    valid_counts,
+    future_row,
+):
+    case = BackendCase(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=8,
+        seq_lens=seq_lens,
+        num_cached_tokens=num_cached_tokens,
+        num_contexts=num_contexts,
+    )
+    golden_topk = torch.full((len(valid_counts), 2), -1, dtype=torch.int32)
+    for row, valid_count in enumerate(valid_counts):
+        golden_topk[row, :valid_count] = torch.arange(valid_count, dtype=torch.int32)
+    golden = {phase: golden_topk}
+
+    _assert_sparse_indexer_matches_golden({phase: golden_topk}, golden, case=case, compress_ratio=4)
+
+    future = golden_topk.clone()
+    future[future_row, 0] += 1
+    with pytest.raises(AssertionError, match="future index"):
+        _assert_sparse_indexer_matches_golden({phase: future}, golden, case=case, compress_ratio=4)
+
+
+def test_sparse_end_to_end_golden_rejects_corrupted_token_row():
+    golden = torch.zeros(274, 256)
+    actual = golden.clone()
+    actual[147].fill_(1.0)
+
+    with pytest.raises(AssertionError, match="worst_row_close"):
+        _assert_sparse_end_to_end_matches_golden(
+            actual,
+            golden,
+            atol=0.1,
+            rtol=0.01,
+        )
+
+
 def _phases_for(cfg: ModelAttnConfig) -> dict:
+    if cfg.sparse_attention_config is not None:
+        return _phases(cfg.sparse_topk + 32, gen_len=1)
     if cfg.mask != "sliding":
         return _PHASES
 
@@ -117,7 +253,10 @@ def _common(cfg: ModelAttnConfig) -> dict:
             qk_nope_head_dim=cfg.qk_nope_head_dim,
             qk_rope_head_dim=cfg.qk_rope_head_dim,
             v_head_dim=cfg.v_head_dim,
+            hidden_size=cfg.hidden_size,
         )
+    if cfg.sparse_attention_config is not None:
+        common.update(sparse_attention_config=cfg.sparse_attention_config)
     return common
 
 
@@ -139,6 +278,30 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     """
     common = _common(cfg)
     phases = _phases_for(cfg)
+
+    # Sparse cases use one model-agnostic sweep (bf16 latent cache, fixed layout/
+    # page/manager). Every backend runs its own indexer over shared weights, so
+    # a case covers selection and execution together; the phase lengths
+    # (top-k + 32) keep every long row genuinely sparse.
+    if cfg.sparse_attention_config is not None:
+        manager = "v2" if _SPARSE_USE_KVM_V2 else "v1"
+        tag = (
+            f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{_SPARSE_KV_LAYOUT}"
+            f"-p{_SPARSE_PAGE_SIZE}-{manager}"
+        )
+        for phase_name in ("ctx", "gen", "mix"):
+            yield (
+                f"{cfg.id}-{phase_name}-{tag}",
+                BackendCase(
+                    page_size=_SPARSE_PAGE_SIZE,
+                    kv_layout=_SPARSE_KV_LAYOUT,
+                    dtype=_SPARSE_COMPUTE_DTYPE,
+                    use_kv_cache_manager_v2=_SPARSE_USE_KVM_V2,
+                    **phases[phase_name],
+                    **common,
+                ),
+            )
+        return
 
     # Bidirectional, KV-cache-free DiT / encoder workloads: only compute dtype.
     if cfg.no_cache:
@@ -226,7 +389,13 @@ MODEL_CASES = _model_cases()
 
 @pytest.mark.parametrize("name", list(MODEL_CASES), ids=lambda n: n)
 def test_attention_backend(name):
-    run_case(MODEL_CASES[name])
+    case = MODEL_CASES[name]
+    if case.is_sparse and getSMVersion() < 100:
+        # The backend matrix includes the TRTLLM trtllm-gen sparse FMHA, which
+        # is Blackwell-only. The Vanilla reference itself remains usable below
+        # SM100 through the module's FlashMLA dispatch.
+        pytest.skip(f"DSA requires sm>=100/Blackwell (have sm{getSMVersion()})")
+    run_case(case)
 
 
 # ---------------------------------------------------------------------------
