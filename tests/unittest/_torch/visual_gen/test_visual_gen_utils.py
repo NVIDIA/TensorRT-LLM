@@ -1137,3 +1137,25 @@ class TestReferenceBroadcastSplit:
         peer = pickle.loads(pickle.dumps(req))
         assert peer.ref_sizes == req.ref_sizes
         assert peer.ref_sizes[:2] == [1024, 7]
+
+    def test_dropped_request_releases_its_shared_memory(self):
+        """A handle that is never consumed keeps its shared-memory block mapped
+        until the process exits, so a request that fails on its way to rank0
+        has to consume its own handles on the way out."""
+        import gc
+        import glob
+
+        def blocks():
+            return set(glob.glob("/dev/shm/torch_*"))
+
+        before = blocks()
+        req = self._request(os.urandom(1024 * 1024))
+        req.refs_to_handles()
+        gc.collect()
+        assert len(blocks() - before) == len(req.ref_handles)
+
+        # What the sender thread does when the request never reaches rank0.
+        req.refs_to_bytes()
+        del req
+        gc.collect()
+        assert blocks() - before == set()

@@ -211,8 +211,7 @@ class MockVisualGen:
         # used by tests to assert forwarded VisualGenParams fields.
         self.last_inputs = None
         self.last_params = None
-        # Snapshot of the resolved reference bytes at generation time,
-        # captured before the route cleans them up. Keyed by stored path.
+        # Resolved reference bytes per slot, recorded at generation time.
         self.last_ref_bytes = {}
         # Stand-in for the coordinator-side executor proxy. The async video
         # route reads ``default_generation_params`` / ``extra_param_specs``

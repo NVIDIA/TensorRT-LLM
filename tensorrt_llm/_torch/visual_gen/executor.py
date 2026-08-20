@@ -977,6 +977,7 @@ class DiffusionRemoteClient:
 
     def _process_requests(self):
         """Process pending requests."""
+        req = None
         try:
             req = self.pending_requests.get(timeout=POLL_TIMEOUT)
             if req is None:
@@ -994,6 +995,11 @@ class DiffusionRemoteClient:
         except Exception as e:
             logger.error(f"DiffusionClient: Error sending request: {e}")
             logger.error(traceback.format_exc())
+            if req is not None and req.ref_handles:
+                # The request never reached rank0, so nothing downstream will
+                # consume its handles, and an unconsumed handle keeps its
+                # shared-memory block mapped until this process exits.
+                req.refs_to_bytes()
 
     def _process_responses(self):
         """Poll and process responses."""

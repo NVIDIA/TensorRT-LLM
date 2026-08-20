@@ -172,9 +172,9 @@ class _VideoRoutesMixin:
                     f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
                 )
                 sync_video_start = time.perf_counter()
-                # Offload the blocking resolve/materialize/enqueue off the event
-                # loop but await it, so bad media / bad params still surface as
-                # 400 here; then await generation on the executor's loop.
+                # Offload the blocking resolve/enqueue off the event loop but
+                # await it, so bad media / bad params still surface as 400
+                # here; then await generation on the executor's loop.
                 handle = await asyncio.to_thread(
                     self.generator.generate_async, request.prompt, params
                 )

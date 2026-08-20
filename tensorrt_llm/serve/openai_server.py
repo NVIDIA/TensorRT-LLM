@@ -3074,7 +3074,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_gen_start = time.perf_counter()
-                # Offload the blocking materialize/enqueue off the event loop but
+                # Offload the blocking resolve/enqueue off the event loop but
                 # await it (bad params → 400 here); then await generation.
                 handle = await asyncio.to_thread(self.generator.generate_async,
                                                  request.prompt, params)

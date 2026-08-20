@@ -221,9 +221,9 @@ class TestMediaRefValidation:
         from tensorrt_llm.visual_gen import MediaRef
 
         ref = MediaRef(content="aGk=", format="base64")
-        ref.content = "/tmp/materialized"  # contradicts format for one statement
+        ref.content = "/tmp/ref.png"  # contradicts format for one statement
         ref.format = "path"
-        assert (ref.content, ref.format) == ("/tmp/materialized", "path")
+        assert (ref.content, ref.format) == ("/tmp/ref.png", "path")
 
     def test_unknown_format_rejected(self):
         from pydantic import ValidationError

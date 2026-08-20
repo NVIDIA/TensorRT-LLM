@@ -125,8 +125,8 @@ Conditioning references are supplied through the typed, per-modality fields `ima
 
 | `format` | Content | Notes |
 |---|---|---|
-| `path` | A local file readable by the process running generation | Bare path or `file://` URI. The file must exist, and passes through in place — it is neither copied nor deleted. |
-| `url` | An `http(s)` URL | Fetched through the SSRF-guarded loader, then materialized to a local path. |
+| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. The file must exist; it is read once on the coordinator and is never modified or deleted. |
+| `url` | An `http(s)` URL | Fetched on the coordinator through the SSRF-guarded loader. |
 | `base64` | Base64 text | A `data:` URI is also accepted. |
 | `bytes` | Raw `bytes` | Python API only. Rejected over JSON (HTTP 422) — send `base64` or upload the file via multipart. |
 

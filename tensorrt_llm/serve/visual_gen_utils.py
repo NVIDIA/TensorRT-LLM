@@ -133,7 +133,7 @@ def _build_reference_list(value: Any) -> Optional[list]:
     ``value`` is None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or
     a list of those. Each entry becomes a ``MediaRef`` carrying its transport
     content plus the declared (or, for an upload, implied) wire format.
-    Resolution and materialization happen later at the engine choke point.
+    Resolution to bytes happens later, at the engine choke point.
     """
     if value is None:
         return None
@@ -505,7 +505,7 @@ def parse_visual_gen_params(
             params.num_frames = derived
         # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
         # transport content (``bytes`` for an upload, the string otherwise).
-        # The engine resolves and materializes; the boundary never touches disk.
+        # The engine resolves it to bytes; the boundary never touches disk.
         image_refs = _build_reference_list(request.image_reference)
         if image_refs:
             params.image_reference = image_refs
