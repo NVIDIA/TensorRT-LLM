@@ -4662,7 +4662,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(16)
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
-    def test_w4a16_mxfp4(self, mode, monkeypatch):
+    def test_w4a16_mxfp4(self, mode: str,
+                         monkeypatch: pytest.MonkeyPatch) -> None:
         """GSM8K on the bf16 + MXFP4-routed-expert checkpoint (16 GPUs, DEP16).
 
         No automated L0 stage schedules 16-GPU functional tests; this case is
