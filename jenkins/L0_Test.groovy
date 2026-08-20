@@ -4099,7 +4099,13 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     ].join(" ")
 
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
-    def testCount = sh(returnStdout: true, script: "wc -l < ${testList} | tr -d ' '").trim()
+    // Count non-empty lines, not newlines: trt-test-db writes the test names
+    // with no trailing newline, so `wc -l` undercounts by one -- it reports 0
+    // for a single-test render, which would trip the empty-list guard below
+    // (and mis-report every stage's count by one). `grep -c .` is agnostic to
+    // the missing terminator; `|| true` keeps the zero-match exit 1 from
+    // aborting the step.
+    def testCount = sh(returnStdout: true, script: "grep -c . ${testList} || true").trim()
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
