@@ -2225,17 +2225,11 @@ def _create_kv_cache_manager(
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
-    # Inkling: the KV cache is sized from the text tower, whose geometry lives in
-    # the top-level config's ``text_config``.
-    _is_inkling = is_inkling(config)
-    if _is_inkling:
-        config = getattr(config, "text_config", config)
-
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
     num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
         config, 'num_key_value_heads', num_attention_heads)
-    if _is_inkling:
+    if is_inkling(config):
         # Hybrid per-layer geometry: local (sliding-window) layers use 16 KV
         # heads, global layers 8; head_dim is uniform (128). V2 divides each by
         # tp_size and allocates the paged pool per layer accordingly (the generic
