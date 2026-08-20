@@ -39,7 +39,7 @@ def _make_gate_case() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace
     return layer, tensor, norm
 
 
-def _enable_gate_dependencies(monkeypatch) -> None:
+def _enable_gate_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(deepseekv3, "IS_FLASHINFER_AVAILABLE", True)
     monkeypatch.setattr(deepseekv3, "IS_CUTLASS_DSL_AVAILABLE", True)
     monkeypatch.setattr(deepseekv3, "is_sm_100f", lambda: True)
@@ -64,7 +64,9 @@ def _can_use(
     )
 
 
-def test_wideep_flashinfer_add_add_rmsnorm_accepts_exact_contract(monkeypatch) -> None:
+def test_wideep_flashinfer_add_add_rmsnorm_accepts_exact_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _enable_gate_dependencies(monkeypatch)
     layer, hidden_states, _ = _make_gate_case()
 
@@ -92,7 +94,7 @@ def test_wideep_flashinfer_add_add_rmsnorm_accepts_exact_contract(monkeypatch) -
     ),
 )
 def test_wideep_flashinfer_add_add_rmsnorm_fails_closed(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     rejection: str,
 ) -> None:
     _enable_gate_dependencies(monkeypatch)

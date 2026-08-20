@@ -371,7 +371,20 @@ class RMSNorm(nn.Module):
         additional_residual: torch.Tensor,
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fuse a BF16-rounded MoE output add into FlashInfer RMSNorm."""
+        """Fuse a BF16-rounded MoE output add into FlashInfer RMSNorm.
+
+        Args:
+            hidden_states: BF16 tensor of shape ``(M, H)`` containing one MoE
+                contribution. Mutated in place with the normalized output.
+            additional_residual: BF16 tensor of shape ``(M, H)`` containing
+                the second MoE contribution. This tensor is not modified.
+            residual: BF16 tensor of shape ``(M, H)``. Mutated in place with
+                the BF16-rounded MoE sum plus the original residual.
+
+        Returns:
+            A tuple containing the same ``hidden_states`` and ``residual``
+            tensor objects after their in-place updates.
+        """
         if (self.nvfp4_scale is not None or self.return_hp_output
                 or self.use_gemma or self.use_cuda_tile):
             raise ValueError(
