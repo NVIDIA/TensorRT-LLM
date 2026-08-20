@@ -37,6 +37,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from ..metadata import KVCacheParams
 from ..utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
@@ -578,6 +579,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return self.paged_kv_indices
         total_blocks = self.num_generation_blocks + self.num_context_blocks
         return self._vswa_pool_indices_cache[pool_id][:total_blocks]
+
+    def _sanitize_swa_page_indices(self, page_indices: torch.Tensor,
+                                   layer_idx: int) -> None:
+        """Replace evicted SWA pages with a safe in-range page index."""
+        window_vec = getattr(self.kv_cache_manager, 'max_attention_window_vec',
+                             None)
+        if not window_vec or window_vec[layer_idx % len(window_vec)] is None:
+            return
+
+        # KVCacheManagerV2 marks evicted out-of-window pages with -1.
+        # FlashInfer may dereference page IDs before applying window_left, so
+        # keep masked positions in range. The SWA mask excludes their values
+        # from the attention result.
+        page_indices.masked_fill_(page_indices == BAD_PAGE_INDEX, 0)
 
     def swap_paged_kv_indices_for_layer(self, layer_idx: int) -> None:
         """Copy pool-specific page indices into the shared buffer.
@@ -1542,8 +1557,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
         # indices of used cache blocks for each sequence
+        primary_layer_idx = None
+        if self._vswa_layer_to_pool is not None:
+            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_layer_idx = self._vswa_pool_to_rep_layer[primary_pool_id]
+        else:
+            layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets', {})
+            primary_layer_idx = next(iter(layer_offsets), None)
+
         paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
-            self.request_ids, self.num_blocks)
+            self.request_ids, self.num_blocks, layer_idx=primary_layer_idx)
+        if primary_layer_idx is not None:
+            self._sanitize_swa_page_indices(paged_kv_indices, primary_layer_idx)
 
         self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
             paged_kv_indices, non_blocking=True)
@@ -1579,6 +1604,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 pool_indices = \
                     self.kv_cache_manager.get_batch_cache_indices_flat(
                         self.request_ids, self.num_blocks, layer_idx=rep_layer)
+                self._sanitize_swa_page_indices(pool_indices, rep_layer)
                 buf = getattr(self, f'_vswa_pool_buf_{pool_id}')
                 buf[:pool_indices.size(0)].copy_(pool_indices,
                                                  non_blocking=True)

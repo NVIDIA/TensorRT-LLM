@@ -48,6 +48,7 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
@@ -962,17 +963,16 @@ def _build_gemma4_kv_cache_manager(
 
     # Set per-layer max_attention_window when head_dim or kv_heads differ
     # across layers, so V2 creates separate pool groups for different page
-    # sizes.  ``max_seq_len - 1`` on sliding layers prevents V2 block
-    # eviction that would cause FlashInfer page index OOB when kv_lens
-    # exceeds sliding_window.
+    # sizes.
     sliding_window = getattr(config, "sliding_window", None)
     max_attn_window = None
     needs_vswa = isinstance(head_dim, list) and len(set(head_dim)) > 1
     if not needs_vswa:
         needs_vswa = isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1
     if needs_vswa and sliding_window:
+        swa_window = min(sliding_window, max_seq_len - 1)
         max_attn_window = [
-            max_seq_len - 1 if lt == "sliding_attention" else max_seq_len for lt in layer_types
+            swa_window if lt == "sliding_attention" else max_seq_len for lt in layer_types
         ]
 
     kv_cache_config = KvCacheConfigV2(
@@ -3558,6 +3558,95 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     def test_cuda_graph_decode_26b_like(self):
         """26B-like: GQA=2, K=V, hd=256/512."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG), "26B")
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_with_evicted_swa_pages(self):
+        """FA2 CUDA graph decode safely ignores evicted SWA pages."""
+        config_dict = deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG)
+        config_dict["sliding_window"] = 1024
+        config_dict["max_position_embeddings"] = 4096
+        config = Gemma4TextConfig(**config_dict)
+
+        tokens_per_block = 32
+        cached_tokens = 2046
+        kv_cache_manager = self._get_kv_cache_manager(
+            config,
+            num_blocks=80,
+            tokens_per_block=tokens_per_block,
+            batch_size=1,
+        )
+        self.addCleanup(kv_cache_manager.shutdown)
+
+        requests = kv_cache_manager.add_dummy_requests([0], [cached_tokens + 1], is_gen=True)
+        self.assertIsNotNone(requests)
+        torch.nn.init.normal_(kv_cache_manager.get_buffers(0))
+
+        num_blocks = (cached_tokens + 1 + tokens_per_block - 1) // tokens_per_block
+        raw_indices = kv_cache_manager.get_batch_cache_indices_flat([0], [num_blocks], layer_idx=0)
+        self.assertIn(BAD_PAGE_INDEX, raw_indices.tolist())
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.ones(1, dtype=torch.int),
+            num_contexts=0,
+            is_cuda_graph=True,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[cached_tokens],
+            ),
+            workspace_buffer=torch.empty(
+                _FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"
+            ),
+            max_num_requests=1,
+            max_num_tokens=4096,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=[0],
+        )
+        metadata.prepare()
+        sanitized_indices = metadata.get_paged_kv_indices_for_layer(0)
+        self.assertNotIn(BAD_PAGE_INDEX, sanitized_indices.cpu().tolist())
+
+        layer = FlashInferAttention(
+            layer_idx=0,
+            num_heads=config.num_attention_heads,
+            head_dim=config.head_dim,
+            num_kv_heads=config.num_key_value_heads,
+            q_scaling=1.0 / math.sqrt(config.head_dim),
+            flashinfer_backend="fa2",
+        )
+        query = torch.randn(
+            1,
+            config.num_attention_heads * config.head_dim,
+            dtype=config.torch_dtype,
+            device="cuda",
+        )
+
+        eager_output = None
+        for _ in range(2):
+            eager_output = layer.forward(
+                query,
+                None,
+                None,
+                metadata,
+                attention_window_size=config.sliding_window,
+            )
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = layer.forward(
+                query,
+                None,
+                None,
+                metadata,
+                attention_window_size=config.sliding_window,
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.isfinite(graph_output).all())
+        torch.testing.assert_close(graph_output, eager_output, atol=1e-2, rtol=0)
 
     @torch.no_grad()
     @unittest.mock.patch(
