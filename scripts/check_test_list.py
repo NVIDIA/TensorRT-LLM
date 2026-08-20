@@ -974,6 +974,13 @@ def verify_l0_test_lists(llm_src):
 
 def verify_qa_test_lists(llm_src):
     test_qa_path = f"{llm_src}/tests/integration/test_lists/qa"
+    # Start from a clean qa_test.txt so a stale file left by an earlier run
+    # (this opens it in append mode below) can't inject entries an older
+    # checkout collected into the current parity comparison.
+    try:
+        os.remove(f"{llm_src}/qa_test.txt")
+    except OSError:
+        pass
     # Remove dynamically generated perf tests
     subprocess.run(f"rm -f {test_qa_path}/*perf*", shell=True, check=True)
     test_def_files = subprocess.check_output(
