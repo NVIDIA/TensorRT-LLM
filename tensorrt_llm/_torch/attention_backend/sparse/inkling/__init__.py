@@ -27,7 +27,7 @@ decode kernel needs is a view of the base's own buffers (``page_table.py``).
 from .backend import InklingTritonAttention
 from .cache_manager import InklingHybridCacheManager
 from .conv_state import (
-    CONV_ROLES,
+    CONV_ROLE,
     InklingConvRuntime,
     InklingConvState,
     InklingConvStateCache,

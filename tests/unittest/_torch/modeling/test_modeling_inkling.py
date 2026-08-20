@@ -1929,16 +1929,20 @@ def test_build_cache_config_appends_ssm_layers_for_the_conv_state(monkeypatch):
     assert [int(layer.layer_id) for layer in out.layers] == [0, 1, 2, 3]
     assert mgr._conv_layer_id(0) == 2 and mgr._conv_layer_id(1) == 3
 
-    # Four roles per layer, sized per request (not per block): channels * kwin.
+    # One buffer per layer holding [k | v | attn | mlp], sized per request (not
+    # per block): summed channels * kwin. One pool is what a state transfer
+    # wants -- the section widths travel beside it, as Mamba's [x | B | C] do.
     ssm = out.layers[2]
-    assert [b.role for b in ssm.buffers] == list(cm.CONV_ROLES)
+    assert [b.role for b in ssm.buffers] == [cm.CONV_ROLE]
     itemsize = torch.empty((), dtype=torch.bfloat16).element_size()
-    assert [b.size for b in ssm.buffers] == [
+    sections = [
         8 * 3 * itemsize,  # k, kv_dim
         8 * 3 * itemsize,  # v, kv_dim
         8 * 3 * itemsize,  # attn, hidden
         8 * 3 * itemsize,  # mlp, hidden
     ]
+    assert [b.size for b in ssm.buffers] == [sum(sections)]
+    assert mgr._conv_section_bytes(0) == sections
     # SsmLayerConfig forbids a per-block override -- these are not paged.
     assert all(b.tokens_per_block_override is None for b in ssm.buffers)
 

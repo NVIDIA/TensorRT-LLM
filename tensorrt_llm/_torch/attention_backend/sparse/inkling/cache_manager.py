@@ -49,7 +49,7 @@ from .....logger import logger
 from ....pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
 from ....pyexecutor.llm_request import LlmRequest
 from ....pyexecutor.scheduler import ScheduledRequests
-from .conv_state import CONV_ROLES, InklingConvState, InklingConvStateCache
+from .conv_state import CONV_ROLE, InklingConvState, InklingConvStateCache
 
 
 def _resolve_conv_dtype(pretrained_config) -> torch.dtype:
@@ -301,6 +301,50 @@ class InklingHybridCacheManager(KVCacheManagerV2):
 
     # ======================= end KV cache block reuse =======================
 
+    # ---- conv geometry, all derived from what the base already resolved -----
+    @property
+    def _conv_tp_size(self) -> int:
+        # The attention TP, not the global one: the k/v convs follow the kv-head
+        # split, as V2 does for the paged pool.
+        return 1 if self.mapping.enable_attention_dp else self.mapping.tp_size
+
+    @property
+    def _reserve_attention_dp_slot(self) -> bool:
+        return bool(self.mapping.enable_attention_dp)
+
+    @property
+    def _num_conv_request_slots(self) -> int:
+        # One row per resident sequence; each pipeline stage holds a microbatch.
+        return self.max_batch_size * self.mapping.pp_size
+
+    @property
+    def _num_reserved_conv_slots(self) -> int:
+        # Asked of the pool rather than re-derived: the two counts must agree or
+        # slots_for indexes the V2 buffer out of bounds.
+        return InklingConvStateCache.reserved_slot_count(
+            reserve_attention_dp_slot=self._reserve_attention_dp_slot
+        )
+
+    def _conv_section_bytes(self, global_layer_idx: int) -> List[int]:
+        """Per-slot bytes of the layer's four conv sections, in pool order."""
+        config = self._conv_config
+        kv_dim = (
+            config.layer_num_kv_heads(global_layer_idx) * config.layer_head_dim(global_layer_idx)
+        ) // self._conv_tp_size
+        window = config.sconv_kernel_size - 1
+        itemsize = torch.empty((), dtype=self._conv_dtype).element_size()
+        return [
+            c * window * itemsize for c in (kv_dim, kv_dim, config.hidden_size, config.hidden_size)
+        ]
+
+    def _conv_bytes_per_slot(self, global_layer_idx: int) -> int:
+        """Bytes one request occupies in the layer's conv state.
+
+        One number, not four: the sections share a buffer. ``_conv_section_bytes``
+        keeps their widths, which is what a TP-mismatched transfer splits on.
+        """
+        return sum(self._conv_section_bytes(global_layer_idx))
+
     # ---- V2 configuration -------------------------------------------------
     def _conv_layer_id(self, local_layer_idx: int) -> LayerId:
         """Cache-layer id holding ``local_layer_idx``'s four conv states."""
@@ -325,9 +369,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
                 SsmLayerConfig(
                     layer_id=LayerId(num_attention_layers + local_idx),
                     buffers=[
-                        BufferConfig(role=role, size=nbytes)
-                        for role, nbytes in zip(
-                            CONV_ROLES, self._conv_bytes_per_slot(self.pp_layers[local_idx])
+                        BufferConfig(
+                            role=CONV_ROLE,
+                            size=self._conv_bytes_per_slot(self.pp_layers[local_idx]),
                         )
                     ],
                 )
@@ -357,19 +401,16 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         """Name a role that actually exists in ``pool_id``.
 
         The base returns ``Role.KEY`` unconditionally, but conv pools hold no KEY.
-        The role is resolved rather than named because V2 coalesces the four
-        states by size, so which one represents a pool is its packing decision.
         """
         first_layer = int(self.impl.layer_grouping[pool_id][0])
         if first_layer < self.num_local_layers:
             return super()._get_pool_roles(pool_id)
-        for role in CONV_ROLES:
-            if (pool_id, role) in self._pool_layer_ids_by_role:
-                return role, None
+        if (pool_id, CONV_ROLE) in self._pool_layer_ids_by_role:
+            return CONV_ROLE, None
         raise RuntimeError(
-            f"Inkling conv pool {pool_id} (first layer {first_layer}) holds none "
-            f"of {[str(r) for r in CONV_ROLES]}; _build_cache_config and the pool "
-            "packing disagree about what landed where."
+            f"Inkling conv pool {pool_id} (first layer {first_layer}) does not "
+            f"hold {CONV_ROLE}; _build_cache_config and the pool packing "
+            "disagree about what landed where."
         )
 
     def _conv_state_buffer(

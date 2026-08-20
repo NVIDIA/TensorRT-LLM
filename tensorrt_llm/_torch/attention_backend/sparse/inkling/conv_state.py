@@ -39,20 +39,20 @@ InklingConvState = namedtuple("InklingConvState", ["k", "v", "attn", "mlp"])
 
 
 class InklingRole:
-    """V2 pool roles for the four short convolutions of a decoder layer.
+    """V2 pool role for a decoder layer's short-conv state.
 
-    Four roles despite only two widths: k/v and attn/mlp merely happen to pair up
-    in size today, and V2 coalesces same-sized buffers on its own.
+    One role, not four: the four convolutions share a window length, so they are
+    one buffer per layer holding ``[k | v | attn | mlp]`` along the channel axis.
+    That is also the shape a state transfer wants -- one pool with the section
+    widths beside it, as Mamba stores ``[x | B | C]``.
     """
 
-    CONV_K = DataRole("inkling_conv_k")
-    CONV_V = DataRole("inkling_conv_v")
-    CONV_ATTN = DataRole("inkling_conv_attn")
-    CONV_MLP = DataRole("inkling_conv_mlp")
+    CONV_STATE = DataRole("inkling_conv")
 
 
-# Order matches InklingConvState's fields so the two can be zipped.
-CONV_ROLES = (InklingRole.CONV_K, InklingRole.CONV_V, InklingRole.CONV_ATTN, InklingRole.CONV_MLP)
+CONV_ROLE = InklingRole.CONV_STATE
+# Section order within the buffer; matches InklingConvState's fields.
+CONV_SECTIONS = ("k", "v", "attn", "mlp")
 
 
 class InklingConvStateCache:
@@ -119,23 +119,32 @@ class InklingConvStateCache:
                 return torch.zeros(num_slots, *state_shape, device=device, dtype=dtype)
 
         self._layers: List[InklingConvState] = []
+        self._section_channels: List[List[int]] = []
         for i in range(config.num_hidden_layers):
             kv_dim = (config.layer_num_kv_heads(i) * config.layer_head_dim(i)) // tp_size
             hidden = config.hidden_size
-            bufs = [
-                allocate(i, role, [channels, kwin])
-                for role, channels in zip(CONV_ROLES, (kv_dim, kv_dim, hidden, hidden))
-            ]
-            for buf in bufs:
-                if buf.shape[0] < num_slots:
-                    raise RuntimeError(
-                        f"Inkling conv pool layer {i}: allocator returned "
-                        f"{buf.shape[0]} slots but the pool needs {num_slots} "
-                        f"({num_request_slots} request + reserved). The V2 SSM "
-                        "layer was sized from a different slot count than "
-                        "InklingConvStateCache assumes."
-                    )
-            self._layers.append(InklingConvState(*(b[:num_slots] for b in bufs)))
+            sections = [kv_dim, kv_dim, hidden, hidden]
+            self._section_channels.append(sections)
+            buf = allocate(i, CONV_ROLE, [sum(sections), kwin])
+            if buf.shape[0] < num_slots:
+                raise RuntimeError(
+                    f"Inkling conv pool layer {i}: allocator returned "
+                    f"{buf.shape[0]} slots but the pool needs {num_slots} "
+                    f"({num_request_slots} request + reserved). The V2 SSM "
+                    "layer was sized from a different slot count than "
+                    "InklingConvStateCache assumes."
+                )
+            buf = buf[:num_slots]
+            # Views, not copies. Each is [num_slots, channels, kwin] with the
+            # buffer's own strides; the causal_conv1d ops read conv_state's
+            # strides off the tensor, so a section does not have to be
+            # contiguous across slots -- within one slot it is.
+            offsets = [0]
+            for width in sections:
+                offsets.append(offsets[-1] + width)
+            self._layers.append(
+                InklingConvState(*(buf[:, a:b, :] for a, b in zip(offsets, offsets[1:])))
+            )
         # Refreshed in place per forward so a captured graph aliases it and every
         # replay sees the current batch. Indexed by batch position, not by slot.
         self.state_indices = torch.arange(num_slots, dtype=torch.int32, device=device)
@@ -151,6 +160,16 @@ class InklingConvStateCache:
     def conv_state_bytes(self) -> int:
         """Total device bytes this pool holds. Reported by the cache manager."""
         return sum(t.numel() * t.element_size() for st in self._layers for t in st)
+
+    def section_bytes(self, layer_idx: int) -> List[int]:
+        """Per-slot bytes of each section, in ``CONV_SECTIONS`` order.
+
+        What a state transfer needs to split one slot at its semantic
+        boundaries when the two sides disagree on TP -- the k/v sections are
+        sharded, the residual-stream ones are not.
+        """
+        itemsize = self._layers[layer_idx].k.element_size()
+        return [width * self.kwin * itemsize for width in self._section_channels[layer_idx]]
 
     def layer_state(self, layer_idx: int) -> InklingConvState:
         """The four short-conv state buffers for ``layer_idx`` (pool views)."""
