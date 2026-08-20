@@ -284,8 +284,8 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
     int64_t const nope_size, int64_t const rope_size, int64_t const lora_size,
     torch::Tensor const& kv_cache_block_offsets, torch::Tensor const& host_kv_cache_pool_pointers,
     torch::Tensor const& host_kv_cache_pool_mapping, torch::optional<torch::Tensor> kv_scale_orig_quant,
-    int64_t const layer_idx, int64_t const tokens_per_block, int64_t const attention_window_size,
-    int64_t const beam_width, int64_t const quant_mode)
+    int64_t const residual_dim, int64_t const layer_idx, int64_t const tokens_per_block,
+    int64_t const attention_window_size, int64_t const beam_width, int64_t const quant_mode)
 {
     auto input_dtype = q.scalar_type();
     TORCH_CHECK(input_dtype == torch::kFloat16 || input_dtype == torch::kFloat32 || input_dtype == torch::kBFloat16);
@@ -307,9 +307,14 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
     TLLM_CHECK_WITH_INFO(!(kv_cache_quant_mode.hasFp4KvCache() && input_dtype == torch::kFloat32),
         "FP32 input is not supported when writing an NVFP4 MLA cache.");
     int head_size = lora_size + rope_size;
+    TLLM_CHECK_WITH_INFO(residual_dim >= 0 && residual_dim <= rope_size && residual_dim % 16 == 0,
+        "MLA KV residual_dim must be a multiple of 16 in [0, rope_size], got %ld", residual_dim);
+    TLLM_CHECK_WITH_INFO(kv_cache_quant_mode.hasFp4KvCache() || residual_dim == 0,
+        "MLA KV residual quantization requires an NVFP4 KV cache.");
+    int const storage_head_size = head_size + static_cast<int>(residual_dim);
     auto kv_cache_buffers = buildPagedKvCacheBuffers(std::optional(kv_cache_block_offsets),
         std::optional(host_kv_cache_pool_pointers), std::optional(host_kv_cache_pool_mapping), kv_cache_quant_mode,
-        layer_idx, num_contexts, tokens_per_block, 1 /*kv_head_num*/, head_size, attention_window_size,
+        layer_idx, num_contexts, tokens_per_block, 1 /*kv_head_num*/, storage_head_size, attention_window_size,
         attention_window_size, beam_width, 0 /*seq_offset*/, true /*is_mla_enable*/, torch::elementSize(input_dtype));
     auto& kv_cache_buffer = kv_cache_buffers.kvCacheBuffer;
     auto& kv_scale_cache_buffer = kv_cache_buffers.kvScaleCacheBuffer;
@@ -488,6 +493,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor host_kv_cache_pool_pointers"
         ", Tensor host_kv_cache_pool_mapping"
         ", Tensor? kv_scale_orig_quant"
+        ", int residual_dim"
         ", int layer_idx"
         ", int tokens_per_block"
         ", int attention_window_size"

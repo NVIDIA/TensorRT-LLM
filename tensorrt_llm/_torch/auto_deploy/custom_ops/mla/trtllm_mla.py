@@ -1213,6 +1213,7 @@ def _handle_prefill_thop_cached_kv(
         host_kv_cache_pool_pointers,
         planner.host_pool_mapping,
         planner.kv_scale_orig_quant,
+        0,  # residual_dim
         _CONTEXT_LAYER_OFFSET,
         tokens_per_block,
         max_context_length,

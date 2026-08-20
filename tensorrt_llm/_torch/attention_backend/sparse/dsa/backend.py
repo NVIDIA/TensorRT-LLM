@@ -289,6 +289,7 @@ class DSATrtllmAttention(TrtllmAttention):
             self.kv_scale_orig_quant
             if metadata.kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4
             else None,
+            metadata.kv_cache_manager.mla_kv_cache_residual_dim,
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
