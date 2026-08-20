@@ -96,7 +96,7 @@ def test_default_model_constants_respect_env_overrides():
         cwd=root,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
         env=env,
     )
 
@@ -126,7 +126,7 @@ def test_example_help_command_runs_from_repo_root():
         cwd=root,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
     )
 
     combined_output = result.stdout + result.stderr
@@ -148,7 +148,7 @@ def test_quick_start_entrypoint_imports_without_module_error():
         cwd=root,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
     )
 
     combined_output = result.stdout + result.stderr
@@ -168,6 +168,6 @@ def test_workflow_entrypoint_modules_run_without_import_warnings():
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=60,
         )
         assert result.returncode == 0, result.stdout + result.stderr

@@ -180,6 +180,49 @@ def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(
     assert selected == test_lines[1]
 
 
+@pytest.mark.parametrize(
+    ("selected_suffix", "waive_line", "expected"),
+    (
+        (" SKIP (inline)", "", True),
+        (" SKIP(inline)", "", True),
+        ("", "{nodeid} SKIP (global)", True),
+        ("", "{nodeid} SKIP(global)", True),
+        ("", "{nodeid} XFAIL (known failure)", False),
+        ("", "perf/test_other.py::test_other SKIP (other)", False),
+    ),
+)
+def test_ci_submit_skips_precheck_only_for_selected_skip_waive(
+    ci_submit_module: ModuleType,
+    tmp_path: Path,
+    selected_suffix: str,
+    waive_line: str,
+    expected: bool,
+) -> None:
+    nodeid = "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-case]"
+    waives = tmp_path / "waives.txt"
+    waives.write_text(waive_line.format(nodeid=nodeid), encoding="utf-8")
+
+    assert (
+        ci_submit_module.selected_test_is_skip_waived(f"{nodeid}{selected_suffix}", waives)
+        is expected
+    )
+
+
+def test_ci_submit_honors_matching_platform_scoped_skip_waive(
+    ci_submit_module: ModuleType, tmp_path: Path
+) -> None:
+    nodeid = "perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-case]"
+    waives = tmp_path / "waives.txt"
+    waives.write_text(f"full:GB300/{nodeid} SKIP (platform)\n", encoding="utf-8")
+
+    assert ci_submit_module.selected_test_is_skip_waived(
+        nodeid, waives, test_prefix="GB300-Disagg-Perf"
+    )
+    assert not ci_submit_module.selected_test_is_skip_waived(
+        nodeid, waives, test_prefix="DGX_B200-Disagg-Perf"
+    )
+
+
 def test_ci_submit_selector_matches_installed_pytest_split(
     ci_submit_module: ModuleType,
 ) -> None:

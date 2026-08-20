@@ -58,6 +58,7 @@ class PipelineComponent(str, Enum):
     IMAGE_PROCESSOR = "image_processor"
     SOUND_TOKENIZER = "sound_tokenizer"
     GUIDER = "guider"
+    VISION_LANGUAGE_ENCODER = "vision_language_encoder"
 
 
 @dataclass
