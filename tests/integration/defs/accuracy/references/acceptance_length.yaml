@@ -34,3 +34,6 @@ TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len:
 TestQwen3_5_4B::test_dflash:
   ref_al: 3.96417002949639
   min_al: 3.7659615280215704
+TestKimiK3::test_w4a16_mxfp4:
+  ref_al: 1.318
+  min_al: 1.15

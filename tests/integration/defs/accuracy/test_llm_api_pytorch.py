@@ -4662,13 +4662,17 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(16)
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
-    def test_w4a16_mxfp4(self, mode):
+    def test_w4a16_mxfp4(self, mode, monkeypatch):
         """GSM8K on the bf16 + MXFP4-routed-expert checkpoint (16 GPUs, DEP16).
 
         No automated L0 stage schedules 16-GPU functional tests; this case is
-        run by QA / manually (qualified on 4x4 GB300 nodes). Each mode mirrors
+        registered in qa/llm_function_multinode.txt and run by QA's weekly
+        multinode pipeline (qualified on 4x4 GB300 nodes). Each mode mirrors
         the corresponding examples/kimi_k3/eval_extra_llm_options*.yaml config
-        - keep them in sync when editing either.
+        - keep them in sync when editing either. The `sa` leg additionally
+        records spec-dec acceptance: AL/AR lines in the eval log (via
+        TLLM_EVAL_SPEC_STATS) and an iteration-stats AL asserted against
+        references/acceptance_length.yaml.
         """
         kv_cache_kwargs = dict(
             enable_block_reuse=False,
@@ -4705,7 +4709,13 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 enable_chunked_prefill=False,
                 cuda_graph_config=CudaGraphConfig(max_batch_size=8),
                 speculative_config=SADecodingConfig(max_draft_len=2),
+                # AL capture needs per-iteration spec-decoding stats.
+                enable_iter_perf_stats=True,
+                max_stats_len=-1,
             )
+            # Log corpus-aggregate AL and AR at eval end ("Spec-dec stats:"
+            # lines) — QA records acceptance from the test log (TRTLLM-15036).
+            monkeypatch.setenv("TLLM_EVAL_SPEC_STATS", "1")
 
         with LLM(self.MODEL_PATH,
                  kv_cache_config=KvCacheConfig(**kv_cache_kwargs),
@@ -4713,6 +4723,19 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.W4A16_MXFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            if mode == "sa":
+                acceptance_length = _compute_acceptance_length(llm)
+                print(f"[AL] TestKimiK3::test_w4a16_mxfp4[sa] "
+                      f"acceptance_length = {acceptance_length:.3f}")
+                # ref_al/min_al live in references/acceptance_length.yaml.
+                # The reference was measured on the same workload but
+                # through the lm-eval-route estimator, whose weighting may
+                # not match this iteration-stats one exactly — so min_al is
+                # set as a loose acceptance-collapse tripwire rather than
+                # the populate-path default. Tighten both once this test's
+                # own runs establish a baseline.
+                assert_acceptance_length("TestKimiK3::test_w4a16_mxfp4",
+                                         acceptance_length)
 
 
 class TestQwen3_4B(LlmapiAccuracyTestHarness):

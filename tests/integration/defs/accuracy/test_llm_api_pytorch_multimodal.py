@@ -533,8 +533,9 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # thinks by default. preserve_caller_max_tokens keeps max_tokens=16384
     # over lm-eval's 512-token MMMU default — without it the CoT is truncated
     # before the response channel opens, the extractor silently falls back,
-    # and the score sinks toward the K2.5 floor (81.56): treat such a score
-    # with clean logs as a harness failure, not a model regression.
+    # and the score sinks toward the K2.5 reference floor (see
+    # references/mmmu.yaml): treat such a score with clean logs as a harness
+    # failure, not a model regression.
     EXTRA_EVALUATOR_KWARGS = dict(
         post_process_fn=extract_kimi_k3_mmmu_answer,
         preserve_caller_max_tokens=True,
@@ -548,8 +549,9 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
 
         No automated L0 stage schedules 16-GPU functional tests; this case is
-        run by QA / manually (qualified on 4x4 GB300 nodes, reference 84.89
-        +/- 1.16). Mirrors examples/kimi_k3/run_eval_kimi_k3.sbatch
+        registered in qa/llm_function_multinode.txt and run by QA's weekly
+        multinode pipeline (qualified on 4x4 GB300 nodes; reference in
+        references/mmmu.yaml). Mirrors examples/kimi_k3/run_eval_kimi_k3.sbatch
         --task mmmu: the base eval_extra_llm_options.yaml serving config with
         max_seq_len raised to 24576 (8192 input + 16384 output).
         """
