@@ -538,10 +538,10 @@ def install_python_dependencies(llm_src, install_wheel=True):
             check=True)
     else:
         # Minimal deps for pytest --collect-only without a trtllm wheel.
-        # requirements-check-test-list.txt covers only the packages imported at
+        # jenkins/requirements-check-test-list.txt covers only the packages imported at
         # module scope during collection (torch CPU build, pytest plugins, etc.).
         subprocess.run(
-            f"pip3 install -r {llm_src}/requirements-check-test-list.txt",
+            f"pip3 install -r {llm_src}/jenkins/requirements-check-test-list.txt",
             shell=True,
             check=True)
     subprocess.run(

@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimal dependencies for pytest --collect-only used by check_test_list.py
+# --no-install-wheel mode (CPU-only, no trtllm wheel needed).
+#
+# These are the packages imported at module scope during pytest collection in
+# tests/integration/defs/conftest.py and its transitive imports.  Runtime-only
+# deps (GPU kernels, trtllm bindings, etc.) are intentionally excluded.
+#
+# torch: conftest.py imports it at module scope; the CPU wheel is sufficient
+# for collection and avoids the ~2 GB CUDA download.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.12.0
+
+psutil
+tqdm
+PyYAML
+mako
+oyaml
+# pynvml: gpu_clock_lock.py imports pynvml at module scope (nvmlInit() is
+# called only inside methods, so the import itself works without a GPU driver)
+nvidia-ml-py
+
+# pytest and the plugins declared in tests/integration/defs/pytest.ini
+pytest<9.1
+pytest-asyncio
+pytest-threadleak
+pytest-unused-fixtures
