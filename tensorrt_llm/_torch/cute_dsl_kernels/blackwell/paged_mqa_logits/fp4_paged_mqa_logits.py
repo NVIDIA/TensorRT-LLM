@@ -424,7 +424,7 @@ def utccp_required_smem_warp_transpose(smem_ptr) -> None:
         smem_ptr: cute.Pointer to int32, must be 128-int (= 512-byte) aligned.
     """
     lane_idx = cute.arch.lane_idx()
-    values = cute.make_fragment(4, cutlass.Int32)
+    values = cute.make_rmem_tensor(4, cutlass.Int32)
     for i in cutlass.range_constexpr(4):
         offset = (i ^ (lane_idx >> 3)) * 32 + lane_idx
         values[i] = ld_shared_b32(smem_ptr + offset)
@@ -2197,12 +2197,12 @@ class FP4MQALogitsKernel:
                         MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     # emit_seed_counts needs no extra budget cut.
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
-                w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
                 # actual STG happens once after the for-t loop to land all
                 # STGs in one contiguous LSU phase.
                 if cutlass.const_expr(self.use_batched_store):
-                    result_arr = cute.make_fragment(next_n, self.output_dtype)
+                    result_arr = cute.make_rmem_tensor(next_n, self.output_dtype)
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)
@@ -2971,12 +2971,12 @@ class FP4MQALogitsKernel:
                         MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                     # emit_seed_counts needs no extra budget cut.
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
-                w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
                 # actual STG happens once after the for-t loop to land all
                 # STGs in one contiguous LSU phase.
                 if cutlass.const_expr(self.use_batched_store):
-                    result_arr = cute.make_fragment(next_n, self.output_dtype)
+                    result_arr = cute.make_rmem_tensor(next_n, self.output_dtype)
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)

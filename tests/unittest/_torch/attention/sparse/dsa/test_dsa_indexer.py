@@ -3513,6 +3513,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         meta.kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.draft_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        meta.prepare_for_draft_forward.return_value = None
         return meta
 
     @staticmethod
@@ -3547,13 +3548,15 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         assert saved is not None
         assert saved["target_kv_cache_manager"] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
-        assert "saved_dsa_state" not in saved
+        assert "saved_backend_state" not in saved
+        meta.prepare_for_draft_forward.assert_called_once_with()
 
         restore_attn_metadata_after_draft_replay(meta, saved)
 
         assert meta.kv_cache_manager is original_kv_mgr
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
+        meta.restore_after_draft_forward.assert_called_once_with(None)
 
     def test_native_dsa_replay_swaps_and_restores_buffers(self):
         """Switch native DSA metadata to draft buffers and restore it."""
@@ -3583,6 +3586,15 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         del meta.slot_mapping_fp8_fullkv
         del meta.slot_mapping_scale_fullkv
 
+        meta.prepare_for_draft_forward.side_effect = (
+            lambda: DSAtrtllmAttentionMetadata.prepare_for_draft_forward(meta)
+        )
+        meta.restore_after_draft_forward.side_effect = (
+            lambda saved_state: DSAtrtllmAttentionMetadata.restore_after_draft_forward(
+                meta, saved_state
+            )
+        )
+
         def is_attn_metadata(obj, cls):
             if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
                 return obj is meta
@@ -3594,13 +3606,13 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
                 side_effect=is_attn_metadata,
             ),
             patch(
-                "tensorrt_llm._torch.speculative.interface.torch.cuda.is_current_stream_capturing",
+                "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.torch.cuda.is_current_stream_capturing",
                 return_value=True,
             ),
         ):
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
-        assert "saved_dsa_state" in saved
+        assert "saved_backend_state" in saved
         assert meta.slot_mapping_fp8 is draft_buffers["slot_mapping_fp8"]
         restore_attn_metadata_after_draft_replay(meta, saved)
         assert meta.slot_mapping_fp8 is target_buffers["slot_mapping_fp8"]
