@@ -1166,13 +1166,23 @@ class TestProcessTelemetrySession:
         monkeypatch.setattr(usage_lib, "_TERMINAL_FLUSH_TIMEOUT", 0.01)
         assert usage_lib.apply_usage_session_config(default_usage_context="llm_class")
         release_send = threading.Event()
+        terminal_threads = []
+        real_thread = threading.Thread
 
         def blocking_send(payload):
             del payload
             release_send.wait(timeout=1)
 
+        def track_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            terminal_threads.append(thread)
+            return thread
+
         started = time.monotonic()
-        with patch.object(usage_lib, "_send_to_gxt", side_effect=blocking_send):
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=blocking_send),
+            patch.object(usage_lib.threading, "Thread", side_effect=track_thread),
+        ):
             assert usage_lib.report_exit(
                 usage_lib.TerminalOutcome(
                     termination_kind="exception",
@@ -1185,8 +1195,11 @@ class TestProcessTelemetrySession:
             )
         elapsed = time.monotonic() - started
         release_send.set()
+        assert len(terminal_threads) == 1
+        terminal_threads[0].join(timeout=1)
 
         assert elapsed < 0.2
+        assert not terminal_threads[0].is_alive()
 
     def test_terminal_reuses_active_background_reporter(self, monkeypatch, enable_telemetry):
         """Process-exit fallback need not create a thread during Python atexit."""
