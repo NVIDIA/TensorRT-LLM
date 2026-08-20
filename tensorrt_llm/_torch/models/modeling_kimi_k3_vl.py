@@ -500,7 +500,9 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
         text_model_config = copy.copy(model_config)
         assert hasattr(config, "text_config"), "Kimi K3 config must have text_config"
         text_model_config._frozen = False
-        text_model_config.pretrained_config = config.text_config
+        text_config = copy.copy(config.text_config)
+        text_config._checkpoint_dir = getattr(config, "_name_or_path", None)
+        text_model_config.pretrained_config = text_config
 
         # Remap quant exclude_modules: language_model.X -> model.X
         if text_model_config.quant_config.exclude_modules:

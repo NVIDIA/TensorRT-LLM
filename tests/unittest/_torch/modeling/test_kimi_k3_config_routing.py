@@ -16,9 +16,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
+import torch.nn as nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_kimi_k3_vl
 from tensorrt_llm._torch.models.modeling_kimi_k25 import _vision_requires_replication
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_kimi_k3_multimodal_config,
@@ -145,6 +149,37 @@ class TestKimiK3LoaderRouting(unittest.TestCase):
         self.assertEqual(config.architectures, ["KimiLinearForCausalLM"])
         self.assertEqual(config.model_type, "kimi_linear")
         self.assertEqual(config.hidden_size, 7168)
+
+
+class _FakeKimiLinearForCausalLM(nn.Module):
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__()
+        self.model_config = model_config
+        self.config = model_config.pretrained_config
+
+
+class TestKimiK3ModelConstruction(unittest.TestCase):
+    def test_text_backbone_preserves_resolved_checkpoint_dir(self) -> None:
+        checkpoint_dir = "/resolved/kimi-k3"
+        text_config = PretrainedConfig()
+        config = PretrainedConfig()
+        config.text_config = text_config
+        config._name_or_path = checkpoint_dir
+        model_config = ModelConfig(pretrained_config=config)
+
+        with (
+            patch.object(modeling_kimi_k3_vl, "DISAGG", True),
+            patch.object(
+                modeling_kimi_k3_vl,
+                "KimiLinearForCausalLM",
+                _FakeKimiLinearForCausalLM,
+            ),
+        ):
+            model = modeling_kimi_k3_vl.KimiK3ForConditionalGeneration(model_config)
+
+        self.assertEqual(model.llm.config._checkpoint_dir, checkpoint_dir)
+        self.assertIsNot(model.llm.config, text_config)
+        self.assertFalse(hasattr(text_config, "_checkpoint_dir"))
 
 
 if __name__ == "__main__":
