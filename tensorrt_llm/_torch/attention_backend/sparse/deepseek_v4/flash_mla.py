@@ -33,7 +33,6 @@ def _write_fp8_shadow_torch(
     source_block: torch.Tensor,
     shadow_block: torch.Tensor,
     token_offset: torch.Tensor,
-    valid: torch.Tensor,
     is_fp8_pool: bool,
     kv_scale: torch.Tensor,
     tokens_per_block: int,
@@ -44,7 +43,6 @@ def _write_fp8_shadow_torch(
     quant_block = 64
     num_scales = nope_dim // quant_block
     data_bytes = nope_dim + rope_dim * 2
-    bytes_per_token = DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
 
     token_data = pool[source_block, token_offset]
     if is_fp8_pool:
@@ -75,12 +73,7 @@ def _write_fp8_shadow_torch(
 
     row_stride = shadow.shape[1]
     row_base = shadow_block * row_stride
-    padding_start = row_base + tokens_per_block * bytes_per_token
-    data_start = torch.where(
-        valid,
-        row_base + token_offset * data_bytes,
-        padding_start,
-    )
+    data_start = row_base + token_offset * data_bytes
     data_indices = (
         data_start.unsqueeze(1)
         + torch.arange(data_bytes, device=pool.device, dtype=torch.long).unsqueeze(0)
@@ -88,11 +81,7 @@ def _write_fp8_shadow_torch(
     shadow_flat = shadow.view(-1)
     shadow_flat[data_indices] = encoded_data.reshape(-1)
 
-    scale_start = torch.where(
-        valid,
-        row_base + tokens_per_block * data_bytes + token_offset * 8,
-        padding_start + data_bytes,
-    )
+    scale_start = row_base + tokens_per_block * data_bytes + token_offset * 8
     scale_indices = (
         scale_start.unsqueeze(1)
         + torch.arange(8, device=pool.device, dtype=torch.long).unsqueeze(0)
@@ -729,16 +718,17 @@ class DeepSeekV4FlashMLA:
 
         shadow = metadata.kv_cache_manager.get_flash_mla_shadow_buffer(self._layer_idx, attn_type)
         shadow_num_blocks = shadow.shape[0]
-        shadow_view = torch.as_strided(
-            shadow,
-            size=(shadow_num_blocks, tokens_per_block, 1, bytes_per_token),
-            stride=(shadow.stride(0), bytes_per_token, bytes_per_token, 1),
+        shadow_view = shadow.view(
+            shadow_num_blocks,
+            tokens_per_block,
+            1,
+            bytes_per_token,
         )
         if block_table.shape[1] == 0:
             return shadow_view
 
         with nvtx_range_debug("deepseek_v4_fp8_shadow_update"):
-            source_block, shadow_block, token_offset, valid = self._get_shadow_write_slots(
+            source_block, shadow_block, token_offset = self._get_shadow_write_slots(
                 metadata,
                 block_table,
                 attn_type,
@@ -752,7 +742,6 @@ class DeepSeekV4FlashMLA:
                 source_block,
                 shadow_block,
                 token_offset,
-                valid,
                 is_fp8_pool,
                 kv_scale,
                 tokens_per_block,
@@ -769,7 +758,7 @@ class DeepSeekV4FlashMLA:
         position_ids: Optional[torch.Tensor],
         *,
         is_generation: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Map cache entries written in this phase to their physical slots."""
         device = block_table.device
         empty = torch.empty(0, dtype=torch.long, device=device)
@@ -777,7 +766,7 @@ class DeepSeekV4FlashMLA:
         num_requests = metadata.num_generations if is_generation else metadata.num_contexts
         request_end = request_start + num_requests
         if num_requests == 0:
-            return empty, empty, empty, empty.bool()
+            return empty, empty, empty
 
         if attn_type == DeepseekV4AttentionType.SWA:
             token_start = metadata.num_ctx_tokens if is_generation else 0
@@ -811,7 +800,7 @@ class DeepSeekV4FlashMLA:
                 else metadata.max_ctx_compressed_tokens[compress_ratio]
             )
             if max_new_tokens == 0:
-                return empty, empty, empty, empty.bool()
+                return empty, empty, empty
             all_slots = torch.arange(num_requests * max_new_tokens, device=device, dtype=torch.long)
             request_grid = all_slots // max_new_tokens
             token_grid = all_slots % max_new_tokens
@@ -841,7 +830,6 @@ class DeepSeekV4FlashMLA:
         source_block: torch.Tensor,
         shadow_block: torch.Tensor,
         token_offset: torch.Tensor,
-        valid: torch.Tensor,
         is_fp8_pool: bool,
         kv_scale: torch.Tensor,
         tokens_per_block: int,
@@ -857,7 +845,6 @@ class DeepSeekV4FlashMLA:
             source_block,
             shadow_block,
             token_offset,
-            valid,
             is_fp8_pool,
             kv_scale,
             tokens_per_block,

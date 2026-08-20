@@ -23,7 +23,6 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
-from .backend import DeepseekV4TrtllmAttention
 from .flash_mla import DeepSeekV4FlashMLA
 
 if TYPE_CHECKING:
@@ -126,8 +125,6 @@ def initialize_sparse_attn(self) -> None:
     if sm_version < 90:
         raise RuntimeError(f"DeepSeek-V4 requires Hopper or newer GPUs, got SM{sm_version}")
     if sm_version == 90:
-        if not isinstance(self.mqa, DeepseekV4TrtllmAttention):
-            raise TypeError("DeepSeek-V4 Hopper requires DeepseekV4TrtllmAttention")
         self._dsv4_flash_mla = DeepSeekV4FlashMLA(self.mqa, self.mqa.compress_ratio)
     self._disable_dsv4_epilogue_fusion = os.environ.get(
         "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION", ""

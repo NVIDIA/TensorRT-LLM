@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from collections import defaultdict
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
@@ -63,8 +62,8 @@ from .params import (
 def _flash_mla_shadow_bytes_per_token(tokens_per_block: int, compress_ratio: int) -> int:
     """Return manager-accounted MODEL1 shadow bytes per original cache token."""
     shadow_tokens_per_block = tokens_per_block // compress_ratio
-    shadow_bytes_per_block = (shadow_tokens_per_block + 1) * DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
-    return math.ceil(shadow_bytes_per_block / tokens_per_block)
+    shadow_bytes_per_block = shadow_tokens_per_block * DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
+    return shadow_bytes_per_block // tokens_per_block
 
 
 def get_attn_dim(
@@ -538,8 +537,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             raise RuntimeError("FlashMLA shadow buffers do not support expanded page indices")
 
         index_mode = _get_index_mode(attn_type)
+        source_offset = source.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
         shadow_offset = shadow.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
-        base_pages = torch.div(source_pages, source.scale, rounding_mode="floor")
+        base_pages = torch.div(
+            source_pages - source_offset,
+            source.scale,
+            rounding_mode="floor",
+        )
         return base_pages * shadow.scale + shadow_offset
 
     def map_flash_mla_shadow_token_indices(
@@ -566,7 +570,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         request_indices: torch.Tensor,
         token_positions: torch.Tensor,
         valid: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Map request-relative writes to source and shadow cache slots."""
         block_size = self.tokens_per_block
         if attn_type == DeepseekV4AttentionType.COMPRESS:
@@ -589,9 +593,23 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             & (shadow_block >= 0)
             & (shadow_block < shadow_num_blocks)
         )
-        source_block = source_block.clamp(min=0, max=max(source_num_blocks - 1, 0))
-        shadow_block = shadow_block.clamp(min=0, max=max(shadow_num_blocks - 1, 0))
-        return source_block, shadow_block, token_offset, valid
+
+        layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
+        index_mode = _get_index_mode(attn_type)
+        source = self.impl.get_page_index_converter(layer_id, attn_type.role)
+        shadow = self.impl.get_page_index_converter(
+            layer_id, DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES[attn_type]
+        )
+        source_fallback = source.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
+        shadow_fallback = shadow.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
+
+        # Preserve static shapes for CUDA graphs without adding padding to each
+        # shadow page. Invalid entries rewrite one matching canonical slot, so
+        # duplicate writes are byte-identical and cannot corrupt live cache data.
+        source_block = torch.where(valid, source_block, source_fallback)
+        shadow_block = torch.where(valid, shadow_block, shadow_fallback)
+        token_offset = torch.where(valid, token_offset, 0)
+        return source_block, shadow_block, token_offset
 
     def _get_window_size(
         self, compress_ratio: int, attn_type: DeepseekV4AttentionType
@@ -1246,7 +1264,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         block_size = self.tokens_per_block
         if attn_type == DeepseekV4AttentionType.COMPRESS:
             block_size = self.compressed_block_sizes[layer_idx]
-        return (block_size + 1) * DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
+        return block_size * DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
 
     def get_cache_bytes_per_token(self) -> int:
         """Get the average cache bytes per token for DeepSeek-V4."""
