@@ -4518,6 +4518,46 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert result.normal_text == ""
         assert result.calls == []
 
+    @pytest.mark.parametrize("residue", [
+        "<|close|>message<|sep|>", "<|end_of_msg|>",
+        "<|close|>message<|sep|><|end_of_msg|>"
+    ])
+    def test_streaming_post_section_residue_never_leaks(self, sample_tools,
+                                                        parser, residue):
+        """Structural framing after the section is stripped, not streamed.
+
+        ``parse_streaming_increment`` leaves post-section residue in the
+        buffer; if it arrives in a later increment the no-``bot_token`` path
+        must not emit it as content. Streaming must match non-streaming, which
+        strips the same residue via ``_trailing_structural``. Regression:
+        without the ``_section_done`` guard the residue leaked as ``content``.
+        """
+        preamble = "Sure. "
+        section = self._section(
+            self._call("get_weather", 1,
+                       self._argument("location", "string", "NYC")))
+        # Section completes in the first increment; residue trickles in one
+        # character at a time in later increments (worst case for partial
+        # structural tokens).
+        chunks = [preamble + section] + list(residue)
+
+        normal_text = ""
+        calls = []
+        for chunk in chunks:
+            result = parser.parse_streaming_increment(chunk, sample_tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        result = parser.finish(sample_tools)
+        normal_text += result.normal_text
+        calls.extend(result.calls)
+
+        assert normal_text == preamble
+        assert [call.name for call in calls] == ["get_weather"]
+        # Streaming agrees with the non-streaming path on the same full text.
+        non_streaming = self.make_parser().detect_and_parse(
+            preamble + section + residue, sample_tools)
+        assert non_streaming.normal_text == preamble
+
     def test_finish_flushes_held_partial_bot_token_as_text(
             self, sample_tools, parser):
         """A held-back bot_token prefix is plain text once the stream ends."""

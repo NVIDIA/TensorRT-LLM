@@ -59,6 +59,10 @@ class KimiK3ToolParser(BaseToolParser):
         super().__init__()
         self.bot_token = "<|open|>tools<|sep|>"  # nosec B105
         self.eot_token = "<|close|>tools<|sep|>"  # nosec B105
+        # Set once a complete tools section has been emitted. A K3 tools
+        # section terminates the message, so anything streamed afterwards is
+        # structural framing, not content.
+        self._section_done = False
         # Structural leftovers that may trail the tools section when the
         # reasoning parser is not in front of this parser.
         self._trailing_structural = re.compile(
@@ -109,9 +113,8 @@ class KimiK3ToolParser(BaseToolParser):
             return json.loads(value)
         except json.JSONDecodeError:
             logger.warning(
-                "kimi_k3 tool parser: argument declared type=%s but body is "
-                "not valid JSON; keeping raw text",
-                value_type,
+                f"kimi_k3 tool parser: argument declared type={value_type} but "
+                "body is not valid JSON; keeping raw text"
             )
             return value
 
@@ -147,11 +150,11 @@ class KimiK3ToolParser(BaseToolParser):
             name = attrs.get("tool")
             if not name:
                 logger.warning(
-                    "kimi_k3 tool parser: call without tool attribute: %s", match.group("attrs")
+                    f"kimi_k3 tool parser: call without tool attribute: {match.group('attrs')}"
                 )
                 continue
             if name not in tool_indices:
-                logger.warning("Model attempted to call undefined function: %s", name)
+                logger.warning(f"Model attempted to call undefined function: {name}")
             calls.append(
                 ToolCallItem(
                     tool_index=position,
@@ -193,6 +196,13 @@ class KimiK3ToolParser(BaseToolParser):
 
     def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
         self._buffer += new_text
+        if self._section_done:
+            # The completed tools section terminated the K3 message; any later
+            # text is structural framing (``<|close|>message<|sep|>``,
+            # ``<|end_of_msg|>``), never user content. Buffer it so ``finish``
+            # strips it — matching ``detect_and_parse`` — instead of emitting
+            # protocol tokens as content.
+            return StreamingParseResult()
         bot_idx = self._buffer.find(self.bot_token)
         if bot_idx == -1:
             hold = self._ends_with_partial_token(self._buffer, self.bot_token)
@@ -212,9 +222,10 @@ class KimiK3ToolParser(BaseToolParser):
             return StreamingParseResult(normal_text=normal_text)
         section_end = eot_idx + len(self.eot_token)
         result = self.detect_and_parse(self._buffer[:section_end], tools)
-        # Anything after the section (normally empty) is re-examined on the
-        # next increment rather than dropped.
+        # The section terminates the message; hold any trailing framing in the
+        # buffer for ``finish`` to strip rather than emitting it as content.
         self._buffer = self._buffer[section_end:]
+        self._section_done = True
         return StreamingParseResult(
             normal_text=normal_text + result.normal_text, calls=result.calls
         )
