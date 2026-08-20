@@ -55,7 +55,7 @@ class _Response:
 @pytest.mark.parametrize(
     ("pr_info", "expected"),
     (
-        ({"user": {"login": " Pilot-User "}}, (True, "pilot-user", "author is allowlisted")),
+        ({"user": {"login": " Pilot-User "}}, (True, "Pilot-User", "author is allowlisted")),
         (
             {"user": {"login": "someone-else"}},
             (False, "someone-else", "author is not allowlisted"),

@@ -27,7 +27,7 @@ import urllib.request
 from collections.abc import Mapping, Set
 from typing import Optional
 
-PILOT_USERS: frozenset[str] = frozenset({"crazydemo"})
+PILOT_USERS: frozenset[str] = frozenset({"crazydemo", "QiJune"})
 
 _GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
 _TRIGGER_PHRASE_ENV = "gitlabTriggerPhrase"
@@ -57,10 +57,11 @@ def evaluate_pr_info(pr_info: object, pilot_users: Set[str] = PILOT_USERS) -> tu
     if not isinstance(user, Mapping):
         return False, "", "PR API response has no user"
     raw_login = user.get("login")
-    login = raw_login.strip().lower() if isinstance(raw_login, str) else ""
+    login = raw_login.strip() if isinstance(raw_login, str) else ""
     if not login:
         return False, "", "PR API response has no author login"
-    if login not in pilot_users:
+    normalized_pilot_users = {pilot_user.casefold() for pilot_user in pilot_users}
+    if login.casefold() not in normalized_pilot_users:
         return False, login, "author is not allowlisted"
     return True, login, "author is allowlisted"
 
