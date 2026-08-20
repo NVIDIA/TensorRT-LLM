@@ -6,6 +6,7 @@
 import json
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -216,6 +217,29 @@ def test_explicit_bf16_config_dequantizes_fp4_checkpoint(monkeypatch):
 
     assert loaded is sentinel
     assert call["enable_fp4"] is False
+
+
+@pytest.mark.parametrize(
+    ("enable_fp4", "selected", "expected_count"),
+    [
+        (True, {"decoder.conv1"}, 1),
+        (False, {"decoder.conv1", "decoder.conv2"}, 2),
+        (True, {"decoder.conv1", "decoder.conv2"}, None),
+    ],
+)
+def test_nvfp4_checkpoint_bf16_operator_warning(enable_fp4, selected, expected_count):
+    quantized = {"decoder.conv1", "decoder.conv2"}
+
+    with patch.object(vae_loader.logger, "warning") as warning:
+        vae_loader._warn_dequantized_nvfp4_weights(quantized, selected, enable_fp4)
+
+    if expected_count is None:
+        warning.assert_not_called()
+        return
+    warning.assert_called_once()
+    message = warning.call_args.args[0]
+    assert message.startswith(f"{expected_count} VAE convolution(s)")
+    assert "cannot recover the original BF16 weights" in message
 
 
 def test_wan_vae_rejects_unsupported_quantization():
