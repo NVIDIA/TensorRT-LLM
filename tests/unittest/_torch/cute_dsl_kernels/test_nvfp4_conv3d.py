@@ -18,17 +18,17 @@ import torch
 import torch.nn.functional as F
 
 
-def _require_blackwell() -> None:
+def _require_sm100() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
     major, minor = torch.cuda.get_device_capability()
-    if major < 10:
-        pytest.skip(f"NVFP4 Conv3d requires Blackwell, got sm_{major}{minor}")
+    if major != 10:
+        pytest.skip(f"NVFP4 Conv3d requires SM100-family, got sm_{major}{minor}")
 
 
 def test_nvfp4_conv3d_bias_residual_epilogue_matches_reference() -> None:
     """Exercise the product tactic and BF16 epilogue against the kernel reference."""
-    _require_blackwell()
+    _require_sm100()
     cutlass = pytest.importorskip("cutlass")
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_blockscaled_implicit_gemm_fprop import (
         run,
@@ -64,7 +64,7 @@ def test_nvfp4_conv3d_bias_residual_epilogue_matches_reference() -> None:
 @pytest.mark.parametrize("channels", [128, 192, 512])
 def test_fused_silu_nvfp4_quant_matches_trtllm_quantize(channels: int) -> None:
     """Compare fused bytes, including activation blocks beyond calibration."""
-    _require_blackwell()
+    _require_sm100()
     pytest.importorskip("triton")
     from tensorrt_llm._torch.visual_gen.models.wan.fp4_fused_quant import silu_nvfp4_quant
 
@@ -88,7 +88,7 @@ def test_fused_silu_nvfp4_quant_matches_trtllm_quantize(channels: int) -> None:
 
 
 def test_fused_rmsnorm_silu_nvfp4_quant_matches_trtllm_quantize() -> None:
-    _require_blackwell()
+    _require_sm100()
     pytest.importorskip("triton")
     from tensorrt_llm._torch.visual_gen.models.wan.fp4_fused_quant import rmsnorm_silu_nvfp4_quant
 
@@ -121,7 +121,7 @@ def test_fused_rmsnorm_silu_nvfp4_quant_matches_trtllm_quantize() -> None:
 
 def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None:
     """Run the VAE wrapper through its real CuTe ABI on a partial output tile."""
-    _require_blackwell()
+    _require_sm100()
     pytest.importorskip("cutlass")
     from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
         NVFP4WanCausalConv3d,
@@ -180,7 +180,7 @@ def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None
 
 def test_nvfp4_wan_conv_reuses_cubin_across_runtime_shapes() -> None:
     """The provider's runtime-shape kernel serves compatible C and H/W values."""
-    _require_blackwell()
+    _require_sm100()
     pytest.importorskip("cutlass")
     from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
         NVFP4WanCausalConv3d,

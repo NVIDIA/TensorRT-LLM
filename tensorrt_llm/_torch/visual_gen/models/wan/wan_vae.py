@@ -774,6 +774,8 @@ class NVFP4WanCausalConv3d(WanCausalConv3d):
 
     Weight is pre-quantized once (lazily on first forward). ``input_scale`` (the ModelOpt
     calibrated divisor-form scale) enables STATIC activation quant; otherwise dynamic.
+    Construction takes ownership of ``base`` parameters; callers must replace and discard
+    ``base`` rather than reuse or mutate it.
     """
 
     def __init__(
@@ -792,9 +794,8 @@ class NVFP4WanCausalConv3d(WanCausalConv3d):
             )
 
         super().__init__(base.in_channels, base.out_channels, 3, stride=1, padding=1)
-        # The base module is replaced immediately after construction. Reuse its
-        # parameters instead of copying GPU weights through a CPU-initialized
-        # temporary Conv3d.
+        # Reuse the owned parameters instead of copying GPU weights through a
+        # CPU-initialized temporary Conv3d.
         self.weight = base.weight
         self.bias = base.bias
         self._fp4_pq: _FP4PrequantizedWeight | None = None
