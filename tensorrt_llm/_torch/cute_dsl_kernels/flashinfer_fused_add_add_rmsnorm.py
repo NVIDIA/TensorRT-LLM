@@ -323,7 +323,7 @@ def _get_compiled_fused_add_add_rmsnorm_kernel(
 
 
 def fused_add_add_rmsnorm_cute(
-    input: torch.Tensor,
+    input: torch.Tensor,  # noqa: A002 - stable custom-op forwarding name
     additional: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
