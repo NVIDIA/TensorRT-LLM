@@ -220,6 +220,7 @@ def _build_moe_module(
 
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style
+    activation_type = model.activation_type_enum
 
     routing_method = _create_routing_method(
         model.routing_method_cls,
@@ -264,6 +265,7 @@ def _build_moe_module(
         swiglu_beta=model.swiglu_beta if swiglu_gptoss_style else None,
         swiglu_limit=model.swiglu_limit if swiglu_gptoss_style else None,
         num_local_experts=num_local_experts,
+        activation_type=activation_type,
     )
 
     weight_loading_mode = getattr(
@@ -285,6 +287,7 @@ def _build_moe_module(
         swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
         swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
         swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+        activation_type=activation_type,
     )
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:

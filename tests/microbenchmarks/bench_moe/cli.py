@@ -39,6 +39,7 @@ from .search import (
     _resolve_search_from_args,
 )
 from .specs import (
+    _ACTIVATIONS,
     _ALL_BACKENDS,
     _COMM_METHODS,
     _ROUTING_METHODS,
@@ -229,6 +230,13 @@ def parse_args() -> argparse.Namespace:
             "Routing method. Defaults to AUTO: built-in models use the spec "
             "default; custom shapes must specify an explicit method."
         ),
+    )
+    model_group.add_argument(
+        "--activation",
+        type=lambda s: str(s).upper(),
+        default=None,
+        choices=sorted(_ACTIVATIONS),
+        help="Expert activation. Defaults to the model's value, else SWIGLU.",
     )
 
     workload_group = parser.add_argument_group("Workload shape")
@@ -546,6 +554,7 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
             topk_group=args.topk_group,
             n_shared_experts=int(args.n_shared_experts) if args.n_shared_experts is not None else 0,
             shared_expert_mode=args.shared_expert_mode,
+            activation_type=args.activation or "SWIGLU",
         )
 
     # Built-in model with optional per-field overrides.
@@ -576,6 +585,7 @@ def _resolve_model_from_args(args: argparse.Namespace) -> ModelSpec:
         swiglu_alpha=base.swiglu_alpha,
         swiglu_beta=base.swiglu_beta,
         swiglu_limit=base.swiglu_limit,
+        activation_type=args.activation or base.activation_type,
     )
 
 
