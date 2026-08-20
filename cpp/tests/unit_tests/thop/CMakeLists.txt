@@ -18,3 +18,6 @@ if(${BUILD_PYT})
   target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
                                            ${TORCH_LIBRARIES})
 endif()
+
+# Header-only decision on plain types: no CUDA, no torch, no GPU needed.
+add_gtest(moeWorkspaceReservationRuleTest moeWorkspaceReservationRuleTest.cpp)
