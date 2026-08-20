@@ -2211,17 +2211,17 @@ class FP4MQALogitsKernel:
                     meta_warp = local_tidx // 32
                     meta_lane = local_tidx % 32
                     if cutlass.const_expr(self.emit_seed_counts):
-                        sthr = cute.make_fragment(next_n * 3, cutlass.Float32)
-                        scnt = cute.make_fragment(next_n * 3, cutlass.Int32)
-                        spass = cute.make_fragment(next_n, cutlass.Int32)
+                        sthr = cute.make_rmem_tensor(next_n * 3, cutlass.Float32)
+                        scnt = cute.make_rmem_tensor(next_n * 3, cutlass.Int32)
+                        spass = cute.make_rmem_tensor(next_n, cutlass.Int32)
                         for _i in cutlass.range_constexpr(next_n):
                             spass[_i] = cutlass.Int32(0)
                         for _i in cutlass.range_constexpr(next_n * 3):
                             sthr[_i] = cutlass.Float32(_META_FLT_MAX)
                             scnt[_i] = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_cand or self.emit_cand_bucketed):
-                        cwbase = cute.make_fragment(next_n, cutlass.Int32)
-                        cwleft = cute.make_fragment(next_n, cutlass.Int32)
+                        cwbase = cute.make_rmem_tensor(next_n, cutlass.Int32)
+                        cwleft = cute.make_rmem_tensor(next_n, cutlass.Int32)
                         for _i in cutlass.range_constexpr(next_n):
                             cwbase[_i] = cutlass.Int32(0)
                             cwleft[_i] = cutlass.Int32(0)
@@ -2229,10 +2229,10 @@ class FP4MQALogitsKernel:
                         # Per-lane hit accumulators, carried across all
                         # tiles of the same q and flushed once per
                         # q-transition — no warp-wide ops per tile.
-                        hacc_min = cute.make_fragment(next_n, cutlass.Float32)
-                        hacc_max = cute.make_fragment(next_n, cutlass.Float32)
-                        hacc_sum = cute.make_fragment(next_n, cutlass.Float32)
-                        hacc_cnt = cute.make_fragment(next_n, cutlass.Int32)
+                        hacc_min = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        hacc_max = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        hacc_sum = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        hacc_cnt = cute.make_rmem_tensor(next_n, cutlass.Int32)
                         for _t in cutlass.range_constexpr(next_n):
                             hacc_min[_t] = cutlass.Float32(_META_FLT_MAX)
                             hacc_max[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
@@ -2985,17 +2985,17 @@ class FP4MQALogitsKernel:
                     meta_warp = local_tidx // 32
                     meta_lane = local_tidx % 32
                     if cutlass.const_expr(self.emit_seed_counts):
-                        sthr = cute.make_fragment(next_n * 3, cutlass.Float32)
-                        scnt = cute.make_fragment(next_n * 3, cutlass.Int32)
-                        spass = cute.make_fragment(next_n, cutlass.Int32)
+                        sthr = cute.make_rmem_tensor(next_n * 3, cutlass.Float32)
+                        scnt = cute.make_rmem_tensor(next_n * 3, cutlass.Int32)
+                        spass = cute.make_rmem_tensor(next_n, cutlass.Int32)
                         for _i in cutlass.range_constexpr(next_n):
                             spass[_i] = cutlass.Int32(0)
                         for _i in cutlass.range_constexpr(next_n * 3):
                             sthr[_i] = cutlass.Float32(_META_FLT_MAX)
                             scnt[_i] = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_cand or self.emit_cand_bucketed):
-                        cwbase = cute.make_fragment(next_n, cutlass.Int32)
-                        cwleft = cute.make_fragment(next_n, cutlass.Int32)
+                        cwbase = cute.make_rmem_tensor(next_n, cutlass.Int32)
+                        cwleft = cute.make_rmem_tensor(next_n, cutlass.Int32)
                         for _i in cutlass.range_constexpr(next_n):
                             cwbase[_i] = cutlass.Int32(0)
                             cwleft[_i] = cutlass.Int32(0)
@@ -3003,10 +3003,10 @@ class FP4MQALogitsKernel:
                         # Per-lane hit accumulators, carried across all
                         # tiles of the same q and flushed once per
                         # q-transition — no warp-wide ops per tile.
-                        hacc_min = cute.make_fragment(next_n, cutlass.Float32)
-                        hacc_max = cute.make_fragment(next_n, cutlass.Float32)
-                        hacc_sum = cute.make_fragment(next_n, cutlass.Float32)
-                        hacc_cnt = cute.make_fragment(next_n, cutlass.Int32)
+                        hacc_min = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        hacc_max = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        hacc_sum = cute.make_rmem_tensor(next_n, cutlass.Float32)
+                        hacc_cnt = cute.make_rmem_tensor(next_n, cutlass.Int32)
                         for _t in cutlass.range_constexpr(next_n):
                             hacc_min[_t] = cutlass.Float32(_META_FLT_MAX)
                             hacc_max[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
