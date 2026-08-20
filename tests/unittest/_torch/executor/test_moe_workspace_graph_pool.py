@@ -173,6 +173,12 @@ _GEOMETRIES = {
 }
 
 
+# This PR makes the reservation the default, so the arms that reproduce the
+# pre-fix behaviour have to switch it off explicitly. Without this they would
+# exercise the fix and the fault assertions would silently invert.
+_RESERVE_OFF = {"TLLM_MOE_CAPTURE_WORKSPACE_RESERVE": "0"}
+
+
 def _run(
     arm: str,
     geometry: str,
@@ -201,7 +207,7 @@ def test_workspace_held_across_pool_teardown_faults(geometry):
     size. If one geometry stops faulting, the diagnosis needs re-examining
     rather than the test relaxing.
     """
-    assert _run("hazard", geometry) != 0, (
+    assert _run("hazard", geometry, extra_env=_RESERVE_OFF) != 0, (
         f"[{geometry}] expected the held MoE workspace to fault the allocator; "
         "if this now passes, the PyTorch allocator behaviour has changed and "
         "CUDAGraphRunner.clear() should be re-examined"
@@ -213,7 +219,7 @@ def test_workspace_held_across_pool_teardown_faults(geometry):
 @pytest.mark.parametrize("geometry", sorted(_GEOMETRIES))
 def test_releasing_workspaces_first_avoids_the_fault(geometry):
     """clear_all_workspaces() before the teardown, which is what clear() does."""
-    assert _run("fix", geometry) == 0
+    assert _run("fix", geometry, extra_env=_RESERVE_OFF) == 0
 
 
 # The reservation arms run the HAZARD script -- no clear_all_workspaces() before
