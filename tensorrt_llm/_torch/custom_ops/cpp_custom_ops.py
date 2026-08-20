@@ -337,6 +337,21 @@ def _register_fake():
                 packed.new_empty((num_tokens, num_heads_index, head_dim),
                                  dtype=torch.float8_e4m3fn))
 
+    @torch.library.register_fake(
+        "trtllm::minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert")
+    def _(packed, kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc,
+          kv_quant_scale, num_heads_q, num_heads_kv, num_heads_index, head_dim,
+          rotary_dim, eps, q_weight, k_weight, index_q_weight, index_k_weight,
+          rotary_cos_sin, position_ids):
+        del kv_data_cache, kv_scale_cache, index_k_cache, out_cache_loc
+        del kv_quant_scale, num_heads_kv, rotary_dim, eps, q_weight, k_weight
+        del index_q_weight, index_k_weight, rotary_cos_sin, position_ids
+        num_tokens = packed.shape[0]
+        return (packed.new_empty((num_tokens, num_heads_q, head_dim),
+                                 dtype=torch.float8_e4m3fn),
+                packed.new_empty((num_tokens, num_heads_index, head_dim),
+                                 dtype=torch.float8_e4m3fn))
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)

@@ -91,6 +91,18 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
     float eps, void const* q_weight, void const* k_weight, void const* index_q_weight, void const* index_k_weight,
     float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream);
 
+// MiniMax-M3 sparse horizontal producer for an NVFP4 main KV cache.  Q,
+// index-Q, and index-K remain FP8.  Main K/V are quantized directly from the
+// normalized/RoPE registers into packed E2M1 data plus E4M3 SF16 scales.
+void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
+    void* kv_data_cache, void* kv_scale_cache, void* index_k_cache, int const* out_cache_loc,
+    float const* kv_quant_scale, int64_t data_page_stride, int64_t data_plane_stride, int64_t data_head_stride,
+    int64_t data_token_stride, int64_t scale_page_stride, int64_t scale_plane_stride, int64_t scale_head_stride,
+    int64_t index_page_stride, int64_t index_token_stride, int page_size, int num_tokens, int num_heads_q,
+    int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps, void const* q_weight,
+    void const* k_weight, void const* index_q_weight, void const* index_k_weight, float const* rotary_cos_sin,
+    int const* position_ids, cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

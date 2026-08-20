@@ -878,7 +878,7 @@ def minimax_m3_fused_sparse_qkv_producer(
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
 ) -> List[torch.Tensor]:
-    """Run the existing fused sparse producer in a captured graph segment."""
+    """Run the fused sparse producer in a captured graph segment."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     packed = attn_layer.qkv_proj(hidden_states)
     result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
@@ -888,7 +888,7 @@ def minimax_m3_fused_sparse_qkv_producer(
         allow_graph_padding=True,
     )
     if result is None:
-        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer.")
+        raise RuntimeError("MiniMax-M3 piecewise graph requires the fused sparse QKV producer.")
     return list(result)
 
 
@@ -1411,12 +1411,14 @@ class MiniMaxM3Attention(Attention):
 
         The CUDA kernel is token-major and batch-type agnostic: per-token
         positions and cache slots cover pure prefill, mixed aggregate batches,
-        and CUDA-graph decode.
+        and CUDA-graph decode.  FP8 caches receive FP8 K/V directly.  NVFP4
+        caches receive packed E2M1 K/V plus their E4M3 SF16 scale bytes while
+        Q, index-Q, and index-K remain FP8.
         """
         if (
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-            or not self._emit_fp8_main_qkv()
+            or not (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
             or self.attn.indexer_kv_dtype != "fp8"
         ):
             return None
@@ -1446,15 +1448,47 @@ class MiniMaxM3Attention(Attention):
         index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
         out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
         num_tokens = int(packed.shape[0])
-        supported_main_cache = (
-            buffers is not None
-            and buffers.is_cuda
-            and buffers.dtype == torch.float8_e4m3fn
-            and buffers.dim() == 5
-            and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
-            and buffers.stride(4) == 1
-            and buffers.stride(3) == 128
+        layer_uses_nvfp4 = bool(
+            getattr(kv_cache_manager, "is_nvfp4_layer", lambda _layer_idx: False)(self.layer_idx)
         )
+        scale_buffers = (
+            kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
+            if layer_uses_nvfp4
+            else None
+        )
+        kv_quant_scale = getattr(self.qkv_proj, "inv_kv_scales", None) if layer_uses_nvfp4 else None
+        if layer_uses_nvfp4:
+            supported_main_cache = (
+                buffers is not None
+                and buffers.is_cuda
+                and buffers.dtype in (torch.int8, torch.uint8)
+                and buffers.dim() == 5
+                and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 64)
+                and buffers.stride(4) == 1
+                and buffers.stride(3) == 64
+                and scale_buffers is not None
+                and scale_buffers.is_cuda
+                and scale_buffers.dtype == torch.uint8
+                and scale_buffers.dim() == 5
+                and tuple(scale_buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 8)
+                and scale_buffers.stride(4) == 1
+                and scale_buffers.stride(3) == 8
+                and kv_quant_scale is not None
+                and kv_quant_scale.is_cuda
+                and kv_quant_scale.dtype == torch.float32
+                and kv_quant_scale.numel() >= 3
+                and kv_quant_scale.is_contiguous()
+            )
+        else:
+            supported_main_cache = (
+                buffers is not None
+                and buffers.is_cuda
+                and buffers.dtype == torch.float8_e4m3fn
+                and buffers.dim() == 5
+                and tuple(buffers.shape[1:]) == (2, self.num_key_value_heads, 128, 128)
+                and buffers.stride(4) == 1
+                and buffers.stride(3) == 128
+            )
         supported_index_cache = (
             index_k_cache.is_cuda
             and index_k_cache.dtype == torch.float8_e4m3fn
@@ -1483,10 +1517,7 @@ class MiniMaxM3Attention(Attention):
         ):
             return None
 
-        q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
-            packed.contiguous(),
-            buffers,
-            index_k_cache,
+        common_args = (
             out_cache_loc[:num_tokens],
             self.num_heads,
             self.num_key_value_heads,
@@ -1501,6 +1532,23 @@ class MiniMaxM3Attention(Attention):
             rotary_cos_sin,
             position_ids.reshape(-1).contiguous().to(torch.int32),
         )
+        if layer_uses_nvfp4:
+            q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers.view(torch.uint8),
+                scale_buffers,
+                index_k_cache,
+                common_args[0],
+                kv_quant_scale,
+                *common_args[1:],
+            )
+        else:
+            q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers,
+                index_k_cache,
+                *common_args,
+            )
         attn_metadata._msa_prewritten_layer = self.attn.layer_idx
         return q.flatten(1), index_q.flatten(1)
 
@@ -2099,7 +2147,7 @@ class MiniMaxM3Attention(Attention):
             and is_torch_compiling()
             and self.enable_fused_qkv_index_projection
             and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-            and self._emit_fp8_main_qkv()
+            and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
             and self.attn.indexer_kv_dtype == "fp8"
         ):
             q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
