@@ -671,6 +671,8 @@ class TestKVCacheFailuresGen:
 
     def test_recompute_search_is_independent_of_ordinary_eviction_frontier(self):
         """A shrunk scheduling range cannot hide a younger preserved victim."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
+
         current = make_gen_request(0)
         victim = make_gen_request(1)
         mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: True)
@@ -683,22 +685,24 @@ class TestKVCacheFailuresGen:
         )
         evicted = [victim]
         recompute_paused = []
-        released_request_indices = set()
+        recompute_pause_state = _RecomputePauseState(frontier=1)
 
-        success = sched._try_release_for_gen(
+        req_it_end, success = sched._try_recompute_pause_for_gen(
             current,
             [current, victim],
             req_it=0,
-            released_request_indices=released_request_indices,
+            req_it_end=1,
+            recompute_pause_state=recompute_pause_state,
             evicted=evicted,
             recompute_paused=recompute_paused,
             protected_request_ids=set(),
         )
 
         assert success
+        assert req_it_end == 1
         assert evicted == []
         assert recompute_paused == [victim]
-        assert released_request_indices == {1}
+        assert recompute_pause_state.victim_indices == {1}
         mgr.free_resources.assert_called_once_with(victim)
         cross_mgr.free_resources.assert_called_once_with(victim)
         mgr.try_allocate_generation.assert_called_once_with(current)

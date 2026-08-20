@@ -40,6 +40,14 @@ class ScheduleAction(enum.Enum):
     STOP = "stop"  # stop the scheduling loop
 
 
+class _RecomputePauseState:
+    """Candidate frontier and exact victims for one scheduling iteration."""
+
+    def __init__(self, frontier: int):
+        self.frontier = frontier
+        self.victim_indices: set[int] = set()
+
+
 class BudgetTracker:
     """Tracks token, request, and PEFT budgets for one scheduling iteration.
 
@@ -323,7 +331,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         req_it_end = len(requests_list)
-        released_request_indices: set[int] = set()
+        recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
 
         # Context requests are always deferred to a second phase so that
@@ -352,7 +360,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         while req_it < req_it_end:
             req = requests_list[req_it]
 
-            if req_it in released_request_indices:
+            if req_it in recompute_pause_state.victim_indices:
                 req_it += 1
                 continue
 
@@ -434,7 +442,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     requests_list,
                     req_it,
                     req_it_end,
-                    released_request_indices,
+                    recompute_pause_state,
                     evicted,
                     recompute_paused,
                     protected_cache_owner_ids,
@@ -993,7 +1001,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         requests_list: list,
         req_it: int,
         req_it_end: int,
-        released_request_indices: set[int],
+        recompute_pause_state: _RecomputePauseState,
         evicted: RequestList,
         recompute_paused: RequestList,
         protected_cache_owner_ids: set[int],
@@ -1038,11 +1046,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         if not success:
-            success = self._try_release_for_gen(
+            req_it_end, success = self._try_recompute_pause_for_gen(
                 req,
                 requests_list,
                 req_it,
-                released_request_indices,
+                req_it_end,
+                recompute_pause_state,
                 evicted,
                 recompute_paused,
                 protected_cache_owner_ids,
@@ -1071,7 +1080,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
             self._evict_request(req)
             evicted.append(req)
-        elif self.enable_recompute_pause and self._can_release_for_recompute(
+        elif self.enable_recompute_pause and self._is_recompute_pause_candidate(
             req, protected_cache_owner_ids
         ):
             # The request was evicted in an earlier scheduling pass. Its cache
@@ -1082,9 +1091,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"[V2Scheduler] Releasing cache for blocked request {req.py_request_id} "
                 f"for recomputation after preserved eviction could not make progress"
             )
-            self._release_cache_for_recompute(req)
+            self._recompute_pause_request(req)
             recompute_paused.append(req)
-            released_request_indices.add(req_it)
+            recompute_pause_state.victim_indices.add(req_it)
+            recompute_pause_state.frontier = min(recompute_pause_state.frontier, req_it)
 
         return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end, True
 
@@ -1135,7 +1145,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
-    def _can_release_for_recompute(self, req: LlmRequest, protected_request_ids: set[int]) -> bool:
+    def _is_recompute_pause_candidate(
+        self, req: LlmRequest, protected_request_ids: set[int]
+    ) -> bool:
         if req.request_id in protected_request_ids:
             return False
         # is_generation_in_progress_state also includes GENERATION_TO_COMPLETE,
@@ -1149,7 +1161,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return self._is_started_request(req)
 
-    def _release_cache_for_recompute(self, req: LlmRequest) -> None:
+    def _recompute_pause_request(self, req: LlmRequest) -> None:
         self._clear_request_runtime_state(req)
         self.kv_cache_manager.free_resources(req)
         if self.draft_kv_cache_manager is not None:
@@ -1205,40 +1217,52 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return req_it_end, False
 
-    def _try_release_for_gen(
+    def _try_recompute_pause_for_gen(
         self,
         req: LlmRequest,
         requests_list: RequestList,
         req_it: int,
-        released_request_indices: set[int],
+        req_it_end: int,
+        recompute_pause_state: _RecomputePauseState,
         evicted: RequestList,
         recompute_paused: RequestList,
         protected_request_ids: set[int],
-    ) -> bool:
-        """Release evicted cache state when preserving it cannot make progress.
+    ) -> tuple[int, bool]:
+        """Use main's recompute-pause fallback after preserved eviction fails.
 
-        Active candidates have already gone through ordinary eviction in this
-        pass. Candidates that were already suspended had the same opportunity
-        in an earlier pass. If admission still fails, release the youngest safe
-        candidate and retry. Exact victim indices prevent released requests
-        from being revisited later in this scheduling pass.
+        The scheduler does not inspect the physical cache topology. Every
+        candidate first goes through manager-owned eviction; if allocation
+        still fails, this fallback releases one safe request for recomputation.
         """
         if not self.enable_recompute_pause:
-            return False
+            return req_it_end, False
 
         while True:
             victim_idx = None
-            for i in range(len(requests_list) - 1, req_it, -1):
-                if i in released_request_indices:
+            for i in range(recompute_pause_state.frontier - 1, req_it, -1):
+                if i in recompute_pause_state.victim_indices:
                     continue
                 candidate = requests_list[i]
-                if self._can_release_for_recompute(candidate, protected_request_ids):
+                if self._is_recompute_pause_candidate(candidate, protected_request_ids):
                     victim_idx = i
                     break
 
             if victim_idx is None:
-                break
-            victim = requests_list[victim_idx]
+                victim = next(
+                    (
+                        candidate
+                        for candidate in evicted
+                        if self._is_recompute_pause_candidate(candidate, protected_request_ids)
+                    ),
+                    None,
+                )
+                if victim is None:
+                    break
+                victim_idx = next(
+                    i for i, candidate in enumerate(requests_list) if candidate is victim
+                )
+            else:
+                victim = requests_list[victim_idx]
 
             evicted_victim_pos = next(
                 (i for i, candidate in enumerate(evicted) if candidate is victim), None
@@ -1249,17 +1273,28 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"[V2Scheduler] Releasing cache for request {victim.py_request_id} "
                 f"for recomputation to admit request {req.py_request_id}"
             )
-            self._release_cache_for_recompute(victim)
+            self._recompute_pause_request(victim)
             recompute_paused.append(victim)
-            released_request_indices.add(victim_idx)
+            recompute_pause_state.victim_indices.add(victim_idx)
+            recompute_pause_state.frontier = min(recompute_pause_state.frontier, victim_idx)
 
-            # Retry immediately after the destructive fallback. Physical tier
-            # topology remains entirely inside the cache manager.
+            # Releasing a preserved request can also free room in a lower tier,
+            # so give another active request the ordinary eviction path before
+            # selecting another recompute victim.
             success = self.kv_cache_manager.try_allocate_generation(req)
+            if not success:
+                req_it_end, success = self._try_evict_for_gen(
+                    req,
+                    requests_list,
+                    req_it,
+                    req_it_end,
+                    evicted,
+                    protected_request_ids,
+                )
             if success:
-                return True
+                return req_it_end, True
 
-        return False
+        return req_it_end, False
 
     # ---- Sorting ----
 
