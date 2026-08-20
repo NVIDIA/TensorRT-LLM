@@ -2698,6 +2698,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             return runner_id
 
+        def _get_default_tactic(
+                self) -> Tuple[Tuple[int, int], Tuple[int, int], bool]:
+            """Return the untuned tactic, honoring an explicit N-tile override."""
+            return (
+                (self.tile_size, self.fc2_n_tile_size_override or 128),
+                (self.tile_size // 128, 1),
+                False,
+            )
+
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -2861,9 +2870,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if isinstance(tactic, tuple):
                 mma_tiler_mn, cluster_shape_mn, raster_along_m = tactic
             else:
-                mma_tiler_mn = (self.tile_size, 128)
-                cluster_shape_mn = (self.tile_size // 128, 1)
-                raster_along_m = False
+                mma_tiler_mn, cluster_shape_mn, raster_along_m = (
+                    self._get_default_tactic())
             assert mma_tiler_mn[
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 

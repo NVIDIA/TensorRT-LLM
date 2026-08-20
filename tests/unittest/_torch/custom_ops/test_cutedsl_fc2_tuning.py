@@ -24,7 +24,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_runner(monkeypatch) -> "Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner":
+def _make_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> "Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner":
     monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 100)
     monkeypatch.setattr(
         Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
@@ -49,7 +51,11 @@ def _make_runner(monkeypatch) -> "Sm100BlockScaledContiguousGroupedGemmFinalizeF
         ("256", {256}),
     ],
 )
-def test_fc2_n_tile_size_override(monkeypatch, env_value, expected_n_tiles) -> None:
+def test_fc2_n_tile_size_override(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str | None,
+    expected_n_tiles: set[int],
+) -> None:
     if env_value is None:
         monkeypatch.delenv(_CUTEDSL_FC2_N_TILE_SIZE_ENV, raising=False)
     else:
@@ -61,6 +67,7 @@ def test_fc2_n_tile_size_override(monkeypatch, env_value, expected_n_tiles) -> N
     tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
 
     assert {tactic[0][1] for tactic in tactics} == expected_n_tiles
+    assert runner._get_default_tactic()[0][1] == (int(env_value) if env_value is not None else 128)
     if env_value is None:
         assert "fc2_n_tile_size_override" not in runner.unique_id()
     else:
@@ -71,7 +78,10 @@ def test_fc2_n_tile_size_override(monkeypatch, env_value, expected_n_tiles) -> N
 
 
 @pytest.mark.parametrize("env_value", ["", "64", "128,256", " 128", "invalid"])
-def test_fc2_n_tile_size_override_rejects_invalid_values(monkeypatch, env_value) -> None:
+def test_fc2_n_tile_size_override_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str,
+) -> None:
     monkeypatch.setenv(_CUTEDSL_FC2_N_TILE_SIZE_ENV, env_value)
 
     with pytest.raises(ValueError, match=f"{_CUTEDSL_FC2_N_TILE_SIZE_ENV} must be unset"):

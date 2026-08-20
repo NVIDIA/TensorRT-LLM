@@ -142,6 +142,7 @@ l0_b200:
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
+  - unittest/_torch/custom_ops/test_cutedsl_fc2_tuning.py
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
