@@ -319,3 +319,185 @@ def issue_dynamic_block_scaled_mma_tile(
                     _nvvm_raw.Tcgen05MMABlockScale.BLOCK16,
                 }
             nvvm.tcgen05_mma_block_scale(**nvvm_args)
+
+
+# =============================================================================
+# SM107 2x-K dynamic-N MMA
+# =============================================================================
+#
+# Rubin changes the block-scaled instruction descriptor and exposes the 2x-K
+# form through PTX before it is represented by the public NVVM bindings used
+# above. Keep the SM107 emitter here, next to the SM100 emitter, so the shared
+# FC12 kernel can select it without importing a second copy of the mainloop.
+
+_SM107_BIT_K_SIZE_UPPER = 3
+_SM107_BIT_B_SF_ID = 4
+_SM107_BIT_A_FORMAT = 7
+_SM107_BIT_B_FORMAT = 10
+_SM107_BIT_A_MAJOR = 15
+_SM107_BIT_B_MAJOR = 16
+_SM107_BIT_N_DIM = 17
+_SM107_BIT_M_DIM = 27
+_SM107_BIT_A_SF_ID = 29
+_SM107_NVFP4_INSTRUCTION_K = 128
+
+
+def build_sm107_static_idesc_base(
+    *,
+    instruction_mnk: tuple[int, int, int],
+    a_major: int = 0,
+    b_major: int = 0,
+) -> int:
+    """Pack the static fields of one Rubin NVFP4 2x-K descriptor."""
+    instruction_m, instruction_n, instruction_k = instruction_mnk
+    if instruction_m not in (128, 256):
+        raise ValueError(
+            f"SM107 MegaMoE requires instruction M 128 or 256, got {instruction_m}."
+        )
+    n_granularity = 16 if instruction_m == 256 else 8
+    if instruction_n <= 0 or instruction_n > 256 or instruction_n % n_granularity != 0:
+        raise ValueError(
+            f"Invalid SM107 instruction N {instruction_n} for instruction M {instruction_m}."
+        )
+    if instruction_k != _SM107_NVFP4_INSTRUCTION_K:
+        raise ValueError("SM107 NVFP4 MegaMoE requires the 2x instruction K "
+                         f"{_SM107_NVFP4_INSTRUCTION_K}, got {instruction_k}.")
+
+    descriptor = 0
+    # Dual FP4 2x-K encoding: k_size_upper=1 and k_size=0. E2M1 format
+    # is code 1 for both operands. Scale format and SFA layout are also 0.
+    descriptor |= 1 << _SM107_BIT_K_SIZE_UPPER
+    descriptor |= 1 << _SM107_BIT_A_FORMAT
+    descriptor |= 1 << _SM107_BIT_B_FORMAT
+    descriptor |= (a_major & 0x1) << _SM107_BIT_A_MAJOR
+    descriptor |= (b_major & 0x1) << _SM107_BIT_B_MAJOR
+    descriptor |= ((instruction_m >> 7) & 0x3) << _SM107_BIT_M_DIM
+    return descriptor & 0xFFFFFFFF
+
+
+@dsl_user_op
+def compute_sm107_idesc(
+    *,
+    static_base: int,
+    valid_tokens_in_tile,
+    sfa_tmem_addr_i32,
+    sfb_tmem_addr_i32,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int32:
+    """Add runtime N and scale-factor IDs to an SM107 descriptor."""
+    n_dim_value = _align16(valid_tokens_in_tile) >> Int32(3)
+    descriptor = Int32(static_base) | (n_dim_value << _SM107_BIT_N_DIM)
+    sfa_top_bits = Int32(sfa_tmem_addr_i32) & Int32(0xC0000000)
+    sfb_top_bits = Int32(sfb_tmem_addr_i32) & Int32(0xC0000000)
+    descriptor = descriptor | ((sfa_top_bits >> Int32(30 - _SM107_BIT_A_SF_ID))
+                               & Int32(0x3 << _SM107_BIT_A_SF_ID))
+    descriptor = descriptor | ((sfb_top_bits >> Int32(30 - _SM107_BIT_B_SF_ID))
+                               & Int32(0x3 << _SM107_BIT_B_SF_ID))
+    return descriptor
+
+
+@dsl_user_op
+def _sm107_mma_block_scaled_nvfp4(
+    *,
+    cta_group: int,
+    d_tmem_i32,
+    a_desc_i64,
+    b_desc_i64,
+    idesc_i32,
+    enable_input_d_i32,
+    sfa_tmem_i32,
+    sfb_tmem_i32,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Emit one SM107 NVFP4 2x-K block-scaled instruction."""
+    if cta_group not in (1, 2):
+        raise ValueError(f"cta_group must be one or two, got {cta_group}.")
+    llvm.inline_asm(
+        None,
+        [
+            d_tmem_i32,
+            a_desc_i64,
+            b_desc_i64,
+            idesc_i32,
+            enable_input_d_i32,
+            sfa_tmem_i32,
+            sfb_tmem_i32,
+        ],
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, $4, 0;\n\t"
+        f"tcgen05.mma.cta_group::{cta_group}.kind::mxf4nvf4.block_scale.block16 "
+        "[$0], $1, $2, $3, [$5], [$6], p;\n\t"
+        "}\n",
+        "r,l,l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def issue_sm107_dynamic_block_scaled_mma_window(
+    *,
+    acc_tensor: cute.Tensor,
+    a_window_frag: cute.Tensor,
+    b_window_frag: cute.Tensor,
+    sfa_window_tensor: cute.Tensor,
+    sfb_window_tensor: cute.Tensor,
+    valid_tokens_in_tile: Int32,
+    mma_instruction_mnk: tuple,
+    window_instruction_offset: int,
+    window_instruction_count: int,
+    first_instruction_accumulate,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Issue one Rubin NVFP4 SF window with caller-owned accumulation state."""
+    if window_instruction_count <= 0:
+        raise ValueError("window_instruction_count must be positive.")
+    if window_instruction_offset < 0:
+        raise ValueError("window_instruction_offset must be nonnegative.")
+    if mma_instruction_mnk[2] != _SM107_NVFP4_INSTRUCTION_K:
+        raise ValueError(
+            "mma_instruction_mnk must use the SM107 NVFP4 2x instruction K.")
+
+    static_idesc_base = build_sm107_static_idesc_base(
+        instruction_mnk=mma_instruction_mnk, )
+    cta_group = 2 if mma_instruction_mnk[0] == 256 else 1
+
+    for instruction_index in range(window_instruction_count):
+        fragment_instruction_index = window_instruction_offset + instruction_index
+        a_atom = a_window_frag[(None, 0, fragment_instruction_index)]
+        b_atom = b_window_frag[(None, 0, fragment_instruction_index)]
+        sfa_atom = sfa_window_tensor[(None, 0, instruction_index)]
+        sfb_atom = sfb_window_tensor[(None, 0, instruction_index)]
+        acc_atom = acc_tensor[(None, 0, 0)]
+
+        operand_a = _smem_desc_to_i64(_as_value(a_atom.iterator))
+        operand_b = _smem_desc_to_i64(_as_value(b_atom.iterator))
+        operand_sfa_i32 = _tmem_ptr_to_i32(_as_value(sfa_atom.iterator))
+        operand_sfb_i32 = _tmem_ptr_to_i32(_as_value(sfb_atom.iterator))
+        operand_acc_i32 = _tmem_ptr_to_i32(_as_value(acc_atom.iterator))
+        descriptor = compute_sm107_idesc(
+            static_base=static_idesc_base,
+            valid_tokens_in_tile=valid_tokens_in_tile,
+            sfa_tmem_addr_i32=operand_sfa_i32,
+            sfb_tmem_addr_i32=operand_sfb_i32,
+        )
+        accumulate = first_instruction_accumulate if instruction_index == 0 else True
+
+        with cute.arch.elect_one():
+            _sm107_mma_block_scaled_nvfp4(
+                cta_group=cta_group,
+                d_tmem_i32=operand_acc_i32,
+                a_desc_i64=operand_a,
+                b_desc_i64=operand_b,
+                idesc_i32=descriptor.ir_value(),
+                enable_input_d_i32=Int32(Boolean(accumulate)).ir_value(),
+                sfa_tmem_i32=operand_sfa_i32,
+                sfb_tmem_i32=operand_sfb_i32,
+            )
