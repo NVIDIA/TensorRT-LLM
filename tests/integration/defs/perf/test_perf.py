@@ -927,6 +927,9 @@ class PerfTestConfig:
         if self.build_only or not self.output_lens:
             return None
 
+        if len(self.input_lens) != len(self.output_lens):
+            return None
+
         # LoRA data is generated with nonzero input/output length deviations.
         if self.num_loras > 0:
             return None

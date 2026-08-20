@@ -31,6 +31,7 @@ from defs.perf import test_perf as perf_test  # noqa: E402
         ([500], [2000], 2500),
         ([500, 1000], [2000, 1500], 2500),
         ([500, 1000], [2000, 2000], None),
+        ([500, 1000], [2000], None),
     ],
 )
 def test_fixed_dataset_sequence_length(
