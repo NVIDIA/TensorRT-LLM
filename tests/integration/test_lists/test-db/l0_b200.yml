@@ -192,6 +192,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_adapter_free_cache_miss_rejected_during_capture
   - unittest/_torch/moe/test_moe_backend.py::test_scheduler_selects_cutedsl_deep_ep_direct_metadata
   - unittest/_torch/moe/test_moe_backend.py::test_scheduler_rejects_direct_metadata_for_other_backend_or_communication
+  - unittest/_torch/moe/test_moe_backend.py::test_scheduler_rejects_direct_metadata_without_fused_finalize
   - unittest/_torch/moe/test_moe_backend.py::test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
