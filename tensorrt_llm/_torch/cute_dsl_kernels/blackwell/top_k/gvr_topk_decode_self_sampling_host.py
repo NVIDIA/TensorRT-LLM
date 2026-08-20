@@ -38,18 +38,20 @@ hints only steer the sampling ladder (exactness never depends on them), and
 on real V3.2 decode captures raw prev-step hints land on MORE of the current
 top-K than +1-shifted ones (mean overlap 0.773 vs 0.536 across 15 cells x 14
 consecutive step-pairs, the gap widening with ISL), so one offset-free hint
-convention serves all three models. The production decode engine
-instead reads per-request ``seq_lens`` on-device with per-row MTP offsets
-(sync-free, CUDA-graph-replay safe with growing KV); adopting that per-row
-contract inside these kernels is tracked follow-up work. Until then this
-module is exercised standalone (unit tests / benchmarking) and must not be
-substituted for the tiered path under continuous batching, MTP
-(``next_n > 1``), or CUDA-graph capture.
+convention serves all three models. The production per-row contract
+(per-request ``kv_lens`` read on-device, per-row MTP offsets — sync-free and
+CUDA-graph-replay safe with growing KV) is implemented by ``run_varlen``,
+which is the entry the opt-in DSA dispatch seam calls. The batch-uniform
+``run``/``run_ws`` entries keep the original standalone contract (one
+host-side ``n_valid`` for the whole batch), are exercised for unit tests and
+benchmarking only, and must not be substituted for the tiered path under
+continuous batching, MTP (``next_n > 1``), or CUDA-graph capture.
 """
 
 import math
 import operator
 import threading
+from collections.abc import Sequence
 
 import torch
 
@@ -148,8 +150,10 @@ CMPC = 4096  # L2372 crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # L2374 CTA size of the clustered register path
 
 
-def route(b, n, npad, k):
+def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     """Mirror of gvr_topk_launch (kernel.cu L2754-3197). Pure. See module doc."""
+    if b < 1:
+        raise RuntimeError(f"route requires b >= 1, got {b}")
     wide = b <= 148  # L2757
 
     # ================= register-resident block (L2758-2949) =================
@@ -490,7 +494,7 @@ _DYN_RT = {
 _DYN_SMEM = ("reg", "regimg")  # smem depends on CMP/IMGW -> recomputed per n
 
 
-def route_static(b, n, npad, k):
+def route_static(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     """route() with the n-continuous fields redacted (see _DYN_RT/_DYN_SMEM).
     Constant on maximal n-intervals ("bands"); every redacted field is
     reconstructible from (static, n) by route_dynamic."""
@@ -503,7 +507,7 @@ def route_static(b, n, npad, k):
     return st
 
 
-def route_dynamic(static, n):
+def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object], int]:
     """Recompute the redacted n-continuous scalars from (static, n).
     Returns (rt_updates, smem). Transcribed independently from route() —
     the factorization fuzz is the equivalence proof, and the device-side
@@ -581,7 +585,7 @@ def route_dynamic(static, n):
     )
 
 
-def route_split(b, n, npad, k):
+def route_split(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     """route_static + route_dynamic recombined — must equal route() exactly
     (the factorization fuzz in the unit tests asserts this)."""
     st = route_static(b, n, npad, k)
@@ -592,7 +596,9 @@ def route_split(b, n, npad, k):
     return plan
 
 
-def route_streaming(b, n, npad, k, force_main=False):
+def route_streaming(
+    b: int, n: int, npad: int, k: int, force_main: bool = False
+) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
     correct for ANY row length, so the register-resident specialists are
@@ -601,6 +607,8 @@ def route_streaming(b, n, npad, k, force_main=False):
     110,003/110,003 agreement).  force_main additionally skips the clus
     rounding (v1 varlen engine ships the gvr_main port first; the raw
     min(r1, r2) R then matches the CUDA else-branch exactly)."""
+    if b < 1:
+        raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
     R = 1
     if b <= 32:
         r1 = max(148 // b, 1)
@@ -759,7 +767,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     return lc
 
 
-def route_bands(b, npad, k, n_lo=None, n_hi=None):
+def route_bands(
+    b: int, npad: int, k: int, n_lo: int | None = None, n_hi: int | None = None
+) -> list[tuple[int, int, dict[str, object]]]:
     """Enumerate maximal n-intervals on which route_static is constant.
     Dense O(n_hi - n_lo) scan of the pure host dispatch — an offline /
     engine-init tool (seconds for the 262144-token envelope), NOT a hot
@@ -1142,11 +1152,11 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
 
     key = (b, n, npad, k)
     lc = _LAUNCH_CACHE.get(key)
+    if lc is None:
+        lc = _build_launcher(b, n, npad, k)
+        _LAUNCH_CACHE[key] = lc
+    fn, args, needs_ws = lc
     try:
-        if lc is None:
-            lc = _build_launcher(b, n, npad, k)
-            _LAUNCH_CACHE[key] = lc
-        fn, args, needs_ws = lc
         if needs_ws:
             fn(logits, pre_idx, indices, ws, *args)
         else:
@@ -1154,13 +1164,23 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
     except Exception as e:
         raise RuntimeError(f"gvr_topk launch failed (b={b} n={n} npad={npad} k={k}): {e}") from e
     if values is not None:
-        values.copy_(logits.gather(1, indices.to(torch.int64)))
+        # same epilogue as run_varlen: a (never-expected) negative index
+        # degrades to -FLT_MAX instead of a context-poisoning device assert
+        idx64 = indices.to(torch.int64)
+        values.copy_(logits.gather(1, idx64.clamp_min(0)))
+        values.masked_fill_(indices < 0, torch.finfo(_F32).min)
 
 
 # ---------------------------------------------------------------------------
 # exports (main.cpp:98-124)
 # ---------------------------------------------------------------------------
-def run(logits, pre_idx, n_valid, indices, values=None):
+def run(
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    n_valid: int,
+    indices: torch.Tensor,
+    values: torch.Tensor | None = None,
+) -> None:
     """TESTING/BENCH ONLY — production callers must use ``run_varlen`` (per-request
     device kv_lens; this entry assumes one batch-uniform host ``n_valid``,
     which real serving batches do not satisfy).
@@ -1181,7 +1201,14 @@ def run(logits, pre_idx, n_valid, indices, values=None):
     _run_impl(logits, pre_idx, n_valid, indices, ws, values)
 
 
-def run_ws(logits, pre_idx, n_valid, indices, workspace, values=None):
+def run_ws(
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    n_valid: int,
+    indices: torch.Tensor,
+    workspace: torch.Tensor,
+    values: torch.Tensor | None = None,
+) -> None:
     """TESTING/BENCH ONLY — production callers must use ``run_varlen(workspace=...)``.
 
     Explicit-workspace form for multi-stream callers (main.cpp:105-116)."""
@@ -1190,17 +1217,17 @@ def run_ws(logits, pre_idx, n_valid, indices, workspace, values=None):
 
 
 def run_varlen(
-    logits,
-    pre_idx,
-    kv_lens,
-    indices,
-    next_n=1,
-    compress_ratio=1,
-    values=None,
-    max_seq_len=None,
-    engine="auto",
-    workspace=None,
-):
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    kv_lens: torch.Tensor,
+    indices: torch.Tensor,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    values: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
+    engine: str = "auto",
+    workspace: torch.Tensor | None = None,
+) -> None:
     """Production-contract varlen entry (per-row device kv_lens).
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
@@ -1411,6 +1438,7 @@ __all__ = [
     "run",
     "run_ws",
     "run_varlen",
+    "warmup_varlen",
     "workspace_bytes",
     "WS_BYTES",
     "default_workspace",
@@ -1429,42 +1457,52 @@ _VARLEN_WARMUP_DONE: set = set()
 _VARLEN_WARMUP_LOCK = threading.Lock()
 
 
-def warmup_varlen(top_k, max_seq_len, compress_ratio=1, next_n=1, num_rows_list=(1,)):
+def warmup_varlen(
+    top_k: int,
+    max_seq_len: int,
+    compress_ratio: int = 1,
+    next_n: int = 1,
+    num_rows_list: Sequence[int] = (1,),
+) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
     One tiny real launch per requested ``num_rows`` (compile keys do not
-    depend on tensor contents). Uses the current CUDA device.
+    depend on tensor contents). Uses the current CUDA device. The done-key
+    is recorded only after every launch succeeds, so a failed or interrupted
+    warmup is retried on the next call instead of short-circuiting to an
+    uncompiled engine.
     """
     dev = torch.cuda.current_device()
-    key = (
-        dev,
-        int(top_k),
-        int(max_seq_len),
-        int(compress_ratio),
-        int(next_n),
-        tuple(int(r) for r in num_rows_list),
-    )
+    nn = max(1, int(next_n))
+    # round each request down to a next_n multiple (min next_n) and dedup
+    rows_list = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
+    if not rows_list:
+        return
+    key = (dev, int(top_k), int(max_seq_len), int(compress_ratio), nn, tuple(rows_list))
     with _VARLEN_WARMUP_LOCK:
         if key in _VARLEN_WARMUP_DONE:
             return
-        _VARLEN_WARMUP_DONE.add(key)
     n_env = max(1, int(max_seq_len) // int(compress_ratio))
     npad = (n_env + 63) // 64 * 64
-    for rows in key[5]:
-        rows = max(int(next_n), rows - rows % int(next_n) or int(next_n))
-        batch = rows // int(next_n)
-        logits = torch.zeros((rows, npad), dtype=torch.float32, device=dev)
-        kv_lens = torch.full((batch,), int(max_seq_len), dtype=torch.int32, device=dev)
-        pre_idx = torch.zeros((batch, int(top_k)), dtype=torch.int32, device=dev)
-        out = torch.empty((rows, int(top_k)), dtype=torch.int32, device=dev)
+    rows_max = rows_list[-1]
+    # one allocation at the largest geometry; smaller row counts run on
+    # contiguous prefix views (compile keys depend on shapes only)
+    logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
+    kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
+    pre_idx = torch.zeros((rows_max // nn, int(top_k)), dtype=torch.int32, device=dev)
+    out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
+    for rows in rows_list:
+        batch = rows // nn
         run_varlen(
-            logits,
-            pre_idx,
-            kv_lens,
-            out,
-            next_n=int(next_n),
+            logits[:rows],
+            pre_idx[:batch],
+            kv_lens[:batch],
+            out[:rows],
+            next_n=nn,
             compress_ratio=int(compress_ratio),
             max_seq_len=int(max_seq_len),
         )
-        del logits, kv_lens, pre_idx, out
+    del logits, kv_lens, pre_idx, out
     torch.cuda.synchronize()
+    with _VARLEN_WARMUP_LOCK:
+        _VARLEN_WARMUP_DONE.add(key)

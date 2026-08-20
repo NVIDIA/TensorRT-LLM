@@ -40,8 +40,12 @@ if not torch.cuda.is_available():
 if not IS_CUTLASS_DSL_AVAILABLE:
     pytest.skip("cutlass DSL is required for gvr_selfsampling_topk tests", allow_module_level=True)
 
-if getSMVersion() != 100:
-    pytest.skip("self-sampling GVR kernels target Blackwell sm_100", allow_module_level=True)
+if getSMVersion() < 100:
+    pytest.skip(
+        "self-sampling GVR kernels require Blackwell (SM100+) — same gate as "
+        "the production dispatch",
+        allow_module_level=True,
+    )
 
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
     gvr_topk_decode_self_sampling_host as ss_host,
@@ -593,7 +597,6 @@ def test_selfsampling_dispatch_is_pure_and_total():
             assert r["block"] >= 128 and r["grid"][0] >= 1
 
 
-@pytest.mark.skipif(getSMVersion() < 100, reason="sm100+")
 def test_selfsampling_topk_varlen_rejects_non_fp32():
     """Engine-level dtype contract: bf16/fp16 logits must raise a clear
     error (the dispatch seam falls through before this; direct callers get

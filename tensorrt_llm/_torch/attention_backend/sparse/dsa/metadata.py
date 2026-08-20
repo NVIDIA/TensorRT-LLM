@@ -17,6 +17,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+from tensorrt_llm.logger import logger
 
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -278,13 +279,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             num_sms=self.num_sms,
         )
 
-    def warmup_selfsampling_topk(self, next_n: int) -> None:
+    def warmup_selfsampling_topk(
+        self, next_n: int, batch_sizes: Optional[List[int]] = None
+    ) -> None:
         """Pre-compile the self-sampling GVR varlen engine during warmup.
 
-        Mirrors ``warmup_cute_dsl_radix_topk``: captured geometries compile in
-        the warmup-step forwards; this covers the eager first-touch (bs=1)
-        tuple so a live request never pays the DSL JIT. No-op unless the
-        opt-in gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        Mirrors ``warmup_cute_dsl_radix_topk``. The varlen launcher is keyed
+        by the exact row count, so this warms the eager first-touch tuple
+        (bs=1) plus every configured CUDA-graph batch size — capture then
+        never depends on a prior warmup-forward having compiled its key, and
+        a live request never pays the DSL JIT for those geometries. Eager
+        batches outside ``batch_sizes`` still compile lazily on first touch.
+        No-op unless the opt-in gate (TRTLLM_GVR_SELF_SAMPLING=1) selects
+        the engine.
         """
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
             return
@@ -302,15 +309,26 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         except ImportError:
             return
+        rows = {int(next_n)}
+        for bs in batch_sizes or ():
+            rows.add(int(bs) * int(next_n))
         # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
         # is compressed — same multiply-back as the dispatch seam)
-        _ss_host.warmup_varlen(
-            int(top_k),
-            int(self.get_indexer_max_seq_len()) * cr,
-            compress_ratio=cr,
-            next_n=int(next_n),
-            num_rows_list=(int(next_n),),
-        )
+        try:
+            _ss_host.warmup_varlen(
+                int(top_k),
+                int(self.get_indexer_max_seq_len()) * cr,
+                compress_ratio=cr,
+                next_n=int(next_n),
+                num_rows_list=tuple(sorted(rows)),
+            )
+        except torch.cuda.OutOfMemoryError:
+            # warmup is best-effort: the dispatch works without it (engines
+            # JIT lazily outside capture), so do not fail engine init
+            logger.warning(
+                "self-sampling GVR warmup ran out of memory; varlen engines "
+                "will JIT-compile lazily on first touch instead."
+            )
 
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
