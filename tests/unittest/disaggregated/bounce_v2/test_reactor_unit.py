@@ -54,6 +54,8 @@ from tensorrt_llm._torch.disaggregation.bounce_v2.config import BounceV2Config  
 from tensorrt_llm._torch.disaggregation.bounce_v2.engine import BounceTransferStatus  # noqa: E402
 from tensorrt_llm._torch.disaggregation.bounce_v2.plan import SCATTER_RUN_DTYPE  # noqa: E402
 from tensorrt_llm._torch.disaggregation.bounce_v2.reactor import (  # noqa: E402
+    _KIND_EVENT,
+    _KIND_XFER,
     FAIL_GATHER,
     FAIL_REACTOR_STALLED,
     FAIL_WRITE,
@@ -162,16 +164,26 @@ class FakePoller:
     """CompletionPoller stand-in: reports exactly what the test enqueues.
 
     Mirrors the binding's exactly-once contract — a delivered row is gone —
-    which is precisely what the R1 fixes rely on.
+    which is precisely what the R1 fixes rely on. Rows must also carry the
+    production KIND per row type (the reactor's _KIND_* mirror the binding's
+    KIND_* constants): the reactor now maps a FAILED xfer row's kind to the
+    failure stage — _KIND_EVENT means the C++ chain died at the gather stage
+    (FAIL_GATHER), _KIND_XFER a failed RDMA write (FAIL_WRITE). Copy-pool
+    completions (gather/scatter) are event rows; agent write completions are
+    xfer rows, exactly like the binding.
     """
 
     def __init__(self) -> None:
         self._mu = threading.Lock()
         self._rows: list[tuple[int, int, int]] = []
 
-    def complete(self, cid: int, ok: bool, kind: int = 0) -> None:
+    def complete(self, cid: int, ok: bool, kind: int = _KIND_EVENT) -> None:
         with self._mu:
             self._rows.append((int(cid), kind, 1 if ok else 0))
+
+    def complete_xfer(self, xid: int, ok: bool) -> None:
+        """An RDMA-write completion row (KIND_XFER, like registerXfer ids)."""
+        self.complete(xid, ok, kind=_KIND_XFER)
 
     def drain(self, _timeout_ms: int) -> np.ndarray:
         with self._mu:
@@ -445,7 +457,7 @@ class TestFailedCompletionTerminatesChunk:
         _wait_until(lambda: len(box.agent.posts) == 1, 10.0, "the RDMA write to be posted")
         xid = box.agent.posts[0][4]
 
-        box.poller.complete(xid, ok=False)
+        box.poller.complete_xfer(xid, ok=False)
         result = fut.result(timeout=10)
         assert result.ok is False
         assert result.reason == FAIL_WRITE
@@ -489,7 +501,7 @@ class TestFailedCompletionTerminatesChunk:
         xid_a = by_addr[credits[0].addr]
         xid_b = by_addr[credits[1].addr]
 
-        box.poller.complete(xid_a, ok=False)
+        box.poller.complete_xfer(xid_a, ok=False)
         result = fut.result(timeout=10)
         assert result.ok is False
         assert result.reason == FAIL_WRITE
@@ -502,7 +514,7 @@ class TestFailedCompletionTerminatesChunk:
             assert xid_a not in box.reactor._completions
         assert peer.recv(NEGATIVE_WAIT_S) is None, "cancel sent while B was still writing"
 
-        box.poller.complete(xid_b, ok=True)  # the orphan write drains
+        box.poller.complete_xfer(xid_b, ok=True)  # the orphan write drains
         _wait_until(lambda: box.sched.local_held_count() == 0, 10.0, "B's region to free")
         assert box.sched.free_bytes() == cap0
         _assert_cancel(peer, rid)

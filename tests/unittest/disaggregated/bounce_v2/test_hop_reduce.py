@@ -65,6 +65,11 @@ config_mod = importlib.import_module("bounce_v2.config")
 reactor_mod = importlib.import_module("bounce_v2.reactor")
 scheduler_mod = importlib.import_module("bounce_v2.scheduler")
 
+# Reactor threads are created inside test bodies and joined by fixture
+# teardown, which runs AFTER pytest-threadleak's end-of-call check — same
+# rationale as the identical marker in test_reactor_engine.py.
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 K_PAGE = 4096
 ARENA_BASE = 0x10_0000_0000  # fake device address of arena offset 0
 REMOTE_BASE = 0x20_0000_0000  # fake remote credit addresses
