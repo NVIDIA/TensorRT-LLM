@@ -184,6 +184,15 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration
   - unittest/_torch/moe/test_moe_backend.py::test_apply_router_weight_on_input_support_is_not_inherited
+  # WideEP DeepEP-to-CuTeDSL metadata selection and adapter-free contracts.
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_direct_metadata_tuning_is_static_and_legacy_remains_dynamic
+  - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_deep_ep_direct_metadata_disable_env
+  - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache
+  - unittest/_torch/moe/test_moe_backend.py::test_deep_ep_adapter_free_cache_miss_rejected_during_capture
+  - unittest/_torch/moe/test_moe_backend.py::test_scheduler_selects_cutedsl_deep_ep_direct_metadata
+  - unittest/_torch/moe/test_moe_backend.py::test_scheduler_rejects_direct_metadata_for_other_backend_or_communication
+  - unittest/_torch/moe/test_moe_backend.py::test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
