@@ -38,6 +38,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
     _fp4_align_input_channels,
     _fp4_align_output_channels,
     _supports_nvfp4_conv3d,
+    _supports_nvfp4_device,
     swap_wan_convs_to_fp4,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -84,6 +85,25 @@ def test_fp4_conv_composes_with_parallel_vae_halo():
     # Same-padding stride-1 geometry emits the rank-local extent directly, so
     # its rank-local residual can enter the FP4 epilogue before halo wrapping.
     assert halo.supports_residual_fusion
+
+
+def test_fp4_conv_reuses_base_parameters():
+    base = WanCausalConv3d(8, 8, 3, padding=1)
+    fp4_conv = NVFP4WanCausalConv3d(base)
+
+    assert fp4_conv.weight is base.weight
+    assert fp4_conv.bias is base.bias
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"), [((9, 0), False), ((10, 0), True), ((12, 0), False)]
+)
+def test_fp4_device_capability_is_sm100_family(monkeypatch, capability, expected):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: capability)
+
+    assert _supports_nvfp4_device(torch.device("cuda")) is expected
+    assert not _supports_nvfp4_device(torch.device("cpu"))
 
 
 def test_fp4_conv_rejects_unsupported_geometry():
@@ -216,6 +236,7 @@ def test_vae_quant_config_enables_dynamic_fp4_from_bf16(monkeypatch):
     monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
     monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: False)
     monkeypatch.setattr(vae_loader, "_load_native_wan_vae", lambda *args: model)
+    monkeypatch.setattr(vae_loader, "_supports_nvfp4_device", lambda _: True)
 
     loaded = load_wan_vae(
         "/unused",
@@ -229,6 +250,21 @@ def test_vae_quant_config_enables_dynamic_fp4_from_bf16(monkeypatch):
     assert loaded is model
     assert not isinstance(model[0].conv1, NVFP4WanCausalConv3d)
     assert isinstance(model[0].conv2, NVFP4WanCausalConv3d)
+
+
+def test_vae_quant_config_rejects_unsupported_device(monkeypatch):
+    model = torch.nn.Sequential(WanResidualBlock(64, 64).eval())
+    monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
+    monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: False)
+    monkeypatch.setattr(vae_loader, "_load_native_wan_vae", lambda *args: model)
+    monkeypatch.setattr(vae_loader, "_supports_nvfp4_device", lambda _: False)
+
+    with pytest.raises(ValueError, match="SM100-family"):
+        load_wan_vae(
+            "/unused",
+            torch.device("cuda"),
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        )
 
 
 @pytest.mark.parametrize(
