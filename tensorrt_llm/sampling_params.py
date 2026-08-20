@@ -367,6 +367,7 @@ class SamplingParams:
     # request-provided. Serving adapters set this to preserve which fields were
     # explicitly present before they materialize their protocol defaults.
     _request_provided_fields: Optional[frozenset[str]] = field(default=None, init=False, repr=False)
+    _allow_greedy_multiple_returns: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
         if self.pad_id is None:
@@ -425,6 +426,7 @@ class SamplingParams:
             self.best_of is not None
             and self.best_of > 1
             and self._greedy_decoding
+            and not self._allow_greedy_multiple_returns
             and not os.environ.get("TLLM_ALLOW_N_GREEDY_DECODING", None)
         ):
             raise ValueError(
