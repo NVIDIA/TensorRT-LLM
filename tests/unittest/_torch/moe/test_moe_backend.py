@@ -17,7 +17,8 @@
 import importlib
 import itertools
 import logging
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
 
@@ -1300,7 +1301,11 @@ def test_megamoe_sm107_dsv4_pro_default_tactics(
     assert selected[-1] == (fallback_tactic, 107)
 
 
-def test_megamoe_cutedsl_accepts_sm107_with_required_dependencies() -> None:
+@pytest.mark.parametrize(
+    ("sm", "eligible"),
+    [(100, True), (103, True), (107, True), (101, False), (109, False)],
+)
+def test_megamoe_cutedsl_sm_support(sm: int, eligible: bool) -> None:
     verdict = MegaMoECuteDsl.can_implement(
         MoEProblem(
             quant=QuantAlgo.NVFP4.value,
@@ -1317,7 +1322,7 @@ def test_megamoe_cutedsl_accepts_sm107_with_required_dependencies() -> None:
             use_dp=False,
             num_slots=8,
             env=MoEEnvironment(
-                sm=107,
+                sm=sm,
                 available_deps=(
                     "megamoe_cutedsl_runtime",
                     "megamoe_cutedsl_op",
@@ -1326,7 +1331,27 @@ def test_megamoe_cutedsl_accepts_sm107_with_required_dependencies() -> None:
         ),
     )
 
-    assert verdict.eligible
+    assert verdict.eligible is eligible
+    if not eligible:
+        assert verdict.reject_reason == MoERejectReason.SM_UNSUPPORTED
+
+
+def test_megamoe_kernel_arch_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.cute_dsl_kernels import mega_moe_nvfp4
+
+    sm100_kernel = object()
+    sm107_kernel = object()
+    module_name = f"{mega_moe_nvfp4.__name__}.megamoe_kernel"
+    fake_module = ModuleType(module_name)
+    fake_module.Sm100MegaMoEKernel = sm100_kernel
+    fake_module.Sm107MegaMoEKernel = sm107_kernel
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    assert mega_moe_nvfp4.import_kernel(100) is sm100_kernel
+    assert mega_moe_nvfp4.import_kernel(103) is sm100_kernel
+    assert mega_moe_nvfp4.import_kernel(107) is sm107_kernel
+    with pytest.raises(ValueError, match="supports SM100, SM103, or SM107"):
+        mega_moe_nvfp4.import_kernel(101)
 
 
 def run_backend_moe(
