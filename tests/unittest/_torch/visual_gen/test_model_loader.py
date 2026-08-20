@@ -214,6 +214,7 @@ def test_vae_quant_config_is_independent_from_transformer(tmp_path):
             {
                 "_class_name": "WanPipeline",
                 "transformer": ["diffusers", "WanTransformer3DModel"],
+                "vae": ["diffusers", "AutoencoderKLWan"],
             }
         ),
         encoding="utf-8",
@@ -224,6 +225,17 @@ def test_vae_quant_config_is_independent_from_transformer(tmp_path):
         json.dumps({"_class_name": "WanTransformer3DModel"}),
         encoding="utf-8",
     )
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir()
+    (vae_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "AutoencoderKLWan",
+                "quantization_config": {"quant_algo": "NVFP4"},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     config = DiffusionPipelineConfig.from_pretrained(
         str(tmp_path),
@@ -231,7 +243,6 @@ def test_vae_quant_config_is_independent_from_transformer(tmp_path):
             model=str(tmp_path),
             quant_config={"quant_algo": "FP8", "dynamic": True},
             vae_quant_config={
-                "quant_algo": "NVFP4",
                 "ignore": ["decoder.up_blocks.0.*"],
                 "config_groups": {
                     "default": {
@@ -291,6 +302,25 @@ def test_parse_vae_dynamic_quantization_modes(raw, expected):
 
     assert quant_config.quant_algo == QuantAlgo.NVFP4
     assert (dynamic_weight, dynamic_activation) == expected
+
+
+def test_vae_quant_config_dict_inherits_checkpoint_algorithm():
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config, dynamic_weight, dynamic_activation = (
+        DiffusionPipelineConfig.load_vae_quant_config(
+            {"ignore": ["decoder.conv1"]},
+            {"quant_algo": "NVFP4", "dynamic": False},
+        )
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.NVFP4
+    assert quant_config.is_module_excluded_from_quantization("decoder.conv1")
+    # Checkpoint metadata is authoritative for packed tensors and scales, but
+    # only explicit user dynamic settings override the loader's auto mode.
+    assert dynamic_weight is None
+    assert dynamic_activation is None
 
 
 @pytest.mark.parametrize(

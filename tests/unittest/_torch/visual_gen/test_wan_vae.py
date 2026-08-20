@@ -81,9 +81,9 @@ def test_fp4_conv_composes_with_parallel_vae_halo():
     assert halo.module is fp4_conv
     assert halo.absorbs_silu
     assert halo.absorbs_norm
-    # The mainline halo path computes an expanded output and strips it after
-    # the convolution, so its rank-local residual cannot enter the epilogue.
-    assert not getattr(halo, "supports_residual_fusion", False)
+    # Same-padding stride-1 geometry emits the rank-local extent directly, so
+    # its rank-local residual can enter the FP4 epilogue before halo wrapping.
+    assert halo.supports_residual_fusion
 
 
 def test_fp4_conv_rejects_unsupported_geometry():

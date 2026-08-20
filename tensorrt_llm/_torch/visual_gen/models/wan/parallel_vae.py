@@ -128,6 +128,15 @@ class WanCausalConvHalo(HaloExchangeConv):
     def absorbs_norm(self) -> bool:
         return getattr(self.module, "absorbs_norm", False)
 
+    @property
+    def supports_residual_fusion(self) -> bool:
+        # A rank-local residual can enter the epilogue only when the wrapped
+        # convolution directly emits the local extent. The fallback path emits
+        # halo outputs and strips them after the convolution.
+        return self._local_output_spatial_padding is not None and getattr(
+            self.module, "supports_residual_fusion", False
+        )
+
     def forward(
         self,
         x: torch.Tensor,

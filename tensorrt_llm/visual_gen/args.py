@@ -685,7 +685,8 @@ class VisualGenArgs(StrictBaseModel):
             "use ``ignore`` to exclude matching VAE modules and either "
             "top-level ``dynamic`` for weight-plus-activation shorthand or "
             "one ``config_groups`` entry to configure them independently. "
-            "``None`` lets the VAE checkpoint select its native precision."
+            "A dict without ``quant_algo`` inherits the VAE checkpoint "
+            "algorithm; ``None`` leaves all choices checkpoint-driven."
         ),
     )
     compilation_config: CompilationConfig = Field(

@@ -349,14 +349,17 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     @staticmethod
     def load_vae_quant_config(
         quant_config_dict: dict,
+        checkpoint_quant_config_dict: Optional[dict] = None,
     ) -> Tuple[QuantConfig, Optional[bool], Optional[bool]]:
-        """Parse VAE quantization and preserve explicit ModelOpt dynamic modes.
+        """Overlay VAE quantization on its checkpoint and parse dynamic modes.
 
         A top-level ``dynamic`` is shorthand for setting both weight and
         activation quantization. Alternatively, one ModelOpt config group may
         set ``weights.dynamic`` and ``input_activations.dynamic`` independently.
         Omitted values remain ``None`` so the VAE loader can resolve them from
-        checkpoint contents.
+        checkpoint contents. A user dictionary without ``quant_algo`` inherits
+        the VAE checkpoint algorithm; an explicit ``QuantConfig`` is handled by
+        the caller and can disable checkpoint-driven quantization.
         """
         has_shorthand = "dynamic" in quant_config_dict
         has_groups = "config_groups" in quant_config_dict
@@ -399,8 +402,13 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             dynamic_weight = _dynamic_value("weights")
             dynamic_activation = _dynamic_value("input_activations")
 
+        effective_quant_config = dict(quant_config_dict)
+        if "quant_algo" not in effective_quant_config and isinstance(
+            checkpoint_quant_config_dict, dict
+        ):
+            effective_quant_config["quant_algo"] = checkpoint_quant_config_dict.get("quant_algo")
         quant_config, _, _, _ = DiffusionPipelineConfig.load_diffusion_quant_config(
-            quant_config_dict
+            effective_quant_config
         )
         if (
             dynamic_weight is not None or dynamic_activation is not None
@@ -702,12 +710,14 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         # not reuse the transformer instance: component routing by name pattern
         # cannot represent BF16 transformer + FP4 VAE (or the reverse).
         user_vae_quant = args.vae_quant_config if args else None
+        vae_component_config = component_config_dicts.get(PipelineComponent.VAE.value, {})
+        checkpoint_vae_quant = vae_component_config.get("quantization_config")
         if isinstance(user_vae_quant, dict):
             (
                 vae_quant_config,
                 vae_dynamic_weight_quant,
                 vae_dynamic_activation_quant,
-            ) = cls.load_vae_quant_config(user_vae_quant)
+            ) = cls.load_vae_quant_config(user_vae_quant, checkpoint_vae_quant)
         elif isinstance(user_vae_quant, QuantConfig):
             vae_quant_config = user_vae_quant
             vae_dynamic_weight_quant = None
