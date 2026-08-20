@@ -135,7 +135,7 @@ def test_cute_dsl_radix_preserves_compressed_mtp_fallback(monkeypatch) -> None:
     )
 
 
-def test_gvr_uses_prior_state_and_updates_it(monkeypatch) -> None:
+def test_gvr_uses_caller_prior_state(monkeypatch) -> None:
     gvr = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
     top_k = TopK(
@@ -172,7 +172,7 @@ def test_gvr_uses_prior_state_and_updates_it(monkeypatch) -> None:
         "max_seq_len": 8,
         "order_row": None,
     }
-    assert prior_indices.tolist() == [[5, 3]]
+    assert prior_indices.tolist() == [[0, 0]]
 
 
 def test_gvr_uses_caller_prepared_row_order(monkeypatch) -> None:
@@ -251,7 +251,7 @@ def test_cuda_radix_defaults_dispatch_to_cpp(monkeypatch) -> None:
     )
 
 
-def test_cuda_gvr_reserves_workspace_during_capture_and_updates_prior(monkeypatch) -> None:
+def test_cuda_gvr_reserves_workspace_during_capture(monkeypatch) -> None:
     decode = Mock(side_effect=lambda *args, **kwargs: args[2].copy_(torch.tensor([[3, 1]])))
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=True))
@@ -310,7 +310,7 @@ def test_cuda_gvr_reserves_workspace_during_capture_and_updates_prior(monkeypatc
     assert runtime_call.kwargs["heuristic_scratch"].data_ptr() == workspace.data_ptr()
     assert runtime_call.kwargs["radix_aux_indices"] is radix_indices
     assert runtime_call.kwargs["radix_aux_logits"] is radix_values
-    assert prior_indices.tolist() == [[3, 1]]
+    assert prior_indices.tolist() == [[0, 0]]
 
 
 def test_unsupported_prefill_implementation_raises() -> None:

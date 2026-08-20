@@ -82,9 +82,8 @@ class TopK(nn.Module):
             scan_lengths: Per-request score-column lengths for decode.
             next_n: Number of decode rows per request.
             gvr_prior_indices: Required for GVR decode. Int32 tensor with shape
-                ``[num_requests, top_k]`` on ``scores.device``. Each call reads
-                the previous selection and updates it in place with the last
-                decode row for every request.
+                ``[num_requests, top_k]`` on ``scores.device`` containing the
+                previous selection. The caller owns its write-back lifecycle.
             gvr_row_order: Optional int32 tensor with shape ``[num_requests]``
                 on ``scores.device``. It contains a reusable request ordering
                 prepared once for the current forward step.
@@ -288,7 +287,6 @@ class TopK(nn.Module):
                 max_seq_len=scores.shape[1],
                 order_row=gvr_row_order,
             )
-        gvr_prior_indices.copy_(output_indices[next_n - 1 :: next_n])
         return output_indices
 
     def update_gvr_prior_from_prefill(

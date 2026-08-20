@@ -54,6 +54,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     transform_local_topk_and_prepare_pool_view,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
@@ -207,6 +208,74 @@ def test_kv_lens_row_reorder_threshold():
     DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(metadata_at)
     row_order = metadata_at.kv_lens_row_reorder.cpu().tolist()
     assert [kv_lens[i] for i in row_order] == sorted(kv_lens, reverse=True)
+
+
+@skip_pre_hopper
+def test_gvr_prior_writeback_uses_aux_stream():
+    batch_size = 2
+    index_topk = 4
+    cache_manager, sparse_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=128,
+        tokens_per_block=64,
+        max_seq_len=64,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    try:
+        request_ids = list(range(batch_size))
+        kv_lens = torch.full((batch_size,), index_topk, dtype=torch.int32)
+        cache_manager.add_dummy_requests(
+            request_ids,
+            kv_lens.tolist(),
+            is_gen=False,
+            prepare_resource=True,
+        )
+        metadata = _create_mock_metadata(
+            request_ids,
+            batch_size,
+            num_contexts=0,
+            num_generations=batch_size,
+            seq_lens=torch.ones(batch_size, dtype=torch.int32),
+            kv_lens=kv_lens,
+            num_cached_tokens=[index_topk - 1] * batch_size,
+            cache_manager=cache_manager,
+            num_ctx_tokens=0,
+            num_tokens=batch_size,
+            index_topk=index_topk,
+            enable_indexer_skip=True,
+        )
+        indexer = create_indexer(sparse_config)
+        indexer._enable_heuristic_topk = True
+        indexer.aux_stream = torch.cuda.Stream()
+        metadata.gvr_prior_indices = torch.zeros(
+            (cache_manager.num_local_layers, batch_size, index_topk),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        hidden_states = torch.empty((batch_size, 1), device="cuda")
+        unused = torch.empty((batch_size, 1), device="cuda")
+
+        with with_multi_stream(True):
+            topk_indices = indexer.sparse_attn_indexer(
+                metadata,
+                hidden_states,
+                unused,
+                unused,
+                unused,
+                unused,
+            )
+            assert indexer._prev_topk_copy_pending
+            indexer.maybe_join_prev_topk_copy()
+
+        local_layer = cache_manager.layer_offsets[indexer.layer_idx]
+        torch.testing.assert_close(
+            metadata.gvr_prior_indices[local_layer, :batch_size],
+            topk_indices,
+        )
+        assert not indexer._prev_topk_copy_pending
+    finally:
+        cache_manager.shutdown()
 
 
 def test_shared_topk_lifecycle():

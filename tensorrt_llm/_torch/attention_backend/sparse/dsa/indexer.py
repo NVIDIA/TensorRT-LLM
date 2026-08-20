@@ -1731,18 +1731,21 @@ class Indexer(nn.Module):
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
             )
 
-        if (
-            gvr_prior_indices is not None
-            and has_decode
-            and (reuse_topk or metadata.skip_indexer_for_gen_reqs)
-        ):
+        if gvr_prior_indices is not None and has_decode:
             next_n = num_gen_tokens // num_generations
-            # Keep bypassed decode results as the next GVR prior; MTP reuse holds the accepted row.
-            gvr_prior_indices[:num_generations].copy_(
-                topk_indices_buffer[token_offset : token_offset + num_gen_tokens][
-                    next_n - 1 :: next_n
-                ]
-            )
+            decode_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
+            last_mtp_topk = decode_topk[next_n - 1 :: next_n]
+            prev_topk_dst = gvr_prior_indices[:num_generations]
+            if do_multi_stream() and self.aux_stream is not None:
+                # Overlap the GVR prior write-back with this layer's sparse attention.
+                self.prev_topk_copy_events[0].record()
+                with torch.cuda.stream(self.aux_stream):
+                    self.prev_topk_copy_events[0].wait()
+                    prev_topk_dst.copy_(last_mtp_topk)
+                    self.prev_topk_copy_events[1].record()
+                self._prev_topk_copy_pending = True
+            else:
+                prev_topk_dst.copy_(last_mtp_topk)
 
         if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:
             rows = None
@@ -1787,7 +1790,7 @@ class Indexer(nn.Module):
         return gen_topk[base + offset]
 
     def maybe_join_prev_topk_copy(self) -> None:
-        """Join the aux-stream heuristic prev_topk write-back, if forked."""
+        """Join the aux-stream GVR prior write-back, if forked."""
         if self._prev_topk_copy_pending:
             self.prev_topk_copy_events[1].wait()
             self._prev_topk_copy_pending = False
