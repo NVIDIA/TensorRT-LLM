@@ -751,7 +751,9 @@ def test_pool_session_shutdown_never_blocks_after_release():
 # blocking shutdown() non-blocking and defangs its MPI_Abort escalation.
 
 
-def _proxy_awaiting_worker_init(owns_session: bool, future_exception=None, ready_status=None):
+def _proxy_awaiting_worker_init(
+    owns_session: bool, future_exception=None, ready_status=None, future_cancelled=False
+):
     """Proxy parked in _start_executor_workers' init-status wait loop.
 
     Seeds only what that path touches: a status queue, one worker future,
@@ -760,8 +762,9 @@ def _proxy_awaiting_worker_init(owns_session: bool, future_exception=None, ready
     initialization-failure path. By default the future is already finished
     successfully (a silent non-leader death) and the status queue never
     reports ready; ``future_exception`` makes the worker die raising
-    instead, and ``ready_status`` makes the status queue deliver that tuple
-    (a pending future) to exercise the non-ready path.
+    instead, ``future_cancelled`` makes the future cancelled, and
+    ``ready_status`` makes the status queue deliver that tuple (a pending
+    future) to exercise the non-ready path.
     """
     proxy = _bare_proxy()
     proxy._error_queue = _queue.Queue()
@@ -776,7 +779,9 @@ def _proxy_awaiting_worker_init(owns_session: bool, future_exception=None, ready
 
     worker_future = _Future()
     if ready_status is None:
-        if future_exception is not None:
+        if future_cancelled:
+            assert worker_future.cancel()
+        elif future_exception is not None:
             worker_future.set_exception(future_exception)
         else:
             worker_future.set_result(None)
@@ -912,6 +917,28 @@ def test_worker_exception_death_during_init_does_not_abort_borrowed_session():
     assert proxy._engine_dead is True
     proxy.mpi_session.shutdown_abort.assert_not_called()
     proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+def test_cancelled_worker_future_during_init_is_treated_as_death():
+    """A cancelled worker future must fail init through the ordered teardown.
+
+    done() is True for a cancelled future and exception() then raises
+    CancelledError, so returning it from detection would escape the init
+    wait loop through a side entrance without the abort-before-mark
+    teardown; skipping the future instead would leave detection blind while
+    the ready wait loop spins forever. A cancelled worker_main future means
+    that rank can never come up, so it is a death like any other
+    (mirroring _check_mpi_futures on the runtime path).
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True, future_cancelled=True)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
 
 
 def test_non_ready_status_during_init_aborts_then_marks_dead():

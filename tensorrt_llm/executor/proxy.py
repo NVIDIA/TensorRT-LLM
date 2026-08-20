@@ -655,8 +655,12 @@ class GenerationExecutorProxy(GenerationExecutor):
                                 "exited unexpectedly")
         for fut in self.mpi_futures:
             if fut.done():
-                return fut.exception() or RuntimeError(
-                    "MPI worker exited unexpectedly")
+                # exception() raises CancelledError on a cancelled future,
+                # which would escape the init wait loop without the ordered
+                # teardown; a cancelled worker future still means this rank
+                # can never come up, so report it as a death instead.
+                exc = fut.exception() if not fut.cancelled() else None
+                return exc or RuntimeError("MPI worker exited unexpectedly")
         check = getattr(self.mpi_session, "check_worker_error", None)
         if check is None:
             return None
