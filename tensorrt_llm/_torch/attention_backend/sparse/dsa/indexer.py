@@ -1521,7 +1521,7 @@ class Indexer(nn.Module):
                 :num_ctx_tokens, :
             ]
 
-        # Update GVR state after chunk all-gathers or the dense-index copy.
+        # Dense skip outputs remain valid priors if a later step enters GVR.
         if has_prefill:
             self.top_k.update_gvr_prior_from_prefill(
                 topk_indices_buffer[:num_ctx_tokens],
@@ -1712,6 +1712,8 @@ class Indexer(nn.Module):
             scan_lengths = metadata.gen_indexer_kv_lens_cuda_runtime
             assert scan_lengths is not None
 
+            # Paged MQA logits allocate their score width at
+            # indexer_max_seq_len, so TopK's CuTe GVR tuning key is stable.
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
@@ -1731,6 +1733,7 @@ class Indexer(nn.Module):
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
             )
 
+        # Keep the GVR prior current for computed, reused, and dense-skip TopK.
         if gvr_prior_indices is not None and has_decode:
             next_n = num_gen_tokens // num_generations
             decode_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]

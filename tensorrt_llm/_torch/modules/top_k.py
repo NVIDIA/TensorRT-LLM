@@ -228,6 +228,8 @@ class TopK(nn.Module):
         self, scores: torch.Tensor
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if scores.dtype != torch.float32:
+            # The C++ bf16/fp16 entry has no split-work tier or aux-buffer
+            # arguments and rejects widths that would require split work.
             return None, None
 
         shape = (scores.shape[0], _MAX_RADIX_BLOCKS_PER_ROW, self.top_k)
