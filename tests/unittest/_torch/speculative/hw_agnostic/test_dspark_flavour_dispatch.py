@@ -68,6 +68,7 @@ def _configs(
     architectures=None,
     attention_backend="TRTLLM",
     embedded=False,
+    top_level=None,
 ):
     """Duck-typed (target ModelConfig, draft ModelConfig) for dispatch-only asserts."""
     model_config = SimpleNamespace(
@@ -83,6 +84,7 @@ def _configs(
             model_type=model_type,
             architectures=architectures,
             dflash_config=dflash_config,
+            **(top_level or {}),
         )
     )
     return model_config, draft_config
@@ -172,6 +174,25 @@ def test_dflash_refuses_a_dspark_drafter(stub_dflash):
     assert "decoding_type" in message, "the error must say how to fix the config"
 
 
+def test_dflash_refuses_a_top_level_spelling_dspark_drafter(stub_dflash):
+    # RadixArk/Kimi-K3-DSpark as published: the head switches sit at the top
+    # level and dflash_config carries only mask_token_id / target_layer_ids.
+    # A reader that looks in dflash_config alone misses exactly the drafter
+    # this guard exists to catch.
+    model_config, draft_config = _configs(
+        dflash_config={"mask_token_id": 163824, "target_layer_ids": [7, 23, 51, 67, 83]},
+        top_level={
+            "markov_rank": 256,
+            "markov_head_type": "vanilla",
+            "enable_confidence_head": True,
+            "block_size": 7,
+        },
+    )
+
+    with pytest.raises(ValueError, match="DSpark"):
+        modeling_dflash._build_dflash_draft(model_config, draft_config, None, None)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -252,12 +273,16 @@ def test_declares_dspark_heads(dflash_config, expected):
 #
 # The worker, the spec metadata and the separate-draft-KV-cache decision must
 # follow the same flavour flag the builder follows. When they disagree,
-# DSparkWorker gets a standalone drafter and dies reaching for V4-draft-only
+# DSv4DSparkWorker gets a standalone drafter and dies reaching for V4-draft-only
 # attributes (num_stages, write_context_windows) -- only at the first forward,
 # long after the engine reported a successful build.
 # --------------------------------------------------------------------------
 
-_WORKER_SENTINELS = {"DFlashWorker": object(), "DSparkWorker": object()}
+_WORKER_SENTINELS = {
+    "DFlashWorker": object(),
+    "DSparkWorker": object(),
+    "DSv4DSparkWorker": object(),
+}
 # SimpleNamespace rather than object(): get_spec_metadata assigns
 # ``metadata.enable_penalty`` on whatever it built, which a bare object rejects.
 _METADATA_SENTINELS = {
@@ -296,8 +321,8 @@ def _spec_config(mode, *, embedded, allow_separate_kv=True):
 @pytest.mark.parametrize(
     "mode,embedded,expected",
     [
-        (SpeculativeDecodingMode.DSPARK, True, "DSparkWorker"),
-        (SpeculativeDecodingMode.DSPARK, False, "DFlashWorker"),
+        (SpeculativeDecodingMode.DSPARK, True, "DSv4DSparkWorker"),
+        (SpeculativeDecodingMode.DSPARK, False, "DSparkWorker"),
         (SpeculativeDecodingMode.DFLASH, False, "DFlashWorker"),
     ],
 )

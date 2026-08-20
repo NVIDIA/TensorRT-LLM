@@ -21,7 +21,7 @@ from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .dspark import DSparkSpecMetadata, DSparkWorker
+from .dspark import DSparkSpecMetadata, DSparkWorker, DSv4DSparkWorker
 from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
                      Eagle3OneModelSpecMetadata, Eagle3OneModelWorker,
                      Eagle3ResourceManager, Eagle3SpecMetadata, MTPEagleWorker)
@@ -794,16 +794,18 @@ def get_spec_worker(spec_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
-    # Only the embedded DeepSeek-V4-Pro draft is served by DSparkWorker, whose
-    # rolling-window plumbing reads V4-draft-only attributes (num_stages,
-    # write_context_windows, forward_batched). A standalone DSpark drafter is a
-    # DFlash-lineage model and is served by DFlashWorker, which already probes
-    # the DSpark heads defensively (getattr has_markov_head / _dspark_shift_label).
-    if spec_dec_mode.is_dflash() or (
-            spec_dec_mode.is_dspark()
-            and not spec_config.draft_is_embedded_in_target):
+    if spec_dec_mode.is_dflash():
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    # DSpark splits by deployment form, mirroring the draft-model side. The
+    # embedded DeepSeek-V4-Pro draft needs DSv4DSparkWorker, whose rolling-window
+    # plumbing reads V4-draft-only attributes (num_stages, write_context_windows,
+    # forward_batched). A standalone drafter is DFlash lineage and is served by
+    # DSparkWorker, which adds only the Markov bias and the shift_label
+    # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
+        if spec_config.draft_is_embedded_in_target:
+            return DSv4DSparkWorker(spec_config, mapping,
+                                    use_separate_draft_kv_cache)
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)

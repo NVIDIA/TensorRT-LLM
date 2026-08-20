@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from .dflash import DFlashWorker, dflash_draft_slot_ids
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -184,7 +185,7 @@ class DSparkSpecMetadata(SpecMetadata):
         ]
 
 
-class DSparkWorker(SpecWorkerBase):
+class DSv4DSparkWorker(SpecWorkerBase):
     """Worker for DSpark speculative decoding.
 
     DSpark drafts a whole block of ``block_size`` tokens in one backbone forward
@@ -208,6 +209,14 @@ class DSparkWorker(SpecWorkerBase):
     ``DSv4DSparkDraftModel.write_context_windows``), in addition to the per-step bonus
     write done by the generation path. These affect draft acceptance rate only,
     not correctness, which the standard target verify guarantees.
+
+    Naming: workers are classified by *deployment form*, not by draft
+    backbone (see :class:`DSparkWorker`). This one is form-specific
+    because it owns a rolling captured-context window and drives the draft
+    through attributes only an embedded DeepSeek-V4-Pro draft has --
+    ``num_stages``, ``_attn_params``, ``write_context_windows``,
+    ``write_context_windows_batched`` and ``forward_batched``. A standalone
+    drafter has none of them and is served by :class:`DSparkWorker`.
 
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
@@ -252,7 +261,7 @@ class DSparkWorker(SpecWorkerBase):
         # capture-safe whenever ``cuda_graph_config`` is set).
 
         logger.info(
-            f"DSparkWorker initialized with "
+            f"DSv4DSparkWorker initialized with "
             f"use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
 
@@ -696,3 +705,146 @@ class DSparkWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+
+class DSparkWorker(DFlashWorker):
+    """Worker for a *standalone* DSpark drafter (DFlash lineage).
+
+    DSpark is DFlash plus two extra heads, so the drafting plumbing is
+    inherited wholesale from :class:`DFlashWorker` -- paged context K/V,
+    slot management, the mask-token block forward -- and only the two
+    head-driven policies are overridden here: the block-output slot
+    convention (``shift_label``) and the Markov intra-block logit bias.
+
+    Mirrors the model side, where ``DSparkDrafterForCausalLM`` extends
+    ``DFlashForCausalLM`` with the same two heads.
+
+    Naming: this is the unqualified DSpark worker because a separately
+    shipped drafter is the ordinary case; :class:`DSv4DSparkWorker` carries
+    the qualifier because a draft embedded in the target checkpoint is the
+    special one. Workers are classified by *deployment form*, never by draft
+    backbone -- so there is no ``Qwen3DSparkWorker``. Note the name meant the
+    embedded worker before this split; both the rebind and the rename to
+    ``DSv4DSparkWorker`` land in one commit so the swap reads as a unit.
+
+    A worker is agnostic to the draft backbone: everything backbone-shaped is
+    supplied by the draft model, which reports its own shapes
+    (``_num_attn_layers``, ``_num_heads``, ``_num_kv_heads``, ``_head_dim``)
+    and owns the operators (``_build_fused_kv_buffers``,
+    ``precompute_context_kv``, ``dflash_forward``,
+    ``apply_markov_chain_logits``, ``project_target_hidden``). The worker only
+    allocates against the reported shapes and sequences the calls. An MLA
+    drafter therefore reuses this class unchanged; its differences (fused-QKV
+    assumptions, a 576-latent K/V layout) land in its own draft-model
+    subclass. Naming workers by backbone would produce N classes with
+    identical bodies.
+
+    Deployment form is the axis the runtime state actually splits on: paged
+    draft K/V here, a worker-owned rolling window in
+    :class:`DSv4DSparkWorker`.
+    """
+
+    def set_draft_model(self, draft_model) -> None:
+        """Reject an unsupported vocab mapping here rather than mid-decode.
+
+        ``d2t`` is model-static, so a config mistake should surface at load and
+        not as a ``NotImplementedError`` raised per decode step, possibly during
+        CUDA-graph capture.
+        """
+        super().set_draft_model(draft_model)
+        if self._d2t is not None and getattr(draft_model, "has_markov_head", False):
+            raise NotImplementedError(
+                "DSpark Markov head requires a shared draft/target vocab "
+                "(d2t vocab mapping is not supported); drafter "
+                f"{type(draft_model).__name__} declares one."
+            )
+
+    def _draft_slot_ids(
+        self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
+    ) -> torch.Tensor:
+        """Block-output slots under the dspark ``shift_label`` convention.
+
+        The drafter checkpoint declares the convention, so it is read off the
+        draft model rather than assumed: a DSpark drafter trained with the
+        legacy DFlash slot layout keeps the base class' slots 1..K.
+        """
+        shift_label = getattr(draft_model, "_dspark_shift_label", False)
+        return dflash_draft_slot_ids(
+            num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
+        )
+
+    def _refine_block_logits(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """Add the greedy-chained Markov intra-block bias to the block logits.
+
+        A DSpark drafter checkpoint may omit the Markov head (``markov_rank``
+        0), which loads as a drafter without one; that case falls through to
+        the unmodified backbone logits.
+        """
+        if not getattr(draft_model, "has_markov_head", False):
+            return gen_logits
+        return self._apply_dspark_markov_bias(
+            draft_model, gen_logits, inputs["first_prev_tokens"], spec_metadata
+        )
+
+    def _apply_dspark_markov_bias(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """Apply the dspark vanilla-Markov intra-block bias to block logits.
+
+        Reference (DeepSpec VanillaMarkov.sample_block_tokens, temperature 0):
+        step i adds bias = markov_w2 @ markov_w1[prev_i] to the shared-lm_head
+        logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
+        is the greedy token from step i-1's biased logits. Greedy per-position
+        argmax of the returned logits therefore reproduces the reference
+        sampled chain; the rejection-sampling path samples from the same
+        biased distributions (proposal conditioned on the greedy chain).
+
+        Handles a TP vocab-sharded draft lm_head by slicing markov_w2's rows
+        to this rank's contiguous shard and chaining through the TP-aware
+        global argmax.
+        """
+        # The d2t guard lives in set_draft_model: it is model-static, so raising
+        # it here would surface a load-time config error per decode step.
+        # Unlike the d2t guard this one cannot move to set_draft_model: it
+        # keys on the runtime logits width, and reproducing that at init would
+        # duplicate the draft head's sharding rules. A standalone drafter
+        # borrows the target lm_head, whose gather_output defaults to True, so
+        # the logits normally arrive full-vocab and this branch is skipped.
+        full_vocab = draft_model.markov_w2.shape[0]
+        shard = gen_logits.shape[-1]
+        vocab_slice = None
+        if shard != full_vocab:
+            mapping = self.mapping
+            if (
+                mapping is None
+                or getattr(mapping, "enable_attention_dp", False)
+                or shard * mapping.tp_size != full_vocab
+            ):
+                raise NotImplementedError(
+                    f"DSpark Markov head: draft logits width {shard} does not "
+                    f"match the drafter vocab {full_vocab} and is not a plain "
+                    "TP column shard of it."
+                )
+            vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
+
+        def argmax_fn(step_logits):
+            # Full-vocab token ids (TP-aware when sharded); tokens stay in
+            # draft-vocab space, which is what markov_w1 indexes.
+            return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
+
+        return draft_model.apply_markov_chain_logits(
+            gen_logits,
+            first_prev_tokens,
+            argmax_fn=argmax_fn,
+            vocab_slice=vocab_slice,
+        )
