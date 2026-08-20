@@ -91,6 +91,7 @@ l0_h100:
   - unittest/disaggregated/bounce_v2/test_reactor_engine.py
   - unittest/disaggregated/bounce_v2/test_engine_lifecycle.py
   - unittest/disaggregated/bounce_v2/test_integration.py
+  - unittest/disaggregated/bounce_v2/test_event_chain.py
   - unittest/disaggregated/test_sync_transfer_timing.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
