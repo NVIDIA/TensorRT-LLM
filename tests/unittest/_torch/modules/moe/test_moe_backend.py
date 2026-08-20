@@ -47,7 +47,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     RenormalizeMoeRoutingMethod,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
+from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
     CuteDslFusedMoENvfp4Runner,
