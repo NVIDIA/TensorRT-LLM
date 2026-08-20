@@ -20,7 +20,7 @@ import os
 import re
 import shutil
 import sys
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple
 
 import pytest
 import yaml
@@ -71,13 +71,15 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "phi_4_multimodal_instruct_fp8",
 }
 
-# Models that use random_image dataset in serve mode benchmarks.
+# Models that use random_image dataset in serve mode benchmarks. Also used by
+# get_fixed_dataset_sequence_length() to exclude variable image-token counts.
 # Maps model name to (width, height, num_images) tuple.
 SERVE_IMAGE_MODELS = {
     "nemotron_3_nano_omni_nvfp4_image": (1526, 1024, 1),
 }
 
-# Models that require openai-chat backend for benchmark_serving
+# Models that require openai-chat backend for benchmark_serving. Also used by
+# get_fixed_dataset_sequence_length() to exclude chat-template tokens.
 # (e.g., reasoning / multimodal models that use chat completions API).
 OPENAI_CHAT_BACKEND_MODELS = {
     "nemotron_3_nano_omni_nvfp4",
@@ -90,8 +92,8 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 }
 
 # All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
-# benchmark client commands: forcing generation past EOS produces unstable
-# acceptance rates for spec-dec.
+# benchmark client commands and fixed sequence-length inference: forcing
+# generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
     "qwen3_4b_eagle3",
     "qwen3_235b_a22b_fp4_eagle3",
@@ -920,27 +922,28 @@ class PerfTestConfig:
         """
         return self.get_benchmark_type() == "enc_dec"
 
-    def get_fixed_dataset_sequence_length(self) -> Optional[int]:
+    def get_fixed_dataset_sequence_length(self) -> int | None:
         """Return the common total length when every dataset shape is fixed."""
-        if self.build_only or self.runtime not in ("bench", "serve"):
-            return None
-        if not self.output_lens or len(self.input_lens) != len(
-                self.output_lens):
+        if self.build_only or not self.output_lens:
             return None
 
         # LoRA data is generated with nonzero input/output length deviations.
         if self.num_loras > 0:
             return None
 
-        # These serve requests may terminate at EOS or include image tokens,
-        # so their configured text lengths are not fixed runtime lengths.
-        if self.runtime == "serve" and (self.model_name in SPEC_DEC_MODELS or
-                                        self.model_name in SERVE_IMAGE_MODELS):
+        # These serve requests may terminate at EOS, add chat-template tokens,
+        # or include image tokens, so their configured text lengths are not
+        # fixed runtime lengths.
+        if self.runtime == "serve" and (self.model_name in SPEC_DEC_MODELS
+                                        or self.model_name in SERVE_IMAGE_MODELS
+                                        or self.model_name
+                                        in OPENAI_CHAT_BACKEND_MODELS):
             return None
 
         sequence_lengths = {
             input_len + output_len
-            for input_len, output_len in zip(self.input_lens, self.output_lens)
+            for input_len, output_len in zip(
+                self.input_lens, self.output_lens, strict=True)
         }
         if len(sequence_lengths) != 1:
             return None
@@ -1026,12 +1029,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             return config
 
         configured_max_seq_len = config.get('max_seq_len')
-        if (configured_max_seq_len is not None
-                and fixed_sequence_length > int(configured_max_seq_len)):
-            print_warning(
-                f"Not inferring avg_seq_len={fixed_sequence_length}: it "
-                f"exceeds max_seq_len={configured_max_seq_len}.")
-            return config
+        if configured_max_seq_len is not None:
+            fixed_sequence_length = min(fixed_sequence_length,
+                                        int(configured_max_seq_len))
 
         # Perf definitions are sometimes reused with an older wheel during
         # release walkbacks and bisection. Do not pass a field that its strict

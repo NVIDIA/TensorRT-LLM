@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pathlib
 import sys
-from pathlib import Path
+import types
 
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "integration"))
 
 from defs.perf import test_perf as perf_test  # noqa: E402
@@ -32,7 +33,11 @@ from defs.perf import test_perf as perf_test  # noqa: E402
         ([500, 1000], [2000, 2000], None),
     ],
 )
-def test_fixed_dataset_sequence_length(input_lens, output_lens, expected):
+def test_fixed_dataset_sequence_length(
+    input_lens: list[int],
+    output_lens: list[int],
+    expected: int | None,
+) -> None:
     config = perf_test.PerfTestConfig(
         runtime="bench",
         input_lens=input_lens,
@@ -48,15 +53,16 @@ def test_fixed_dataset_sequence_length(input_lens, output_lens, expected):
         ("bench", "", 0, True),
         ("bench", "", 1, False),
         ("serve", "qwen3_4b_eagle3", 0, False),
+        ("serve", "nemotron_3_nano_omni_nvfp4", 0, False),
         ("serve", "nemotron_3_nano_omni_nvfp4_image", 0, False),
     ],
 )
 def test_variable_dataset_does_not_infer_sequence_length(
-    runtime,
-    model_name,
-    num_loras,
-    build_only,
-):
+    runtime: str,
+    model_name: str,
+    num_loras: int,
+    build_only: bool,
+) -> None:
     config = perf_test.PerfTestConfig(
         model_name=model_name,
         runtime=runtime,
@@ -77,16 +83,16 @@ def test_variable_dataset_does_not_infer_sequence_length(
         ("bench", "", {}, None),
         ("bench", "_autodeploy", {}, None),
         ("bench", "pytorch", {"kv_cache_config": None}, 2500),
-        ("bench", "pytorch", {"max_seq_len": 2048}, None),
+        ("bench", "pytorch", {"max_seq_len": 2048}, 2048),
     ],
 )
 def test_model_yaml_infers_avg_seq_len_for_supported_configs(
-    monkeypatch,
-    runtime,
-    backend,
-    base_config,
-    expected,
-):
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: str,
+    backend: str,
+    base_config: dict[str, object],
+    expected: int | None,
+) -> None:
     runner = object.__new__(perf_test.MultiMetricPerfTest)
     runner._config = perf_test.PerfTestConfig(
         runtime=runtime,
@@ -107,7 +113,7 @@ def test_model_yaml_infers_avg_seq_len_for_supported_configs(
     assert kv_cache_config.get("avg_seq_len") == expected
 
 
-def test_model_yaml_preserves_explicit_avg_seq_len(monkeypatch):
+def test_model_yaml_preserves_explicit_avg_seq_len(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = object.__new__(perf_test.MultiMetricPerfTest)
     runner._config = perf_test.PerfTestConfig(
         runtime="bench",
@@ -127,11 +133,11 @@ def test_model_yaml_preserves_explicit_avg_seq_len(monkeypatch):
     assert config["kv_cache_config"]["avg_seq_len"] == 1024
 
 
-def test_model_yaml_skips_avg_seq_len_for_older_schema(monkeypatch):
+def test_model_yaml_skips_avg_seq_len_for_older_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm.llmapi import llm_args
 
     class LegacyKvCacheConfig:
-        model_fields = {}
+        model_fields = types.MappingProxyType({})
 
     runner = object.__new__(perf_test.MultiMetricPerfTest)
     runner._config = perf_test.PerfTestConfig(
