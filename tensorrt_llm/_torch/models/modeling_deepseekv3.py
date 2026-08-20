@@ -1134,8 +1134,13 @@ class Deepseekv3MoE(nn.Module):
                 kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         return quant_config
 
-    def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, do_finalize):
+    def compute_routed_output(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp4: Optional[Fp4QuantizedTensor],
+        all_rank_num_tokens: Optional[list[int]],
+        do_finalize: bool,
+    ) -> torch.Tensor | list[torch.Tensor | None]:
         # max-throughput
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
@@ -1168,7 +1173,8 @@ class Deepseekv3MoE(nn.Module):
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
         defer_shared_routed_add: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor
+                                                                 | None]:
         if not do_finalize:
             assert not self.use_dp
 
@@ -1556,8 +1562,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        def _run_MoE(hidden_states, hidden_states_fp4, do_finalize,
-                     defer_shared_routed_add):
+        def _run_MoE(
+            hidden_states: torch.Tensor,
+            hidden_states_fp4: Optional[Fp4QuantizedTensor],
+            do_finalize: bool,
+            defer_shared_routed_add: bool,
+        ) -> torch.Tensor | tuple[torch.Tensor,
+                                  torch.Tensor] | list[torch.Tensor | None]:
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,

@@ -70,6 +70,21 @@ if IS_FLASHINFER_AVAILABLE:
                                          residual: torch.Tensor,
                                          weight: torch.Tensor,
                                          eps: float) -> None:
+        """Fuse a BF16 MoE add, residual add, and RMSNorm in place.
+
+        Args:
+            input: Contiguous or row-strided BF16 tensor of shape ``(M, H)``.
+                Updated in place with the normalized output.
+            additional: BF16 tensor of shape ``(M, H)`` containing the second
+                MoE contribution. This tensor is not modified.
+            residual: BF16 tensor of shape ``(M, H)``. Updated in place with
+                the BF16-rounded MoE sum plus the original residual.
+            weight: Contiguous BF16 RMSNorm weight of shape ``(H,)``.
+            eps: Epsilon added to the RMSNorm variance.
+
+        Returns:
+            ``None``. ``input`` and ``residual`` are updated in place.
+        """
         # Keep this import lazy so installations that use FlashInfer's CUDA
         # norm fallback do not need CUTLASS DSL unless the default-off WideEP
         # path is explicitly selected.

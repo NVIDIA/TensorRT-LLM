@@ -12,6 +12,7 @@ global-to-shared pipeline.
 
 import functools
 import math
+from collections.abc import Callable
 
 import cutlass
 import cutlass.cute as cute
@@ -273,7 +274,7 @@ def _get_compiled_fused_add_add_rmsnorm_kernel(
     enable_pdl: bool,
     sm_version: int,
     contiguous: bool = True,
-):
+) -> Callable[..., None]:
     dtype = get_cutlass_dtype(dtype_str)
     kernel_obj = FusedAddAddRMSNormKernel(dtype, hidden_size, weight_bias, sm_version=sm_version)
     sym_m = cute.sym_int(64)
@@ -330,10 +331,48 @@ def fused_add_add_rmsnorm_cute(
     weight_bias: float = 0.0,
     enable_pdl: bool = False,
 ) -> None:
-    """Run three-input fused add + add + RMSNorm in place."""
+    """Run three-input BF16 fused add + add + RMSNorm in place."""
+    if input.ndim != 2 or additional.ndim != 2 or residual.ndim != 2:
+        raise ValueError(
+            "input, additional, and residual must all be 2D (M, H); got "
+            f"{tuple(input.shape)}, {tuple(additional.shape)}, and {tuple(residual.shape)}"
+        )
+    if additional.shape != input.shape or residual.shape != input.shape:
+        raise ValueError(
+            "additional and residual must match input shape; got "
+            f"{tuple(additional.shape)} and {tuple(residual.shape)} versus {tuple(input.shape)}"
+        )
+    if input.dtype != torch.bfloat16:
+        raise ValueError(f"input must use torch.bfloat16, got {input.dtype}")
+    if additional.dtype != input.dtype or residual.dtype != input.dtype:
+        raise ValueError(
+            "additional and residual must match input dtype; got "
+            f"{additional.dtype} and {residual.dtype} versus {input.dtype}"
+        )
+    if not input.is_cuda:
+        raise ValueError("input, additional, residual, and weight must be CUDA tensors")
+    if additional.device != input.device or residual.device != input.device:
+        raise ValueError(
+            "additional and residual must be on the same device as input; got "
+            f"{additional.device} and {residual.device} versus {input.device}"
+        )
+
     shape = input.shape
     hidden_size = shape[-1]
     num_rows = shape[0]
+    if weight.ndim != 1 or weight.shape[0] != hidden_size:
+        raise ValueError(f"weight must have shape ({hidden_size},), got {tuple(weight.shape)}")
+    if weight.dtype != input.dtype or weight.device != input.device:
+        raise ValueError(
+            "weight must match input dtype and device; got "
+            f"{weight.dtype} on {weight.device} versus {input.dtype} on {input.device}"
+        )
+    if any(tensor.stride(-1) != 1 for tensor in (input, additional, residual)):
+        raise ValueError(
+            "input, additional, and residual must be contiguous in the hidden dimension"
+        )
+    if not weight.is_contiguous():
+        raise ValueError("weight must be contiguous")
 
     is_contiguous = (
         input.is_contiguous() and additional.is_contiguous() and residual.is_contiguous()
@@ -354,6 +393,5 @@ def fused_add_add_rmsnorm_cute(
 
 __all__ = [
     "FusedAddAddRMSNormKernel",
-    "_get_compiled_fused_add_add_rmsnorm_kernel",
     "fused_add_add_rmsnorm_cute",
 ]
