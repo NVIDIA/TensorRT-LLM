@@ -4,7 +4,7 @@
 # Benchmark Cosmos3 VisualGen serving on an already-allocated single node.
 #
 # The script starts trtllm-serve, waits for /health, runs the online benchmark,
-# validates the result JSON, and retains the server/client logs and run metadata.
+# validates the result JSON, and retains logs, metadata, and optional client media.
 
 set -euo pipefail
 
@@ -31,6 +31,7 @@ NUM_INFERENCE_STEPS=${NUM_INFERENCE_STEPS-}
 GUIDANCE_SCALE=${GUIDANCE_SCALE-}
 SEED=${SEED-}
 NEGATIVE_PROMPT=${NEGATIVE_PROMPT-}
+OUTPUT_FORMAT=${OUTPUT_FORMAT-}
 
 NUM_PROMPTS=${NUM_PROMPTS:-3}
 REQUEST_RATE=${REQUEST_RATE:-inf}
@@ -41,6 +42,7 @@ METRIC_PERCENTILES=${METRIC_PERCENTILES:-50,90,99}
 PROMPT=${PROMPT:-"A cinematic scene with natural motion and consistent subjects"}
 NUM_GPUS_VALUE=${NUM_GPUS-}
 SAVE_DETAILED=${SAVE_DETAILED:-true}
+SAVE_MEDIA=${SAVE_MEDIA:-false}
 DRY_RUN=${DRY_RUN:-false}
 
 RUN_TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)
@@ -49,6 +51,8 @@ SERVER_LOG="${RESULT_DIR}/server.log"
 BENCHMARK_LOG="${RESULT_DIR}/benchmark.log"
 RESULT_JSON="${RESULT_DIR}/result.json"
 METADATA_JSON="${RESULT_DIR}/metadata.json"
+SERVER_MEDIA_DIR=
+CLIENT_MEDIA_DIR=
 
 fail() {
     echo "ERROR: $*" >&2
@@ -71,6 +75,32 @@ print_command() {
         printf '%q ' "$arg"
     done
     printf '\n'
+}
+
+ensure_server_port_available() {
+    if ! "$PYTHON_BIN" - "$HOST" "$PORT" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+address_family = (
+    socket.AF_INET6
+    if all(info[0] == socket.AF_INET6 for info in addr_info)
+    else socket.AF_INET
+)
+
+with socket.socket(address_family, socket.SOCK_STREAM) as server_socket:
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server_socket.bind((host, port))
+    except OSError:
+        raise SystemExit(1)
+PY
+    then
+        fail "Cannot start VisualGen server on ${HOST}:${PORT}; port is already in use. Stop the existing server or set PORT to a free port."
+    fi
 }
 
 wait_for_server() {
@@ -105,9 +135,23 @@ cleanup() {
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+    if [ -n "${SERVER_MEDIA_DIR:-}" ] && [ -d "$SERVER_MEDIA_DIR" ]; then
+        case "${SERVER_MEDIA_DIR##*/}" in
+            .server-media.*)
+                if ! rm -rf -- "$SERVER_MEDIA_DIR"; then
+                    echo "WARNING: Failed to remove temporary server media: ${SERVER_MEDIA_DIR}" >&2
+                fi
+                ;;
+            *)
+                echo "WARNING: Refusing to remove unexpected server media path: ${SERVER_MEDIA_DIR}" >&2
+                ;;
+        esac
+        SERVER_MEDIA_DIR=
+    fi
 }
 
 validate_boolean SAVE_DETAILED "$SAVE_DETAILED"
+validate_boolean SAVE_MEDIA "$SAVE_MEDIA"
 validate_boolean DRY_RUN "$DRY_RUN"
 
 case "$MODE" in
@@ -168,7 +212,7 @@ EXTRA_BODY=$(
 import json
 import sys
 
-mode, raw_extra_params = sys.argv[1:]
+mode, raw_extra_params, output_format = sys.argv[1:]
 try:
     extra_params = json.loads(raw_extra_params or "{}")
 except json.JSONDecodeError as exc:
@@ -180,9 +224,21 @@ required = {}
 body = {}
 if mode == "t2i":
     required["output_type"] = "image"
+    allowed_formats = {"png", "webp", "jpeg", "safetensors", "pt"}
+else:
+    allowed_formats = {"mp4", "avi", "auto", "safetensors", "pt"}
 if mode in {"t2av", "ti2av"}:
     required["enable_audio"] = True
     body["format"] = "mp4"
+
+if output_format:
+    if output_format not in allowed_formats:
+        raise SystemExit(
+            f"ERROR: OUTPUT_FORMAT={output_format!r} is not valid for MODE={mode}"
+        )
+    if mode in {"t2av", "ti2av"} and output_format != "mp4":
+        raise SystemExit(f"ERROR: MODE={mode} requires OUTPUT_FORMAT=mp4")
+    body["format"] = output_format
 
 for key, expected in required.items():
     if key in extra_params and extra_params[key] != expected:
@@ -195,7 +251,7 @@ for key, expected in required.items():
 if extra_params:
     body["extra_params"] = extra_params
 print(json.dumps(body, separators=(",", ":")))
-' "$MODE" "$EXTRA_PARAMS"
+' "$MODE" "$EXTRA_PARAMS" "$OUTPUT_FORMAT"
 )
 
 NUM_GPUS_EXPLICIT=false
@@ -252,6 +308,10 @@ BENCHMARK_CMD=(
 
 if [ "$SAVE_DETAILED" = "true" ]; then
     BENCHMARK_CMD+=(--save-detailed)
+fi
+if [ "$SAVE_MEDIA" = "true" ]; then
+    CLIENT_MEDIA_DIR="${RESULT_DIR}/media"
+    BENCHMARK_CMD+=(--media-dir "$CLIENT_MEDIA_DIR")
 fi
 if [ -n "$SIZE" ]; then
     BENCHMARK_CMD+=(--size "$SIZE")
@@ -324,6 +384,7 @@ from pathlib import Path
     max_concurrency,
     input_reference,
     request_body,
+    save_media,
 ) = sys.argv[1:]
 request_body = json.loads(request_body)
 metadata = {
@@ -337,6 +398,7 @@ metadata = {
     "input_reference": input_reference or None,
     "extra_params": request_body.get("extra_params", {}),
     "request_body": request_body,
+    "save_media": save_media == "true",
 }
 Path(output_path).write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 ' \
@@ -348,7 +410,8 @@ Path(output_path).write_text(json.dumps(metadata, indent=2) + "\n", encoding="ut
     "$REQUEST_RATE" \
     "$MAX_CONCURRENCY" \
     "$INPUT_REFERENCE_BASENAME" \
-    "$EXTRA_BODY"
+    "$EXTRA_BODY" \
+    "$SAVE_MEDIA"
 
 echo "VisualGen Serving Benchmark"
 echo "Model:               ${MODEL}"
@@ -359,6 +422,7 @@ echo "GPUs:                ${NUM_GPUS_VALUE}"
 echo "Request rate:        ${REQUEST_RATE}"
 echo "Max concurrency:     ${MAX_CONCURRENCY}"
 echo "Input reference:     ${INPUT_REFERENCE_BASENAME:-none}"
+echo "Client media:        ${CLIENT_MEDIA_DIR:-disabled}"
 echo "Result directory:    ${RESULT_DIR}"
 echo "Server command:"
 print_command "${SERVER_CMD[@]}"
@@ -370,10 +434,14 @@ if [ "$DRY_RUN" = "true" ]; then
     exit 0
 fi
 
-echo "Starting server; log: ${SERVER_LOG}"
-"${SERVER_CMD[@]}" >"$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
+ensure_server_port_available
+SERVER_MEDIA_DIR=$(mktemp -d "${RESULT_DIR}/.server-media.XXXXXX")
 trap cleanup EXIT
+
+echo "Starting server; log: ${SERVER_LOG}"
+TRTLLM_MEDIA_STORAGE_PATH="$SERVER_MEDIA_DIR" \
+    "${SERVER_CMD[@]}" >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
 
 wait_for_server
 SERVER_LOG_START_LINE=$(wc -l <"$SERVER_LOG" | tr -d ' ')
@@ -391,7 +459,7 @@ if [ ! -f "$RESULT_JSON" ]; then
 fi
 
 "$PYTHON_BIN" - "$RESULT_JSON" "$SERVER_LOG" "$SERVER_LOG_START_LINE" \
-    "$NUM_PROMPTS" "$NUM_GPUS_VALUE" "$SAVE_DETAILED" \
+    "$NUM_PROMPTS" "$NUM_GPUS_VALUE" "$SAVE_DETAILED" "$SAVE_MEDIA" "$CLIENT_MEDIA_DIR" \
     2>&1 <<'PY' | tee -a "$BENCHMARK_LOG"
 import json
 import re
@@ -409,6 +477,8 @@ start_line = int(sys.argv[3])
 expected_requests = int(sys.argv[4])
 expected_num_gpus = int(sys.argv[5])
 save_detailed = sys.argv[6] == "true"
+save_media = sys.argv[7] == "true"
+client_media_dir = Path(sys.argv[8]) if save_media else None
 
 result = json.loads(result_path.read_text(encoding="utf-8"))
 completed = int(result.get("completed", -1))
@@ -426,6 +496,21 @@ if reported_num_gpus != expected_num_gpus:
     )
 if result.get("mode") in {"t2av", "ti2av"} and result.get("audio_validated") is not True:
     raise SystemExit("ERROR: audio benchmark result was not validated with ffprobe")
+if save_media:
+    media_files = result.get("media_files")
+    if not isinstance(media_files, list) or len(media_files) != expected_requests:
+        saved_count = len(media_files) if isinstance(media_files, list) else "unavailable"
+        raise SystemExit(
+            "ERROR: benchmark did not retain one client media file per measured request: "
+            f"saved={saved_count}, expected={expected_requests}"
+        )
+    missing_media = [
+        media_file
+        for media_file in media_files
+        if not (client_media_dir / media_file).is_file()
+    ]
+    if missing_media:
+        raise SystemExit(f"ERROR: retained client media files are missing: {missing_media}")
 
 run_lines = server_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[start_line:]
 decode_pattern = re.compile(r"(?:Video|Image) decoded in ([0-9]+(?:\.[0-9]+)?)s")
@@ -488,6 +573,8 @@ if "mean_vision_decode" in result:
 else:
     print("  Avg. Vision Decode Time (s): unavailable; inspect the server log")
 print(f"  Request Latency (s): {result['mean_latency']:.4f}")
+if save_media:
+    print(f"  Retained media files: {len(result['media_files'])} in {client_media_dir}")
 if "mean_total_pipeline_time" in result:
     print(
         "  Total Pipeline Time (s/request), mean: "
@@ -505,3 +592,6 @@ echo "  Server log:    ${SERVER_LOG}"
 echo "  Benchmark log: ${BENCHMARK_LOG}"
 echo "  Result JSON:   ${RESULT_JSON}"
 echo "  Metadata JSON: ${METADATA_JSON}"
+if [ "$SAVE_MEDIA" = "true" ]; then
+    echo "  Client media:  ${CLIENT_MEDIA_DIR}"
+fi

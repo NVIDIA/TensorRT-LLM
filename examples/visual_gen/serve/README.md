@@ -61,6 +61,27 @@ the synchronous image or video endpoint, validates the saved result, and stops
 the server. Acquire the node before running the script; `trtllm-serve` starts
 all workers required by the VisualGen config.
 
+The wrapper refuses to start when `HOST:PORT` is already bound. Stop the
+existing server or set `PORT` to a free port. It does not reuse or terminate an
+existing listener because its `/health` response could belong to a different
+deployment and produce a misleading benchmark.
+
+Synchronous video responses require server-side encoding files while they are
+being downloaded. The wrapper isolates those files in a unique temporary media
+directory under `RESULT_DIR` and removes the directory after stopping the
+server. It never deletes the shared server default (`/tmp/trtllm_generated`) or
+media owned by asynchronous jobs or other server processes.
+
+Set `SAVE_MEDIA=true` to have the benchmark client retain one response file per
+measured request under `RESULT_DIR/media`. The unmeasured warm-up response is
+not saved, and client file writes happen after request latency is captured.
+This is separate from the temporary server media above, which is still removed
+when the benchmark exits. Files use the encoding reported by the server; set
+`OUTPUT_FORMAT=jpeg` for JPEG image artifacts or `OUTPUT_FORMAT=mp4` for MP4
+video artifacts. Reuse a result directory only when replacing its prior
+artifacts is intended; otherwise keep the default timestamped `RESULT_DIR` or
+set a unique path.
+
 | `MODE` | Endpoint | Request encoding | Required conditioning | Required `extra_params` |
 |--------|----------|------------------|-----------------------|-------------------------|
 | `t2i` | `/v1/images/generations` | JSON | None | `output_type: image` |
@@ -80,6 +101,12 @@ selected mode and rejects conflicting values.
 # Text to image
 MODE=t2i MODEL=nvidia/Cosmos3-Super-Text2Image \
 SERVER_CONFIG=examples/visual_gen/configs/cosmos3-t2i-1gpu.yaml \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+
+# Text to image, retaining each measured response as JPEG
+MODE=t2i MODEL=nvidia/Cosmos3-Super-Text2Image \
+SERVER_CONFIG=examples/visual_gen/configs/cosmos3-t2i-1gpu.yaml \
+SAVE_MEDIA=true OUTPUT_FORMAT=jpeg \
 ./examples/visual_gen/serve/benchmark_visual_gen.sh
 
 # Text to video
@@ -144,8 +171,10 @@ deployment when it uses more than one worker.
 
 Generation controls (`SIZE`, `SECONDS_TO_GENERATE`, `FPS`, `NUM_FRAMES`,
 `NUM_INFERENCE_STEPS`, `GUIDANCE_SCALE`, `SEED`, and `NEGATIVE_PROMPT`) are sent
-only when explicitly set. In particular, leaving `NUM_INFERENCE_STEPS` unset
-preserves the fixed checkpoint schedule of distilled 4-step models.
+only when explicitly set. `OUTPUT_FORMAT` similarly requests an explicit media
+encoding without changing whether the client retains the response. In
+particular, leaving `NUM_INFERENCE_STEPS` unset preserves the fixed checkpoint
+schedule of distilled 4-step models.
 
 Traffic controls are `NUM_PROMPTS`, `REQUEST_RATE`, `BURSTINESS`,
 `MAX_CONCURRENCY`, and `REQUEST_TIMEOUT`. Each run uses a timestamped result
@@ -156,6 +185,11 @@ directory by default and retains:
 - `result.json`, validated to have all requests complete and the expected GPU count
 - `metadata.json`, including model, config, mode, worker count, traffic settings,
   and conditioning-media basename (never the media bytes)
+- `media/request-NNNN.<format>` for each measured request when `SAVE_MEDIA=true`
+
+When media retention is enabled, `result.json` lists these relative paths in
+`media_files`, and the wrapper verifies that every measured request produced a
+file before accepting the run.
 
 The result reports average diffusion (`mean_denoise`), generation
 (`mean_generation`), request latency (`mean_latency`), seconds per denoising
