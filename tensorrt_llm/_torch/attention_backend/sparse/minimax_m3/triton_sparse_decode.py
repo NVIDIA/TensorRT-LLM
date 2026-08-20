@@ -36,6 +36,8 @@ import triton.language as tl
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
+from .msa_utils import check_decode_span_shape
+
 # One sparse block is exactly one KV page.
 SPARSE_BLOCK_SIZE = 128
 
@@ -315,11 +317,9 @@ def minimax_m3_sparse_attn_decode(
     """
     total_q, num_heads, head_dim = q.shape
     num_kv_heads = int(k_paged.shape[1])
-    if total_q != int(seq_lens.shape[0]) * decode_query_len:
-        raise ValueError(
-            f"total_q ({total_q}) must be batch ({int(seq_lens.shape[0])}) * "
-            f"decode_query_len ({decode_query_len})."
-        )
+    check_decode_span_shape(
+        "MiniMax-M3 Triton sparse decode", total_q, int(seq_lens.shape[0]), decode_query_len
+    )
     if int(k_paged.shape[2]) != SPARSE_BLOCK_SIZE:
         raise ValueError(
             f"MiniMax-M3 sparse decode requires page_size={SPARSE_BLOCK_SIZE}; "

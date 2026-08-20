@@ -27,6 +27,8 @@ import torch
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
+from .msa_utils import check_decode_span_shape
+
 
 @functools.lru_cache(maxsize=None)
 def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> int:
@@ -158,6 +160,15 @@ def minimax_m3_trtllm_gen_dense_decode(
     """
     from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
         _trtllm_gen_batch_decode_with_kv_cache,
+    )
+
+    # The multi-CTA KV counters are sized against max_num_requests, so a batch
+    # read out of a longer q would undersize them.
+    check_decode_span_shape(
+        "MiniMax-M3 trtllm-gen dense decode",
+        int(q.shape[0]),
+        int(seq_lens.shape[0]),
+        decode_query_len,
     )
 
     kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
