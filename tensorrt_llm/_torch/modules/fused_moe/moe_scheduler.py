@@ -519,11 +519,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # through **kwargs, so the request does not need a comm-side test.
             if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
-            # The optimization belongs to the DeepEP transport contract: any
-            # backend exposing an NVFP4 input scale can use it when DeepEP's
-            # own shape, dtype, quantization, and feature-flag checks pass.
+            # The backend must explicitly guarantee that DeepEP can replace
+            # its complete quantize_input path. This fails closed for dynamic
+            # scaling, AWQ preprocessing, padding, and unvalidated backends.
             if isinstance(moe.comm, DeepEPLowLatency):
-                nvfp4_input_scale = getattr(moe.backend, "fc31_input_scale", None)
+                nvfp4_input_scale = moe.backend.get_deep_ep_nvfp4_dispatch_input_scale(x)
                 fuse_bf16_nvfp4_dispatch = (
                     nvfp4_input_scale is not None
                     and moe.comm.should_fuse_bf16_nvfp4_dispatch(x, nvfp4_input_scale)

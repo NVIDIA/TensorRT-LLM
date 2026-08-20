@@ -3,7 +3,7 @@ index 7cb3372..9ff05d4 100644
 --- a/csrc/deep_ep.cpp
 +++ b/csrc/deep_ep.cpp
 @@ -1380,2 +1380,86 @@ Buffer::low_latency_dispatch_fp4(const torch::Tensor& x, const torch::Tensor& x_
- 
+
 +std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
 +Buffer::low_latency_dispatch_bf16_to_fp4(const torch::Tensor& x, const torch::Tensor& global_scale,
 +                    const torch::Tensor& topk_idx,
@@ -123,7 +123,7 @@ index 7377b72..70b765d 100644
 -                                const std::optional<torch::Tensor>& out);
 +                                const std::optional<torch::Tensor>& out,
 +                                bool stage_recv_metadata);
- 
+
 diff --git a/csrc/kernels/extension_api.cuh b/csrc/kernels/extension_api.cuh
 index af13a4b..dddce33 100644
 --- a/csrc/kernels/extension_api.cuh
@@ -156,7 +156,7 @@ index 7867f60..38a4aa2 100644
 --- a/csrc/kernels/extension_kernels.cu
 +++ b/csrc/kernels/extension_kernels.cu
 @@ -263,3 +263,3 @@ switch (hidden) { \
- 
+
 -template <int kHidden>
 +template <int kHidden, bool kQuantizeBf16Input = false>
  __global__ __launch_bounds__(1024, 1) void
@@ -178,7 +178,7 @@ index 7867f60..38a4aa2 100644
 -            const auto x_scales_int4  = reinterpret_cast<const int4*>(x_scales) + token_idx * kScalesVecAccessNum;
              const auto rdma_x_src_idx = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(rdma_x) + token_idx * kNumBytesPerMsg);
 @@ -320,11 +322,31 @@ dispatch_fp4(void* packed_recv_x, void* packed_recv_x_scales,
- 
+
 -            #pragma unroll
 -            for (int i = thread_id; i < kHiddenVecAccessNum; i += num_threads) {
 -                auto int4_value = __ldg(x_int4 + i);
@@ -224,7 +224,7 @@ index 7867f60..38a4aa2 100644
 +                x, x_scales, nullptr, topk_idx, \
                  atomic_counter_per_expert, atomic_finish_counter_per_expert, \
 @@ -541,2 +563,49 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
- 
+
 +void dispatch_bf16_to_fp4(void* packed_recv_x, void* packed_recv_x_scales,
 +                int* packed_recv_src_info, int64_t* packed_recv_layout_range,
 +                int* packed_recv_count,
@@ -417,7 +417,7 @@ index ee9ca67..0031c07 100644
                          tma_store_wait<kNumStages - 1>();
 -                    __syncwarp();
 +                    __syncwarp(sync_mask);
- 
+
 @@ -856,3 +862,3 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                      tma_store_fence();
 -                    __syncwarp();
@@ -463,7 +463,7 @@ index bdc1181..681dca9 100644
 +                             cumulative_local_expert_recv_stats)
 +        return packed_recv_x, packed_recv_x_scales, packed_recv_count, handle, \
 +            EventOverlap(event, tensors_to_record if async_finish else None), hook
-     
+
 @@ -650,3 +679,4 @@ class Buffer:
                              handle: tuple, async_finish: bool = False,
 -                            return_recv_hook: bool = False, out: Optional[torch.Tensor] = None) -> \
@@ -518,7 +518,7 @@ index a455091..e64a1b2 100644
 -            buffer.low_latency_combine_low_precision(1, x, x_global_scales, topk_idx[rank], topk_weights, handle)
 +            buffer.low_latency_combine_low_precision(
 +                "nvfp4", x, x_global_scales, topk_idx[rank], topk_weights, handle)
-     
+
 @@ -124,2 +150,21 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                          barrier_comm_profiling=True, suppress_kineto_output=True)
 +
@@ -542,6 +542,6 @@ index a455091..e64a1b2 100644
 +
      print(f'[rank {rank}] LL Dispatch FP4 bandwidth: {comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us, | '
 @@ -127,3 +172,2 @@ def test_all2all(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
-     
+
 -
  # noinspection PyUnboundLocalVariable
