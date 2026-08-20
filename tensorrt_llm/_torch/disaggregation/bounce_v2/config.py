@@ -95,9 +95,12 @@ class BounceV2Config:
     #: credited chunk's RDMA write the moment its gather event completes,
     #: instead of reporting the gather to Python and having the reactor post.
     #: Python then handles ONE completion per chunk (the write) instead of
-    #: two. Sender-local: no protocol or handshake impact. Requires the
-    #: binding's post_transfer_1to1_on_event; silently (with a warning) falls
-    #: back to the classic path on older bindings.
+    #: two. Sender-local: no protocol or handshake impact. With the two-phase
+    #: binding (poller.reserve_chain + agent.fulfill_chain_1to1) the chain is
+    #: RESERVED at gather launch and completed when the credit arrives, so a
+    #: gather that finished before its GRANT still takes the C++ path; the
+    #: one-shot post_transfer_1to1_on_event arm is the next fallback, and
+    #: older bindings fall back (with a warning) to the classic path.
     enable_cpp_chain: bool = False
     #: Receiver-side lease on granted regions. Derived (``None`` default) as
     #: 2 x ``request_timeout_ms``: a dead sender emits neither DATA nor a

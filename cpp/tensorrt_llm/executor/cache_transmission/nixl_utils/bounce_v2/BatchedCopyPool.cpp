@@ -245,8 +245,8 @@ std::size_t BatchedCopyPool::freeCount()
     return mFree.size();
 }
 
-std::int64_t BatchedCopyPool::submitCopy(
-    std::uint64_t const* srcs, std::uint64_t const* dsts, std::uint32_t const* sizes, std::size_t n)
+std::int64_t BatchedCopyPool::submitCopy(std::uint64_t const* srcs, std::uint64_t const* dsts,
+    std::uint32_t const* sizes, std::size_t n, std::uint64_t* reserveChainId)
 {
     TLLM_CHECK_WITH_INFO(
         n <= mMaxPlanEntries, "BatchedCopyPool::submitCopy: n (%zu) > maxPlanEntries (%zu)", n, mMaxPlanEntries);
@@ -291,7 +291,10 @@ std::int64_t BatchedCopyPool::submitCopy(
         // The poller's onTerminal returns the context to the free list from the poll thread —
         // contexts recycle in C++ without waiting for Python to drain the completion. Registered
         // inside the try so a throwing registration still releases the context below.
-        return static_cast<std::int64_t>(mPoller.registerEvent(ctx->event, [this, ctx] { release(ctx); }));
+        // `reserveChainId` (two-phase chain) is taken atomically WITH the registration, so the
+        // poll thread can never complete the event before the reservation exists.
+        return static_cast<std::int64_t>(mPoller.registerEvent(
+            ctx->event, [this, ctx] { release(ctx); }, reserveChainId));
     }
     catch (...)
     {

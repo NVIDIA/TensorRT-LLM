@@ -67,8 +67,13 @@ public:
     /// srcs/dsts/sizes are HOST arrays of FINAL device addresses; n must be <= maxPlanEntries().
     /// Returns the CompletionPoller id of the recorded completion event, or kBusy when no stream
     /// context is free. Thread-safe. Throws on CUDA failure (the context is returned first).
-    [[nodiscard]] std::int64_t submitCopy(
-        std::uint64_t const* srcs, std::uint64_t const* dsts, std::uint32_t const* sizes, std::size_t n);
+    ///
+    /// `reserveChainId` (optional, two-phase chain): forwarded to
+    /// CompletionPoller::registerEvent so the chain reservation is taken ATOMICALLY with the event
+    /// registration (guaranteed — never loses the race to the poll sweep). 0 when unavailable
+    /// (poller shut down); untouched on kBusy/throw.
+    [[nodiscard]] std::int64_t submitCopy(std::uint64_t const* srcs, std::uint64_t const* dsts,
+        std::uint32_t const* sizes, std::size_t n, std::uint64_t* reserveChainId = nullptr);
 
     [[nodiscard]] std::size_t maxPlanEntries() const noexcept
     {

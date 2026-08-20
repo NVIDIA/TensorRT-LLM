@@ -33,9 +33,11 @@ THREADING CONTRACT (every cross-thread interaction):
     state), request creation + eager pump under ``_req_mu``, WANT send under
     the channel lock. ``CreditScheduler`` is internally locked;
     ``BatchedCopyPool.submit_copy`` is thread-safe;
-    ``NixlTransferAgent.post_transfer_1to1`` runs on the reactor thread AND
-    on submit threads (a racing GRANT parks credits, then the submitter's
-    eager pump attaches them: _pump_locked -> _post_write_locked) — every
+    ``NixlTransferAgent.post_transfer_1to1`` (and the two-phase chain's
+    ``fulfill_chain_1to1``, whose gather-already-done flavor posts INLINE on
+    the calling thread) runs on the reactor thread AND on submit threads (a
+    racing GRANT parks credits, then the submitter's eager pump attaches
+    them: _pump_locked -> _post_write_locked / _fulfill_chain_locked) — every
     such call site holds ``_req_mu``, which serializes the posts.
   - ``_req_mu`` guards the sender request table AND ``_completions`` (the
     completion-id routing map): both are touched by submit threads (eager
@@ -56,14 +58,25 @@ THREADING CONTRACT (every cross-thread interaction):
     additionally poll ``alive()`` so even a hard thread death cannot hang a
     ``wait()`` (design risk #2).
 
-BLOCKING POINT: exactly one — ``zmq.Poller.poll(1 ms)`` over the ROUTER when
-a tick found no work (GIL released). Completions ride the same <=1 ms cap via
-``CompletionPoller.drain(0)`` each tick (the design's documented polling
-fallback; no other sleeps exist in the loop).
+BLOCKING POINT: exactly one — ``zmq.Poller.poll`` over the ROUTER plus (when
+available) the completion WAKEUP FD, when a tick found no work (GIL
+released). With a compiled poller exposing ``set_wakeup_fd`` the loop is
+EVENT-DRIVEN: every C++ completion publish/retire and every cross-thread
+command (``forget_peer``, ``shutdown``) writes one token to the fd, so the
+poll wakes immediately, and the timeout is deadline-driven — the earliest of
+the sender no-progress sweep, the receiver lease sweep, and the stats log,
+clamped to [1 ms, 100 ms] (the 100 ms cap is the lost-wakeup safety net; a
+non-empty scatter backlog keeps the 1 ms floor because its retry is
+pool-capacity-driven, not fd-signalled from Python's side). Without the fd
+(pure-python poller, old binding, or fd setup failure) the loop keeps the
+classic fixed 1 ms tick — the fd path is a strict enhancement, never a
+dependency. Completions are still drained non-blockingly via
+``CompletionPoller.drain(0)`` each tick; no other sleeps exist in the loop.
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -114,8 +127,15 @@ __all__ = [
 
 #: Separates peer name from request id in a flow key (same as the C++ kSep).
 _FLOW_SEP = "\x1f"
-#: Reactor idle-poll cap (the design's 1 ms tick).
+#: Reactor idle-poll floor (the design's 1 ms tick; also the LEGACY fixed
+#: tick when the completion wakeup fd is unavailable).
 _POLL_MS = 1
+#: Idle-poll cap in event-driven mode: the safety net for a lost wakeup (a
+#: full eventfd counter / pipe, or a bug) — never a steady-state latency term.
+_POLL_MAX_MS = 100
+#: The wakeup token: an eventfd REQUIRES an 8-byte little-endian nonzero
+#: counter increment; a pipe simply carries the same 8 bytes.
+_WAKE_TOKEN = (1).to_bytes(8, "little")
 #: Max ROUTER messages handled per tick (batching bound; keeps one giant
 #: burst from starving completion handling within a tick).
 _MAX_MSGS_PER_TICK = 512
@@ -128,6 +148,11 @@ _SEND_HWM = 1 << 16
 #: hardcoded so the pure-Python reactor stays importable without it).
 _KIND_EVENT = 0
 _KIND_XFER = 1
+#: CompletionPoller.fulfill/cancel result codes (mirror the binding's
+#: FULFILL_*/CANCEL_* constants; hardcoded for the same importability reason).
+_FULFILL_DECLINED = 0
+_FULFILL_POSTED = 2
+_CANCEL_REVERTED = 1
 #: Runtime stats log cadence (one INFO line; only when counters changed).
 _STATS_LOG_S = 30.0
 
@@ -172,6 +197,11 @@ class _Posted:
     remote_dev: int = 0
     copy_id: int = -1
     xfer_id: int = -1
+    #: Two-phase C++ chain: a reservation was taken at gather launch, so this
+    #: chunk's ONE completion id is ``xfer_id`` from the start (the gather's
+    #: own completion is consumed in C++). While GATHERING it awaits its
+    #: fulfill; a request failing before then must cancel the reservation.
+    reserved: bool = False
 
 
 @dataclass
@@ -256,19 +286,48 @@ class BounceReactor:
         )
         # EXPERIMENTAL C++ chain (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): the C++
         # poll thread posts a credited chunk's RDMA write as soon as its
-        # gather event fires (see _arm_chain_locked); Python then sees ONE
-        # completion per chunk instead of gather + write.
+        # gather event fires; Python then sees ONE completion per chunk
+        # instead of gather + write. Two flavors, best available wins:
+        #   - TWO-PHASE (reserve at gather launch, fulfill when the credit
+        #     arrives): a chunk whose gather already finished still takes the
+        #     C++ path — requires poller.reserve_chain/cancel_chain and the
+        #     agent's fulfill_chain_1to1;
+        #   - one-shot arm (post_transfer_1to1_on_event): only wins when the
+        #     credit is attached while the gather is STILL pending (kept as
+        #     the fallback for reserve-declined chunks and older bindings).
         self._chain_fn = None
+        self._reserve_fn = None
+        self._fulfill_fn = None
+        self._cancel_fn = None
+        self._submit_chained_fn = None
         if config.enable_cpp_chain:
             self._chain_fn = getattr(raw_agent, "post_transfer_1to1_on_event", None)
-            if self._chain_fn is None:
+            reserve_fn = getattr(poller, "reserve_chain", None)
+            cancel_fn = getattr(poller, "cancel_chain", None)
+            fulfill_fn = getattr(raw_agent, "fulfill_chain_1to1", None)
+            if reserve_fn is not None and cancel_fn is not None and fulfill_fn is not None:
+                self._reserve_fn = reserve_fn
+                self._cancel_fn = cancel_fn
+                self._fulfill_fn = fulfill_fn
+                # Atomic submit+reserve (preferred): the reservation is taken
+                # inside the same C++ critical section that registers the
+                # gather's completion event, so the 50 us poll thread can
+                # NEVER win the reserve race; the separate reserve_chain call
+                # stays as the fallback for a pool binding without it.
+                self._submit_chained_fn = getattr(copy_pool, "submit_copy_chained", None)
+                atomic = ", atomic reserve" if self._submit_chained_fn is not None else ""
+                logger.info(
+                    f"bounce_v2({self_name}): C++ gather->RDMA chain enabled (two-phase "
+                    f"reserve/fulfill{atomic})"
+                )
+            elif self._chain_fn is not None:
+                logger.info(f"bounce_v2({self_name}): C++ gather->RDMA chain enabled")
+            else:
                 logger.warning(
                     f"bounce_v2({self_name}): TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN requested but the "
                     f"agent binding lacks post_transfer_1to1_on_event; using the classic "
                     f"gather->post path"
                 )
-            else:
-                logger.info(f"bounce_v2({self_name}): C++ gather->RDMA chain enabled")
 
         # --- control channel ---
         self._zmq = zmq.Context(io_threads=1)
@@ -282,6 +341,39 @@ class BounceReactor:
         self._endpoint: str = self._router.getsockopt_string(zmq.LAST_ENDPOINT)
         self._zpoller = zmq.Poller()
         self._zpoller.register(self._router, zmq.POLLIN)
+
+        # --- completion wakeup fd (event-driven ticks; see module docstring
+        # BLOCKING POINT). Best-effort: any setup failure keeps the legacy
+        # 1 ms tick. The reactor owns the fd pair; _wake_mu serializes writers
+        # against the close in shutdown(). ---
+        self._wake_mu = threading.Lock()
+        self._wakeup_rfd: Optional[int] = None
+        self._wakeup_wfd: Optional[int] = None
+        set_wakeup_fd = getattr(poller, "set_wakeup_fd", None)
+        if set_wakeup_fd is not None:
+            rfd = wfd = None
+            try:
+                if hasattr(os, "eventfd"):  # Linux, Python >= 3.10: one fd, 8-byte counter
+                    rfd = wfd = os.eventfd(0, os.EFD_NONBLOCK)
+                else:
+                    rfd, wfd = os.pipe()
+                    os.set_blocking(rfd, False)
+                    os.set_blocking(wfd, False)
+                self._zpoller.register(rfd, zmq.POLLIN)
+                set_wakeup_fd(wfd)
+                self._wakeup_rfd = rfd
+                self._wakeup_wfd = wfd
+            except OSError as e:
+                logger.warning(
+                    f"bounce_v2({self_name}): completion wakeup fd setup failed ({e}); "
+                    f"keeping the legacy 1 ms reactor tick"
+                )
+                for fd in {rfd, wfd} - {None}:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
         self._ch_mu = threading.Lock()
         self._dealers: dict[str, zmq.Socket] = {}
 
@@ -361,9 +453,13 @@ class BounceReactor:
             return
         self._next_stats_log = now + _STATS_LOG_S
         snap = self.stats()
-        if not snap or snap == self._last_stats_snapshot:
+        # The reactor_wake_* counters advance on every idle deadline poll, so
+        # they alone must not count as "changed" (a fully idle reactor would
+        # log forever); they still appear in the line once real work moves.
+        comparable = {k: v for k, v in snap.items() if not k.startswith("reactor_wake_")}
+        if not comparable or comparable == self._last_stats_snapshot:
             return
-        self._last_stats_snapshot = snap
+        self._last_stats_snapshot = comparable
         line = " ".join(f"{k}={v}" for k, v in sorted(snap.items()))
         logger.info(f"bounce_v2({self._self_name}): stats {line}")
 
@@ -427,6 +523,7 @@ class BounceReactor:
             victim_rids = [rid for rid, req in self._requests.items() if req.peer == peer]
         with self._cmd_mu:
             self._cmds.append(("forget_peer", peer, victim_rids))
+        self._wake()
 
     def submit(
         self,
@@ -501,13 +598,15 @@ class BounceReactor:
             self._thread.join(timeout=5)
             return
         self._stop.set()
+        self._wake()  # cut the (<= _POLL_MAX_MS) poll short instead of riding it out
         self._thread.join(timeout=5)
         self._maybe_log_stats(force=True)
         if self._thread.is_alive():
             # Wedged reactor: libzmq sockets are NOT thread-safe, and the
             # stuck thread may still be inside a ROUTER poll/recv. Closing
             # the sockets (or term'ing the context) under it can segfault —
-            # LEAK them instead; still fail every pending future.
+            # LEAK them instead (the wakeup fds too: the thread may be inside
+            # a poll over the read end); still fail every pending future.
             logger.warning(
                 f"bounce_v2({self._self_name}): reactor did not join within 5 s; "
                 f"leaking its ZMQ sockets/context (closing under a live thread "
@@ -516,6 +615,24 @@ class BounceReactor:
             self._fail_all(FAIL_SHUTDOWN)
             return
         self._fail_all(FAIL_SHUTDOWN)
+        # Close the wakeup fds only AFTER (a) the poller stops writing them —
+        # set_wakeup_fd(-1) synchronizes under the poller's mutex, so no C++
+        # write can straddle it — and (b) _wake_mu excludes any in-flight
+        # Python writer (forget_peer/shutdown from another thread). The
+        # reactor thread (the only reader) is already joined.
+        if self._wakeup_rfd is not None:
+            set_wakeup_fd = getattr(self._poller, "set_wakeup_fd", None)
+            if set_wakeup_fd is not None:
+                set_wakeup_fd(-1)
+            with self._wake_mu:
+                rfd, wfd = self._wakeup_rfd, self._wakeup_wfd
+                self._wakeup_rfd = None
+                self._wakeup_wfd = None
+            for fd in {rfd, wfd} - {None}:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         with self._ch_mu:
             for dealer in self._dealers.values():
                 dealer.close(linger=0)
@@ -533,6 +650,12 @@ class BounceReactor:
                 self._set_device()
             while not self._stop.is_set():
                 self._heartbeat = time.monotonic()
+                # Drain the wakeup fd FIRST (level semantics): a token written
+                # after this read but before the drains below leaves the fd
+                # readable, so the next poll returns immediately — a wakeup is
+                # never lost, at worst it costs one extra tick.
+                if self._wakeup_rfd is not None:
+                    self._drain_wakeup_fd()
                 did_work = self._drain_commands()
                 did_work |= self._drain_router()
                 did_work |= self._drain_completions()
@@ -543,14 +666,62 @@ class BounceReactor:
                 self._flush_acks()
                 self._maybe_log_stats()
                 if not did_work:
-                    # The ONE blocking point: <=1 ms on the ROUTER (GIL
-                    # released). Completions ride the same cap via the
-                    # non-blocking drain above.
-                    self._zpoller.poll(_POLL_MS)
+                    # The ONE blocking point (GIL released): the ROUTER plus
+                    # the wakeup fd, for the deadline-driven timeout (legacy
+                    # fixed 1 ms without the fd). Completions ride the wakeup
+                    # fd (or the timeout) via the non-blocking drain above.
+                    ready = self._zpoller.poll(self._poll_timeout_ms())
+                    if self._wakeup_rfd is not None:
+                        if any(sock == self._wakeup_rfd for sock, _ in ready):
+                            self._bump("reactor_wake_fd")
+                        elif not ready:
+                            self._bump("reactor_wake_deadline")
         except Exception as e:  # thread exception boundary (mirrors ioLoop's)
             logger.error(f"bounce_v2({self._self_name}): reactor crashed: {e}", exc_info=True)
             self._dead = True
             self._fail_all(FAIL_REACTOR_DEAD)
+
+    def _wake(self) -> None:
+        """Write one wakeup token (any thread; no-op without the fd). Never
+        blocks: EAGAIN means the fd is already level-ready."""
+        with self._wake_mu:
+            if self._wakeup_wfd is None:
+                return
+            try:
+                os.write(self._wakeup_wfd, _WAKE_TOKEN)
+            except BlockingIOError:
+                pass
+
+    def _drain_wakeup_fd(self) -> None:
+        """Drain the wakeup fd fully (reactor thread only). One read empties
+        an eventfd (the kernel returns-and-resets the whole counter); pipes
+        loop until EAGAIN. A racing extra token is harmless (see _run)."""
+        try:
+            while os.read(self._wakeup_rfd, 4096):
+                pass
+        except BlockingIOError:
+            pass
+
+    def _poll_timeout_ms(self) -> int:
+        """Poll timeout for an idle tick. Legacy fixed 1 ms tick without the
+        wakeup fd; otherwise deadline-driven: sleep until the earliest timed
+        obligation, in [1 ms, _POLL_MAX_MS]. The scatter backlog keeps the
+        1 ms floor — its retry waits on copy-pool capacity, which only the
+        poller's retire-wakeup covers when the compiled pool is in use, so
+        the short tick stays as the universal backstop."""
+        if self._wakeup_rfd is None:
+            return _POLL_MS
+        if self._scatter_backlog:
+            return _POLL_MS
+        now = time.monotonic()
+        deadline = now + _POLL_MAX_MS / 1000.0
+        if self._cfg.request_timeout_ms > 0:
+            # Only meaningful when timeouts are on: _check_sender_timeouts
+            # never advances _next_sender_sweep otherwise (a stale past value
+            # would pin the loop to the 1 ms floor).
+            deadline = min(deadline, self._next_sender_sweep)
+        deadline = min(deadline, self._next_lease_sweep, self._next_stats_log)
+        return max(_POLL_MS, min(_POLL_MAX_MS, int((deadline - now) * 1000.0) + 1))
 
     def _drain_commands(self) -> bool:
         with self._cmd_mu:
@@ -664,13 +835,28 @@ class BounceReactor:
             req.next_credit += 1
             req.last_progress = time.monotonic()
             if target.state == _PostState.GATHERING:
-                # Eager chunk still gathering: with the C++ chain enabled the
-                # credit lets us arm the gather->post chain right now; losing
-                # the race to the gather's own completion is fine — the
-                # classic path then posts from _on_gather_done as before.
-                self._arm_chain_locked(rid, req, target)
+                if target.reserved:
+                    # Two-phase chain: the reservation was taken at gather
+                    # launch, so the credit completes it regardless of whether
+                    # the gather already finished (the arm race is gone).
+                    self._fulfill_chain_locked(rid, req, target)
+                else:
+                    # Eager chunk still gathering: with the C++ chain enabled
+                    # the credit lets us arm the gather->post chain right now;
+                    # losing the race to the gather's own completion is fine —
+                    # the classic path then posts from _on_gather_done.
+                    self._arm_chain_locked(rid, req, target)
             elif target.state == _PostState.GATHERED:
                 # Eagerly-gathered chunk was only waiting for its credit.
+                if self._chain_fn is not None and self._reserve_fn is None:
+                    # One-shot arm mode: the gather completed BEFORE its
+                    # credit, so the arm race was lost before an arm could
+                    # even be attempted. Count it here so tx_chain_arm_race
+                    # is ordering-independent (exactly one bump per chunk the
+                    # chain could not take, whether the credit found the
+                    # chunk GATHERING — attempt refused in C++ — or already
+                    # GATHERED like now).
+                    self._bump("tx_chain_arm_race")
                 self._post_write_locked(rid, req, target)
                 if req.abandon_reason:
                     return
@@ -714,12 +900,19 @@ class BounceReactor:
             if local_off is None:
                 break
             region_base = self._arena_base + local_off
+            reserved = -1
             try:
-                copy_id = self._pool.submit_copy(
-                    chunk.src_ptrs,
-                    (np.uint64(region_base) + chunk.bounce_offsets).astype(np.uint64),
-                    chunk.sizes,
-                )
+                bounce_dsts = (np.uint64(region_base) + chunk.bounce_offsets).astype(np.uint64)
+                if self._submit_chained_fn is not None:
+                    # Atomic submit+reserve: the reservation exists before the
+                    # C++ poll thread can even see the event — the reserve
+                    # race is structurally impossible on this path.
+                    copy_id, reserved = self._submit_chained_fn(
+                        chunk.src_ptrs, bounce_dsts, chunk.sizes
+                    )
+                    copy_id, reserved = int(copy_id), int(reserved)
+                else:
+                    copy_id = self._pool.submit_copy(chunk.src_ptrs, bounce_dsts, chunk.sizes)
             except RuntimeError as e:
                 # Gather launch failed (CUDA error / plan overflow). No event
                 # was registered, so the region is safe to recycle now; fail
@@ -748,14 +941,35 @@ class BounceReactor:
                 posted.remote_handle = credit.region_handle
                 posted.remote_addr = credit.addr
                 posted.remote_dev = credit.dev_id
-            self._completions[copy_id] = ("gather", rid)
+            if self._reserve_fn is not None:
+                # Two-phase C++ chain: the chunk's ONE completion id is the
+                # reservation from here on. The atomic path above already
+                # reserved; the separate-call fallback (older pool binding)
+                # reserves here and CAN lose to the 50 us poll thread on a
+                # tiny gather. A decline (race lost / poller shutdown) keeps
+                # the classic route below.
+                if reserved < 0 and self._submit_chained_fn is None:
+                    reserved = int(self._reserve_fn(copy_id))
+                if reserved >= 0:
+                    posted.reserved = True
+                    posted.xfer_id = reserved
+                    self._completions[reserved] = ("xfer", rid)
+                    self._bump("tx_chain_reserved")
+                else:
+                    self._bump("tx_chain_reserve_declined")
+                    self._completions[copy_id] = ("gather", rid)
+            else:
+                self._completions[copy_id] = ("gather", rid)
             req.posted.append(posted)
             req.next_post += 1
             req.last_progress = time.monotonic()
             if posted.has_credit:
-                # Credited at launch: arm the C++ chain immediately (no-op
-                # when the chain is disabled/unavailable).
-                self._arm_chain_locked(rid, req, posted)
+                # Credited at launch: complete/arm the C++ chain immediately
+                # (no-op when the chain is disabled/unavailable).
+                if posted.reserved:
+                    self._fulfill_chain_locked(rid, req, posted)
+                else:
+                    self._arm_chain_locked(rid, req, posted)
         self._send_grants(grants)
 
     def _drain_pending_posts(self) -> bool:
@@ -813,6 +1027,37 @@ class BounceReactor:
         self._completions[posted.xfer_id] = ("xfer", rid)
         req.last_progress = time.monotonic()
         return True
+
+    def _fulfill_chain_locked(self, rid: int, req: _Request, posted: _Posted) -> None:
+        """Two-phase chain, phase 2: the credit arrived for a RESERVED chunk
+        (_req_mu held) — hand C++ the destination. On ARMED/POSTED the chunk
+        moves to WRITING (its one completion, the reserved id, resolves after
+        the write like any armed chain). On DECLINED a terminal FAILURE row
+        for the reserved id is already published/pending (the gather failed
+        in C++, or the poller shut down): post nothing, leave the chunk
+        GATHERING — the row's _on_xfer_done advances and fails it."""
+        rc = int(
+            self._fulfill_fn(
+                posted.xfer_id,
+                self._arena_base + posted.local_offset,
+                posted.remote_addr,
+                posted.write_bytes,
+                self._device_id,
+                posted.remote_dev,
+                req.peer,
+                self._poller,
+            )
+        )
+        if rc == _FULFILL_DECLINED:
+            self._bump("tx_chain_fulfill_declined")
+            return
+        posted.state = _PostState.WRITING
+        self._bump("tx_chain_armed")
+        if rc == _FULFILL_POSTED:
+            # The gather had already finished: the write was posted inline —
+            # exactly the chunks the one-shot arm used to lose to the race.
+            self._bump("tx_chain_fulfilled_late")
+        req.last_progress = time.monotonic()
 
     def _post_write_locked(self, rid: int, req: _Request, posted: _Posted) -> None:
         """Gathered + credited -> post the 1:1 RDMA write. _req_mu held."""
@@ -887,6 +1132,13 @@ class BounceReactor:
                 # relabel a chunk that is no longer WRITING.
                 if target.state == _PostState.WRITING:
                     target.state = _PostState.SENT
+                elif target.state == _PostState.GATHERING and target.reserved:
+                    # A RESERVED chunk's failure row landed before its fulfill
+                    # (chained gather failed, or the poller shut down): the
+                    # reservation is terminal — the kernel is done and the
+                    # write was never posted — so the staging region is safe
+                    # to recycle in _fail_request_locked below.
+                    target.state = _PostState.GATHERED
                 self._fail_request_locked(
                     rid, req, FAIL_GATHER if kind == _KIND_EVENT else FAIL_WRITE
                 )
@@ -993,7 +1245,10 @@ class BounceReactor:
         Regions are recycled only once nothing can still touch their memory:
         a WRITING chunk's region defers until its RDMA completion (the NIC
         may still read it); a GATHERING chunk's region defers until its copy
-        event fires (the kernel may still write it); GATHERED/SENT recycle
+        event fires (the kernel may still write it) — a RESERVED one first
+        cancels its chain reservation, which either reverts the completion to
+        the original copy_id (then deferred the same way) or reports the
+        gather already terminal (then recycled now); GATHERED/SENT recycle
         now. The chunk whose FAILED completion triggered this call must be
         advanced to a terminal state (GATHERED/SENT) by its handler first:
         its completion id was already consumed by the drain, so registering
@@ -1023,7 +1278,24 @@ class BounceReactor:
                 self._orphan_writes[rid] = self._orphan_writes.get(rid, 0) + 1
                 deferred_write = True
             elif p.state == _PostState.GATHERING:
-                self._completions[p.copy_id] = ("orphan_gather", p.local_offset)
+                if p.reserved:
+                    # Reserved, not yet fulfilled: the reservation must not
+                    # outlive the request (an unfulfilled reservation neither
+                    # publishes nor frees anything until poller shutdown).
+                    # cancel_chain either REVERTS it — the gather is still
+                    # running and will publish under its ORIGINAL copy_id,
+                    # which we re-route as the orphaned gather — or reports it
+                    # TERMINAL (gather done or failed): the kernel is done and
+                    # the write was never posted, so the region recycles now;
+                    # an already-published failure row finds its route popped
+                    # below and drains into a no-op.
+                    self._completions.pop(p.xfer_id, None)
+                    if int(self._cancel_fn(p.xfer_id)) == _CANCEL_REVERTED:
+                        self._completions[p.copy_id] = ("orphan_gather", p.local_offset)
+                    else:
+                        grants.extend(self._sched.release_local(p.local_offset))
+                else:
+                    self._completions[p.copy_id] = ("orphan_gather", p.local_offset)
             else:  # GATHERED / SENT: nothing touches the region anymore
                 grants.extend(self._sched.release_local(p.local_offset))
         if deferred_write:
@@ -1034,6 +1306,12 @@ class BounceReactor:
         del self._requests[rid]
         self._send_grants(grants)
         _resolve(future, BounceResult(False, reason))
+        # This may run on a SUBMIT thread (mispair / gather-launch failure at
+        # submit time): the regions released above can unblock another request
+        # parked on arena capacity, so wake the reactor's pump now instead of
+        # riding out the (<= _POLL_MAX_MS) deadline poll. No-op without the fd
+        # or from the reactor thread itself (one extra drained token).
+        self._wake()
 
     def _on_orphan_xfer_done(self, local_offset: int, rid: int) -> None:
         """A failed request's in-flight write reached a terminal state: its

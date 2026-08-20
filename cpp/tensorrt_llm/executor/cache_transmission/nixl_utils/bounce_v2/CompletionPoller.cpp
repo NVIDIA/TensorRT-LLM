@@ -24,6 +24,8 @@
 #include <chrono>
 #include <exception>
 
+#include <unistd.h>
+
 namespace tensorrt_llm::executor::kv_cache::bounce_v2
 {
 
@@ -55,12 +57,17 @@ CompletionPoller::~CompletionPoller()
     mRetired.clear();
 }
 
-std::uint64_t CompletionPoller::registerEvent(cudaEvent_t event, std::function<void()> onTerminal)
+std::uint64_t CompletionPoller::registerEvent(
+    cudaEvent_t event, std::function<void()> onTerminal, std::uint64_t* reserveChainId)
 {
     std::uint64_t const id = mNextId.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(mMu);
     if (mStop.load(std::memory_order_acquire))
     {
+        if (reserveChainId != nullptr)
+        {
+            *reserveChainId = 0; // no reservation after shutdown; the event id resolves classically
+        }
         // Late registration after shutdown: terminate immediately so the id still resolves. The
         // kernel behind the event may still be running — wait for it BEFORE onTerminal() recycles
         // the context, or its pinned plan buffer could be reused/freed under a live kernel.
@@ -76,10 +83,42 @@ std::uint64_t CompletionPoller::registerEvent(cudaEvent_t event, std::function<v
             onTerminal();
         }
         mCv.notify_all();
+        signalWakeupLocked();
         return id;
     }
-    mEvents.push_back(EventEntry{id, event, std::move(onTerminal)});
+    EventEntry entry{id, event, std::move(onTerminal)};
+    if (reserveChainId != nullptr)
+    {
+        // Atomic two-phase reservation: created in the SAME critical section as the registration,
+        // so the poll sweep can never complete the event before the reservation exists — unlike a
+        // separate reserveChain call, this cannot lose the race (guaranteed chain).
+        entry.chainId = mNextId.fetch_add(1, std::memory_order_relaxed);
+        *reserveChainId = entry.chainId;
+    }
+    mEvents.push_back(std::move(entry));
     return id;
+}
+
+void CompletionPoller::setWakeupFd(int fd) noexcept
+{
+    // Under mMu, like every write: after this returns with -1, no thread can still write the old
+    // fd — the owner may close it.
+    std::lock_guard<std::mutex> lk(mMu);
+    mWakeupFd = fd;
+}
+
+void CompletionPoller::signalWakeupLocked() noexcept
+{
+    if (mWakeupFd < 0)
+    {
+        return;
+    }
+    // One 8-byte token: an eventfd REQUIRES 8 bytes, and a pipe simply carries them. Non-blocking
+    // best-effort — EAGAIN (saturated counter / full pipe) means the fd is already level-ready,
+    // and any other error is covered by the reader's bounded poll timeout.
+    std::uint64_t const token = 1;
+    ssize_t const rc = ::write(mWakeupFd, &token, sizeof(token));
+    static_cast<void>(rc);
 }
 
 std::int64_t CompletionPoller::armXferAfterEvent(std::uint64_t eventId, ChainPoster poster)
@@ -114,6 +153,114 @@ std::int64_t CompletionPoller::armXferAfterEvent(std::uint64_t eventId, ChainPos
     return -1;
 }
 
+std::int64_t CompletionPoller::reserveChain(std::uint64_t eventId)
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    if (mStop.load(std::memory_order_acquire))
+    {
+        // Shutting down: refuse; the event id itself resolves via the shutdown sweep, which the
+        // caller's classic route still owns.
+        return -1;
+    }
+    for (auto& e : mEvents)
+    {
+        if (e.id == eventId)
+        {
+            if (e.chainId != 0)
+            {
+                return -1; // double reserve/arm refused
+            }
+            std::uint64_t const id = mNextId.fetch_add(1, std::memory_order_relaxed);
+            e.chainId = id; // chainPoster stays empty: reserved, awaiting fulfillChain
+            return static_cast<std::int64_t>(id);
+        }
+    }
+    // Already terminal (its own completion publishes/published) or unknown: classic path.
+    return -1;
+}
+
+std::int64_t CompletionPoller::fulfillChain(std::uint64_t reservedId, ChainPoster poster)
+{
+    if (!poster)
+    {
+        return kFulfillDeclined; // caller bug; safe: declining never posts and never double-publishes
+    }
+    std::vector<PendingChain> ready;
+    {
+        std::lock_guard<std::mutex> lk(mMu);
+        if (!mStop.load(std::memory_order_acquire))
+        {
+            for (auto& e : mEvents)
+            {
+                if (e.chainId == reservedId)
+                {
+                    if (e.chainPoster)
+                    {
+                        // Already fulfilled: that chain resolves the reserved id on its own.
+                        return kFulfillDeclined;
+                    }
+                    e.chainPoster = std::move(poster);
+                    return kFulfillArmed;
+                }
+            }
+            auto it = std::find(mGatherDoneChains.begin(), mGatherDoneChains.end(), reservedId);
+            if (it != mGatherDoneChains.end())
+            {
+                // Gather already done OK: post inline on THIS thread via the executeChains path
+                // (outside mMu; mChainsInFlight keeps unregisterEvents' teardown wait correct).
+                mGatherDoneChains.erase(it);
+                ++mChainsInFlight;
+                ready.push_back(PendingChain{reservedId, std::move(poster)});
+            }
+        }
+        // mStop / unknown reservation: the gather failed ({reserved, kKindEvent, 0} is
+        // published/pending) or the shutdown sweep terminated it ({reserved, kKindXfer, 0}) —
+        // either way exactly one terminal row exists for the reserved id; decline below.
+    }
+    if (ready.empty())
+    {
+        return kFulfillDeclined;
+    }
+    executeChains(ready);
+    return kFulfillPosted;
+}
+
+std::int64_t CompletionPoller::cancelChain(std::uint64_t reservedId)
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    for (auto& e : mEvents)
+    {
+        if (e.chainId == reservedId)
+        {
+            if (e.chainPoster)
+            {
+                // Documented-unreachable (cancel is only called for reserved-UNFULFILLED chains):
+                // warn but leave the armed chain alone — its own terminal row still publishes, so
+                // kCancelTerminal would be a lie only about WHO frees the region; the caller's
+                // contract violation is the real bug to surface.
+                TLLM_LOG_WARNING(
+                    "CompletionPoller: cancelChain(%llu) hit a FULFILLED chain (contract violation); "
+                    "leaving it armed — its terminal row still publishes",
+                    static_cast<unsigned long long>(reservedId));
+                return kCancelTerminal;
+            }
+            // Revert the reservation: the event publishes under its ORIGINAL id again (the caller
+            // re-routes it, e.g. as an orphaned gather); the reserved id never publishes.
+            e.chainId = 0;
+            return kCancelReverted;
+        }
+    }
+    auto it = std::find(mGatherDoneChains.begin(), mGatherDoneChains.end(), reservedId);
+    if (it != mGatherDoneChains.end())
+    {
+        mGatherDoneChains.erase(it); // gather done, write never posted: nothing ever publishes
+        return kCancelTerminal;
+    }
+    // Gather failed (failure row published/pending) or the shutdown sweep terminated it: terminal
+    // either way — the caller pops its route, so a pending row drains into a no-op.
+    return kCancelTerminal;
+}
+
 std::uint64_t CompletionPoller::registerXfer(std::unique_ptr<TransferStatus> status)
 {
     std::uint64_t const id = mNextId.fetch_add(1, std::memory_order_relaxed);
@@ -124,6 +271,7 @@ std::uint64_t CompletionPoller::registerXfer(std::unique_ptr<TransferStatus> sta
         releaseXferLocked(entry);
         mDone.push_back(Completion{id, kKindXfer, 0});
         mCv.notify_all();
+        signalWakeupLocked();
         return id;
     }
     mXfers.push_back(XferEntry{id, std::move(status)});
@@ -211,6 +359,13 @@ void CompletionPoller::shutdown() noexcept
         }
     }
     mEvents.clear();
+    for (auto const id : mGatherDoneChains)
+    {
+        // Reserved chain whose gather completed but whose fulfill never arrived: terminate the
+        // reserved id like an armed chain (gather OK, write never posted -> kKindXfer).
+        mDone.push_back(Completion{id, kKindXfer, 0});
+    }
+    mGatherDoneChains.clear();
     for (auto& x : mXfers)
     {
         releaseXferLocked(x);
@@ -218,6 +373,7 @@ void CompletionPoller::shutdown() noexcept
     }
     mXfers.clear();
     mCv.notify_all();
+    signalWakeupLocked();
 }
 
 void CompletionPoller::releaseXferLocked(XferEntry& entry)
@@ -246,6 +402,7 @@ void CompletionPoller::releaseXferLocked(XferEntry& entry)
 bool CompletionPoller::pollOnceLocked(std::vector<PendingChain>& chainsOut)
 {
     bool published = false;
+    bool retired = false; // ANY entry going terminal frees a resource -> worth a wakeup token
 
     // CUDA events: cudaSuccess => done, cudaErrorNotReady => keep polling, anything else => failure.
     for (auto it = mEvents.begin(); it != mEvents.end();)
@@ -264,16 +421,26 @@ bool CompletionPoller::pollOnceLocked(std::vector<PendingChain>& chainsOut)
         {
             it->onTerminal();
         }
+        retired = true;
         if (it->chainId != 0)
         {
             if (st == cudaSuccess)
             {
-                // Successful gather with an armed chain: publish NOTHING for the event — the
-                // chunk's one completion is the reserved xfer id, resolved after the post. The
-                // in-flight count (under mMu, same critical section as the erase) lets
-                // unregisterEvents wait out the poster that will run outside mMu.
-                chainsOut.push_back(PendingChain{it->chainId, std::move(it->chainPoster)});
-                ++mChainsInFlight;
+                if (it->chainPoster)
+                {
+                    // Successful gather with an armed chain: publish NOTHING for the event — the
+                    // chunk's one completion is the reserved xfer id, resolved after the post. The
+                    // in-flight count (under mMu, same critical section as the erase) lets
+                    // unregisterEvents wait out the poster that will run outside mMu.
+                    chainsOut.push_back(PendingChain{it->chainId, std::move(it->chainPoster)});
+                    ++mChainsInFlight;
+                }
+                else
+                {
+                    // RESERVED but not yet fulfilled (the credit is still in flight): remember
+                    // gather-done; fulfillChain posts inline later. Publish NOTHING.
+                    mGatherDoneChains.push_back(it->chainId);
+                }
             }
             else
             {
@@ -311,9 +478,17 @@ bool CompletionPoller::pollOnceLocked(std::vector<PendingChain>& chainsOut)
         releaseXferLocked(*it);
         mDone.push_back(Completion{it->id, kKindXfer, state == TransferState::kSUCCESS ? 1 : 0});
         published = true;
+        retired = true;
         it = mXfers.erase(it);
     }
 
+    if (retired)
+    {
+        // Signal even when nothing was PUBLISHED (chained/reserved gathers): the retirement freed
+        // a copy-stream context, and a reactor parked on pool capacity must retry now, not at its
+        // fallback deadline.
+        signalWakeupLocked();
+    }
     return published;
 }
 
@@ -338,6 +513,7 @@ void CompletionPoller::executeChains(std::vector<PendingChain>& chains)
         {
             mDone.push_back(Completion{chain.id, kKindXfer, 0});
             mCv.notify_all();
+            signalWakeupLocked();
             continue;
         }
         if (mStop.load(std::memory_order_acquire))
@@ -348,6 +524,7 @@ void CompletionPoller::executeChains(std::vector<PendingChain>& chains)
             releaseXferLocked(entry);
             mDone.push_back(Completion{chain.id, kKindXfer, 0});
             mCv.notify_all();
+            signalWakeupLocked();
             continue;
         }
         mXfers.push_back(XferEntry{chain.id, std::move(status)});
