@@ -104,6 +104,13 @@ def validate_decode_layout(md, layer: int, num_gen: int) -> None:
             "into kv_lens_cuda, which only holds for pure generation batches"
         )
     offsets = md.kv_cache_block_offsets
+    if offsets is None:
+        raise RuntimeError(
+            "Inkling has no kv_cache_block_offsets to borrow as its decode page "
+            "table. prepare() fills it for any batch that reaches a kernel, so "
+            "its absence is a setup error worth naming -- without this the next "
+            "line reports it as AttributeError on NoneType."
+        )
     row = pt_row(md, layer)
     if row >= offsets.shape[0]:
         raise RuntimeError(
