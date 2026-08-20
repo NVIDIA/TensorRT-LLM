@@ -29,7 +29,6 @@ from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.config import UsageContext
 
 
-
 @pytest.fixture(autouse=True)
 def _reset_process_telemetry_state():
     """Keep process-scoped telemetry state isolated between unit tests."""
