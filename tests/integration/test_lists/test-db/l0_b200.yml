@@ -147,6 +147,7 @@ l0_b200:
   - unittest/_torch/modeling/test_kimi_k3_fp8_weight_read_gates.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
+  - unittest/_torch/attention/kernels/test_cutedsl_fc2_tuning.py
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
