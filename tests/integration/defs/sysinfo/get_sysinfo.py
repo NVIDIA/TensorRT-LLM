@@ -111,7 +111,13 @@ def is_power():
 # TODO(#17993): cherry-picked from PR #17993 to unblock this PR's CI (distro->'na'
 # empty-render bug). Drop this and take main's version when resolving the rebase
 # conflict after #17993 lands.
-def get_linux_distribution():
+def get_linux_distribution() -> tuple[str, str, str]:
+    """Return Linux distribution ID, version, and codename.
+
+    Returns:
+        A tuple containing the distribution ID, version, and codename.
+        Returns ``("na", "na", "na")`` when metadata is unavailable.
+    """
     try:
         import distro
         return (distro.id(), distro.version(), distro.codename())
