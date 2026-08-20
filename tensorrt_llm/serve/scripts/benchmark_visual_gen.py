@@ -33,6 +33,7 @@ On the client side, run:
 
 import argparse
 import asyncio
+import base64
 import gc
 import json
 import math
@@ -47,7 +48,7 @@ import time
 import traceback
 from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Optional
@@ -92,6 +93,8 @@ class VisualGenRequestInput:
     extra_body: Optional[dict] = None
     input_reference: Optional[str] = None
     validate_audio: bool = False
+    media_output_stem: Optional[str] = None
+    saved_media_paths: list[str] = field(default_factory=list, init=False)
 
 
 def _build_payload_common(request_input: VisualGenRequestInput) -> dict:
@@ -210,6 +213,99 @@ def _validate_audio_response(response_body: bytes) -> None:
             Path(temp_path).unlink(missing_ok=True)
 
 
+def _write_media_file(path: Path, content: bytes) -> None:
+    """Atomically persist one generated response body."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        temp_path.write_bytes(content)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _video_response_suffix(
+    response_headers: Any, response_body: bytes, payload: dict[str, Any]
+) -> str:
+    """Resolve the actual video response suffix from HTTP metadata or bytes."""
+    supported_suffixes = {".mp4", ".avi", ".safetensors", ".pt"}
+    content_disposition = response_headers.get("Content-Disposition", "")
+    filename_match = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", content_disposition)
+    if filename_match:
+        suffix = Path(filename_match.group(1)).suffix.lower()
+        if suffix in supported_suffixes:
+            return suffix
+
+    content_type = response_headers.get("Content-Type", "").partition(";")[0].lower()
+    content_type_suffixes = {
+        "video/mp4": ".mp4",
+        "video/x-msvideo": ".avi",
+    }
+    if content_type in content_type_suffixes:
+        return content_type_suffixes[content_type]
+
+    if len(response_body) >= 12 and response_body[4:8] == b"ftyp":
+        return ".mp4"
+    if response_body[:4] == b"RIFF" and response_body[8:12] == b"AVI ":
+        return ".avi"
+
+    requested_format = payload.get("format")
+    if requested_format in {"mp4", "avi", "safetensors", "pt"}:
+        return f".{requested_format}"
+    raise ValueError("Could not determine the generated video response format")
+
+
+def _save_response_media(
+    *,
+    media_kind: str,
+    output_stem: str,
+    payload: dict[str, Any],
+    response_headers: Any,
+    response_body: bytes,
+) -> list[str]:
+    """Persist one measured image or video response and return its paths."""
+    stem = Path(output_stem)
+    if media_kind == "video":
+        if payload.get("response_format") == "b64_json":
+            response_json = json.loads(response_body)
+            encoded_media = response_json.get("b64_json")
+            output_format = response_json.get("format")
+            if not isinstance(encoded_media, str) or not isinstance(output_format, str):
+                raise ValueError("Video b64_json response is missing format or media bytes")
+            if output_format not in {"mp4", "avi", "safetensors", "pt"}:
+                raise ValueError(f"Unsupported generated video format: {output_format}")
+            content = base64.b64decode(encoded_media, validate=True)
+            suffix = f".{output_format}"
+        else:
+            content = response_body
+            suffix = _video_response_suffix(response_headers, response_body, payload)
+        output_path = stem.with_suffix(suffix)
+        _write_media_file(output_path, content)
+        return [str(output_path)]
+
+    if media_kind != "image":
+        raise ValueError(f"Unsupported response media kind: {media_kind}")
+
+    response_json = json.loads(response_body)
+    image_items = response_json.get("data")
+    output_format = response_json.get("output_format", payload.get("format", "png"))
+    if not isinstance(image_items, list) or not image_items:
+        raise ValueError("Image response is missing generated media")
+    if output_format not in {"png", "webp", "jpeg", "safetensors", "pt"}:
+        raise ValueError(f"Unsupported generated image format: {output_format}")
+
+    output_paths = []
+    for index, image_item in enumerate(image_items):
+        if not isinstance(image_item, dict) or not isinstance(image_item.get("b64_json"), str):
+            raise ValueError("Image response is missing b64_json media bytes")
+        content = base64.b64decode(image_item["b64_json"], validate=True)
+        item_stem = stem if len(image_items) == 1 else stem.with_name(f"{stem.name}-{index:02d}")
+        output_path = item_stem.with_suffix(f".{output_format}")
+        _write_media_file(output_path, content)
+        output_paths.append(str(output_path))
+    return output_paths
+
+
 def _parse_server_timing_header(headers: Any) -> dict[str, float]:
     """Parse required VisualGen Server-Timing metrics into seconds.
 
@@ -248,6 +344,7 @@ def _get_server_timing_metric(
 async def _do_post(
     request_input: VisualGenRequestInput,
     payload: dict[str, Any],
+    media_kind: str,
     pbar: Optional[tqdm],
     session: Optional[aiohttp.ClientSession],
 ) -> VisualGenRequestOutput:
@@ -268,6 +365,15 @@ async def _do_post(
                 output.latency = time.perf_counter() - st
                 if request_input.validate_audio:
                     await asyncio.to_thread(_validate_audio_response, response_body)
+                if request_input.media_output_stem is not None:
+                    request_input.saved_media_paths = await asyncio.to_thread(
+                        _save_response_media,
+                        media_kind=media_kind,
+                        output_stem=request_input.media_output_stem,
+                        payload=payload,
+                        response_headers=response.headers,
+                        response_body=response_body,
+                    )
                 server_timings = _parse_server_timing_header(response.headers)
                 output.generation = _get_server_timing_metric(
                     server_timings,
@@ -322,7 +428,7 @@ async def async_request_image_generation(
 ) -> VisualGenRequestOutput:
     """POST /v1/images/generations and measure E2E latency."""
     payload = _build_image_payload(request_input)
-    return await _do_post(request_input, payload, pbar, session)
+    return await _do_post(request_input, payload, "image", pbar, session)
 
 
 async def async_request_video_generation(
@@ -332,7 +438,7 @@ async def async_request_video_generation(
 ) -> VisualGenRequestOutput:
     """POST /v1/videos/generations (sync endpoint) and measure E2E latency."""
     payload = _build_video_payload(request_input)
-    return await _do_post(request_input, payload, pbar, session)
+    return await _do_post(request_input, payload, "video", pbar, session)
 
 
 VISUAL_GEN_REQUEST_FUNCS = {
@@ -374,6 +480,7 @@ async def benchmark(
     no_test_input: bool = False,
     request_timeout: float = 6 * 60 * 60,
     num_gpus: int = 1,
+    media_dir: Optional[str] = None,
 ) -> dict[str, Any]:
     if backend not in VISUAL_GEN_REQUEST_FUNCS:
         raise ValueError(
@@ -437,13 +544,21 @@ async def benchmark(
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    measured_request_inputs: list[VisualGenRequestInput] = []
     async with aiohttp.ClientSession(
         trust_env=True,
         timeout=timeout,
         connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
     ) as session:
+        request_index = 0
         async for request in get_request(input_requests, request_rate, burstiness):
+            request_index += 1
             request_input = _make_request_input(request.prompt)
+            if media_dir is not None:
+                request_input.media_output_stem = str(
+                    Path(media_dir) / f"request-{request_index:04d}"
+                )
+            measured_request_inputs.append(request_input)
             tasks.append(asyncio.create_task(limited_request_func(request_input, pbar, session)))
 
         outputs: list[VisualGenRequestOutput] = await asyncio.gather(*tasks)
@@ -476,10 +591,15 @@ async def benchmark(
 
     num_inference_steps = gen_params.get("num_inference_steps")
     if num_inference_steps is not None:
-        result["mean_seconds_per_denoising_step"] = (
-            result["mean_denoise"] / num_inference_steps
-        )
+        result["mean_seconds_per_denoising_step"] = result["mean_denoise"] / num_inference_steps
     result["audio_validated"] = require_audio
+    if media_dir is not None:
+        media_root = Path(media_dir)
+        result["media_files"] = [
+            str(Path(path).relative_to(media_root))
+            for request_input in measured_request_inputs
+            for path in request_input.saved_media_paths
+        ]
 
     _print_trtllm_measurements(result)
 
@@ -506,17 +626,11 @@ def _summarize_metric(
     }
 
 
-_DENOISING_STEP_PATTERN = re.compile(
-    r"Step ([0-9]+)/([0-9]+)\s*\|\s*([0-9]+(?:\.[0-9]+)?)s"
-)
-_TOTAL_PIPELINE_PATTERN = re.compile(
-    r"Total pipeline time:\s*([0-9]+(?:\.[0-9]+)?)s"
-)
+_DENOISING_STEP_PATTERN = re.compile(r"Step ([0-9]+)/([0-9]+)\s*\|\s*([0-9]+(?:\.[0-9]+)?)s")
+_TOTAL_PIPELINE_PATTERN = re.compile(r"Total pipeline time:\s*([0-9]+(?:\.[0-9]+)?)s")
 
 
-def _summarize_total_pipeline_times(
-    log_lines: list[str], expected_requests: int
-) -> dict[str, Any]:
+def _summarize_total_pipeline_times(log_lines: list[str], expected_requests: int) -> dict[str, Any]:
     """Summarize measured total-pipeline times emitted by the server log."""
     if expected_requests <= 0:
         return {}
@@ -555,8 +669,7 @@ def _summarize_denoising_step_times(
     step_times = [
         float(match.group(3))
         for line in log_lines
-        if (match := _DENOISING_STEP_PATTERN.search(line))
-        and int(match.group(2)) == step_count
+        if (match := _DENOISING_STEP_PATTERN.search(line)) and int(match.group(2)) == step_count
     ]
     expected_samples = expected_requests * step_count
     # The wrapper always issues one validation request before measurements.
@@ -567,9 +680,7 @@ def _summarize_denoising_step_times(
         return {}
 
     measured_step_times = step_times[-expected_samples:]
-    summary = _summarize_metric(
-        "denoising_step_time", measured_step_times, list(percentiles)
-    )
+    summary = _summarize_metric("denoising_step_time", measured_step_times, list(percentiles))
     summary["denoising_step_times"] = measured_step_times
     return summary
 
@@ -726,6 +837,10 @@ def main(args: argparse.Namespace):
 
     num_gpus = _resolve_num_gpus(args)
 
+    media_dir = args.media_dir
+    if media_dir is not None:
+        Path(media_dir).mkdir(parents=True, exist_ok=True)
+
     gc.disable()
 
     benchmark_result = asyncio.run(
@@ -746,6 +861,7 @@ def main(args: argparse.Namespace):
             no_test_input=args.no_test_input,
             request_timeout=args.request_timeout,
             num_gpus=num_gpus,
+            media_dir=media_dir,
         )
     )
 
@@ -807,6 +923,8 @@ def main(args: argparse.Namespace):
             json.dump(result_json, outfile, indent=2)
 
         print(f"Results saved to: {file_name}")
+    if media_dir is not None:
+        print(f"Generated media saved to: {media_dir}")
 
 
 if __name__ == "__main__":
@@ -970,6 +1088,12 @@ if __name__ == "__main__":
     )
     output_group.add_argument(
         "--result-filename", type=str, default=None, help="Custom result filename."
+    )
+    output_group.add_argument(
+        "--media-dir",
+        type=str,
+        default=None,
+        help="Persist measured response media in this directory; the warm-up response is not saved.",
     )
     output_group.add_argument(
         "--metric-percentiles",
