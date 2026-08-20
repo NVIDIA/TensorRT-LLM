@@ -106,8 +106,11 @@ def apply_msa_patch(project_dir: Path) -> None:
     def patch_cmd(*flags: str):
         # --no-backup-if-mismatch keeps the .orig copy of a hunk applied at an
         # offset out of the packaged submodule.
+        # -l tolerates trailing-whitespace differences in the upstream source
+        # while still requiring every non-whitespace context token to match.
         return [
-            "patch", "-p1", "--batch", "--no-backup-if-mismatch", *flags, "-i",
+            "patch", "-l", "-p1", "--batch", "--no-backup-if-mismatch", *flags,
+            "-i",
             str(msa_patch)
         ]
 
