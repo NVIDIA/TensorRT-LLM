@@ -42,6 +42,32 @@ def _find_checkpoint():
     return None
 
 
+_LFS_MAGIC = b"version https://git-lfs.github.com/spec/v1"
+
+
+def _find_lfs_pointer_files(ckpt):
+    """Top-level checkpoint files that are still git-lfs pointers.
+
+    The checkpoint is staged from a git-lfs clone; a models mirror that has
+    not been hydrated (or has lagged the hydrated source) serves ~130-byte
+    pointer files instead of the real blobs, and the resulting failures are
+    deep and misleading (e.g. tiktoken parsing the pointer text as a vocab).
+    """
+    offenders = []
+    for name in sorted(os.listdir(ckpt)):
+        path = os.path.join(ckpt, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                head = f.read(len(_LFS_MAGIC))
+        except OSError:
+            continue
+        if head == _LFS_MAGIC:
+            offenders.append(name)
+    return offenders
+
+
 @pytest.mark.skip_less_device(4)
 def test_kimi_k3_sa_specdec_logits_parity():
     ckpt = _find_checkpoint()
@@ -50,6 +76,13 @@ def test_kimi_k3_sa_specdec_logits_parity():
     # runners' models mount would silently end this coverage.
     assert ckpt is not None, (
         "Kimi K3 checkpoint not found (set KIMI_K3_CKPT or stage under LLM_MODELS_ROOT)"
+    )
+    lfs_pointers = _find_lfs_pointer_files(ckpt)
+    assert not lfs_pointers, (
+        f"Kimi K3 checkpoint at {ckpt} is not hydrated on this runner's models "
+        f"mirror — these files are still git-lfs pointers: {lfs_pointers}. "
+        f"This is a checkpoint-staging/mirror-sync problem, not a code failure; "
+        f"re-sync the mirror or 'git lfs pull' the staging copy."
     )
 
     env = os.environ.copy()
