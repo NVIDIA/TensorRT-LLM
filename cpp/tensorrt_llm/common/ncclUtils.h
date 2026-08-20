@@ -257,6 +257,12 @@ public:
     NCCLWindowAllocator(NCCLWindowAllocator&&) = delete;
     NCCLWindowAllocator& operator=(NCCLWindowAllocator&&) = delete;
 
+    // How many requests were refused because a graph was capturing.
+    size_t captureRefusals() const noexcept
+    {
+        return mCaptureRefusals.load(std::memory_order_relaxed);
+    }
+
 private:
     friend class NCCLWindowAllocatorTestAccess;
 
@@ -293,6 +299,10 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
+    // Requests refused because a CUDA graph was capturing. Non-zero simply means
+    // captured collectives took the non-symmetric path; it is the observable for
+    // how much of a workload that is.
+    std::atomic<size_t> mCaptureRefusals{0};
     // Smallest request size that is known to fail collectively for each communicator.
     // Requests below the recorded size may still succeed and already-pooled buffers are always
     // reused before consulting this cache.
