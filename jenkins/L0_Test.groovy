@@ -2373,8 +2373,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         fi
                     done
 
-                    # Kill tail -f process
-                    kill \$tailPid
+                    # Stop and reap the log follower. It may have already exited
+                    # when the remote log stream closes; that is not a test failure.
+                    kill \$tailPid 2>/dev/null || true
+                    wait \$tailPid 2>/dev/null || true
 
                     # Wait briefly to ensure accounting is consistent
                     sleep 10
