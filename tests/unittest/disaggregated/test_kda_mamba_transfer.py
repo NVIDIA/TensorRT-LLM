@@ -182,8 +182,10 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         assert mlg.ssm_bytes_per_head == KDA_HEAD_DIM * KDA_HEAD_DIM * SSM_DTYPE.itemsize
         assert ssm_pv.bytes_per_layer // mlg.ssm_bytes_per_head == KDA_NUM_HEADS
 
-        # Layer offsets cover exactly the KDA layers.
-        assert sorted(mlg.mamba_layer_offsets.keys()) == [i for i, m in enumerate(_KDA_MASK) if m]
+        # local_layers cover exactly the KDA layers (by global_layer_id).
+        assert sorted(ll.global_layer_id for ll in mlg.local_layers) == [
+            i for i, m in enumerate(_KDA_MASK) if m
+        ]
 
         # Matched-parallelism payload: mamba_payload_bytes must equal
         # NUM_KDA_LAYERS * (conv + ssm) for matched TP.
@@ -273,12 +275,10 @@ def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_i
 
     if layer_ids is None:
         layer_ids = range(1, NUM_KDA_LAYERS + 1)
-    mamba_layer_offsets = {glid: i for i, glid in enumerate(layer_ids)}
-    sorted_lids = [lid for _, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])]
     local_layers = [
-        LocalLayer(local_layer_id=lid, global_layer_id=gid)
-        for gid, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
+        LocalLayer(local_layer_id=i, global_layer_id=glid) for i, glid in enumerate(layer_ids)
     ]
+    sorted_lids = [ll.local_layer_id for ll in local_layers]
     conv_pool = PhysicalPool(base_address=0x1000, slot_bytes=conv_slot_bytes, num_slots=8)
     ssm_pool = PhysicalPool(base_address=0x2000000, slot_bytes=ssm_slot_bytes, num_slots=8)
     pool_views = [
@@ -303,7 +303,6 @@ def _synthetic_kda_page_table(ssm_slot_bytes: int, conv_slot_bytes: int, layer_i
     ]
     mlg = MambaLayerGroup(
         pool_group_idx=0,
-        mamba_layer_offsets=mamba_layer_offsets,
         local_layers=local_layers,
         pool_views=pool_views,
         conv_section_bytes=[conv_slot_bytes // 3] * 3,

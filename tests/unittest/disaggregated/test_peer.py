@@ -96,7 +96,6 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
     )
     conv_slot_bytes = 4096 // mamba_tp
     ssm_slot_bytes = 8192 // mamba_tp
-    mamba_layer_offsets = {100: 0, 101: 1}
     sorted_lids = [0, 1]
     mamba_local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=100),
@@ -124,7 +123,6 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
     ]
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
-        mamba_layer_offsets=mamba_layer_offsets,
         local_layers=mamba_local_layers,
         pool_views=mamba_pool_views,
         conv_section_bytes=[1024 // mamba_tp, 512 // mamba_tp, 512 // mamba_tp],

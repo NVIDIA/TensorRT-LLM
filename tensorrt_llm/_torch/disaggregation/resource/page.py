@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, FrozenSet, List, Optional
+from typing import FrozenSet, List, Optional
 
 import numpy as np
 
@@ -261,11 +261,12 @@ class LayerGroup:
 
     @classmethod
     def from_dict(cls, data: dict) -> "LayerGroup":
-        if data.get("kv_head_num_per_rank") is not None:
+        kind = int(data["kind"])
+        if kind == CacheKind.PAGED:
             return AttentionLayerGroup.from_dict(data)
-        elif data.get("mamba_layer_offsets") is not None:
+        elif kind == CacheKind.STATE:
             return MambaLayerGroup.from_dict(data)
-        raise ValueError("Invalid layer group")
+        raise ValueError(f"Unknown layer group kind: {kind}")
 
 
 @dataclass
@@ -277,6 +278,7 @@ class AttentionLayerGroup(LayerGroup):
 
     def to_dict(self) -> dict:
         return {
+            "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
             "kv_head_num_per_rank": int(self.kv_head_num_per_rank),
             "sliding_window_size": self.sliding_window_size,
@@ -308,18 +310,17 @@ class MambaLayerGroup(LayerGroup):
     where pool_idx=0 is conv, pool_idx=1 is ssm.
     """
 
-    kind: CacheKind = CacheKind.STATE
-    mamba_layer_offsets: Dict[int, int] = field(default_factory=dict)
     conv_section_bytes: Optional[List[int]] = None
     ssm_bytes_per_head: Optional[int] = None
-    slot_major_layout: bool = (
-        False  # True when pools use slot-major interleaved storage (coalesced)
-    )
+    slot_major_layout: bool = False
+
+    def __post_init__(self) -> None:
+        self.kind = CacheKind.STATE
 
     def to_dict(self) -> dict:
         return {
+            "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
-            "mamba_layer_offsets": {int(k): int(v) for k, v in self.mamba_layer_offsets.items()},
             "local_layers": [ll.to_dict() for ll in self.local_layers],
             "pool_views": [pv.to_dict() for pv in self.pool_views],
             "conv_section_bytes": self.conv_section_bytes,
@@ -329,49 +330,10 @@ class MambaLayerGroup(LayerGroup):
 
     @classmethod
     def from_dict(cls, data: dict) -> "MambaLayerGroup":
-        mamba_layer_offsets = {int(k): int(v) for k, v in data["mamba_layer_offsets"].items()}
-        local_layers = [LocalLayer.from_dict(x) for x in data.get("local_layers", [])]
-        pool_views = [PoolView.from_dict(pv) for pv in data.get("pool_views", [])]
-
-        # Legacy format: rebuild pool_views/local_layers from inline pool dicts
-        if not pool_views and data.get("conv_states") and data.get("ssm_states"):
-            conv_pool = PhysicalPool.from_dict(data["conv_states"])
-            ssm_pool = PhysicalPool.from_dict(data["ssm_states"])
-            sorted_lids = [
-                lid for _, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
-            ]
-            pool_views = [
-                PoolView(
-                    pool_idx=0,
-                    buffer_entries=np.array(
-                        [(lid, 0, conv_pool.slot_bytes) for lid in sorted_lids],
-                        dtype=BUFFER_ENTRY_DTYPE,
-                    ),
-                    pool_role=MAMBA_CONV_ROLE,
-                    mapper_kind=MapperKind.SECTIONED,
-                    bytes_per_layer=conv_pool.slot_bytes,
-                ),
-                PoolView(
-                    pool_idx=1,
-                    buffer_entries=np.array(
-                        [(lid, 0, ssm_pool.slot_bytes) for lid in sorted_lids],
-                        dtype=BUFFER_ENTRY_DTYPE,
-                    ),
-                    pool_role=MAMBA_SSM_ROLE,
-                    mapper_kind=MapperKind.INDEXED,
-                    bytes_per_layer=ssm_pool.slot_bytes,
-                ),
-            ]
-            local_layers = [
-                LocalLayer(local_layer_id=lid, global_layer_id=gid)
-                for gid, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
-            ]
-
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
-            local_layers=local_layers,
-            pool_views=pool_views,
-            mamba_layer_offsets=mamba_layer_offsets,
+            local_layers=[LocalLayer.from_dict(x) for x in data["local_layers"]],
+            pool_views=[PoolView.from_dict(pv) for pv in data["pool_views"]],
             conv_section_bytes=[int(x) for x in data["conv_section_bytes"]]
             if data.get("conv_section_bytes")
             else None,

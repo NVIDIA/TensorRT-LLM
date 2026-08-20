@@ -343,7 +343,7 @@ class MambaPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
-    def should_send(self, peer_overlap, peer_rank_info) -> bool:
+    def should_send(self, peer_overlap, peer_rank_info) -> "bool | None":
         """Mamba TP routing: always send (each rank owns unique sharded state).
         When mamba_tp == 1 (attention_dp), returns None to signal fan-in election."""
         mamba_tp, _ = MambaPolicy._mamba_tp(self._ri)

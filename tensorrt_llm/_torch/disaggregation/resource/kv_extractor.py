@@ -157,14 +157,16 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
-def _build_mamba_pool_views(conv_pool, ssm_pool, mamba_layer_offsets):
+def _build_mamba_pool_views(conv_pool, ssm_pool, local_layers):
     """Build pool_views for mamba: conv at pool_idx=0, ssm at pool_idx=1.
 
     Conv uses mapper_kind=SECTIONED (section-level granularity for TP split),
     SSM uses mapper_kind=INDEXED (head-level granularity). MambaPolicy.build_mapper
     dispatches ConvStateMismatchMapper vs MambaHeadMismatchMapper accordingly.
     """
-    sorted_lids = [lid for _, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])]
+    sorted_lids = [
+        ll.local_layer_id for ll in sorted(local_layers, key=lambda ll: ll.local_layer_id)
+    ]
     return [
         PoolView(
             pool_idx=0,
@@ -189,11 +191,11 @@ def _build_mamba_pool_views(conv_pool, ssm_pool, mamba_layer_offsets):
 
 def _build_layer_group_for_mamba(
     manager: MambaHybridCacheManager, pool_group_idx: int
-) -> MambaLayerGroup:
-    mamba_layer_offsets = {
-        int(global_layer_id): int(local_layer_id)
-        for global_layer_id, local_layer_id in manager._impl.mamba_layer_offsets.items()
-    }
+) -> "tuple[MambaLayerGroup, PhysicalPoolGroup]":
+    local_layers = [
+        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
+        for gid, lid in sorted(manager._impl.mamba_layer_offsets.items(), key=lambda x: x[1])
+    ]
 
     conv_state = manager._impl.mamba_cache.conv
     ssm_state = manager._impl.mamba_cache.temporal
@@ -226,16 +228,11 @@ def _build_layer_group_for_mamba(
     ssm_elem_size = ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
-    local_layers = [
-        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
-        for gid, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
-    ]
     pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
     layer_group = MambaLayerGroup(
         pool_group_idx=pool_group_idx,
         local_layers=local_layers,
-        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, mamba_layer_offsets),
-        mamba_layer_offsets=mamba_layer_offsets,
+        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, local_layers),
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
     )
@@ -288,18 +285,17 @@ def _build_v2_mamba_state_pool(states: Sequence[torch.Tensor]) -> PhysicalPool:
 
 def _build_layer_group_for_v2_mamba(
     manager: MambaHybridCacheManagerV2, pool_group_idx: int
-) -> MambaLayerGroup:
-    mamba_layer_offsets = {
-        int(global_layer_id): int(local_layer_id)
-        for global_layer_id, local_layer_id in manager.mamba_layer_offsets.items()
-    }
+) -> "tuple[MambaLayerGroup, PhysicalPoolGroup]":
+    local_layers = [
+        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
+        for gid, lid in sorted(manager.mamba_layer_offsets.items(), key=lambda x: x[1])
+    ]
 
-    expected_offsets = list(range(len(mamba_layer_offsets)))
-    if sorted(mamba_layer_offsets.values()) != expected_offsets:
+    num_layers = len(local_layers)
+    expected_offsets = list(range(num_layers))
+    if sorted(ll.local_layer_id for ll in local_layers) != expected_offsets:
         raise ValueError("V2 Mamba layer offsets must be dense")
-    if len(manager.all_conv_states) != len(expected_offsets) or len(manager.all_ssm_states) != len(
-        expected_offsets
-    ):
+    if len(manager.all_conv_states) != num_layers or len(manager.all_ssm_states) != num_layers:
         raise ValueError("V2 Mamba state tensors must match the layer-offset table")
 
     first_conv_state = manager.all_conv_states[0]
@@ -317,16 +313,11 @@ def _build_layer_group_for_v2_mamba(
     ssm_elem_size = first_ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
-    local_layers = [
-        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
-        for gid, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
-    ]
     pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
     layer_group = MambaLayerGroup(
         pool_group_idx=pool_group_idx,
         local_layers=local_layers,
-        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, mamba_layer_offsets),
-        mamba_layer_offsets=mamba_layer_offsets,
+        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, local_layers),
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
         slot_major_layout=True,

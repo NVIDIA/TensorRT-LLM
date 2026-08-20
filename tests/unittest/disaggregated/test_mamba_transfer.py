@@ -287,7 +287,6 @@ def test_mamba_payload_bytes_matched_tp():
 
     conv_slot_bytes = 1024
     ssm_slot_bytes = 2048
-    mamba_layer_offsets = {1: 0, 2: 1}
     sorted_lids = [0, 1]
 
     conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=8)
@@ -313,13 +312,12 @@ def test_mamba_payload_bytes_matched_tp():
         ),
     ]
     local_layers = [
-        LocalLayer(local_layer_id=lid, global_layer_id=gid)
-        for gid, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
+        LocalLayer(local_layer_id=0, global_layer_id=1),
+        LocalLayer(local_layer_id=1, global_layer_id=2),
     ]
 
     mlg = MambaLayerGroup(
         pool_group_idx=1,
-        mamba_layer_offsets=mamba_layer_offsets,
         local_layers=local_layers,
         pool_views=pool_views,
         conv_section_bytes=[512, 256, 256],

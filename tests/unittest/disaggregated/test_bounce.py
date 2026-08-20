@@ -698,7 +698,6 @@ def _k3_page_table() -> KVCachePageTable:
         local_layers=[LocalLayer(i, i) for i in range(24)],
         pool_views=[PoolView(pool_idx=0, buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE))],
     )
-    mamba_layer_offsets = {gl: i for i, gl in enumerate(range(24, 24 + _K3_KDA_LAYERS))}
     sorted_lids = list(range(_K3_KDA_LAYERS))
     local_layers = [
         LocalLayer(local_layer_id=i, global_layer_id=gl)
@@ -728,7 +727,6 @@ def _k3_page_table() -> KVCachePageTable:
     ]
     mamba = MambaLayerGroup(
         pool_group_idx=1,
-        mamba_layer_offsets=mamba_layer_offsets,
         local_layers=local_layers,
         pool_views=pool_views,
         conv_section_bytes=[_K3_CONV_SLOT_BYTES // 3] * 3,

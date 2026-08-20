@@ -24,7 +24,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     build_page_table,
     build_page_table_from_manager,
 )
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_global_layer_ids,
     get_layer_byte_ranges,
@@ -673,7 +673,6 @@ def test_mamba_layer_group_serialization():
         PoolView,
     )
 
-    mamba_layer_offsets = {10: 0, 11: 1, 12: 2}
     sorted_lids = [0, 1, 2]
     conv_slot_bytes = 128
     ssm_slot_bytes = 256
@@ -704,7 +703,6 @@ def test_mamba_layer_group_serialization():
     ]
     mlg = MambaLayerGroup(
         pool_group_idx=1,
-        mamba_layer_offsets=mamba_layer_offsets,
         local_layers=local_layers,
         pool_views=pool_views,
         conv_section_bytes=[512, 256, 256],
@@ -712,12 +710,12 @@ def test_mamba_layer_group_serialization():
     )
 
     d = mlg.to_dict()
-    assert d["mamba_layer_offsets"] == {10: 0, 11: 1, 12: 2}
     assert d["conv_section_bytes"] == [512, 256, 256]
+    assert d["kind"] == int(CacheKind.STATE)
+    assert "mamba_layer_offsets" not in d
 
     restored = LayerGroup.from_dict(d)
     assert isinstance(restored, MambaLayerGroup)
-    assert restored.mamba_layer_offsets == {10: 0, 11: 1, 12: 2}
     assert len(restored.pool_views) == 2
     assert restored.pool_views[0].pool_role == MAMBA_CONV_ROLE
     assert restored.pool_views[0].bytes_per_layer == conv_slot_bytes
@@ -798,7 +796,6 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
         slot_bytes=physical_slot_bytes,
         num_slots=num_slots,
     )
-    mamba_layer_offsets = {1: 0, 2: 1}
     sorted_lids = [0, 1]
     local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=1),
@@ -828,7 +825,6 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
     ]
     mamba_group = MambaLayerGroup(
         pool_group_idx=0,
-        mamba_layer_offsets=mamba_layer_offsets,
         local_layers=local_layers,
         pool_views=pool_views,
         slot_major_layout=True,
@@ -876,7 +872,6 @@ def test_legacy_mamba_registration_uses_layer_major_pools() -> None:
         num_slots=num_slots,
         layer_stride_bytes=num_slots * 256,
     )
-    mamba_layer_offsets = {10: 0, 11: 1, 12: 2}
     sorted_lids = [0, 1, 2]
     local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=10),
@@ -905,7 +900,6 @@ def test_legacy_mamba_registration_uses_layer_major_pools() -> None:
     ]
     mamba_group = MambaLayerGroup(
         pool_group_idx=0,
-        mamba_layer_offsets=mamba_layer_offsets,
         local_layers=local_layers,
         pool_views=pool_views,
     )
@@ -952,7 +946,6 @@ def test_mixed_page_table_serialization():
     # Mamba layer group
     from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
 
-    mamba_layer_offsets = {1: 0, 2: 1}
     mamba_sorted_lids = [0, 1]
     mamba_local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=1),
@@ -980,7 +973,6 @@ def test_mixed_page_table_serialization():
     ]
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
-        mamba_layer_offsets=mamba_layer_offsets,
         local_layers=mamba_local_layers,
         pool_views=mamba_pool_views,
         conv_section_bytes=[256, 128, 128],
@@ -1003,7 +995,12 @@ def test_mixed_page_table_serialization():
     assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
     assert isinstance(restored.layer_groups[1], MambaLayerGroup)
     assert restored.layer_groups[0].kv_head_num_per_rank == 4
-    assert restored.layer_groups[1].mamba_layer_offsets == {1: 0, 2: 1}
+    assert [
+        (ll.local_layer_id, ll.global_layer_id) for ll in restored.layer_groups[1].local_layers
+    ] == [
+        (0, 1),
+        (1, 2),
+    ]
 
     # Verify utils work correctly with mixed page table
     from tensorrt_llm._torch.disaggregation.resource.utils import (
