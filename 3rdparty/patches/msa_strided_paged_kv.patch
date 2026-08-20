@@ -3338,10 +3338,10 @@ index 8ccc2cb..daf0e74 100644
          pipeline_sm_stats: pipeline.PipelineAsync,
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/selected_nvfp4_to_fp8.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/selected_nvfp4_to_fp8.py
 new file mode 100644
-index 0000000..e7602b9
+index 0000000..0c48008
 --- /dev/null
 +++ b/python/fmha_sm100/cute/src/sm100/fwd_decode/selected_nvfp4_to_fp8.py
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,324 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +# SPDX-License-Identifier: Apache-2.0
 +
@@ -3387,7 +3387,6 @@ index 0000000..e7602b9
 +            qheadperkv=16,
 +            paged_kv=True,
 +            page_size=page_size,
-+            direct_q2k_topk=topk,
 +        )
 +        self.is_v = bool(is_v)
 +        self.num_kv_heads = int(num_kv_heads)
