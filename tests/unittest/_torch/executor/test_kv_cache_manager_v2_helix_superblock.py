@@ -252,7 +252,10 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
 def test_scheduler_allocation_failure_raises_under_helix() -> None:
     """Precedent-consistent no-evict stance: allocation failure under helix
     raises instead of entering the (unvalidated-under-helix) eviction path."""
-    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+        KVCacheV2Scheduler,
+        _RecomputePauseState,
+    )
 
     sched = SimpleNamespace(
         has_cp_helix=True,
@@ -272,7 +275,10 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
             requests_list=[req],
             req_it=0,
             req_it_end=1,
+            recompute_pause_state=_RecomputePauseState(1),
             evicted=[],
+            recompute_paused=[],
+            inflight_request_ids=set(),
             scheduled_beam_width=0,
         )
 
