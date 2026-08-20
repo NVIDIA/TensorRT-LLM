@@ -423,6 +423,25 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        # AttentionMetadata.create_cuda_graph_metadata() starts from a shallow
+        # copy. None of the per-instance plan owners or per-step state may cross
+        # that boundary: an eager prepare could otherwise hand a graph clone a
+        # plan backed by eager allocations, and a later eager step could mutate
+        # the same owner after its addresses had been captured.
+        self._msa_proxy_plan = None
+        self._msa_gqa_plan = None
+        self._msa_dense_plan = None
+        self._msa_eager_proxy_plan = None
+        self._msa_eager_gqa_plan = None
+        self._msa_eager_dense_plan = None
+        self._msa_eager_n_valid_buf = None
+        self._msa_eager_n_valid_blocks = None
+        self._msa_decode_span = None
+        self._msa_max_kv_len = 0
+        self._msa_worst_case_max_k_tiles = 0
+        self._msa_captured_resolution = None
+        self._msa_prewritten_layer = None
+        self._msa_fields_ready = False
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         # See on_update_kv_lens.

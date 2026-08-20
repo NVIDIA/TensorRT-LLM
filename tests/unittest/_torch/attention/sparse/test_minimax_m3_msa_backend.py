@@ -9,6 +9,7 @@ Numerical parity against the Triton reference is covered by the SM100
 integration accuracy test.
 """
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +37,48 @@ def test_sparse_decode_fixed_stride_page_indptr_matches_expanded_rows():
         torch.tensor([2, 1], dtype=torch.int32), page_table_stride=8
     )
     assert indptr.tolist() == [0, 0, 8, 16]
+
+
+def test_msa_post_init_drops_shallow_copied_plan_state(monkeypatch):
+    """A CUDA-graph metadata clone must not share eager plan owners."""
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.sparse_metadata_params = None
+
+    stale = object()
+    copied_fields = (
+        "_msa_proxy_plan",
+        "_msa_gqa_plan",
+        "_msa_dense_plan",
+        "_msa_eager_proxy_plan",
+        "_msa_eager_gqa_plan",
+        "_msa_eager_dense_plan",
+        "_msa_eager_n_valid_buf",
+        "_msa_eager_n_valid_blocks",
+        "_msa_decode_span",
+        "_msa_captured_resolution",
+    )
+    for field in copied_fields:
+        setattr(metadata, field, stale)
+    metadata._msa_max_kv_len = 7
+    metadata._msa_worst_case_max_k_tiles = 9
+    metadata._msa_prewritten_layer = 3
+    metadata._msa_fields_ready = True
+
+    clone = copy.copy(metadata)
+    monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
+    monkeypatch.setattr(metadata_cls, "_create_msa_buffers", lambda self: None)
+    clone.__post_init__()
+
+    assert all(getattr(clone, field) is None for field in copied_fields)
+    assert clone._msa_max_kv_len == 0
+    assert clone._msa_worst_case_max_k_tiles == 0
+    assert clone._msa_prewritten_layer is None
+    assert clone._msa_fields_ready is False
+    # Reinitializing the clone must not mutate the source metadata.
+    assert all(getattr(metadata, field) is stale for field in copied_fields)
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
