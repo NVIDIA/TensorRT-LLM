@@ -24,6 +24,7 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  prefer_pinned, str_dtype_to_binding,
                                  torch_dtype_to_str)
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -569,6 +570,8 @@ class KvCacheCreator:
             # For PP, draft layers are only on the last rank (see
             # get_pp_layers), so only that rank should include draft cost.
             effective_draft_config = self._get_effective_draft_config()
+            draft_cost_config = self._get_one_model_draft_kv_cache_config(
+                kv_cache_config)
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
                 # Resolve draft manager class from draft config — may differ
@@ -577,13 +580,13 @@ class KvCacheCreator:
                     effective_draft_config, kv_cache_config)
                 total += self._per_manager_cache_cost(
                     draft_kv_cache_manager_cls, effective_draft_config,
-                    kv_cache_config)
+                    draft_cost_config)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 total += self._per_manager_cache_cost(
                     self._kv_cache_manager_cls,
                     effective_draft_config,
-                    kv_cache_config,
+                    draft_cost_config,
                     num_layers=self._get_num_draft_layers(),
                     is_draft=True)
         return total
@@ -1192,6 +1195,18 @@ class KvCacheCreator:
             draft_kv_cache_manager_cls = KVCacheManagerV2
         return draft_kv_cache_manager_cls
 
+    def _get_one_model_draft_kv_cache_config(
+            self, kv_cache_config: KvCacheConfig) -> KvCacheConfig:
+        """Apply a target-manager-requested dtype override to a draft copy."""
+        draft_kv_config = kv_cache_config.model_copy()
+        draft_dtype = getattr(self._kv_cache_manager_cls,
+                              'draft_manager_kv_cache_dtype', None)
+        if draft_dtype is not None and draft_kv_config.dtype == "nvfp4":
+            logger.info(f"Draft KV cache manager uses dtype={draft_dtype} "
+                        f"(target uses {draft_kv_config.dtype}).")
+            draft_kv_config.dtype = draft_dtype
+        return draft_kv_config
+
     def _create_one_model_draft_kv_cache_manager(
         self,
         estimating_kv_cache: bool = False,
@@ -1208,8 +1223,14 @@ class KvCacheCreator:
         # otherwise fall back to target model config for MTP).
         effective_draft_config = self._get_effective_draft_config()
 
-        draft_kv_config = (kv_cache_config_override if kv_cache_config_override
-                           is not None else self._kv_cache_config).model_copy()
+        base_draft_kv_config = (kv_cache_config_override
+                                if kv_cache_config_override is not None else
+                                self._kv_cache_config)
+        draft_kv_config = self._get_one_model_draft_kv_cache_config(
+            base_draft_kv_config)
+        draft_kv_cache_dtype_override = (
+            str_dtype_to_binding(draft_kv_config.dtype)
+            if draft_kv_config.dtype != base_draft_kv_config.dtype else None)
         draft_kv_config.max_attention_window = _derive_draft_max_attention_window(
             self._kv_cache_config,
             effective_draft_config.pretrained_config,
@@ -1286,6 +1307,7 @@ class KvCacheCreator:
             # One-model draft specific overrides
             model_config=effective_draft_config,
             dtype=effective_draft_config.pretrained_config.torch_dtype,
+            kv_cache_dtype_override=draft_kv_cache_dtype_override,
             is_draft=True,
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
@@ -1881,6 +1903,7 @@ def _create_kv_cache_manager(
         num_layers: Optional[int] = None,
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
+        kv_cache_dtype_override: Optional[DataType] = None,
         kv_cache_type=None,
         is_disagg: bool = False) -> KVCacheManager:
     """
@@ -1984,6 +2007,11 @@ def _create_kv_cache_manager(
         kv_cache_dtype = tensorrt_llm.bindings.DataType.NVFP4
     else:
         kv_cache_dtype = str_dtype_to_binding(torch_dtype_to_str(dtype))
+    if kv_cache_dtype_override is not None:
+        # A one-model draft may deliberately use a different cache dtype than
+        # its target.  Override the draft ModelConfig's inherited quant mode
+        # so allocation and pool-pointer envelopes agree.
+        kv_cache_dtype = kv_cache_dtype_override
 
     # Use provided num_layers if available, otherwise use config.
     # When layer_mask is set (e.g., KV sharing), num_layers for the cache
