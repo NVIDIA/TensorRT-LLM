@@ -118,6 +118,7 @@ class TouchDB:
         try:
             touch_cols = {row[1] for row in conn.execute("PRAGMA table_info(touch)")}
             row_cols = {row[1] for row in conn.execute("PRAGMA table_info(touch_rows)")}
+            test_meta_cols = {row[1] for row in conn.execute("PRAGMA table_info(test_case_meta)")}
             metadata = dict(conn.execute("SELECT key, value FROM meta"))
         except sqlite3.Error as exc:
             conn.close()
@@ -131,6 +132,14 @@ class TouchDB:
                 "stage",
             }
             <= row_cols
+            or not {
+                "test",
+                "stage",
+                "outcome",
+                "expected_workers",
+                "saved_procs",
+            }
+            <= test_meta_cols
             or metadata.get("schema_version") != _SCHEMA_VERSION
             or metadata.get("storage_schema") != _STORAGE_SCHEMA
         ):
@@ -138,6 +147,7 @@ class TouchDB:
             raise ValueError(
                 "unexpected compact touch schema, "
                 f"touch_columns={sorted(touch_cols)}, row_columns={sorted(row_cols)}, "
+                f"test_meta_columns={sorted(test_meta_cols)}, "
                 f"schema_version={metadata.get('schema_version')}, "
                 f"storage_schema={metadata.get('storage_schema')}"
             )
@@ -288,14 +298,11 @@ class TouchDB:
         ]
 
     def incomplete_capture_tests(self) -> set[str]:
-        """Tests `test_meta` reports as not passed or short of the spawned process count."""
-        try:
-            rows = self._conn.execute(
-                "SELECT test FROM test_case_meta WHERE test != '' AND "
-                "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)"
-            )
-        except sqlite3.OperationalError:
-            return set()
+        """Tests whose compact completeness view reports a failed or missing capture."""
+        rows = self._conn.execute(
+            "SELECT test FROM test_case_meta WHERE test != '' AND "
+            "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)"
+        )
         # Tests that recorded nothing are not selection candidates.
         return {row[0] for row in rows} & self.known_tests()
 

@@ -28,7 +28,7 @@ not lines executed (far cheaper than line tracing).
 
 `jenkins/L0_MergeRequest.groovy` decides pipeline-level eligibility and propagates it to the runner via `testFilter[cbts_coverage]`:
 
-- `ENABLE_CBTS_COVERAGE` (global kill-switch) AND the post-merge gate — coverage runs only on the official post-merge pipeline
+- `ENABLE_CBTS_COVERAGE` (global kill-switch); for CI validation, coverage is temporarily allowed outside the official post-merge pipeline
 
 `isCbtsStage()` in `jenkins/L0_Test.groovy` then gates each stage on that propagated flag plus:
 
