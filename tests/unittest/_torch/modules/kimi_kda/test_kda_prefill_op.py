@@ -409,16 +409,16 @@ def test_fused_prefill_beta_sigmoid_matches_unfused_kernel(
                 dtype=torch.float32,
                 device="cuda",
             ).reshape(batch_size, sequence_length, NUM_HEADS)
-        state_seed = randn(
+        initial_state = randn(
             num_sequences, NUM_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.float32, scale=0.01
         )
-        state_indices = torch.arange(num_sequences, dtype=torch.int32, device="cuda")
 
         common = dict(
             v=v,
             g=g,
             scale=HEAD_DIM**-0.5,
-            state_indices=state_indices,
+            initial_state=initial_state,
+            output_final_state=True,
             safe_gate=True,
             lower_bound=-5.0,
             use_gate_in_kernel=True,
@@ -430,31 +430,113 @@ def test_fused_prefill_beta_sigmoid_matches_unfused_kernel(
         q_unfused, _ = l2norm_fwd(q)
         k_unfused, _ = l2norm_fwd(k)
         beta_unfused = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
-        state_unfused = state_seed.clone()
-        output_unfused = torch.ops.trtllm.kda_prefill(
+        output_unfused, state_unfused = torch.ops.trtllm.kda_prefill(
             q=q_unfused,
             k=k_unfused,
             beta=beta_unfused,
-            state_pool=state_unfused,
             use_beta_sigmoid_in_kernel=False,
             **common,
         )
-        # The op reuses shape-keyed output buffers; retain the first result
-        # before the fused call overwrites it.
+        # The op reuses shape-keyed output/state buffers; retain the first
+        # result before the fused call overwrites them.
         output_unfused = output_unfused.clone()
+        state_unfused = state_unfused.clone()
 
-        state_fused = state_seed.clone()
-        output_fused = torch.ops.trtllm.kda_prefill(
+        output_fused, state_fused = torch.ops.trtllm.kda_prefill(
             q=q_unfused,
             k=k_unfused,
             beta=beta,
-            state_pool=state_fused,
             use_beta_sigmoid_in_kernel=True,
             **common,
         )
 
         _assert_close(output_fused, output_unfused)
         _assert_close(state_fused, state_unfused)
+
+
+@torch.no_grad()
+def test_kda_prefill_op_empty_token_batch():
+    """T=0 call: no output rows, recurrent state passes through unchanged.
+
+    The runtime can emit a context batch with an empty token payload
+    (observed under the overlap scheduler + logprobs flows). The op used
+    to raise ``RuntimeError: step must be nonzero`` from its
+    ``arange(step=T)`` buffer setup; the FLA fallback tolerates the call.
+    """
+    num_heads, head_k, head_v = 4, 128, 128
+    q = torch.empty(1, 0, num_heads, head_k, dtype=torch.bfloat16, device="cuda")
+    k = torch.empty_like(q)
+    g = torch.empty(1, 0, num_heads, head_k, dtype=torch.float32, device="cuda")
+    v = torch.empty(1, 0, num_heads, head_v, dtype=torch.bfloat16, device="cuda")
+    beta = torch.empty(1, 0, num_heads, dtype=torch.float32, device="cuda")
+    initial_state = torch.randn(1, num_heads, head_k, head_v, dtype=torch.float32, device="cuda")
+
+    output, final_state = torch.ops.trtllm.kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=head_k**-0.5,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    assert output.shape == (1, 0, num_heads, head_v)
+    torch.testing.assert_close(final_state, initial_state)
+    # State must not alias the input (the caller copies it back into the
+    # pool the initial state may be a view of).
+    assert final_state.data_ptr() != initial_state.data_ptr()
+
+    _, final_state_zero = torch.ops.trtllm.kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=head_k**-0.5,
+        initial_state=None,
+        output_final_state=True,
+    )
+    torch.testing.assert_close(final_state_zero, torch.zeros_like(initial_state))
+
+
+@torch.no_grad()
+def test_kda_prefill_op_empty_token_batch_variants():
+    """Regression coverage for the T=0 guard's other entry shapes.
+
+    - varlen (cu_seqlens present): n_seqs derives from cu_seqlens, not B
+    - output_final_state=False: the op's empty-tensor final-state fallback
+    - use_fused_k1234=True: the guard must precede the fused-path branch
+    """
+    num_heads, head_k, head_v = 4, 128, 128
+    q = torch.empty(1, 0, num_heads, head_k, dtype=torch.bfloat16, device="cuda")
+    k = torch.empty_like(q)
+    g = torch.empty(1, 0, num_heads, head_k, dtype=torch.float32, device="cuda")
+    v = torch.empty(1, 0, num_heads, head_v, dtype=torch.bfloat16, device="cuda")
+    beta = torch.empty(1, 0, num_heads, dtype=torch.float32, device="cuda")
+    common = dict(q=q, k=k, v=v, g=g, beta=beta, scale=head_k**-0.5)
+
+    # Varlen: two zero-length sequences -> final_state per sequence.
+    cu_seqlens = torch.tensor([0, 0, 0], dtype=torch.long, device="cuda")
+    _, final_state = torch.ops.trtllm.kda_prefill(
+        **common, initial_state=None, output_final_state=True, cu_seqlens=cu_seqlens
+    )
+    assert final_state.shape == (2, num_heads, head_k, head_v)
+    assert (final_state == 0).all()
+
+    # output_final_state=False: op returns the empty placeholder tensor.
+    output, final_state = torch.ops.trtllm.kda_prefill(
+        **common, initial_state=None, output_final_state=False
+    )
+    assert output.shape == (1, 0, num_heads, head_v)
+    assert final_state.numel() == 0
+
+    # Fused path: the guard must fire before _launch_fused_k1234.
+    output, final_state = torch.ops.trtllm.kda_prefill(
+        **common, initial_state=None, output_final_state=True, use_fused_k1234=True
+    )
+    assert output.shape == (1, 0, num_heads, head_v)
+    assert final_state.shape == (1, num_heads, head_k, head_v)
 
 
 @torch.no_grad()
@@ -548,8 +630,8 @@ def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_length
 
 
 @torch.no_grad()
-def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(monkeypatch):
-    """The indexed pool path matches FLA for prefix and continuation states."""
+def test_kda_prefill_opt_out_fallback_preserves_mixed_initial_states(monkeypatch):
+    """The explicit FLA fallback preserves prefix/continuation pool states."""
     torch.manual_seed(3)
     optimized, _ = _make_attention_pair()
     monkeypatch.setenv("TLLM_KDA_ENABLE_OPT_PREFILL", "0")
@@ -567,7 +649,7 @@ def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(monke
         * 0.05
     )
     slots = 5
-    slot_indices = torch.tensor([3, 0, 4, 1], dtype=torch.int32, device="cuda")
+    slot_indices = torch.tensor([3, 0, 4, 1], dtype=torch.long, device="cuda")
     has_initial_states = torch.tensor([True, False, True, False], device="cuda")
     projection_size = NUM_HEADS * HEAD_DIM
     conv_seed = (

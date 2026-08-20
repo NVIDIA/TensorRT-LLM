@@ -29,7 +29,6 @@ from ...distributed import AllReduce, AllReduceStrategy
 from ...modules.multi_stream_utils import maybe_execute_in_parallel
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
-from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
 from ._kda_kernels import KDAKernelDispatch, copy_kda_replay_conv_window, fused_kda_post_conv
 
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
@@ -330,7 +329,12 @@ class KimiKDALinearAttention(nn.Module):
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         batch_size = attn_metadata.seq_lens.shape[0]
-        state_indices = mamba_metadata.state_indices[:batch_size]
+        # index_copy_/index_select need int64 indices; the int64 mirror is
+        # prepared once per step by Mamba2Metadata.prepare() so KDA layers
+        # do not each replay an int32->int64 cast inside the decode graph.
+        state_indices = getattr(mamba_metadata, "state_indices_long", None)
+        if state_indices is None or state_indices.shape[0] != batch_size:
+            state_indices = mamba_metadata.state_indices[:batch_size].long()
         cu_seqlens = mamba_metadata.query_start_loc_long[: num_prefills + 1]
         num_decodes = batch_size - num_prefills
 
@@ -431,15 +435,8 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache=None,
     ) -> torch.Tensor:
         fused_qkvg = self.qkvg_proj
-        chunk_indices = getattr(mamba_metadata, "kda_chunk_indices", None)
-        varlen_is_aligned = getattr(mamba_metadata, "kda_varlen_is_aligned", None)
-        single_sequence_length = getattr(mamba_metadata, "kda_single_sequence_length", None)
         if (
-            not self._dispatch.can_use_optimized_prefill(
-                cu_seqlens=cu_seqlens,
-                num_tokens=x2d.shape[0],
-                chunk_indices=chunk_indices,
-            )
+            not self._dispatch.can_use_optimized_prefill(cu_seqlens=cu_seqlens)
             or self._packed_conv_weight is None
             or (self._qkvg_proj_weight is None and fused_qkvg is None)
         ):
@@ -476,30 +473,16 @@ class KimiKDALinearAttention(nn.Module):
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
         # conv/recurrent state was onboarded into this request's slot.
-        has_init = mamba_metadata.has_initial_states[:num_prefills]
-        if not self._dispatch.can_use_indexed_prefill(
-            state_pool=ssm_pool,
-            state_indices=slot_indices,
-            has_initial_states=has_init,
-            cu_seqlens=cu_seqlens,
-            num_tokens=x2d.shape[0],
-            chunk_indices=chunk_indices,
-        ):
-            return self.forward_prefill_fallback(
-                x2d,
-                cu_seqlens,
-                mamba_metadata,
-                num_prefills,
-                conv_pool,
-                ssm_pool,
-                slot_indices,
-                layer_cache,
-            )
-        reset_recurrent_state_rows(
-            ssm_pool,
-            slot_indices,
-            has_init,
+        has_init = (
+            mamba_metadata.has_initial_states[:num_prefills]
+            if mamba_metadata.use_initial_states
+            else None
         )
+        recurrent_in = None
+        if mamba_metadata.use_initial_states:
+            assert has_init is not None
+            recurrent_in = ssm_pool.index_select(0, slot_indices)
+            recurrent_in[~has_init] = 0
 
         # Reuse GDN's packed variable-length causal convolution. It reads
         # and writes the live [slots, 3D, W - 1] pool directly and honors
@@ -531,11 +514,11 @@ class KimiKDALinearAttention(nn.Module):
             head_dim=self.head_dim,
         )
 
-        # The optimized kernel reads and writes the V-first pool directly.
-        # Unsupported layouts and batches are routed to the FLA fallback
-        # before reaching this point.
+        # Kernel dispatch (in-tree trtllm::kda_prefill or FLA chunk_kda).
+        # Both paths exchange states in the pool's V-first [N, H, V, K]
+        # layout, so recurrent_in / final_state map to ssm_pool 1:1.
         lower_bound = self.gate_lower_bound
-        o, _ = self._dispatch.prefill_chunk_kda(
+        o, final_state = self._dispatch.prefill_chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -544,18 +527,15 @@ class KimiKDALinearAttention(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             scale=self.head_k_dim**-0.5,
-            initial_state=None,
+            initial_state=recurrent_in,
             safe_gate=lower_bound is not None,
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            state_pool=ssm_pool,
-            state_indices=slot_indices,
-            varlen_is_aligned=varlen_is_aligned,
-            single_sequence_length=single_sequence_length,
         )
 
         # The packed convolution persisted the live convolution pool in place.
+        assert final_state is not None
+        ssm_pool.index_copy_(0, slot_indices, final_state.to(ssm_pool.dtype))
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
         # are zero for a fresh request, so the tail columns are unused).
@@ -579,7 +559,6 @@ class KimiKDALinearAttention(nn.Module):
         from fla.modules.l2norm import l2norm_fwd
 
         d = self.proj_size
-        slot_indices_long = slot_indices.long()
         x = x2d.unsqueeze(0)
         q_proj = self.q_proj(x)
         k_proj = self.k_proj(x)
@@ -588,13 +567,13 @@ class KimiKDALinearAttention(nn.Module):
         conv_q_in = conv_k_in = conv_v_in = recurrent_in = None
         if mamba_metadata.use_initial_states:
             has_init = mamba_metadata.has_initial_states[:num_prefills]
-            conv_state = conv_pool.index_select(0, slot_indices_long)
+            conv_state = conv_pool.index_select(0, slot_indices)
             conv_state[~has_init] = 0
             conv_q_in, conv_k_in, conv_v_in = _kda_split_conv_sections(conv_state, d)
             conv_q_in = _kda_expand_fla_conv_cache(conv_q_in)
             conv_k_in = _kda_expand_fla_conv_cache(conv_k_in)
             conv_v_in = _kda_expand_fla_conv_cache(conv_v_in)
-            recurrent_in = ssm_pool.index_select(0, slot_indices_long)
+            recurrent_in = ssm_pool.index_select(0, slot_indices)
             recurrent_in[~has_init] = 0
 
         q, conv_q = self.q_conv1d(
@@ -631,21 +610,20 @@ class KimiKDALinearAttention(nn.Module):
             safe_gate=self.gate_lower_bound is not None,
             lower_bound=self.gate_lower_bound,
             cu_seqlens=cu_seqlens,
-            force_fallback=True,
         )
 
         # FLA returns gathered full-width caches; persist their W - 1 live
         # windows back to the slot-indexed cache-manager pool.
         conv_pool.index_copy_(
             0,
-            slot_indices_long,
+            slot_indices,
             torch.cat([conv_q[:, :, 1:], conv_k[:, :, 1:], conv_v[:, :, 1:]], dim=1).to(
                 conv_pool.dtype
             ),
         )
         assert final_state is not None
-        ssm_pool.index_copy_(0, slot_indices_long, final_state.to(ssm_pool.dtype))
-        self._sync_kda_replay_conv_window(layer_cache, slot_indices_long, conv_pool)
+        ssm_pool.index_copy_(0, slot_indices, final_state.to(ssm_pool.dtype))
+        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
         return self._output_gate_and_proj(x, o)
 
     def forward_decode(
@@ -774,14 +752,11 @@ class KimiKDALinearAttention(nn.Module):
         from einops import rearrange
 
         d = self.proj_size
-        slot_indices_long = slot_indices.long()
         x = x2d.unsqueeze(1)  # [B, 1, hidden]
-        cs = conv_pool.index_select(0, slot_indices_long)
+        cs = conv_pool.index_select(0, slot_indices)
         conv_q, conv_k, conv_v = _kda_split_conv_sections(cs, d)
         state = (
-            ssm_pool
-            if ssm_state_indices is not None
-            else ssm_pool.index_select(0, slot_indices_long)
+            ssm_pool if ssm_state_indices is not None else ssm_pool.index_select(0, slot_indices)
         )
 
         q_proj = self.q_proj(x)
@@ -882,11 +857,11 @@ class KimiKDALinearAttention(nn.Module):
 
         conv_pool.index_copy_(
             0,
-            slot_indices_long,
+            slot_indices,
             torch.cat([new_conv_q, new_conv_k, new_conv_v], dim=1).to(conv_pool.dtype),
         )
         if ssm_state_indices is None:
-            ssm_pool.index_copy_(0, slot_indices_long, state.to(ssm_pool.dtype))
+            ssm_pool.index_copy_(0, slot_indices, state.to(ssm_pool.dtype))
         # Fused-verify replay caches: keep the committed conv window in
         # sync with the plain-decode advance. NOTE: this path is only
         # correct for requests with no pending accepted drafts
@@ -894,7 +869,7 @@ class KimiKDALinearAttention(nn.Module):
         # pools lag by the pending prefix and only the fused verify kernel
         # can advance them. The spec workers pad drafts to the static max,
         # so drafted batches always take the verify path.
-        self._sync_kda_replay_conv_window(layer_cache, slot_indices_long, conv_pool)
+        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
         return out.squeeze(1)
 
@@ -1029,9 +1004,9 @@ class KimiKDALinearAttention(nn.Module):
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = self.gate_lower_bound
 
-        pending = layer_cache.prev_num_accepted_tokens[
-            slot_indices
-        ]  # accepted drafts of the previous round, per req
+        pending = layer_cache.prev_num_accepted_tokens[slot_indices].to(
+            torch.int32
+        )  # accepted drafts of the previous round, per req
         cu_seqlens = torch.arange(
             0, (num_decodes + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
         )
@@ -1057,7 +1032,7 @@ class KimiKDALinearAttention(nn.Module):
             qkg_cache=layer_cache.kda_qkg_cache,
             v_cache=layer_cache.kda_v_cache,
             beta_cache=layer_cache.kda_beta_cache,
-            ssm_state_indices=slot_indices,
+            ssm_state_indices=slot_indices.to(torch.int32),
             cu_seqlens=cu_seqlens,
             num_spec=num_spec,
             num_accepted_tokens=pending,
@@ -1130,13 +1105,12 @@ class KimiKDALinearAttention(nn.Module):
 
         # Gathered copies — mutated across steps, never written back to the
         # live pools.
-        slot_indices_long = slot_indices.long()
-        cs = conv_pool.index_select(0, slot_indices_long)
+        cs = conv_pool.index_select(0, slot_indices)
         conv_q, conv_k, conv_v = _kda_split_conv_sections(cs, d)
         conv_q = _kda_expand_fla_conv_cache(conv_q)
         conv_k = _kda_expand_fla_conv_cache(conv_k)
         conv_v = _kda_expand_fla_conv_cache(conv_v)
-        state = ssm_pool.index_select(0, slot_indices_long)
+        state = ssm_pool.index_select(0, slot_indices)
 
         step_outputs: List[torch.Tensor] = []
         for t in range(num_steps):
