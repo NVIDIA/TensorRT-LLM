@@ -282,6 +282,7 @@ def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(monkeypatch
     torch.testing.assert_close(adapter_free[0], legacy[0])
     torch.testing.assert_close(adapter_free[1], legacy[1])
     assert adapter_free[2].shape == legacy[2].shape
+    assert adapter_free[2].shape == (hidden_states.shape[0] * hidden_states.shape[1], 1)
     assert adapter_free[2].dtype == legacy[2].dtype
     torch.testing.assert_close(adapter_free[3], legacy[3])
     assert adapter_free_reused[2] is adapter_free[2]
@@ -340,7 +341,9 @@ def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
     scheduler.moe = SimpleNamespace(
         backend=backend,
         comm=comm,
-        routing_method=SimpleNamespace(experts_per_token=1),
+        # DeepEP consumes the model's routing top-k and presents one local
+        # placeholder slot per expert-major row to fused MoE.
+        routing_method=SimpleNamespace(experts_per_token=8),
     )
 
     assert scheduler._use_cutedsl_deep_ep_direct_metadata(supports_post_quant) is expected
@@ -361,17 +364,11 @@ def test_scheduler_rejects_direct_metadata_for_other_backend_or_communication():
     assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False
 
 
-@pytest.mark.parametrize(
-    "use_fused_finalize,experts_per_token",
-    [(False, 1), (True, 2)],
-)
-def test_scheduler_rejects_direct_metadata_without_finalize_or_top1(
-    use_fused_finalize: bool, experts_per_token: int
-):
+def test_scheduler_rejects_direct_metadata_without_fused_finalize():
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
     backend.disable_deep_ep_direct_metadata = False
-    backend.use_fused_finalize = use_fused_finalize
+    backend.use_fused_finalize = False
     backend._weights_created = True
     backend.quant_config = SimpleNamespace(
         layer_quant_mode=SimpleNamespace(
@@ -382,7 +379,7 @@ def test_scheduler_rejects_direct_metadata_without_finalize_or_top1(
     scheduler.moe = SimpleNamespace(
         backend=backend,
         comm=comm,
-        routing_method=SimpleNamespace(experts_per_token=experts_per_token),
+        routing_method=SimpleNamespace(experts_per_token=8),
     )
 
     assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False

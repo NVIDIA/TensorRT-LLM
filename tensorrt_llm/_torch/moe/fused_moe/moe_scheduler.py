@@ -232,6 +232,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
     def _use_cutedsl_deep_ep_direct_metadata(self, supports_post_quant: bool) -> bool:
         """Whether the full adapter-free, count-native DeepEP path is supported."""
         moe = self.moe
+        # DeepEP has already consumed the model's routing top-k here. Its
+        # expert-major receive buffer exposes one local placeholder slot per
+        # physical row, so the pre-dispatch routing top-k is not an eligibility
+        # constraint for this post-dispatch path.
         return (
             isinstance(moe.comm, DeepEPLowLatency)
             and moe.backend.capabilities.supports_deep_ep_direct_metadata
@@ -239,7 +243,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
             and moe.backend.has_nvfp4
             and supports_post_quant
             and moe.backend.use_fused_finalize
-            and moe.routing_method.experts_per_token == 1
         )
 
     # ------------------------------------------------------------------
