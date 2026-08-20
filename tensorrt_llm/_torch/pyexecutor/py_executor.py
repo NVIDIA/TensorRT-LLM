@@ -1759,12 +1759,11 @@ class PyExecutor:
     def enqueue_request(
             self,
             request: ExecutorRequest,
-            query: Optional[List] = None,
             result_wait_queue: "Optional[ActorHandle]" = None) -> int:
         """
-        Enqueue a new request; `query` is currently unused.
+        Enqueue a new request.
         """
-        req_id = self.executor_request_queue.enqueue_request(request, query)
+        req_id = self.executor_request_queue.enqueue_request(request)
         if result_wait_queue is not None:
             with self.response_cv:
                 self.result_wait_queues[req_id] = result_wait_queue

@@ -429,8 +429,6 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params._decoder_output_token_prefix)
             if max_tokens is not None:
                 max_tokens -= output_prefix_len
-            query_token_len = len(
-                request.query_token_ids) if request.query_token_ids else 0
 
             cp_size = 1
             max_seq_len = None
@@ -461,14 +459,13 @@ class BaseWorker(GenerationExecutor):
                     len(prompt_token_ids) <= executor_config.max_seq_len
                 ), f"`prompt_token_ids` length ({len(prompt_token_ids)}) is greater than `max_seq_len` ({executor_config.max_seq_len})"
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
-            default_max_tokens = max_seq_len - splited_prompt_len - query_token_len
+            default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
                 # Raise error on `default_max_tokens` not enough, since max_tokens should be less than `default_max_tokens``
                 raise ValueError(
                     f"`default_max_tokens` ({default_max_tokens}) must be greater than 0, "
                     f"`default_max_tokens` ({default_max_tokens}) = max_seq_len ({max_seq_len})"
-                    f" - `splited_prompt_len` ({splited_prompt_len}) - `query_token_len` ({query_token_len})"
-                )
+                    f" - `splited_prompt_len` ({splited_prompt_len})")
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:
@@ -567,23 +564,11 @@ class BaseWorker(GenerationExecutor):
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 
-            if request.query_token_ids is not None:
-                # pytorch star attention workflow
-                # a workaround to avoid public interface update
-                if self._is_pytorch_backend and result_wait_queue is not None:
-                    req_id = self.engine.enqueue_request(
-                        executor_request,
-                        request.query_token_ids,
-                        result_wait_queue=result_wait_queue)
-                else:
-                    req_id = self.engine.enqueue_request(
-                        executor_request, request.query_token_ids)
+            if self._is_pytorch_backend and result_wait_queue is not None:
+                req_id = self.engine.enqueue_request(
+                    executor_request, result_wait_queue=result_wait_queue)
             else:
-                if self._is_pytorch_backend and result_wait_queue is not None:
-                    req_id = self.engine.enqueue_request(
-                        executor_request, result_wait_queue=result_wait_queue)
-                else:
-                    req_id = self.engine.enqueue_request(executor_request)
+                req_id = self.engine.enqueue_request(executor_request)
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e
