@@ -68,7 +68,6 @@ def generate_examples():
         'quickstart_example.py',
         'quickstart_advanced.py',
         'quickstart_multimodal.py',
-        'star_attention.py',
         # Older VisualGen example scripts without ### :title metadata; opt
         # in by adding the metadata block and removing the entry below.
         'visual_gen_flux.py',

@@ -23,7 +23,7 @@ class RequestQueueItem:
     _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
-    query: Optional[list] = None  # only used in `StarAttention`
+    query: Optional[list] = None  # currently unused
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler
     # step boundary with in-flight requests still in the engine.
@@ -123,7 +123,7 @@ class ExecutorRequestQueue:
                         request: ExecutorRequest,
                         query: Optional[List] = None) -> int:
         """
-        Enqueue a new request, query is only used in `StarAttention`.
+        Enqueue a new request; `query` is currently unused.
         """
         return self._enqueue_impl([(request, query)])[0]
 

@@ -438,19 +438,6 @@ def create_py_executor(
         tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
         kv_cache_config.tokens_per_block = tokens_per_block
 
-    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION":
-        # Star attention still derives its page table from every allocated block,
-        # which is incompatible with blocks allocated ahead for reuse.
-        if kv_cache_config.enable_block_reuse:
-            logger.warning(
-                f"Disabling block reuse for {llm_args.attn_backend} backend")
-            kv_cache_config.enable_block_reuse = False
-
-    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
-        logger.warning(
-            f"Disabling chunked context for {llm_args.attn_backend} backend")
-        enable_chunked_context = False
-
     spec_config = llm_args.speculative_config
     if spec_config is not None and spec_config.decoding_type == "AUTO":
         from tensorrt_llm._torch.speculative import suggest_spec_config

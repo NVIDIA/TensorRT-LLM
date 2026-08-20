@@ -1762,7 +1762,7 @@ class PyExecutor:
             query: Optional[List] = None,
             result_wait_queue: "Optional[ActorHandle]" = None) -> int:
         """
-        Enqueue a new request, query is only used in `StarAttention`.
+        Enqueue a new request; `query` is currently unused.
         """
         req_id = self.executor_request_queue.enqueue_request(request, query)
         if result_wait_queue is not None:
@@ -7807,24 +7807,12 @@ class PyExecutor:
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
 
-    def _update_request_states_star_attention(
-            self, scheduled_requests: ScheduledRequests):
-        for request in scheduled_requests.context_requests:
-            if request.ctx_iters >= len(request.ctx_blocks) - 2:
-                request.state = LlmRequestState.GENERATION_IN_PROGRESS
-            request.ctx_iters += 1
-
-        for request in scheduled_requests.generation_requests:
-            request.gen_iters += 1
-
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == CpType.STAR:
-                self._update_request_states_star_attention(scheduled_requests)
-            elif cp_type == CpType.HELIX:
+            if cp_type == CpType.HELIX:
                 # Take the usual route with _update_request_states_tp().
                 pass
             else:

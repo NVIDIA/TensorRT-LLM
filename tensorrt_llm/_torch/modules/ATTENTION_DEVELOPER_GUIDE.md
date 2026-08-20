@@ -11,9 +11,7 @@ This guide covers the TRT-LLM PyTorch attention stack:
 
 Use it when modifying the current implementation or adding a new model's
 attention behavior. It covers standard `Attention`, Multi-head Latent
-Attention (MLA), dense backends, and sparse backends. It does not cover
-`tensorrt_llm/_torch/attention_backend/star_flashinfer.py`, which is planned
-for deprecation.
+Attention (MLA), dense backends, and sparse backends.
 
 ## Glossary
 

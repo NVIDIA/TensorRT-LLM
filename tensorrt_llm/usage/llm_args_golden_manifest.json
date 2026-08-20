@@ -108,8 +108,7 @@
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
-        "FLASHINFER",
-        "FLASHINFER_STAR_ATTENTION"
+        "FLASHINFER"
       ],
       "annotation": "<class 'str'>",
       "converter": "allowlist",
@@ -213,23 +212,8 @@
       "path": "context_parallel_size"
     },
     {
-      "allowed_values": [],
-      "annotation": "Optional[int]",
-      "converter": "",
-      "kind": "value",
-      "path": "cp_config.block_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[int]",
-      "converter": "",
-      "kind": "value",
-      "path": "cp_config.cp_anchor_size"
-    },
-    {
       "allowed_values": [
         "ULYSSES",
-        "STAR",
         "RING",
         "HELIX"
       ],
