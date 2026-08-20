@@ -38,6 +38,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -475,15 +476,9 @@ async def benchmark(
 
     num_inference_steps = gen_params.get("num_inference_steps")
     if num_inference_steps is not None:
-        seconds_per_step = [denoise / num_inference_steps for denoise in denoises]
-        result.update(
-            _summarize_metric(
-                "seconds_per_denoising_step",
-                seconds_per_step,
-                selected_percentiles,
-            )
+        result["mean_seconds_per_denoising_step"] = (
+            result["mean_denoise"] / num_inference_steps
         )
-        result["seconds_per_denoising_step"] = seconds_per_step
     result["audio_validated"] = require_audio
 
     _print_trtllm_measurements(result)
@@ -509,6 +504,48 @@ def _summarize_metric(
         f"max_{name}": float(np.max(values)) if values else 0.0,
         f"percentiles_{name}": percentiles,
     }
+
+
+_DENOISING_STEP_PATTERN = re.compile(
+    r"Step ([0-9]+)/([0-9]+)\s*\|\s*([0-9]+(?:\.[0-9]+)?)s"
+)
+
+
+def _summarize_denoising_step_times(
+    log_lines: list[str],
+    expected_requests: int,
+    step_count: int,
+    percentiles: tuple[float, ...] = (95.0, 99.0),
+) -> dict[str, Any]:
+    """Summarize individual measured denoising-step times from server logs.
+
+    The wrapper runs one validation request before the measured requests. Step
+    lines for measured requests therefore appear last, even when measured
+    requests execute concurrently and their lines interleave.
+    """
+    if expected_requests <= 0 or step_count <= 0:
+        return {}
+
+    step_times = [
+        float(match.group(3))
+        for line in log_lines
+        if (match := _DENOISING_STEP_PATTERN.search(line))
+        and int(match.group(2)) == step_count
+    ]
+    expected_samples = expected_requests * step_count
+    # The wrapper always issues one validation request before measurements.
+    # Requiring its full sample group prevents an incomplete measured request
+    # from borrowing tail samples from validation.
+    required_samples = (expected_requests + 1) * step_count
+    if len(step_times) < required_samples:
+        return {}
+
+    measured_step_times = step_times[-expected_samples:]
+    summary = _summarize_metric(
+        "denoising_step_time", measured_step_times, list(percentiles)
+    )
+    summary["denoising_step_times"] = measured_step_times
+    return summary
 
 
 def _print_trtllm_measurements(result: dict[str, Any]) -> None:
