@@ -419,12 +419,8 @@ def create_py_executor(
 
     tokens_per_block = kv_cache_config.tokens_per_block
 
-    # RocketKV's Vanilla path keeps its landmark (KT) cache in a single block per
-    # sequence: RocketVanillaAttention writes the whole sequence into
-    # kt_cache_block_offsets[0], and kt_tokens_per_block is derived from
-    # tokens_per_block. It does not support a paged KT cache, so force one block
-    # per sequence for it. Plain Vanilla attention supports paged KV cache and is
-    # left untouched.
+    # RocketKV's Vanilla path does not support a paged KT cache, so force one
+    # block per sequence for it. See RocketVanillaAttention for detail.
     sparse_config = llm_args.sparse_attention_config
     if (llm_args.attn_backend == "VANILLA" and sparse_config is not None
             and getattr(sparse_config, "algorithm", None) == "rocket"):
