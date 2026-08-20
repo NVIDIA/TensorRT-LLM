@@ -144,7 +144,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         ) // self._conv_tp_size
         window = config.sconv_kernel_size - 1
         itemsize = torch.empty((), dtype=self._conv_dtype).element_size()
-        return [c * window * itemsize for c in (kv_dim, kv_dim, config.hidden_size, config.hidden_size)]
+        return [
+            c * window * itemsize for c in (kv_dim, kv_dim, config.hidden_size, config.hidden_size)
+        ]
 
     # ---- V2 configuration -------------------------------------------------
     def _conv_layer_id(self, local_layer_idx: int) -> LayerId:

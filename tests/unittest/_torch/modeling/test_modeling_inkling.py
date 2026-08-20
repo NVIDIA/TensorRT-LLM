@@ -900,7 +900,6 @@ def test_inkling_selects_the_hybrid_cache_manager():
 
     from tensorrt_llm._torch.attention_backend.sparse import get_sparse_attn_kv_cache_manager
     from tensorrt_llm._torch.attention_backend.sparse.inkling import (
-        InklingAttentionMetadata,
         InklingHybridCacheManager,
         InklingSparseAttentionConfig,
     )
@@ -1037,9 +1036,7 @@ def test_the_conv_runtime_slices_the_published_rows():
     assert rt.gen_indices.tolist() == pool.state_indices[2:4].tolist()
     # Views of the pool's own buffer, not copies.
     for view in (rt.ctx_indices, rt.gen_indices):
-        assert (
-            view.untyped_storage().data_ptr() == pool.state_indices.untyped_storage().data_ptr()
-        )
+        assert view.untyped_storage().data_ptr() == pool.state_indices.untyped_storage().data_ptr()
     # Varlen offsets over the context prefix only, and no carried conv window.
     assert rt.query_start_loc.tolist() == [0, 3, 7]
     assert rt.has_initial_state.tolist() == [False, False]
