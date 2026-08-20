@@ -721,11 +721,17 @@ def test_mamba_layer_group_serialization():
     assert len(restored.pool_views) == 2
     assert restored.pool_views[0].pool_role == MAMBA_CONV_ROLE
     assert restored.pool_views[0].bytes_per_layer == conv_slot_bytes
+    assert restored.pool_views[0].mapper_kind == MapperKind.SECTIONED
     assert restored.pool_views[1].pool_role == MAMBA_SSM_ROLE
     assert restored.pool_views[1].bytes_per_layer == ssm_slot_bytes
+    assert restored.pool_views[1].mapper_kind == MapperKind.INDEXED
     assert restored.conv_section_bytes == [512, 256, 256]
     assert restored.ssm_bytes_per_head == 128
-    assert len(restored.local_layers) == 3
+    assert [(ll.local_layer_id, ll.global_layer_id) for ll in restored.local_layers] == [
+        (0, 10),
+        (1, 11),
+        (2, 12),
+    ]
 
     legacy_pool = PhysicalPool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
     assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
@@ -802,7 +808,8 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
         PoolView(
             pool_idx=0,
             buffer_entries=np.array(
-                [(lid, 0, state_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+                [(lid, lid * state_bytes, state_bytes) for lid in sorted_lids],
+                dtype=BUFFER_ENTRY_DTYPE,
             ),
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
@@ -811,7 +818,8 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
         PoolView(
             pool_idx=0,
             buffer_entries=np.array(
-                [(lid, 0, state_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+                [(lid, (num_layers + lid) * state_bytes, state_bytes) for lid in sorted_lids],
+                dtype=BUFFER_ENTRY_DTYPE,
             ),
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
@@ -837,7 +845,7 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
     ]
 
 
-def test_legacy_mamba_registration_uses_layer_major_pools():
+def test_legacy_mamba_registration_uses_layer_major_pools() -> None:
     import numpy as np
 
     from tensorrt_llm._torch.disaggregation.resource.page import (
