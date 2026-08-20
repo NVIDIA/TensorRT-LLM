@@ -147,8 +147,15 @@ BatchedCopyPool::~BatchedCopyPool()
     // onTerminal into a destructed pool (use-after-free). Give in-flight contexts a short bounded
     // window to drain normally (event fires -> onTerminal returns the context), then UNREGISTER
     // every event of this pool from the poller BEFORE destroying anything: unregisterEvents holds
-    // the poller's sweep mutex, so after it returns no entry of ours is being queried or called
-    // back. The unregistered ids simply never report to Python — acceptable at teardown.
+    // the poller's sweep mutex AND waits out any chain poster still executing outside it, so after
+    // it returns no entry of ours is being queried or called back. The unregistered ids —
+    // including the reserved id of an armed-but-unposted gather->RDMA chain — simply never report
+    // to Python; waiters unblock via the reactor's request-timeout/stall watchdogs. Acceptable at
+    // teardown only; the ordered path (poller.shutdown() BEFORE the pool is dropped) terminates
+    // every id properly and makes this the GC-order fallback.
+    // (A chain poster references only the agent/poller, never this pool, so a poster that slips
+    // past the freeCount fast path below — its context was recycled at gather-completion — cannot
+    // touch destroyed pool state.)
     // NOTE: this destructor may run under the GIL (nanobind tp_dealloc); the poll thread never
     // takes the GIL, so waiting on the poller mutex here cannot deadlock.
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);

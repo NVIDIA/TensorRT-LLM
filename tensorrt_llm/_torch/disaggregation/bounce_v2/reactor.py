@@ -124,6 +124,10 @@ _MAX_MSGS_PER_TICK = 512
 _SENDER_SWEEP_S = 0.1
 #: Per-peer outbound queue cap, mirrors the C++ kSendHwm.
 _SEND_HWM = 1 << 16
+#: CompletionPoller drain-row kinds (mirror the binding's KIND_* constants;
+#: hardcoded so the pure-Python reactor stays importable without it).
+_KIND_EVENT = 0
+_KIND_XFER = 1
 
 # Failure-reason strings mirror the C++ BounceFailReason::toString set.
 FAIL_PLAN_REJECTED = "bounce: plan rejected (request did not fit a transfer plan)"
@@ -248,6 +252,21 @@ class BounceReactor:
         self._max_descs_per_chunk = min(
             self._max_plan_entries, max(1024, config.max_chunk_size_bytes // 256)
         )
+        # EXPERIMENTAL C++ chain (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): the C++
+        # poll thread posts a credited chunk's RDMA write as soon as its
+        # gather event fires (see _arm_chain_locked); Python then sees ONE
+        # completion per chunk instead of gather + write.
+        self._chain_fn = None
+        if config.enable_cpp_chain:
+            self._chain_fn = getattr(raw_agent, "post_transfer_1to1_on_event", None)
+            if self._chain_fn is None:
+                logger.warning(
+                    f"bounce_v2({self_name}): TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN requested but the "
+                    f"agent binding lacks post_transfer_1to1_on_event; using the classic "
+                    f"gather->post path"
+                )
+            else:
+                logger.info(f"bounce_v2({self_name}): C++ gather->RDMA chain enabled")
 
         # --- control channel ---
         self._zmq = zmq.Context(io_threads=1)
@@ -549,7 +568,7 @@ class BounceReactor:
         rows = self._poller.drain(0)
         if rows.shape[0] == 0:
             return False
-        for cid, _kind, ok in rows.tolist():
+        for cid, kind, ok in rows.tolist():
             with self._req_mu:
                 route = self._completions.pop(cid, None)
             if route is None:
@@ -558,7 +577,7 @@ class BounceReactor:
             if tag == "gather":
                 self._on_gather_done(route[1], cid, bool(ok))
             elif tag == "xfer":
-                self._on_xfer_done(route[1], cid, bool(ok))
+                self._on_xfer_done(route[1], cid, bool(ok), int(kind))
             elif tag == "scatter":
                 self._finish_scatter(route[1], bool(ok))
             elif tag == "orphan_gather":
@@ -609,7 +628,13 @@ class BounceReactor:
             req.pending_credits.popleft()
             req.next_credit += 1
             req.last_progress = time.monotonic()
-            if target.state == _PostState.GATHERED:
+            if target.state == _PostState.GATHERING:
+                # Eager chunk still gathering: with the C++ chain enabled the
+                # credit lets us arm the gather->post chain right now; losing
+                # the race to the gather's own completion is fine — the
+                # classic path then posts from _on_gather_done as before.
+                self._arm_chain_locked(rid, req, target)
+            elif target.state == _PostState.GATHERED:
                 # Eagerly-gathered chunk was only waiting for its credit.
                 self._post_write_locked(rid, req, target)
                 if req.abandon_reason:
@@ -691,6 +716,10 @@ class BounceReactor:
             req.posted.append(posted)
             req.next_post += 1
             req.last_progress = time.monotonic()
+            if posted.has_credit:
+                # Credited at launch: arm the C++ chain immediately (no-op
+                # when the chain is disabled/unavailable).
+                self._arm_chain_locked(rid, req, posted)
         self._send_grants(grants)
 
     def _drain_pending_posts(self) -> bool:
@@ -708,6 +737,41 @@ class BounceReactor:
                     cur = self._requests.get(rid)
                     did_work |= cur is None or (cur.next_post, cur.next_credit) != before
         return did_work
+
+    def _arm_chain_locked(self, rid: int, req: _Request, posted: _Posted) -> bool:
+        """Try to arm the C++ gather->RDMA chain for a credited, still-
+        gathering chunk (_req_mu held). On success the chunk's ONE remaining
+        completion is the reserved xfer id: the gather completion is consumed
+        in C++ (never drained), the write posts on the C++ poll thread, and
+        the classic copy_id route is dropped; the chunk moves to WRITING so
+        the failure path treats its staging region exactly like an in-flight
+        write (recycled only once the chain reaches a terminal state — the
+        reserved id resolves only after the gather is terminal AND the write,
+        if posted, is terminal). Returns False when the chain is disabled,
+        the chunk is not eligible, or the arm lost the race to the gather's
+        own completion — the classic two-hop path then proceeds unchanged."""
+        if self._chain_fn is None or not posted.has_credit:
+            return False
+        if posted.state != _PostState.GATHERING:
+            return False
+        reserved = self._chain_fn(
+            posted.copy_id,
+            self._arena_base + posted.local_offset,
+            posted.remote_addr,
+            posted.write_bytes,
+            self._device_id,
+            posted.remote_dev,
+            req.peer,
+            self._poller,
+        )
+        if reserved < 0:
+            return False
+        self._completions.pop(posted.copy_id, None)
+        posted.xfer_id = int(reserved)
+        posted.state = _PostState.WRITING
+        self._completions[posted.xfer_id] = ("xfer", rid)
+        req.last_progress = time.monotonic()
+        return True
 
     def _post_write_locked(self, rid: int, req: _Request, posted: _Posted) -> None:
         """Gathered + credited -> post the 1:1 RDMA write. _req_mu held."""
@@ -754,7 +818,7 @@ class BounceReactor:
             if target.has_credit:
                 self._post_write_locked(rid, req, target)
 
-    def _on_xfer_done(self, rid: int, xfer_id: int, ok: bool) -> None:
+    def _on_xfer_done(self, rid: int, xfer_id: int, ok: bool, kind: int = _KIND_XFER) -> None:
         data_msg: Optional[tuple[str, bytes]] = None
         with self._req_mu:
             req = self._requests.get(rid)
@@ -764,17 +828,25 @@ class BounceReactor:
             if target is None:
                 return
             if not ok:
-                # The failed write's completion id was already consumed by the
-                # drain and the NIC is DONE with the staging region: advance
-                # the chunk to a terminal state BEFORE failing, so
-                # _fail_request_locked releases its region now and does not
-                # count it as an orphan write (its consumed id would never
-                # fire again, wedging _orphan_writes and the deferred cancel).
+                # The chunk's completion id was already consumed by the drain,
+                # so the chunk must go terminal HERE: _fail_request_locked
+                # would otherwise re-register the consumed id as an orphan
+                # write that can never fire (wedging _orphan_writes and the
+                # deferred cancel, and leaking the region). Every failed row
+                # that lands here is terminal for the staging region:
+                #   (id, KIND_XFER, 0)  classic write or chained post failed /
+                #       shutdown -> the NIC/agent is DONE with the region;
+                #   (id, KIND_EVENT, 0) chained gather failed -> the kernel is
+                #       done and the write was never posted (NIC never saw the
+                #       region) — reported as FAIL_GATHER to keep the reason
+                #       accurate.
                 # Guarded like the gather path: a duplicate delivery must not
                 # relabel a chunk that is no longer WRITING.
                 if target.state == _PostState.WRITING:
                     target.state = _PostState.SENT
-                self._fail_request_locked(rid, req, FAIL_WRITE)
+                self._fail_request_locked(
+                    rid, req, FAIL_GATHER if kind == _KIND_EVENT else FAIL_WRITE
+                )
                 return
             chunk = req.plan.chunks[target.chunk_idx]
             data_msg = (

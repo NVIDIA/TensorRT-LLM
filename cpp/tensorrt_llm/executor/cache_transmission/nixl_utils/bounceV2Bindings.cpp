@@ -166,7 +166,38 @@ void initBounceV2Bindings(nb::module_& m, nb::class_<kvc::NixlTransferAgent, kvc
             nb::arg("peer"), nb::arg("poller"), nb::call_guard<nb::gil_scoped_release>(),
             "Post ONE single-descriptor no-notif RDMA write of FINAL device addresses (below the "
             "VMM splitter) and hand its TransferStatus to the poller. Returns the poller completion "
-            "id, or -1 when the post failed.");
+            "id, or -1 when the post failed.")
+        .def(
+            "post_transfer_1to1_on_event",
+            [](kvc::NixlTransferAgent& self, std::uint64_t copyId, std::uintptr_t srcPtr, std::uintptr_t dstPtr,
+                std::size_t nbytes, std::uint32_t srcDev, std::uint32_t dstDev, std::string const& peer,
+                CompletionPoller& poller) -> std::int64_t
+            {
+                auto poster = [agent = &self, srcPtr, dstPtr, nbytes, srcDev, dstDev,
+                                  peer]() -> std::unique_ptr<kvc::TransferStatus>
+                {
+                    kvc::TransferDescs srcDescs{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{srcPtr, nbytes, srcDev}}};
+                    kvc::TransferDescs dstDescs{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{dstPtr, nbytes, dstDev}}};
+                    return agent->postXferRequestLocked(
+                        kvc::TransferOp::kWRITE, srcDescs, dstDescs, peer, /*syncMessage=*/{});
+                };
+                return poller.armXferAfterEvent(copyId, std::move(poster));
+            },
+            nb::arg("copy_id"), nb::arg("src_ptr"), nb::arg("dst_ptr"), nb::arg("nbytes"), nb::arg("src_dev"),
+            nb::arg("dst_dev"), nb::arg("peer"), nb::arg("poller"),
+            // The armed poster captures the agent; keep the agent alive at least as long as the
+            // poller that may still run it (the engine teardown order already guarantees this;
+            // keep_alive is belt-and-braces for ad-hoc scripts).
+            nb::keep_alive<9, 1>(), nb::call_guard<nb::gil_scoped_release>(),
+            "EXPERIMENTAL (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): arm a gather->RDMA chain — when the "
+            "given copy_id (a submit_copy completion id still pending in the poller) completes "
+            "successfully, the C++ poll thread itself posts this single-descriptor RDMA write and "
+            "polls it under a RESERVED completion id, which is returned. The gather completion is "
+            "consumed in C++ (never drained), so Python sees exactly ONE completion per chunk: "
+            "(reserved, KIND_XFER, ok) after the write, (reserved, KIND_XFER, 0) when the post "
+            "failed or shutdown intervened, (reserved, KIND_EVENT, 0) when the gather itself "
+            "failed (write never posted). Returns -1 when the copy_id is no longer pending "
+            "(already completed / unknown / double-arm) — fall back to the classic path.");
 }
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce_v2

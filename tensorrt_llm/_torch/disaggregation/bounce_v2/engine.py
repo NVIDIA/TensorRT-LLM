@@ -63,6 +63,7 @@ from .scheduler import CreditScheduler
 
 __all__ = [
     "BOUNCE_V2_ENV",
+    "BOUNCE_V2_CPP_CHAIN_ENV",
     "BounceEngine",
     "BounceTransferStatus",
     "NoBounceEngine",
@@ -76,6 +77,11 @@ __all__ = [
 #: native/rank_info.py). All ranks of a disaggregated deployment must run the
 #: same version when the flag is enabled.
 BOUNCE_V2_ENV = "TRTLLM_BOUNCE_V2_ENABLE"
+#: EXPERIMENTAL opt-in: sender-side C++ gather->RDMA chain (see
+#: BounceV2Config.enable_cpp_chain). Purely local — no handshake impact.
+BOUNCE_V2_CPP_CHAIN_ENV = "TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN"
+
+_TRUTHY = ("1", "true", "TRUE", "True")
 
 # Handshake blob: magic 'BV2H', u16 wire version, u16 control kind (1 = zmq),
 # u64 effective max chunk bytes, u64 arena usable capacity, u32 endpoint len,
@@ -257,7 +263,8 @@ class BounceEngine:
         logger.info(
             f"bounce_v2({self_name}): engine ready endpoint={self._reactor.endpoint} "
             f"chunk={config.max_chunk_size_bytes} arena={config.arena_size_bytes} "
-            f"inflight={config.max_inflight_chunks_per_request}"
+            f"inflight={config.max_inflight_chunks_per_request} "
+            f"cpp_chain={config.enable_cpp_chain}"
         )
 
     # ---------------------------- handshake ---------------------------- #
@@ -466,4 +473,8 @@ def create_bounce_v2_engine(
     fallback would be a ~1000x perf cliff discovered in production)."""
     if os.environ.get(BOUNCE_V2_ENV, "0") not in ("1", "true", "TRUE", "True"):
         return NoBounceEngine()
-    return BounceEngine(agent, BounceV2Config(enabled=True), device_id, self_name)
+    config = BounceV2Config(
+        enabled=True,
+        enable_cpp_chain=os.environ.get(BOUNCE_V2_CPP_CHAIN_ENV, "0") in _TRUTHY,
+    )
+    return BounceEngine(agent, config, device_id, self_name)

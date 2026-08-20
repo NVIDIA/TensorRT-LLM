@@ -82,6 +82,38 @@ std::uint64_t CompletionPoller::registerEvent(cudaEvent_t event, std::function<v
     return id;
 }
 
+std::int64_t CompletionPoller::armXferAfterEvent(std::uint64_t eventId, ChainPoster poster)
+{
+    if (!poster)
+    {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lk(mMu);
+    if (mStop.load(std::memory_order_acquire))
+    {
+        // Shutting down: refuse the arm; the shutdown sweep terminates the event id itself with
+        // ok=0, which the caller's classic route still owns.
+        return -1;
+    }
+    for (auto& e : mEvents)
+    {
+        if (e.id == eventId)
+        {
+            if (e.chainId != 0)
+            {
+                return -1; // double arm refused
+            }
+            std::uint64_t const id = mNextId.fetch_add(1, std::memory_order_relaxed);
+            e.chainId = id;
+            e.chainPoster = std::move(poster);
+            return static_cast<std::int64_t>(id);
+        }
+    }
+    // Event already terminal (its completion is published or pending in mDone) or unknown: the
+    // caller lost the race and falls back to the classic path.
+    return -1;
+}
+
 std::uint64_t CompletionPoller::registerXfer(std::unique_ptr<TransferStatus> status)
 {
     std::uint64_t const id = mNextId.fetch_add(1, std::memory_order_relaxed);
@@ -112,14 +144,29 @@ std::vector<CompletionPoller::Completion> CompletionPoller::drain(int timeoutMs)
 
 std::size_t CompletionPoller::unregisterEvents(std::vector<cudaEvent_t> const& events)
 {
-    // Taking mMu synchronizes with pollLoop's sweep (pollOnceLocked runs under it): once this
-    // returns, no removed entry can be cudaEventQuery'd or have its onTerminal invoked.
-    std::lock_guard<std::mutex> lk(mMu);
+    // Taking mMu synchronizes with pollLoop's sweep (pollOnceLocked runs under it): once the erase
+    // is done, no removed entry can be cudaEventQuery'd or have its onTerminal invoked. Erasing an
+    // entry with an ARMED chain also drops its reserved id and poster — neither ever reports
+    // (consistent with the entry's own id; waiters unblock via the reactor's timeout/stall paths).
+    std::unique_lock<std::mutex> lk(mMu);
     auto const before = mEvents.size();
     mEvents.erase(std::remove_if(mEvents.begin(), mEvents.end(),
                       [&events](EventEntry const& e)
                       { return std::find(events.begin(), events.end(), e.event) != events.end(); }),
         mEvents.end());
+    // Chain posters run OUTSIDE mMu (executeChains, by design — drain()/register* must not stall
+    // behind postXferRequest), so the erase alone does not prove the poll thread is out of its
+    // sweep: wait — bounded and GIL-free (the poll thread never takes the GIL; it only needs mMu,
+    // which this wait releases) — for every in-flight poster to finish before returning, so the
+    // caller may safely destroy anything a poster could still reference. Posters are short (one
+    // RDMA post), so the bound only guards against a wedged agent; warn-and-proceed mirrors the
+    // other bounded teardown paths.
+    if (!mCv.wait_for(lk, std::chrono::seconds(2), [this] { return mChainsInFlight == 0; }))
+    {
+        TLLM_LOG_WARNING(
+            "CompletionPoller: %zu chain poster(s) still in flight after unregisterEvents wait; proceeding",
+            mChainsInFlight);
+    }
     return before - mEvents.size();
 }
 
@@ -151,7 +198,17 @@ void CompletionPoller::shutdown() noexcept
         {
             e.onTerminal();
         }
-        mDone.push_back(Completion{e.id, kKindEvent, 0});
+        if (e.chainId != 0)
+        {
+            // Armed chain, write never posted: terminate the RESERVED id (that is the only id the
+            // caller still routes; kKindXfer because the chunk's classic event route was dropped
+            // when the arm succeeded).
+            mDone.push_back(Completion{e.chainId, kKindXfer, 0});
+        }
+        else
+        {
+            mDone.push_back(Completion{e.id, kKindEvent, 0});
+        }
     }
     mEvents.clear();
     for (auto& x : mXfers)
@@ -186,7 +243,7 @@ void CompletionPoller::releaseXferLocked(XferEntry& entry)
     entry.status.reset();
 }
 
-bool CompletionPoller::pollOnceLocked()
+bool CompletionPoller::pollOnceLocked(std::vector<PendingChain>& chainsOut)
 {
     bool published = false;
 
@@ -207,8 +264,30 @@ bool CompletionPoller::pollOnceLocked()
         {
             it->onTerminal();
         }
-        mDone.push_back(Completion{it->id, kKindEvent, st == cudaSuccess ? 1 : 0});
-        published = true;
+        if (it->chainId != 0)
+        {
+            if (st == cudaSuccess)
+            {
+                // Successful gather with an armed chain: publish NOTHING for the event — the
+                // chunk's one completion is the reserved xfer id, resolved after the post. The
+                // in-flight count (under mMu, same critical section as the erase) lets
+                // unregisterEvents wait out the poster that will run outside mMu.
+                chainsOut.push_back(PendingChain{it->chainId, std::move(it->chainPoster)});
+                ++mChainsInFlight;
+            }
+            else
+            {
+                // Gather failed: the write is never posted. kKindEvent tells the caller the
+                // chain died at the gather stage (FAIL_GATHER, not FAIL_WRITE).
+                mDone.push_back(Completion{it->chainId, kKindEvent, 0});
+                published = true;
+            }
+        }
+        else
+        {
+            mDone.push_back(Completion{it->id, kKindEvent, st == cudaSuccess ? 1 : 0});
+            published = true;
+        }
         it = mEvents.erase(it);
     }
 
@@ -238,16 +317,59 @@ bool CompletionPoller::pollOnceLocked()
     return published;
 }
 
+void CompletionPoller::executeChains(std::vector<PendingChain>& chains)
+{
+    for (auto& chain : chains)
+    {
+        std::unique_ptr<TransferStatus> status;
+        try
+        {
+            status = chain.poster();
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_WARNING("CompletionPoller: armed chain post threw: %s", e.what());
+        }
+        std::lock_guard<std::mutex> lk(mMu);
+        // This chain's outside-mMu section is over; wake any unregisterEvents caller waiting for
+        // in-flight posters to drain. Decremented on EVERY path (success, failed post, shutdown).
+        --mChainsInFlight;
+        if (status == nullptr)
+        {
+            mDone.push_back(Completion{chain.id, kKindXfer, 0});
+            mCv.notify_all();
+            continue;
+        }
+        if (mStop.load(std::memory_order_acquire))
+        {
+            // Raced shutdown(): its sweep already drained mXfers and will never poll this handle —
+            // release it here and terminate the reserved id so no drain() caller waits forever.
+            XferEntry entry{chain.id, std::move(status)};
+            releaseXferLocked(entry);
+            mDone.push_back(Completion{chain.id, kKindXfer, 0});
+            mCv.notify_all();
+            continue;
+        }
+        mXfers.push_back(XferEntry{chain.id, std::move(status)});
+        mCv.notify_all();
+    }
+}
+
 void CompletionPoller::pollLoop()
 {
     while (!mStop.load(std::memory_order_acquire))
     {
+        std::vector<PendingChain> chains;
         {
             std::lock_guard<std::mutex> lk(mMu);
-            if (pollOnceLocked())
+            if (pollOnceLocked(chains))
             {
                 mCv.notify_all();
             }
+        }
+        if (!chains.empty())
+        {
+            executeChains(chains);
         }
         std::this_thread::sleep_for(std::chrono::microseconds(mPollIntervalUs));
     }
