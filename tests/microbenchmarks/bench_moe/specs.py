@@ -35,6 +35,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
 )
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, MoeModelConfig
@@ -47,6 +48,11 @@ _ROUTING_METHODS: Dict[str, type] = {
     "DEEPSEEK_V3": DeepSeekV3MoeRoutingMethod,
     "MINIMAX_M2": MiniMaxM2MoeRoutingMethod,
     "SIGMOID_RENORM": SigmoidRenormMoeRoutingMethod,
+}
+
+_ACTIVATIONS: Dict[str, ActivationType] = {
+    "SWIGLU": ActivationType.Swiglu,
+    "RELU2": ActivationType.Relu2,
 }
 
 _ROUTING_NAME_BY_CLS: Dict[type, str] = {cls: name for name, cls in _ROUTING_METHODS.items()}
@@ -117,6 +123,7 @@ class ModelSpec:
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
+    activation_type: str = "SWIGLU"
 
     def __post_init__(self) -> None:
         if self.n_shared_experts < 0:
@@ -129,6 +136,10 @@ class ModelSpec:
     @property
     def routing_method_cls(self) -> type:
         return _ROUTING_METHODS[self.routing_method]
+
+    @property
+    def activation_type_enum(self) -> ActivationType:
+        return _ACTIVATIONS[self.activation_type]
 
     @property
     def quant_algo_enum(self) -> Optional[QuantAlgo]:
@@ -394,5 +405,31 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         swiglu_alpha=1.702,
         swiglu_beta=1.0,
         swiglu_limit=7.0,
+    ),
+    # Qwen3.8, 2.4T total / A95B activated
+    "qwen3_8": ModelSpec(
+        name="qwen3_8",
+        num_experts=512,
+        top_k=10,
+        hidden_size=8192,
+        intermediate_size=2048,
+        quant_algo=None,
+        routing_method="RENORMALIZE",
+    ),
+    # Kimi-K3
+    # Activation is "situ" (situ(g) * up, situ(g) = b*tanh(g/b)*sigmoid(g)), which
+    # TensorRT-LLM does not implement here. situ is *gated*, so SWIGLU has the
+    # same fc1 fan-out, GEMM shapes and comm volume -- a faithful perf proxy,
+    # differing only in the epilogue elementwise math.
+    "kimi_k3": ModelSpec(
+        name="kimi_k3",
+        num_experts=896,
+        top_k=16,
+        hidden_size=3584,
+        intermediate_size=3072,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
     ),
 }
