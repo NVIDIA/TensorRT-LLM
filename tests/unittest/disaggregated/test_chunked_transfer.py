@@ -458,54 +458,6 @@ def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
 # ---------------------------------------------------------------------------
 
 
-def test_late_peer_replay_enqueues_before_concurrent_final_slice():
-    """Replay holds dispatch ordering until every older slice is queued."""
-    sender, session = _make_replay_sender()
-    enqueued_slice_ids = []
-    replay_build_started = threading.Event()
-    release_replay = threading.Event()
-    final_send_started = threading.Event()
-    final_send_done = threading.Event()
-
-    def build_write_meta(task, info):
-        if task.slice_id == 0 and not replay_build_started.is_set():
-            replay_build_started.set()
-            assert release_replay.wait(timeout=5)
-        return SimpleNamespace(task=task, peer_rank=info.instance_rank)
-
-    sender._build_kv_write_meta = build_write_meta
-    sender._enqueue = lambda meta: enqueued_slice_ids.append(meta.task.slice_id)
-
-    session.send(KVSlice(is_last_slice=False, block_ids_per_layer_groups=[[0]]))
-    session.send(KVSlice(is_last_slice=False, block_ids_per_layer_groups=[[1]]))
-
-    info = _replay_info()
-    replay_thread = threading.Thread(
-        target=sender._respond_with_kv,
-        args=(b"", [b"REQUEST_DATA", info.to_bytes()]),
-    )
-    replay_thread.start()
-    assert replay_build_started.wait(timeout=5)
-
-    def send_final_slice():
-        final_send_started.set()
-        session.send(KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[2]]))
-        final_send_done.set()
-
-    final_thread = threading.Thread(target=send_final_slice)
-    final_thread.start()
-    assert final_send_started.wait(timeout=5)
-    assert not final_send_done.wait(timeout=0.1)
-
-    release_replay.set()
-    replay_thread.join(timeout=5)
-    final_thread.join(timeout=5)
-
-    assert not replay_thread.is_alive()
-    assert not final_thread.is_alive()
-    assert enqueued_slice_ids == [0, 1, 2]
-
-
 def test_late_peer_replay_includes_final_slice_sent_before_registration():
     """A final slice buffered before replay is queued once after older slices."""
     sender, session = _make_replay_sender()

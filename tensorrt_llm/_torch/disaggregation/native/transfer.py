@@ -1164,30 +1164,28 @@ class Sender(SenderBase):
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
-        # dispatch_lock keeps replayed tasks ahead of concurrently added slices.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             if session is None:
                 self._save_peer_req_info(info)
                 return
-        with session.dispatch_lock:
-            with session.lock:
-                self._save_peer_req_info(info)
-                tasks = list(session.kv_tasks)
-                # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
-                # Send it directly to unblock the receiver's TRANSFERRING task event;
-                # CANCEL_SESSION alone would leave it stuck indefinitely.
-                if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
-                    self._send_failed_result_to_receiver(info)
-                    return
-            for task in tasks:
-                if task._perf_timer is not None:
-                    task._perf_timer.record_task_start(info.instance_rank)
-                trans_meta = self._build_kv_write_meta(task, info)
-                if task._perf_timer is not None:
-                    task._perf_timer.record_push_start(trans_meta.peer_rank)
-                self._enqueue(trans_meta)
+        with session.lock:
+            self._save_peer_req_info(info)
+            tasks = list(session.kv_tasks)
+            # No tasks: no worker will send KV_AGENT_RESULT FAILED to the receiver.
+            # Send it directly to unblock the receiver's TRANSFERRING task event;
+            # CANCEL_SESSION alone would leave it stuck indefinitely.
+            if not tasks and session.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                self._send_failed_result_to_receiver(info)
+                return
+        for task in tasks:
+            if task._perf_timer is not None:
+                task._perf_timer.record_task_start(info.instance_rank)
+            trans_meta = self._build_kv_write_meta(task, info)
+            if task._perf_timer is not None:
+                task._perf_timer.record_push_start(trans_meta.peer_rank)
+            self._enqueue(trans_meta)
 
     def _send_failed_result_to_receiver(self, info: RecvReqInfo):
         try:
@@ -1332,10 +1330,6 @@ class TxSession(TxSessionBase):
         self.kv_tasks = []
         self.aux_task = None
         self.lock = threading.Lock()
-        # Serializes task discovery and queue insertion between live sends and
-        # late-peer replay. The worker FIFO makes is_last_slice correct only
-        # when every older slice is enqueued first.
-        self.dispatch_lock = threading.Lock()
 
         self._exception: Optional[Exception] = None
         self._closed = False
@@ -1380,36 +1374,34 @@ class TxSession(TxSessionBase):
     def send(self, slice: KVSlice) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
-        with self.dispatch_lock:
-            with self.lock:
-                if not self.kv_tasks:
-                    overall_timeout_s = self._overall_timeout_s
-                    if overall_timeout_s is None or overall_timeout_s <= 0:
-                        overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
-                    self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
-                params = self._base_args.params
-                slice_id = len(self.kv_tasks)
-                task = KVSendTask(
-                    slice,
-                    params,
-                    slice_id,
-                    prompt_len=self._base_args.prompt_len,
-                    beam_width=self._base_args.beam_width,
-                )
-                task._unique_rid = self.disagg_request_id
-                self.kv_tasks.append(task)
-                req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
-            self._sender.dispatch_task(task, req_info_snapshot)
+        with self.lock:
+            if not self.kv_tasks:
+                overall_timeout_s = self._overall_timeout_s
+                if overall_timeout_s is None or overall_timeout_s <= 0:
+                    overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+                self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+            params = self._base_args.params
+            slice_id = len(self.kv_tasks)
+            task = KVSendTask(
+                slice,
+                params,
+                slice_id,
+                prompt_len=self._base_args.prompt_len,
+                beam_width=self._base_args.beam_width,
+            )
+            task._unique_rid = self.disagg_request_id
+            self.kv_tasks.append(task)
+            req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
+        self._sender.dispatch_task(task, req_info_snapshot)
 
     def send_aux(self) -> AuxSendTask:
-        with self.dispatch_lock:
-            with self.lock:
-                params = self._base_args.params
-                task = AuxSendTask(params, self.aux_slot)
-                task._unique_rid = self.disagg_request_id
-                self.aux_task = task
-                req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
-            self._sender.dispatch_task(task, req_info_snapshot)
+        with self.lock:
+            params = self._base_args.params
+            task = AuxSendTask(params, self.aux_slot)
+            task._unique_rid = self.disagg_request_id
+            self.aux_task = task
+            req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
+        self._sender.dispatch_task(task, req_info_snapshot)
         return task
 
     def pack_aux(self, request: LlmRequest) -> None:
