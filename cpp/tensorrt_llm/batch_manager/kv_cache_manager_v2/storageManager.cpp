@@ -1029,13 +1029,13 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     size_t quota = newQuota.has_value()
         ? roundUp(newQuota.value(), static_cast<size_t>(lvlStorage.poolSizeGranularity()))
         : lvlStorage.totalQuota();
-    size_t minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity());
+    auto const minSlots = minSlotsForTier(lvlStorage.cacheTier());
+    size_t const minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
     if (quota < minQuota)
     {
-        throw std::invalid_argument("Quota " + std::to_string(quota)
-            + " is insufficient for min_slots constraints (requires at least " + std::to_string(minQuota) + ")");
+        throw InsufficientQuotaError(lvlStorage.cacheTier(), quota, minQuota);
     }
-    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, mMinSlots, quota);
+    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
 
     if (!isLastLevel(level))
         TLLM_CHECK_DEBUG(persistentPages == nullptr);
@@ -1251,26 +1251,47 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
     TypedVec<PoolGroupIndex, float> const& ratio) const
 {
-    CacheTier tier = cacheTierOf(tierConfig);
-    size_t quota = cacheTierQuota(tierConfig);
-    size_t granularity = CacheLevelManager::cacheTierGranularity(tier, quota);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity), roundUp(quota, granularity));
-    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, mMinSlots);
+    CacheTier const tier = cacheTierOf(tierConfig);
+    size_t const configuredQuota = cacheTierQuota(tierConfig);
+    size_t const granularity = CacheLevelManager::cacheTierGranularity(tier, configuredQuota);
+    auto const minSlots = minSlotsForTier(tier);
+    size_t const minQuota = minQuotaForLevel(slotSizeLists, granularity, minSlots);
+    size_t const quota = roundUp(configuredQuota, granularity);
+    if (quota < minQuota)
+    {
+        throw InsufficientQuotaError(tier, quota, minQuota);
+    }
+    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
+}
+
+// ---------------------------------------------------------------------------
+// minSlotsForTier
+// ---------------------------------------------------------------------------
+
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::minSlotsForTier(CacheTier tier) const
+{
+    // Only the GPU tier follows workload-derived minimum-slot constraints.
+    // Lower tiers keep a one-slot structural floor per pool group.
+    if (tier == CacheTier::GPU_MEM)
+    {
+        return mMinSlots;
+    }
+    return TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(), 1);
 }
 
 // ---------------------------------------------------------------------------
 // minQuotaForLevel
 // ---------------------------------------------------------------------------
 
-size_t StorageManager::minQuotaForLevel(
-    TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity) const
+size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
     size_t total = 0;
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
         for (auto slotSize : slotSizeLists[pgIdx])
         {
-            total += roundUp(slotCountToSizeT(mMinSlots[pgIdx]) * slotSize, granularity);
+            total += roundUp(slotCountToSizeT(minSlots[pgIdx]) * slotSize, granularity);
         }
     }
     return total;

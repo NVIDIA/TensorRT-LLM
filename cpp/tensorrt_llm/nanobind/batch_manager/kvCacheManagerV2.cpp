@@ -634,6 +634,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
+    static nb::object sInsufficientQuotaError
+        = nb::exception<kv::InsufficientQuotaError>(m, "InsufficientQuotaError", PyExc_ValueError);
+    sInsufficientQuotaError.attr("cache_tier") = nb::none();
+    sInsufficientQuotaError.attr("quota") = nb::none();
+    sInsufficientQuotaError.attr("min_quota") = nb::none();
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();
 
@@ -702,6 +707,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("HOST_MEM", kv::CacheTier::HOST_MEM)
         .value("DISK", kv::CacheTier::DISK)
         .export_values();
+
+    // Preserve the tier and quota values used by creator-level diagnostics.
+    nb::register_exception_translator(
+        [](std::exception_ptr const& p, void*)
+        {
+            try
+            {
+                if (p)
+                {
+                    std::rethrow_exception(p);
+                }
+            }
+            catch (kv::InsufficientQuotaError const& e)
+            {
+                nb::object inst = sInsufficientQuotaError(nb::str(e.what()));
+                inst.attr("cache_tier") = nb::cast(e.cacheTier);
+                inst.attr("quota") = nb::cast(e.quota);
+                inst.attr("min_quota") = nb::cast(e.minQuota);
+                PyErr_SetObject(sInsufficientQuotaError.ptr(), inst.ptr());
+            }
+        });
 
     // ---- KvCache::Status enum (also accessible as _KVCache.Status) ---------
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")

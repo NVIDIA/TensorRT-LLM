@@ -86,7 +86,12 @@ if _BACKEND == "python":
         KVCacheUpdatedData,
         UniqueToken,
     )
-    from ._exceptions import CuError, OutOfMemoryError, OutOfPagesError  # noqa: F401
+    from ._exceptions import (  # noqa: F401
+        CuError,
+        InsufficientQuotaError,
+        OutOfMemoryError,
+        OutOfPagesError,
+    )
     from ._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycleId  # noqa: F401
     from ._stats import (  # noqa: F401
         _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -217,6 +222,38 @@ else:
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(KVCacheIterationStatsDelta._field_names)
     PlannedDropHandle = _cpp.PlannedDropHandle
     CuError = _cpp.CuError
+    InsufficientQuotaError = _cpp.InsufficientQuotaError
+
+    def _init_insufficient_quota_error(
+        self,
+        cache_tier_or_message: object,
+        quota: Optional[int] = None,
+        min_quota: Optional[int] = None,
+    ) -> None:
+        # The C++ translator constructs the exception from its formatted
+        # message, while callers use the same structured constructor as the
+        # pure-Python backend.
+        if quota is None and min_quota is None:
+            ValueError.__init__(self, cache_tier_or_message)
+            return
+        if quota is None or min_quota is None:
+            raise TypeError("quota and min_quota must be provided together")
+        self.cache_tier = cache_tier_or_message
+        self.quota = quota
+        self.min_quota = min_quota
+        tier_name = {
+            "GPU_MEM": "GPU",
+            "HOST_MEM": "host",
+            "DISK": "disk",
+        }[getattr(cache_tier_or_message, "name")]
+        ValueError.__init__(
+            self,
+            f"{tier_name} cache tier quota {quota} is insufficient for the minimum "
+            f"storage layout (requires at least {min_quota})",
+        )
+
+    InsufficientQuotaError.__init__ = _init_insufficient_quota_error
+    del _init_insufficient_quota_error
 
     # Symbols added on main that are not yet ported to the C++ backend.
     # TODO(kvCacheManagerV2-cpp): port these and replace the fallbacks.
@@ -309,6 +346,7 @@ __all__ = [
     "GpuCacheTierConfig",
     "HalfOpenRange",
     "HostCacheTierConfig",
+    "InsufficientQuotaError",
     "KVCacheDesc",
     "KVCacheCreatedData",
     "KVCacheEvent",

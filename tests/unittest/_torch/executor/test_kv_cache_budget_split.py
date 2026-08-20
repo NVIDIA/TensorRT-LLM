@@ -23,6 +23,7 @@ from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, InsufficientQuotaError
 
 pytestmark = pytest.mark.cpu_only
 
@@ -68,6 +69,23 @@ def _make_creator(
     )
 
     return c
+
+
+def test_build_managers_reports_gpu_quota_guidance() -> None:
+    creator = object.__new__(KvCacheCreator)
+    quota_error = InsufficientQuotaError(CacheTier.GPU_MEM, 1 << 30, 2 << 30)
+    creator._build_managers = Mock(side_effect=quota_error)
+
+    with pytest.raises(ValueError) as raised:
+        creator.build_managers({})
+
+    message = str(raised.value)
+    assert "max_gpu_total_bytes" in message
+    assert "free_gpu_memory_fraction" in message
+    assert "max_batch_size" in message
+    assert "max_seq_len" in message
+    assert "max_num_tokens" in message
+    assert raised.value.__cause__ is quota_error
 
 
 class TestSplitGpuBudgetForDraft:
