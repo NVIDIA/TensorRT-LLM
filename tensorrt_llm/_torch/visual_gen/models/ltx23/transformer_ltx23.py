@@ -71,9 +71,9 @@ class LTX23TransformerBlock(nn.Module):
 
         # Matches LTX-2's per-block gate: on unsupported inner dims the helpers
         # fall back to the numerically identical eager path.
-        self._fuse_adaln = (
-            video is None or is_fused_adaln_supported_dim(video.dim)
-        ) and (audio is None or is_fused_adaln_supported_dim(audio.dim))
+        self._fuse_adaln = (video is None or is_fused_adaln_supported_dim(video.dim)) and (
+            audio is None or is_fused_adaln_supported_dim(audio.dim)
+        )
 
         def attn(name, query_dim, context_dim, kv, gated):
             return LTX2Attention(
@@ -176,15 +176,27 @@ class LTX23TransformerBlock(nn.Module):
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(6, 9)
             )
             norm_vx = apply_fused_rmsnorm_shift_scale(
-                vx, vscale_msa[0], vscale_msa[1], vshift_msa[0], vshift_msa[1],
-                self.norm_eps, self._fuse_adaln,
+                vx,
+                vscale_msa[0],
+                vscale_msa[1],
+                vshift_msa[0],
+                vshift_msa[1],
+                self.norm_eps,
+                self._fuse_adaln,
             )
             v_msa = self.attn1(norm_vx, pe=video.positional_embeddings, timestep=video.timesteps)
             # vx <- vx + v_msa * gate_msa, rms_norm, then the query modulation.
             vx, attn2_q_input = apply_fused_gate_resid_rmsnorm_shift_scale(
-                vx, v_msa, vgate_msa[0], vgate_msa[1],
-                vscale_ca[0], vscale_ca[1], vshift_ca[0], vshift_ca[1],
-                self.norm_eps, self._fuse_adaln,
+                vx,
+                v_msa,
+                vgate_msa[0],
+                vgate_msa[1],
+                vscale_ca[0],
+                vscale_ca[1],
+                vshift_ca[0],
+                vshift_ca[1],
+                self.norm_eps,
+                self._fuse_adaln,
             )
             v_ca = self._text_cross_attention(
                 attn2_q_input,
@@ -194,9 +206,7 @@ class LTX23TransformerBlock(nn.Module):
                 video.timesteps,
                 video_prompt_timestep,
             )
-            vx = apply_fused_gate_resid(
-                vx, v_ca, vgate_ca[0], vgate_ca[1], self._fuse_adaln
-            )
+            vx = apply_fused_gate_resid(vx, v_ca, vgate_ca[0], vgate_ca[1], self._fuse_adaln)
 
         # --- Audio self-attention + text cross-attention ---
         if run_ax:
@@ -207,14 +217,28 @@ class LTX23TransformerBlock(nn.Module):
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(6, 9)
             )
             norm_ax = apply_fused_rmsnorm_shift_scale(
-                ax, ascale_msa[0], ascale_msa[1], ashift_msa[0], ashift_msa[1],
-                self.norm_eps, self._fuse_adaln,
+                ax,
+                ascale_msa[0],
+                ascale_msa[1],
+                ashift_msa[0],
+                ashift_msa[1],
+                self.norm_eps,
+                self._fuse_adaln,
             )
-            a_msa = self.audio_attn1(norm_ax, pe=audio.positional_embeddings, timestep=audio.timesteps)
+            a_msa = self.audio_attn1(
+                norm_ax, pe=audio.positional_embeddings, timestep=audio.timesteps
+            )
             ax, audio_attn2_q_input = apply_fused_gate_resid_rmsnorm_shift_scale(
-                ax, a_msa, agate_msa[0], agate_msa[1],
-                ascale_ca[0], ascale_ca[1], ashift_ca[0], ashift_ca[1],
-                self.norm_eps, self._fuse_adaln,
+                ax,
+                a_msa,
+                agate_msa[0],
+                agate_msa[1],
+                ascale_ca[0],
+                ascale_ca[1],
+                ashift_ca[0],
+                ashift_ca[1],
+                self.norm_eps,
+                self._fuse_adaln,
             )
             a_ca = self._text_cross_attention(
                 audio_attn2_q_input,
@@ -224,9 +248,7 @@ class LTX23TransformerBlock(nn.Module):
                 audio.timesteps,
                 audio_prompt_timestep,
             )
-            ax = apply_fused_gate_resid(
-                ax, a_ca, agate_ca[0], agate_ca[1], self._fuse_adaln
-            )
+            ax = apply_fused_gate_resid(ax, a_ca, agate_ca[0], agate_ca[1], self._fuse_adaln)
 
         # --- Bidirectional audio <-> video cross-attention (identical to LTX-2) ---
         if run_a2v or run_v2a:
@@ -239,8 +261,13 @@ class LTX23TransformerBlock(nn.Module):
                     video.cross_gate_timestep,
                 )
                 a2v_vx = apply_fused_rmsnorm_shift_scale(
-                    vx_pre, scale_v_a2v[0], scale_v_a2v[1], shift_v_a2v[0], shift_v_a2v[1],
-                    self.norm_eps, self._fuse_adaln,
+                    vx_pre,
+                    scale_v_a2v[0],
+                    scale_v_a2v[1],
+                    shift_v_a2v[0],
+                    shift_v_a2v[1],
+                    self.norm_eps,
+                    self._fuse_adaln,
                 )
                 scale_a_a2v, shift_a_a2v, _, _, _ = _get_av_ca_ada_table_ts_pairs(
                     self.scale_shift_table_a2v_ca_audio,
@@ -249,8 +276,13 @@ class LTX23TransformerBlock(nn.Module):
                     audio.cross_gate_timestep,
                 )
                 a2v_ax = apply_fused_rmsnorm_shift_scale(
-                    ax_pre, scale_a_a2v[0], scale_a_a2v[1], shift_a_a2v[0], shift_a_a2v[1],
-                    self.norm_eps, self._fuse_adaln,
+                    ax_pre,
+                    scale_a_a2v[0],
+                    scale_a_a2v[1],
+                    shift_a_a2v[0],
+                    shift_a_a2v[1],
+                    self.norm_eps,
+                    self._fuse_adaln,
                 )
                 k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
                     a2v_ax, pe=audio.cross_positional_embeddings
@@ -271,8 +303,13 @@ class LTX23TransformerBlock(nn.Module):
                     audio.cross_gate_timestep,
                 )
                 v2a_ax = apply_fused_rmsnorm_shift_scale(
-                    ax_pre, scale_a_v2a[0], scale_a_v2a[1], shift_a_v2a[0], shift_a_v2a[1],
-                    self.norm_eps, self._fuse_adaln,
+                    ax_pre,
+                    scale_a_v2a[0],
+                    scale_a_v2a[1],
+                    shift_a_v2a[0],
+                    shift_a_v2a[1],
+                    self.norm_eps,
+                    self._fuse_adaln,
                 )
                 _, _, scale_v_v2a, shift_v_v2a, _ = _get_av_ca_ada_table_ts_pairs(
                     self.scale_shift_table_a2v_ca_video,
@@ -281,8 +318,13 @@ class LTX23TransformerBlock(nn.Module):
                     video.cross_gate_timestep,
                 )
                 v2a_vx = apply_fused_rmsnorm_shift_scale(
-                    vx_pre, scale_v_v2a[0], scale_v_v2a[1], shift_v_v2a[0], shift_v_v2a[1],
-                    self.norm_eps, self._fuse_adaln,
+                    vx_pre,
+                    scale_v_v2a[0],
+                    scale_v_v2a[1],
+                    shift_v_v2a[0],
+                    shift_v_v2a[1],
+                    self.norm_eps,
+                    self._fuse_adaln,
                 )
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
                     v2a_vx, pe=video.cross_positional_embeddings
@@ -301,8 +343,13 @@ class LTX23TransformerBlock(nn.Module):
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
             )
             vx_scaled = apply_fused_rmsnorm_shift_scale(
-                vx, vscale_mlp[0], vscale_mlp[1], vshift_mlp[0], vshift_mlp[1],
-                self.norm_eps, self._fuse_adaln,
+                vx,
+                vscale_mlp[0],
+                vscale_mlp[1],
+                vshift_mlp[0],
+                vshift_mlp[1],
+                self.norm_eps,
+                self._fuse_adaln,
             )
             vx = apply_fused_gate_resid(
                 vx, self.ff(vx_scaled), vgate_mlp[0], vgate_mlp[1], self._fuse_adaln
@@ -314,8 +361,13 @@ class LTX23TransformerBlock(nn.Module):
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
             )
             ax_scaled = apply_fused_rmsnorm_shift_scale(
-                ax, ascale_mlp[0], ascale_mlp[1], ashift_mlp[0], ashift_mlp[1],
-                self.norm_eps, self._fuse_adaln,
+                ax,
+                ascale_mlp[0],
+                ascale_mlp[1],
+                ashift_mlp[0],
+                ashift_mlp[1],
+                self.norm_eps,
+                self._fuse_adaln,
             )
             ax = apply_fused_gate_resid(
                 ax, self.audio_ff(ax_scaled), agate_mlp[0], agate_mlp[1], self._fuse_adaln

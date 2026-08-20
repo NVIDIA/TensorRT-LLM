@@ -71,10 +71,10 @@ def _detect_native_ltx_pipeline(config: dict) -> str:
             f"missing={sorted(missing)}, mismatched={mismatched}"
         )
     if transformer.get("cross_attention_adaln") is not True:
-        raise ValueError(
-            "LTX-2.3 text projection found without cross_attention_adaln=True."
-        )
+        raise ValueError("LTX-2.3 text projection found without cross_attention_adaln=True.")
     return "LTX23Pipeline"
+
+
 # --- end LTX-2.3 detection ---------------------------------------------------
 
 if TYPE_CHECKING:

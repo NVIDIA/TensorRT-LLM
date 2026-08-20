@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""End-to-end golden-media tests for LTX-2.3, the counterpart to the
-test_ltx2_lpips_against_golden family in test_visual_gen.py.
+"""End-to-end golden-media tests for LTX-2.3.
+
+The counterpart to the test_ltx2_lpips_against_golden family in test_visual_gen.py.
 
 LTX-2.3 emits audio and video, so quality is gated on two axes: decoded pixels
 against a golden MP4 via the shared LPIPS eval script, and the audio waveform
@@ -39,17 +40,13 @@ import soundfile as sf
 import torch
 from defs.conftest import llm_models_root
 
-REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..")
-)
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
 VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
     REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
 )
 
 _MODELS_ROOT = str(llm_models_root())
-LTX23_MODEL_PATH = os.environ.get(
-    "LTX23_MODEL_PATH", os.path.join(_MODELS_ROOT, "LTX-2.3")
-)
+LTX23_MODEL_PATH = os.environ.get("LTX23_MODEL_PATH", os.path.join(_MODELS_ROOT, "LTX-2.3"))
 LTX23_TEXT_ENCODER_PATH = os.environ.get(
     "LTX23_TEXT_ENCODER_PATH", os.path.join(_MODELS_ROOT, "gemma", "gemma-3-12b-it")
 )
@@ -79,9 +76,7 @@ LTX23_LPIPS_SEED = 42
 # cross-host kernel drift. The audio gate is mean absolute log-mel difference in
 # dB; deterministic same-host reruns land near zero.
 LTX23_LPIPS_THRESHOLD = 0.05
-LTX23_AUDIO_MEL_L1_THRESHOLD = float(
-    os.environ.get("LTX23_AUDIO_MEL_L1_THRESHOLD", "0.45")
-)
+LTX23_AUDIO_MEL_L1_THRESHOLD = float(os.environ.get("LTX23_AUDIO_MEL_L1_THRESHOLD", "0.45"))
 
 
 def _skip_if_missing(path, label, is_dir=False):
@@ -116,9 +111,7 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
     except RuntimeError as err:
         if "MP4 format requires ffmpeg" not in str(err):
             raise
-        raise RuntimeError(
-            f"ffmpeg is unavailable for LPIPS video encoding: {err}"
-        ) from err
+        raise RuntimeError(f"ffmpeg is unavailable for LPIPS video encoding: {err}") from err
     assert os.path.isfile(output_path), f"LTX-2.3 did not produce video {output_path}"
 
 
@@ -146,9 +139,7 @@ def _run_lpips_eval(tmp_dir, sample_id, prompt, reference_path, generated_path):
     env = os.environ.copy()
     env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     env["PYTHONPATH"] = (
-        f"{REPO_ROOT}{os.pathsep}{env['PYTHONPATH']}"
-        if env.get("PYTHONPATH")
-        else REPO_ROOT
+        f"{REPO_ROOT}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else REPO_ROOT
     )
     with _lpips_deterministic_algorithms():
         result = subprocess.run(
@@ -216,9 +207,7 @@ def _generate_ltx23_av(video_out_path, audio_out_path):
     from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
     _skip_if_missing(LTX23_MODEL_PATH, "LTX-2.3 checkpoint", is_dir=True)
-    _skip_if_missing(
-        LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (gemma-3-12b-it)", is_dir=True
-    )
+    _skip_if_missing(LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (gemma-3-12b-it)", is_dir=True)
 
     # Nested @torch.compile decorators are not suppressed by
     # TorchCompileConfig(enable=False) alone, so force eager over the whole render.
@@ -272,8 +261,7 @@ def test_ltx23_video_lpips_against_golden(tmp_path, ltx23_av_candidate):
         str(tmp_path), "ltx23", LTX23_LPIPS_PROMPT, LTX23_GOLDEN_VIDEO, video_path
     )
     assert score < LTX23_LPIPS_THRESHOLD, (
-        f"LTX-2.3 video LPIPS too high: {score:.6f} "
-        f"(expected < {LTX23_LPIPS_THRESHOLD:.6f})"
+        f"LTX-2.3 video LPIPS too high: {score:.6f} (expected < {LTX23_LPIPS_THRESHOLD:.6f})"
     )
 
 
@@ -293,9 +281,7 @@ def test_ltx23_audio_against_golden(ltx23_av_candidate):
 def test_ltx23_example(tmp_path):
     """The LTX-2 example driver in --model_type ltx23 mode produces an MP4."""
     _skip_if_missing(LTX23_MODEL_PATH, "LTX-2.3 checkpoint", is_dir=True)
-    _skip_if_missing(
-        LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (gemma-3-12b-it)", is_dir=True
-    )
+    _skip_if_missing(LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (gemma-3-12b-it)", is_dir=True)
 
     examples_root = os.path.join(REPO_ROOT, "examples", "visual_gen")
     output_path = os.path.join(str(tmp_path), "ltx23_output.mp4")
@@ -303,12 +289,16 @@ def test_ltx23_example(tmp_path):
         [
             sys.executable,
             os.path.join(examples_root, "models", "ltx2.py"),
-            "--model_type", "ltx23",
-            "--model", LTX23_MODEL_PATH,
+            "--model_type",
+            "ltx23",
+            "--model",
+            LTX23_MODEL_PATH,
             "--visual_gen_args",
             os.path.join(examples_root, "configs", "ltx23-t2v-bf16-1gpu.yaml"),
-            "--text_encoder_path", LTX23_TEXT_ENCODER_PATH,
-            "--output_path", output_path,
+            "--text_encoder_path",
+            LTX23_TEXT_ENCODER_PATH,
+            "--output_path",
+            output_path,
         ],
         check=False,
     )

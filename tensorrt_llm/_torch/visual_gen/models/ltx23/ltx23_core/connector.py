@@ -91,9 +91,7 @@ def _build_connector(
         attention_head_dim=attention_head_dim,
         num_attention_heads=num_attention_heads,
         num_layers=cfg.get("connector_num_layers", 8),
-        positional_embedding_max_pos=cfg.get(
-            "connector_positional_embedding_max_pos", [4096]
-        ),
+        positional_embedding_max_pos=cfg.get("connector_positional_embedding_max_pos", [4096]),
         num_learnable_registers=cfg.get("connector_num_learnable_registers", 128),
         rope_type=rope_type,
         double_precision_rope=double_precision_rope,
