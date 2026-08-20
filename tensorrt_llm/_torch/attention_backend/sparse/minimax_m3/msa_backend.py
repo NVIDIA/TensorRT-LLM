@@ -1768,17 +1768,22 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         block_table = None
         seq_lens_cuda = None
         decode_query_len = None
-        # gen_first is the span's first query token: the scorer takes
-        # [gen_first, num_tokens) over rows [ctx_rows, row_last) and the proxy
-        # the context prefix ahead of both, which is empty on a pure-decode step.
+        # The scorer takes query tokens [gen_first, gen_last) over rows
+        # [ctx_rows, row_last), and the proxy the context prefix ahead of both,
+        # which is empty on a pure-decode step. Unported, the proxy takes the
+        # whole batch and neither bound applies.
         gen_first = 0
+        gen_last = num_tokens
         ctx_rows = 0
         if ported:
-            gen_first, ctx_rows, row_last, decode_query_len = msa_decode_span_bounds(
+            gen_first, gen_last, ctx_rows, row_last, decode_query_len = msa_decode_span_bounds(
                 metadata, num_tokens
             )
             block_table = metadata.msa_block_table[ctx_rows:row_last]
             seq_lens_cuda = metadata.msa_seq_lens_cuda[ctx_rows:row_last]
+        # Tokens the max-score buffer must cover: the span's own once the scorer
+        # owns it, the whole batch otherwise.
+        span_tokens = gen_last - gen_first
         # One selection path, and one thing decides which scratch it reads:
         # only a pure-decode step is CUDA-graph captured, so only there did
         # prepare() mirror the plans into the graph-safe buffers and refresh the
@@ -1800,7 +1805,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 else int(proxy_plan[3]["max_k_tiles"])
             )
             max_score = metadata.msa_proxy_max_score_view(
-                config.num_index_heads, plan_max_k_tiles, num_tokens
+                config.num_index_heads, plan_max_k_tiles, span_tokens
             )
             n_valid_blocks = metadata.msa_n_valid_blocks[:num_tokens]
         else:
@@ -1811,17 +1816,16 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             n_valid_blocks = metadata.msa_eager_n_valid_blocks
             if n_valid_blocks is not None:
                 n_valid_blocks = n_valid_blocks[:num_tokens]
-            # The scorer never allocates: it fills the buffer it is handed.
-            # Shaped to the span's tokens alone, because the proxy writes its
-            # own half as a contiguous [heads, k_tiles, tokens] block (see
-            # msa_proxy_max_score_view) and so cannot take a slice of this one.
-            # The span's tokens are at most a decode step's worth, which is what
-            # the store was sized for.
+            # The scorer never allocates: it fills the buffer it is handed, and
+            # cannot fill a slice of the proxy's, which fmha_sm100 writes as one
+            # contiguous [heads, k_tiles, tokens] block (see
+            # msa_proxy_max_score_view). A span is at most a decode step's worth
+            # of tokens, which is what the store was sized for.
             max_score = (
                 metadata.msa_proxy_max_score_view(
                     config.num_index_heads,
                     metadata.msa_worst_case_max_k_tiles,
-                    num_tokens - gen_first,
+                    span_tokens,
                 )
                 if ported
                 else None
@@ -1843,6 +1847,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             seq_lens_cuda=seq_lens_cuda,
             decode_query_len=decode_query_len,
             gen_token_first=gen_first,
+            gen_token_last=gen_last,
             ctx_rows=ctx_rows,
         )
 

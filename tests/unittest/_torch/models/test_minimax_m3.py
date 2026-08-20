@@ -172,6 +172,63 @@ def test_minimax_m3_fused_sparse_producer_fake_shapes(monkeypatch):
     assert index_q.dtype == torch.float8_e4m3fn
 
 
+def test_attention_dispatch_clips_the_piecewise_token_pad():
+    """Only the live tokens reach the attention core, and the output's pad rows
+    come back zeroed rather than as the buffer supplied them."""
+    seen = {}
+
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+        seen["rows"] = [None if t is None else int(t.shape[0]) for t in (q, k, v, idx_q, idx_k)]
+        seen["out_rows"] = int(output.shape[0])
+        output.fill_(7.0)
+
+    attn_layer = SimpleNamespace(_dispatch_attention_backend=capture)
+    # Eleven speculative decode requests of 4 query tokens, padded to 64.
+    padded, live, hidden = 64, 44, 8
+    q = torch.ones((padded, hidden))
+    output = torch.full((padded, hidden), float("nan"))
+
+    minimax_m3_module._dispatch_attention_over_live_tokens(
+        attn_layer,
+        q,
+        q,
+        q,
+        None,
+        None,
+        SimpleNamespace(num_tokens=live),
+        output,
+    )
+
+    assert seen["rows"] == [live, live, live, None, None]
+    assert seen["out_rows"] == live
+    assert torch.equal(output[:live], torch.full((live, hidden), 7.0))
+    assert torch.equal(output[live:], torch.zeros(padded - live, hidden))
+
+
+def test_attention_dispatch_leaves_an_unpadded_step_alone():
+    """No pad, so nothing to clip and nothing to zero."""
+    seen = {}
+
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+        seen["out"] = output
+        del q, k, v, idx_q, idx_k, attn_metadata
+
+    output = torch.full((5, 8), float("nan"))
+    minimax_m3_module._dispatch_attention_over_live_tokens(
+        SimpleNamespace(_dispatch_attention_backend=capture),
+        torch.ones((5, 8)),
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_tokens=5),
+        output,
+    )
+
+    assert seen["out"].shape == (5, 8)
+    assert output.isnan().all()
+
+
 def _make_text_config():
     """Build a SimpleNamespace mimicking the real M3 text config (trimmed)."""
     sparse_attention_config = {

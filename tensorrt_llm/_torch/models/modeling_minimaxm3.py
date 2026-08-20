@@ -818,6 +818,42 @@ def _extract_minimax_m3_attention_extra_attrs(layer_idx: str):
     return metadata, attn_layer
 
 
+def _dispatch_attention_over_live_tokens(
+    attn_layer: "MiniMaxM3Attention",
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    idx_q: Optional[torch.Tensor],
+    idx_k: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+    output: torch.Tensor,
+) -> None:
+    """Run the attention core over the step's live tokens alone.
+
+    A piecewise CUDA graph pads token-shaped inputs up to its capture bucket
+    without adding requests to go with them (see _get_padding_params in
+    model_engine), so q can outrun the rows the batch has. The kernels below
+    read a request out of a token index, so the pad comes off here, once for
+    both dispatch paths rather than at each kernel.
+
+    No kernel writes the pad rows of output, so they are zeroed instead of
+    left holding whatever the buffer came with, which no one can tell from a
+    real NaN.
+    """
+    num_tokens = int(attn_metadata.num_tokens)
+    if num_tokens < int(output.shape[0]):
+        output[num_tokens:].zero_()
+    attn_layer._dispatch_attention_backend(
+        q[:num_tokens],
+        k[:num_tokens] if k is not None else None,
+        v[:num_tokens] if v is not None else None,
+        idx_q[:num_tokens] if idx_q is not None else None,
+        idx_k[:num_tokens] if idx_k is not None else None,
+        attn_metadata,
+        output[:num_tokens],
+    )
+
+
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
 def minimax_m3_attn_custom_op_inplace(
     q: torch.Tensor,
@@ -830,16 +866,9 @@ def minimax_m3_attn_custom_op_inplace(
 ) -> None:
     """Run MiniMax-M3 cache and attention work behind a compile boundary."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
-    num_tokens = attn_metadata.num_tokens
-    attn_layer._dispatch_attention_backend(
-        q[:num_tokens],
-        k[:num_tokens] if k is not None else None,
-        v[:num_tokens] if v is not None else None,
-        idx_q[:num_tokens] if idx_q is not None else None,
-        idx_k[:num_tokens] if idx_k is not None else None,
-        attn_metadata,
-        output[:num_tokens],
-    )
+    # The live token count is a host value, so the compiled graph above must
+    # not see it: it would guard on it and recapture per count.
+    _dispatch_attention_over_live_tokens(attn_layer, q, k, v, idx_q, idx_k, attn_metadata, output)
 
 
 @torch.library.custom_op("trtllm::minimax_m3_fused_sparse_qkv_producer", mutates_args=())
@@ -1893,7 +1922,10 @@ class MiniMaxM3Attention(Attention):
                 output,
             )
         else:
-            self._dispatch_attention_backend(q, k, v, idx_q, idx_k, attn_metadata, output)
+            # A generation-only step runs here rather than through compile
+            # (_ContextOnlyCompiledModel) and is padded all the same, since the
+            # bucket is agreed across ranks.
+            _dispatch_attention_over_live_tokens(self, q, k, v, idx_q, idx_k, attn_metadata, output)
         return output
 
     def _dispatch_attention_backend(
