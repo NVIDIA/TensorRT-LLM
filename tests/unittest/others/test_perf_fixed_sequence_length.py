@@ -18,11 +18,26 @@ import sys
 import types
 
 import pytest
+import yaml
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "integration"))
 
 from defs.perf import test_perf as perf_test  # noqa: E402
+
+
+def _make_runner(runtime: str) -> perf_test.MultiMetricPerfTest:
+    runner = object.__new__(perf_test.MultiMetricPerfTest)
+    runner._config = perf_test.PerfTestConfig(
+        model_name="test_model",
+        runtime=runtime,
+        backend="pytorch" if runtime == "bench" else "",
+        input_lens=[500],
+        output_lens=[2000],
+    )
+    runner._benchmark_script = "trtllm-bench"
+    runner.lora_dirs = []
+    return runner
 
 
 @pytest.mark.parametrize(
@@ -154,3 +169,37 @@ def test_model_yaml_skips_avg_seq_len_for_older_schema(monkeypatch: pytest.Monke
     config = runner._get_model_yaml_config()
 
     assert "kv_cache_config" not in config
+
+
+def test_bench_command_uses_inferred_avg_seq_len(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner("bench")
+    monkeypatch.setattr(perf_test, "get_model_dir", lambda model_name: "/models/test")
+    monkeypatch.setattr(perf_test, "get_model_yaml_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(perf_test, "get_sampler_options_config", lambda config: {})
+
+    command = runner.get_trtllm_bench_command(str(tmp_path))
+
+    config_argument = next(argument for argument in command if argument.startswith("--config="))
+    config_path = pathlib.Path(config_argument.removeprefix("--config="))
+    with config_path.open() as config_file:
+        config = yaml.safe_load(config_file)
+    assert config["kv_cache_config"]["avg_seq_len"] == 2500
+
+
+def test_serve_command_uses_inferred_avg_seq_len(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner("serve")
+    monkeypatch.setattr(perf_test, "get_model_dir", lambda model_name: "/models/test")
+    monkeypatch.setattr(perf_test, "get_model_yaml_config", lambda *args, **kwargs: {})
+
+    command = runner.get_trtllm_serve_server_command(str(tmp_path))
+
+    config_path = pathlib.Path(command[command.index("--config") + 1])
+    with config_path.open() as config_file:
+        config = yaml.safe_load(config_file)
+    assert config["kv_cache_config"]["avg_seq_len"] == 2500
