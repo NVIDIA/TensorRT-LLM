@@ -144,12 +144,20 @@ class CoordinatorServer:
     async def version(self) -> Response:
         return self._response({"version": VERSION})
 
-    async def __call__(self, host: str, port: int, uds: Optional[str] = None) -> None:
+    async def __call__(
+        self,
+        host: str,
+        port: int,
+        uds: Optional[str] = None,
+        keep_alive_timeout: int = TIMEOUT_KEEP_ALIVE,
+    ) -> None:
         # Single-process (owns routing state + the centralized ZMQ ingest bind);
         # workers=1 forced so a leaked WEB_CONCURRENCY can't fork it. When ``uds``
         # is set the co-located fleet uses it for the hot /select,/finish path
         # (avoids the TCP loopback overhead that dominated per-request latency).
-        kwargs = dict(workers=1, log_level="info", timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+        # keep_alive_timeout comes from the disaggregated config's
+        # ``server_keep_alive_timeout`` so both listeners are tuned by one key.
+        kwargs = dict(workers=1, log_level="info", timeout_keep_alive=keep_alive_timeout)
         if uds:
             # uvicorn.Config binds uds XOR host:port, so run two Servers: UDS for
             # the fleet (hot path) and TCP for health/external clients.

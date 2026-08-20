@@ -365,26 +365,25 @@ class SessionReuseCache:
         real = None
         prefetcher = _prefetcher()
         if prefetcher is not None:
+            # A timeout must fail closed: starting a synchronous replacement
+            # would create two MPI pools concurrently on the same allocation.
+            # Unexpected prefetcher errors also propagate instead of silently
+            # hiding lifecycle bugs behind a synchronous fallback.
+            real = prefetcher.take(n_workers)
+        if real is None:
+            # One attempt gets the full worker-bootstrap deadline. If identity
+            # collection still fails, unidentified workers may remain alive;
+            # an immediate retry would overlap another MPI bootstrap with
+            # them, so propagate the fail-closed error.
+            real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
+        if prefetcher is not None:
             try:
-                real = prefetcher.take(n_workers)
-            except Exception as e:  # prefetch is an optimization: fall back
-                print(f"[session-reuse] prefetched-pool take failed: {e}", flush=True)
-                real = None
-            try:
-                # Restock ONE shadow for the next miss of this size (no-op if
-                # one is already armed/building, or prefetch is disabled).
+                # Restock only after the current pool is ready. On a shadow
+                # miss, scheduling before the synchronous spawn would make
+                # two MPI pools bootstrap concurrently on the same GPUs.
                 prefetcher.schedule_shadow(n_workers, env_overlay=overrides)
             except Exception:
                 pass
-        if real is None:
-            try:
-                real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
-            except Exception as e:
-                # wait_shutdown spawns fail closed (identity collection must
-                # complete); a transient slow node deserves one loud retry —
-                # a second failure means the node is genuinely broken.
-                print(f"[session-reuse] pool spawn failed, retrying once: {e}", flush=True)
-                real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
         real._reuse_uses = 0
         real._reuse_spawn_snapshot = snapshot
         # (pid, start_time) per worker, recorded by the library at spawn

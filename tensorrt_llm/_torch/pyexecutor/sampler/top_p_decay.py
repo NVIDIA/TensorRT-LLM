@@ -67,7 +67,7 @@ class TopPDecayStore:
        consumed.
     2. Pre-sample (``TopPDecayHandler.build_metadata`` -> ``TopPDecayMetadata``
        -> ``TopPDecayMixin``): the per-row top-p fed to top_p /
-       top_k_top_p sampling is overridden with the decayed runtime value
+       top_k_top_p / min_p sampling is overridden with the decayed runtime value
        for decay-active rows (fused gather, ``top_p_decay_gather``).
     3. Post-sample (``TopPDecayHandler.update_after_sample``): the recurrence
        above is applied in place for the sampled decay-active slots (fused
@@ -153,7 +153,7 @@ class TopPDecayHandler:
         # tokens and produces multiple tokens per step (req_num_steps =
         # 1 + draft_token_length). One-model speculation (vanilla MTP, one-model
         # Eagle3 / MTP-Eagle, SA, draft-target-one-model) uses its own
-        # SpecSamplerBase-derived sampler and never reaches TorchSampler; the
+        # SpecSampler and never reaches TorchSampler; the
         # drafter-based modes that DO flow draft tokens through TorchSampler
         # (two-model draft-target, NGram, user-provided, two-model Eagle3 /
         # MTP-Eagle) are what can make this length non-zero. top-p decay does not
@@ -281,7 +281,7 @@ class TopPDecayHandler:
         seq_slots: torch.Tensor,
         seq_slots_cuda: torch.Tensor,
     ) -> Optional[TopPDecayMetadata]:
-        """Build the Top-P Decay metadata for a top_p / top_k_top_p group.
+        """Build the Top-P Decay metadata for a top_p / top_k_top_p / min_p group.
 
         Lifecycle step 2, see :class:`TopPDecayStore`. Returns None when no request
         currently uses decay. The metadata's ``slots`` tensor is aligned to the

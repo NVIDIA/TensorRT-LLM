@@ -43,6 +43,65 @@ def as_tuple(x):
     return x if isinstance(x, tuple) else (x, x)
 
 
+def classify_worker_error(exc: BaseException) -> str | None:
+    """Failure class for the response channel: "client", "capacity", or None.
+
+    Keyed off built-in exception types rather than a VisualGen-specific
+    hierarchy: ``ValueError`` means the request's content was unusable
+    (400), ``MemoryError`` means a valid request did not fit (503), and
+    anything else is an unclassified runtime failure (500). Detail travels
+    in the message. ``torch.cuda.OutOfMemoryError`` is spelled out because
+    it derives from ``RuntimeError``, not ``MemoryError``.
+    """
+    if isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError)):
+        return "capacity"
+    if isinstance(exc, ValueError):
+        return "client"
+    return None
+
+
+def synchronize_media_prepare_status(exc: Exception | None) -> None:
+    """All-rank convergence point between media prepare and model collectives.
+
+    Every rank decodes/prepares its media independently; a rank that failed
+    while others proceed into the transformer's collectives would hang the
+    job. All ranks call this with their local outcome; if any failed, the
+    lowest failing rank's error class + message is broadcast, the failing
+    rank(s) re-raise their own exception, and every healthy rank raises a
+    reconstructed equivalent in lockstep. Runs on CPU tensors so
+    the hybrid (``cpu:gloo``) process group carries it even when the failure
+    was CUDA/NVDEC initialization. Converges *caught* failures only — a fatal
+    process or context death is beyond its reach.
+    """
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        if exc is not None:
+            raise exc
+        return
+
+    healthy_sentinel = 2**31 - 1
+    rank = dist.get_rank()
+    flag = torch.tensor([rank if exc is not None else healthy_sentinel], dtype=torch.int64)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    failing_rank = int(flag.item())
+    if failing_rank == healthy_sentinel:
+        return
+
+    payload = [None]
+    if rank == failing_rank:
+        payload = [(classify_worker_error(exc), str(exc))]
+    dist.broadcast_object_list(payload, src=failing_rank)
+
+    if exc is not None:
+        raise exc
+    kind, message = payload[0]
+    message = f"[rank {failing_rank}] {message}"
+    if kind == "client":
+        raise ValueError(message)
+    if kind == "capacity":
+        raise MemoryError(message)
+    raise RuntimeError(message)
+
+
 class SequenceSharder:
     """Block-shard / all-gather a tensor along its sequence dimension.
 

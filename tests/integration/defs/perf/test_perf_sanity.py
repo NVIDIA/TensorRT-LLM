@@ -19,6 +19,7 @@ import fcntl
 import glob
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -29,9 +30,10 @@ import pytest
 import yaml
 from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
+from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info
-from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
@@ -102,8 +104,16 @@ DEFAULT_TIMEOUT = 10800
 # per-test pytest kill both saves GPU-hours and leaves a classifiable failure
 # in the CI log. The disagg bound is larger because its /health only answers
 # once EVERY ctx/gen worker has finished model load + autotune + warmup.
-AGG_SERVER_READY_TIMEOUT = 1800
+# 1800 proved too tight for the largest agg cases: gb300 DeepSeek-V4-Pro
+# ctx_only (con4301) needs ~2000s of model load + autotune before /health
+# answers, so it failed readiness while the server was still coming up
+# (nvbugs/6517846). Raised to match the disagg bound.
+AGG_SERVER_READY_TIMEOUT = 3600
 DISAGG_SERVER_READY_TIMEOUT = 3600
+# GEN workers normally reap within seconds after benchmark_status is written.
+# Keep this well below the whole-test timeout so a stuck multi-node srun cannot
+# turn the optional log-flush synchronization into a pytest/Slurm cancellation.
+GEN_LOG_SENTINEL_TIMEOUT = 120
 
 
 def server_ready_timeout(default: int, mode: str) -> int:
@@ -338,13 +348,14 @@ def parse_gen_worker_device_step_time(
     end-of-file are considered for gen_server_{i}.log — used to slice out a
     single client's iteration segment.
 
-    The log is read exactly once. The caller (DisaggTestCmds.run_cmd) blocks
-    on the gen_server_{i}.done sentinels before calling this, so every gen
-    srun has already exited and its &> aggregate log is fully flushed — there
-    is no partially-written tail to poll for. This replaces the earlier
-    settle-poll heuristic, which could return a mean over a truncated prefix
-    when it accepted the first repeated row count while the log was still
-    flushing across NFS (nvbugs 6487036 / 6487040).
+    The log is read exactly once. The caller (DisaggTestCmds.run_cmd) normally
+    waits for the gen_server_{i}.done sentinels first, so every gen srun has
+    exited and its &> aggregate log is fully flushed. If the dedicated
+    sentinel wait expires, the caller parses the current contents instead of
+    consuming the whole-test timeout; a missing metric then hard-fails before
+    upload. This replaces the earlier settle-poll heuristic, which could
+    accept a truncated prefix while the log was still flushing across NFS
+    (nvbugs 6487036 / 6487040 / 6487038).
     """
     per_file_scans, _total_count = _scan_gen_worker_device_step_time(
         output_dir, num_gen_servers, start_offsets
@@ -456,6 +467,28 @@ def force_num_accepted_tokens_from_env_str(env_vars: str) -> int:
 def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     """Add host and port to command."""
     return cmd + ["--host", host, "--port", str(port)]
+
+
+def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) -> str:
+    """Run a benchmark while streaming its combined output to an artifact log."""
+    benchmark_env = env.copy()
+    benchmark_env.setdefault("PYTHONUNBUFFERED", "1")
+    with open(log_path, "wb") as log_file:
+        result = subprocess.run(
+            cmd,
+            env=benchmark_env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+
+    with open(log_path, "rb") as log_file:
+        raw_output = log_file.read()
+
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=raw_output)
+
+    return raw_output.decode("utf-8", errors="replace")
 
 
 class ServerConfig:
@@ -586,7 +619,6 @@ class ServerConfig:
             "gpus_per_node",
             "match_mode",
             "client_configs",
-            "match_mode",
             "backend",
             "extra_llm_api_config_path",
             "server_env_var",
@@ -622,30 +654,7 @@ class ServerConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "s_model_name",
-            "l_tp",
-            "l_ep",
-            "l_pp",
-            "l_cp",
-            "l_gpus_per_node",
-            "l_max_batch_size",
-            "b_enable_attention_dp",
-            "s_serving_backend",
-            # kv_cache_config
-            "s_kv_cache_dtype",
-            # cache_transceiver_config
-            "s_cache_transceiver_backend",
-            # speculative_config
-            # Keep baseline matching on the legacy key during DB migration.
-            # l_max_draft_len is written to DB but not used for matching until
-            # backfill completes.
-            "s_spec_decoding_type",
-            "l_num_nextn_predict_layers",
-            "l_force_num_accepted_tokens",
-            # moe_config
-            "l_load_balancer_num_slots",
-        ]
+        return get_server_match_keys(self.match_mode)
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""
@@ -894,6 +903,11 @@ class ClientConfig:
         self.model_path = ""
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
+        # Derived from lane identity only (gen_only + concurrency == 1); do not
+        # set this from lane YAML. warmup is intentionally not a baseline match
+        # key, which is only sound while its value stays fully determined by
+        # benchmark_mode and concurrency.
+        self.warmup = client_config_data.get("warmup", False)
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
@@ -972,11 +986,15 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
             "--ignore-eos",
         ]
+        # benchmark_serving's initial single-prompt test run (excluded from
+        # metrics) doubles as a warmup request; keep it disabled unless the
+        # lane requests one.
+        if not self.warmup:
+            benchmark_cmd.append("--no-test-input")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -1013,18 +1031,7 @@ class ClientConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "l_concurrency",
-            "l_iterations",
-            "l_isl",
-            "l_osl",
-            "d_random_range_ratio",
-            "s_backend",
-            "b_use_chat_template",
-            "b_streaming",
-            "b_use_nv_sa_benchmark",
-            "b_eos",
-        ]
+        return get_client_match_keys()
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
@@ -1045,6 +1052,7 @@ class ClientConfig:
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
             "b_eos": self.spec_decoding,
+            "b_warmup": self.warmup,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -1069,6 +1077,7 @@ class DisaggConfig:
         model_name: str,
         hardware: dict,
         server_env_var: str,
+        internal_request_auth_key: str | None = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1079,6 +1088,7 @@ class DisaggConfig:
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
+        self.internal_request_auth_key = internal_request_auth_key
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1097,7 +1107,10 @@ class AggrTestCmds(NamedTuple):
 
     def get_server_logs(self, server_idx) -> List[str]:
         server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
-        return [server_file_path]
+        benchmark_logs = sorted(
+            glob.glob(os.path.join(self.test_output_dir, f"trtllm-benchmark.{server_idx}.*.log"))
+        )
+        return [server_file_path, *benchmark_logs]
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run all clients for a server and return outputs.
@@ -1114,8 +1127,16 @@ class AggrTestCmds(NamedTuple):
 
         try:
             server_hostname = "localhost"
-            server_port = get_free_port()
-            server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, server_port)
+            # port 0 + --report_addr: let the server bind a kernel-assigned
+            # port and tell us which one, instead of reserving one here and
+            # racing whoever takes it before the server binds.
+            server_addr_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.addr")
+            if os.path.exists(server_addr_path):
+                os.remove(server_addr_path)
+            server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, 0) + [
+                "--report_addr",
+                server_addr_path,
+            ]
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
             server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
@@ -1129,6 +1150,7 @@ class AggrTestCmds(NamedTuple):
                     stdout=server_ctx,
                     stderr=subprocess.STDOUT,
                 )
+                _, server_port = wait_for_reported_addr(server_addr_path, self.timeout, server_proc)
 
                 wait_for_endpoint_ready(
                     f"http://{server_hostname}:{server_port}/health",
@@ -1158,14 +1180,11 @@ class AggrTestCmds(NamedTuple):
                     client_env = copy.deepcopy(os.environ)
                     if client_config:
                         client_env.update(client_config.to_env())
-                    output = subprocess.check_output(
+                    output = _run_benchmark_with_log(
                         client_cmd_with_port,
-                        stderr=subprocess.STDOUT,
-                        env=client_env,
-                    ).decode()
-
-                    with open(client_file_path, "w") as client_ctx:
-                        client_ctx.write(output)
+                        client_env,
+                        client_file_path,
+                    )
                     outputs.append(output)
                 else:
                     print_info(
@@ -1210,6 +1229,7 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    internal_request_auth_key: str = ""
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
     # Used by run_cmd() to merge per-config env vars into the appropriate
@@ -1218,19 +1238,28 @@ class DisaggTestCmds(NamedTuple):
     # receive env via SLURM env propagation set up by submit.py.
     server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
 
-    def _generate_hostname_file(self, server_idx: int, port: int):
-        """Create hostname file for coordination."""
-        hostnames_dir = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
-        if not os.path.exists(hostnames_dir):
-            os.makedirs(hostnames_dir, exist_ok=True)
-        hostname_file = os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
-        with open(hostname_file, "w") as f:
-            f.write(f"{self.hostname}:{port}")
+    def _hostnames_dir(self, server_idx: int) -> str:
+        """Directory the disagg tasks exchange bound addresses through.
+
+        Scoped by SLURM job id so a rerun never reads the previous run's files:
+        test_output_dir is derived from the test case name alone and is created
+        with exist_ok=True, so it is reused across runs. The step id is
+        deliberately excluded -- each role runs as a separate srun step within
+        one job, and they must all agree on this path.
+        """
+        run_id = os.environ.get("SLURM_JOB_ID", "local")
+        return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
+
+    def _hostname_file(self, server_idx: int) -> str:
+        """Path this task's server reports its bound address to."""
+        hostnames_dir = self._hostnames_dir(server_idx)
+        os.makedirs(hostnames_dir, exist_ok=True)
+        return os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
 
     def _generate_disagg_server_config(self, server_idx: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
-        hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+        hostnames_folder = self._hostnames_dir(server_idx)
         expected_count = self.num_ctx_servers + self.num_gen_servers
         start_time = time.time()
         hostnames = []
@@ -1247,7 +1276,11 @@ class DisaggTestCmds(NamedTuple):
             time.sleep(10)
             if not os.path.exists(hostnames_folder):
                 continue
-            hostnames = os.listdir(hostnames_folder)
+            # Only completed files: trtllm-serve publishes its address by
+            # renaming a "<name>.<rand>.tmp" sibling into place, and counting
+            # those transient entries would both inflate the count and get
+            # parsed as a CTX/GEN url below.
+            hostnames = [f for f in os.listdir(hostnames_folder) if f.endswith(".txt")]
             if len(hostnames) >= expected_count:
                 break
 
@@ -1265,15 +1298,14 @@ class DisaggTestCmds(NamedTuple):
             elif hostname_file.startswith("GEN"):
                 gen_hostnames.append(hostname_port)
 
-        # Allocate port here (after waiting) to minimize the window between
-        # port allocation and actual use, avoiding TOCTOU race conditions
-        # where another process on the same node grabs the port.
-        disagg_server_port = get_free_port()
-
+        # port 0: the disagg server binds a kernel-assigned port and reports it
+        # back via --report_addr, so there is no window between choosing a port
+        # here and the server binding it.
         server_config = {
             "hostname": self.hostname,
-            "port": disagg_server_port,
+            "port": 0,
             "backend": "pytorch",
+            "internal_request_auth_key": self.internal_request_auth_key,
             "context_servers": {
                 "num_instances": self.num_ctx_servers,
                 "urls": ctx_hostnames,
@@ -1289,25 +1321,19 @@ class DisaggTestCmds(NamedTuple):
         print_info(f"Server config file {config_path} generated")
         return config_path
 
-    def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
-        """Wait for and read disagg server config."""
-        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
-        start_time = time.time()
-        while True:
-            if os.path.exists(config_path):
-                print_info(f"Server config file found: {config_path}")
-                break
-            elapsed_time = time.time() - start_time
-            if elapsed_time > self.timeout:
-                raise RuntimeError(
-                    f"Server config file {config_path} not found after {self.timeout}s"
-                )
-            print_info(f"Waiting for server config file, elapsed time: {elapsed_time}s")
-            time.sleep(10)
+    def _disagg_server_addr_file(self, server_idx: int) -> str:
+        """Path the disagg server reports its bound address to."""
+        return os.path.join(self._hostnames_dir(server_idx), f"DISAGG_SERVER.{server_idx}.addr")
 
-        with open(config_path, "r") as f:
-            server_config = yaml.safe_load(f)
-        return server_config["hostname"], server_config["port"]
+    def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
+        """Wait for the disagg server to report the address it bound.
+
+        The config carries port 0, so the address is only known once the server
+        has bound; reading it from the config would yield 0.
+        """
+        addr_path = self._disagg_server_addr_file(server_idx)
+        print_info(f"Waiting for disagg server address file {addr_path}")
+        return wait_for_reported_addr(addr_path, self.timeout)
 
     def wait_for_benchmark_ready(
         self,
@@ -1348,7 +1374,11 @@ class DisaggTestCmds(NamedTuple):
                 )
             time.sleep(10)
 
-    def wait_for_gen_log_sentinels(self, poll_interval: float = 2.0) -> bool:
+    def wait_for_gen_log_sentinels(
+        self,
+        timeout: float = GEN_LOG_SENTINEL_TIMEOUT,
+        poll_interval: float = 2.0,
+    ) -> bool:
         """Block until every gen worker signals that its log is fully written.
 
         Each gen worker's srun in slurm_launch_draft.sh redirects all of its
@@ -1357,25 +1387,26 @@ class DisaggTestCmds(NamedTuple):
         flushed). The benchmark writes benchmark_status *before* calling this,
         which is what lets the gen srun exit — so this is not circular.
 
-        Returns True once all sentinels exist, or False if self.timeout is
-        reached first. On False the caller still parses whatever is on disk:
-        the sentinel is a correctness optimization against reading a
-        mid-flush log (nvbugs 6487036 / 6487040), never a hang risk for CI.
+        Returns True once all sentinels exist, or False if the dedicated
+        sentinel timeout is reached first. On False the caller falls back to
+        parsing the current log contents. The bounded wait prevents a stuck
+        multi-node srun from consuming the whole-test timeout and triggering
+        Slurm's kill-on-bad-exit cascade (nvbugs 6487036 / 6487040 / 6487038).
         """
         sentinels = [
             os.path.join(self.test_output_dir, f"gen_server_{i}.done")
             for i in range(self.num_gen_servers)
         ]
-        start_time = time.time()
+        start_time = time.monotonic()
         while True:
             missing = [p for p in sentinels if not os.path.exists(p)]
             if not missing:
                 print_info("All gen worker log sentinels present; log flush complete.")
                 return True
-            elapsed_time = time.time() - start_time
-            if elapsed_time > self.timeout:
+            elapsed_time = time.monotonic() - start_time
+            if elapsed_time > timeout:
                 print_info(
-                    f"Timeout ({self.timeout}s) waiting for gen worker log "
+                    f"Timeout ({timeout}s) waiting for gen worker log "
                     f"sentinels {missing}; parsing current log contents."
                 )
                 return False
@@ -1383,6 +1414,36 @@ class DisaggTestCmds(NamedTuple):
                 f"Waiting for gen worker log sentinels {missing}, elapsed time: {elapsed_time:.0f}s"
             )
             time.sleep(poll_interval)
+
+    def _append_gen_worker_device_step_time(
+        self,
+        pending_device_step_time: List[dict],
+        outputs: List[str],
+    ) -> None:
+        """Wait for GEN log flush, then append each pending client metric.
+
+        A sentinel timeout is a bounded teardown fallback, not a reason to
+        discard metrics that are already present in the GEN logs. If the
+        fallback parse finds no usable metric, check_test_failure still fails
+        the gen_only run before results are uploaded.
+        """
+        if not pending_device_step_time:
+            return
+
+        self.wait_for_gen_log_sentinels()
+        for record in pending_device_step_time:
+            device_step_time_mean = parse_gen_worker_device_step_time(
+                self.test_output_dir,
+                self.num_gen_servers,
+                start_offsets=record["start_offsets"],
+            )
+            if device_step_time_mean is None:
+                continue
+            summary_line = f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
+            with open(record["benchmark_file_path"], "a") as benchmark_ctx:
+                benchmark_ctx.write(f"\n{summary_line}\n")
+            idx = record["output_index"]
+            outputs[idx] = f"{outputs[idx]}\n{summary_line}\n"
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
@@ -1400,6 +1461,13 @@ class DisaggTestCmds(NamedTuple):
             os.path.join(self.test_output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log")
         )
         server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
+        server_logs.extend(
+            sorted(
+                glob.glob(
+                    os.path.join(self.test_output_dir, f"trtllm-benchmark.{server_idx}.*.log")
+                )
+            )
+        )
         return server_logs
 
     @staticmethod
@@ -1426,8 +1494,11 @@ class DisaggTestCmds(NamedTuple):
             self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
         )
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
-            port = get_free_port()
-            self._generate_hostname_file(server_idx, port)
+            # port 0 + --report_addr: the worker binds a kernel-assigned port
+            # and publishes host:port itself, so no port is reserved here and
+            # left unbound while anything on the node could take it. The disagg
+            # server reads these files to build its config, exactly as before.
+            hostname_file = self._hostname_file(server_idx)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
 
@@ -1436,7 +1507,10 @@ class DisaggTestCmds(NamedTuple):
                 config_idx = server_cmd.index("--config") + 1
                 self._wait_for_config_file(server_cmd[config_idx])
 
-            server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
+            server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, 0) + [
+                "--report_addr",
+                hostname_file,
+            ]
             try:
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
@@ -1468,7 +1542,18 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
+                # _hostnames_dir is scoped by job, so a new job never sees an
+                # older one's files, but a retry within the same job and the
+                # same server_idx would. Drop the previous attempt's address
+                # first, or the BENCHMARK task connects to a dead port. This
+                # task owns the file exclusively, so removing it here is safe.
+                disagg_addr_path = self._disagg_server_addr_file(server_idx)
+                if os.path.exists(disagg_addr_path):
+                    os.remove(disagg_addr_path)
                 self._generate_disagg_server_config(server_idx)
+                # The config carries port 0; publish the resolved address so
+                # the BENCHMARK task can find the server.
+                disagg_cmd = disagg_cmd + ["--report_addr", disagg_addr_path]
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
                 disagg_server_file_path = os.path.join(
                     self.test_output_dir,
@@ -1497,13 +1582,16 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "BENCHMARK":
             # Perf-benchmark clients whose gen-worker device step time must be
-            # parsed once the gen logs are flushed. The parse is deferred out of
+            # parsed after the gen-log flush wait. The parse is deferred out of
             # the client loop because gen_server_*.log keeps being written until
             # the gen srun exits, and the gen srun only exits after
             # benchmark_status is written in the finally below. Parsing inside
             # the loop (as before) could read a truncated / not-yet-flushed log
             # and report a wrong mean (nvbugs 6487036 / 6487040).
             pending_device_step_time: List[dict] = []
+            collect_device_step_time = (
+                configs_for_idx is not None and configs_for_idx[2].benchmark_mode == "gen_only"
+            )
             try:
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
@@ -1535,35 +1623,37 @@ class DisaggTestCmds(NamedTuple):
                         )
                         print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
 
-                        # Snapshot gen_server log sizes so the per-client
-                        # average covers only iterations driven by this client.
-                        gen_log_start_offsets = gen_worker_log_sizes(
-                            self.test_output_dir, self.num_gen_servers
-                        )
+                        # Snapshot gen_server log sizes so the gen_only
+                        # per-client average covers only iterations driven by
+                        # this client. Other modes do not emit this metric and
+                        # must not wait for the GEN teardown sentinel.
+                        gen_log_start_offsets = None
+                        if collect_device_step_time:
+                            gen_log_start_offsets = gen_worker_log_sizes(
+                                self.test_output_dir, self.num_gen_servers
+                            )
 
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
                             bench_env.update(client_config.to_env())
-                        output = subprocess.check_output(
+                        output = _run_benchmark_with_log(
                             client_cmd_with_port,
-                            env=bench_env,
-                            stderr=subprocess.STDOUT,
-                        ).decode()
-
-                        with open(benchmark_file_path, "w") as benchmark_ctx:
-                            benchmark_ctx.write(output)
+                            bench_env,
+                            benchmark_file_path,
+                        )
 
                         outputs.append(output)
-                        # Defer the gen-worker device-step-time parse until the
-                        # gen logs are flushed (see below); remember where to
-                        # write the summary back.
-                        pending_device_step_time.append(
-                            {
-                                "output_index": len(outputs) - 1,
-                                "benchmark_file_path": benchmark_file_path,
-                                "start_offsets": gen_log_start_offsets,
-                            }
-                        )
+                        if collect_device_step_time:
+                            # Defer the gen-worker device-step-time parse until
+                            # the gen logs are flushed (see below); remember
+                            # where to write the summary back.
+                            pending_device_step_time.append(
+                                {
+                                    "output_index": len(outputs) - 1,
+                                    "benchmark_file_path": benchmark_file_path,
+                                    "start_offsets": gen_log_start_offsets,
+                                }
+                            )
                     else:
                         print_info(
                             f"Skipping perf benchmark for client {client_idx}: "
@@ -1599,27 +1689,12 @@ class DisaggTestCmds(NamedTuple):
 
             # benchmark_status is written, so the gen workers can now stop and
             # their srun will exit and drop gen_server_{i}.done. Wait once for
-            # those sentinels (bounded by self.timeout), then parse each
-            # benchmark client's gen-worker device step time a single time: the
-            # flushed log is complete, so no settle polling is needed. Only
-            # gen_only runs emit prev_device_step_time; other modes parse to
-            # None and skip the summary line.
-            if pending_device_step_time:
-                self.wait_for_gen_log_sentinels()
-                for record in pending_device_step_time:
-                    device_step_time_mean = parse_gen_worker_device_step_time(
-                        self.test_output_dir,
-                        self.num_gen_servers,
-                        start_offsets=record["start_offsets"],
-                    )
-                    if device_step_time_mean is not None:
-                        summary_line = (
-                            f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
-                        )
-                        with open(record["benchmark_file_path"], "a") as benchmark_ctx:
-                            benchmark_ctx.write(f"\n{summary_line}\n")
-                        idx = record["output_index"]
-                        outputs[idx] = f"{outputs[idx]}\n{summary_line}\n"
+            # those sentinels (bounded independently of the whole-test timeout),
+            # then parse each benchmark client's gen-worker device step time a
+            # single time. A timeout falls back to the current log contents.
+            # Only gen_only runs populate this queue; other modes skip both the
+            # sentinel wait and device-step-time parsing.
+            self._append_gen_worker_device_step_time(pending_device_step_time, outputs)
 
         return outputs
 
@@ -1892,6 +1967,7 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        internal_request_auth_key = self._resolve_internal_request_auth_key(config)
 
         # Parse concurrency_list - can be string or list
         concurrency_str = benchmark.get("concurrency_list", "1")
@@ -1933,6 +2009,7 @@ class PerfSanityTestConfig:
         else:
             # For e2e and gen_only modes - create ctx and gen server configs
             ctx_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1942,6 +2019,7 @@ class PerfSanityTestConfig:
             }
 
             gen_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1963,6 +2041,7 @@ class PerfSanityTestConfig:
                 model_name=model_name,
                 hardware=hardware,
                 server_env_var=server_env_var,
+                internal_request_auth_key=internal_request_auth_key,
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
@@ -2003,6 +2082,15 @@ class PerfSanityTestConfig:
                 "use_nv_sa_benchmark": use_nv_sa_benchmark,
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
+                # gen_only measures a single round (iterations forced to 1
+                # above), so one-time costs like the cache transceiver's lazy
+                # connection setup would otherwise land entirely on the
+                # measured TTFT. Scoped to concurrency == 1: the gen executor's
+                # fill gate (TLLM_BENCHMARK_REQ_QUEUES_SIZE) only opens once
+                # `concurrency` requests are queued, so a lone warmup request
+                # would deadlock higher-concurrency lanes — which amortize the
+                # cold start anyway.
+                "warmup": benchmark_mode == "gen_only" and concurrency == 1,
             }
             client_config = ClientConfig(
                 client_config_data,
@@ -2013,6 +2101,32 @@ class PerfSanityTestConfig:
             client_configs.append(client_config)
 
         self.server_client_configs = {0: client_configs}
+
+    def _resolve_internal_request_auth_key(self, config: dict) -> str:
+        explicit_key = config.get("internal_request_auth_key")
+        if explicit_key:
+            return explicit_key
+
+        test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
+        os.makedirs(test_output_dir, exist_ok=True)
+        key_path = os.path.join(test_output_dir, "internal_request_auth_key.txt")
+        lock_path = f"{key_path}.lock"
+
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                if os.path.exists(key_path):
+                    with open(key_path, "r") as key_file:
+                        internal_request_auth_key = key_file.read().strip()
+                    if internal_request_auth_key:
+                        return internal_request_auth_key
+
+                internal_request_auth_key = secrets.token_hex(32)
+                with open(key_path, "w") as key_file:
+                    key_file.write(f"{internal_request_auth_key}\n")
+                return internal_request_auth_key
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def get_commands(self):
         """Get commands based on runtime and benchmark_mode."""
@@ -2126,6 +2240,7 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            internal_request_auth_key=disagg_config.internal_request_auth_key,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )

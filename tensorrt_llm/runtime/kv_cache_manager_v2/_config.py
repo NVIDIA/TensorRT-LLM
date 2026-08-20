@@ -245,6 +245,16 @@ class KVCacheManagerConfig:
     Collect V2 KV cache allocation, reuse, and transfer statistics.
     """
 
+    text_only: bool = False
+    """
+    Deployment-level guarantee that no request carries multi-modal content, so token
+    sequences never contain digests. A per-_KVCache text_only override may only tighten
+    this (a text-only deployment forbids a request claiming otherwise). Default False.
+
+    (In this pure-Python backend the block hasher has no digest-free fast path, so this
+    flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
+    """
+
     @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self.swa_scratch_reuse is not None

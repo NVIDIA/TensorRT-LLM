@@ -36,10 +36,12 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
                 duration = float(case.attrib.get('time', 0))
                 if duration <= 5 * 60:
                     rerun_2_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will rerun 2 times")
+                    print(test_name +
+                          " will rerun 2 times, because duration <= 5 min")
                 elif duration <= 10 * 60:
                     rerun_1_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will rerun 1 time")
+                    print(test_name +
+                          " will rerun 1 time, because duration <= 10 min")
                 elif any(failSig.lower() in ET.tostring(
                         case, encoding='unicode').lower()
                          for failSig in failSignaturesList):
@@ -48,7 +50,10 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
                           " will rerun 1 time, because of fail signature")
                 else:
                     rerun_0_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will not rerun")
+                    print(
+                        test_name +
+                        " will not rerun, because duration > 10 min and no failure signature matches"
+                    )
     return ran_tests
 
 

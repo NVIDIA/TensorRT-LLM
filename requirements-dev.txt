@@ -3,8 +3,14 @@
 # before pytest collection so already-imported Diffusers modules match the
 # package files. 0.39.0 matches the runtime floor in requirements.txt.
 diffusers==0.39.0
+# get_sysinfo.py's Linux-distribution probe. Must be explicit: it used to arrive
+# transitively via openai, and openai 3.3.1 dropped it, which silently emptied
+# every sysinfo-rendered CI test list (linux_distribution_name became 'na').
+distro==1.9.0
 boto3
 einops
+# Reference implementation for KDA kernel parity tests.
+flash-linear-attention==0.5.2
 lpips
 graphviz
 mypy==1.19.1
@@ -14,7 +20,8 @@ parameterized
 pre-commit
 pybind11
 pybind11-stubgen
-pytest<9.1
+# 8.4+ needed for `pytest.RaisesExc` support in `pytest.mark.xfail`.
+pytest>=8.4,<9.1
 pytest-asyncio
 pytest-cov
 pytest-csv

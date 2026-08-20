@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/qwen3_next.py
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -38,6 +41,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention_backend import AttentionMetadata
@@ -114,6 +118,32 @@ def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
             and not enable_attention_dp)
 
 
+def _experts_excluded_from_quant(model_config: ModelConfig[Qwen3NextConfig],
+                                 layer_idx: Optional[int]) -> bool:
+    """Is this layer's routed-experts module listed in ``exclude_modules``?
+
+    ``exclude_modules`` is applied only after every module is built, but
+    ``create_moe`` has to pick the MoE backend class before that. A backend
+    picked for FP8/NVFP4 weights rejects the experts if they turn out to be
+    bf16, so look the answer up now instead of waiting for that pass.
+    """
+    quant_config = model_config.quant_config
+    if layer_idx is None or not quant_config.exclude_modules:
+        return False
+    candidates = [f"model.layers.{layer_idx}.mlp.experts"]
+    n_hidden_layers = getattr(model_config.pretrained_config,
+                              "num_hidden_layers", None)
+    # One MTP layer has two names: mtp.layers.<i> in the checkpoint and
+    # model.layers.<n_hidden_layers + i> at runtime. Only the Qwen3.5 entry
+    # points rewrite the first into the second, so try both names here.
+    if n_hidden_layers is not None and layer_idx >= n_hidden_layers:
+        candidates.append(
+            f"mtp.layers.{layer_idx - n_hidden_layers}.mlp.experts")
+    return any(
+        quant_config.is_module_excluded_from_quantization(candidate)
+        for candidate in candidates)
+
+
 class Qwen3NextGate(nn.Module):
 
     def __init__(
@@ -143,10 +173,15 @@ class Qwen3NextGate(nn.Module):
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
+        weight = weights[0].get("weight")
+        if not allow_partial_loading:
+            assert weight is not None
+        if weight is not None:
+            self.weight.copy_(weight[:])
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:
@@ -213,6 +248,22 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if quant_config_dict and layer_idx is not None:
             expert_quant_config = quant_config_dict.get(
                 f"model.layers.{layer_idx}.mlp.experts")
+        moe_model_config = model_config
+        if _experts_excluded_from_quant(model_config, layer_idx):
+            # These experts end up bf16 whatever the per-layer entry says, so
+            # build them on CUTLASS, the only backend that serves bf16
+            # unconditionally.
+            expert_quant_config = QuantConfig(kv_cache_quant_algo=model_config.
+                                              quant_config.kv_cache_quant_algo)
+            if model_config.moe_backend != "CUTLASS":
+                moe_model_config = copy.copy(model_config)
+                moe_model_config._frozen = False
+                moe_model_config.moe_backend = "CUTLASS"
+                moe_model_config._frozen = True
+                logger.warning(
+                    f"Layer {layer_idx} MoE experts are excluded from "
+                    "quantization; using moe_backend=CUTLASS for this layer "
+                    f"(other layers keep {model_config.moe_backend}).")
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -221,7 +272,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=False,
-            model_config=model_config,
+            model_config=moe_model_config,
             layer_idx=layer_idx,
             weight_loading_mode=weight_loading_mode,
             override_quant_config=expert_quant_config,
@@ -766,34 +817,12 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
                                                        torch.cuda.Stream]):
-        # Some HF checkpoints (e.g. Qwen3.5 NVFP4) keep the MTP layer entirely
-        # unquantized -- including its MoE experts (no weight_scale tensors).
-        # Most non-CUTLASS MoE backends (TRTLLMGen, CuteDsl, ...) reject
-        # unquantized / kv-cache-only quant_modes at create_weights or
-        # forward time (e.g. "TRTLLMGenFusedMoE doesn't support
-        # fp16/bf16/fp32 MoE", "CuteDslFusedMoE doesn't support quantization
-        # mode [128]" where bit 128 is FP8_KV_CACHE only).  CUTLASS MoE
-        # supports both BF16 and quantized MoE, so when the checkpoint marks
-        # MTP as excluded from quantization, fall back to CUTLASS *only* for
-        # the MTP layer.  Regular layers (0..num_hidden_layers-1) keep the
-        # user-selected backend.
-        mtp_model_config = model_config
-        if (model_config.moe_backend != "CUTLASS"
-                and Qwen3NextMTP._is_mtp_excluded_from_quant(model_config)):
-            original_backend = model_config.moe_backend
-            mtp_model_config = copy.copy(model_config)
-            mtp_model_config._frozen = False
-            mtp_model_config.moe_backend = "CUTLASS"
-            mtp_model_config._frozen = True
-            logger.warning(
-                "Qwen3Next MTP layer is unquantized in the checkpoint; "
-                "falling back to moe_backend=CUTLASS for the MTP layer "
-                f"(regular layers keep moe_backend={original_backend}).")
-
-        super().__init__(mtp_model_config, layer_idx,
+        # Some HF checkpoints (e.g. Qwen3.5 NVFP4) keep the whole MTP layer in
+        # bf16. Qwen3NextSparseMoeBlock handles that for every layer, MTP
+        # included, so nothing layer-specific is needed here.
+        super().__init__(model_config, layer_idx,
                          aux_stream_dict[AuxStreamType.Attention])
-        config = mtp_model_config.pretrained_config
-        self.model_config = mtp_model_config
+        config = model_config.pretrained_config
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
             key: torch.cuda.Event()
@@ -813,13 +842,13 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
             use_gemma=True,
         )
 
-        if mtp_model_config.mapping.enable_attention_dp:
+        if model_config.mapping.enable_attention_dp:
             self.fc = Linear(
                 config.hidden_size * 2,
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                skip_create_weights_in_init=mtp_model_config.
+                skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
@@ -830,66 +859,16 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
                 bias=False,
                 dtype=config.torch_dtype,
                 tensor_parallel_mode=TensorParallelMode.ROW,
-                mapping=mtp_model_config.mapping,
+                mapping=model_config.mapping,
                 reduce_output=True,
-                skip_create_weights_in_init=mtp_model_config.
+                skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
                 use_cute_dsl_blockscaling_mm=False,
             )
-        self.shared_head = Qwen3NextMTPHead(mtp_model_config)
+        self.shared_head = Qwen3NextMTPHead(model_config)
         # MTP applies shared_head.norm after the base decoder forward, so its
         # MoE-output all-reduce cannot consume next_layer_layernorm.
         self.fusion_config.POST_MOE_FUSION = False
-
-    @staticmethod
-    def _mtp_pattern_covers_experts(tail: str) -> bool:
-        """Does an MTP exclude pattern cover the routed experts?
-
-        ``tail`` is what follows the ``mtp.`` /
-        ``model.layers.<n_hidden_layers>`` prefix.
-        """
-        stripped = tail.strip(".*")
-        if not stripped:
-            # Bare (or wildcarded) layer prefix: covers the whole layer.
-            return True
-        if stripped.startswith("layers."):
-            # "layers.<idx>[.<module>]" -- drop "layers" and the index.
-            parts = stripped.split(".", 2)
-            stripped = parts[2] if len(parts) > 2 else ""
-            if not stripped:
-                return True
-        return "mlp.experts" in stripped
-
-    @staticmethod
-    def _is_mtp_excluded_from_quant(
-            model_config: ModelConfig[Qwen3NextConfig]) -> bool:
-        """Heuristic: did the checkpoint leave the MTP *MoE* unquantized?
-
-        ``apply_quant_config_exclude_modules`` runs *after* this constructor.
-        For Qwen3.5 paths the exclude_modules list has already been
-        translated to ``model.layers.<n_hidden_layers>*`` by
-        ``_normalize_qwen35_exclude_modules`` -- detect that.  Raw HF
-        ``mtp.*`` patterns are also accepted (defensive: if some future
-        weight mapper does not translate them, this still triggers the
-        backend fallback so the MoE path doesn't crash).
-        """
-        qc = getattr(model_config, "quant_config", None)
-        if qc is None or not getattr(qc, "exclude_modules", None):
-            return False
-        n_layers = getattr(model_config.pretrained_config, "num_hidden_layers",
-                           None)
-        target_prefix = (f"model.layers.{n_layers}"
-                         if n_layers is not None else None)
-        for pat in qc.exclude_modules:
-            if pat.startswith("mtp."):
-                tail = pat[len("mtp."):]
-            elif target_prefix is not None and pat.startswith(target_prefix):
-                tail = pat[len(target_prefix):]
-            else:
-                continue
-            if Qwen3NextMTP._mtp_pattern_covers_experts(tail):
-                return True
-        return False
 
     def forward(
         self,
@@ -902,44 +881,60 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        del all_rank_num_tokens
+        # Install this draft step's attention-DP token distribution: the draft
+        # loop passes it as a kwarg and leaves attn_metadata alone, matching
+        # Eagle3DraftModel.forward. The MoE below reads the per-rank counts off
+        # attn_metadata, and an MTP Eagle draft runs one token per sequence
+        # after step 0, so a stale target value mismatches collective sizes.
+        previous_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        if all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
-        def norm_embeds():
-            return self.pre_fc_norm_embedding(embed_tokens(input_ids))
+        try:
 
-        def norm_hidden():
-            return self.pre_fc_norm_hidden(hidden_states)
+            def norm_embeds():
+                return self.pre_fc_norm_embedding(embed_tokens(input_ids))
 
-        inputs_embeds, hidden_states = maybe_execute_in_parallel(
-            norm_embeds,
-            norm_hidden,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
-            disable_on_compile=True,
-        )
-        hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+            def norm_hidden():
+                return self.pre_fc_norm_hidden(hidden_states)
 
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
-        if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
-            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+            inputs_embeds, hidden_states = maybe_execute_in_parallel(
+                norm_embeds,
+                norm_hidden,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+                disable_on_compile=True,
+            )
+            hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
 
-        hidden_states = self.fc(hidden_states)
+            tp_size = self.model_config.mapping.tp_size
+            tp_rank = self.model_config.mapping.tp_rank
+            if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
+                hidden_states = torch.chunk(hidden_states, tp_size,
+                                            dim=-1)[tp_rank]
 
-        hidden_states, residual = super().forward(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            residual=None,
-            spec_metadata=spec_metadata,
-            **kwargs,
-        )
-        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-        if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+            hidden_states = self.fc(hidden_states)
 
-        return hidden_states
+            hidden_states, residual = super().forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=None,
+                spec_metadata=spec_metadata,
+                **kwargs,
+            )
+            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if spec_metadata is not None:
+                spec_metadata.maybe_capture_hidden_states(
+                    0, hidden_states, None)
+
+            return hidden_states
+        finally:
+            # Shared with the target forward, so restore on the exception path
+            # too; otherwise a failed draft step corrupts every later forward.
+            if all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = previous_all_rank_num_tokens
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1074,17 +1069,15 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Use V2 for the hybrid state layout.
+        """Disable block reuse until a snapshot policy is configured."""
+        return {"kv_cache_config": {"enable_block_reuse": False}}
 
-        Block reuse remains opt-in because it also requires a recurrent-state
-        snapshot policy.
-        """
-        return {
-            "kv_cache_config": {
-                "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": True,
-            }
-        }
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for the hybrid state layout."""
+        return "V2"
 
     @classmethod
     def get_preferred_transceiver_runtime(cls,
@@ -1098,7 +1091,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                      weight_mapper: BaseWeightMapper,
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
-        new_weights = weight_mapper.preprocess_weights(weights)
+        new_weights = weight_mapper.preprocess_weights(
+            weights, allow_partial_loading=allow_partial_loading)
         # `new_weights` aliases the source tensors for every key
         # `preprocess_weights` did not rewrite -- the routed experts, i.e. most
         # of a MoE checkpoint. Holding `weights` too would pin them, so

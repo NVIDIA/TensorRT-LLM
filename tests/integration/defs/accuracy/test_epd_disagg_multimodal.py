@@ -207,6 +207,9 @@ class EPDVariant:
             ),
             max_batch_size=64,
             expected_quant_algo=QuantAlgo.FP8,
+            # Default 128 workers trips a native-library abort in the CPU-side
+            # multimodal preprocessing path on H100 (nvbugs/6478692).
+            max_workers=16,
         )
 
     @classmethod

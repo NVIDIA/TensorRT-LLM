@@ -15,6 +15,7 @@
 
 import gc
 import os
+import pickle
 import threading
 import time
 from importlib.util import find_spec
@@ -28,15 +29,33 @@ from tensorrt_llm.runtime.kv_cache_hash import (
     KV_CACHE_HASH_ALGO_V2_SHA256_64,
     truncate_sha256_hash_to_int64,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheCreatedData as NativeKVCacheCreatedData
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEvent as NativeKVCacheEvent
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventDiff as NativeKVCacheEventDiff
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    KVCacheEventManager as NativeKVCacheEventManager,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheRemovedData as NativeKVCacheRemovedData
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    KVCacheStoredBlockData as NativeKVCacheStoredBlockData,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheStoredData as NativeKVCacheStoredData
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheUpdatedData as NativeKVCacheUpdatedData
+from tensorrt_llm.runtime.kv_cache_manager_v2 import UniqueToken as NativeUniqueToken
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import (
+    KVCacheCreatedData,
+    KVCacheEvent,
     KVCacheEventDiff,
     KVCacheEventManager,
+    KVCacheRemovedData,
     KVCacheStoredBlockData,
+    KVCacheStoredData,
+    KVCacheUpdatedData,
     UniqueToken,
 )
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
-    from kv_cache_manager_v2 import CacheLevel, CudaStream, KVCacheManager, TokenId
+    from kv_cache_manager_v2 import CacheLevel, CudaStream, KVCacheManager, TokenId, _introspection
     from kv_cache_manager_v2._block_radix_tree import Block, ReuseScope, RootBlock
     from kv_cache_manager_v2._utils import CachedCudaStream, init_cuda_once, temporary_sys_path
 else:
@@ -45,6 +64,7 @@ else:
         CudaStream,
         KVCacheManager,
         TokenId,
+        _introspection,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
         Block,
@@ -63,42 +83,7 @@ except ImportError:
     torch = None
 
 
-_DEFAULT_CACHE_LEVEL = CacheLevel(0)
-
-
-class _FakePage:
-    def __init__(self, cache_level=_DEFAULT_CACHE_LEVEL, priority=0):
-        self.cache_level = cache_level
-        self.priority = priority
-
-
-class _FakePageRef:
-    def __init__(self, page):
-        self._page = page
-
-    def __call__(self):
-        return self._page
-
-
-class _FakeRootBlock:
-    ordinal = -1
-
-    def __init__(self, lora_task_id=None, cache_salt_id=None, reuse_scope=None):
-        # Support both the new ReuseScope-based shape and the legacy flat
-        # (lora_task_id, cache_salt_id) shape so tests can exercise either.
-        self.lora_task_id = lora_task_id
-        self.cache_salt_id = cache_salt_id
-        if reuse_scope is not None:
-            self.reuse_scope = reuse_scope
-
-
-class _FakeBlock:
-    def __init__(self, key, tokens, num_life_cycles=1, prev=None):
-        self.key = key
-        self.tokens = tokens
-        self.prev = prev or _FakeRootBlock()
-        self.ordinal = getattr(self.prev, "ordinal", -1) + 1
-        self.storage = [_FakePageRef(_FakePage()) for _ in range(num_life_cycles)]
+_USING_CPP_BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "python"
 
 
 with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
@@ -129,6 +114,54 @@ def _create_test_manager(
     )
 
 
+@pytest.fixture
+def real_block_factory():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+    managers = []
+    blocks = []
+
+    def create(event_manager, *, num_life_cycles=1, tokens_per_block=4):
+        manager = _create_test_manager(
+            event_manager,
+            tokens_per_block=tokens_per_block,
+            window_size=tokens_per_block if num_life_cycles == 2 else None,
+        )
+        managers.append(manager)
+
+        def make(tokens, coverage_per_lc, *, parent=None, reuse_scope=None):
+            block = _introspection.make_test_block(
+                manager, tokens, coverage_per_lc, parent, reuse_scope
+            )
+            blocks.append(block)
+            return block
+
+        return make
+
+    yield create
+
+    for block in blocks:
+        _introspection.close_test_block(block)
+    blocks.clear()
+    gc.collect()
+    for manager in reversed(managers):
+        manager.shutdown()
+    gc.enable()
+
+
+def _block_key(block):
+    return _introspection.test_block_key(block)
+
+
+def _add_stored_block(event_manager, block):
+    _introspection.event_manager_add_stored_block(event_manager, block)
+
+
+def _add_stored_life_cycle(event_manager, block, life_cycle_id):
+    _introspection.event_manager_add_stored_life_cycle(event_manager, block, life_cycle_id)
+
+
 def _token_ids(start, end):
     return [TokenId(token_id) for token_id in range(start, end)]
 
@@ -136,6 +169,13 @@ def _token_ids(start, end):
 def _flush_serialized_events(event_manager):
     event_manager.flush_iteration_events()
     return KVCacheEventSerializer.serialize(event_manager.get_latest_events(0))
+
+
+def _flush_contract_events(event_manager):
+    events = _flush_serialized_events(event_manager)
+    for event in events:
+        event["hash_algo"] = "<backend-specific>"
+    return events
 
 
 def _stored_events(events):
@@ -167,6 +207,251 @@ def _commit_and_close(manager, stream, tokens, *, input_tokens=None, reuse_scope
     kv_cache.close()
     del kv_cache
     gc.collect()
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ event manager")
+def test_native_event_manager_queue_and_stored_coalescing():
+    event_manager = NativeKVCacheEventManager(
+        max_kv_event_entries=8,
+        window_size=128,
+        hash_algo="v2_sha256",
+    )
+    event_manager.add_stored_event(
+        None,
+        [
+            NativeKVCacheStoredBlockData(
+                "block0",
+                [NativeUniqueToken(1), NativeUniqueToken(2)],
+                cache_level=0,
+                priority=35,
+            )
+        ],
+    )
+    event_manager.add_stored_event(
+        "block0",
+        [
+            NativeKVCacheStoredBlockData(
+                "block1",
+                [NativeUniqueToken(3), NativeUniqueToken(4)],
+                cache_level=0,
+                priority=35,
+            )
+        ],
+    )
+
+    event_manager.flush_iteration_events()
+    event_objects = pickle.loads(pickle.dumps(event_manager.get_latest_events(0)))
+    events = KVCacheEventSerializer.serialize(event_objects)
+
+    assert len(events) == 1
+    assert events[0]["hash_algo"] == "v2_sha256"
+    assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == [
+        "block0",
+        "block1",
+    ]
+
+
+def test_native_event_manager_v1_hash_matches_legacy_cpp_hasher():
+    _tb = pytest.importorskip("tensorrt_llm.bindings")
+    block_key = _tb.internal.batch_manager.BlockKey
+    block_key_hasher = _tb.internal.batch_manager.BlockKeyHasher
+    parent_hash = block_key_hasher.hash(block_key([1, 2, 3, 4]))
+
+    assert NativeKVCacheEventManager._hash_block_key([1, 2, 3, 4], 0, None, None) == parent_hash
+    assert NativeKVCacheEventManager._hash_block_key(
+        [5, 6], parent_hash, None, None
+    ) == block_key_hasher.hash(block_key([5, 6]), parent_hash)
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="requires the native C++ event manager")
+def test_native_event_manager_attention_dp_gather_callback():
+    gathered_events = []
+
+    def gather(local_events):
+        gathered_events.extend(local_events)
+        return [pickle.loads(pickle.dumps(local_events))]
+
+    event_manager = NativeKVCacheEventManager(
+        max_kv_event_entries=2,
+        window_size=128,
+        attention_dp_rank=0,
+        attention_dp_gather=gather,
+    )
+    event_manager.add_created_event([4])
+
+    events = _flush_serialized_events(event_manager)
+
+    assert len(gathered_events) == 1
+    assert events[0]["attention_dp_rank"] == 0
+    assert events[0]["data"]["num_blocks_per_cache_level"] == [4]
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="compares native and Python event managers")
+def test_native_event_data_value_semantics_match_python_reference():
+    native_token = NativeUniqueToken("token", 7)
+    native_block = NativeKVCacheStoredBlockData(
+        "block",
+        [native_token],
+        cache_level=1,
+        priority=35,
+        mm_keys=[(b"short-mm-key", 3), (b"another-key", 5, "uuid")],
+        cache_salt="salt",
+    )
+    native_diff = NativeKVCacheEventDiff(0, 1)
+    native_objects = [
+        native_token,
+        NativeKVCacheCreatedData([2, 3]),
+        native_block,
+        NativeKVCacheStoredData(None, [native_block]),
+        NativeKVCacheRemovedData(["block"]),
+        native_diff,
+        NativeKVCacheUpdatedData("block", native_diff, None),
+    ]
+    native_event = NativeKVCacheEvent(
+        4,
+        native_objects[3],
+        128,
+        "same-hash-label",
+        1,
+        2,
+    )
+    native_objects.append(native_event)
+
+    python_token = UniqueToken("token", 7)
+    python_block = KVCacheStoredBlockData(
+        "block",
+        [python_token],
+        cache_level=1,
+        priority=35,
+        mm_keys=[(b"short-mm-key", 3), (b"another-key", 5, "uuid")],
+        cache_salt="salt",
+    )
+    python_diff = KVCacheEventDiff(0, 1)
+    python_objects = [
+        python_token,
+        KVCacheCreatedData([2, 3]),
+        python_block,
+        KVCacheStoredData(None, [python_block]),
+        KVCacheRemovedData(["block"]),
+        python_diff,
+        KVCacheUpdatedData("block", python_diff, None),
+    ]
+    python_objects.append(
+        KVCacheEvent(
+            4,
+            python_objects[3],
+            128,
+            "same-hash-label",
+            1,
+            2,
+        )
+    )
+
+    for value, python_value in zip(native_objects, python_objects):
+        assert pickle.loads(pickle.dumps(value)) == value
+        assert repr(value) == repr(python_value)
+
+    python_event = KVCacheEventManager(max_kv_event_entries=1)
+    native_manager = NativeKVCacheEventManager(max_kv_event_entries=1)
+    python_event.add_stored_event(None, [python_block], layer_group_id=2)
+    native_manager.add_stored_event(None, [native_block], layer_group_id=2)
+    assert _flush_contract_events(native_manager) == _flush_contract_events(python_event)
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="compares native and Python event managers")
+def test_native_event_manager_public_methods_match_python_reference():
+    python_manager = KVCacheEventManager(
+        max_kv_event_entries=16,
+        window_size=128,
+        window_size_by_layer_group=None,
+    )
+    native_manager = NativeKVCacheEventManager(
+        max_kv_event_entries=16,
+        window_size=128,
+        window_size_by_layer_group=None,
+    )
+    python_manager.set_layer_group_window_sizes({0: 64, 1: 96})
+    native_manager.set_layer_group_window_sizes({0: 64, 1: 96})
+
+    for manager, block_type, token_type, diff_type in (
+        (python_manager, KVCacheStoredBlockData, UniqueToken, KVCacheEventDiff),
+        (
+            native_manager,
+            NativeKVCacheStoredBlockData,
+            NativeUniqueToken,
+            NativeKVCacheEventDiff,
+        ),
+    ):
+        manager.add_created_event([2, 3], layer_group_ids=[0, 1])
+        manager.add_stored_event(
+            None,
+            [block_type("block-0", [token_type(1)], cache_level=0, priority=35)],
+            layer_group_id=0,
+        )
+        manager.add_stored_event(
+            "block-0",
+            [block_type("block-1", [token_type(2)], cache_level=0, priority=35)],
+            layer_group_id=0,
+        )
+        manager.add_removed_event(block_hash for block_hash in ("removed-0", "removed-1"))
+        manager.add_updated_event(
+            "updated",
+            cache_level=diff_type(0, 1),
+            priority=diff_type(35, 50),
+            layer_group_id=1,
+        )
+
+    assert _flush_contract_events(native_manager) == _flush_contract_events(python_manager)
+    assert native_manager.get_latest_events(0) == python_manager.get_latest_events(0) == []
+    assert native_manager.get_latest_events(-1) == python_manager.get_latest_events(-1) == []
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="compares native and Python event managers")
+def test_native_event_manager_unknown_raw_keys_match_python_noop_behavior():
+    python_manager = KVCacheEventManager(max_kv_event_entries=4)
+    native_manager = NativeKVCacheEventManager(max_kv_event_entries=4)
+
+    for manager, diff_type in (
+        (python_manager, KVCacheEventDiff),
+        (native_manager, NativeKVCacheEventDiff),
+    ):
+        manager.add_removed_event([b"short", b"still-not-a-radix-key"])
+        manager.add_removed_life_cycle_event(b"short", 0)
+        manager.add_updated_event(b"short")
+        manager.add_updated_event(b"short", cache_level=diff_type(0, 1))
+
+    assert _flush_contract_events(native_manager) == _flush_contract_events(python_manager) == []
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="compares native and Python event managers")
+def test_native_event_manager_disabled_queue_and_blocking_read_match_python_reference():
+    for manager_type in (KVCacheEventManager, NativeKVCacheEventManager):
+        disabled = manager_type(max_kv_event_entries=0)
+        disabled.add_created_event([1])
+        disabled.flush_iteration_events()
+        assert disabled.get_latest_events(0) == []
+
+        manager = manager_type(max_kv_event_entries=1)
+        result = []
+        reader = threading.Thread(target=lambda: result.extend(manager.get_latest_events()))
+        reader.start()
+        time.sleep(0.05)
+        assert reader.is_alive()
+        manager.add_created_event([1])
+        manager.flush_iteration_events()
+        reader.join(timeout=1)
+        assert not reader.is_alive()
+        assert len(result) == 1
+
+
+@pytest.mark.skipif(not _USING_CPP_BACKEND, reason="compares native and Python event managers")
+def test_native_event_manager_constructor_errors_match_python_reference():
+    for manager_type in (KVCacheEventManager, NativeKVCacheEventManager):
+        with pytest.raises(ValueError, match="Unsupported V2 KV cache event hash algorithm"):
+            manager_type(max_kv_event_entries=1, hash_algo="unsupported")
+
+    with pytest.raises(TypeError):
+        NativeKVCacheUpdatedData("block")
 
 
 def test_v2_kv_cache_event_manager_serialization():
@@ -302,26 +587,23 @@ def test_v2_kv_cache_event_manager_accepts_removed_iterables():
     }
 
 
-def test_v2_kv_cache_event_manager_coalesces_contiguous_stored_events():
-    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
-    block0 = _FakeBlock(b"\xab\xcd", [1, 2], num_life_cycles=2)
-    block1 = _FakeBlock(b"\xab\xce", [3, 4], num_life_cycles=2, prev=block0)
+def test_v2_kv_cache_event_manager_coalesces_contiguous_stored_events(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2, tokens_per_block=2)
+    block0 = make_block([1, 2], [2, 2])
+    block1 = make_block([3, 4], [2, 2], parent=block0)
 
-    event_manager.add_stored_block_event_from_block(block0)
-    event_manager.add_stored_block_event_from_block(block1)
-
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
     events = _flush_serialized_events(event_manager)
+    expected_hashes = [_block_key(block0).hex(), _block_key(block1).hex()]
 
     assert [event["data"]["type"] for event in events] == ["stored", "stored"]
     assert [event["layer_group_id"] for event in events] == [0, 1]
-    assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == [
-        "abcd",
-        "abce",
-    ]
-    assert [block["block_hash"] for block in events[1]["data"]["blocks"]] == [
-        "abcd",
-        "abce",
-    ]
+    assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == expected_hashes
+    assert [block["block_hash"] for block in events[1]["data"]["blocks"]] == expected_hashes
     assert events[0]["data"]["parent_hash"] is None
     assert events[1]["data"]["parent_hash"] is None
 
@@ -334,33 +616,28 @@ def test_v2_kv_cache_event_manager_serializes_layer_group_id():
 
     assert [event["layer_group_id"] for event in events] == [0, 1]
     assert [event["data"] for event in events] == [
-        {
-            "type": "created",
-            "num_blocks_per_cache_level": [2, 3],
-        },
-        {
-            "type": "created",
-            "num_blocks_per_cache_level": [2, 3],
-        },
+        {"type": "created", "num_blocks_per_cache_level": [2, 3]},
+        {"type": "created", "num_blocks_per_cache_level": [2, 3]},
     ]
 
 
-def test_v2_kv_cache_event_manager_sha256_64_compatibility_mode():
-    event_manager = KVCacheEventManager(
+def test_v2_kv_cache_event_manager_sha256_64_compatibility_mode(real_block_factory):
+    event_manager = NativeKVCacheEventManager(
         max_kv_event_entries=8,
         window_size=128,
         hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64,
     )
-    block0 = _FakeBlock(bytes.fromhex("8000000000000001" + "00" * 24), [1, 2])
-    block1 = _FakeBlock(bytes.fromhex("0102030405060708" + "00" * 24), [3, 4], prev=block0)
+    make_block = real_block_factory(event_manager, tokens_per_block=2)
+    block0 = make_block([1, 2], [2])
+    block1 = make_block([3, 4], [2], parent=block0)
 
-    event_manager.add_stored_block_event_from_block(block0)
-    event_manager.add_stored_block_event_from_block(block1)
-    event_manager.add_removed_event(block0.key)
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
+    event_manager.add_removed_event(_block_key(block0))
     events = _flush_serialized_events(event_manager)
 
-    expected_block0_hash = truncate_sha256_hash_to_int64(block0.key)
-    expected_block1_hash = truncate_sha256_hash_to_int64(block1.key)
+    expected_block0_hash = truncate_sha256_hash_to_int64(_block_key(block0))
+    expected_block1_hash = truncate_sha256_hash_to_int64(_block_key(block1))
     assert [event["hash_algo"] for event in events] == [
         KV_CACHE_HASH_ALGO_V2_SHA256_64,
         KV_CACHE_HASH_ALGO_V2_SHA256_64,
@@ -378,18 +655,20 @@ def test_v2_kv_cache_event_manager_sha256_64_compatibility_mode():
     assert all(isinstance(block_hash, int) for block_hash in events[1]["data"]["block_hashes"])
 
 
-def test_v2_kv_cache_event_manager_v1_hash_algo_matches_v1_block_key_hash():
-    event_manager = KVCacheEventManager(
+def test_v2_kv_cache_event_manager_v1_hash_algo_matches_v1_block_key_hash(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(
         max_kv_event_entries=8,
         window_size=128,
         hash_algo=KV_CACHE_HASH_ALGO_V1,
     )
-    root = _FakeRootBlock()
-    block0 = _FakeBlock(b"block0", [1, 2, 3, 4], prev=root)
-    block1 = _FakeBlock(b"block1", [5, 6], prev=block0)
+    make_block = real_block_factory(event_manager)
+    block0 = make_block([1, 2, 3, 4], [4])
+    block1 = make_block([5, 6], [2], parent=block0)
 
-    event_manager.add_stored_block_event_from_block(block0)
-    event_manager.add_stored_block_event_from_block(block1)
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
     events = _flush_serialized_events(event_manager)
 
     assert events[0]["hash_algo"] == KV_CACHE_HASH_ALGO_V1
@@ -410,18 +689,18 @@ def test_v2_root_key_distinguishes_lora_from_cache_salt_id():
     )
 
 
-def test_v2_kv_cache_event_manager_v1_hash_algo_mixes_cache_salt_id():
-    event_manager = KVCacheEventManager(
+def test_v2_kv_cache_event_manager_v1_hash_algo_mixes_cache_salt_id(real_block_factory):
+    event_manager = NativeKVCacheEventManager(
         max_kv_event_entries=8,
         window_size=128,
         hash_algo=KV_CACHE_HASH_ALGO_V1,
     )
-    root = _FakeRootBlock(cache_salt_id=123)
-    block0 = _FakeBlock(b"block0", [1, 2, 3, 4], prev=root)
-    block1 = _FakeBlock(b"block1", [5, 6], prev=block0)
+    make_block = real_block_factory(event_manager)
+    block0 = make_block([1, 2, 3, 4], [4], reuse_scope=ReuseScope(salt=123))
+    block1 = make_block([5, 6], [2], parent=block0)
 
-    event_manager.add_stored_block_event_from_block(block0)
-    event_manager.add_stored_block_event_from_block(block1)
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
     events = _flush_serialized_events(event_manager)
 
     assert events[0]["hash_algo"] == KV_CACHE_HASH_ALGO_V1
@@ -431,61 +710,41 @@ def test_v2_kv_cache_event_manager_v1_hash_algo_mixes_cache_salt_id():
     ]
 
 
-def test_v2_kv_cache_event_manager_v1_hash_reads_root_reuse_scope():
-    # Regression test: when ``RootBlock`` exposes its scope via a ReuseScope
-    # NamedTuple rather than direct ``lora_task_id`` / ``cache_salt_id``
-    # attributes, ``_root_attrs_from_root_block`` must still recover the same
-    # (lora_id, salt) — otherwise V1-compat event hashes silently collapse to
-    # (None, None) for every LoRA/salt request and Dynamo routing degrades.
-    tokens0 = [1, 2, 3, 4]
-    tokens1 = [5, 6]
-
-    def hashes_for(root):
-        event_manager = KVCacheEventManager(
+def test_v2_kv_cache_event_manager_v1_hash_reads_root_reuse_scope(real_block_factory):
+    def hashes_for(reuse_scope):
+        event_manager = NativeKVCacheEventManager(
             max_kv_event_entries=8,
             window_size=128,
             hash_algo=KV_CACHE_HASH_ALGO_V1,
         )
-        block0 = _FakeBlock(b"block0", tokens0, prev=root)
-        block1 = _FakeBlock(b"block1", tokens1, prev=block0)
-        event_manager.add_stored_block_event_from_block(block0)
-        event_manager.add_stored_block_event_from_block(block1)
+        make_block = real_block_factory(event_manager)
+        block0 = make_block([1, 2, 3, 4], [4], reuse_scope=reuse_scope)
+        block1 = make_block([5, 6], [2], parent=block0)
+        _add_stored_block(event_manager, block0)
+        _add_stored_block(event_manager, block1)
         return _stored_block_hashes(_flush_serialized_events(event_manager))
 
-    # ReuseScope-shaped RootBlock and legacy-shape RootBlock must produce
-    # identical event hashes for the same scope.
-    scope_root = _FakeRootBlock(reuse_scope=ReuseScope(lora_id=11, salt=22))
-    legacy_root = _FakeRootBlock(lora_task_id=11, cache_salt_id=22)
-    assert hashes_for(scope_root) == hashes_for(legacy_root)
-
-    # Different scopes must still produce different hashes (no silent collapse).
-    other_scope_root = _FakeRootBlock(reuse_scope=ReuseScope(lora_id=99, salt=22))
-    assert hashes_for(scope_root) != hashes_for(other_scope_root)
-
-    # An unsalted ReuseScope must match an unsalted legacy root.
-    empty_scope_root = _FakeRootBlock(reuse_scope=ReuseScope())
-    unsalted_legacy_root = _FakeRootBlock()
-    assert hashes_for(empty_scope_root) == hashes_for(unsalted_legacy_root)
+    scope_hashes = hashes_for(ReuseScope(lora_id=11, salt=22))
+    assert scope_hashes != hashes_for(ReuseScope(lora_id=99, salt=22))
+    assert scope_hashes != hashes_for(ReuseScope())
 
 
-def test_v2_kv_cache_event_manager_v1_hash_recomputes_removed_parent():
-    event_manager = KVCacheEventManager(
+def test_v2_kv_cache_event_manager_v1_hash_recomputes_removed_parent(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(
         max_kv_event_entries=8,
         window_size=128,
         hash_algo=KV_CACHE_HASH_ALGO_V1,
     )
-    root = _FakeRootBlock()
-    block0 = _FakeBlock(b"block0", [1, 2, 3, 4], prev=root)
-    block1 = _FakeBlock(b"block1", [5, 6], prev=block0)
+    make_block = real_block_factory(event_manager)
+    block0 = make_block([1, 2, 3, 4], [4])
+    block1 = make_block([5, 6], [2], parent=block0)
 
-    event_manager.add_stored_block_event_from_block(block0)
-    event_manager.add_removed_event(block0.key)
-
-    assert event_manager._v1_hash_from_radix_block(block1) == 6875034662206558884
-
-    event_manager.add_stored_block_event_from_block(block1)
-    events = _flush_serialized_events(event_manager)
-    stored_events = _stored_events(events)
+    _add_stored_block(event_manager, block0)
+    event_manager.add_removed_event(_block_key(block0))
+    _add_stored_block(event_manager, block1)
+    stored_events = _stored_events(_flush_serialized_events(event_manager))
 
     assert stored_events[-1]["data"]["parent_hash"] == 924206229973855
     assert stored_events[-1]["data"]["blocks"][0]["block_hash"] == 6875034662206558884
@@ -505,21 +764,21 @@ def test_v2_kv_cache_event_manager_v1_hash_algo_matches_cpp_hasher():
     assert KVCacheEventManager._hash_block_key([1, 2, 3, 4], 0, 123, None) == lora_hash
 
 
-def test_v2_kv_cache_event_manager_v1_hash_events_match_cpp_hasher():
+def test_v2_kv_cache_event_manager_v1_hash_events_match_cpp_hasher(real_block_factory):
     _tb = pytest.importorskip("tensorrt_llm.bindings")
     block_key = _tb.internal.batch_manager.BlockKey
     block_key_hasher = _tb.internal.batch_manager.BlockKeyHasher
-    event_manager = KVCacheEventManager(
+    event_manager = NativeKVCacheEventManager(
         max_kv_event_entries=8,
         window_size=128,
         hash_algo=KV_CACHE_HASH_ALGO_V1,
     )
-    root = _FakeRootBlock()
-    block0 = _FakeBlock(b"block0", [1, 2, 3, 4], prev=root)
-    block1 = _FakeBlock(b"block1", [5, 6], prev=block0)
+    make_block = real_block_factory(event_manager)
+    block0 = make_block([1, 2, 3, 4], [4])
+    block1 = make_block([5, 6], [2], parent=block0)
 
-    event_manager.add_stored_block_event_from_block(block0)
-    event_manager.add_stored_block_event_from_block(block1)
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
     events = _flush_serialized_events(event_manager)
 
     parent_hash = block_key_hasher.hash(block_key([1, 2, 3, 4]))
@@ -587,7 +846,7 @@ def test_v1_and_v2_managers_emit_same_v1_hash_stored_events():
         manager_v1.flush_iteration_events()
         v1_events = KVCacheEventSerializer.serialize(manager_v1.get_latest_events(10))
 
-        event_manager_v2 = KVCacheEventManager(
+        event_manager_v2 = NativeKVCacheEventManager(
             max_kv_event_entries=event_buffer_max_size,
             window_size=max_seq_len,
             hash_algo=KV_CACHE_HASH_ALGO_V1,
@@ -754,32 +1013,54 @@ def test_v2_kv_cache_event_manager_serializes_updated_event():
     }
 
 
-def test_v2_kv_cache_event_manager_uses_stored_registry_for_removed_event():
-    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
-    block = _FakeBlock(b"\xab\xcd", [1, 2])
+def test_v2_kv_cache_event_manager_uses_stored_registry_for_removed_event(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager)
+    block = make_block([1, 2], [2])
+    block_hash = _block_key(block).hex()
 
-    event_manager.add_stored_block_event_from_block(block)
-    block.storage = []
-    event_manager.add_removed_event(block.key)
-    event_manager.add_removed_event(block.key)
-
+    _add_stored_block(event_manager, block)
+    event_manager.add_removed_event(_block_key(block))
+    event_manager.add_removed_event(_block_key(block))
     events = _flush_serialized_events(event_manager)
 
     assert [event["data"]["type"] for event in events] == ["stored", "removed"]
     assert [event["layer_group_id"] for event in events] == [0, 0]
-    assert events[0]["data"]["blocks"][0]["block_hash"] == "abcd"
+    assert events[0]["data"]["blocks"][0]["block_hash"] == block_hash
     assert "layer_groups" not in events[0]["data"]["blocks"][0]
-    assert events[1]["data"]["block_hashes"] == ["abcd"]
+    assert events[1]["data"]["block_hashes"] == [block_hash]
     assert "layer_groups" not in events[1]["data"]
 
 
-def test_v2_kv_cache_event_manager_emits_partial_life_cycle_removed_events():
-    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
-    block = _FakeBlock(b"\xab\xcd", [1, 2], num_life_cycles=2)
+def test_v2_kv_cache_event_manager_omits_partial_life_cycle_coverage(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 1])
 
-    event_manager.add_stored_block_event_from_block(block)
-    event_manager.add_removed_life_cycle_event(block.key, 0)
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
 
+    assert [event["layer_group_id"] for event in events] == [0]
+    assert _stored_block_hashes(events) == [_block_key(block).hex()]
+
+    _add_stored_life_cycle(event_manager, block, 1)
+    assert _flush_serialized_events(event_manager) == []
+
+
+def test_v2_kv_cache_event_manager_emits_partial_life_cycle_removed_events(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 2])
+    block_hash = _block_key(block).hex()
+
+    _add_stored_block(event_manager, block)
+    event_manager.add_removed_life_cycle_event(_block_key(block), 0)
     events = _flush_serialized_events(event_manager)
 
     assert [event["data"]["type"] for event in events] == [
@@ -788,33 +1069,31 @@ def test_v2_kv_cache_event_manager_emits_partial_life_cycle_removed_events():
         "removed",
     ]
     assert [event["layer_group_id"] for event in events] == [0, 1, 0]
-    assert events[0]["data"]["blocks"][0]["block_hash"] == "abcd"
-    assert events[1]["data"]["blocks"][0]["block_hash"] == "abcd"
-    assert "layer_groups" not in events[0]["data"]["blocks"][0]
-    assert "layer_groups" not in events[1]["data"]["blocks"][0]
-    assert events[2]["data"]["block_hashes"] == ["abcd"]
-    assert "layer_groups" not in events[2]["data"]
+    assert events[0]["data"]["blocks"][0]["block_hash"] == block_hash
+    assert events[1]["data"]["blocks"][0]["block_hash"] == block_hash
+    assert events[2]["data"]["block_hashes"] == [block_hash]
 
-    event_manager.add_removed_life_cycle_event(block.key, 1)
-    event_manager.add_removed_life_cycle_event(block.key, 1)
-
+    event_manager.add_removed_life_cycle_event(_block_key(block), 1)
+    event_manager.add_removed_life_cycle_event(_block_key(block), 1)
     events = _flush_serialized_events(event_manager)
 
     assert [event["data"]["type"] for event in events] == ["removed"]
     assert events[0]["layer_group_id"] == 1
-    assert events[0]["data"]["block_hashes"] == ["abcd"]
-    assert "layer_groups" not in events[0]["data"]
+    assert events[0]["data"]["block_hashes"] == [block_hash]
 
 
-def test_v2_kv_cache_event_manager_whole_block_removal_clears_life_cycle_state():
-    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
-    block = _FakeBlock(b"\xab\xce", [1, 2], num_life_cycles=2)
+def test_v2_kv_cache_event_manager_whole_block_removal_clears_life_cycle_state(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 2])
+    block_hash = _block_key(block).hex()
 
-    event_manager.add_stored_block_event_from_block(block)
-    event_manager.add_removed_life_cycle_event(block.key, 0)
-    event_manager.add_removed_event(block.key)
-    event_manager.add_removed_event(block.key)
-
+    _add_stored_block(event_manager, block)
+    event_manager.add_removed_life_cycle_event(_block_key(block), 0)
+    event_manager.add_removed_event(_block_key(block))
+    event_manager.add_removed_event(_block_key(block))
     events = _flush_serialized_events(event_manager)
 
     assert [event["data"]["type"] for event in events] == [
@@ -824,21 +1103,26 @@ def test_v2_kv_cache_event_manager_whole_block_removal_clears_life_cycle_state()
         "removed",
     ]
     assert [event["layer_group_id"] for event in events] == [0, 1, 0, 1]
-    assert events[2]["data"]["block_hashes"] == ["abce"]
-    assert events[3]["data"]["block_hashes"] == ["abce"]
+    assert events[2]["data"]["block_hashes"] == [block_hash]
+    assert events[3]["data"]["block_hashes"] == [block_hash]
 
 
-def test_v2_kv_cache_event_manager_readds_life_cycle_emits_stored_event():
-    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
-    block = _FakeBlock(b"\xab\xcf", [1, 2], num_life_cycles=2)
+def test_v2_kv_cache_event_manager_readds_life_cycle_emits_stored_event(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 2])
+    block_key = _block_key(block)
+    block_hash = block_key.hex()
 
-    event_manager.add_stored_block_event_from_block(block)
+    _add_stored_block(event_manager, block)
     event_types = [event["data"]["type"] for event in _flush_serialized_events(event_manager)]
     assert event_types == ["stored", "stored"]
 
-    event_manager.add_removed_life_cycle_event(block.key, 0)
-    event_manager.add_stored_life_cycle_event_from_block(block, 0)
-    event_manager.add_removed_life_cycle_event(block.key, 1)
+    event_manager.add_removed_life_cycle_event(block_key, 0)
+    _add_stored_life_cycle(event_manager, block, 0)
+    event_manager.add_removed_life_cycle_event(block_key, 1)
     events = _flush_serialized_events(event_manager)
 
     assert [event["data"]["type"] for event in events] == [
@@ -847,58 +1131,80 @@ def test_v2_kv_cache_event_manager_readds_life_cycle_emits_stored_event():
         "removed",
     ]
     assert [event["layer_group_id"] for event in events] == [0, 0, 1]
-    assert events[0]["data"]["block_hashes"] == ["abcf"]
-    assert events[1]["data"]["blocks"][0]["block_hash"] == "abcf"
-    assert "layer_groups" not in events[1]["data"]["blocks"][0]
-    assert events[2]["data"]["block_hashes"] == ["abcf"]
+    assert events[0]["data"]["block_hashes"] == [block_hash]
+    assert events[1]["data"]["blocks"][0]["block_hash"] == block_hash
+    assert events[2]["data"]["block_hashes"] == [block_hash]
 
-    event_manager.add_removed_life_cycle_event(block.key, 0)
+    event_manager.add_removed_life_cycle_event(block_key, 0)
     events = _flush_serialized_events(event_manager)
-
     assert [event["data"]["type"] for event in events] == ["removed"]
     assert events[0]["layer_group_id"] == 0
-    assert events[0]["data"]["block_hashes"] == ["abcf"]
-    assert "layer_groups" not in events[0]["data"]
+    assert events[0]["data"]["block_hashes"] == [block_hash]
 
 
-def test_v2_kv_cache_event_manager_reemits_stored_after_all_life_cycles_were_removed():
-    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
-    block = _FakeBlock(b"\xab\xd0", [1, 2])
+def test_v2_kv_cache_event_manager_serializes_only_fully_covered_life_cycle_tokens(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 1])
 
-    event_manager.add_stored_block_event_from_block(block)
-    event_manager.add_removed_life_cycle_event(block.key, 0)
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["layer_group_id"] for event in events] == [0]
+    assert [token["token_id"] for token in events[0]["data"]["blocks"][0]["tokens"]] == [1, 2]
+
+    _add_stored_life_cycle(event_manager, block, 1)
+    assert _flush_serialized_events(event_manager) == []
+
+
+def test_v2_kv_cache_event_manager_reemits_stored_after_all_life_cycles_were_removed(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager)
+    block = make_block([1, 2], [2])
+    block_key = _block_key(block)
+
+    _add_stored_block(event_manager, block)
+    event_manager.add_removed_life_cycle_event(block_key, 0)
     event_types = [event["data"]["type"] for event in _flush_serialized_events(event_manager)]
     assert event_types == ["stored", "removed"]
 
-    event_manager.add_stored_life_cycle_event_from_block(block, 0)
+    _add_stored_life_cycle(event_manager, block, 0)
     events = _flush_serialized_events(event_manager)
 
     assert [event["data"]["type"] for event in events] == ["stored"]
     assert events[0]["layer_group_id"] == 0
-    assert events[0]["data"]["blocks"][0]["block_hash"] == "abd0"
-    assert "layer_groups" not in events[0]["data"]["blocks"][0]
+    assert events[0]["data"]["blocks"][0]["block_hash"] == block_key.hex()
 
 
-def test_v2_kv_cache_event_manager_flushes_removed_before_updated_event():
-    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
-    removed_block = _FakeBlock(b"\xab\xd1", [1, 2])
-    updated_block = _FakeBlock(b"\xab\xd2", [3, 4])
+def test_v2_kv_cache_event_manager_flushes_removed_before_updated_event(
+    real_block_factory,
+):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager)
+    removed_block = make_block([1, 2], [2])
+    updated_block = make_block([3, 4], [2])
+    removed_key = _block_key(removed_block)
+    updated_key = _block_key(updated_block)
 
-    event_manager.add_stored_block_event_from_block(removed_block)
-    event_manager.add_stored_block_event_from_block(updated_block)
+    _add_stored_block(event_manager, removed_block)
+    _add_stored_block(event_manager, updated_block)
     _flush_serialized_events(event_manager)
 
-    event_manager.add_removed_event(removed_block.key)
+    event_manager.add_removed_event(removed_key)
     event_manager.add_updated_event(
-        updated_block.key,
-        cache_level=KVCacheEventDiff(old_value=0, new_value=1),
+        updated_key,
+        cache_level=NativeKVCacheEventDiff(old_value=0, new_value=1),
         layer_group_id=0,
     )
     events = _flush_serialized_events(event_manager)
 
     assert [event["data"]["type"] for event in events] == ["removed", "updated"]
-    assert events[0]["data"]["block_hashes"] == ["abd1"]
-    assert events[1]["data"]["block_hash"] == "abd2"
+    assert events[0]["data"]["block_hashes"] == [removed_key.hex()]
+    assert events[1]["data"]["block_hash"] == updated_key.hex()
 
 
 @pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
@@ -907,7 +1213,7 @@ def test_v2_stored_events_match_block_hash_chain():
     gc.collect()
     gc.disable()
 
-    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=16, window_size=128)
     manager = None
     try:
         tokens_per_block = 4
@@ -922,12 +1228,16 @@ def test_v2_stored_events_match_block_hash_chain():
         stored_events = _stored_events(events)
         assert len(stored_events) == 1
 
+        # Both the Python and C++ backends hash blocks with SHA-256 over the same
+        # little-endian token encoding, so the block-key chain matches the
+        # pure-Python Block.make_key implementation on either backend.
         root_key = RootBlock.make_key(ReuseScope())
         block0_key = Block.make_key(root_key, tokens[:tokens_per_block])
         block1_key = Block.make_key(block0_key, tokens[tokens_per_block:])
         expected_hashes = [block0_key.hex(), block1_key.hex()]
 
         assert _stored_block_hashes(stored_events) == expected_hashes
+        assert stored_events[0]["hash_algo"] == "v2_sha256"
         assert stored_events[0]["data"]["parent_hash"] is None
         assert [
             block["block_hash"] for block in stored_events[0]["data"]["blocks"]
@@ -938,6 +1248,15 @@ def test_v2_stored_events_match_block_hash_chain():
         assert [
             token["token_id"] for token in stored_events[0]["data"]["blocks"][1]["tokens"]
         ] == list(range(tokens_per_block, 2 * tokens_per_block))
+
+        if _USING_CPP_BACKEND:
+            event_manager.add_updated_event(
+                bytes.fromhex(expected_hashes[0]),
+                cache_level=NativeKVCacheEventDiff(old_value=0, new_value=1),
+                layer_group_id=0,
+            )
+            updated_events = _flush_serialized_events(event_manager)
+            assert updated_events[0]["data"]["block_hash"] == expected_hashes[0]
     finally:
         gc.enable()
         if manager is not None:
@@ -950,7 +1269,7 @@ def test_v2_v1_hash_events_include_cache_salt_from_kv_cache():
     gc.collect()
     gc.disable()
 
-    event_manager = KVCacheEventManager(
+    event_manager = NativeKVCacheEventManager(
         max_kv_event_entries=16,
         window_size=128,
         hash_algo=KV_CACHE_HASH_ALGO_V1,
@@ -986,7 +1305,7 @@ def test_v2_reused_prefix_does_not_emit_duplicate_stored_events():
     gc.collect()
     gc.disable()
 
-    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=16, window_size=128)
     manager = None
     try:
         tokens_per_block = 4
@@ -1010,12 +1329,14 @@ def test_v2_reused_prefix_does_not_emit_duplicate_stored_events():
         reuse_events = _flush_serialized_events(event_manager)
         reused_hashes = _stored_block_hashes(reuse_events)
 
+        # SHA-256 block-key chain is identical across both backends.
         root_key = RootBlock.make_key(ReuseScope())
         block0_key = Block.make_key(root_key, prefix_tokens[:tokens_per_block])
         block1_key = Block.make_key(block0_key, prefix_tokens[tokens_per_block:])
         block2_key = Block.make_key(block1_key, new_tokens)
+        prefix_keys = [block0_key, block1_key]
 
-        assert prefix_hashes == [block0_key.hex(), block1_key.hex()]
+        assert prefix_hashes == [block_key.hex() for block_key in prefix_keys]
         assert reused_hashes == [block2_key.hex()]
         assert not (set(prefix_hashes) & set(reused_hashes))
     finally:
@@ -1030,7 +1351,7 @@ def test_v2_removed_events_match_stored_hashes():
     gc.collect()
     gc.disable()
 
-    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=16, window_size=128)
     manager = None
     try:
         tokens_per_block = 4
@@ -1075,7 +1396,7 @@ def test_v2_removed_event_emitted_when_last_level_page_is_dropped():
     tokens_per_block = 8
     window_size = 8
     num_blocks = 4
-    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=window_size)
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=16, window_size=window_size)
     manager = None
     try:
         manager = _create_test_manager(
@@ -1133,17 +1454,23 @@ def test_v2_kv_cache_event_manager_emits_updated_on_level_migration():
     # a small window is used: it keeps the min_slots floor low enough that the
     # GPU level can be shrunk below the committed block count, forcing surplus
     # reusable pages to migrate to host.
+    #
+    # More committed blocks and a deeper shrink than the removed-event test are
+    # used here on purpose: the GPU eviction/migration walks the two attention
+    # pool groups in insertion order, so the surplus must exceed the first pool
+    # group's block count for the second pool group to also migrate — only then
+    # do both layer groups emit an "updated" (GPU -> host) event.
     tokens_per_block = 8
     window_size = 8
-    num_blocks = 4
-    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=window_size)
+    num_blocks = 8
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=64, window_size=window_size)
     manager = None
     try:
         manager = _create_test_manager(
             event_manager,
             tokens_per_block=tokens_per_block,
-            gpu_quota=16 << 20,
-            host_quota=8 << 20,
+            gpu_quota=32 << 20,
+            host_quota=32 << 20,
             window_size=window_size,
             kv_buf_size=1 << 20,
         )
@@ -1163,7 +1490,7 @@ def test_v2_kv_cache_event_manager_emits_updated_on_level_migration():
         del kv_cache
         gc.collect()
 
-        assert manager.resize(CacheLevel(0), 8 << 20)
+        assert manager.resize(CacheLevel(0), 12 << 20)
 
         event_manager.flush_iteration_events()
         events = KVCacheEventSerializer.serialize(event_manager.get_latest_events())

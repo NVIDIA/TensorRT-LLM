@@ -101,6 +101,17 @@ class MappingBase:
         # ``num_experts_per_worker``. This is what unlocks dwdp_size values
         # that do not divide ``num_experts`` evenly (e.g. dwdp_size = 3, 5)
         # and the IPC-era redundancy mode where adjacent peer ranges overlap.
+        # Record whether the caller explicitly requested a MoE TP/EP split
+        # (the -1 sentinels mean "auto"). Model code (e.g. Kimi K3) uses this
+        # to distinguish an explicit ``moe_tensor_parallel_size`` /
+        # ``moe_expert_parallel_size`` request from the auto default, which
+        # resolves to the same ``(moe_tp=tp_size, moe_ep=1)`` values. Only
+        # meaningful on mappings built from raw user args: ``to_dict()`` emits
+        # resolved values, so a ``from_dict`` round-trip marks this True.
+        self.moe_tp_ep_user_specified = (dwdp_size <= 1
+                                         and (moe_tp_size != -1
+                                              or moe_ep_size != -1))
+
         if dwdp_size > 1:
             moe_tp_size = 1
             moe_ep_size = 1

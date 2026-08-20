@@ -17,6 +17,7 @@
 
 import asyncio
 import os
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -322,6 +323,32 @@ async def wait_for_port_released(port):
         return False
 
 
+def get_registered_worker_urls(port: int) -> tuple[list[str], list[str]]:
+    """Return ``(ctx_urls, gen_urls)`` as registered with the disagg server.
+
+    Workers launched with ``port=0`` pick their listening port inside the child
+    process, so the cluster registry is the only authoritative source for their
+    addresses. Call this once the server reports ready, i.e. once every worker
+    the test expects has registered.
+
+    Args:
+        port: Disagg server port
+
+    Returns:
+        tuple[list[str], list[str]]: Context and generation worker URLs, each
+        sorted so the ordering is stable across calls.
+    """
+    assert port > 0, "port must be positive"
+    info_resp = requests.get(f"http://localhost:{port}/cluster_info", timeout=5)
+    assert info_resp.status_code == 200, f"cluster_info returned {info_resp.status_code}"
+    workers = info_resp.json().get("current_workers", {})
+
+    def _urls(role_key: str) -> list[str]:
+        return sorted(f"http://{w['host']}:{w['port']}" for w in workers.get(role_key, []))
+
+    return _urls("context_servers"), _urls("generation_servers")
+
+
 def verify_cluster_info(ready, ctx_workers=-1, gen_workers=-1, port=0, expected_code=200):
     """Verify cluster info from /cluster_info endpoint.
 
@@ -477,7 +504,13 @@ def disagg_cluster_config(service_discovery):
 
 
 @pytest.fixture
-def disagg_server_config(disagg_cluster_config, router, disagg_port):
+def internal_request_auth_key():
+    """Create one internal auth key shared by proxy and workers."""
+    return secrets.token_hex(32)
+
+
+@pytest.fixture
+def disagg_server_config(disagg_cluster_config, router, disagg_port, internal_request_auth_key):
     """Create disaggregated server configuration."""
     return {
         "hostname": "localhost",
@@ -485,14 +518,16 @@ def disagg_server_config(disagg_cluster_config, router, disagg_port):
         "disagg_cluster": disagg_cluster_config,
         "context_servers": {"router": {"type": router}},
         "generation_servers": {"router": {"type": router}},
+        "internal_request_auth_key": internal_request_auth_key,
     }
 
 
 @pytest.fixture
-def worker_config(disagg_cluster_config):
+def worker_config(disagg_cluster_config, internal_request_auth_key):
     """Create worker configuration."""
     return {
         "disagg_cluster": disagg_cluster_config,
+        "internal_request_auth_key": internal_request_auth_key,
         "disable_overlap_scheduler": True,
         "cache_transceiver_config": {"backend": "DEFAULT"},
         "kv_cache_config": {

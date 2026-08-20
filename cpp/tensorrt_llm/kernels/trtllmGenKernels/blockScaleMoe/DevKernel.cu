@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,9 @@
 #include <cub/cub.cuh>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
+
+#include <algorithm>
+#include <cstdint>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -90,7 +93,11 @@ __global__ void activationKernel(KernelParams params)
             for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
                  hiddenIdx += blockDim.x * gridDim.x)
             {
-                int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
+                // Compute global-memory offsets in int64: under Attention DP + AllGather the
+                // permuted token count (permutedIdx up to totalNumPaddedTokens) times a hidden/inner
+                // dimension can exceed INT_MAX, so 32-bit index math would overflow. Applies to all
+                // permutedIdx/tokenIdx * dim offsets in this file.
+                int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenIdx;
 
                 float x1 = (float) params.inPtr[baseIdx];                       // up (linear)
                 float x2 = (float) params.inPtr[baseIdx + params.innerDim / 2]; // gate (silu input)
@@ -104,7 +111,7 @@ __global__ void activationKernel(KernelParams params)
                 float act = silu(x2);
                 Type out = (Type) (act * x1);
 
-                int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+                int64_t const outIdx = static_cast<int64_t>(permutedIdx) * (params.innerDim / 2) + hiddenIdx;
                 params.outPtr[outIdx] = out;
             }
         }
@@ -231,6 +238,151 @@ struct KernelTraits<1>
 
 constexpr int DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA = 128;
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Permuted-space SwiGLU for the DeepSeek-FP8 separate-activation path.
+//
+// `activationDeepSeekKernel` below grids over the *expanded* index space
+// (numTokens x topK) and discovers work by loading expandedIdxToPermutedIdx,
+// skipping entries that map to -1. Under expert parallelism only 1/ep_size of
+// those entries are local, so most of the launched CTAs do no memory work at
+// all -- yet they still run the unconditional cub::BlockReduce. At a large
+// context and a high expert-parallel degree the launched CTA count exceeds the
+// permuted rows of real work by the ep_size factor, and the achieved bandwidth
+// is a small fraction of what the row count alone would need.
+//
+// Every memory access in that kernel is addressed by (permutedIdx, hiddenIdx)
+// only -- the expanded index exists purely to find the work. So grid directly
+// over the permuted rows instead and the indirection, the -1 slots and the
+// ep_size-fold CTA inflation all disappear together.
+//
+// Layout: one warp owns exactly one (permutedRow, 128-element scale block).
+// 32 lanes x 4 elements = 128 = one scale block, so the amax reduction is a
+// single warp shuffle instead of a shared-memory block reduce, and each lane
+// moves 4 bytes per load instead of 1.
+//
+// totalNumPaddedTokens is only known on the device, so the grid is persistent
+// and strides over the row space. This visits the per-expert tile padding that
+// the expanded-space kernel skips (~4% extra rows at 32 local experts); those
+// rows are dropped by the finalize kernel. The arithmetic below deliberately
+// matches activationDeepSeekKernel bit for bit, including its finite all-zero
+// block handling.
+constexpr int kDsActWarpSize = 32;
+constexpr int kDsActEltsPerSf = 128;
+constexpr int kDsActEltsPerThread = kDsActEltsPerSf / kDsActWarpSize;
+constexpr int kDsActWarpsPerCta = 4;
+constexpr int kDsActPermutedNumThreadsPerCta = kDsActWarpSize * kDsActWarpsPerCta;
+constexpr float kDsActAmaxEpsilon = 1.0e-10F;
+
+constexpr bool shouldUsePermutedActivation(int innerDim, int numTokens, int topK, int numExperts, int tileTokensDim)
+{
+    int const outputDim = innerDim / 2;
+    bool const layoutEligible = outputDim >= kDsActEltsPerSf && outputDim % kDsActEltsPerSf == 0 && innerDim % 8 == 0;
+    int64_t const realRowsPerExpert = numExperts > 0 ? static_cast<int64_t>(numTokens) * topK / numExperts : 0;
+    bool const paddingAmortised = tileTokensDim > 0 && realRowsPerExpert >= tileTokensDim;
+    return layoutEligible && paddingAmortised;
+}
+
+template <typename KernelParams>
+__global__ void activationDeepSeekPermutedKernel(KernelParams params)
+{
+    using Type = typename KernelParams::Type;
+    using PackedIo = uint32_t; // kDsActEltsPerThread x 8-bit elements
+
+    static_assert(kDsActEltsPerThread == 4, "PackedIo assumes 4 elements per thread");
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
+#endif
+
+    float constexpr kE4m3MaxVal{448.F};
+
+    int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+    int const outputDim = params.innerDim / 2;
+    int const numSfBlocks = outputDim / kDsActEltsPerSf;
+
+    bool const hasSwigluLimit = params.hasSwigluLimit;
+    float const swigluLimit = params.swigluLimit;
+
+    int const lane = threadIdx.x % kDsActWarpSize;
+    int const warpInCta = threadIdx.x / kDsActWarpSize;
+
+    int64_t const numTasks = static_cast<int64_t>(totalNumPaddedTokens) * numSfBlocks;
+    int64_t const taskStride = static_cast<int64_t>(gridDim.x) * kDsActWarpsPerCta;
+
+    for (int64_t task = static_cast<int64_t>(blockIdx.x) * kDsActWarpsPerCta + warpInCta; task < numTasks;
+         task += taskStride)
+    {
+        int const permutedIdx = static_cast<int>(task / numSfBlocks);
+        int const sfBlock = static_cast<int>(task % numSfBlocks);
+        int const hiddenBase = sfBlock * kDsActEltsPerSf + lane * kDsActEltsPerThread;
+
+        // Both scales are uniform across the warp: one per (row, scale block).
+        float const scale1 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock];
+        float const scale2 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * (sfBlock + numSfBlocks)];
+
+        int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenBase;
+        PackedIo const packed1 = *reinterpret_cast<PackedIo const*>(params.inPtr + baseIdx);
+        PackedIo const packed2 = *reinterpret_cast<PackedIo const*>(params.inPtr + baseIdx + outputDim);
+
+        Type const* elts1 = reinterpret_cast<Type const*>(&packed1);
+        Type const* elts2 = reinterpret_cast<Type const*>(&packed2);
+
+        float out[kDsActEltsPerThread];
+        float aMax = 0.F;
+#pragma unroll
+        for (int i = 0; i < kDsActEltsPerThread; ++i)
+        {
+            float x1 = scale1 * static_cast<float>(elts1[i]); // up (linear)
+            float x2 = scale2 * static_cast<float>(elts2[i]); // gate (silu input)
+            if (hasSwigluLimit)
+            {
+                x2 = fminf(x2, swigluLimit);
+                x1 = fmaxf(fminf(x1, swigluLimit), -swigluLimit);
+            }
+            out[i] = silu(x2) * x1;
+            aMax = fmaxf(aMax, fabsf(out[i]));
+        }
+
+#pragma unroll
+        for (int offset = kDsActWarpSize / 2; offset > 0; offset >>= 1)
+        {
+            aMax = fmaxf(aMax, __shfl_xor_sync(0xffffffffu, aMax, offset));
+        }
+
+        // Floor aMax so an all-zero block stays finite: without it scaleOut is
+        // zero and quantizing evaluates 0 / 0, which is undefined and writes FP8
+        // NaNs into that row. Same epsilon as the DeepGEMM FP8 activation
+        // quantizer (fp8_utils.py).
+        float const scaleOut = fmaxf(aMax, kDsActAmaxEpsilon) / kE4m3MaxVal;
+
+        if (lane == 0)
+        {
+            params.outDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock] = scaleOut;
+        }
+
+        PackedIo packedOut;
+        Type* outElts = reinterpret_cast<Type*>(&packedOut);
+#pragma unroll
+        for (int i = 0; i < kDsActEltsPerThread; ++i)
+        {
+            // Divide; do NOT hoist a reciprocal. `x / s` and `x * (1/s)` round
+            // differently, and an equivalence run showed that single ulp flip a
+            // greedy-decoded token. This must match activationDeepSeekKernel
+            // bit for bit.
+            outElts[i] = static_cast<Type>(out[i] / scaleOut);
+        }
+        *reinterpret_cast<PackedIo*>(params.outPtr + static_cast<int64_t>(permutedIdx) * outputDim + hiddenBase)
+            = packedOut;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void activationDeepSeekKernel(KernelParams params)
 {
@@ -311,7 +463,7 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                     }
 
                     // Process blocks for this CTA
-                    int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
+                    int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenIdx;
 
                     int const scale1Idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
                     int const scale2Idx
@@ -358,10 +510,11 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                         {
                             continue;
                         }
-                        s_scaleOutArr[tokenInCtaIdx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+                        float const scaleOut = fmaxf(aMaxArr[tokenInCtaIdx], kDsActAmaxEpsilon) / E4m3MaxVal;
+                        s_scaleOutArr[tokenInCtaIdx] = scaleOut;
                         int const scaleOut_idx
                             = permutedIdxArr[tokenInCtaIdx] + totalNumPaddedTokens * (hiddenIdx / 128);
-                        params.outDqSfsPtr[scaleOut_idx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+                        params.outDqSfsPtr[scaleOut_idx] = scaleOut;
                     }
                 }
                 __syncthreads();
@@ -380,7 +533,7 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                         continue;
                     }
                     float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
-                    int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+                    int64_t const outIdx = static_cast<int64_t>(permutedIdx) * (params.innerDim / 2) + hiddenIdx;
                     params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
                 }
             }
@@ -435,8 +588,45 @@ void run(Data const& data, void* stream)
 
         const dim3 grid(gridSizeX, gridSizeY, data.topK);
 
-        LAUNCH_ACTIVATION(
-            data, activationDeepSeekKernel, numTokensPerCta, grid, DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
+        // The two kernels sweep different spaces, and which one is cheaper flips
+        // with batch size.
+        //
+        // The expanded-space kernel visits numTokens x topK slots and skips the
+        // ~(1 - 1/ep_size) of them that are not local, so it never touches the
+        // per-expert tile padding. The permuted-space kernel sweeps
+        // [0, totalNumPaddedTokens), which *is* padded: each local expert
+        // contributes up to tileTokensDim-1 rows of padding that carry no real
+        // tokens but cost a full row of load/compute/store.
+        //
+        // At prefill that padding is noise next to the real rows, and the
+        // permuted sweep wins by the ep_size factor. At decode the ratio
+        // inverts: a single token leaves well under one real row per expert
+        // against the same padding, so the permuted kernel does almost nothing
+        // but padding. Getting this wrong costs more on every decode step than
+        // the prefill win is worth over a full generation.
+        //
+        // So gate on real work per expert. tileTokensDim is exactly the padding
+        // granularity, which makes it the natural threshold: below it, an
+        // expert's real rows do not even fill the tile that must be swept for it.
+        if (shouldUsePermutedActivation(data.innerDim, data.numTokens, data.topK, data.numExperts, data.tileTokensDim))
+        {
+            int64_t const maxTasks = static_cast<int64_t>(data.numTokens) * data.topK * (outputDim / kDsActEltsPerSf);
+            int64_t const ctasForAllTasks = (maxTasks + kDsActWarpsPerCta - 1) / kDsActWarpsPerCta;
+            // Persistent grid: totalNumPaddedTokens is a device-side value, so the
+            // host can only bound it. Cap at a few waves and let the grid stride
+            // absorb the difference rather than launching the (numTokens x topK)
+            // worst case that the expanded-space kernel pays unconditionally.
+            int const numCtas = static_cast<int>(std::min<int64_t>(ctasForAllTasks, int64_t{numSms} * 32));
+            dim3 const permutedGrid(std::max(numCtas, 1), 1, 1);
+
+            LAUNCH_ACTIVATION(
+                data, activationDeepSeekPermutedKernel, 1, permutedGrid, kDsActPermutedNumThreadsPerCta, 0, stream);
+        }
+        else
+        {
+            LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
+                DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
+        }
     }
     else
     {
@@ -669,14 +859,14 @@ __global__ void permuteKernel(KernelParams params)
         {
 
             // Load chunk of token into registers
-            const Type data = params.inPtr[tokenIdx * params.hiddenDim + hiddenIdx];
+            const Type data = params.inPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx];
 
             // Write to topK places
             for (int k = 0; k < params.topK; k++)
             {
                 int const expandedIdx = tokenIdx * params.topK + k;
                 int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-                params.outPtr[permutedIdx * params.hiddenDim + hiddenIdx] = data;
+                params.outPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDim + hiddenIdx] = data;
             }
         }
         if (params.useDeepSeekFp8)
@@ -764,15 +954,16 @@ __global__ void finalizeKernel(KernelParams params)
                 if (params.expertWeightsPtr != nullptr)
                 {
                     TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
-                    data += float{scale} * float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+                    data += float{scale}
+                        * float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded + hiddenIdx]};
                 }
                 else
                 {
-                    data += float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+                    data += float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded + hiddenIdx]};
                 }
             }
 
-            params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
+            params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
         }
     }
 }
@@ -902,7 +1093,9 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
                 float const expertProb = (float) params.expertWeightsPtr[tokenIdx * params.topK + k];
 
                 float const scale = expertProb * blockScale;
-                acc += scale * static_cast<float>(params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]);
+                acc += scale
+                    * static_cast<float>(
+                        params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded + hiddenIdx]);
             }
 
             // The largest (finite) value that can be represented using E4m3.
@@ -915,9 +1108,15 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
             {
                 if (params.outDqSfsPtr)
                 {
-                    s_scaleOut = aMax / E4m3MaxVal;
+                    // Same all-zero-block hazard as the activation kernels: without the floor
+                    // an all-zero accumulator makes the division below evaluate 0 / 0. This
+                    // branch is unreachable today because every thop entry point passes
+                    // args.output_scale = nullptr, so nothing observable changes; the floor is
+                    // here so the first caller to wire up outDqSfsPtr does not inherit it.
+                    float const scaleOut = fmaxf(aMax, activation::kDsActAmaxEpsilon) / E4m3MaxVal;
+                    s_scaleOut = scaleOut;
                     int const scaleOut_idx = tokenIdx + hiddenIdx / 128 * params.numTokens;
-                    params.outDqSfsPtr[scaleOut_idx] = aMax / E4m3MaxVal;
+                    params.outDqSfsPtr[scaleOut_idx] = scaleOut;
                 }
                 else
                 {
@@ -927,7 +1126,7 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
             __syncthreads();
             float const scaleOut = s_scaleOut;
             __syncthreads();
-            params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = (Type) (acc / scaleOut);
+            params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] = (Type) (acc / scaleOut);
         }
     }
 }

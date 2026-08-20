@@ -162,7 +162,11 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
         tl.store(output_base + head_offsets, value, mask=head_mask)
 
 
-def fused_qkv_gemma_rmsnorm_rope_gate(
+@torch.library.custom_op(
+    "trtllm::fused_qkv_gemma_rmsnorm_rope_gate",
+    mutates_args=(),
+)
+def _fused_qkv_gemma_rmsnorm_rope_gate(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
@@ -173,30 +177,10 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
-    mrope_section: Optional[Tuple[int, int, int]] = None,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Prepare packed QKV and gate with one Triton kernel.
-
-    Args:
-        qkv: ``[num_tokens, 2 * q_size + 2 * kv_size]`` BF16/FP16 projection
-            output in per-head interleaved Q/G layout.
-        q_weight: ``[head_dim]`` raw Gemma RMSNorm Q weights.
-        k_weight: ``[head_dim]`` raw Gemma RMSNorm K weights.
-        cos_sin: ``[max_positions, 2, rotary_dim // 2]`` FP32 NeoX table.
-        positions: Flattenable ``[num_tokens]`` plain-RoPE positions, or
-            ``[3, ..., num_tokens]`` interleaved-MRoPE positions.
-        eps: RMSNorm epsilon.
-        num_q_heads: Local query-head count.
-        num_kv_heads: Local key/value-head count.
-        head_dim: Per-head Q/K/V dimension.
-        rotary_dim: Prefix dimension receiving NeoX RoPE.
-        mrope_section: Temporal/height/width rotary-half dimensions. ``None``
-            selects plain RoPE; a tuple selects Qwen-style interleaved MRoPE.
-
-    Returns:
-        Packed QKV ``[num_tokens, q_size + 2 * kv_size]`` and gate
-        ``[num_tokens, num_q_heads, head_dim]``.
-    """
     assert qkv.dim() == 2 and qkv.stride(-1) == 1
     assert qkv.dtype in (torch.bfloat16, torch.float16)
     assert q_weight.shape == (head_dim,) and k_weight.shape == (head_dim,)
@@ -208,10 +192,8 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
     assert cos_sin.shape[0] > 0
 
     num_tokens = qkv.shape[0]
-    use_mrope = mrope_section is not None
     if use_mrope:
-        assert len(mrope_section) == 3
-        assert sum(mrope_section) == rotary_dim // 2
+        assert mrope_section1 > 0 and mrope_section2 > 0
         assert positions.numel() == 3 * num_tokens
         positions = positions.reshape(3, num_tokens)
     else:
@@ -258,11 +240,96 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
         output_fp16=qkv.dtype == torch.float16,
         has_pass_through=rotary_dim < head_dim,
         use_mrope=use_mrope,
-        mrope_section1=mrope_section[1] if use_mrope else 0,
-        mrope_section2=mrope_section[2] if use_mrope else 0,
+        mrope_section1=mrope_section1,
+        mrope_section2=mrope_section2,
         num_warps=4,
     )
     return qkv_out, gate_out
+
+
+@_fused_qkv_gemma_rmsnorm_rope_gate.register_fake
+def _(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    use_mrope: bool,
+    mrope_section1: int,
+    mrope_section2: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = qkv.shape[0]
+    qkv_width = (num_q_heads + 2 * num_kv_heads) * head_dim
+    return (
+        qkv.new_empty((num_tokens, qkv_width)),
+        qkv.new_empty((num_tokens, num_q_heads, head_dim)),
+    )
+
+
+def fused_qkv_gemma_rmsnorm_rope_gate(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    mrope_section: Optional[Tuple[int, int, int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prepare packed QKV and gate with one Triton kernel.
+
+    Args:
+        qkv: ``[num_tokens, 2 * q_size + 2 * kv_size]`` BF16/FP16 projection
+            output in per-head interleaved Q/G layout.
+        q_weight: ``[head_dim]`` raw Gemma RMSNorm Q weights.
+        k_weight: ``[head_dim]`` raw Gemma RMSNorm K weights.
+        cos_sin: ``[max_positions, 2, rotary_dim // 2]`` FP32 NeoX table.
+        positions: Flattenable ``[num_tokens]`` plain-RoPE positions, or
+            ``[3, ..., num_tokens]`` interleaved-MRoPE positions.
+        eps: RMSNorm epsilon.
+        num_q_heads: Local query-head count.
+        num_kv_heads: Local key/value-head count.
+        head_dim: Per-head Q/K/V dimension.
+        rotary_dim: Prefix dimension receiving NeoX RoPE.
+        mrope_section: Temporal/height/width rotary-half dimensions. ``None``
+            selects plain RoPE; a tuple selects Qwen-style interleaved MRoPE.
+
+    Returns:
+        Packed QKV ``[num_tokens, q_size + 2 * kv_size]`` and gate
+        ``[num_tokens, num_q_heads, head_dim]``.
+    """
+    use_mrope = mrope_section is not None
+    if use_mrope:
+        assert len(mrope_section) == 3
+        assert sum(mrope_section) == rotary_dim // 2
+        mrope_section1 = mrope_section[1]
+        mrope_section2 = mrope_section[2]
+    else:
+        mrope_section1 = 0
+        mrope_section2 = 0
+    return _fused_qkv_gemma_rmsnorm_rope_gate(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        use_mrope,
+        mrope_section1,
+        mrope_section2,
+    )
 
 
 @triton.jit
@@ -302,13 +369,15 @@ def _fused_sigmoid_mul_kernel(
     )
 
 
-def fused_sigmoid_mul(
+@torch.library.custom_op(
+    "trtllm::fused_sigmoid_mul_inplace",
+    mutates_args=("attention_output",),
+)
+def fused_sigmoid_mul_inplace(
     attention_output: torch.Tensor,
     gate: torch.Tensor,
-    *,
-    inplace: bool = False,
-) -> torch.Tensor:
-    """Compute ``attention_output * sigmoid(gate)`` in one kernel."""
+) -> None:
+    """Apply ``attention_output *= sigmoid(gate)`` with a Triton kernel."""
     assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
     num_tokens, hidden_size = attention_output.shape
     if gate.dim() == 3:
@@ -325,18 +394,17 @@ def fused_sigmoid_mul(
         gate_stride_token = gate.stride(0)
         gate_stride_head = hidden_size
 
-    output = attention_output if inplace else torch.empty_like(attention_output)
     if num_tokens == 0:
-        return output
+        return
 
     max_block_size = 1024 if num_tokens < 1024 else 2048
     block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
     grid = (num_tokens, triton.cdiv(hidden_size, block_size))
     _fused_sigmoid_mul_kernel[grid](
-        output,
+        attention_output,
         attention_output,
         gate,
-        output.stride(0),
+        attention_output.stride(0),
         attention_output.stride(0),
         gate_stride_token,
         gate_stride_head,
@@ -345,4 +413,3 @@ def fused_sigmoid_mul(
         block_size=block_size,
         num_warps=4,
     )
-    return output

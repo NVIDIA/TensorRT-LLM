@@ -18,6 +18,7 @@ In benchmark disagg mode the GEN executor must defer the forward pass
 until all benchmark requests have completed KV transfer.  These tests
 cover:
 - State-based `_is_benchmark_disagg_fill_complete` predicate
+- Executor-side fill-target clamping to the request admission capacity
 - `can_forward` gating initialisation and transitions
 - ADP dummy suppression during fill vs taper-down
 - ADP router imbalance regression (nvbug 6071070)
@@ -30,7 +31,10 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler import RequestScheduler, ScheduledRequests
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,13 +48,22 @@ def _make_active_request(
 ) -> Mock:
     """Create an active request stub with disagg state flags."""
     req = Mock()
-    req.state_value = LlmRequestState.GENERATION_IN_PROGRESS.value
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
-    req.state = (
-        LlmRequestState.DISAGG_TRANS_ERROR if in_error else LlmRequestState.GENERATION_IN_PROGRESS
-    )
+    if in_error:
+        req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    elif in_transfer:
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    elif in_init:
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+    else:
+        req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.state_value = req.state.value
     req.is_attention_dp_dummy = False
+    req.is_encoder_init_state = False
+    req.is_context_init_state = False
+    req.is_generation_in_progress_state = req.state == LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_encoder_output_ready_event = None
     return req
 
 
@@ -62,12 +75,10 @@ def _make_transceiver(transfer_complete: bool = True) -> Mock:
 
 
 class MockBenchmarkExecutor:
-    """Minimal stub mirroring the PyExecutor attributes used by
-    `_is_benchmark_disagg_fill_complete`, `_check_benchmark_disagg_gate`,
-    and the `can_forward` gate.
+    """Minimal stub mirroring benchmark-fill PyExecutor attributes.
 
-    Binds the real production methods so tests exercise actual logic
-    without needing a fully-initialised executor.
+    Binds the fill-target configuration and gate methods so tests exercise
+    production logic without needing a fully-initialised executor.
     """
 
     def __init__(
@@ -80,6 +91,7 @@ class MockBenchmarkExecutor:
         num_fetch_requests: int = 0,
         is_warmup: bool = False,
         active_requests=None,
+        max_num_active_requests: int = 8,
     ):
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -91,6 +103,7 @@ class MockBenchmarkExecutor:
         self._benchmark_sync_progress_global = False
         self._fill_admit_cap = 0
         self.enable_attention_dp = enable_attention_dp
+        self.max_num_active_requests = max_num_active_requests
         self.num_fetch_requests = num_fetch_requests
         self.is_warmup = is_warmup
         self.active_requests = active_requests if active_requests is not None else []
@@ -104,8 +117,82 @@ class MockBenchmarkExecutor:
 
     _dist_size = staticmethod(PyExecutor._dist_size)
     _allgather_model_parallel_status = PyExecutor._allgather_model_parallel_status
+    _get_request_admission_capacity = PyExecutor._get_request_admission_capacity
+    _configure_benchmark_req_queues_size = PyExecutor._configure_benchmark_req_queues_size
     _is_benchmark_disagg_fill_complete = PyExecutor._is_benchmark_disagg_fill_complete
     _check_benchmark_disagg_gate = PyExecutor._check_benchmark_disagg_gate
+
+
+# ---------------------------------------------------------------------------
+# Executor-side fill-target clamping
+# ---------------------------------------------------------------------------
+
+
+class TestBenchmarkFillTargetCapacity:
+    """Verify the fill target cannot exceed the executor admission ceiling."""
+
+    @pytest.mark.parametrize(
+        (
+            "enable_attention_dp",
+            "tp_size",
+            "max_num_active_requests",
+            "requested_fill_target",
+            "expected_fill_target",
+        ),
+        [
+            pytest.param(False, 8, 1, 8, 1, id="con8_non_adp"),
+            pytest.param(True, 32, 4, 180, 128, id="con180_adp"),
+            pytest.param(True, 16, 32, 666, 512, id="con666_adp"),
+            pytest.param(True, 8, 512, 4301, 4096, id="con4301_adp"),
+            pytest.param(True, 4, 8, 16, 16, id="reachable_target"),
+            pytest.param(False, 1, 8, 0, 0, id="disabled"),
+        ],
+    )
+    def test_configures_effective_fill_target(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        enable_attention_dp: bool,
+        tp_size: int,
+        max_num_active_requests: int,
+        requested_fill_target: int,
+        expected_fill_target: int,
+    ) -> None:
+        ex = MockBenchmarkExecutor(
+            enable_attention_dp=enable_attention_dp,
+            tp_size=tp_size,
+            max_num_active_requests=max_num_active_requests,
+        )
+        monkeypatch.setenv("TLLM_BENCHMARK_REQ_QUEUES_SIZE", str(requested_fill_target))
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning") as mock_warning:
+            ex._configure_benchmark_req_queues_size()
+
+        assert ex.benchmark_req_queues_size == expected_fill_target
+        if expected_fill_target < requested_fill_target:
+            mock_warning.assert_called_once()
+            warning = mock_warning.call_args.args[0]
+            assert f"requested fill target {requested_fill_target}" in warning
+            assert f"admission capacity {expected_fill_target}" in warning
+            assert f"effective fill target {expected_fill_target}" in warning
+        else:
+            mock_warning.assert_not_called()
+
+    def test_clamped_target_allows_gate_to_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reproduce the former capacity-one livelock through the engine path."""
+        ex = MockBenchmarkExecutor(
+            kv_cache_transceiver=_make_transceiver(),
+            num_fetch_requests=1,
+            active_requests=[_make_active_request()],
+            max_num_active_requests=1,
+        )
+        monkeypatch.setenv("TLLM_BENCHMARK_REQ_QUEUES_SIZE", "8")
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger.warning"):
+            ex._configure_benchmark_req_queues_size()
+        ex.is_benchmark_disagg = True
+
+        assert ex.benchmark_req_queues_size == 1
+        assert ex._is_benchmark_disagg_fill_complete(ScheduledRequests()) is True
 
 
 # ---------------------------------------------------------------------------
@@ -510,12 +597,30 @@ class MockPadDummyExecutor:
         self.max_total_draft_tokens = 0
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
-        self._enable_dsv4_adp_dummy_fixes = True
+        self._enable_adp_dummy_fixes = True
+        self._enable_scheduler_aware_adp_dummy = True
+        self._enable_non_overlap_adp_forward_intent = True
         self.max_num_tokens = None
 
         self.dist = Mock()
         self.dist.tp_size = tp_size
         self.dist.tp_allgather.side_effect = lambda value: [value]
+        # Simulate a peer rank with generation compute after the fill gate
+        # opens, so an empty local rank needs a generation dummy.
+        self.dist.tp_allreduce.side_effect = lambda value, op: max(
+            value, int(self._ADPForwardIntent.GENERATION)
+        )
+
+        self.scheduler = Mock()
+        self.scheduler.scheduling_state_range = (
+            LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_TO_COMPLETE,
+        )
+        self.scheduler.is_request_in_schedulable_state.side_effect = (
+            lambda request: RequestScheduler.is_request_in_schedulable_state(
+                self.scheduler, request
+            )
+        )
 
         self.kv_cache_manager = Mock()
         self.kv_cache_manager.mapping.has_cp_helix.return_value = False
@@ -527,10 +632,11 @@ class MockPadDummyExecutor:
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
 
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _ADPForwardIntent
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
     _count_schedulable_active_requests = PyExecutor._count_schedulable_active_requests
+    _get_non_overlap_adp_forward_intent = PyExecutor._get_non_overlap_adp_forward_intent
     _has_adp_dummy_kv_capacity = PyExecutor._has_adp_dummy_kv_capacity
     _should_skip_dummy_for_benchmark_disagg = PyExecutor._should_skip_dummy_for_benchmark_disagg
 
@@ -1076,7 +1182,7 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
-    def test_partial_transfer_admission_uses_only_admitted_requests(self):
+    def test_partial_transfer_admission_uses_only_admitted_requests(self) -> None:
         """The admitted subset is prepared and passed to the idle check."""
         admitted_req = _make_active_request(in_init=True)
         deferred_req = _make_active_request(in_init=True)
@@ -1091,7 +1197,7 @@ class TestFailFastDuringBenchmarkFill:
         ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
         ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
         ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
-            0, [admitted_req], False, False
+            0, [admitted_req], False, False, is_idle=True
         )
         ex._handle_errors.assert_not_called()
 

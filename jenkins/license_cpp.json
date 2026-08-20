@@ -44,6 +44,12 @@
         "tensorrt_llm/kernels/causalConv1d/causalConv1d.h": "dual license",
         "tensorrt_llm/thop/causalConv1dOp.cpp": "dual license",
         "tensorrt_llm/common/vec_dtypes.cuh": "dual license",
+        "tensorrt_llm/common/sha256/attributes.h": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256.cpp": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256.h": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256_arm_shani.cpp": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256_endian.h": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256_x86_shani.cpp": "external (Bitcoin Core MIT)",
         "_": "don't remove, for trailing comma"
     }
 }

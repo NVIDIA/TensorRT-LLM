@@ -35,8 +35,6 @@ from tensorrt_llm.executor.utils import (
     namespace_client_id,
 )
 
-# The CI CPU stages collect with -m "cpu_only and not disabled" and skip
-# files that don't mention pytest.mark.cpu_only (see unittest/conftest.py).
 pytestmark = pytest.mark.cpu_only
 
 

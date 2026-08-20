@@ -20,8 +20,10 @@ import java.lang.Exception
 import groovy.transform.Field
 
 // Docker image registry
-IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
+IMAGE_NAME = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging"
 NGC_IMAGE_NAME = "${IMAGE_NAME}/ngc"
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -63,11 +65,14 @@ def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 def ACTION_INFO = "action_info"
 @Field
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
+    (TRTLLM_VERSION_OVERRIDE): null,
 ]
 
 @Field
@@ -144,7 +149,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     }
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     switch(type)
     {
@@ -169,7 +174,9 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
-                    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202608172149_docker_dind_mtu_helper
+                    command: ['/usr/local/bin/dind-mtu']
+                    args: ['start']
                     tty: true
                     resources:
                       requests:
@@ -215,6 +222,8 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
             spec:
                 qosClass: Guaranteed
                 ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -248,8 +257,8 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
         return ""
     }
 
-    if (TRIGGER_TYPE != "post-merge") {
-        echo "Trigger type is not post-merge, skip preparing wheel from build stage"
+    if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        echo "Trigger type does not use the build stage wheel"
         return ""
     }
 
@@ -268,7 +277,7 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
-def buildImage(config, imageKeyToTag)
+def buildImage(config, imageKeyToTag, versionOverride)
 {
     def target = config.target
     def action = config.action
@@ -280,16 +289,21 @@ def buildImage(config, imageKeyToTag)
     def arch = config.arch == 'arm64' ? 'sbsa' : 'x86_64'
     def dockerfileStage = config.dockerfileStage
 
-    def tag = "${arch}-${target}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
+    def imageType = TRIGGER_TYPE == "nightly-release" ?
+        "${target}-nightly" : target
+    def dependentImageType = TRIGGER_TYPE == "nightly-release" ?
+        "${dependent.target}-nightly" : dependent.target
+    def tag = "${arch}-${imageType}-torch_${torchInstallType}${postTag}-${LLM_DEFAULT_TAG}"
 
-    def dependentTag = tag.replace("${arch}-${target}-", "${arch}-${dependent.target}-")
+    def dependentTag = tag.replace(
+        "${arch}-${imageType}-", "${arch}-${dependentImageType}-")
 
     def imageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${tag}"
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release" && TRIGGER_TYPE == "post-merge") {
-        echo "Use NGC artifacts for post merge build"
+    if (target == "ngc-release" && (TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        echo "Use the NGC staging registry for ${TRIGGER_TYPE} build"
         dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
         imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
         customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
@@ -302,31 +316,76 @@ def buildImage(config, imageKeyToTag)
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
         trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
     }
+    if (versionOverride) {
+        def resolvedVersionOverride = versionOverride
+        if (versionOverride.startsWith(".")) {
+            def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
+            def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
+            if (!versionMatcher.find()) {
+                error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
+            }
+            resolvedVersionOverride =
+                "${versionMatcher.group(1)}${versionOverride}"
+        }
+        env.TRTLLM_VERSION_OVERRIDE = resolvedVersionOverride
+        args += ' TRT_LLM_VERSION="${TRTLLM_VERSION_OVERRIDE}"'
+    }
 
     // Step 2: Build the images
     stage ("Install Package") {
+        sh(label: "Validate Docker bridge MTU", script: "/usr/local/bin/dind-mtu validate")
         sh "pwd && ls -alh"
         sh "env | sort"
         sh "apk add make git"
         sh "git config --global --add safe.directory '*'"
-
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
-        }
-
-        withCredentials([
-            usernamePassword(
-                credentialsId: "svc_tensorrt_gitlab_read_api_token",
-                usernameVariable: 'USERNAME',
-                passwordVariable: 'PASSWORD'
-            ),
-            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
-        ]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
-        }
     }
-    def containerGenFailure = null
-    try {
+    // resourceLedger.withResource registers the docker-login lifecycle *before*
+    // the first login, then runs the reclaim (logout) in a finally on both
+    // success and failure -- re-raising the body's own error -- replacing the
+    // prior try/catch/finally/containerGenFailure/rethrow. Registering before the
+    // logins means any registry we authenticate to below is owed a logout even if
+    // a later login (or the pod) fails partway through; if the build pod dies
+    // before the finally runs, the entry is left live for a post-build sweep
+    // (Phase 3) rather than being silently lost.
+    resourceLedger.withResource(this,
+        id: "docker-login/${config.stageName}",
+        type: "dockerLogin",
+        reclaim: { p, e ->
+            stage ("Docker Logout") {
+                withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
+                    // Best-effort and independent: attempt every logout even if an
+                    // earlier one fails, so a failure on one registry can't leave
+                    // another still authenticated.
+                    try {
+                        sh "docker logout artifactory.nvidia.com"
+                    } catch (Exception logoutEx) {
+                        echo "docker logout artifactory.nvidia.com failed: ${logoutEx}"
+                    }
+                    try {
+                        sh "docker logout ${DEFAULT_GIT_URL}:5005"
+                    } catch (Exception logoutEx) {
+                        echo "docker logout for gitlab registry failed: ${logoutEx}"
+                    }
+                }
+            }
+        }) {
+        stage ("Docker Login") {
+            // Read-write artifactory credentials (image push)
+            withCredentials([usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login artifactory.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
+            }
+
+            withCredentials([
+                usernamePassword(
+                    credentialsId: "svc_tensorrt_gitlab_read_api_token",
+                    usernameVariable: 'USERNAME',
+                    passwordVariable: 'PASSWORD'
+                ),
+                string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+            ]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${USERNAME} -p ${PASSWORD}")
+            }
+        }
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
         def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep '^ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
@@ -422,23 +481,12 @@ def buildImage(config, imageKeyToTag)
                 """
             }
         }
-    } catch (Exception ex) {
-        containerGenFailure = ex
-    } finally {
-        stage ("Docker Logout") {
-            withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
-                sh "docker logout urm.nvidia.com"
-                sh "docker logout ${DEFAULT_GIT_URL}:5005"
-            }
-        }
-        if (containerGenFailure != null) {
-            throw containerGenFailure
-        }
     }
 }
 
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
+    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
@@ -524,14 +572,37 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             dockerfileStage: "release",
         ],
     ]
+    def triggerTypeBuildDefaults = [
+        "nightly-release": [
+            buildInternalRelease: false,
+            buildCiImage: false,
+            buildNgcRelease: true,
+        ],
+    ]
+    def buildDefaults = triggerTypeBuildDefaults[TRIGGER_TYPE] ?: [:]
+    // params may contain a Declarative default even when the remote parameter was dropped.
+    // env presence indicates that the parameter was attached to the current build.
+    def resolveBuildStageParam = { parameterName ->
+        if (env."${parameterName}" != null) {
+            return params[parameterName]
+        }
+        if (buildDefaults.containsKey(parameterName)) {
+            return buildDefaults[parameterName]
+        }
+        return params[parameterName]
+    }
+    def buildInternalRelease = resolveBuildStageParam("buildInternalRelease")
+    def buildCiImage = resolveBuildStageParam("buildCiImage")
+    def buildNgcRelease = resolveBuildStageParam("buildNgcRelease")
+
     def enabledStages = []
-    if (params.buildInternalRelease) {
+    if (buildInternalRelease) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
-    if (params.buildCiImage) {
+    if (buildCiImage) {
         enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
     }
-    if (params.buildNgcRelease) {
+    if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
     }
     buildConfigs = buildConfigs.findAll { key, config -> key in enabledStages }
@@ -556,7 +627,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     config.stageName = key
                     try {
                         trtllm_utils.launchKubernetesPod(pipeline, config.podConfig, "docker") {
-                            buildImage(config, imageKeyToTag)
+                            buildImage(config, imageKeyToTag, versionOverride)
                         }
                     } catch (InterruptedException e) {
                         throw e
@@ -778,7 +849,7 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                            def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
+                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {
                                 echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
@@ -806,7 +877,10 @@ pipeline {
                             }
                             cmd += "--image "
                             cmd += imageKeyToTag.values().join(" ")
-                            withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                            withCredentials([
+                                usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET'),
+                                usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')
+                            ]) {
                                 trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
                             }
                         }

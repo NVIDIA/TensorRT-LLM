@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -224,6 +224,7 @@ void PeftCacheManager::prefetchLoraWeights(std::string const& modelDir, runtime:
         TensorPtr weights = runtime::utils::loadNpy(bufferManager, weightsFn, runtime::MemoryType::kCPU);
         TensorPtr config = runtime::utils::loadNpy(bufferManager, configFn, runtime::MemoryType::kCPU);
         TLLM_LOG_DEBUG("prefetch lora task %s", tasks[taskId].c_str());
+        configureDataType(weights->getDataType());
         mHostLoraCache->put(std::stoi(tasks[taskId]), weights, config, true);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
@@ -263,7 +264,15 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     auto optLoraConfig = llmRequest->getLoraConfig();
     if (optTaskId || optLoraWeights || optLoraConfig)
     {
-        runtime::lora::loraValidateRequestTensors(optTaskId, optLoraWeights, optLoraConfig, mModelConfig, mWorldConfig);
+        auto const requestDataType = optLoraWeights
+            ? std::optional<tensorrt_llm::DataType>{optLoraWeights.value()->getDataType()}
+            : std::nullopt;
+        runtime::lora::loraValidateRequestTensors(
+            optTaskId, optLoraWeights, optLoraConfig, mModelConfig, mWorldConfig, requestDataType);
+        if (optLoraWeights)
+        {
+            configureDataType(optLoraWeights.value()->getDataType());
+        }
     }
     else
     {
@@ -372,6 +381,42 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
         mPutFutures.try_emplace(taskId, std::move(putFuture));
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
+}
+
+void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
+{
+    auto const modelDataType = mModelConfig.getDataType();
+#ifdef ENABLE_FP8
+    TLLM_CHECK_WITH_INFO(dataType == modelDataType || dataType == tensorrt_llm::DataType::kFP8,
+        "Unsupported LoRA weights dtype %s for PEFT cache; expected model dtype %s or FP8",
+        runtime::IBuffer::getDataTypeName(dataType), runtime::IBuffer::getDataTypeName(modelDataType));
+#else
+    TLLM_CHECK_WITH_INFO(dataType == modelDataType,
+        "Unsupported LoRA weights dtype %s for PEFT cache; expected model dtype %s",
+        runtime::IBuffer::getDataTypeName(dataType), runtime::IBuffer::getDataTypeName(modelDataType));
+#endif
+
+    std::lock_guard<std::mutex> lock(mDataTypeMutex);
+    if (mDataType)
+    {
+        TLLM_CHECK_WITH_INFO(mDataType.value() == dataType,
+            "PEFT cache supports one homogeneous LoRA dtype; cache is %s but received %s",
+            runtime::IBuffer::getDataTypeName(mDataType.value()), runtime::IBuffer::getDataTypeName(dataType));
+        return;
+    }
+
+    // Reconfigure host and device caches to the new dtype atomically: LoraCache::copyTask
+    // locks both caches' mCacheMutex to verify they agree on dtype before copying a task, so
+    // reconfiguring them one at a time here would let a concurrent copyTask observe one cache
+    // already switched to the new dtype while the other still holds the old one.
+    mHostLoraCache->setDataTypeCoordinated(*mDeviceLoraCache, dataType);
+    mDataType = dataType;
+}
+
+tensorrt_llm::DataType PeftCacheManager::getDataType() const
+{
+    std::lock_guard<std::mutex> lock(mDataTypeMutex);
+    return mDataType.value_or(mModelConfig.getDataType());
 }
 
 std::tuple<std::unordered_map<uint64_t, std::future<void>>, BasePeftCacheManager::TaskIdToReqIds>

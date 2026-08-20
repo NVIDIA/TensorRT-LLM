@@ -71,6 +71,7 @@ def _wait(pred, timeout=5.0):
 def test_reuse_hands_back_same_pool(reuse_cache):
     s1 = reuse_cache.acquire(_FakePool, 2)
     real = s1._real
+    assert len(reuse_cache.prefetch.restocks) == 1  # armed only on the cache miss
     # Cache-managed pools block their (real) shutdown on worker exit, so a
     # replacement spawned right after a retire cannot race the GPU release.
     assert real.wait_shutdown
@@ -79,6 +80,7 @@ def test_reuse_hands_back_same_pool(reuse_cache):
     s2 = reuse_cache.acquire(_FakePool, 2)
     assert s2._real is real  # the SAME pool, reused
     assert reuse_cache.resets  # workers were reset between handouts
+    assert len(reuse_cache.prefetch.restocks) == 1  # reuse does not create a shadow
 
 
 def test_cached_handover_reaps_in_flight_retires(reuse_cache):
@@ -113,27 +115,79 @@ def test_cache_miss_takes_prefetched_shadow(reuse_cache):
 
 
 def test_cache_miss_falls_back_to_sync_spawn_and_restocks(reuse_cache):
-    s = reuse_cache.acquire(_FakePool, 2)  # nothing armed: sync spawn
+    events = []
+
+    class _OrderedPool(_FakePool):
+        def __init__(self, *args, **kwargs):
+            events.append("sync pool ready")
+            super().__init__(*args, **kwargs)
+
+    original_schedule = reuse_cache.prefetch.schedule_shadow
+
+    def _record_schedule(*args, **kwargs):
+        events.append("shadow scheduled")
+        original_schedule(*args, **kwargs)
+
+    reuse_cache.prefetch.schedule_shadow = _record_schedule
+    s = reuse_cache.acquire(_OrderedPool, 2)  # nothing armed: sync spawn
     assert isinstance(s._real, _FakePool) and s._real.wait_shutdown
     assert s._real.env_overrides.get("TRTLLM_HF_WEIGHT_CACHE") == "1"
     assert reuse_cache.prefetch.restocks  # shadow armed for the NEXT miss
+    assert events == ["sync pool ready", "shadow scheduled"]
 
 
-def test_spawn_failure_retries_once(reuse_cache):
-    # wait_shutdown spawns fail closed (identity collection must complete);
-    # one loud retry absorbs a transient slow node, a second failure means
-    # the node is genuinely broken and must propagate.
+def test_shadow_timeout_does_not_start_sync_pool(reuse_cache):
     calls = []
 
-    class _FlakyPool(_FakePool):
+    def _timeout(_n_workers):
+        raise TimeoutError("shadow bootstrap still running")
+
+    reuse_cache.prefetch.take = _timeout
+
+    class _RecordingPool(_FakePool):
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            super().__init__(*args, **kwargs)
+
+    with pytest.raises(TimeoutError, match="still running"):
+        reuse_cache.acquire(_RecordingPool, 2)
+    assert calls == []
+    assert reuse_cache.prefetch.restocks == []
+
+
+def test_prefetcher_programming_error_propagates(reuse_cache):
+    calls = []
+
+    def _fail(_n_workers):
+        raise ValueError("prefetch lifecycle bug")
+
+    reuse_cache.prefetch.take = _fail
+
+    class _RecordingPool(_FakePool):
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            super().__init__(*args, **kwargs)
+
+    with pytest.raises(ValueError, match="prefetch lifecycle bug"):
+        reuse_cache.acquire(_RecordingPool, 2)
+    assert calls == []
+    assert reuse_cache.prefetch.restocks == []
+
+
+def test_spawn_failure_propagates_without_retry(reuse_cache):
+    # The attempt already waited for the full bootstrap deadline. Retrying
+    # could overlap workers that the failed identity barrier could not reap.
+    calls = []
+
+    class _FailingPool(_FakePool):
         def __init__(self, n_workers, wait_shutdown=False, env_overrides=None):
             calls.append(1)
-            if len(calls) == 1:
-                raise RuntimeError("identity collection incomplete")
-            super().__init__(n_workers, wait_shutdown, env_overrides)
+            raise RuntimeError("identity collection incomplete")
 
-    s = reuse_cache.acquire(_FlakyPool, 2)
-    assert isinstance(s._real, _FlakyPool) and len(calls) == 2
+    with pytest.raises(RuntimeError, match="identity collection incomplete"):
+        reuse_cache.acquire(_FailingPool, 2)
+    assert calls == [1]
+    assert reuse_cache.prefetch.restocks == []
 
 
 def test_reuse_size_mismatch_builds_new(reuse_cache):

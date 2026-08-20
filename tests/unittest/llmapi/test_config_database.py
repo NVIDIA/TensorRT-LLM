@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import llm_args as llm_args_module
@@ -36,6 +36,9 @@ from .yaml_validation_harness import (
     mock_cuda_for_schema_validation,
     validate_torch_llm_args_config,
 )
+
+pytestmark = pytest.mark.cpu_only
+
 
 CONFIG_ROOT = Path(__file__).parents[3] / "examples" / "configs"
 REPO_ROOT = CONFIG_ROOT.parent.parent
@@ -101,7 +104,7 @@ def _get_default_values_for_config(config_path: Path) -> dict:
 
     model = entry["model"]
     arch = entry["arch"]
-    model_cls = MODEL_CLASS_MAPPING.get(arch)
+    model_cls = get_registered_model_class(arch)
     if not model_cls or not hasattr(model_cls, "get_model_defaults"):
         return global_default
 

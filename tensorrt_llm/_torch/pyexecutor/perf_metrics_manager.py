@@ -11,8 +11,8 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 from .llm_request import PerfTimingInfo
 

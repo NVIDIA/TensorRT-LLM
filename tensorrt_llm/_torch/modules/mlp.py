@@ -8,9 +8,10 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
 from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
-from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from .linear import (Linear, TensorParallelMode, WeightMode,
+                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 
 
 class MLP(nn.Module):
@@ -99,13 +100,8 @@ class MLP(nn.Module):
         self.up_proj.create_weights()
         self.down_proj.create_weights()
 
-        has_nvfp4 = hasattr(self.down_proj,
-                            'has_nvfp4') and self.down_proj.has_nvfp4
+        has_static_nvfp4_input = is_static_nvfp4_input_eligible(self.down_proj)
         has_kernel = hasattr(torch.ops.trtllm, 'fused_relu2_quantize')
-        # NVFP4LinearMethod.create_weights always allocates input_scale as a
-        # Parameter, but excluded layers reset it to None at load time. Check
-        # for a real tensor.
-        has_scale = getattr(self.down_proj, 'input_scale', None) is not None
         is_relu2 = self.activation is relu2
         # The fused relu2+fp4_quantize kernel body is guarded by
         # ``__CUDA_ARCH__ >= 1000`` (see fusedActivationQuant.cu). On pre-SM100
@@ -113,7 +109,7 @@ class MLP(nn.Module):
         # quantize in the downstream linear layer.
         is_sm100_or_later = get_sm_version() >= 100
 
-        self._use_fused_relu2_quant = (has_nvfp4 and has_kernel and has_scale
+        self._use_fused_relu2_quant = (has_static_nvfp4_input and has_kernel
                                        and is_relu2 and is_sm100_or_later)
 
         # Static eligibility for the fused GELU(tanh) CuteDSL epilogue (mirrors
@@ -139,11 +135,14 @@ class MLP(nn.Module):
         # may be downgraded to unquantized after create_weights (e.g. LTX-2
         # quant-exclusion), so re-check the NVFP4 _input_prepare at runtime (a
         # torch.compile trace-time guard, not a per-step cost); else fall back to eager.
-        if self._use_fused_gelu and hasattr(
-                getattr(self.up_proj, "quant_method", None), "_input_prepare"):
-            if self._use_fused_gelu_fp4out and hasattr(
-                    getattr(self.down_proj, "quant_method", None),
-                    "_input_prepare"):
+        if (self._use_fused_gelu
+                and self.up_proj.has_nvfp4_activation_quantization
+                and hasattr(getattr(self.up_proj, "quant_method", None),
+                            "_input_prepare")):
+            if (self._use_fused_gelu_fp4out
+                    and is_static_nvfp4_input_eligible(self.down_proj)
+                    and hasattr(getattr(self.down_proj, "quant_method", None),
+                                "_input_prepare")):
                 m = self._token_count(x)
                 return self.down_proj(
                     self._fused_gelu(x, fp4_out=m >= MLP._FP4OUT_MIN_M))
@@ -151,7 +150,10 @@ class MLP(nn.Module):
 
         x_up = self.up_proj(x)
 
-        if self._use_fused_relu2_quant:
+        # Weight loading may replace the quantization method after
+        # create_weights(), so do not rely on the cached eligibility alone.
+        if (self._use_fused_relu2_quant
+                and is_static_nvfp4_input_eligible(self.down_proj)):
             x_act = self._fused_relu2_quant(x_up)
         else:
             x_act = self.activation(x_up)
@@ -169,16 +171,14 @@ class MLP(nn.Module):
         applied in forward (quant_method can be downgraded after this).
         """
         if (self.activation is not gelu_tanh
-                or get_sm_version() not in (100, 103)
-                or not getattr(self.up_proj, "has_nvfp4", False)):
+                or get_sm_version() not in (100, 103) or not getattr(
+                    self.up_proj, "has_nvfp4_activation_quantization", False)):
             return False, False
         bf16_ok = hasattr(torch.ops.trtllm,
                           "cute_dsl_nvfp4_dense_gemm_gelu_blackwell")
         fp4_ok = (bf16_ok and hasattr(
             torch.ops.trtllm, "cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell")
-                  and getattr(self.down_proj, "has_nvfp4", False)
-                  and not self.down_proj.force_dynamic_quantization
-                  and self.down_proj.input_scale is not None)
+                  and is_static_nvfp4_input_eligible(self.down_proj))
         return bf16_ok, fp4_ok
 
     @staticmethod
@@ -272,8 +272,7 @@ class MLP(nn.Module):
 
         assert self.layer_idx is not None, "layer_idx is required for lora"
         x_up_lora = self.up_lora(x, lora_params, self.layer_idx)
-        if x_up_lora is not None:
-            x_up = x_up + x_up_lora
+        x_up = add_lora_result(x_up, x_up_lora)
 
         x_act = self.activation(x_up)
         x_down = self.down_proj(x_act,

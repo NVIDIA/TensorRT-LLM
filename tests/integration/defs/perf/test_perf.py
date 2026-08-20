@@ -55,12 +55,8 @@ NEMOTRON_SUPER_MODELS = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
-    "llama_v3.3_nemotron_super_49b",
-    "llama_v3.3_nemotron_super_49b_fp8",
-    "llama_v3.1_nemotron_ultra_253b",
-    "llama_v3.1_nemotron_ultra_253b_fp8",
-    "kimi_k2_nvfp4",
     "kimi_k2.5_fp4",
+    "minimax_m3_fp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
@@ -70,9 +66,6 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
     "nemotron_nano_12b_v2",
-    "phi_4_multimodal_instruct",
-    "phi_4_multimodal_instruct_fp4",
-    "phi_4_multimodal_instruct_fp8",
 }
 
 # Models that use random_image dataset in serve mode benchmarks.

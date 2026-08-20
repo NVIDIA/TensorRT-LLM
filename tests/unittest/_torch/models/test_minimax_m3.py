@@ -37,8 +37,11 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3Model,
     _build_swiglu_oai_dense_mlp,
+    _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
+    _validate_sparse_attention_runtime_config,
     _wrap_dict_as_config,
     get_moe_layer_ids,
     get_sparse_disable_index_value_layer_ids,
@@ -52,6 +55,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM3MoeRoutingMethod,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
@@ -62,6 +66,41 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "sparse_attention_config",
+    [None, RocketSparseAttentionConfig()],
+)
+def test_validate_sparse_attention_runtime_config_rejects_wrong_backend(
+    sparse_attention_config: MiniMaxM3SparseAttentionConfig | RocketSparseAttentionConfig | None,
+) -> None:
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=sparse_attention_config,
+    )
+
+    with pytest.raises(ValueError, match="algorithm='minimax_m3'"):
+        _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
+    )
+
+    _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_model_init_validates_sparse_attention_runtime_config() -> None:
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=None,
+    )
+
+    with pytest.raises(ValueError, match="algorithm='minimax_m3'"):
+        MiniMaxM3Model(model_config)
 
 
 def _make_text_config():
@@ -599,6 +638,242 @@ def test_minimax_m3_attention_dense_apply_index_qk_norm_raises():
         attn.apply_index_qk_norm(idx_q, idx_k)
 
 
+def _make_fused_qk_norm_rope_test_config():
+    """Return (text_config, ModelConfig) with a kernel-supported head_dim.
+
+    fused_qk_norm_rope only compiles for head_dim in {64, 128, 256}, so the
+    head_dim=32 config from _make_attention_test_config cannot drive the fused
+    path. This variant keeps the real M3 head_dim=128, sparse_index_dim=128 and
+    rotary_dim=64 geometry with few heads so the tensors stay small.
+    """
+    n_layers = 4
+    sparse_cfg = {
+        "use_sparse_attention": True,
+        "sparse_index_dim": 128,
+        "sparse_num_index_heads": 2,
+        "sparse_topk_blocks": 4,
+        "sparse_block_size": 16,
+        "sparse_init_block": 0,
+        "sparse_local_block": 1,
+        "sparse_score_type": "max",
+        "sparse_disable_index_value": [0, 1, 1, 1],
+        "sparse_attention_freq": [0, 1, 1, 1],
+    }
+    text_cfg = _wrap_dict_as_config(
+        {
+            "hidden_size": 512,
+            "intermediate_size": 128,
+            "num_hidden_layers": n_layers,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 256,
+            "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6,
+            "use_gemma_norm": True,
+            "rope_theta": 5000000.0,
+            "rotary_dim": 64,
+            "partial_rotary_factor": 0.5,
+            "qk_norm_type": "per_head",
+            "use_qk_norm": True,
+            "sparse_attention_config": sparse_cfg,
+            "torch_dtype": torch.bfloat16,
+        }
+    )
+    model_cfg = ModelConfig(
+        pretrained_config=text_cfg,
+        mapping=Mapping(),
+        skip_create_weights_in_init=True,
+    )
+    return text_cfg, model_cfg
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 fused QK-norm+RoPE needs CUDA")
+def test_minimax_m3_fused_qk_norm_rope_main_matches_separate():
+    """Fused main-branch helper matches separate norm plus partial RoPE.
+
+    Covers the helper's wiring against the path it replaces: partial rotary dim,
+    theta and neox flag from RopeParams, Gemma scaling, per-head norm weights,
+    and the norm epsilon.
+    """
+    _, model_cfg = _make_fused_qk_norm_rope_test_config()
+    attn = MiniMaxM3Attention(
+        model_config=model_cfg,
+        layer_idx=0,
+        is_sparse_attention_layer=False,
+    )
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_dim = attn.head_dim
+
+    torch.manual_seed(0)
+    attn.q_norm.weight = torch.nn.Parameter(torch.randn(head_dim, dtype=dtype, device=device) * 0.2)
+    attn.k_norm.weight = torch.nn.Parameter(torch.randn(head_dim, dtype=dtype, device=device) * 0.2)
+
+    seq = 6
+    qkv = torch.randn(seq, attn.q_size + 2 * attn.kv_size, dtype=dtype, device=device)
+    position_ids = torch.arange(seq, dtype=torch.int32, device=device) + 3
+
+    # Fused path.
+    fused = attn._fused_qk_norm_rope(
+        qkv.clone(),
+        position_ids,
+        num_heads_q=attn.num_heads,
+        num_heads_k=attn.num_key_value_heads,
+        num_heads_v=attn.num_key_value_heads,
+        head_dim=head_dim,
+        q_norm=attn.q_norm,
+        k_norm=attn.k_norm,
+    )
+    assert fused is not None, "bf16 qkv + position_ids must take the fused path"
+    q_f, k_f, v_f = fused.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+
+    # Separate fallback path.
+    q_s, k_s, v_s = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+    q_s, k_s = attn.apply_qk_norm(q_s, k_s)
+    q_s, k_s = attn.rotary_emb(position_ids, [q_s, k_s])
+
+    torch.testing.assert_close(q_f.contiguous(), q_s.contiguous(), rtol=5e-2, atol=1e-1)
+    torch.testing.assert_close(k_f.contiguous(), k_s.contiguous(), rtol=5e-2, atol=1e-1)
+    # V is untouched by both paths.
+    torch.testing.assert_close(v_f.contiguous(), v_s.contiguous(), rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 fused QK-norm+RoPE needs CUDA")
+def test_minimax_m3_fused_qk_norm_rope_index_matches_separate():
+    """Fused index-branch helper matches the separate path.
+
+    The index branch norms and rotates the concatenated idx_q (per-head) and
+    idx_k (single replicated head) with num_heads_v=0, then splits back.
+    """
+    _, model_cfg = _make_fused_qk_norm_rope_test_config()
+    attn = MiniMaxM3Attention(
+        model_config=model_cfg,
+        layer_idx=3,
+        is_sparse_attention_layer=True,
+        disable_index_value=True,
+    )
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    sparse_index_dim = attn.sparse_index_dim
+    num_index_heads = attn.sparse_num_index_heads
+
+    torch.manual_seed(1)
+    attn.index_q_norm.weight = torch.nn.Parameter(
+        torch.randn(sparse_index_dim, dtype=dtype, device=device) * 0.3
+    )
+    attn.index_k_norm.weight = torch.nn.Parameter(
+        torch.randn(sparse_index_dim, dtype=dtype, device=device) * 0.3
+    )
+
+    seq = 5
+    idx_q = torch.randn(seq, num_index_heads * sparse_index_dim, dtype=dtype, device=device)
+    idx_k = torch.randn(seq, sparse_index_dim, dtype=dtype, device=device)
+    position_ids = torch.arange(seq, dtype=torch.int32, device=device) + 7
+
+    # Fused path over concatenated [idx_q, idx_k].
+    fused = attn._fused_qk_norm_rope(
+        torch.cat([idx_q, idx_k], dim=-1),
+        position_ids,
+        num_heads_q=num_index_heads,
+        num_heads_k=1,
+        num_heads_v=0,
+        head_dim=sparse_index_dim,
+        q_norm=attn.index_q_norm,
+        k_norm=attn.index_k_norm,
+    )
+    assert fused is not None
+    iq_f, ik_f = fused.split([num_index_heads * sparse_index_dim, sparse_index_dim], dim=-1)
+
+    # Separate fallback path.
+    iq_s, ik_s = attn.apply_index_qk_norm(idx_q, idx_k)
+    iq_s, ik_s = attn.rotary_emb(position_ids, [iq_s, ik_s])
+
+    torch.testing.assert_close(iq_f.contiguous(), iq_s.contiguous(), rtol=5e-2, atol=1e-1)
+    torch.testing.assert_close(ik_f.contiguous(), ik_s.contiguous(), rtol=5e-2, atol=1e-1)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 fused QK-norm+RoPE needs CUDA")
+def test_minimax_m3_fused_qk_norm_rope_fallbacks():
+    """The fused helper returns None (fallback) for non-bf16 or no position_ids."""
+    _, model_cfg = _make_fused_qk_norm_rope_test_config()
+    attn = MiniMaxM3Attention(
+        model_config=model_cfg,
+        layer_idx=0,
+        is_sparse_attention_layer=False,
+    )
+    device = torch.device("cuda")
+    seq = 3
+    total = attn.q_size + 2 * attn.kv_size
+    position_ids = torch.arange(seq, dtype=torch.int32, device=device)
+
+    # No position_ids means RoPE cannot run, so fall back.
+    qkv_bf16 = torch.randn(seq, total, dtype=torch.bfloat16, device=device)
+    assert (
+        attn._fused_qk_norm_rope(
+            qkv_bf16,
+            None,
+            num_heads_q=attn.num_heads,
+            num_heads_k=attn.num_key_value_heads,
+            num_heads_v=attn.num_key_value_heads,
+            head_dim=attn.head_dim,
+            q_norm=attn.q_norm,
+            k_norm=attn.k_norm,
+        )
+        is None
+    )
+
+    # Non-bf16 activations hit the bf16-only guard, so fall back.
+    qkv_fp16 = torch.randn(seq, total, dtype=torch.float16, device=device)
+    assert (
+        attn._fused_qk_norm_rope(
+            qkv_fp16,
+            position_ids,
+            num_heads_q=attn.num_heads,
+            num_heads_k=attn.num_key_value_heads,
+            num_heads_v=attn.num_key_value_heads,
+            head_dim=attn.head_dim,
+            q_norm=attn.q_norm,
+            k_norm=attn.k_norm,
+        )
+        is None
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
+def test_minimax_m3_expect_fused_qk_norm_rope_predicate():
+    """bf16 activations plus position_ids require the fused kernel.
+
+    M3 keeps bf16 attention activations under every quantization flavor, so a
+    runtime fallback there trips the forward assertions. Non-bf16 activations or
+    missing position_ids relax the expectation.
+    """
+    _, model_cfg = _make_fused_qk_norm_rope_test_config()
+    attn = MiniMaxM3Attention(
+        model_config=model_cfg,
+        layer_idx=3,
+        is_sparse_attention_layer=True,
+        disable_index_value=True,
+    )
+    device = torch.device("cuda")
+    position_ids = torch.arange(4, dtype=torch.int32, device=device)
+
+    # bf16 activations require fusion.
+    assert attn.attn_activation_dtype == torch.bfloat16
+    assert attn._expect_fused_qk_norm_rope(position_ids) is True
+
+    # No position_ids means RoPE cannot run, so a fallback is allowed.
+    assert attn._expect_fused_qk_norm_rope(None) is False
+
+    # Non-bf16 activations allow a fallback with no assertion.
+    attn.attn_activation_dtype = torch.float16
+    assert attn._expect_fused_qk_norm_rope(position_ids) is False
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 attention construction needs CUDA")
 def test_minimax_m3_attention_real_config_index_branch_shapes():
@@ -1017,3 +1292,44 @@ def test_minimax_m3_swiglu_oai_dense_mlp_under_adp_is_replicated():
         "ADP down_proj must skip the cross-rank all-reduce; otherwise it "
         "mixes outputs across independent rank-local token sets"
     )
+
+
+# ---------------------------------------------------------------------------
+# Fused SwiGLU-OAI numeric equivalence
+# ---------------------------------------------------------------------------
+#
+# The dense MLP and MoE shared expert express swigluoai as plain SwiGLU with
+# (alpha, beta, limit) so it routes through the fused silu_and_mul kernel.
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="fused silu_and_mul Triton kernel requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
+    """Fused silu_and_mul with (alpha, beta, limit) matches the eager reference.
+
+    Also checks that alpha=1 and beta=0 recover plain SwiGLU.
+    """
+    from tensorrt_llm._torch.modules.swiglu import swiglu
+
+    torch.manual_seed(0)
+    alpha, limit = 1.702, 7.0
+    # Wide range so both clamp branches (gate upper, up symmetric) are hit.
+    gate_up = torch.randn(64, 2 * 128, device="cuda", dtype=dtype) * 6.0
+
+    ref = _minimax_m3_swiglu_oai(gate_up, alpha=alpha, limit=limit)
+    fused = swiglu(gate_up, swiglu_alpha=alpha, swiglu_beta=1.0, swiglu_limit=limit)
+
+    assert fused.shape == ref.shape
+    assert fused.dtype == gate_up.dtype
+    # fp32 accumulation inside the kernel; loose tol for bf16 rounding.
+    atol = 2e-2 if dtype == torch.bfloat16 else 1e-4
+    torch.testing.assert_close(fused.float(), ref.float(), atol=atol, rtol=1e-2)
+
+    # alpha=1 / beta=0 reduces to plain SwiGLU: silu(gate_clamped) * up_clamped.
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate_c = gate.clamp(max=limit)
+    up_c = up.clamp(min=-limit, max=limit)
+    plain_ref = torch.nn.functional.silu(gate_c) * up_c
+    plain = swiglu(gate_up, swiglu_limit=limit)
+    torch.testing.assert_close(plain.float(), plain_ref.float(), atol=atol, rtol=1e-2)

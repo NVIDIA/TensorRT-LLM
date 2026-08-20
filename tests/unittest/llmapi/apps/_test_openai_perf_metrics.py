@@ -1,11 +1,13 @@
-import json
 import logging
 import os
 import tempfile
-from urllib.request import urlopen
 
 import pytest
+import requests
 import yaml
+from test_common.perf_metrics_utils import wait_for_perf_metrics_jsonl
+
+from tensorrt_llm.serve import perf_metrics
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -21,13 +23,18 @@ def model_name():
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file(request):
+def perf_metrics_output_dir(tmp_path_factory):
+    return tmp_path_factory.mktemp("perf_metrics")
+
+
+@pytest.fixture(scope="module")
+def temp_extra_llm_api_options_file(perf_metrics_output_dir):
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
         extra_llm_api_options_dict = {
             "return_perf_metrics": True,
-            "perf_metrics_max_requests": 10
+            "perf_metrics_output_dir": str(perf_metrics_output_dir),
         }
 
         with open(temp_file_path, 'w') as f:
@@ -51,34 +58,43 @@ def server(model_name: str,
         logger.info("Tests completed, shutting down server")
 
 
-def test_metrics_endpoint(server: RemoteOpenAIServer):
-
-    client = server.get_client()
-    client.completions.create(
-        model="Server",
-        prompt="Hello, my name is",
-        max_tokens=25,
-        stream=False,
+def test_return_perf_metrics_and_jsonl_dump(server: RemoteOpenAIServer,
+                                            perf_metrics_output_dir):
+    response = requests.post(
+        f"{server.url_root}/v1/completions",
+        headers={perf_metrics.RETURN_METRICS_HEADER: "1"},
+        json={
+            "model": "Server",
+            "prompt": "Hello, my name is",
+            "max_tokens": 2,
+        },
+        timeout=120,
     )
+    assert response.status_code == 200
 
-    response = urlopen(f'{server.url_root}/perf_metrics')
-    assert response.status is 200
+    for header in (
+            perf_metrics.SERVER_TIMING_HEADER,
+            perf_metrics.START_END_TIME_HEADER,
+            perf_metrics.STEP_METRICS_HEADER,
+            perf_metrics.CTX_CHUNK_METRICS_HEADER,
+    ):
+        assert response.headers.get(header)
 
-    data_list = json.loads(response.read())
-    assert len(data_list) == 1
-    assert "perf_metrics" in data_list[0]
-    assert "request_id" in data_list[0]
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir,
+                                          expected_count=1)
+    data = records[-1]
+    assert data["status"] == "complete"
+    assert set(data) == {
+        "request_id",
+        "perf_metrics",
+        "time_breakdown_metrics",
+        "status",
+    }
 
-    data = data_list[0]["perf_metrics"]
-    assert "first_iter" in data
-    assert "last_iter" in data
-    assert data["first_iter"] <= data["last_iter"]
+    request_metrics = data["perf_metrics"]
+    assert request_metrics["first_iter"] <= request_metrics["last_iter"]
 
-    timing_metrics = data["timing_metrics"]
-    assert "arrival_time" in timing_metrics
-    assert "first_scheduled_time" in timing_metrics
-    assert "first_token_time" in timing_metrics
-    assert "last_token_time" in timing_metrics
+    timing_metrics = request_metrics["timing_metrics"]
     assert timing_metrics["arrival_time"] < timing_metrics[
         "first_scheduled_time"]
     assert timing_metrics["first_scheduled_time"] < timing_metrics[
@@ -86,16 +102,35 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
     assert timing_metrics["first_token_time"] <= timing_metrics[
         "last_token_time"]
 
-    kv_cache_metrics = data["kv_cache_metrics"]
-    assert "num_total_allocated_blocks" in kv_cache_metrics
-    assert "num_new_allocated_blocks" in kv_cache_metrics
-    assert "num_reused_blocks" in kv_cache_metrics
-    assert "num_missed_blocks" in kv_cache_metrics
+    kv_cache_metrics = request_metrics["kv_cache_metrics"]
     assert kv_cache_metrics["num_new_allocated_blocks"] <= kv_cache_metrics[
         "num_total_allocated_blocks"]
 
-    # exclude disagg specific metrics
-    assert "ctx_request_id" not in data_list[0]
-    assert "kv_cache_size" not in timing_metrics
+    assert "ctx_request_id" not in data
     assert "kv_cache_transfer_start" not in timing_metrics
     assert "kv_cache_transfer_end" not in timing_metrics
+
+
+def test_streaming_metrics_require_request_opt_in(server: RemoteOpenAIServer):
+    payload = {
+        "model": "Server",
+        "prompt": "Hello, my name is",
+        "max_tokens": 2,
+        "stream": True,
+    }
+    response = requests.post(f"{server.url_root}/v1/completions",
+                             json=payload,
+                             timeout=120)
+    assert response.status_code == 200
+    assert "data: [DONE]" in response.text
+    assert f"event: {perf_metrics.SSE_METRICS_EVENT}" not in response.text
+
+    response = requests.post(
+        f"{server.url_root}/v1/completions",
+        headers={perf_metrics.RETURN_METRICS_HEADER: "1"},
+        json=payload,
+        timeout=120,
+    )
+    assert response.status_code == 200
+    assert "data: [DONE]" in response.text
+    assert f"event: {perf_metrics.SSE_METRICS_EVENT}" in response.text

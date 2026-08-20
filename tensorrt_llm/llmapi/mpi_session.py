@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import abc
 import itertools
+import math
 import os
 import socket
 import sys
@@ -26,6 +30,91 @@ if ENABLE_MULTI_DEVICE:
     from tensorrt_llm._utils import global_mpi_size, mpi_world_size
 
 T = TypeVar("T")
+
+_FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
+_FLASHINFER_WORKER_BOOTSTRAP = """
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+from mpi4py import MPI
+
+workspace_lock = None
+rank = "unknown"
+if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
+    try:
+        workspace_root = Path(sys.argv[1]).expanduser()
+        rank = MPI.COMM_WORLD.Get_rank()
+        slot = rank
+        slot_stride = MPI.COMM_WORLD.Get_size()
+        # Reuse the rank's cache when possible. Concurrent pools with the same
+        # rank skip locked slots in world-size strides, keeping every worker apart.
+        while True:
+            workspace = workspace_root / f"rank-{slot}"
+            workspace.mkdir(parents=True, exist_ok=True)
+            workspace_lock = (workspace / ".lock").open("a")
+            try:
+                fcntl.flock(workspace_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                workspace_lock.close()
+                workspace_lock = None
+                slot += slot_stride
+
+        # Preserve FlashInfer's default cubin cache before changing its workspace
+        # base. Importing flashinfer.jit.env here would initialize all of its
+        # workspace constants before the isolated base is configured.
+        os.environ.setdefault(
+            "FLASHINFER_CUBIN_DIR",
+            str(Path.home() / ".cache" / "flashinfer" / "cubins"),
+        )
+        os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
+    # This isolation is only a cache optimization. Any setup failure must fall
+    # back to FlashInfer's shared defaults rather than prevent the MPI worker
+    # from starting.
+    except Exception as error:  # noqa: BLE001
+        if workspace_lock is not None:
+            try:
+                workspace_lock.close()
+            except Exception as close_error:  # noqa: BLE001
+                print(
+                    f"[trtllm] rank {rank} could not close a failed FlashInfer "
+                    f"workspace lock ({close_error})",
+                    file=sys.stderr,
+                )
+        workspace_lock = None
+        print(
+            f"[trtllm] rank {rank} could not isolate its FlashInfer workspace "
+            f"({error}); falling back to FlashInfer's shared defaults",
+            file=sys.stderr,
+        )
+
+from mpi4py.futures.server import main
+
+# Hold the lock for the server's lifetime. The kernel also releases it when a
+# worker exits abnormally, so a later launch can safely reuse the cache slot.
+try:
+    main()
+finally:
+    if workspace_lock is not None:
+        try:
+            fcntl.flock(workspace_lock, fcntl.LOCK_UN)
+        except OSError as error:
+            print(
+                f"[trtllm] rank {rank} could not unlock the FlashInfer "
+                f"workspace ({error})",
+                file=sys.stderr,
+            )
+        try:
+            workspace_lock.close()
+        except OSError as error:
+            print(
+                f"[trtllm] rank {rank} could not close the FlashInfer "
+                f"workspace lock ({error})",
+                file=sys.stderr,
+            )
+"""
 
 
 class MPINodeState:
@@ -220,6 +309,36 @@ def _process_start_time(pid: int) -> Optional[bytes]:
         return None
 
 
+_DEFAULT_IDENTITY_TIMEOUT = 300.0
+
+
+def _identity_barrier_timeout() -> float:
+    """Deadline for the ``wait_shutdown`` worker-identity barrier, in seconds.
+
+    The barrier itself completes in milliseconds, but it is the first work ever
+    submitted to a freshly built ``MPIPoolExecutor``, and mpi4py spawns lazily
+    from its manager thread — so this deadline really bounds the whole worker
+    bootstrap: process spawn plus ``import tensorrt_llm``, measured at ~50-65s
+    on an idle node and up to ~117s on a contended one. Hence a ceiling sized
+    against bootstrap cost rather than barrier latency. The test-session
+    prefetcher derives its own wait budget from this value so it cannot abandon
+    a bootstrap that this layer still considers healthy.
+    ``TRTLLM_MPI_IDENTITY_TIMEOUT`` overrides it.
+    """
+    raw = os.environ.get("TRTLLM_MPI_IDENTITY_TIMEOUT")
+    if not raw:
+        return _DEFAULT_IDENTITY_TIMEOUT
+    try:
+        value = float(raw)
+        if math.isfinite(value) and value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning(f"Ignoring invalid TRTLLM_MPI_IDENTITY_TIMEOUT={raw!r}; "
+                   f"using {_DEFAULT_IDENTITY_TIMEOUT}s")
+    return _DEFAULT_IDENTITY_TIMEOUT
+
+
 def _worker_identity_barrier():
     """Runs inside a pool worker; module-level so it is picklable.
 
@@ -315,12 +434,13 @@ class MpiPoolSession(MpiSession):
         cancel the pending tasks). Instead of handing out such a pool, tear
         it down and raise; callers fall back to a fresh spawn.
         """
+        timeout = _identity_barrier_timeout()
         try:
             futures = [
                 self.mpi_pool.submit(_worker_identity_barrier)
                 for _ in range(self.n_workers)
             ]
-            done, not_done = futures_wait(futures, timeout=60.0)
+            done, not_done = futures_wait(futures, timeout=timeout)
             identities = tuple(f.result() for f in done)
         except Exception as e:
             self._teardown_unidentified_pool(())
@@ -336,7 +456,9 @@ class MpiPoolSession(MpiSession):
                 "MpiPoolSession(wait_shutdown=True): worker identity "
                 f"collection incomplete ({len(identities)}/{self.n_workers} "
                 "valid identities); pool torn down instead of handing out a "
-                "session that cannot honor the wait_shutdown contract")
+                "session that cannot honor the wait_shutdown contract. Raise "
+                "TRTLLM_MPI_IDENTITY_TIMEOUT if worker bootstrap is merely "
+                f"slow (deadline was {timeout}s)")
         return identities
 
     def _teardown_unidentified_pool(self, partial_identities: Tuple) -> None:
@@ -397,12 +519,20 @@ class MpiPoolSession(MpiSession):
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM")
+            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
+                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
         }
         env.update(self._env_overrides)
+        isolate_workspace = (self.n_workers > 1 and env.get(
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "0") == "1"
+                             and "FLASHINFER_WORKSPACE_BASE" not in env)
+        python_args = ([
+            "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
+        ] if isolate_workspace else None)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
-                                        env=env)
+                                        env=env,
+                                        python_args=python_args)
 
     def __del__(self):
         self.shutdown_abort()

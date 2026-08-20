@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import numpy as np
+import pytest
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     MemRegionGroup,
@@ -26,6 +27,8 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+
+pytestmark = pytest.mark.cpu_only
 
 
 def make_rankinfo(
@@ -57,7 +60,6 @@ def make_rankinfo(
         device_id=0,
         layer_num_per_pp=[1],
         sender_endpoints=[],
-        server_endpoint="",
         self_endpoint="",
         transfer_engine_info=b"",
         attention=AttentionInfo(

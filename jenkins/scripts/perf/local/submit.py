@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import copy
 import json
@@ -10,6 +25,10 @@ import sys
 from datetime import datetime
 
 import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from benchmark_utils import parse_positive_concurrency  # noqa: E402
+from cluster_env import get_ucx_tls_cmd, gpu_type_from_supported_gpus  # noqa: E402
 
 
 def _import_precheck_config(llm_src):
@@ -330,32 +349,12 @@ def get_benchmark_config(config, benchmark_mode):
     if benchmark_mode is None:
         return {}
     benchmark = config.get("benchmark", {})
-    concurrency_str = benchmark.get("concurrency_list", "1")
-    concurrency = int(concurrency_str) if isinstance(concurrency_str, str) else concurrency_str
+    concurrency = parse_positive_concurrency(benchmark.get("concurrency_list", "1"))
 
     return {
         "mode": benchmark_mode,
         "concurrency": concurrency,
     }
-
-
-def get_benchmark_request_queue_size(config, concurrency):
-    """Cap the gen-only fill target to the GEN executor's active capacity."""
-    gen_config = (config.get("worker_config", {}) or {}).get("gen", {}) or {}
-    concurrency = int(concurrency)
-    max_batch_size = int(gen_config.get("max_batch_size", concurrency))
-    enable_attention_dp = gen_config.get("enable_attention_dp", False)
-    tp_size = int(gen_config.get("tensor_parallel_size", 1))
-    max_capacity = max_batch_size * tp_size if enable_attention_dp else max_batch_size
-    queue_size = min(max_capacity, concurrency)
-    if queue_size < concurrency:
-        print(
-            "[WARNING] TLLM_BENCHMARK_REQ_QUEUES_SIZE capped to "
-            f"{queue_size} (max_batch_size={max_batch_size}, tp_size={tp_size}, "
-            f"attention_dp={enable_attention_dp}) instead of concurrency={concurrency}. "
-            "The fill loop cannot reach a target above the GEN executor capacity."
-        )
-    return queue_size
 
 
 def partition_has_gpu_gres(partition):
@@ -374,6 +373,27 @@ def partition_has_gpu_gres(partition):
         return gres.startswith("gpu:")
     except Exception:
         return False
+
+
+def detect_cluster_name():
+    """Best-effort Slurm cluster name detection on the submission frontend."""
+    name = os.environ.get("SLURM_CLUSTER_NAME", "")
+    if name:
+        return name
+    try:
+        config_out = subprocess.check_output(
+            ["scontrol", "show", "config"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+        for line in config_out.splitlines():
+            key, separator, value = line.partition("=")
+            if key.strip() == "ClusterName" and separator:
+                return value.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
 
 
 def generate_sbatch_params(args, hardware_config, work_dir):
@@ -625,6 +645,14 @@ def main():
         default=8000,
         help="Port the disagg server listens on (exported as DISAGG_SERVER_PORT)",
     )
+    parser.add_argument(
+        "--cluster-name",
+        default="",
+        help="Cluster name used with the GPU type to pick UCX env settings "
+        "(bloom SlurmPartition.clusterName, e.g. gcp-nrt, aws-cmh). If not "
+        "set, best-effort detected from SLURM_CLUSTER_NAME / scontrol; note "
+        "Slurm's own ClusterName may differ from the bloom name.",
+    )
 
     args = parser.parse_args()
 
@@ -686,10 +714,14 @@ def main():
         with open(config_yaml, "r") as f:
             config = yaml.safe_load(f)
 
-    # Detect GPU type from config metadata
-    supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
-    is_b200 = "B200" in supported_gpus
-    is_gb300 = "GB300" in supported_gpus
+    # Detect GPU type and cluster only for disaggregated UCX selection.
+    if runtime_mode == "disaggregated":
+        supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
+        gpu_type = gpu_type_from_supported_gpus(supported_gpus)
+        cluster_name = args.cluster_name or detect_cluster_name()
+    else:
+        gpu_type = ""
+        cluster_name = ""
 
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -869,21 +901,15 @@ def main():
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif "gen_only" in bm_config.get("mode", ""):
             concurrency = bm_config.get("concurrency", 1)
-            queue_size = get_benchmark_request_queue_size(config, concurrency)
-            ctx_worker_env_vars = (
-                f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
-            )
+            # GEN worker only: the same flag on the CTX worker has been seen to
+            # hang gen_only runs with KV blocks never released.
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={queue_size} {gen_worker_env_vars}"
+                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        if is_gb300:
-            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
-        elif is_b200:
-            ucx_tls_cmd = "export UCX_TLS=^ib &&"
-        else:
-            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
+        ucx_tls_cmd = get_ucx_tls_cmd(cluster_name, gpu_type)
+        print(f"UCX env: cluster={cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
@@ -930,6 +956,7 @@ def main():
         # of the real worker steps; enable policy and timeouts come from
         # precheck_config (single owner).
         pcfg = _import_precheck_config(llm_src)
+        precheck_enabled = pcfg.precheck_enabled(config)
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,
@@ -940,16 +967,16 @@ def main():
                     hardware_config.get("gpus_per_ctx_server", 0) or 0,
                     hardware_config.get("gpus_per_gen_server", 0) or 0,
                 ),
+                llm_models_root=args.llm_models_root if precheck_enabled else None,
             )
         )
 
         # Add srun args for disagg
         srun_args_lines.extend(
-            [
-                "--container-env=DISAGG_SERVING_TYPE",
-                "--container-env=pytestCommand",
-            ]
+            ["--container-env=DISAGG_SERVING_TYPE", "--container-env=pytestCommand"]
         )
+        if precheck_enabled:
+            srun_args_lines.append("--container-env=LLM_MODELS_ROOT")
     else:
         worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{tllm_profile_start_stop}' "

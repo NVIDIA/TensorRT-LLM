@@ -25,6 +25,8 @@ import pytest
 
 from tensorrt_llm.commands import serve
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _mock_llmapi_modules(
     monkeypatch: pytest.MonkeyPatch,

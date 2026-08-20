@@ -1,12 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import base64
 import gc
-import importlib.util
-import multiprocessing
+import json
+import os
 import pickle
 import re
-import subprocess
-import sys
-import traceback
 from typing import Callable, List, Optional, Tuple
 
 import pytest
@@ -16,8 +16,14 @@ from _torch.ray_orchestrator.single_gpu.test_llm_update_weights import (
     compare_logits,
     run_generate,
 )
+from safetensors import safe_open
 from torch.multiprocessing.reductions import reduce_tensor
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Qwen3_5MoeForConditionalGeneration,
+)
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_blackwell, skip_pre_hopper
@@ -28,7 +34,9 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
     _quantize_nvfp4,
 )
 from tensorrt_llm._torch.utils import get_device_uuid
-from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
+from tensorrt_llm.executor.ray.utils import control_action_decorator
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
+from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
 # Ray-backed LLM teardown only fires from RayExecutor.shutdown(), which runs
 # after pytest-threadleak's per-test snapshot — see the matching docstring in
@@ -50,6 +58,102 @@ def release_shared_cuda_memory():
     torch.cuda.empty_cache()
 
 
+def _decoder_weight_group(name: str) -> str:
+    """Group the same parameter across repeated decoder layers."""
+    return re.sub(r"^model\.layers\.\d+\.", "", name)
+
+
+def _run_multi_gpu_update_weights(
+    *,
+    model_dir: str,
+    hf_model: RefHFModelWithIPCHandles,
+    device_ids: List[int],
+    llm_kwargs: dict,
+    sampling_params: SamplingParams,
+    partial: bool,
+    weight_group: Callable[[str], str] = _decoder_weight_group,
+    prompts_texts: Optional[List[str]] = None,
+    tokenizer_dir: Optional[str] = None,
+    warm_before_update: bool = False,
+    generate_fn: Callable = run_generate,
+) -> None:
+    """Run the shared warm/update/finalize/reference-comparison workflow."""
+    if prompts_texts is None:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir or model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+    del tokenizer
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=len(device_ids),
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        **llm_kwargs,
+    ) as llm:
+        if warm_before_update:
+            llm.generate(prompts, sampling_params)
+
+        if partial:
+            groups = sorted(
+                {weight_group(name) for name, _ in hf_model.all_weights[hf_model.device_id]}
+            )
+            for group in groups:
+                ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                    device_ids,
+                    weight_filter=lambda name, group=group: (weight_group(name) == group),
+                )
+                llm._collective_rpc("update_weights", (ipc_handles,))
+        else:
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(device_ids)
+            llm._collective_rpc("update_weights", (ipc_handles,))
+
+        llm._collective_rpc("update_weights", (None,))
+        llm_logits, ref_logits = generate_fn(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits)
+
+
+def _run_fp8_update_weights(model_dir: str, fp8_model_dir: str, partial: bool) -> None:
+    model_dir = str(llm_models_root() / model_dir)
+    fp8_model_dir = str(llm_models_root() / fp8_model_dir)
+    num_hidden_layers = 1
+    hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
+
+    llm_kwargs = {
+        "kv_cache_config": KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1),
+        "model_kwargs": {
+            "num_hidden_layers": num_hidden_layers,
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            },
+        },
+    }
+    if "Qwen3/Qwen3-30B-A3B" in model_dir:
+        llm_kwargs["moe_config"] = {"backend": "DEEPGEMM"}
+
+    _run_multi_gpu_update_weights(
+        model_dir=model_dir,
+        hf_model=hf_model,
+        device_ids=[0, 1],
+        llm_kwargs=llm_kwargs,
+        sampling_params=SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        ),
+        partial=partial,
+        tokenizer_dir=fp8_model_dir,
+    )
+
+
 @pytest.mark.part0
 @skip_pre_blackwell
 @pytest.mark.parametrize(
@@ -60,63 +164,7 @@ def release_shared_cuda_memory():
     ],
 )
 def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
-    model_dir = str(llm_models_root() / model_dir)
-    fp8_model_dir = str(llm_models_root() / fp8_model_dir)
-    additional_kwargs = {}
-    if "Qwen3/Qwen3-30B-A3B" in model_dir:
-        additional_kwargs["moe_config"] = {
-            "backend": "DEEPGEMM",
-        }
-        # moe_intermediate_size is 768, and FP8 block scaling needs each
-        # MoE TP shard to stay a multiple of the 128 block size, so MoE TP
-        # is capped at 2 (768 / 2 = 384) and EP covers the rest of tp=4.
-        additional_kwargs["moe_tensor_parallel_size"] = 2
-        additional_kwargs["moe_expert_parallel_size"] = 2
-    num_hidden_layers = 1
-    hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
-    tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    with LLM(
-        model=model_dir,
-        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=4,
-        load_format="dummy",
-        pipeline_parallel_size=1,
-        kv_cache_config=kv_cache_config,
-        model_kwargs={
-            "num_hidden_layers": num_hidden_layers,
-            "quantization_config": {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128],
-            },
-        },
-        **additional_kwargs,
-    ) as llm:
-        # Generate texts from the prompts.
-        prompts_texts = [
-            "Hello, my name is",
-            "The president of the United States is",
-            "The capital of France is",
-            "The future of AI is",
-        ]
-        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-        del tokenizer
-        sampling_params = SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
-        )
-
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1, 2, 3])
-
-        llm._collective_rpc("update_weights", (ipc_handles,))
-        # Finalize the update weights
-        llm._collective_rpc("update_weights", (None,))
-
-        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-        compare_logits(llm_logits, ref_logits)
-
-    del hf_model
+    _run_fp8_update_weights(model_dir, fp8_model_dir, partial=False)
 
 
 @pytest.mark.part1
@@ -129,82 +177,538 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
     ],
 )
 def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
-    model_dir = str(llm_models_root() / model_dir)
-    fp8_model_dir = str(llm_models_root() / fp8_model_dir)
-    additional_kwargs = {}
-    if "Qwen3/Qwen3-30B-A3B" in model_dir:
-        additional_kwargs["moe_config"] = {
-            "backend": "DEEPGEMM",
+    _run_fp8_update_weights(model_dir, fp8_model_dir, partial=True)
+
+
+_QWEN35_35B_TP8 = 8
+_QWEN35_35B_REDUCED_LAYERS = 4
+_QWEN35_35B_LAYER_TYPES = [
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+]
+_QWEN35_35B_TP8_EXTENSION = (
+    "_torch.ray_orchestrator.multi_gpu.test_llm_update_weights_multi_gpu."
+    "Qwen35_35BTP8WorkerExtension"
+)
+
+
+def _qwen35_35b_bf16_model_dir() -> str:
+    """Resolve the real BF16 checkpoint, with a local override for bring-up."""
+    model_dir = os.environ.get("QWEN35_35B_BF16_MODEL_DIR")
+    if model_dir:
+        return model_dir
+    return str(llm_models_root() / "Qwen3.5-35B-A3B")
+
+
+def _qwen35_35b_fp8_model_dir() -> str:
+    """Resolve the real block-FP8 checkpoint, with a local override."""
+    model_dir = os.environ.get("QWEN35_35B_FP8_MODEL_DIR")
+    if model_dir:
+        return model_dir
+    return str(llm_models_root() / "Qwen3.5-35B-A3B-FP8")
+
+
+def _qwen35_35b_test_config(model_dir: str):
+    """Keep the exact 35B width while reducing depth for refit-test memory."""
+    config = AutoConfig.from_pretrained(model_dir)
+    text_config = config.text_config
+
+    text_config.num_hidden_layers = _QWEN35_35B_REDUCED_LAYERS
+    text_config.layer_types = _QWEN35_35B_LAYER_TYPES
+
+    # MTP refit is independent of the rollout-model refit under test.
+    if hasattr(text_config, "mtp_num_hidden_layers"):
+        text_config.mtp_num_hidden_layers = 0
+
+    # Transformers eagerly evaluates this fallback even when
+    # moe_intermediate_size is present.
+    if not hasattr(text_config, "intermediate_size"):
+        text_config.intermediate_size = text_config.moe_intermediate_size
+
+    # Text-only generation still constructs the VLM wrapper.
+    config.vision_config.depth = 1
+    return config
+
+
+def _qwen35_35b_model_kwargs() -> dict:
+    """Apply the same depth, MTP, and vision reductions to TRT-LLM."""
+    return {
+        "text_config": {
+            "num_hidden_layers": _QWEN35_35B_REDUCED_LAYERS,
+            "layer_types": _QWEN35_35B_LAYER_TYPES,
+            "mtp_num_hidden_layers": 0,
+        },
+        "vision_config": {"depth": 1},
+    }
+
+
+def _qwen35_35b_sampling_params() -> SamplingParams:
+    """Sample enough positions to resolve GDN recurrent-state drift.
+
+    compare_logits averages a top-k overlap ratio over the generated positions,
+    so at max_tokens=8 it only resolves 1/(8 * topk) steps — too coarse to tell
+    real state drift from one arbitrary top-k tie-break. 32 positions also let
+    the state accumulate long enough to diverge. Matches _nemotron_h_body.
+    """
+    return SamplingParams(temperature=0, return_generation_logits=True, max_tokens=32)
+
+
+def _qwen35_35b_is_test_weight(name: str) -> bool:
+    """Select checkpoint weights used by the reduced-depth text model."""
+    if name.startswith("model.visual.") or ".mtp." in name:
+        return False
+    layer_match = re.search(r"\.layers\.(\d+)\.", name)
+    return not (layer_match and int(layer_match.group(1)) >= _QWEN35_35B_REDUCED_LAYERS)
+
+
+class RefQwen35_35BModelWithIPCHandles(RefHFModelWithIPCHandles):
+    """Production-width BF16 35B reference model for exact-logit comparison.
+
+    Unlike the generic helper, the source-device IPC entries alias the HF
+    parameters instead of cloning them. update_weights only reads these
+    allocations, saving one complete model copy on cuda:0 while keeping the
+    reference model available for logits comparison.
+    """
+
+    def __init__(
+        self,
+        model_dir: str,
+        device_id: int = 0,
+        device_ids: Optional[List[int]] = None,
+    ):
+        self.device_id = device_id
+        config = _qwen35_35b_test_config(model_dir)
+        self.model = (
+            Qwen3_5MoeForConditionalGeneration.from_pretrained(
+                model_dir,
+                config=config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+                low_cpu_mem_usage=True,
+            )
+            .eval()
+            .to(f"cuda:{device_id}")
+        )
+        self.all_weights = {}
+        self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
+        self._replicate_weights_to_devices(
+            list(range(torch.cuda.device_count())) if device_ids is None else device_ids
+        )
+
+    def _replicate_weights_to_devices(self, device_ids: List[int]) -> None:
+        source_weights = [
+            (name, parameter.detach()) for name, parameter in self.model.named_parameters()
+        ]
+        self.all_weights[self.device_id] = source_weights
+        for device_id in device_ids:
+            if device_id == self.device_id:
+                continue
+            self.all_weights[device_id] = [
+                (name, parameter.to(f"cuda:{device_id}")) for name, parameter in source_weights
+            ]
+
+
+class RefQwen35_35BFP8CheckpointWithIPCHandles(RefHFModelWithIPCHandles):
+    """Expose exact production-width checkpoint tensors through CUDA IPC.
+
+    Transformers currently does not ingest Qwen3.5's per-expert block-FP8
+    checkpoint layout: it reports the split expert weights/scales as
+    unexpected and initializes fused expert parameters. Refit must consume
+    the checkpoint representation, so load the selected safetensors entries
+    directly rather than silently testing randomly initialized BF16 tensors.
+    """
+
+    def __init__(self, model_dir: str, device_ids: List[int]):
+        self.device_id = device_ids[0]
+        self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
+        self.all_weights = {device_id: [] for device_id in device_ids}
+
+        with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+
+        selected_by_shard = {}
+        for name, shard in weight_map.items():
+            if _qwen35_35b_is_test_weight(name):
+                selected_by_shard.setdefault(shard, []).append(name)
+
+        for shard, names in sorted(selected_by_shard.items()):
+            with safe_open(
+                os.path.join(model_dir, shard), framework="pt", device="cpu"
+            ) as checkpoint:
+                for name in sorted(names):
+                    weight = checkpoint.get_tensor(name)
+                    for device_id in device_ids:
+                        self.all_weights[device_id].append((name, weight.to(f"cuda:{device_id}")))
+
+
+def _qwen35_35b_weight_group(name: str) -> str:
+    """Group repeated layers/experts while separating projection families.
+
+    This produces a practical number of update RPCs and deliberately places
+    QKV, Z, B, A, gate-up, and down projections in separate invocations. It
+    therefore exercises mapper state across incremental calls rather than
+    relying on checkpoint or dictionary order to keep fusion groups together.
+    """
+    name = re.sub(r"(\.layers\.)\d+\.", r"\1*.", name)
+    name = re.sub(r"(\.blocks\.)\d+\.", r"\1*.", name)
+    name = re.sub(r"(\.experts\.)\d+\.", r"\1*.", name)
+    return name
+
+
+def _qwen35_35b_selected_checkpoint_names(model_dir: str) -> List[str]:
+    """Return the production-width text weights used by the reduced-depth test."""
+    with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    return sorted(name for name in weight_map if _qwen35_35b_is_test_weight(name))
+
+
+def _qwen35_35b_load_checkpoint_group(
+    model_dir: str, weight_group: str, device: torch.device
+) -> List[Tuple[str, torch.Tensor]]:
+    """Load one incremental update group onto a Ray worker's local GPU."""
+    with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    selected_by_shard = {}
+    for name in _qwen35_35b_selected_checkpoint_names(model_dir):
+        if _qwen35_35b_weight_group(name) == weight_group:
+            selected_by_shard.setdefault(weight_map[name], []).append(name)
+
+    weights = []
+    for shard, names in sorted(selected_by_shard.items()):
+        with safe_open(os.path.join(model_dir, shard), framework="pt", device="cpu") as checkpoint:
+            weights.extend((name, checkpoint.get_tensor(name).to(device)) for name in sorted(names))
+    return weights
+
+
+def _return_local_weight(tensor: torch.Tensor, *_: object) -> torch.Tensor:
+    """Return a worker-local tensor through the refit handle interface."""
+    return tensor
+
+
+class Qwen35_35BTP8WorkerExtension(WorkerExtension):
+    """Refit helpers that also work when TP8 spans two Ray nodes."""
+
+    def get_test_device_name(self) -> str:
+        return torch.cuda.get_device_name(self.device_id)
+
+    @control_action_decorator
+    def update_weights_from_local_checkpoint(
+        self, model_dir: str, weight_group: Optional[str] = None
+    ) -> None:
+        """Load a bucket beside each worker, avoiding cross-node CUDA IPC."""
+        if weight_group is None:
+            WorkerExtension.update_weights.__wrapped__(self, None)
+            return
+
+        local_weights = _qwen35_35b_load_checkpoint_group(
+            model_dir,
+            weight_group,
+            torch.device("cuda", self.device_id),
+        )
+        device_uuid = get_device_uuid(self.device_id)
+        handles = {
+            device_uuid: [
+                (
+                    name,
+                    (
+                        _return_local_weight,
+                        (weight, None, None, None, None, None, None),
+                    ),
+                )
+                for name, weight in local_weights
+            ]
         }
-        # moe_intermediate_size is 768, and FP8 block scaling needs each
-        # MoE TP shard to stay a multiple of the 128 block size, so MoE TP
-        # is capped at 2 (768 / 2 = 384) and EP covers the rest of tp=4.
-        additional_kwargs["moe_tensor_parallel_size"] = 2
-        additional_kwargs["moe_expert_parallel_size"] = 2
-    num_hidden_layers = 1
-    hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
-    tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+        WorkerExtension.update_weights.__wrapped__(self, handles)
+
+
+def _run_generate_qwen35_35b(llm, hf_model, prompts, sampling_params):
+    """Compare short generations without allocating 2K-token 248K-vocab logits."""
+    llm_responses = []
+    llm_logits = []
+    for output in llm.generate(prompts, sampling_params):
+        llm_logits.append(output.outputs[0].generation_logits)
+        llm_responses.append(output.outputs[0].token_ids)
+
+    prompt_max_len = max(len(prompt) for prompt in prompts)
+    response_max_len = max(len(response) for response in llm_responses)
+    input_ids, attention_mask, position_ids = RefHFModel.pad_data(
+        prompts,
+        llm_responses,
+        prompt_max_len=prompt_max_len,
+        response_max_len=response_max_len,
+    )
+    ref_logits = hf_model.generate_batch_with_padding(
+        input_ids,
+        attention_mask,
+        position_ids,
+        llm_responses,
+        prompt_max_len=prompt_max_len,
+        micro_batch_size=1,
+        return_logits=True,
+    )
+    return llm_logits, ref_logits
+
+
+def _run_qwen35_35b_update(
+    model_dir: str,
+    partial: bool,
+    tp_size: int = 4,
+    explicit_cuda_graph: bool = False,
+) -> None:
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    device_ids = list(range(tp_size))
+    hf_model = RefQwen35_35BModelWithIPCHandles(model_dir, device_ids=device_ids)
+    cuda_graph_config = (
+        CudaGraphConfig(batch_sizes=[1, 2], max_batch_size=2) if explicit_cuda_graph else None
+    )
+    _run_multi_gpu_update_weights(
+        model_dir=model_dir,
+        hf_model=hf_model,
+        device_ids=device_ids,
+        llm_kwargs={
+            "max_batch_size": 2,
+            "max_seq_len": 256,
+            "max_num_tokens": 256,
+            # The HF reference always carries the GDN state in fp32, so only
+            # the engine accumulates rounding with a bf16 state cache. Serving
+            # keeps bf16 for throughput (see resolve_ssm_cache_dtype), so a
+            # test comparing against HF has to opt in explicitly.
+            "kv_cache_config": KvCacheConfig(
+                enable_block_reuse=True,
+                free_gpu_memory_fraction=0.05,
+                mamba_ssm_cache_dtype="float32",
+            ),
+            **({"cuda_graph_config": cuda_graph_config} if cuda_graph_config is not None else {}),
+            "model_kwargs": _qwen35_35b_model_kwargs(),
+            "moe_config": MoeConfig(backend="TRTLLM"),
+        },
+        sampling_params=_qwen35_35b_sampling_params(),
+        partial=partial,
+        weight_group=_qwen35_35b_weight_group,
+        prompts_texts=["Hello, my name is", "The future of AI is"],
+        warm_before_update=True,
+        generate_fn=_run_generate_qwen35_35b,
+    )
+
+
+def _run_qwen35_35b_bf16_update(
+    partial: bool,
+    tp_size: int = 4,
+    explicit_cuda_graph: bool = False,
+) -> None:
+    _run_qwen35_35b_update(_qwen35_35b_bf16_model_dir(), partial, tp_size, explicit_cuda_graph)
+
+
+def _run_qwen35_35b_fp8_update(partial: bool) -> None:
+    model_dir = _qwen35_35b_fp8_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    device_ids = list(range(4))
+    checkpoint = RefQwen35_35BFP8CheckpointWithIPCHandles(model_dir, device_ids)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
+    del tokenizer
+    sampling_params = _qwen35_35b_sampling_params()
+
+    def generate_logits(llm):
+        return [
+            output.outputs[0].generation_logits for output in llm.generate(prompts, sampling_params)
+        ]
+
+    def update(llm, incremental: bool) -> None:
+        if incremental:
+            groups = sorted(
+                {
+                    _qwen35_35b_weight_group(name)
+                    for name, _ in checkpoint.all_weights[checkpoint.device_id]
+                }
+            )
+            for group in groups:
+                ipc_handles = checkpoint.get_weight_ipc_handles_serialized(
+                    device_ids,
+                    weight_filter=lambda name, group=group: (
+                        _qwen35_35b_weight_group(name) == group
+                    ),
+                )
+                llm._collective_rpc("update_weights", (ipc_handles,))
+        else:
+            ipc_handles = checkpoint.get_weight_ipc_handles_serialized(device_ids)
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        llm._collective_rpc("update_weights", (None,))
+
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=4,
+        tensor_parallel_size=len(device_ids),
         load_format="dummy",
         pipeline_parallel_size=1,
-        kv_cache_config=kv_cache_config,
-        model_kwargs={
-            "num_hidden_layers": num_hidden_layers,
-            "quantization_config": {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128],
-            },
-        },
-        **additional_kwargs,
+        max_batch_size=2,
+        max_seq_len=256,
+        max_num_tokens=256,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.05),
+        model_kwargs=_qwen35_35b_model_kwargs(),
+        moe_config=MoeConfig(backend="TRTLLM"),
     ) as llm:
-        # Generate texts from the prompts.
-        prompts_texts = [
-            "Hello, my name is",
-            "The president of the United States is",
-            "The capital of France is",
-            "The future of AI is",
-        ]
-        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-        del tokenizer
+        # Compile CUDA graphs before refit, then use the first exact-checkpoint
+        # update as the reference for an identical one-shot or partial update.
+        llm.generate(prompts, sampling_params)
+        update(llm, incremental=False)
+        reference_logits = generate_logits(llm)
+        update(llm, incremental=partial)
+        updated_logits = generate_logits(llm)
+        compare_logits(updated_logits, reference_logits)
 
-        sampling_params = SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
+
+def _attach_to_tp8_ray_cluster(monkeypatch) -> None:
+    """Attach to a cluster with eight GPUs when the driver has only four."""
+    test_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+    python_path = os.environ.get("PYTHONPATH")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        f"{test_root}{os.pathsep}{python_path}" if python_path else test_root,
+    )
+    monkeypatch.setenv("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0")
+
+    import ray
+
+    if not ray.is_initialized():
+        try:
+            ray.init(address="auto", ignore_reinit_error=True)
+        except ConnectionError:
+            pytest.skip(
+                "TP8 requires either eight local B200s or an attached Ray cluster with eight B200s"
+            )
+
+    available_gpus = int(ray.cluster_resources().get("GPU", 0))
+    if available_gpus < _QWEN35_35B_TP8:
+        pytest.skip(f"TP8 requires eight cluster GPUs, found {available_gpus}")
+
+
+def _run_qwen35_35b_tp8_multinode_update() -> None:
+    """Run the TP8 CUDA Graph test with checkpoint buckets local to each worker."""
+    model_dir = _qwen35_35b_bf16_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    groups = sorted(
+        {
+            _qwen35_35b_weight_group(name)
+            for name in _qwen35_35b_selected_checkpoint_names(model_dir)
+        }
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
+    del tokenizer
+    sampling_params = _qwen35_35b_sampling_params()
+
+    def generate_logits(llm):
+        return [
+            output.outputs[0].generation_logits for output in llm.generate(prompts, sampling_params)
+        ]
+
+    def update(llm) -> None:
+        for group in groups:
+            llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, group))
+        llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, None))
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls=_QWEN35_35B_TP8_EXTENSION,
+        tensor_parallel_size=_QWEN35_35B_TP8,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        max_batch_size=2,
+        max_seq_len=256,
+        max_num_tokens=256,
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2], max_batch_size=2),
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=True,
+            free_gpu_memory_fraction=0.05,
+            mamba_ssm_cache_dtype="bfloat16",
+        ),
+        model_kwargs=_qwen35_35b_model_kwargs(),
+        moe_config=MoeConfig(backend="TRTLLM"),
+    ) as llm:
+        device_names = llm._collective_rpc("get_test_device_name")
+        assert all("B200" in name.upper() for name in device_names), (
+            f"TP8 alignment coverage requires B200 GPUs, got {device_names}"
         )
 
-        def common_filter(filter_name: str) -> Callable[[str], bool]:
-            def filter_fn(name: str) -> bool:
-                return name.endswith(filter_name)
+        # Capture before refit, then replay the same graph after two identical
+        # cross-bucket updates. The 35B TP8 layout executes the alignment clone.
+        llm.generate(prompts, sampling_params)
+        update(llm)
+        reference_logits = generate_logits(llm)
+        update(llm)
+        updated_logits = generate_logits(llm)
+        compare_logits(updated_logits, reference_logits)
 
-            return filter_fn
 
-        # Generate filter_list from model weight keys by removing layer prefix
-        # e.g., "model.layers.41.input_layernorm.weight" -> "input_layernorm.weight"
-        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
-        filter_set = set()
-        for name, _ in hf_model.all_weights[hf_model.device_id]:
-            suffix = layer_prefix_pattern.sub("", name)
-            filter_set.add(suffix)
-        filter_list = list(filter_set)
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_35b_bf16_tp8_cuda_graph(
+    monkeypatch,
+):
+    """Exercise TP8's BF16 alignment clone through CUDA Graph replay."""
+    if torch.cuda.device_count() >= _QWEN35_35B_TP8:
+        device_names = [
+            torch.cuda.get_device_name(device_id) for device_id in range(_QWEN35_35B_TP8)
+        ]
+        assert all("B200" in name.upper() for name in device_names), (
+            f"TP8 alignment coverage requires B200 GPUs, got {device_names}"
+        )
+        _run_qwen35_35b_bf16_update(
+            partial=True,
+            tp_size=_QWEN35_35B_TP8,
+            explicit_cuda_graph=True,
+        )
+        return
 
-        for filter_name in filter_list:
-            weight_filter = common_filter(filter_name=filter_name)
-            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-                [0, 1, 2, 3], weight_filter=weight_filter
-            )
-            llm._collective_rpc("update_weights", (ipc_handles,))
-        # Finalize the update weights
-        llm._collective_rpc("update_weights", (None,))
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    _run_qwen35_35b_tp8_multinode_update()
 
-        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-        compare_logits(llm_logits, ref_logits)
 
-    del hf_model
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_35b_bf16():
+    """One-shot BF16 refit of the production-width 35B model."""
+    _run_qwen35_35b_bf16_update(partial=False)
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_35b_bf16():
+    """Incremental BF16 refit with GDN and MoE fusion groups split across RPCs."""
+    _run_qwen35_35b_bf16_update(partial=True)
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_35b_fp8():
+    """One-shot block-FP8 refit of the production-width 35B model."""
+    _run_qwen35_35b_fp8_update(partial=False)
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_35b_fp8():
+    """Incremental block-FP8 refit with weights and scales split across RPCs."""
+    _run_qwen35_35b_fp8_update(partial=True)
 
 
 class RefNVFP4ModelWithIPCHandles(RefHFModel):
@@ -358,11 +862,10 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
 
         assert not fusion_buffer, f"Incomplete fusion groups: {list(fusion_buffer.keys())}"
 
-        # Only populate the owning device. Extra replicas are materialized
-        # lazily by ``get_weight_ipc_handles_serialized`` so that GPUs never
-        # asked for via IPC don't hold NVFP4 quantized tensors that persist
-        # across parametrize IDs.
         self.all_weights[self.device_id] = model_weights
+        for i in range(torch.cuda.device_count()):
+            if i != self.device_id:
+                self.all_weights[i] = [(n, p.to(f"cuda:{i}")) for n, p in model_weights]
 
         with torch.no_grad():
             param_dict = dict(self.model.named_parameters())
@@ -464,10 +967,6 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
 
         for device in device_list:
-            if device not in self.all_weights:
-                src = self.all_weights[self.device_id]
-                self.all_weights[device] = [(n, p.to(f"cuda:{device}")) for n, p in src]
-
             all_handles = []
             for item in self.all_weights[device]:
                 name, p = item
@@ -509,7 +1008,7 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=4,
+        tensor_parallel_size=2,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -534,15 +1033,13 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
             temperature=0, return_generation_logits=True, max_tokens=1024
         )
 
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1, 2, 3])
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
         llm._collective_rpc("update_weights", (ipc_handles,))
         llm._collective_rpc("update_weights", (None,))
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
         compare_logits(llm_logits, ref_logits, threshold=0.8)
-
-    del hf_model
 
 
 @pytest.mark.part3
@@ -572,7 +1069,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=4,
+        tensor_parallel_size=2,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -615,7 +1112,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         for filter_name in filter_list:
             weight_filter = common_filter(filter_name=filter_name)
             ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-                [0, 1, 2, 3], weight_filter=weight_filter
+                [0, 1], weight_filter=weight_filter
             )
             llm._collective_rpc("update_weights", (ipc_handles,))
         llm._collective_rpc("update_weights", (None,))
@@ -624,78 +1121,38 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
         compare_logits(llm_logits, ref_logits, threshold=0.8)
 
-    del hf_model
 
+@pytest.mark.part4
+@skip_pre_hopper
+def test_llm_update_weights_nemotron_h():
+    """Weight update on Nemotron-H, a hybrid model mixing mamba, MoE and
+    attention layers.
 
-@pytest.fixture
-def mamba_deps():
-    """Install mamba-ssm and causal-conv1d for the duration of the test, then
-    restore the full pip environment. Uses a pip-freeze diff so transitive
-    dependencies (e.g. quack-kernels pinning nvidia-cutlass-dsl==4.6.0.dev0,
-    which breaks tensorrt-llm's pin of 4.5.0) are also reverted."""
-
-    def _freeze():
-        out = subprocess.check_output(
-            [sys.executable, "-m", "pip", "freeze", "--disable-pip-version-check"],
-            text=True,
-        )
-        result = {}
-        for line in out.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or " @ " in line:
-                continue
-            if "==" in line:
-                name, ver = line.split("==", 1)
-                result[name.lower()] = ver
-        return result
-
-    pkgs = ["mamba-ssm", "causal-conv1d"]
-    mod_names = {"mamba-ssm": "mamba_ssm", "causal-conv1d": "causal_conv1d"}
-    need_install = [p for p in pkgs if importlib.util.find_spec(mod_names[p]) is None]
-
-    before = _freeze() if need_install else None
+    Requires mamba-ssm and causal-conv1d to be importable: without them HF
+    falls back to the naive Python selective_scan path, which OOMs on
+    Nemotron-H and produces unmatched logits. The Ray CI stage installs both
+    next to ray -- see jenkins/scripts/slurm_install.sh."""
     try:
-        if need_install:
-            # --no-deps: avoid pulling in optional kernel deps (quack-kernels,
-            # tilelang) that upgrade nvidia-cutlass-dsl and break tensorrt-llm.
-            # The container already provides torch/einops/etc.
-            subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--no-build-isolation",
-                    "--no-deps",
-                    *need_install,
-                ]
-            )
-            importlib.invalidate_caches()
-        yield
-    finally:
-        if before is None:
-            return
-        after = _freeze()
-        new_pkgs = [p for p in after if p not in before]
-        changed = [(p, before[p]) for p in after if p in before and after[p] != before[p]]
-        if new_pkgs:
-            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", *new_pkgs])
-        if changed:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", *[f"{p}=={v}" for p, v in changed]]
-            )
-
-
-def _nemotron_h_body():
-    """Body of test_llm_update_weights_nemotron_h. Executed in a fresh
-    subprocess via spawn so HF transformers re-imports cleanly and the
-    mamba-ssm / causal-conv1d fast path (installed by the mamba_deps
-    fixture) is picked up. Running this in-process would let the parent
-    pytest's already-resolved negative caches force the naive Python
-    selective_scan path, which OOMs on Nemotron-H and produces unmatched logits."""
+        import causal_conv1d  # noqa: F401
+        import mamba_ssm  # noqa: F401
+    except ImportError as e:
+        # Fail loudly here rather than let the naive fallback OOM further in,
+        # which is a much harder failure to read.
+        pytest.fail(
+            f"{e.name} is not installed, so the mamba fast path is unavailable. "
+            "The Ray CI stage installs mamba-ssm and causal-conv1d alongside ray; "
+            "see jenkins/scripts/slurm_install.sh."
+        )
     model_dir = str(llm_models_root() / "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
     num_hidden_layers = 7
-    hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+    # NemotronHConfig derives num_hidden_layers from ``layers_block_type``
+    # and silently ignores direct assignment, so truncation must go through
+    # the layer-type list. The first 7 entries of the checkpoint's pattern
+    # ("MEMEM*E") keep all three layer types: mamba, MoE and attention.
+    layers_block_type = AutoConfig.from_pretrained(model_dir).layers_block_type[:num_hidden_layers]
+    hf_model = RefHFModelWithIPCHandles(
+        model_dir, num_hidden_layers=num_hidden_layers, layers_block_type=layers_block_type
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     # Nemotron-H's Mamba state dominates the cache budget; 0.25 of free memory
     # leaves enough room for HF (resident on cuda:0 + replicas on cuda:1..3)
@@ -716,7 +1173,7 @@ def _nemotron_h_body():
         kv_cache_config=kv_cache_config,
         moe_config=moe_config,
         max_batch_size=4,
-        model_kwargs={"num_hidden_layers": num_hidden_layers},
+        model_kwargs={"layers_block_type": layers_block_type},
     ) as llm:
         prompts_texts = [
             "Hello, my name is",
@@ -761,32 +1218,13 @@ def _nemotron_h_body():
         llm._collective_rpc("update_weights", (None,))
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-        compare_logits(llm_logits, ref_logits)
+        # Looser threshold: Nemotron-H logits are compared against a BF16
+        # reference and the mamba SSM / selective-scan path introduces small
+        # numerical differences. Measured over 5 runs x 4 prompts (GB200, TP=4,
+        # BF16): mean top-20 overlap 0.891, overall range 0.867-0.928. The
+        # spread is dominated by which prompt it is, not by run-to-run noise --
+        # the weakest prompt stays in 0.867-0.875 across all 5 runs, so 0.85
+        # clears the worst observation by ~0.017 while 0.88 would already flake.
+        compare_logits(llm_logits, ref_logits, threshold=0.85)
 
     del hf_model
-
-
-def _nemotron_h_subprocess_entry(result_queue):
-    try:
-        _nemotron_h_body()
-        result_queue.put(None)
-    except BaseException:
-        result_queue.put(traceback.format_exc())
-
-
-@pytest.mark.part4
-@skip_pre_hopper
-def test_llm_update_weights_nemotron_h(mamba_deps):
-    """Runs _nemotron_h_body in a spawned subprocess so HF transformers
-    sees the mamba-ssm / causal-conv1d fast path installed by the
-    mamba_deps fixture. See _nemotron_h_body docstring for why."""
-    ctx = multiprocessing.get_context("spawn")
-    queue = ctx.Queue()
-    proc = ctx.Process(target=_nemotron_h_subprocess_entry, args=(queue,))
-    proc.start()
-    proc.join()
-    err = queue.get() if not queue.empty() else None
-    if proc.exitcode != 0:
-        pytest.fail(f"Subprocess exited with code {proc.exitcode}\n{err or ''}")
-    if err is not None:
-        pytest.fail(err)

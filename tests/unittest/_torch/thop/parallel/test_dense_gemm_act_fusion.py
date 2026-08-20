@@ -210,9 +210,16 @@ def test_mlp_fp4out_min_m_switch():
     fake_qm = types.SimpleNamespace(_input_prepare=lambda *a, **k: None)
     mlp._use_fused_gelu = True
     mlp._use_fused_gelu_fp4out = True
-    mlp.up_proj.quant_method = fake_qm
+    up = torch.nn.Identity()
+    up.quant_method = fake_qm
+    up.has_nvfp4_activation_quantization = True
+    mlp.up_proj = up
     down = torch.nn.Identity()  # skip the real down GEMM
     down.quant_method = fake_qm
+    down.has_nvfp4_activation_quantization = True
+    down.force_dynamic_quantization = False
+    down.input_scale = torch.ones(1)
+    down.pre_quant_scale = None
     mlp.down_proj = down
     seen = {}
 

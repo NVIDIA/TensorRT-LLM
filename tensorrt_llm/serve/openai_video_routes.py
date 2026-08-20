@@ -10,6 +10,8 @@ mixin via subclassing; the handlers reach back into the server via
 is strictly unchanged from the inlined version.
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
@@ -19,6 +21,7 @@ import traceback
 import uuid
 from http import HTTPStatus
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -30,7 +33,11 @@ from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
 from tensorrt_llm.serve.visual_gen_metrics import build_visual_gen_timing_headers
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
-from tensorrt_llm.visual_gen.params import VisualGenParams
+
+if TYPE_CHECKING:
+    # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
+    # whole visual_gen tree into every LLM serving process.
+    from tensorrt_llm.visual_gen.params import VisualGenParams
 
 
 def _video_content_type(suffix: str) -> str:
@@ -124,6 +131,15 @@ class _VideoRoutesMixin:
             except ValueError as exc:
                 logger.error(f"Video request error: {exc}")
                 return self.create_error_response(str(exc), status_code=HTTPStatus.BAD_REQUEST)
+            except MemoryError as exc:
+                # Valid request that does not fit this deployment (decode /
+                # allocation capacity) — a server condition, not client error.
+                logger.error(f"Video request capacity error: {exc}")
+                return self.create_error_response(
+                    str(exc),
+                    err_type="ServiceUnavailableError",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
 
             if output.video is None:
                 return self.create_error_response(

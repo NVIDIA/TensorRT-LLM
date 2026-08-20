@@ -1,4 +1,4 @@
-Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 This project is licensed under the Apache 2.0 license, whose full license text is available below.
 
@@ -11,6 +11,14 @@ Apache License 2.0 unless otherwise specified. Please refer to the individual
 file headers for specific copyright and license information.
 
 Below is a list of other projects that have portions contained by this project:
+
+--------------------------------------------------------------------------------
+Bitcoin Core
+--------------------------------------------------------------------------------
+Original Source: https://github.com/bitcoin/bitcoin
+Copyright (c) 2009-2026 The Bitcoin Core developers
+Copyright (c) 2009-2026 Bitcoin Developers
+Licensed under the MIT License
 
 --------------------------------------------------------------------------------
 causal-conv1d

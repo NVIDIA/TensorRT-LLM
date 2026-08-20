@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
@@ -37,6 +37,10 @@ from ...utils import (ActivationType, AuxStreamType, EventType,
                       get_last_power_of_2_num_tokens_buckets,
                       last_positive_power_of_2)
 from .fused_moe_cutlass import CutlassFusedMoE
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
+                            MoERejectReason, MoERunContext, MoEStaticCapability,
+                            require_comm_plan)
+from .interface import _reject
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
@@ -353,67 +357,62 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    # ``supports_moe_lora`` is restated because CutlassFusedMoE declares True
+    # and the exact-class comparison it replaces answered False here.
+    # ``supports_dwdp`` is the capability this backend adds. CuteDslB12xFusedMoE
+    # derives from here and needs both, but must spell them out again: setting
+    # the attribute replaces the whole object rather than one field.
+    capabilities = MoEStaticCapability(supports_moe_lora=False,
+                                       supports_dwdp=True)
+
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        Check if CuteDslFusedMoE can implement the given quantization algorithm.
-
-        CuteDslFusedMoE supports:
-        - NVFP4: SM in {100, 103}
-
-        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
-        Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation input data type. Only bfloat16 is supported
-                because output dtype is hardcoded to bfloat16 (input/output dtype must match).
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                CuteDslFusedMoE does NOT support swiglu_gptoss_style.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-        """
-        from .interface import _warn_and_return
-
-        sm_version = get_sm_version()
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """CuteDSL grouped GEMM: NVFP4 on SM100/SM103, bfloat16 activations."""
+        sm_version = d.env.sm
+        quant_algo = p.quant_algo
 
         # CuteDslFusedMoE requires at least SM90
         if sm_version < 90:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
                 f"CuteDslFusedMoE requires SM >= 90, got SM{sm_version}")
 
-        # Check dtype_activation: output is hardcoded to bfloat16, so input must also be bfloat16
-        # to maintain input/output dtype consistency
-        if dtype_activation != torch.bfloat16:
-            return _warn_and_return(
+        # Output is hardcoded to bfloat16, so input must also be bfloat16 to
+        # maintain input/output dtype consistency.
+        if p.dtype_act != torch.bfloat16:
+            return _reject(
+                MoERejectReason.DTYPE_UNSUPPORTED,
                 f"CuteDslFusedMoE only supports bfloat16 activation (output is hardcoded to bfloat16), "
-                f"got {dtype_activation}")
+                f"got {p.dtype_act}")
 
         # CuteDslFusedMoE does NOT support unquantized mode
         if quant_algo is None:
-            return _warn_and_return(
-                "CuteDslFusedMoE does not support unquantized mode")
+            return _reject(MoERejectReason.QUANT_UNSUPPORTED,
+                           "CuteDslFusedMoE does not support unquantized mode")
 
         # CuteDslFusedMoE does NOT support swiglu_gptoss_style
-        if swiglu_gptoss_style:
-            return _warn_and_return(
+        if p.swiglu_gptoss_style:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
                 "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
         # NVFP4 - SM in {100, 103}
         if quant_algo == QuantAlgo.NVFP4:
             if sm_version not in {100, 103}:
-                return _warn_and_return(
+                return _reject(
+                    MoERejectReason.SM_UNSUPPORTED,
                     f"NVFP4 requires SM100 or SM103, got SM{sm_version}")
-            return True, None
+            return MoEEligibility.ok()
 
-        return _warn_and_return(
+        # FP8_BLOCK_SCALES lands here on purpose. ``run_moe_fp8_block_scales``
+        # exists, but its GEMM is ``cute_dsl_fp8_group_blockwise_gemm_ref`` --
+        # an fp32 einsum-per-expert reference, not a CuteDSL kernel -- so
+        # claiming the algorithm here would advertise a reference path as a
+        # backend. DeepGemm / TRTLLMGen own it on SM100/103, Cutlass on
+        # SM90/SM120. See the FP8-block note in MOE_DEVELOPER_GUIDE.md.
+        return _reject(
+            MoERejectReason.QUANT_UNSUPPORTED,
             f"CuteDslFusedMoE does not support quant_algo={quant_algo}")
 
     def __init__(
@@ -434,7 +433,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
         super().__init__(
@@ -451,7 +449,6 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            without_comm=without_comm,
             activation_type=activation_type,
         )
         self.swiglu_limit_scalar = swiglu_limit_scalar or float("inf")
@@ -798,13 +795,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: Optional[torch.Tensor],
-        x_sf: Optional[torch.Tensor] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: bool = False,
-        **kwargs,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with CuteDSL backend.
@@ -812,19 +805,18 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         This method encapsulates the core MoE computation logic, handling different
         quantization schemes (fp8_block_scales and nvfp4).
 
-        Args:
-            # Standard MoE interface parameters:
-            x: Input hidden states (may be pre-quantized)
-            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
-                                    this represents expert slots [num_tokens, top_k] instead.
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors (optional, for certain quantization schemes)
-            moe_output: Pre-allocated MoE output buffer (optional, for NVLINK one-sided backend).
-            enable_alltoall: Whether alltoall communication is enabled.
-
         Returns:
             final_hidden_states tensor.
         """
+        del workspace  # CuteDSL kernels allocate their own intermediates.
+        plan = require_comm_plan(self, ctx)
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        moe_output = plan.moe_output
+        enable_alltoall = plan.enable_alltoall
+
         # Execute MoE computation
         if self.has_nvfp4:
             weight_view = self._build_local_weight_view()

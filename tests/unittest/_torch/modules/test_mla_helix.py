@@ -385,7 +385,7 @@ def _run_mla_distributed(
     ctx_output = input_ctx_rank.new_empty(
         [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim], dtype=input_ctx_rank.dtype
     )
-    mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, output=ctx_output)
+    mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, attn_output=[ctx_output])
 
     # For non-last rank, generate the right latent cache for generation.
     input_ctx_bs = input_ctx.view(scenario.batch, scenario.ctx_len, scenario.hidden_size)

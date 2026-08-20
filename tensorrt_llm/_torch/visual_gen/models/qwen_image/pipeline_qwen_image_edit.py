@@ -86,6 +86,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     concatenated sequence, and the scheduler only steps the generated prefix.
     """
 
+    supports_image_edit = True
     DEFAULT_GENERATION_PARAMS = _EDIT_DEFAULT_GENERATION_PARAMS
 
     def load_standard_components(
@@ -488,7 +489,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
         timer.mark_denoise_start()
         logger.info("Denoising edit (%d steps)...", len(timesteps))
-        for t in timesteps:
+        for _, t in self._profile_denoise_steps(timesteps):
             latent_model_input = torch.cat([latents, image_latents], dim=1)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 

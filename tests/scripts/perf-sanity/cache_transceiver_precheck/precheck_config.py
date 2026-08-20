@@ -26,9 +26,15 @@ block, so config parity is by construction rather than by copying values.
 
 import json
 import os
+import shlex
+from collections.abc import Mapping
+from typing import Any
 
 # Optional per-yaml overrides live under a `cache_transceiver_precheck:` block.
 PRECHECK_DEFAULTS = {
+    # Enabled centrally for every disaggregated perf-sanity case. Individual
+    # yamls may opt out for a documented exception.
+    "enabled": True,
     # Request lengths to transfer. None -> derived: [1024, benchmark ISL],
     # clamped to cache_transceiver_config.max_tokens_in_buffer and to
     # max_request_length below.
@@ -47,12 +53,21 @@ PRECHECK_DEFAULTS = {
     "max_concurrent_pairs": 8,
     # signal.alarm / hang-detector budget for one wave of transfers.
     "wave_timeout_s": 180,
+    # KV-pool + native NIXL/UCX agent construction. Python's signal handler
+    # cannot interrupt a native call, so the HangDetector enforces this
+    # budget when the extension releases the GIL. Ten minutes accommodates
+    # the 1-3 minute cold starts observed on loaded Blackwell CI nodes without
+    # turning a stuck setup into a half-hour gate.
+    "setup_timeout_s": 600,
     # Extra budget for the FIRST rep of the schedule, which pays the one-time
     # NIXL agent metadata wire-up (fetchRemoteMD over the mgmt network): with
     # MLA + ctx pp>1 every receiving rank must connect to every ctx rank, and
     # a cold cross-rack fetch was measured at 100-170s per agent pair. Real
     # serving absorbs this as slow first requests (no hard alarm), so the
-    # precheck must too. None -> derived: min(1800, 150 * max world size).
+    # precheck must too. Keep the no-progress allowance bounded at ten minutes
+    # rather than multiplying it into every serialized peer wait; a yaml can
+    # override this for a topology with measured slower remote-MD setup. None
+    # -> derived: min(600, 150 * max world size).
     "wireup_timeout_s": None,
     # How long the gen side waits for the ctx rendezvous files (covers ctx
     # KV-pool allocation + NIXL/UCX transceiver bring-up).
@@ -61,8 +76,19 @@ PRECHECK_DEFAULTS = {
     "verify_data": True,
 }
 
-# Fallback KV shape when the model directory cannot be resolved: the precheck
-# still exercises the exact network path, just with a synthetic cache shape.
+# Timeout layering. The phase watchdog is reset at every checkpoint; the
+# external step timeout is a bounded total-runtime backstop for GIL-held
+# native hangs. Keep these in the config module so launch and driver budgets
+# cannot silently drift apart again.
+MAX_WIREUP_TIMEOUT_S = 600
+SERIALIZED_WAIT_GRACE_S = 120
+WATCHDOG_GRACE_S = 60
+DEFAULT_STEP_TIMEOUT_S = 1200
+MAX_STEP_TIMEOUT_S = 1800
+
+# Fallback KV shape for dry-runs and explicitly selected manager versions when
+# the model directory cannot be resolved. Manager-version "auto" resolution
+# fails fast instead of silently pairing this shape with V1.
 FALLBACK_KV_SHAPE = {
     "num_layers": 32,
     "num_kv_heads": 8,
@@ -114,67 +140,170 @@ def _spec_nextn(side):
 
 def wireup_timeout_s(max_world):
     """First-rep NIXL agent wire-up allowance (see PRECHECK_DEFAULTS)."""
-    return min(1800, 150 * int(max_world))
+    return min(MAX_WIREUP_TIMEOUT_S, 150 * int(max_world))
 
 
-def default_step_timeout_s(max_world):
+def peer_progress_timeout_s(setup_timeout_s, rendezvous_timeout_s, wave_timeout_s, wireup_s):
+    """Maximum no-progress interval while a peer is queued behind sessions.
+
+    Serialized peer waits are refreshed whenever the target ctx or gen
+    instance advances to another phase or wave. The budget therefore covers one
+    legitimate active phase, not the cumulative duration of every earlier
+    session, which would grow to hours on 6/12-ctx topologies.
+    """
+    longest_active_phase_s = max(
+        int(setup_timeout_s),
+        int(rendezvous_timeout_s),
+        int(wave_timeout_s) + int(wireup_s),
+    )
+    return longest_active_phase_s + SERIALIZED_WAIT_GRACE_S
+
+
+def timeout_budget(cfg, max_world):
+    """Resolve aligned phase, watchdog, and external-step timeout budgets.
+
+    The default external limit is intentionally topology-independent at twenty
+    minutes; yaml overrides may extend exceptional cases to at most thirty
+    minutes. Adding peers alone must not inflate the default.
+    """
+    knobs = dict(PRECHECK_DEFAULTS)
+    knobs.update(cfg.get("cache_transceiver_precheck", {}) or {})
+    wireup_s = int(
+        knobs["wireup_timeout_s"]
+        if knobs["wireup_timeout_s"] is not None
+        else wireup_timeout_s(max_world)
+    )
+    peer_progress_s = peer_progress_timeout_s(
+        knobs["setup_timeout_s"],
+        knobs["rendezvous_timeout_s"],
+        knobs["wave_timeout_s"],
+        wireup_s,
+    )
+    longest_phase_s = max(
+        int(knobs["setup_timeout_s"]),
+        int(knobs["wave_timeout_s"]) + wireup_s,
+        peer_progress_s,
+    )
+    watchdog_s = longest_phase_s + WATCHDOG_GRACE_S
+    step_s = int(knobs.get("step_timeout_s", DEFAULT_STEP_TIMEOUT_S))
+    if step_s > MAX_STEP_TIMEOUT_S:
+        raise ValueError(
+            "cache_transceiver_precheck.step_timeout_s must not exceed the "
+            f"global health-check limit ({MAX_STEP_TIMEOUT_S}s), got {step_s}s"
+        )
+    if step_s <= watchdog_s:
+        raise ValueError(
+            "cache_transceiver_precheck.step_timeout_s must exceed the longest "
+            f"phase watchdog ({watchdog_s}s), got {step_s}s"
+        )
+    return {
+        "wireup_timeout_s": wireup_s,
+        "longest_phase_timeout_s": longest_phase_s,
+        "watchdog_timeout_s": watchdog_s,
+        "step_timeout_s": step_s,
+    }
+
+
+def default_step_timeout_s(cfg, max_world):
     """External (srun-level) timeout covering one precheck instance.
 
-    Includes the first-rep wire-up. Imported by the launch tooling
-    (jenkins/scripts/perf/{,local/}submit.py) so the outer timeout can
-    never drift below the driver's internal budget.
+    Used by precheck_prefix_lines(), which is shared by both launch
+    generators. It always exceeds the longest internal phase watchdog while
+    retaining the 20-minute default and 30-minute maximum health-check limits.
     """
-    return 900 + wireup_timeout_s(max_world)
+    return timeout_budget(cfg, max_world)["step_timeout_s"]
+
+
+def precheck_enabled(cfg):
+    """Resolve the precheck enable/kill-switch policy for a test config.
+
+    On by default; yaml opts out per test; the env var (when set) overrides
+    the yaml either way (global kill switch). Parse the usual boolean spellings
+    so a well-meant TRTLLM_DISAGG_CT_PRECHECK=true force-enable is not silently
+    read as "off"; reject anything ambiguous instead of guessing.
+    """
+    env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
+    if env is not None:
+        val = env.strip().lower()
+        if val in ("1", "true", "on", "yes"):
+            return True
+        if val in ("0", "false", "off", "no"):
+            return False
+        raise ValueError(
+            "TRTLLM_DISAGG_CT_PRECHECK must be a boolean "
+            f"(1/0/true/false/on/off/yes/no), got {env!r}"
+        )
+    knobs = dict(PRECHECK_DEFAULTS)
+    knobs.update(cfg.get("cache_transceiver_precheck", {}) or {})
+    return bool(knobs["enabled"])
 
 
 def precheck_prefix_lines(
-    cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, max_world, stage_name=""
-):
+    cfg: Mapping[str, Any],
+    benchmark_mode: str,
+    config_path_expr: str,
+    ucx_tls_cmd: str,
+    max_world: int,
+    stage_name: str = "",
+    llm_models_root: str | None = None,
+    skip_precheck: bool = False,
+) -> list[str]:
     """Launch-script export lines wiring the precheck gate.
 
     Single owner of the enable/kill-switch policy, the step-timeout default,
     and the export names the gate consumes — shared by
     jenkins/scripts/perf/submit.py and jenkins/scripts/perf/local/submit.py.
-    `config_path_expr` and the env-var references are launch-script-side
-    expressions ($llmSrcNode etc.), expanded at sbatch runtime.
+
+    Args:
+        cfg: Parsed perf-sanity YAML configuration.
+        benchmark_mode: Precheck benchmark mode passed to the driver.
+        config_path_expr: Launch-script expression resolving the YAML path,
+            expanded at sbatch runtime along with its environment references.
+        ucx_tls_cmd: Shell prefix selecting the UCX transports.
+        max_world: Largest role world size, used to derive the step timeout.
+        stage_name: Optional stage name for the synthetic JUnit report.
+        llm_models_root: Model-root path exported when the precheck is enabled.
+        skip_precheck: Disable the gate for this config even when enabled.
+
+    Returns:
+        Generated launch-script export lines shared by both submit modules.
+
+    Raises:
+        ValueError: If the precheck is enabled without a nonempty model root.
     """
-    knobs = cfg.get("cache_transceiver_precheck", {}) or {}
-    # On by default; yaml opts out per test; the env var (when set) overrides
-    # the yaml either way (global kill switch). Parse the usual boolean spellings
-    # so a well-meant TRTLLM_DISAGG_CT_PRECHECK=true force-enable is not silently
-    # read as "off"; reject anything ambiguous instead of guessing.
-    env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
-    if env is not None:
-        val = env.strip().lower()
-        if val in ("1", "true", "on", "yes"):
-            enabled = True
-        elif val in ("0", "false", "off", "no"):
-            enabled = False
-        else:
-            raise ValueError(
-                "TRTLLM_DISAGG_CT_PRECHECK must be a boolean "
-                f"(1/0/true/false/on/off/yes/no), got {env!r}"
-            )
-    else:
-        enabled = bool(knobs.get("enabled", True))
+    # A selected pytest case that is SKIP-waived must not run its precheck.
+    # This takes precedence over the global force-enable knob because there
+    # will be no corresponding test execution to gate.
+    enabled = precheck_enabled(cfg) and not skip_precheck
     cmd = (
         "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
         f"run_precheck.py --config {config_path_expr} "
         "--work-dir $testOutputDir/cache_transceiver_precheck "
         f"--benchmark-mode {benchmark_mode} --llm-src $llmSrcNode"
     )
+    model_root_env = f"LLM_MODELS_ROOT={shlex.quote(llm_models_root)}" if llm_models_root else ""
     lines = [
         f"export ctPrecheckEnabled={int(enabled)}",
-        # The external srun timeout must cover the driver's first-rep NIXL
-        # wire-up allowance; the default derives from the same formula the
-        # driver budgets with (default_step_timeout_s).
-        f"export ctPrecheckTimeout="
-        f"{int(knobs.get('step_timeout_s', default_step_timeout_s(max_world)))}",
+        # Single-source timeout derivation keeps the external backstop above
+        # every phase watchdog without allowing topology-linear inflation.
+        f"export ctPrecheckTimeout={default_step_timeout_s(cfg, max_world)}",
         "export precheckRunScript=$llmSrcNode/jenkins/scripts/perf/"
         "disaggregated/slurm_precheck_run.sh",
-        f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS {cmd} --role ctx"',
-        f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS {cmd} --role gen"',
+        # Quote the complete assignment as an export value. The launch script
+        # expands it into pytestCommand*Precheck, whose later eval interprets
+        # the inner shlex-quoted model path.
+        f"export ctPrecheckModelRootEnv={shlex.quote(model_root_env)}",
+        f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $ctPrecheckModelRootEnv '
+        f'$CTX_WORKER_ENV_VARS $PYTEST_COMMON_VARS {cmd} --role ctx"',
+        f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $ctPrecheckModelRootEnv '
+        f'$GEN_WORKER_ENV_VARS $PYTEST_COMMON_VARS {cmd} --role gen"',
     ]
+    if enabled:
+        if not llm_models_root:
+            raise ValueError("enabled cache-transceiver precheck requires LLM_MODELS_ROOT")
+        # Keep this as a top-level assignment. shlex.quote() is not safe when
+        # nested inside the double-quoted pytestCommand exports below.
+        lines.insert(0, f"export LLM_MODELS_ROOT={shlex.quote(llm_models_root)}")
     if stage_name:
         # Suite name for the synthetic junit xml the gate writes on failure
         # (absent -> the gate falls back to $SLURM_JOB_NAME).
@@ -275,6 +404,15 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
     n_pairs = max(ctx["dp_size"], gen["dp_size"], 1)
     wave_size = max(1, min(n_pairs, int(knobs["max_concurrent_pairs"])))
 
+    setup_timeout_s = int(knobs["setup_timeout_s"])
+    wave_timeout_s = int(knobs["wave_timeout_s"])
+    wireup_s = int(
+        knobs["wireup_timeout_s"]
+        if knobs["wireup_timeout_s"] is not None
+        else wireup_timeout_s(max(ctx["world_size"], gen["world_size"]))
+    )
+    rendezvous_timeout_s = int(knobs["rendezvous_timeout_s"])
+
     plan = {
         "skip": False,
         "num_ctx_servers": num_ctx_servers,
@@ -288,13 +426,16 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         "warmup_requests": int(knobs["warmup_requests"]),
         "n_pairs": n_pairs,
         "wave_size": wave_size,
-        "wave_timeout_s": int(knobs["wave_timeout_s"]),
-        "wireup_timeout_s": int(
-            knobs["wireup_timeout_s"]
-            if knobs["wireup_timeout_s"] is not None
-            else wireup_timeout_s(max(ctx["world_size"], gen["world_size"]))
+        "wave_timeout_s": wave_timeout_s,
+        "setup_timeout_s": setup_timeout_s,
+        "wireup_timeout_s": wireup_s,
+        "peer_progress_timeout_s": peer_progress_timeout_s(
+            setup_timeout_s,
+            rendezvous_timeout_s,
+            wave_timeout_s,
+            wireup_s,
         ),
-        "rendezvous_timeout_s": int(knobs["rendezvous_timeout_s"]),
+        "rendezvous_timeout_s": rendezvous_timeout_s,
         "verify_data": bool(knobs["verify_data"]),
     }
     for role, side, xcvr in (("ctx", ctx_side, ctx_xcvr), ("gen", gen_side, gen_xcvr)):
@@ -304,8 +445,8 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         plan[f"{role}_kv_dtype"] = str(kv_cfg.get("dtype", "auto"))
         # Tri-state, matching KvCacheConfig's pydantic default: explicit
         # True/False from the yaml wins; absent means "auto", which the
-        # driver resolves against the model class's get_model_defaults() at
-        # runtime — exactly like serving (_resolve_kv_cache_manager_v2_auto).
+        # driver resolves against the model class's manager preference at
+        # runtime, exactly like serving (_resolve_kv_cache_manager_v2_auto).
         plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", "auto")
     plan["fingerprint"] = plan_fingerprint(plan)
     return plan

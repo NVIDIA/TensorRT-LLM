@@ -66,6 +66,93 @@ class CUDAGraphTestScenario:
 
 class TestFlashInferAttention(unittest.TestCase):
 
+    def test_separate_kv_draft_metadata_uses_draft_manager(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+            self.skipTest("FlashInfer trtllm-gen requires SM100 or SM103")
+
+        def create_manager():
+            return KVCacheManager(
+                KvCacheConfig(max_tokens=256),
+                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=128,
+                tokens_per_block=32,
+                max_seq_len=64,
+                max_batch_size=2,
+                mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                dtype=tensorrt_llm.bindings.DataType.BF16,
+            )
+
+        target_manager = create_manager()
+        draft_manager = create_manager()
+        try:
+            target_manager.add_dummy_requests([0, 1], [31, 45], is_gen=True)
+            draft_manager.add_dummy_requests([0, 1], [31, 45],
+                                             is_gen=True,
+                                             max_num_draft_tokens=3)
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.ones(2, dtype=torch.int32),
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=[30, 44],
+                ),
+                max_num_requests=2,
+                max_num_tokens=8,
+                kv_cache_manager=target_manager,
+                request_ids=[0, 1],
+                is_cuda_graph=True,
+            )
+            metadata.prepare()
+            draft_metadata = metadata.get_draft_metadata(draft_manager)
+
+            self.assertIs(draft_metadata.kv_cache_manager, draft_manager)
+            self.assertFalse(hasattr(metadata, "kv_lens_cuda"))
+            torch.testing.assert_close(
+                draft_metadata.kv_lens_cuda[:2],
+                torch.tensor([31, 45], dtype=torch.int32, device="cuda"),
+            )
+            draft_blocks = draft_manager.get_batch_cache_indices([0, 1])
+            self.assertEqual(draft_metadata.num_blocks,
+                             list(map(len, draft_blocks)))
+
+            layer = FlashInferAttention(
+                layer_idx=0,
+                num_heads=1,
+                num_kv_heads=1,
+                head_dim=128,
+                flashinfer_backend="trtllm-gen",
+            )
+            q = torch.randn(2, 128, dtype=torch.bfloat16, device="cuda")
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+            self.assertEqual(
+                layer.forward(q, k, v, draft_metadata).shape, q.shape)
+            for wrappers in draft_metadata._plan_params_to_wrappers.values():
+                torch.testing.assert_close(
+                    wrappers.decode_wrapper._kv_lens_buffer[:2],
+                    draft_metadata.kv_lens_cuda[:2],
+                )
+
+            with mock.patch.object(
+                    draft_metadata,
+                    "_plan_with_params",
+                    wraps=draft_metadata._plan_with_params,
+            ) as replan, mock.patch.object(
+                    draft_metadata,
+                    "_build_decode_block_tables",
+            ) as refresh_block_tables:
+                metadata.prepare()
+            replan.assert_not_called()
+            self.assertEqual(refresh_block_tables.call_count,
+                             len(draft_metadata._plan_params_to_wrappers))
+        finally:
+            target_manager.shutdown()
+            draft_manager.shutdown()
+
     def test_ragged_no_kv_cuda_graph_uses_stable_indptr_aliases(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")

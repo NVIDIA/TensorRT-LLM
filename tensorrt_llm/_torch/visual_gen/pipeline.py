@@ -1,8 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import itertools
 import os
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+)
 
 import torch
 import torch.distributed as dist
@@ -21,6 +36,7 @@ from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
+from .profiler import VisualGenProfiler
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -36,67 +52,12 @@ class ExtraParamSchema(StrictBaseModel):
     range: Optional[tuple] = Field(
         default=None, description="Optional (min, max) range for numeric params."
     )
-
-
-def _parse_profile_range():
-    """Parse ``TLLM_PROFILE_VISUAL_GEN_START_STOP`` for CUDA profiler scoping.
-
-    Visual-gen-specific env var (separate from the LLM path's
-    ``TLLM_PROFILE_START_STOP``). Use with ``nsys profile -c cudaProfilerApi ...``.
-
-    Supported formats:
-
-    * ``A-B``            – profile denoise steps A through B
-    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
-    * ``A,B,...``        – individual steps treated as single-step ranges
-    * ``predenoise``     – profile the per-request pre-loop work inside
-                           ``denoise()`` (CFG config setup, scheduler refresh,
-                           TeaCache reset) up to the first denoise step.
-                           Single-shot.
-    * ``postdenoise``    – profile from the end of the last denoise step to
-                           pipeline cleanup, covering VAE decode. Single-shot.
-    * ``all``            – profile the full generation forward (denoise + VAE), skip warmup
-    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
-
-    Returns ``None`` when unset, one of ``"all"`` / ``"predenoise"`` /
-    ``"postdenoise"`` for keyword modes, or ``(frozenset(starts), frozenset(stops))``
-    for numeric ranges.
-
-    .. note::
-       Step indices are **per-request**: each ``denoise()`` call resets the
-       loop counter to 0, so e.g. ``0-4`` profiles steps 0-4 of *every*
-       request. This differs from the LLM path's ``TLLM_PROFILE_START_STOP``
-       which indexes a global executor iteration counter (one forward pass
-       services all in-flight requests, so there is no "per request" index).
-
-       ``predenoise`` and ``postdenoise`` are **single-shot per process**:
-       they fire once around the first user request after warmup and do not
-       re-arm on subsequent requests. Pair ``predenoise`` with
-       ``nsys --capture-range-end=stop`` (keeps the app running cleanly after
-       collection ends). ``postdenoise`` ends collection at process exit, so
-       either ``stop`` or ``stop-shutdown`` works. For multi-request capture,
-       use a numeric range with ``--capture-range-end=repeat:N``.
-    """
-    val = os.environ.get("TLLM_PROFILE_VISUAL_GEN_START_STOP")
-    if not val:
-        return None
-    val = val.strip()
-    if val.lower() in ("all", "predenoise", "postdenoise"):
-        return val.lower()
-    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
-    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
-    starts, stops = [], []
-    for span in val.split(","):
-        span = span.strip()
-        if "-" in span:
-            start, stop = span.split("-", 1)
-            starts.append(int(start))
-            stops.append(int(stop))
-        else:
-            v = int(span)
-            starts.append(v)
-            stops.append(v)
-    return frozenset(starts), frozenset(stops)
+    validator: Optional[Callable[[Any], Any]] = Field(
+        default=None,
+        description="Optional value validator; raises ValueError on invalid "
+        "values. Must be a module-level function (specs are pickled to the "
+        "coordinator in the READY handshake).",
+    )
 
 
 if TYPE_CHECKING:
@@ -108,6 +69,8 @@ class BasePipeline(nn.Module):
     """
     Base class for diffusion pipelines.
     """
+
+    supports_image_edit: bool = False
 
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
@@ -140,13 +103,8 @@ class BasePipeline(nn.Module):
         self.scheduler: Optional[Any] = None
         self._is_warmup: bool = False
 
-        # CUDA profiler scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
-        self._profile_range = _parse_profile_range()
-        self._profiling_active: bool = False
-        # Single-shot guards for predenoise/postdenoise modes — fire once
-        # around the first non-warmup denoise() invocation, then disarm.
-        self._predenoise_pending: bool = self._profile_range == "predenoise"
-        self._postdenoise_pending: bool = self._profile_range == "postdenoise"
+        # Profiler window scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
+        self._profiler = VisualGenProfiler(rank=self.rank)
 
         # Initialize transformer
         self._init_transformer()
@@ -156,21 +114,27 @@ class BasePipeline(nn.Module):
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
 
-    def _cuda_profiler_start(self):
-        """Start CUDA profiler if configured and not already active."""
-        if self._profile_range is not None and not self._profiling_active:
-            torch.cuda.cudart().cudaProfilerStart()
-            self._profiling_active = True
-            if self.rank == 0:
-                logger.info("CUDA profiler started")
+    def run_inference(self, req: Any) -> Any:
+        """Run model-specific inference within shared request profiler boundaries."""
+        if self._is_warmup:
+            return self.infer(req)
+        with self._profiler.request_scope():
+            return self.infer(req)
 
-    def _cuda_profiler_stop(self):
-        """Stop CUDA profiler if currently active."""
-        if self._profiling_active:
-            torch.cuda.cudart().cudaProfilerStop()
-            self._profiling_active = False
-            if self.rank == 0:
-                logger.info("CUDA profiler stopped")
+    def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
+        """Enumerate a denoise loop's steps within its profiling windows.
+
+        ``BasePipeline.denoise()`` uses this, and so must any pipeline that
+        writes its own denoise loop (Qwen-Image, LTX-2 stage 2) — otherwise
+        that loop is silently absent from every trace. Substitute it for the
+        loop's ``enumerate()``; it owns every window boundary the loop has::
+
+            for i, t in self._profile_denoise_steps(timesteps):
+                ...
+        """
+        if self._is_warmup:
+            return enumerate(timesteps)
+        return self._profiler.steps(timesteps)
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay.
@@ -250,6 +214,14 @@ class BasePipeline(nn.Module):
         The executor uses this to check whether a request shape was warmed up.
         """
         return (height, width, num_frames)
+
+    def request_warmup_cache_key(self, req: Any) -> tuple:
+        """Return the warmup cache key for a prepared inference request."""
+        return self.warmup_cache_key(
+            req.params.height,
+            req.params.width,
+            num_frames=req.params.num_frames,
+        )
 
     @property
     def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
@@ -367,6 +339,26 @@ class BasePipeline(nn.Module):
         merges these into ``request.params`` before calling ``infer()``.
         """
         return {}
+
+    def prepare_request(self, req: Any) -> None:
+        """Prepare model-specific inputs before warmup bookkeeping.
+
+        Subclasses may mutate internal request state and resolve request
+        parameters needed by :meth:`request_warmup_cache_key`. The default
+        implementation is a no-op.
+        """
+
+    def classify_request_failure(self, exc: BaseException) -> Optional[str]:
+        """Failure class for the response channel, or ``None`` if unknown.
+
+        Opt-in per pipeline: a pipeline that knows which of its failures are
+        caused by the request's own content returns ``"client"`` or
+        ``"capacity"`` for those. The default leaves every failure
+        unclassified, because the exception's built-in type alone does not say
+        whose fault it was -- a ``ValueError`` is just as likely to be an
+        internal invariant as a rejected input.
+        """
+        return None
 
     def infer(self, req: Any):
         raise NotImplementedError
@@ -1103,8 +1095,8 @@ class BasePipeline(nn.Module):
             guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
                               is active. Outside the interval the effective scale is 1.0
                               (conditional prediction only); both branches still run.
-            post_step_fn: Optional callable applied to latents after each scheduler step.
-                         Signature: post_step_fn(latents) -> latents
+            post_step_fn: Optional callable applied after each scheduler step,
+                         invoked as ``post_step_fn(latents) -> latents``.
                          Use for constraints that must hold throughout denoising.
             scheduler_step_kwargs: Extra keyword arguments forwarded to every
                          scheduler's ``step()`` call.
@@ -1113,14 +1105,6 @@ class BasePipeline(nn.Module):
             Single latents if no extra_streams
             Tuple (primary_latents, extra_streams_dict) if extra_streams provided
         """
-        # ``predenoise`` mode: arm the profiler at the very start of denoise()
-        # so the per-request pre-loop work (CFG config, scheduler refresh,
-        # TeaCache reset) is captured. The window closes at the first step.
-        # Note: hooked here (not at warmup() exit) to avoid leaving the profiler
-        # on across the worker's IPC idle, which can interact badly with CUPTI.
-        if self._predenoise_pending and not self._is_warmup:
-            self._cuda_profiler_start()
-
         if timesteps is None:
             timesteps = scheduler.timesteps
 
@@ -1158,23 +1142,7 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
-        # CUDA profiler scoping: "all" starts here (covers denoise + VAE),
-        # step ranges start/stop at specific indices. See _parse_profile_range().
-        prof = self._profile_range
-        if prof == "all" and not self._is_warmup:
-            self._cuda_profiler_start()
-        # ``predenoise`` was started in warmup() exit; close the window now,
-        # before the first denoise step kernels run. Single-shot: disarm.
-        if self._predenoise_pending and not self._is_warmup:
-            self._cuda_profiler_stop()
-            self._predenoise_pending = False
-        prof_step_starts = prof[0] if isinstance(prof, tuple) else None
-        prof_step_stops = prof[1] if isinstance(prof, tuple) else None
-
-        for i, t in enumerate(timesteps):
-            if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
-                self._cuda_profiler_start()
-
+        for i, t in self._profile_denoise_steps(timesteps):
             step_start = time.time()
 
             current_guidance_scale = self._resolve_step_guidance_scale(
@@ -1251,16 +1219,6 @@ class BasePipeline(nn.Module):
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
 
-            # Step-level profiler stop
-            if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
-                self._cuda_profiler_stop()
-
-        # ``postdenoise`` mode: arm the profiler now so the VAE decode (and
-        # any post-denoise host work) is captured up to cleanup(). Single-shot.
-        if self._postdenoise_pending and not self._is_warmup:
-            self._cuda_profiler_start()
-            self._postdenoise_pending = False
-
         if self.rank == 0:
             total_time = time.time() - start_time
             logger.info("=" * 80)
@@ -1271,7 +1229,7 @@ class BasePipeline(nn.Module):
                 stats = self.cache_accelerator.get_stats()
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
-                        logger.info("Cache-DiT stats: %s", stats)
+                        logger.info(f"Cache-DiT stats: {stats}")
                     elif self.pipeline_config.cache_backend == "teacache":
                         first_val = next(iter(stats.values()), None)
                         if isinstance(first_val, dict):
@@ -1293,7 +1251,7 @@ class BasePipeline(nn.Module):
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
-        self._cuda_profiler_stop()
+        self._profiler.close_window()
 
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")

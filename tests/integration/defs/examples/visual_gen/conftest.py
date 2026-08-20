@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Fixtures shared by VisualGen example tests."""
 
-"""Shared fixtures for VisualGen example integration tests."""
+import shutil
 
 import pytest
 from defs.trt_test_alternative import check_call
@@ -21,7 +22,20 @@ from defs.trt_test_alternative import check_call
 
 @pytest.fixture(scope="session")
 def _visual_gen_deps(llm_venv):
-    """Install optional media dependencies once per VisualGen test session."""
+    """Install the Python and system media dependencies once per session."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
+    if shutil.which("ffmpeg") is None:
+        check_call(["apt-get", "update", "-y"], shell=False)
+        check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
+
+
+@pytest.fixture(scope="session")
+def _visual_gen_lpips_scorer():
+    """Reuse one lazily initialized AlexNet LPIPS model for media tests."""
+    from defs.examples.visual_gen.visual_gen_test_utils import ReusableLPIPSScorer
+
+    scorer = ReusableLPIPSScorer()
+    try:
+        yield scorer
+    finally:
+        scorer.close()

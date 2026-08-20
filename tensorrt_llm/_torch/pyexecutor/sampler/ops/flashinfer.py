@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union, cast
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
@@ -64,6 +65,28 @@ SeedOrTensor = Union[int, torch.Tensor]
 
 
 @_compiler_disable
+def radix_topk_op(
+    values: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sorted top-k via flashinfer's radix-select kernel.
+
+    Drop-in for ``torch.topk(values, k, dim=-1, sorted=True)`` on 2D inputs:
+    returns ``(values, indices)`` with values descending and int64 indices;
+    like torch.topk, the index order among equal values is unspecified.
+    O(n) radix select — much faster than torch.topk on large rows, but with a
+    fixed per-call cost that torch.topk undercuts on small rows (see
+    ``beam_search._beam_topk`` for the size-dispatching entry point).
+
+    ``deterministic=True``: the default collect pass races, which makes the
+    order among equal values vary run to run. This op sits on the default beam
+    path, where reproducible tie order matters for triage.
+    """
+    topk_values, topk_indices = flashinfer.top_k(values, k, sorted=True, deterministic=True)
+    return topk_values, topk_indices
+
+
+@_compiler_disable
 def top_k_top_p_sampling_from_logits_op(
     logits: torch.Tensor,
     top_k: torch.Tensor,
@@ -81,6 +104,41 @@ def top_k_top_p_sampling_from_logits_op(
     """
     tokens: torch.Tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits,
+        top_k=top_k,
+        top_p=top_p,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+        check_nan=check_nan,
+        generator=generator,
+        seed=seed,
+        offset=offset,
+    )
+    return tokens
+
+
+@_compiler_disable
+def top_k_top_p_sampling_from_probs_op(
+    probs: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    seed: Optional[SeedOrTensor] = None,
+    offset: Optional[SeedOrTensor] = None,
+    check_nan: bool = False,
+) -> torch.Tensor:
+    """Fused top-k + top-p filtering and sampling from a probability distribution.
+
+    ``filter_apply_order="top_k_first"`` matches the renorm pipeline (top-k, then
+    top-p over the renormalized survivors). Sampling straight from probs skips
+    the filtered full-vocab tensor that separate renorm + sample would
+    materialize, so this is the cheapest way to terminate a renorm chain --
+    at the cost that no filter may run after it.
+    Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
+    see module docstring for the full contract.
+    """
+    tokens: torch.Tensor = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        probs,
         top_k=top_k,
         top_p=top_p,
         filter_apply_order="top_k_first",
@@ -172,7 +230,7 @@ def top_p_sampling_from_probs_op(
     return tokens
 
 
-# The three ops below wrap the mask -> softmax -> renorm pipeline stages 1:1.
+# The four ops below wrap the mask -> softmax -> renorm pipeline stages 1:1.
 # The wrappers exist so callers stay importable without flashinfer installed
 # (the flashinfer import above is guarded); softmax_op additionally centralizes
 # the PDL env decision.
@@ -196,6 +254,15 @@ def top_k_mask_logits_op(
 ) -> torch.Tensor:
     masked: torch.Tensor = flashinfer.sampling.top_k_mask_logits(logits, top_k)
     return masked
+
+
+@_compiler_disable
+def top_k_renorm_probs_op(
+    probs: torch.Tensor,
+    top_k: torch.Tensor,
+) -> torch.Tensor:
+    renormed: torch.Tensor = flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+    return renormed
 
 
 @_compiler_disable
@@ -307,6 +374,30 @@ def sample_from_logits_op(
     if top_p is not None:
         return top_p_sampling_from_probs_op(probs, top_p, seed=seed, offset=offset)
     return sampling_from_probs_op(probs, seed=seed, offset=offset)
+
+
+@_compiler_disable
+def warmup_sampling_module() -> None:
+    """Build flashinfer's sampling kernels now instead of on first use.
+
+    flashinfer ships these kernels as source, so the first sampling call runs
+    nvcc inline (~90s with a cold cache). Doing that inside the executor loop
+    stalls the rank past the hang detector's threshold. Cheap no-op once built.
+
+    Best-effort, like the neighbouring pre-JIT warmups: this runs ahead of every
+    guard in ``warmup()``, so a broken JIT toolchain must not abort startup for
+    deployments that never sample non-greedily. Ones that do will raise at the
+    real call site instead.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return
+    try:
+        flashinfer.sampling.get_sampling_module()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "flashinfer sampling module prewarm failed; it will be built "
+            f"lazily on first use. {type(e).__name__}: {e}"
+        )
 
 
 @torch.compile(options={"max-autotune": True})

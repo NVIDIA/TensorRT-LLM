@@ -37,8 +37,6 @@ class LoRARequest:
     lora_ckpt_source: str = "hf"
 
     def __post_init__(self):
-        if self.lora_path is not None and not os.path.exists(self.lora_path):
-            raise ValueError(f"lora_path ({self.lora_path}) does not exist.")
         if self.lora_ckpt_source not in ["hf", "nemo"]:
             raise ValueError(
                 f"lora_ckpt_source must be 'hf' or 'nemo', got '{self.lora_ckpt_source}'"

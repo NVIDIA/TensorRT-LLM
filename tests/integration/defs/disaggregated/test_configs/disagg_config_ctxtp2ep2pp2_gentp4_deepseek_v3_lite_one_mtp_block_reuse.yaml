@@ -16,7 +16,8 @@ context_servers:
   kv_cache_config:
     enable_block_reuse: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 4
@@ -29,4 +30,5 @@ generation_servers:
   kv_cache_config:
     enable_block_reuse: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON

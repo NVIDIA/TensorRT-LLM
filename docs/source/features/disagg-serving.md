@@ -208,6 +208,10 @@ generation_servers:
 When routing requests to the context servers, the disaggregated server will mark the requests as "context-only" to skip the generation phase. Similarly,
 when routing requests to the generation servers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
 
+The config also accepts an optional field that tunes the HTTP listeners:
+
+- `server_keep_alive_timeout` (int, default `10`) — HTTP keep-alive timeout in seconds, applied to the client-facing listener and to the coordinator's listener when it runs in-process (see [Coordinator and Worker Fleet](#coordinator-and-worker-fleet)). Raise it (for example, `3600`) when clients hold large idle connection pools and hit `Connection reset by peer` on a reused connection: the server closing an idle connection first leaves the client with a half-closed socket that fails on the next request.
+
 Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:
 ```
 curl http://localhost:8000/v1/completions \

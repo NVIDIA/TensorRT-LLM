@@ -239,6 +239,7 @@ class FluxPipeline(BasePipeline):
                         "return_dict",
                     ],
                     return_dict_default=False,
+                    return_tuple_when_return_dict_false=True,
                 )
             )
 

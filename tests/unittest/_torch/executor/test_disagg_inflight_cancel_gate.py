@@ -362,6 +362,7 @@ def test_peer_buffer_poison_triggers_world_consistent_fatal_cleanup(monkeypatch)
         "Disagg KV cache transfer buffer is poisoned; process restart is required",
         requests=None,
         charge_budget=False,
+        fatal_is_collective_aligned=True,
     )
 
 
@@ -376,6 +377,8 @@ def test_preclassified_fatal_error_keeps_adp_response_collectives_aligned():
     executor.executor_request_queue = Mock()
     executor.executor_request_queue.get_request_queue.return_value = raw_queue
     executor.active_requests = []
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
     executor.gather_all_responses = False
     executor.enable_attention_dp = True
     executor.dist = SimpleNamespace(rank=1, world_size=2)
@@ -383,7 +386,11 @@ def test_preclassified_fatal_error_keeps_adp_response_collectives_aligned():
     executor._terminate_request = Mock()
 
     PyExecutor._handle_errors(
-        executor, "poisoned transfer buffer", requests=None, charge_budget=False
+        executor,
+        "poisoned transfer buffer",
+        requests=None,
+        charge_budget=False,
+        fatal_is_collective_aligned=True,
     )
 
     executor._error_budget.consume.assert_not_called()

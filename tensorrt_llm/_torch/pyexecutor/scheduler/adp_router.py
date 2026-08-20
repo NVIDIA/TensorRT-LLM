@@ -857,6 +857,42 @@ class ConversationAwareADPRouter(ADPRouter):
         while len(self._conv_to_rank) > self._max_sessions:
             self._conv_to_rank.popitem(last=False)
 
+    def _assign_new_conversation_explicit_dp_ranks(
+        self,
+        requests: List["RequestQueueItem"],
+        all_ranks_new_requests: Dict[int, List["RequestQueueItem"]],
+        all_ranks_num_active_requests: List[int],
+        max_num_active_requests: int,
+    ) -> List["RequestQueueItem"]:
+        """Place explicit first turns and establish their affinity binding.
+
+        Once a conversation is bound, its recorded rank takes precedence over
+        later explicit rank hints. Requests whose explicit target is full remain
+        eligible for the normal affinity/load-balanced path below.
+        """
+        remaining: List["RequestQueueItem"] = []
+        for req_item in requests:
+            conv_id = self._conversation_id(req_item)
+            if conv_id is not None and conv_id in self._conv_to_rank:
+                remaining.append(req_item)
+                continue
+
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            target_dp_rank = (
+                scheduling_params.attention_dp_rank if scheduling_params is not None else None
+            )
+            if (
+                target_dp_rank is not None
+                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+            ):
+                all_ranks_num_active_requests[target_dp_rank] += 1
+                all_ranks_new_requests[target_dp_rank].append(req_item)
+                if conv_id is not None:
+                    self._record_target_rank(conv_id, target_dp_rank)
+            else:
+                remaining.append(req_item)
+        return remaining
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
@@ -877,8 +913,9 @@ class ConversationAwareADPRouter(ADPRouter):
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
 
-        # 1) Honour an explicit attention_dp_rank first (strict placement).
-        remaining_unscheduled = self._assign_explicit_dp_ranks(
+        # 1) Honour an explicit attention_dp_rank for a new conversation and
+        #    record that placement. Existing conversations keep their binding.
+        remaining_unscheduled = self._assign_new_conversation_explicit_dp_ranks(
             sorted_requests,
             all_ranks_new_requests,
             all_ranks_num_active_requests,

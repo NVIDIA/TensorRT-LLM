@@ -15,9 +15,12 @@
 import unittest
 
 import numpy as np
+import pytest
 import torch
 
 from tensorrt_llm.models.convert_utils import generate_int8
+
+pytestmark = pytest.mark.cpu_only
 
 
 def dist(x, y):

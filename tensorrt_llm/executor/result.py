@@ -188,6 +188,10 @@ class GenerationResultBase:
         self.cached_tokens = 0
         self.per_pos_drafted = None
         self.per_pos_accepted = None
+        # Cumulative (accepted, drafted) draft-token totals attached by the
+        # PyTorch executor (LlmResult.spec_dec_totals); backfills
+        # RequestPerfMetrics.speculative_decoding in _handle_sequence.
+        self.spec_dec_totals = None
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
@@ -280,6 +284,33 @@ class GenerationResultBase:
     def error(self) -> Optional[str]:
         """Return the error message if this result completed with an error."""
         return self._error_msg
+
+    def _maybe_fill_spec_dec_perf_metrics(
+            self, perf_metrics: "tllm.RequestPerfMetrics") -> None:
+        """Backfill RequestPerfMetrics.speculative_decoding in the PyTorch flow.
+
+        The C++ runtime accumulates that section in
+        LlmRequest::updateNumTokensPerIteration, which the PyTorch flow
+        (TorchSampler) never calls, so the section arrives zeroed even when
+        drafting ran. The PyTorch executor instead attaches cumulative
+        (accepted, drafted) totals to the response (LlmResult.spec_dec_totals,
+        stashed on self in _handle_response); fill the section from them.
+        No-op when the section is already populated (TRT engine / TRTLLMSampler
+        paths) or when no drafting occurred.
+        """
+        if not self.spec_dec_totals:
+            return
+        spec_dec = perf_metrics.speculative_decoding
+        if spec_dec is not None and spec_dec.total_draft_tokens > 0:
+            return
+        accepted, drafted = self.spec_dec_totals
+        if drafted <= 0:
+            return
+        spec_dec = tllm.SpeculativeDecodingMetrics()
+        spec_dec.total_accepted_draft_tokens = accepted
+        spec_dec.total_draft_tokens = drafted
+        spec_dec.acceptance_rate = accepted / drafted
+        perf_metrics.speculative_decoding = spec_dec
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -391,6 +422,7 @@ class GenerationResultBase:
 
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
+            self._maybe_fill_spec_dec_perf_metrics(output.request_perf_metrics)
 
         # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
         if hasattr(response_tensors, 'time_breakdown_metrics'
@@ -523,6 +555,8 @@ class GenerationResultBase:
                                            None)
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
                                             None)
+            self.spec_dec_totals = getattr(response_result, 'spec_dec_totals',
+                                           None)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             # Expose gen-first ctx usage so the postprocessor
             # (_ctx_usage_from_outputs) can adopt the context-side accounting.

@@ -14,12 +14,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,6 +58,75 @@ class _EncoderCacheMultimodalModel(_MultimodalModel):
     supports_encoder_cache = True
 
 
+def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
+    monkeypatch,
+):
+    class _InputProcessor:
+        def __init__(self):
+            self.calls = []
+
+        def get_mm_max_tokens_per_item(self, max_num_encoder_tokens=None):
+            del max_num_encoder_tokens
+            return {"image": 4096}
+
+        def get_dummy_mm_data(
+            self,
+            *,
+            max_num_encoder_tokens,
+            mm_counts,
+            dtype,
+        ):
+            self.calls.append((max_num_encoder_tokens, mm_counts, dtype))
+            item_count = mm_counts["image"]
+            return {"image": {"item_count": item_count}}
+
+    class _Model(MultimodalModelMixin):
+        dtype = torch.float16
+        mm_encoder = object()
+
+        def __init__(self):
+            self.forwarded_item_counts = []
+            self.last_output = None
+
+        def encode_multimodal_inputs(self, multimodal_params):
+            count = multimodal_params[0].multimodal_data["image"]["item_count"]
+            self.forwarded_item_counts.append(count)
+            self.last_output = torch.arange(count * 4).reshape(count, 4)
+            return self.last_output
+
+    input_processor = _InputProcessor()
+    model = _Model()
+    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        model=model,
+        input_processor=input_processor,
+        encoder_batch_size=4,
+        encoder_max_num_tokens=8192,
+        use_mrope=False,
+    )
+    creator._profiling_stage_data = {"enable_mm_reqs": True}
+    creator._mapping = SimpleNamespace(enable_attention_dp=False)
+    creator._max_num_tokens = 18
+    creator._max_beam_width = 1
+
+    # The LLM dummy remains text-only and is not allowed to shrink the
+    # independent encoder profiling budget.
+    requests = creator._create_dummy_context_requests(input_seq_len=18)
+    assert sum(len(request.input_token_ids) for request in requests) == 18
+    assert input_processor.calls == []
+    assert all(getattr(request, "py_multimodal_data", None) is None for request in requests)
+
+    creator._dummy_encoder_inputs = creator._create_dummy_encoder_inputs()
+    assert input_processor.calls == [(8192, {"image": 2}, torch.float16)]
+
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    retained_output = creator._encode_dummy_inputs()
+    assert model.forwarded_item_counts == [2]
+    assert retained_output.data_ptr() != model.last_output.data_ptr()
+    assert creator._dummy_encoder_inputs == []
+
+
 def _make_creator(
     tokens_per_block,
     dummy_reqs,
@@ -61,6 +136,8 @@ def _make_creator(
     model_max_seq_len=1,
     max_cuda_graph_batch_size=1,
     layer_types=None,
+    sliding_window=None,
+    use_sliding_window=None,
     max_attention_window=None,
 ):
     """Build a minimal KvCacheCreator (bypasses __init__) wired up for
@@ -76,10 +153,12 @@ def _make_creator(
 
     c._llm_args = Mock(disable_overlap_scheduler=True)
 
-    pretrained = Mock()
-    # spec=False so attribute access doesn't accept arbitrary fields; set only
-    # the ones the production path reads.
-    pretrained.layer_types = layer_types
+    pretrained = SimpleNamespace(
+        layer_types=layer_types,
+        num_hidden_layers=(len(layer_types) if isinstance(layer_types, (list, tuple)) else None),
+        sliding_window=sliding_window,
+        use_sliding_window=use_sliding_window,
+    )
 
     model_config = Mock()
     model_config.pretrained_config = pretrained
@@ -199,24 +278,33 @@ def test_regression_without_fix_would_overcount():
 
 
 @pytest.mark.parametrize(
-    ("model_cls", "encoder_cache_max_bytes", "expected"),
+    ("model_cls", "encoder_cache_max_bytes", "expected_reserve"),
     [
-        (_TextModel, 64, 1000),
-        (_MultimodalModel, 0, 1000),
-        (_MultimodalModel, 64, 1000),
-        (_EncoderCacheMultimodalModel, 0, 1000),
-        (_EncoderCacheMultimodalModel, 64, 1064),
+        (_TextModel, 64, 0),
+        (_MultimodalModel, 0, 0),
+        (_MultimodalModel, 64, 0),
+        (_EncoderCacheMultimodalModel, 0, 0),
+        (_EncoderCacheMultimodalModel, 64, 64),
     ],
 )
 def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     model_cls,
     encoder_cache_max_bytes,
-    expected,
+    expected_reserve,
 ):
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(model=model_cls(encoder_cache_max_bytes))
 
-    assert creator._reserve_multimodal_encoder_cache_memory(1000) == expected
+    assert creator._get_multimodal_encoder_memory_reserve() == expected_reserve
+
+
+def test_reserve_adds_only_unprofiled_output_capacity():
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        mm_encoder_output_budget_bytes=512,
+        model=_MultimodalModel(0),
+    )
+    assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +317,7 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
 # blocks.  A single long-context request then overflows the full-attention
 # pool and the scheduler livelocks on suspend/retry.  The fix scales
 # num_cache_blocks by the number of distinct attention-window sizes inferred
-# either from ``layer_types`` on the pretrained config (preferred) or from
+# effective per-layer sliding windows on the pretrained config (preferred) or
 # an explicit ``max_attention_window`` list on kv_cache_config (fallback).
 
 
@@ -258,6 +346,21 @@ def test_uniform_layer_types_no_scaling():
     assert uniform._get_token_num_for_estimation() == baseline._get_token_num_for_estimation()
 
 
+def test_get_layer_attention_window_honors_max_window_layers():
+    config = SimpleNamespace(
+        use_sliding_window=True,
+        sliding_window=4096,
+        max_window_layers=2,
+    )
+
+    assert [get_layer_attention_window(config, layer_idx) for layer_idx in range(4)] == [
+        None,
+        None,
+        4096,
+        4096,
+    ]
+
+
 def test_gemma4_hybrid_scales_by_num_pool_groups():
     """Gemma4 hybrid attention (mixed sliding/full layers) must scale the
     estimated block count by the number of distinct layer types.  Otherwise
@@ -266,6 +369,9 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
     tpb = 32
     max_seq_len = 12288
     layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+    # Mixed sliding/full attention must include the model's actual window size;
+    # Gemma4-E2B uses a 512-token sliding window.
+    sliding_window = 512
     assert len(set(layer_types)) == 2
 
     hybrid = _make_creator(
@@ -276,6 +382,7 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         model_max_seq_len=max_seq_len,
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
+        sliding_window=sliding_window,
     )
     uniform = _make_creator(
         tpb,
@@ -293,6 +400,72 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         f"Expected 2x scaling for 2 pool groups, got "
         f"hybrid={hybrid_tokens}, uniform={uniform_tokens}"
     )
+
+
+def test_hybrid_linear_attention_scales_by_num_pool_groups():
+    """Hybrid linear/attention V2 managers retain both estimation pools."""
+    tpb = 32
+    max_seq_len = 4096
+    layer_types = ["linear_attention"] * 30 + ["full_attention"] * 10
+
+    hybrid = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=layer_types,
+    )
+    uniform = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=["full_attention"] * 40,
+    )
+
+    assert hybrid._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
+
+
+@pytest.mark.parametrize(
+    ("sliding_window", "use_sliding_window"),
+    [
+        ([512, 1024], None),
+        (None, True),
+    ],
+    ids=["multiple_window_sizes", "missing_window"],
+)
+def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
+    sliding_window,
+    use_sliding_window,
+):
+    tpb = 32
+    max_seq_len = 4096
+    hybrid = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=sliding_window,
+        use_sliding_window=use_sliding_window,
+    )
+    uniform = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=["full_attention", "full_attention"],
+    )
+
+    assert hybrid._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
 
 
 def test_vswa_max_attention_window_fallback_scales():
@@ -332,6 +505,9 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
     tpb = 32
     max_seq_len = 12288
     layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+    # Mixed sliding/full attention must include the model's actual window size;
+    # Gemma4-E2B uses a 512-token sliding window.
+    sliding_window = 512
 
     c = _make_creator(
         tpb,
@@ -341,6 +517,7 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         model_max_seq_len=max_seq_len,
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
+        sliding_window=sliding_window,
     )
 
     total_tokens = c._get_token_num_for_estimation()
@@ -486,7 +663,6 @@ def test_kv_cache_manager_v2_float_max_seq_len_would_crash_torch_randint():
     """Pre-fix behaviour: a float max_seq_len propagating into
     torch.randint(size=(...,)) raises.  This test documents WHY the cast
     is necessary — if the cast is dropped, the following code crashes."""
-    import torch
 
     float_seq_len = 60160.0
     with pytest.raises((TypeError, RuntimeError)):
@@ -539,7 +715,6 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     11.92 GiB temp-quota inflation on DeepSeek-V4-Pro, raising peak memory
     and OOM risk during KV cache estimation).
     """
-    import torch
 
     from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
 
@@ -590,8 +765,6 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
 
 
 def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
-    import torch
-
     pool_ratio = [0.2, 0.3, 0.5]
     avg_seq_len = 128
     max_seq_len = 4096
@@ -607,6 +780,9 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     # Explicit False: try_prepare_estimation skips estimation for
     # encoder-decoder models, and a bare Mock attribute is truthy.
     model_engine.model.model_config.is_encoder_decoder = False
+    # A bare Mock would auto-create the attribute; real engines set it to
+    # None unless the model opted into MM item scheduling.
+    model_engine.mm_encoder_output_budget_bytes = None
     llm_args = Mock(cache_transceiver_config=None)
 
     with patch.object(
@@ -644,6 +820,13 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
         patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
         patch.object(torch.cuda, "empty_cache"),
         patch.object(torch.cuda, "reset_peak_memory_stats"),
+        # This test exercises inferred pool sizing, not the backend workspace reserve; the mock
+        # model_config would otherwise walk into backend resolution and the MLA byte-cost path.
+        # Neutralize it so no reserve applies.
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
+            return_value=0,
+        ),
     ):
         assert creator.try_prepare_estimation()
         assert kv_cache_config.max_tokens == estimation_max_tokens
@@ -712,3 +895,60 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
 
     assert captured_configs[0].avg_seq_len == expected_avg_seq_len
     assert kv_cache_config.avg_seq_len == 2055
+
+
+def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
+    creator = object.__new__(KvCacheCreator)
+    target_pool_ratio = [0.32, 0.68]
+    creator._kv_cache_config = KvCacheConfig(
+        pool_ratio=target_pool_ratio,
+        max_attention_window=None,
+    )
+    creator._max_seq_len = 9472
+    creator._tokens_per_block = 32
+    creator._max_batch_size = 1024
+    creator._max_num_tokens = 9472
+    creator._max_beam_width = 1
+    creator._kv_connector_manager = None
+    creator._skip_est = False
+    creator._execution_stream = None
+    creator._is_disagg = False
+    creator._mapping = Mock()
+    creator._speculative_config = Mock()
+
+    effective_draft_config = Mock()
+    effective_draft_config.pretrained_config.torch_dtype = "bfloat16"
+    effective_draft_config.sparse_attention_config = None
+
+    with (
+        patch.object(creator, "_get_num_draft_layers", return_value=1),
+        patch.object(creator, "_get_one_model_draft_layer_mask", return_value=[True]),
+        patch.object(
+            creator,
+            "_get_effective_draft_config",
+            return_value=effective_draft_config,
+        ),
+        patch.object(creator, "_enable_kv_cache_stats", return_value=False),
+        patch.object(
+            creator,
+            "_validate_or_fallback_kv_cache_manager_v2",
+            return_value=KVCacheManagerV2,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util._derive_draft_max_attention_window",
+            return_value=None,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_kv_cache_manager_cls",
+            return_value=KVCacheManagerV2,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
+            return_value=Mock(),
+        ) as create_manager,
+    ):
+        creator._create_one_model_draft_kv_cache_manager(creator._max_seq_len)
+
+    draft_config = create_manager.call_args.kwargs["kv_cache_config"]
+    assert draft_config.pool_ratio == [1.0]
+    assert creator._kv_cache_config.pool_ratio == target_pool_ratio

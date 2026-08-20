@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import math
 import re
 from collections import defaultdict
@@ -10,7 +13,8 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
     Qwen3NextHfWeightMapper,
 )
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.modules.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm.quantization import QuantAlgo
 
 _FP8_2D_BLOCK_SIZE = 128
@@ -62,6 +66,109 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         r"^((?:model|mtp)\.layers\.\d+\.mlp)\.(gate_proj|up_proj|down_proj|gate_up_proj)(\..+)$"
     )
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._partial_split_weights: dict[str, object] = {}
+        self._update_weights_active = False
+
+    def begin_update_weights(self) -> None:
+        """Start a new incremental update and discard stale staging state."""
+        self._partial_split_weights.clear()
+        self._update_weights_active = True
+
+    def finalize_update_weights(self) -> None:
+        """Reject incomplete BF16 projection groups before transforms run."""
+        if self._partial_split_weights:
+            pending = sorted(self._partial_split_weights)
+            self.abort_update_weights()
+            preview = ", ".join(pending[:8])
+            if len(pending) > 8:
+                preview += f", ... ({len(pending)} tensors total)"
+            raise RuntimeError(
+                "Cannot finalize Qwen3.5 weight update with incomplete "
+                f"linear-attention projection groups: {preview}"
+            )
+        self._update_weights_active = False
+
+    def abort_update_weights(self) -> None:
+        """Discard tensors retained for an incomplete incremental update."""
+        self._partial_split_weights.clear()
+        self._update_weights_active = False
+
+    def cleanup(self) -> None:
+        """Release staged tensors and references held by the base mapper."""
+        self.abort_update_weights()
+        super().cleanup()
+
+    def _stage_partial_split_projections(self, weights: dict, quant_algo: QuantAlgo | None) -> dict:
+        """Emit complete QKVZ and BA groups from incremental input.
+
+        Packed broadcast boundaries are byte based and may split projections
+        that must be fused before the normal Qwen3Next mapping runs. Retain
+        those tensors on each inference rank until their complete fusion group
+        is available. Block-FP8 QKVZ tensors are dequantized into the temporary
+        BF16 runtime representation, so their weights and scales must be
+        released together. Non-projection tensors pass through immediately.
+        """
+        if not self._update_weights_active:
+            self.begin_update_weights()
+
+        ready_weights = {}
+        for name, tensor in weights.items():
+            if self._SPLIT_PROJ_PATTERN.match(name) is None:
+                ready_weights[name] = tensor
+                continue
+            if name in self._partial_split_weights:
+                raise RuntimeError(f"Duplicate Qwen3.5 partial weight received: {name}")
+            self._partial_split_weights[name] = tensor
+
+        grouped_names = defaultdict(dict)
+        for name in self._partial_split_weights:
+            match = self._SPLIT_PROJ_PATTERN.match(name)
+            assert match is not None
+            prefix, projection_name, suffix = match.groups()
+            grouped_names[(prefix, suffix)][projection_name] = name
+
+        consumed_names = set()
+        for (prefix, suffix), names in grouped_names.items():
+            if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and suffix == "weight_scale_inv":
+                # DeepSeek-format block scales must be emitted with the FP8
+                # weights that consume them below.
+                continue
+
+            qkvz_names = {"qkv", "q", "k", "v", "z"} & names.keys()
+            if "qkv" in qkvz_names:
+                required = {"qkv", "z"}
+            elif qkvz_names:
+                required = {"q", "k", "v", "z"}
+            else:
+                required = set()
+            if required and required.issubset(names):
+                required_names = [names[key] for key in required]
+                requires_block_scales = (
+                    quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                    and suffix == "weight"
+                    and any(
+                        self._partial_split_weights[name].dtype == torch.float8_e4m3fn
+                        for name in required_names
+                    )
+                )
+                if requires_block_scales:
+                    scale_names = grouped_names.get((prefix, "weight_scale_inv"), {})
+                    if required.issubset(scale_names):
+                        consumed_names.update(required_names)
+                        consumed_names.update(scale_names[key] for key in required)
+                else:
+                    consumed_names.update(required_names)
+
+            required_ba = {"b", "a"}
+            if required_ba.issubset(names):
+                consumed_names.update(names[key] for key in required_ba)
+
+        for name in consumed_names:
+            ready_weights[name] = self._partial_split_weights.pop(name)
+        return ready_weights
+
     def _normalize_weight_names(self, weights: dict) -> dict:
         normalized_weights = {}
         for key, tensor in weights.items():
@@ -72,24 +179,19 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             normalized_weights[key] = tensor
         return normalized_weights
 
-    def _normalize_scale_names(self, weights: dict, quant_algo) -> tuple[dict, bool]:
-        # Canonicalize FP8 weight_scale layout so the Linear loader sees one
-        # shape per quant algo:
-        #   - FP8_BLOCK_SCALES: modelopt fp8_pb_wo stores weight_scale shaped
-        #     [blocks_out, 1, blocks_in, 1]; squeeze to [blocks_out, blocks_in]
-        #     and rename to weight_scale_inv. Returns is_modelopt_pb_wo=True
-        #     so the caller can keep modelopt's native FP8 path.
-        #   - FP8_PER_CHANNEL_PER_TOKEN: compressed-tensors stores weight_scale
-        #     shaped [out, 1]; squeeze to 1-D [out].
+    def _normalize_fp8_block_scale_names(self, weights: dict, quant_algo) -> tuple[dict, bool]:
+        # modelopt fp8_pb_wo stores weight_scale shaped [blocks_out, 1, blocks_in, 1].
+        # squeeze to [blocks_out, blocks_in] and rename to weight_scale_inv.
+        # Returns is_modelopt_pb_wo=True so caller can keep modelopt's native FP8 path.
 
         is_modelopt_pb_wo = False
-        if quant_algo not in (QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN):
+        if quant_algo != QuantAlgo.FP8_BLOCK_SCALES:
             return weights, is_modelopt_pb_wo
 
         remapped_weights = {}
         for key, tensor in weights.items():
             if key.endswith(".weight_scale"):
-                if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and tensor.ndim == 4:
+                if tensor.ndim == 4:
                     assert tensor.shape[1] == 1 and tensor.shape[-1] == 1, (
                         f"Expected scale shape [*, 1, *, 1] for {key}, got {tuple(tensor.shape)}"
                     )
@@ -98,12 +200,6 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     # detect 2D-block scales by suffix alone.
                     key = key[: -len("weight_scale")] + "weight_scale_inv"
                     is_modelopt_pb_wo = True
-                elif (
-                    quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-                    and tensor.ndim == 2
-                    and tensor.shape[1] == 1
-                ):
-                    tensor = tensor.squeeze(-1)
             if key in remapped_weights:
                 raise ValueError(f"Duplicate remapped key found: {key}")
             remapped_weights[key] = tensor
@@ -116,7 +212,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
-        if isinstance(module, MoE):
+        if is_moe_weight_owner(module):
             config = self.config.pretrained_config
             # ModelOpt FP8/NVFP4 checkpoints store per-expert split projections
             # ("<e>.gate_proj.weight" + scales). Some preliminary ModelOpt
@@ -129,9 +225,11 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             # quantized loader.
             per_expert_pattern = re.compile(r"^\d+\.(?:gate_proj|up_proj|down_proj)\.")
             has_per_expert_tensors = any(per_expert_pattern.match(name) for name in module_weights)
-            uses_fused_expert_tensors = (
-                "gate_up_proj" in module_weights and not has_per_expert_tensors
+            has_stacked_expert_tensors = any(
+                name in ("gate_up_proj", "down_proj") and getattr(value, "ndim", None) == 3
+                for name, value in module_weights.items()
             )
+            uses_fused_expert_tensors = has_stacked_expert_tensors and not has_per_expert_tensors
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
                 if has_per_expert_tensors and weight_name in ("gate_up_proj", "down_proj"):
@@ -556,12 +654,16 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 remapped_weights[name] = tensor
         return remapped_weights
 
-    def preprocess_weights(self, weights: dict) -> dict:
+    def preprocess_weights(self, weights: dict, allow_partial_loading: bool = False) -> dict:
         is_consumable = isinstance(weights, ConsumableWeightsDict)
         quant_algo = self.config.quant_config.quant_algo
 
         normalized_weights = self._normalize_weight_names(weights)
-        normalized_weights, is_modelopt_pb_wo = self._normalize_scale_names(
+        if allow_partial_loading:
+            normalized_weights = self._stage_partial_split_projections(
+                normalized_weights, quant_algo
+            )
+        normalized_weights, is_modelopt_pb_wo = self._normalize_fp8_block_scale_names(
             normalized_weights, quant_algo
         )
 
@@ -571,13 +673,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         # requantize the split projections onto one shared scale and keep them
         # FP8; whatever remains (in_proj_ba, prefixes without a fused FP8
         # entry) is dequantized to bf16 so scalar scales don't reach
-        # _pack_split_projections (both are no-ops otherwise).
-        normalized_weights = self._requantize_linear_attn_fp8_qkvz(normalized_weights)
-        normalized_weights = self._dequantize_linear_attn_fp8_per_tensor(normalized_weights)
+        # _pack_split_projections.
+        if quant_algo == QuantAlgo.MIXED_PRECISION:
+            normalized_weights = self._requantize_linear_attn_fp8_qkvz(normalized_weights)
+            normalized_weights = self._dequantize_linear_attn_fp8_per_tensor(normalized_weights)
 
         # TRT-LLM's LMHead is always bf16; dequantize an NVFP4 lm_head so it
-        # loads through the unquantized path (no-op if lm_head is not NVFP4).
-        normalized_weights = self._dequantize_lm_head_nvfp4(normalized_weights)
+        # loads through the unquantized path.
+        if quant_algo in (QuantAlgo.MIXED_PRECISION, QuantAlgo.NVFP4):
+            normalized_weights = self._dequantize_lm_head_nvfp4(normalized_weights)
 
         packed_weights = self._pack_split_projections(normalized_weights)
         if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and not is_modelopt_pb_wo:
@@ -586,7 +690,9 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         if not getattr(self.config.pretrained_config, "num_experts", 0):
             packed_weights = self._remap_dense_mlp_weights(packed_weights)
 
-        processed_weights = super().preprocess_weights(packed_weights)
+        processed_weights = super().preprocess_weights(
+            packed_weights, allow_partial_loading=allow_partial_loading
+        )
         if is_consumable and not isinstance(processed_weights, ConsumableWeightsDict):
             return ConsumableWeightsDict(processed_weights)
         return processed_weights

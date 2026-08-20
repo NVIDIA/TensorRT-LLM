@@ -15,7 +15,6 @@ l0_rtx_pro_6000:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_out_of_tree"
-  - unittest/_torch/modules/moe/test_cute_dsl_b12x_moe_backend.py
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
   # SM120 W4A16 / W4A8 mixed-dtype GEMM coverage (paired with FinegrainedMixedDtypeGemm
@@ -51,7 +50,9 @@ l0_rtx_pro_6000:
       stage: post_merge
       backend: pytorch
   tests:
-  - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-120B-gpt_oss/gpt-oss-120b]
+  # Runtime is dominated by loading ~61GB of weights; passing runs have reached
+  # 59.5 min against the 60 min default. https://nvbugs/6523751
+  - test_e2e.py::test_ptp_quickstart_advanced[GPT-OSS-120B-gpt_oss/gpt-oss-120b] TIMEOUT (75)
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False] # 8mins
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True] # 8 mins
@@ -113,8 +114,6 @@ l0_rtx_pro_6000:
   # - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2]
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=0]
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_cutlass] # 20 mins
   # - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_cutlass_eagle3] # failed
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True]

@@ -160,47 +160,137 @@ def test_schedule_shadow_passes_env_overlay_to_build(prefetcher):
     assert prefetcher.overlays == [{"TRTLLM_HF_WEIGHT_CACHE": "1"}]
 
 
-def test_take_wrong_size_in_flight_does_not_wait(prefetcher, monkeypatch):
-    # A miss must not stall behind an in-flight build of ANOTHER size only to
-    # discard the result — that is slower than no prefetch at all (wait ~one
-    # spawn, then spawn again). It falls back to sync immediately, and the
-    # build still lands for a later take of its own size.
+def test_take_wrong_size_in_flight_waits_before_miss(prefetcher, monkeypatch):
+    # A wrong-size shadow is a miss, but the caller must not start its sync
+    # pool until that in-flight bootstrap finishes. Otherwise a group-size
+    # transition can make two MPI pools compete on the same allocation.
     release = threading.Event()
 
     def _slow_build(self, spec, gen, env_overlay=None):
-        release.wait(5)
+        release.wait()
         self._publish(spec, _FakePool(spec), session_prefetcher._spawn_snapshot(), gen)
 
     monkeypatch.setattr(SessionPrefetcher, "_build", _slow_build)
     prefetcher.schedule_shadow(2)
-    t0 = time.monotonic()
-    assert prefetcher.take(4) is None  # wrong size in flight: no join
-    assert time.monotonic() - t0 < 1.0
-    assert prefetcher.stats["pools_skipped_size_in_flight"] == 1
+    result = []
+    taker = threading.Thread(target=lambda: result.append(prefetcher.take(4)))
+    taker.start()
+    time.sleep(0.1)
+    assert taker.is_alive()  # blocked behind the only in-flight bootstrap
     release.set()
-    prefetcher._thread.join(timeout=10)
-    taken = prefetcher.take(2)  # the undisturbed build landed for its size
-    assert isinstance(taken, _FakePool) and taken.n_workers == 2
+    taker.join(timeout=10)
+    assert result == [None]  # wrong-size pool was drained, then rejected
 
 
-def test_factory_degrades_loudly_when_wait_shutdown_spawn_fails(prefetcher):
-    # The library fails closed when identity collection cannot complete; the
-    # prefetch layer must not turn that into a test failure: retry once,
-    # then degrade LOUDLY to a plain pool (pre-prefetch semantics).
+def test_shadow_wait_budget_tracks_identity_timeout(monkeypatch):
+    fake_mpi_session = types.SimpleNamespace(_identity_barrier_timeout=lambda: 125.0)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm.llmapi.mpi_session", fake_mpi_session)
+    assert (
+        session_prefetcher._shadow_build_wait_timeout()
+        == 125 + session_prefetcher._SHADOW_BUILD_FINISH_GRACE
+    )
+
+
+def test_shadow_wait_budget_handles_partially_loaded_mpi_module(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tensorrt_llm.llmapi.mpi_session", types.SimpleNamespace())
+    monkeypatch.setenv("TRTLLM_MPI_IDENTITY_TIMEOUT", "625")
+    assert (
+        session_prefetcher._shadow_build_wait_timeout()
+        == 625 + session_prefetcher._SHADOW_BUILD_FINISH_GRACE
+    )
+
+
+def test_take_timeout_is_terminal_until_build_exits(prefetcher, monkeypatch):
+    join_timeouts = []
+
+    class _HungBuild:
+        alive = True
+
+        def join(self, timeout):
+            join_timeouts.append(timeout)
+
+        def is_alive(self):
+            return self.alive
+
+    thread = _HungBuild()
+    prefetcher._thread = thread
+    prefetcher._building_spec = 2
+    monkeypatch.setattr(session_prefetcher, "_shadow_build_wait_timeout", lambda: 321.0)
+
+    with pytest.raises(TimeoutError, match="refusing to start a concurrent MPI pool"):
+        prefetcher.take(2)
+    with pytest.raises(TimeoutError, match="previously timed out"):
+        prefetcher.take(2)
+
+    # Only the first call spends the full wait budget and records a timeout.
+    # Later calls fail fast until the abandoned build actually exits.
+    assert join_timeouts == [321.0]
+    assert prefetcher._thread is thread
+    assert prefetcher._build_gen == 1
+    assert prefetcher.stats["pool_build_timeouts"] == 1
+
+    thread.alive = False
+    assert prefetcher.take(2) is None
+    assert prefetcher._thread is None
+    assert not prefetcher._build_timed_out
+
+
+def test_concurrent_take_timeout_waits_only_once(prefetcher, monkeypatch):
+    join_started = threading.Event()
+    release_join = threading.Event()
+    join_timeouts = []
+    errors = []
+
+    class _HungBuild:
+        def join(self, timeout):
+            join_timeouts.append(timeout)
+            join_started.set()
+            release_join.wait()
+
+        def is_alive(self):
+            return True
+
+    prefetcher._thread = _HungBuild()
+    prefetcher._building_spec = 2
+    monkeypatch.setattr(session_prefetcher, "_shadow_build_wait_timeout", lambda: 321.0)
+
+    def _take():
+        try:
+            prefetcher.take(2)
+        except TimeoutError as e:
+            errors.append(e)
+
+    first = threading.Thread(target=_take)
+    second = threading.Thread(target=_take)
+    first.start()
+    assert join_started.wait(timeout=5)
+    second.start()
+    release_join.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert len(errors) == 2
+    assert join_timeouts == [321.0]
+    assert prefetcher._build_gen == 1
+    assert prefetcher.stats["pool_build_timeouts"] == 1
+
+
+def test_factory_spawn_failure_propagates_without_retry(prefetcher):
+    # Once the full identity deadline expires, an unidentified worker may
+    # still be alive. Retrying or downgrading to wait_shutdown=False could
+    # overlap it with another pool, so the failure must propagate.
     calls = []
 
     class _FailingWaitPool(_FakePool):
         def __init__(self, n_workers, wait_shutdown=False):
             calls.append(wait_shutdown)
-            if wait_shutdown:
-                raise RuntimeError("identity collection incomplete")
-            super().__init__(n_workers, wait_shutdown)
+            raise RuntimeError("identity collection incomplete")
 
     factory = prefetcher._make_factory(_FailingWaitPool)
-    session = factory(2)
-    assert isinstance(session, _FailingWaitPool) and not session.wait_shutdown
-    assert calls == [True, True, False]  # two contract attempts, then plain
-    assert prefetcher.stats["pools_spawned_degraded"] == 1
+    with pytest.raises(RuntimeError, match="identity collection incomplete"):
+        factory(2)
+    assert calls == [True]
+    assert prefetcher._thread is None  # failure did not restock a shadow
 
 
 def test_factory_hit_hands_over_shadow(prefetcher):
@@ -389,8 +479,8 @@ def test_model_param_discovery(monkeypatch):
     # (a name under LLM_MODELS_ROOT, or an absolute path) — discovered
     # without any test-file changes.
     monkeypatch.setenv("LLM_MODELS_ROOT", "/models-root")
-    item = _FakeItem(params={"model_folder": "Nemotron-H-8B-Base-8K"})
-    assert session_prefetcher._model_dir_of(item) == "/models-root/Nemotron-H-8B-Base-8K"
+    item = _FakeItem(params={"model_folder": "NVIDIA-Nemotron-Nano-9B-v2"})
+    assert session_prefetcher._model_dir_of(item) == "/models-root/NVIDIA-Nemotron-Nano-9B-v2"
     item = _FakeItem(params={"model_dir": "/abs/path/model"})
     assert session_prefetcher._model_dir_of(item) == "/abs/path/model"
     # Non-model params never produce a guess.

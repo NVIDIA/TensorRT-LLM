@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _wan_mock(is_wan22_14b=False, is_wan22_5b=False, name_or_path="", num_heads=12):
     """Create a mock with attributes needed by WanPipeline/WanI2V properties."""
@@ -224,6 +226,18 @@ class TestPipelineDefaults:
         assert d["num_frames"] == 121
         assert d["frame_rate"] == 24.0
 
+    def test_fastwan_defaults(self):
+        """FastWan 2.2 TI2V-5B (DMD distilled): wan22-5b defaults, 3-step, CFG-free."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
+
+        d = WanDMDPipeline.default_generation_params.fget(None)
+        assert d["height"] == 704
+        assert d["width"] == 1280
+        assert d["num_inference_steps"] == 3
+        assert d["guidance_scale"] == 1.0
+        assert d["num_frames"] == 121
+        assert d["frame_rate"] == 24.0
+
     def test_flux_defaults(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
 
@@ -375,6 +389,31 @@ class TestDefaultMerging:
         assert req.params.width == 1920
         assert req.params.num_inference_steps == 50  # Default filled
 
+    def test_flux2_reference_dimensions_remain_unset_for_pipeline_resolution(self):
+        from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+
+        executor = self._make_mock_executor(Flux2Pipeline)
+        executor.pipeline.derive_output_size_from_reference = True
+        req = self._make_request(image=b"encoded image")
+
+        self._merge(executor, req)
+
+        assert req.params.height is None
+        assert req.params.width is None
+        assert req.params.num_inference_steps == 50
+
+    def test_flux2_reference_dimensions_preserve_explicit_values(self):
+        from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+
+        executor = self._make_mock_executor(Flux2Pipeline)
+        executor.pipeline.derive_output_size_from_reference = True
+        req = self._make_request(image=b"encoded image", height=768, width=512)
+
+        self._merge(executor, req)
+
+        assert req.params.height == 768
+        assert req.params.width == 512
+
     def test_extra_params_defaults_merged(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
@@ -514,6 +553,22 @@ class TestVisualGenDefaultParams:
         assert params.width == 1280
         assert params.num_inference_steps == 50
         assert params.guidance_scale == 5.0
+        assert params.num_frames == 121
+        assert params.frame_rate == 24.0
+        assert params.extra_params is None
+
+    def test_fastwan_default_params(self):
+        """FastWan 2.2 TI2V-5B (DMD distilled): 3-step, CFG-free, no extra params."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
+
+        vg = self._make_visual_gen(
+            WanDMDPipeline, _wan_mock(is_wan22_14b=False, is_wan22_5b=True, num_heads=24)
+        )
+        params = vg.default_params
+        assert params.height == 704
+        assert params.width == 1280
+        assert params.num_inference_steps == 3
+        assert params.guidance_scale == 1.0
         assert params.num_frames == 121
         assert params.frame_rate == 24.0
         assert params.extra_params is None
@@ -759,6 +814,81 @@ class TestRequestValidation:
         executor = self._make_mock_executor(LTX2Pipeline)
         req = self._make_request(extra_params={"stg_scale": 0.5})
         self._merge_and_validate(executor, req)  # should not raise
+
+    def test_spec_validator_runs_at_preflight(self):
+        """Per-param validators turn deterministic client errors into 400s at
+        the boundary instead of worker-side failures (Cosmos3 conditioning)."""
+        import torch
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def _validate(extras):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params=extras),
+                declared_defaults={},
+                extra_param_specs=COSMOS3_EXTRA_SPECS,
+            )
+
+        # Valid values pass.
+        _validate({"condition_video_latent_indexes": [0, 1], "condition_video_keep": "last"})
+        # ``video`` carries encoded MP4/AVI bytes: a video signature passes,
+        # empty / non-video bytes are client errors, and anything that is not
+        # bytes (e.g. a decoded tensor) fails the type check.
+        _validate({"video": b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"})
+        with pytest.raises(ValueError, match="empty"):
+            _validate({"video": b""})
+        with pytest.raises(ValueError, match="not a recognized video container"):
+            _validate({"video": b"\x89PNG\r\n\x1a\n and not a video"})
+        with pytest.raises(ValueError, match="expected type 'bytes'"):
+            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8)})
+
+        with pytest.raises(ValueError, match="non-negative"):
+            _validate({"condition_video_latent_indexes": [0, -1]})
+        with pytest.raises(ValueError, match="must not be empty"):
+            _validate({"condition_video_latent_indexes": []})
+        with pytest.raises(ValueError, match="first or last"):
+            _validate({"condition_video_keep": "middle"})
+        # No silent float truncation; None elements are a 400, not a TypeError.
+        with pytest.raises(ValueError, match="must be integers"):
+            _validate({"condition_video_latent_indexes": [1.9]})
+        with pytest.raises(ValueError, match="must be integers"):
+            _validate({"condition_video_latent_indexes": [None]})
+        _validate({"condition_video_latent_indexes": [0, 1.0]})  # integral floats OK
+        with pytest.raises(ValueError, match="output_type"):
+            _validate({"output_type": "gif"})
+        _validate({"output_type": "image"})
+
+    def test_validator_type_errors_become_client_errors(self):
+        """A validator raising TypeError (wrong-shaped value it didn't guard)
+        still folds into the 400 message list instead of escaping as a 500."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def touchy(value):
+            len(value)  # TypeError on ints
+
+        specs = {"knob": ExtraParamSchema(type="int", default=None, validator=touchy)}
+        with pytest.raises(ValueError, match="extra_params\\['knob'\\]"):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params={"knob": 3}),
+                declared_defaults={},
+                extra_param_specs=specs,
+            )
+
+    def test_spec_validators_survive_pickling(self):
+        """Specs travel worker -> coordinator in the READY handshake (pickled
+        over ZMQ); validators must be module-level functions so they serialize
+        by reference — a lambda/closure here would crash worker startup."""
+        import pickle
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        specs = pickle.loads(pickle.dumps(COSMOS3_EXTRA_SPECS))
+        with pytest.raises(ValueError, match="first or last"):
+            specs["condition_video_keep"].validator("middle")
+        with pytest.raises(ValueError, match="not a recognized video container"):
+            specs["video"].validator(b"garbage bytes")
 
     # --- unsupported universal fields ---
 
@@ -1132,7 +1262,7 @@ class TestResolveSeed:
 class TestEngineFailureTransport:
     """Validation is enforced at :meth:`VisualGen.generate_async` entry, so
     by the time a request reaches ``process_request`` only runtime
-    failures from ``pipeline.infer()`` can produce an error response.
+    failures from ``pipeline.run_inference()`` can produce an error response.
     The error message rides back on ``DiffusionResponse.error_msg``.
     """
 
@@ -1160,9 +1290,9 @@ class TestEngineFailureTransport:
 
         executor = self._make_executor(FluxPipeline)
         executor._merge_defaults = lambda req: DiffusionExecutor._merge_defaults(executor, req)
-        executor.pipeline.warmup_cache_key = MagicMock(return_value=(1024, 1024, None))
+        executor.pipeline.request_warmup_cache_key = MagicMock(return_value=(1024, 1024, None))
         executor.pipeline._warmed_up_shapes = None
-        executor.pipeline.infer = MagicMock(side_effect=RuntimeError("oops"))
+        executor.pipeline.run_inference = MagicMock(side_effect=RuntimeError("oops"))
 
         req = DiffusionRequest(
             request_id=7,
@@ -1176,3 +1306,41 @@ class TestEngineFailureTransport:
         resp = executor.response_queue.put.call_args[0][0]
         assert isinstance(resp, DiffusionResponse)
         assert resp.error_msg == "oops"
+
+    def test_reference_size_is_prepared_before_warmup_lookup(self):
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor, DiffusionRequest
+        from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+        from tensorrt_llm.visual_gen.params import VisualGenParams
+
+        events = []
+        executor = self._make_executor(Flux2Pipeline)
+        executor.rank = 1
+        executor._merge_defaults = lambda req: DiffusionExecutor._merge_defaults(executor, req)
+        executor.pipeline.derive_output_size_from_reference = True
+
+        def prepare_request(req):
+            events.append("prepare")
+            req.params.height = 64
+            req.params.width = 80
+
+        def request_warmup_cache_key(req):
+            events.append("warmup_cache_key")
+            return (req.params.height, req.params.width)
+
+        executor.pipeline.prepare_request = MagicMock(side_effect=prepare_request)
+        executor.pipeline.request_warmup_cache_key = MagicMock(side_effect=request_warmup_cache_key)
+        executor.pipeline._warmed_up_shapes = {(1024, 1024)}
+        executor.pipeline.run_inference = MagicMock(
+            side_effect=lambda _req: events.append("infer") or MagicMock()
+        )
+        req = DiffusionRequest(
+            request_id=8,
+            prompt=["test"],
+            params=VisualGenParams(image=b"encoded image"),
+        )
+
+        DiffusionExecutor.process_request(executor, req)
+
+        assert events == ["prepare", "warmup_cache_key", "infer"]
+        executor.pipeline.request_warmup_cache_key.assert_called_once_with(req)
+        executor.pipeline.run_inference.assert_called_once_with(req)

@@ -21,8 +21,10 @@
 #include "tensorrt_llm/common/vec_dtypes.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
+#include <cerrno>
 #include <cooperative_groups.h>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -31,6 +33,54 @@ namespace kernels::moe_comm
 {
 
 using tensorrt_llm::common::launchWithPdlWhenEnabled;
+
+// Resolve the completion-flag wait budget; see the header. Seconds are converted at
+// an assumed 2 GHz SM clock, so they are nominal rather than wall-clock.
+int64_t moeA2AGetTimeoutCycles(bool is_warmup)
+{
+    static constexpr int64_t kAssumedClockHz = 2000ll * 1000ll * 1000ll;
+    static constexpr int64_t kDefaultTimeoutSec = 300;
+    // Warmup contains one-time per-rank costs (JIT compilation, autotuning, module
+    // loading) that can run for minutes and are not synchronized against this
+    // collective, so it needs a larger budget than steady state.
+    static constexpr int64_t kDefaultWarmupTimeoutSec = 1800;
+
+    // Reject trailing garbage, out-of-range values and anything that would overflow
+    // the cycle multiplication.
+    auto const readEnv = [](char const* name, int64_t fallback) -> int64_t
+    {
+        static constexpr int64_t kMaxSec = 24 * 60 * 60; // 1 day; * 2e9 stays well inside int64
+        char const* v = std::getenv(name);
+        if (v == nullptr || *v == '\0')
+        {
+            return fallback;
+        }
+        errno = 0;
+        char* end = nullptr;
+        int64_t parsed = std::strtoll(v, &end, 10);
+        bool const trailingGarbage = (end == v) || (*end != '\0');
+        if (trailingGarbage || errno == ERANGE || parsed <= 0 || parsed > kMaxSec)
+        {
+            TLLM_LOG_WARNING("Ignoring invalid %s=\"%s\" (expected 1..%ld seconds); using %ld s", name, v,
+                static_cast<long>(kMaxSec), static_cast<long>(fallback));
+            return fallback;
+        }
+        return parsed;
+    };
+
+    static int64_t const sSteadySec = readEnv("TRTLLM_MOE_A2A_TIMEOUT_SEC", kDefaultTimeoutSec);
+    static int64_t const sWarmupSec = readEnv("TRTLLM_MOE_A2A_WARMUP_TIMEOUT_SEC", kDefaultWarmupTimeoutSec);
+    static bool const sLogged = []()
+    {
+        TLLM_LOG_INFO(
+            "MoE all-to-all completion-flag budget: steady=%ld s, warmup=%ld s (nominal, at an "
+            "assumed 2 GHz clock64 rate)",
+            static_cast<long>(sSteadySec), static_cast<long>(sWarmupSec));
+        return true;
+    }();
+    (void) sLogged;
+    return (is_warmup ? sWarmupSec : sSteadySec) * kAssumedClockHz;
+}
 
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
@@ -161,10 +211,10 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
     }
 
 #if DISABLE_TIMEOUT
-#define check_timeout(s) false
+#define check_timeout(s, budget) false
 #else
-// 300 * 2000 MHz - should be high enough on any GPU but will prevent a hang
-#define check_timeout(s) ((clock64() - (s)) > (300ll * 2000ll * 1000ll * 1000ll))
+// `budget` is in clock64() cycles, resolved on the host by moeA2AGetTimeoutCycles().
+#define check_timeout(s, budget) ((clock64() - (s)) > (budget))
 #endif
 
 // ============================================================================
@@ -618,7 +668,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
                     flag_set = flag_value == expected_value;
-                } while (!flag_set && !check_timeout(s));
+                } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
 
                 if (__builtin_expect(!flag_set, 0))
                 {
@@ -659,6 +709,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
+    kernel_ptrs.timeout_cycles = params.timeout_cycles;
 
     // Fill source data pointers and payload sizes
     for (int i = 0; i < params.num_payloads; i++)
@@ -1258,7 +1309,7 @@ __global__ void moeA2ACombineKernel(
                     rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
                 flag_set = flag_value == expected_value;
-            } while (!flag_set && !check_timeout(s));
+            } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
 
             if (__builtin_expect(!flag_set, 0))
             {
@@ -1365,6 +1416,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 
     // Prepare kernel pointers struct for combine
     CombineKernelPointers kernel_ptrs = {}; // Zero-initialize
+    kernel_ptrs.timeout_cycles = params.timeout_cycles;
 
     // Set output data pointer in src_data_ptrs[0]
     kernel_ptrs.src_data_ptrs[0] = params.output_data;

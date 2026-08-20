@@ -14,8 +14,9 @@
 # limitations under the License.
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
+import dataclasses
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -40,6 +42,7 @@ from ..attention_backend.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
+from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -54,8 +57,15 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
+from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
+from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
 if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
@@ -321,14 +331,10 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # Use trtllm-gen for ALL layers.  trtllm-gen has pre-compiled cubins
-        # for both H256+SWA and H512 across all supported dtypes.
-        # For FP8 KV cache (NVFP4), Q is also cast to FP8 in the FlashInfer
-        # backend so that QkvE4m3OBfloat16 context cubins can be used
-        # (context cubins require same Q/KV dtype; decode cubins support
-        # mixed dtypes natively).  Uniform backend avoids workspace
-        # corruption between different wrapper types under CUDA graphs.
-        self.attn.flashinfer_backend = "trtllm-gen"
+        # trtllm-gen FMHA kernels are available only on datacenter Blackwell.
+        # Use FlashInfer FA2 on other architectures, including SM120/SM121;
+        # multimodal custom masks then use FlashInfer's native mask planning.
+        self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -656,7 +662,7 @@ class Gemma4DecoderLayer(DecoderLayer):
         # Determine if this is a KV-shared layer
         num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
         first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared
-        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        self.is_kv_shared_layer = num_kv_shared > 0 and layer_idx >= first_kv_shared_layer_idx
 
         # For shared layers, find the target layer to read KV cache from:
         # last non-shared layer of the same attention type (sliding/full).
@@ -1219,11 +1225,10 @@ class Gemma4TextModel(DecoderModel):
         return hidden_states
 
 
-# ---------------------------------------------------------------------------
-# Gemma4 For Causal LM
-# ---------------------------------------------------------------------------
 @register_auto_model("Gemma4ForCausalLM")
-class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    build_mtp_draft_model_from_config = True
+
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -1243,15 +1248,10 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
                 "moe_ep_size>1 requires a Gemma4 MoE variant (only 26B-A4B-it today)."
             )
 
-        super().__init__(
-            Gemma4TextModel(model_config),
-            config=model_config,
-            hidden_size=model_config.pretrained_config.hidden_size,
-            vocab_size=model_config.pretrained_config.vocab_size,
-        )
+        super().__init__(Gemma4TextModel(model_config), model_config)
 
     @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
         FlashInfer backend is required for hybrid attention (per-layer
@@ -1261,6 +1261,23 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         return {
             "attn_backend": "FLASHINFER",
         }
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Gemma4's VSWA layout.
+
+        Hybrid-attention checkpoints (per-layer head_dim) are routed to V2
+        unconditionally regardless of this preference.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
+        return "PYTHON"
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
         """Build bidirectional attention mask from mm_token_type_ids.
@@ -1371,6 +1388,45 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
             token_offset = context_end
         return torch.cat(context_mask_list, dim=0).contiguous()
 
+    def _forward_speculative(
+        self,
+        output: torch.Tensor,
+        input_ids: Optional[torch.IntTensor],
+        orig_input_ids: Optional[torch.IntTensor],
+        position_ids: Optional[torch.IntTensor],
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata,
+        resource_manager,
+    ) -> torch.Tensor:
+        logits = self.logits_processor.forward(
+            output[spec_metadata.gather_ids],
+            self.lm_head,
+            attn_metadata,
+            True,
+        )
+        if self.config.final_logit_softcapping is not None:
+            cap = self.config.final_logit_softcapping
+            logits = torch.tanh(logits / cap) * cap
+
+        spec_input_ids = input_ids if input_ids is not None else orig_input_ids
+        spec_position_ids = position_ids
+        if attn_metadata.padded_num_tokens is not None:
+            if spec_input_ids is not None:
+                spec_input_ids = spec_input_ids[: attn_metadata.num_tokens]
+            if position_ids is not None:
+                spec_position_ids = _slice_spec_position_ids(position_ids, attn_metadata.num_tokens)
+
+        return self.spec_worker(
+            input_ids=spec_input_ids,
+            position_ids=spec_position_ids,
+            hidden_states=output,
+            logits=logits,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=self.draft_model,
+            resource_manager=resource_manager,
+        )
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1380,6 +1436,9 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
+        orig_input_ids: Optional[torch.IntTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         local_attention_mask_data = None
@@ -1406,6 +1465,22 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
             **kwargs,
         )
 
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, output)
+        if attn_metadata.padded_num_tokens is not None:
+            output = output[: attn_metadata.num_tokens]
+
+        if self.spec_worker is not None:
+            return self._forward_speculative(
+                output,
+                input_ids,
+                orig_input_ids,
+                position_ids,
+                attn_metadata,
+                spec_metadata,
+                resource_manager,
+            )
+
         logits = self.logits_processor.forward(
             output,
             self.lm_head,
@@ -1426,3 +1501,202 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         # Ensure PLE nn.Linear modules match model dtype (weight loader may
         # not handle raw nn.Linear correctly, leaving them as float32).
         self.model._ensure_ple_dtype()
+
+
+class Gemma4AssistantMaskedEmbedder(nn.Module):
+    """Compute Gemma4 assistant logits for the selected centroid clusters."""
+
+    def __init__(self, model_config: ModelConfig):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.hidden_size = config.hidden_size
+        self.num_centroids = config.num_centroids
+        self.centroid_intermediate_top_k = config.centroid_intermediate_top_k
+        self.vocab_size = config.vocab_size
+        if self.vocab_size % self.num_centroids != 0:
+            raise ValueError(
+                "Gemma4 assistant vocab_size must be divisible by num_centroids: "
+                f"got {self.vocab_size} and {self.num_centroids}"
+            )
+        self.vocab_size_per_centroid = self.vocab_size // self.num_centroids
+        self.centroids = Linear(
+            self.hidden_size,
+            self.num_centroids,
+            bias=False,
+            dtype=config.torch_dtype,
+        )
+        self.vocab_all_reduce = AllReduce(
+            mapping=model_config.mapping,
+            dtype=config.torch_dtype,
+        )
+        self.register_buffer(
+            "token_ordering",
+            torch.empty(self.vocab_size, dtype=torch.long),
+        )
+
+    @staticmethod
+    def _selected_logits_for_vocab_shard(
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        canonical_positions: torch.Tensor,
+        vocab_start_index: int,
+    ) -> torch.Tensor:
+        """Compute selected logits owned by one vocab-parallel shard."""
+        local_positions = canonical_positions - vocab_start_index
+        is_local = (local_positions >= 0) & (local_positions < lm_head_weight.shape[0])
+        safe_positions = local_positions.clamp_(0, lm_head_weight.shape[0] - 1)
+        selected_embeddings = lm_head_weight[safe_positions.reshape(-1)].view(
+            hidden_states.shape[0],
+            canonical_positions.shape[1],
+            hidden_states.shape[1],
+        )
+        selected_logits = torch.bmm(
+            hidden_states.unsqueeze(1), selected_embeddings.transpose(1, 2)
+        ).squeeze(1)
+        return selected_logits.masked_fill(~is_local, 0)
+
+    @torch.inference_mode()
+    def forward(self, hidden_states: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+        centroid_logits = self.centroids(hidden_states)
+        _, top_k_indices = torch.topk(
+            centroid_logits,
+            k=self.centroid_intermediate_top_k,
+            dim=-1,
+        )
+        canonical_positions = self.token_ordering.view(
+            self.num_centroids, self.vocab_size_per_centroid
+        )[top_k_indices].flatten(1)
+
+        vocab_start_index = 0
+        is_vocab_sharded = lm_head.tp_mode == TensorParallelMode.COLUMN and lm_head.tp_size > 1
+        if is_vocab_sharded:
+            vocab_start_index = lm_head.tp_rank * lm_head.out_features
+        selected_logits = self._selected_logits_for_vocab_shard(
+            hidden_states,
+            lm_head.weight,
+            canonical_positions,
+            vocab_start_index,
+        )
+        if is_vocab_sharded:
+            selected_logits = self.vocab_all_reduce(selected_logits)
+
+        logits = torch.full(
+            (hidden_states.shape[0], self.vocab_size),
+            torch.finfo(hidden_states.dtype).min,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        return logits.scatter_(1, canonical_positions, selected_logits)
+
+
+@register_auto_model("Gemma4AssistantForCausalLM")
+class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    """Gemma4 MTP assistant that attends directly to the target model KV cache."""
+
+    shares_target_kv_cache = True
+
+    def __init__(self, model_config: ModelConfig):
+        assistant_config = model_config.pretrained_config
+        text_model_config = dataclasses.replace(
+            model_config,
+            pretrained_config=assistant_config.text_config,
+            spec_config=None,
+        )
+        super().__init__(
+            Gemma4TextModel(text_model_config),
+            config=model_config,
+            hidden_size=assistant_config.hidden_size,
+            vocab_size=assistant_config.vocab_size,
+        )
+        self.pre_projection = Linear(
+            2 * assistant_config.backbone_hidden_size,
+            assistant_config.hidden_size,
+            bias=False,
+            dtype=assistant_config.torch_dtype,
+        )
+        self.post_projection = Linear(
+            assistant_config.hidden_size,
+            assistant_config.backbone_hidden_size,
+            bias=False,
+            dtype=assistant_config.torch_dtype,
+        )
+        self.masked_embedding = (
+            Gemma4AssistantMaskedEmbedder(model_config)
+            if assistant_config.use_ordered_embeddings
+            else None
+        )
+        # The assistant embedding remains tied to its own LM head. Target input
+        # embeddings have the backbone width and are shared separately.
+        self.target_input_embeddings = None
+
+    def load_weights_from_target_model(
+        self,
+        target_model: "Gemma4ForCausalLM | Gemma4ForConditionalGeneration",
+    ) -> None:
+        target_llm = (
+            target_model if isinstance(target_model, Gemma4ForCausalLM) else target_model.llm
+        )
+        self.target_input_embeddings = target_llm.model.embed_tokens
+
+        target_config = target_llm.config
+        num_source_layers = target_config.num_hidden_layers - target_config.num_kv_shared_layers
+        source_layer_types = target_config.layer_types[:num_source_layers]
+        for layer in self.model.layers:
+            layer_type = "sliding_attention" if layer.is_sliding else "full_attention"
+            if layer_type not in source_layer_types:
+                raise ValueError(f"Target Gemma4 model has no KV source for {layer_type}")
+            source_layer_idx = (
+                len(source_layer_types) - 1 - source_layer_types[::-1].index(layer_type)
+            )
+            layer.self_attn.attn.layer_idx = source_layer_idx
+
+    @staticmethod
+    def _constant_position_ids(
+        position_ids: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        positions = position_ids.squeeze(0) if position_ids.ndim == 2 else position_ids
+        seq_lens = attn_metadata.seq_lens_cuda[: attn_metadata.num_seqs]
+        last_token_indices = torch.cumsum(seq_lens, dim=0, dtype=torch.long) - 1
+        return torch.repeat_interleave(
+            positions[last_token_indices],
+            seq_lens,
+            output_size=positions.shape[0],
+        ).unsqueeze(0)
+
+    def forward_draft_step(
+        self,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        recurrent_hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run one Q-only assistant step over a frozen target KV prefix."""
+        if self.target_input_embeddings is None:
+            raise RuntimeError("Gemma4 assistant target embeddings have not been initialized")
+        target_embeddings = self.target_input_embeddings(input_ids)
+        assistant_inputs = self.pre_projection(
+            torch.cat([target_embeddings, recurrent_hidden_states], dim=-1)
+        )
+        assistant_hidden_states = self.model(
+            attn_metadata=attn_metadata,
+            position_ids=self._constant_position_ids(position_ids, attn_metadata),
+            inputs_embeds=assistant_inputs,
+            spec_metadata=spec_metadata,
+        )
+        projected_hidden_states = self.post_projection(assistant_hidden_states)
+        if self.masked_embedding is not None:
+            logits = self.masked_embedding(assistant_hidden_states, self.lm_head).float()
+        else:
+            logits = self.lm_head(assistant_hidden_states).float()
+        return logits, projected_hidden_states
+
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        weights = weight_mapper.preprocess_weights(weights)
+        ordering_weight_name = "masked_embedding.token_ordering"
+        if self.masked_embedding is not None and ordering_weight_name in weights:
+            # Copy this checkpoint-backed buffer and consume its exact source key.
+            self.masked_embedding.token_ordering.copy_(weights[ordering_weight_name])
+            del weights[ordering_weight_name]
+        super().load_weights(weights, weight_mapper)

@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for GMS-specific branches in ``ModelLoader``."""
 
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -15,13 +17,18 @@ from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
     ArtifactIdentity,
     PostTransformProfile,
     PostTransformProfileRegistry,
+    PostTransformRuntimeConstraints,
     PostTransformTransferScope,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+pytestmark = pytest.mark.cpu_only
+
 
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
@@ -100,10 +107,17 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)
     )
     loader._load_and_validate_config = MagicMock(
-        return_value=SimpleNamespace(name="config", mapping=SimpleNamespace())
+        return_value=SimpleNamespace(
+            name="config",
+            mapping=SimpleNamespace(),
+            pretrained_config=SimpleNamespace(
+                architectures=["TinyForCausalLM"],
+                model_type="tiny",
+            ),
+        )
     )
 
-    monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(model_loader_mod, "timing_metric", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
     # These tests stub ModelConfig, while SourceIdentity has dedicated
@@ -121,7 +135,10 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
 
     def _build_source_identity(_cls, *_args, **kwargs):
         assert kwargs["artifact_identity"] is _SOURCE_IDENTITY.artifact_identity
-        return _SOURCE_IDENTITY
+        return replace(
+            _SOURCE_IDENTITY,
+            transform_abi_id=kwargs["transform_abi_id"],
+        )
 
     monkeypatch.setattr(
         model_loader_mod.SourceIdentity,
@@ -135,11 +152,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     )
     monkeypatch.setattr(model_loader_mod, "get_rank_model_storage", lambda _model: 0)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda: SimpleNamespace(synchronize=lambda: None),
-    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     return loader
 
 
@@ -173,8 +186,13 @@ class _PostTransformMxLoader:
         self.post_load_publish = MagicMock()
 
     @staticmethod
-    def _load_weights(*_args, **kwargs):
-        kwargs["prepare_post_transform_receiver"](kwargs["model"])
+    def _load_weights(
+        *_args: object,
+        prepare_post_transform_receiver: Callable[[nn.Module], None],
+        model: nn.Module,
+        **_kwargs: object,
+    ) -> dict[str, torch.Tensor]:
+        prepare_post_transform_receiver(model)
         return {}
 
     def is_post_transform_weights_preloaded(self) -> bool:
@@ -183,7 +201,7 @@ class _PostTransformMxLoader:
 
 def _spec_config_needing_draft_weights():
     return SimpleNamespace(
-        spec_dec_mode=SimpleNamespace(need_load_draft_weights=lambda: True),
+        needs_separate_draft_weights=True,
         speculative_model="/draft",
     )
 
@@ -198,7 +216,9 @@ def _tiny_profile_registry() -> PostTransformProfileRegistry:
                 model_type="tiny",
                 speculative_mode=None,
                 protocol_version=(ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
+                transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                 transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+                runtime_constraints=PostTransformRuntimeConstraints(),
             ),
         )
     )
@@ -482,6 +502,7 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
     assert callable(kwargs["prepare_post_transform_receiver"])
+    assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
     loader._call_load_weights.assert_not_called()
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,

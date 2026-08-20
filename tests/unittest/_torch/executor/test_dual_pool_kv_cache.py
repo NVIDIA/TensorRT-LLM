@@ -35,6 +35,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, Reso
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -190,6 +193,7 @@ def _make_creator(
     creator._execution_stream = None
     creator._draft_config = None
     creator._skip_est = True
+    creator._fp8_ctx_mla_kv_len_cap = None
     return creator
 
 
@@ -737,11 +741,22 @@ class TestKVCacheV2SchedulerCrossParam:
         )
         assert scheduler.cross_kv_cache_manager is cross_mgr
 
-    def test_factory_forwards_encoder_init_until_state_for_cross_pool(self):
-        """The executor factory must widen V2 scheduling to ENCODER_INIT.
+    @pytest.mark.parametrize(
+        ("cache_transceiver_config", "enable_recompute_pause"),
+        [
+            (None, True),
+            (SimpleNamespace(backend="NIXL"), False),
+        ],
+    )
+    def test_factory_forwards_v2_scheduler_gates(
+        self, cache_transceiver_config, enable_recompute_pause
+    ):
+        """The executor factory must forward encoder and disagg scheduler gates.
 
         Without this, V2 enc-dec requests are filtered by the default
         CONTEXT_INIT state gate before the encoder loop can see them.
+        Recompute pause is disabled for disaggregated serving because a
+        generation worker must not replay context locally.
         """
         from tensorrt_llm._torch.pyexecutor._util import create_py_executor_instance
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -796,11 +811,13 @@ class TestKVCacheV2SchedulerCrossParam:
                 max_batch_size=8,
                 max_beam_width=1,
                 max_num_tokens=4096,
+                cache_transceiver_config=cache_transceiver_config,
             )
 
         kwargs = scheduler_cls.call_args.kwargs
         assert kwargs["cross_kv_cache_manager"] is cross_mgr
         assert kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
+        assert kwargs["enable_recompute_pause"] is enable_recompute_pause
 
 
 # ---------------------------------------------------------------------------

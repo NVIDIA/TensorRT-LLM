@@ -15,7 +15,7 @@ from utils.util import skip_single_gpu
 # isort: on
 
 from tensorrt_llm.executor.base_worker import BaseWorker
-from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
@@ -24,6 +24,7 @@ default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 model_path = llm_models_root() / default_model_name
 
 
+@pytest.mark.cpu_only
 def test_enqueue_request_wraps_lora_load_error():
 
     class LoraManager:
@@ -35,6 +36,9 @@ def test_enqueue_request_wraps_lora_load_error():
         raise RuntimeError("bad adapter")
 
     worker = object.__new__(BaseWorker)
+    # GC-time __del__ -> shutdown() reads this; __init__ is bypassed here, so
+    # seed it to keep teardown a clean no-op.
+    worker.doing_shutdown = False
     worker._lora_manager = LoraManager()
     worker._load_lora_adapter = raise_load_error
     request = type(
@@ -45,6 +49,14 @@ def test_enqueue_request_wraps_lora_load_error():
 
     with pytest.raises(RequestError, match="Failed to load LoRA adapter"):
         worker._enqueue_request(request)
+
+
+def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
+    missing_path = str(tmp_path / "private-lora-path")
+
+    request = LoRARequest("missing", 1, missing_path)
+
+    assert request.path == missing_path
 
 
 def create_fake_executor_config(engine_path, tp_size: int = 1):

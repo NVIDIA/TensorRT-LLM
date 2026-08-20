@@ -16,6 +16,8 @@ import cv2  # noqa: E402
 
 from tensorrt_llm.inputs.media_io import _load_video_by_cv2  # noqa: E402
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(scope="module")
 def sample_video_path(tmp_path_factory: pytest.TempPathFactory) -> str:

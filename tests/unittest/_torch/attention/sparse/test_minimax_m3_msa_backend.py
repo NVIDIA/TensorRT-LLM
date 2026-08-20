@@ -2,17 +2,46 @@
 # SPDX-License-Identifier: Apache-2.0
 """Structural tests for the MiniMax-M3 MSA sparse attention backend.
 
-These validate backend selection and decode scratch-buffer sizing without
-launching kernels. Numerical parity against the Triton reference is covered
-by the SM100 integration accuracy test.
+These validate backend selection, decode scratch-buffer sizing, and the paged
+HND view contract passed to the packaged MSA kernel. Numerical parity against
+the Triton reference is covered by the SM100 integration accuracy test.
 """
+
+import sys
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
-from tensorrt_llm._torch.attention_backend.sparse.utils import _resolve_minimax_m3_backend_cls
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
+from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+
+def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    cute = ModuleType("cutlass.cute")
+    cute.core = SimpleNamespace()
+    cute.ThrMma = object()
+    cute.make_rmem_tensor = object()
+    cutlass = ModuleType("cutlass")
+    cutlass.cute = cute
+    monkeypatch.setitem(sys.modules, "cutlass", cutlass)
+    monkeypatch.setitem(sys.modules, "cutlass.cute", cute)
+    monkeypatch.setattr("importlib.util.find_spec", lambda unused_name: object())
+
+    msa_package_available.cache_clear()
+    try:
+        assert msa_package_available()
+        assert cute.core.ThrMma is cute.ThrMma
+        assert cute.make_fragment is cute.make_rmem_tensor
+    finally:
+        msa_package_available.cache_clear()
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
@@ -74,6 +103,81 @@ def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
     # Oversized requests are rejected rather than silently corrupting memory.
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata.msa_proxy_max_score_view(num_index_heads, worst_k, max_batch + 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_msa_paged_kv_preserves_tma_compatible_outer_stride() -> None:
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 (Blackwell) required")
+
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+
+    from fmha_sm100.cute import interface as sparse_interface
+
+    pages, roles, heads, page_size, head_dim = 5, 2, 2, 128, 128
+    pool = torch.empty(
+        pages,
+        roles,
+        heads,
+        page_size,
+        head_dim,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_buffers.return_value = pool
+
+    k_view, v_view = msa_paged_kv(kv_cache_manager, layer_idx=3)
+
+    kv_cache_manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    for view in (k_view, v_view):
+        assert not view.is_contiguous()
+        prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
+        assert prepared.data_ptr() == view.data_ptr()
+        assert prepared.stride() == view.stride()
+
+    mismatched = sparse_interface._prepare_paged_hnd_input(k_view, page_size // 2)
+    assert mismatched.data_ptr() == k_view.data_ptr()
+    with pytest.raises(ValueError, match="page_size == blk_kv"):
+        sparse_interface._prepare_paged_kv_for_tma(mismatched, mismatched, page_size // 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 (Blackwell) required")
+
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+
+    from fmha_sm100.cute import interface as sparse_interface
+
+    pages, heads, page_size, head_dim = 5, 2, 128, 128
+    outer_stride = heads * page_size * head_dim + 1
+    storage = torch.empty(
+        pages * outer_stride,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    view = storage.as_strided(
+        (pages, heads, page_size, head_dim),
+        (outer_stride, page_size * head_dim, head_dim, 1),
+    )
+
+    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
+
+    assert prepared.is_contiguous()
+    assert prepared.data_ptr() != view.data_ptr()
+    torch.testing.assert_close(prepared, view)
 
 
 def test_msa_index_k_uses_hnd_cache_view_and_writer():

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 
 import torch
 import triton
@@ -21,13 +21,17 @@ import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
+                            MoEProblem, MoERejectReason, MoERunContext,
+                            MoEStaticCapability)
+from .interface import _reject
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
@@ -715,65 +719,62 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    # Restated rather than inherited from CutlassFusedMoE: this backend does
+    # not fuse routed-expert LoRA, and the exact-class comparison this field
+    # replaces already answered False here.
+    capabilities = MoEStaticCapability(supports_moe_lora=False)
+
+    # ``routing_scales_dtype`` is repeated from CutlassFusedMoE because setting
+    # any field here replaces the parent's object wholesale.
+    input_requirement = MoEInputRequirement(
+        routing_scales_dtype=torch.float32,
+        requires_run_moe_workspace=True,
+    )
+
+    def supports_moe_output_in_alltoall_workspace(self):
+        # Overrides the CutlassFusedMoE "True": run_moe emits into its own
+        # workspace buffers and never writes a caller-supplied output tensor,
+        # so a workspace-backed buffer would be left unfilled while combine()
+        # read from it.
+        return False
+
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        Check if DeepGemmFusedMoE can implement the given quantization algorithm.
-
-        DeepGemmFusedMoE supports:
-        - FP8_BLOCK_SCALES: SM in {100, 103}
-
-        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
-        Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation input data type. Supported types are
-                float32, bfloat16, and float16 (required by moe_permute_op kernel).
-                Note: Output dtype is always bfloat16 regardless of input dtype.
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                DeepGemmFusedMoE does NOT support swiglu_gptoss_style.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-        """
-        from .interface import _warn_and_return
-
-        sm_version = get_sm_version()
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """DeepGEMM grouped GEMM: FP8 block scales on SM100/SM103."""
+        sm_version = d.env.sm
+        quant_algo = p.quant_algo
 
         if sm_version not in {100, 103}:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
                 f"DeepGemmFusedMoE requires SM100 or SM103, got SM{sm_version}")
 
-        # Check dtype_activation: moe_permute_op only supports float32, bfloat16, float16
-        if dtype_activation not in {
-                torch.float32, torch.bfloat16, torch.float16
-        }:
-            return _warn_and_return(
+        # moe_permute_op only supports float32, bfloat16, float16
+        if p.dtype_act not in {torch.float32, torch.bfloat16, torch.float16}:
+            return _reject(
+                MoERejectReason.DTYPE_UNSUPPORTED,
                 f"DeepGemmFusedMoE requires float32, bfloat16, or float16 activation, "
-                f"got {dtype_activation}")
+                f"got {p.dtype_act}")
 
         # DeepGemmFusedMoE does NOT support unquantized mode
         if quant_algo is None:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
                 "DeepGemmFusedMoE does not support unquantized mode")
 
         # DeepGemmFusedMoE does NOT support swiglu_gptoss_style
-        if swiglu_gptoss_style:
-            return _warn_and_return(
+        if p.swiglu_gptoss_style:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
                 "DeepGemmFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
         # Only FP8_BLOCK_SCALES is supported
         if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
-            return True, None
+            return MoEEligibility.ok()
 
-        return _warn_and_return(
+        return _reject(
+            MoERejectReason.QUANT_UNSUPPORTED,
             f"DeepGemmFusedMoE does not support quant_algo={quant_algo}")
 
     # To reuse pytorch memory segments allocated during graph capture.
@@ -798,7 +799,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
     ):
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
@@ -829,7 +829,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             swiglu_limit=swiglu_limit,
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
-            without_comm=without_comm,
         )
 
     def get_workspace(self, m_max: int, group_size: int):
@@ -932,11 +931,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
-        workspace: dict = None,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with DeepGemm backend.
@@ -945,13 +942,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         quantization with DeepGemm backend.
 
         Args:
-            # Standard MoE interface parameters:
-            x: Input hidden states (unquantized for DeepGemm)
-            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
-                                    this represents expert slots [num_tokens, top_k] instead.
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors (should be None for DeepGemm)
-            workspace: Workspace dictionary containing buffers for intermediate results
+            ctx: Run context; ``x`` is unquantized and ``x_sf`` must be None.
+            workspace: Buffers for intermediate results, allocated once per
+                      chunk by the scheduler so the aux stream can reuse them.
                       Required keys: 'workspace_0', 'workspace_1', 'workspace_sf'
 
         Returns:
@@ -959,6 +952,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         Note: Similar to CuteDslFusedMoE.run_moe_fp8_block_scales (fused_moe_cute_dsl.py:360-434)
         """
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
         assert workspace is not None, "workspace is required for DeepGemm backend"

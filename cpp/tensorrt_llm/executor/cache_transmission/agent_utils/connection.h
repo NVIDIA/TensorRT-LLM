@@ -345,6 +345,8 @@ private:
     std::unordered_map<std::string, std::list<std::string>> mUnhandledNotifications;
     std::unique_ptr<BaseTransferAgent> m_Agent;
     int mDeviceId;
+    int mRank{0};
+    int mWorldSize{1};
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
     std::atomic<bool> mIsRunning{true};

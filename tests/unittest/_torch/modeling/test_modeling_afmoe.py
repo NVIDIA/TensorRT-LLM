@@ -19,6 +19,7 @@ import unittest
 from copy import deepcopy
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 import tensorrt_llm
@@ -112,6 +113,7 @@ def _shutdown_kv_cache_manager(kv_cache_manager: KVCacheManager) -> None:
     kv_cache_manager.shutdown()
 
 
+@pytest.mark.cpu_only
 class TestAfmoeRegistry(unittest.TestCase):
     """Verify AfmoeForCausalLM resolves through _torch auto-model registration."""
 
@@ -128,6 +130,7 @@ class TestAfmoeRegistry(unittest.TestCase):
         self.assertNotIn("AfmoeForCausalLM", MODEL_MAP)
 
 
+@pytest.mark.cpu_only
 class TestAfmoeRoutingValidation(unittest.TestCase):
     """Verify routing assumption guards."""
 
@@ -158,6 +161,7 @@ class TestAfmoeRoutingValidation(unittest.TestCase):
             AfmoeForCausalLM(model_config)
 
 
+@pytest.mark.cpu_only
 class TestAfmoeWeightMapper(unittest.TestCase):
     """Verify AfmoeHfWeightMapper key transformations."""
 
@@ -264,6 +268,7 @@ class TestAfmoeWeightMapper(unittest.TestCase):
         self.assertFalse(self.mapper.is_special_instance_module(mock_linear))
 
 
+@pytest.mark.cpu_only
 class TestAfmoeWeightLoading(unittest.TestCase):
     """Verify AfmoeForCausalLM applies mapper preprocessing in the real load hook."""
 

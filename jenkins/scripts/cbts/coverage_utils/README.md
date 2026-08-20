@@ -9,14 +9,17 @@ Capture uses `sys.monitoring` `PY_START` (Python 3.12+): each function a test en
 then that code object is disabled until the next test — so overhead scales with functions entered,
 not lines executed (far cheaper than line tracing).
 
+`COLLECTION.md` summarises what the data model is and, importantly, what it does not record;
+`../coverage_selection/SELECTION.md` covers how the consumer side uses it.
+
 ## Files
 
 | File | Role |
 |---|---|
-| `cbts_pystart.py` | The tracker: a `sys.monitoring` (tool id 4) `PY_START` tool that records, per test context, the set of product `(file, qualname)` entered. Writes one `.cbtscov.<stage>.<suffix>.sqlite` per process; these leave the node only inside compressed tarballs, so the publish-artifacts guardword/secret scanner (which byte-matches product paths in raw files but does not recurse into archives) never sees the paths stored inside. |
-| `sitecustomize.py` | Starts the tracker in each Python process under `CBTS_COVERAGE_CONFIG` (except dependency build/install tools — `pip`, `setup.py`, `cmake`, … — which opt out themselves and their spawned subtree). Reads `source` + `data_file` from the rcfile. Long-lived non-pytest processes (e.g. `trtllm-serve`) poll a marker file to switch context; `mpi4py.futures` pool workers use the inherited `CBTS_TEST_ID` context plus the atexit save. |
-| `cbts_plugin.py` | Pytest plugin (`-p cbts_plugin`): per test, writes the marker file, sets `CBTS_TEST_ID`, and switches the tracker context via `sitecustomize.switch_test_context`; also patches `mpi_session._start_mpi_pool` so workers inherit the coverage env. |
-| `pystart_report.py` | Merges all `.cbtscov.*.sqlite` (union per test; legacy `.json`/`.json.gz` also accepted) and emits any of: `--out-sqlite` (indexed `touch(test, file, qualname)` DB — the selector artifact), `--out-dir` (per-file split HTML report: index + one page per file), `--out-json` (full `test -> [file::qualname]` map). With `--source-root` also computes the file/function coverage rate. Prints a one-line touch-count summary. |
+| `cbts_pystart.py` | The tracker: a `sys.monitoring` (tool id 4) `PY_START` tool that records, per test context, the set of product `(file, qualname)` entered. Writes one `.cbtscov.<stage>.<suffix>.sqlite` per process, each carrying a `proc_meta` (stage) row and, in the coordinator, a `test_meta` (per-test outcome + spawned-worker count); these leave the node only inside compressed tarballs, so the publish-artifacts guardword/secret scanner (which byte-matches product paths in raw files but does not recurse into archives) never sees the paths stored inside. |
+| `sitecustomize.py` | Starts the tracker in each Python process under `CBTS_COVERAGE_CONFIG` (except dependency build/install tools — `pip`, `setup.py`, `cmake`, … — which opt out themselves and their spawned subtree). Reads `source` + `data_file` from the rcfile. Every instrumented process saves periodically so its coverage survives a non-clean exit (`mpi4py.futures` pool workers included — their pool is torn down at test end); long-lived non-pytest processes (e.g. `trtllm-serve`) additionally poll a marker file to switch context. `mpi4py.futures` pool workers enable capture only after the product framework's first import settles (bounded by `CBTS_WORKER_ACTIVATE_MAX_SECONDS`), so a `wait_shutdown` identity barrier stays within its timeout. |
+| `cbts_plugin.py` | Pytest plugin (`-p cbts_plugin`): per test, writes the marker file, sets `CBTS_TEST_ID`, switches the tracker context, and records the test outcome via `sitecustomize`; patches `MPIPoolExecutor.__init__` to count the subprocess workers each test spawns and to widen their env so they inherit the coverage bootstrap (the caller's env, incl. `env_overrides`, is preserved). |
+| `pystart_report.py` | Merges all `.cbtscov.*.sqlite` (union per test; legacy `.json`/`.json.gz` also accepted) and emits any of: `--out-sqlite` (indexed `touch(test, file, qualname, stage)` + `test_meta` DB — the selector artifact), `--out-dir` (per-file split HTML report: index + one page per file), `--out-json` (full `test -> [file::qualname]` map). With `--source-root` also computes the file/function coverage rate. Prints touch-count and completeness summaries. |
 | `coveragerc.template` | Template for the runtime rcfile; only `[run] source` + `data_file` are used. |
 | `make_coveragerc.sh` | Substitutes `@...@` placeholders in the template; writes `$JOB_WORKSPACE/.coveragerc`. |
 
@@ -39,10 +42,13 @@ Non-CBTS stages get an empty `.coveragerc` and run uninstrumented.
 - **Integration tests**: the outer pytest carries `-p cbts_plugin`, so each test-db entry (one pytest item) is its own context.
 - **Unit tests** (`test_unittests_v2[entry]`): the inner pytest carries no plugin, so the whole batch runs under the one inherited `CBTS_TEST_ID` context = the test-db entry. This matches CBTS's selection granularity (entry level).
 - `co_qualname` gives `Class.method`, so results roll up to function → class → file. Comprehension / generator / lambda frames are skipped.
+- **Closures are skipped too**: any frame whose qualname contains `<locals>` is dropped, so a decorator's `wrapper` or a registered callback leaves no row however often it runs. The consumer side compensates by widening such a change to file level; see `COLLECTION.md` §5.1.
+- **A pool worker's import phase is not captured**: activation is deferred until `tensorrt_llm` has imported, so module and class bodies get no rows there. See `COLLECTION.md` §5.2.
 
 ## Output
 
-- Per-process `.cbtscov.<stage>.<host>.pid<N>.X<rand>.sqlite` files ride back in the standard `results-<stage>.tar.gz` under `cbts/`. Riding inside a compressed tarball keeps their plaintext product paths away from the artifact guardword/secret scanner, which byte-matches raw files but does not recurse into archives.
+- Every instrumented process saves every `CBTS_PERIODIC_SAVE_SECONDS` (default 5s). Before result collection the pipeline creates `CBTS_STOP_FILE` (`<stage output dir>/cbts_stop`), which suppresses later saves, then waits for the directory mtime to settle so an in-flight save drains.
+- Per-process `.cbtscov.<stage>.<host>.X<rand>.pid<N>.sqlite` files ride back in the standard `results-<stage>.tar.gz` under `cbts/`. Riding inside a compressed tarball keeps their plaintext product paths away from the artifact guardword/secret scanner, which byte-matches raw files but does not recurse into archives.
 - `L0_MergeRequest.groovy`'s Test Coverage stage merges all stages' files via `pystart_report.py` and uploads one tarball to `${UPLOAD_PATH}/cbts-coverage/`:
   - `cbts_pystart_report.tar.gz` — contains `cbts_touchmap.sqlite` (indexed touch DB / selector artifact, with a `meta` table holding the coverage rate) and `cbts_report/` (the split HTML report; open `cbts_report/index.html` after extracting). Bundled compressed so the touch DB's plaintext paths never reach the guardword scanner.
 
@@ -59,8 +65,20 @@ c.execute("SELECT DISTINCT test FROM touch WHERE file = ?",
 # function-level (phase 2): tests that entered a specific function/method
 c.execute("SELECT DISTINCT test FROM touch WHERE file = ? AND qualname = ?",
           ("tensorrt_llm/_torch/pyexecutor/py_executor.py", "PyExecutor.forward")).fetchall()
-# coverage rate
+# per-stage: coverage is attributed to the single-GPU stage it came from
+c.execute("SELECT DISTINCT test FROM touch WHERE file = ? AND stage = ?",
+          ("tensorrt_llm/_torch/pyexecutor/py_executor.py", "RTXPro6000D-PyTorch-1")).fetchall()
+# coverage rate + schema version
 dict(c.execute("SELECT key, value FROM meta"))
+```
+
+A `(test, stage)` is only safe to skip when its coverage is complete — the test passed and
+every process it spawned saved. Force-run anything else:
+
+```python
+# rows NOT safe to skip: non-passed, or a spawned worker/server never saved its coverage
+c.execute("SELECT test, stage FROM test_meta WHERE test != '' AND "
+          "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)").fetchall()
 ```
 
 ## Smoke test

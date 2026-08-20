@@ -15,8 +15,9 @@
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,12 +26,14 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     BatchDesc,
+    DiskCacheTierConfig,
     GpuCacheTierConfig,
+    HostCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
 )
@@ -38,6 +41,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+class _CacheTierInitError(Exception):
+    pass
+
+
+@dataclass
+class _FakeManagerConfig:
+    cache_tiers: list[object]
+    layers: list[object] = field(default_factory=lambda: [None])
 
 
 class _FakeKVCache:
@@ -71,7 +84,7 @@ def _make_cache_config_for_test(
     cache_manager.enable_swa_scratch_reuse = False
     cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
     cache_manager.enable_stats = False
-    cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
+    cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_config.policy)
     cache_manager.is_draft = is_draft
     cache_manager.num_local_layers = 1
     cache_manager.pp_layers = [0]
@@ -87,6 +100,72 @@ def _make_cache_config_for_test(
         tokens_per_block=128,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
     )
+
+
+def _make_manager_for_cache_tier_test(
+    kv_cache_config: KvCacheConfig,
+    impl_side_effect: list[object],
+    *,
+    add_secondary_gpu_tier: bool = False,
+) -> tuple[KVCacheManagerV2, Mock]:
+    impl_constructor = Mock(side_effect=impl_side_effect)
+
+    def build_base_config(
+        self: KVCacheManagerV2,
+        config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        cache_tiers: list[object],
+    ) -> _FakeManagerConfig:
+        del self, config, tokens_per_block
+        return _FakeManagerConfig(cache_tiers=cache_tiers)
+
+    def build_cache_config(
+        self: KVCacheManagerV2, config: _FakeManagerConfig
+    ) -> _FakeManagerConfig:
+        del self
+        if add_secondary_gpu_tier:
+            return _FakeManagerConfig(
+                cache_tiers=[
+                    config.cache_tiers[0],
+                    GpuCacheTierConfig(quota=1 << 20),
+                    *config.cache_tiers[1:],
+                ],
+                layers=config.layers,
+            )
+        return config
+
+    fake_impl = impl_side_effect[-1]
+    assert not isinstance(fake_impl, BaseException)
+    fake_impl.layer_grouping = [[0]]
+    fake_impl.pool_group_descs = []
+    fake_impl.get_layer_group_id.side_effect = lambda _: 0
+
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    with (
+        patch(f"{module}.CuError", _CacheTierInitError),
+        patch(f"{module}.KVCacheManagerPy", impl_constructor),
+        patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
+        patch.object(KVCacheManagerV2, "_build_cache_config", build_cache_config),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
+        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
+        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+    ):
+        manager = KVCacheManagerV2(
+            kv_cache_config,
+            CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+            execution_stream=Mock(),
+        )
+    return manager, impl_constructor
 
 
 @pytest.mark.parametrize(
@@ -107,7 +186,7 @@ def test_commit_min_snapshot_follows_block_reuse_policy(
     config = _make_cache_config_for_test(
         KvCacheConfig(
             enable_block_reuse=enable_block_reuse,
-            block_reuse_policy=block_reuse_policy,
+            block_reuse_config=BlockReuseConfig(policy=block_reuse_policy),
             enable_partial_reuse=True,
         ),
         is_draft=is_draft,
@@ -198,6 +277,94 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
         )
 
 
+def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+        ),
+        [impl],
+    )
+
+    assert manager.can_evict
+    assert impl_constructor.call_count == 1
+    cache_tiers = impl_constructor.call_args.args[0].cache_tiers
+    assert [type(tier) for tier in cache_tiers] == [
+        GpuCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+
+
+def test_disk_init_failure_does_not_use_host_fallback(tmp_path) -> None:
+    with pytest.raises(_CacheTierInitError, match="disk tier init failed"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=0,
+                disk_cache_size=16 << 20,
+                disk_cache_path=str(tmp_path),
+            ),
+            [_CacheTierInitError("disk tier init failed"), Mock()],
+        )
+
+
+@pytest.mark.parametrize(
+    ("add_secondary_gpu_tier", "expected_can_evict"),
+    [(False, False), (True, True)],
+)
+def test_host_init_fallback_recomputes_eviction_capability(
+    add_secondary_gpu_tier: bool,
+    expected_can_evict: bool,
+) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+        ),
+        [_CacheTierInitError("host tier init failed"), impl],
+        add_secondary_gpu_tier=add_secondary_gpu_tier,
+    )
+
+    assert manager.can_evict is expected_can_evict
+    assert impl_constructor.call_count == 2
+    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
+    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
+    assert any(isinstance(tier, HostCacheTierConfig) for tier in initial_tiers)
+    assert all(isinstance(tier, GpuCacheTierConfig) for tier in fallback_tiers)
+    assert len(fallback_tiers) == 1 + int(add_secondary_gpu_tier)
+
+
+def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+        ),
+        [_CacheTierInitError("host tier init failed"), impl],
+    )
+
+    assert manager.can_evict
+    assert impl_constructor.call_count == 2
+    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
+    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
+    assert [type(tier) for tier in initial_tiers] == [
+        GpuCacheTierConfig,
+        HostCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+    assert [type(tier) for tier in fallback_tiers] == [
+        GpuCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+
+
 def test_extra_tokens_are_in_context_capacity() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(avg_seq_len=264),
@@ -219,6 +386,9 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
         context_current_position=10,
         context_remaining_length=0,
         get_tokens=lambda beam_id: list(range(10)),
+        # The C++ backend takes get_tokens_view on this path; it yields a contiguous
+        # 1-D int32 view, so commit() sees an ndarray slice rather than a list.
+        get_tokens_view=lambda beam_id: np.arange(10, dtype=np.int32),
     )
     kv_cache = _FakeKVCache(num_committed_tokens=4)
     manager = object.__new__(KVCacheManagerV2)
@@ -229,7 +399,9 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
 
     manager.try_commit_blocks(request)
 
-    assert kv_cache.committed_tokens == [4, 5, 6, 7, 8, 9]
+    # list() so the assertion holds whichever token source the active backend used:
+    # a plain list (Python backend) or an int32 ndarray slice (C++ backend).
+    assert list(kv_cache.committed_tokens) == [4, 5, 6, 7, 8, 9]
     assert kv_cache.num_committed_tokens == 10
     assert kv_cache.stopped_committing
 
@@ -280,12 +452,26 @@ class _ContextRequest:
         assert beam_id == DEFAULT_BEAM_INDEX
         return self.tokens
 
+    def get_tokens_view(self, beam_id: int = DEFAULT_BEAM_INDEX) -> np.ndarray:
+        """Mirror LlmRequest.get_tokens_view, which the C++ backend takes on the reuse path.
+
+        The real binding returns a zero-copy contiguous 1-D int32 view of the token buffer;
+        the dtype matters because it selects the C++ int32 ingest fast path.
+        """
+        assert beam_id == DEFAULT_BEAM_INDEX
+        return np.asarray(self.tokens, dtype=np.int32)
+
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)
 
 
 @pytest.fixture
-def manager() -> KVCacheManagerV2:
+def max_num_turns() -> int:
+    return 1
+
+
+@pytest.fixture
+def manager(max_num_turns: int) -> KVCacheManagerV2:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     init_cuda_once()
@@ -296,7 +482,10 @@ def manager() -> KVCacheManagerV2:
             max_gpu_total_bytes=16 << 20,
             max_attention_window=[MAX_SEQ_LEN, TOKENS_PER_BLOCK],
             max_util_for_resume=1.0,
-            block_reuse_policy="per_conversation",
+            block_reuse_config=BlockReuseConfig(
+                policy="per_conversation",
+                max_num_turns=max_num_turns,
+            ),
         ),
         CacheType.SELF,
         num_layers=2,
@@ -470,6 +659,39 @@ def test_per_conversation_policy_drops_previous_divergent_blocks(
         assert request_old_prompt.prepopulated_prompt_len == 0
     finally:
         _free_if_active(manager, request_old_prompt)
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+
+
+@pytest.mark.parametrize("max_num_turns", [2])
+def test_per_conversation_policy_retains_configured_number_of_turns(
+    manager: KVCacheManagerV2,
+) -> None:
+    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    request_b = _ContextRequest(2, list(range(100, 108)), 8, "conv-1")
+    request_a_probe = _ContextRequest(3, list(range(8)), 8, "conv-2")
+    request_c = _ContextRequest(4, list(range(200, 208)), 8, "conv-1")
+    request_a_after_eviction = _ContextRequest(5, list(range(8)), 8, "conv-3")
+
+    try:
+        _run_context(manager, request_a)
+        _free_if_active(manager, request_a)
+        _run_context(manager, request_b)
+        _free_if_active(manager, request_b)
+
+        assert manager.prepare_context(request_a_probe)
+        assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
+        _free_if_active(manager, request_a_probe)
+
+        _run_context(manager, request_c)
+        _free_if_active(manager, request_c)
+
+        assert manager.prepare_context(request_a_after_eviction)
+        assert request_a_after_eviction.prepopulated_prompt_len == 0
+    finally:
+        _free_if_active(manager, request_a_after_eviction)
+        _free_if_active(manager, request_c)
+        _free_if_active(manager, request_a_probe)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
 

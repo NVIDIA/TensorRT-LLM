@@ -61,12 +61,19 @@ from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionModel 
 from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
     Gemma4ForConditionalGeneration,
     Gemma4MultimodalEmbedder,
+    Gemma4MultimodalModelBase,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin  # noqa: E402
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
     find_input_mm_embeds,
     get_multimodal_embeddings,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData  # noqa: E402
+from tensorrt_llm.inputs.multimodal import (  # noqa: E402
+    MultimodalInput,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig  # noqa: E402
 from tensorrt_llm.mapping import Mapping  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -125,13 +132,131 @@ SMALL_TEXT_CONFIG = {
 }
 
 
-# Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
-# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
-# ``max_batch_size`` / ``max_num_tokens``). The encoder ``AttentionMetadata`` is
-# sized once at load to this max budget; each forward re-preps it with the real
-# per-image seq lens. Two distinct axes: requests = image/sequence count budget,
-# tokens = total patch budget.
-_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
+    """Lightweight Gemma4 encoder-cache harness without model weights."""
+
+    supports_encoder_cache = True
+    encode_multimodal_inputs = Gemma4ForConditionalGeneration.encode_multimodal_inputs
+
+    def __init__(self, embedding_dim: int = 12) -> None:
+        self.model_config = ModelConfig(
+            multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+        )
+        self._embedding_dim = embedding_dim
+        self.encoder_calls = 0
+        self.audio_tower = None
+        self.embed_audio = object()
+
+    @property
+    def embedding_dim(self) -> int:
+        return self._embedding_dim
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return torch.float32
+
+    def _get_image_features(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
+        del kwargs
+        self.encoder_calls += 1
+        return torch.full(
+            (pixel_values.shape[0] * 2, self.embedding_dim),
+            float(self.encoder_calls),
+            dtype=self.embedding_dtype,
+        )
+
+    def _get_audio_features(
+        self, audio_features: torch.Tensor, audio_features_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        self.encoder_calls += 1
+        return torch.full(
+            (audio_features.shape[0] * 2, self.embedding_dim),
+            float(self.encoder_calls),
+            dtype=self.embedding_dtype,
+        )
+
+
+def _make_keyed_image_param(
+    item_hashes: list[list[int]] | None = None,
+) -> MultimodalParams:
+    if item_hashes is None:
+        item_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
+    item_count = len(item_hashes)
+    embedding_lengths = [2] * item_count
+    pixel_values = torch.arange(item_count, dtype=torch.float32).reshape(item_count, 1, 1)
+    image_position_ids = torch.arange(item_count * 2).reshape(item_count, 1, 2)
+    return MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=item_hashes,
+            multimodal_positions=[0] * item_count,
+            multimodal_lengths=embedding_lengths,
+        ),
+        multimodal_data={
+            "image": {
+                "pixel_values": pixel_values,
+                "image_position_ids": image_position_ids,
+                "image_seq_lens": [1] * item_count,
+            },
+            "multimodal_embedding_lengths": embedding_lengths,
+            "mm_processor_kwargs_hash": "kwargs-a",
+        },
+        multimodal_runtime=MultimodalRuntimeData(
+            embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
+            past_seen_token_num=0,
+            chunk_end_pos=sum(embedding_lengths),
+        ),
+    )
+
+
+def _make_keyed_video_param(item_hashes: list[list[int]]) -> MultimodalParams:
+    item_count = len(item_hashes)
+    embedding_lengths = [2] * item_count
+    return MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=item_hashes,
+            multimodal_positions=[0] * item_count,
+            multimodal_lengths=embedding_lengths,
+        ),
+        multimodal_data={
+            "video": {"pixel_values": torch.arange(item_count).reshape(item_count, 1, 1)},
+            "multimodal_embedding_lengths": embedding_lengths,
+            "mm_processor_kwargs_hash": "kwargs-a",
+        },
+        multimodal_runtime=MultimodalRuntimeData(
+            embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
+            past_seen_token_num=0,
+            chunk_end_pos=sum(embedding_lengths),
+        ),
+    )
+
+
+def _make_keyed_audio_param(item_hashes: list[list[int]]) -> MultimodalParams:
+    item_count = len(item_hashes)
+    embedding_lengths = [2] * item_count
+    return MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=item_hashes,
+            multimodal_positions=[0] * item_count,
+            multimodal_lengths=embedding_lengths,
+        ),
+        multimodal_data={
+            "audio": {
+                "audio_features": torch.arange(item_count * 2).reshape(item_count, 1, 2),
+                "audio_features_mask": torch.ones(item_count, 1),
+            },
+            "multimodal_embedding_lengths": embedding_lengths,
+            "mm_processor_kwargs_hash": "kwargs-a",
+        },
+        multimodal_runtime=MultimodalRuntimeData(
+            embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
+            past_seen_token_num=0,
+            chunk_end_pos=sum(embedding_lengths),
+        ),
+    )
+
+
+# Mirror the engine's ``encoder_max_num_tokens`` runtime budget. The encoder
+# ``AttentionMetadata`` is sized once at load to this maximum; each forward
+# re-preps it with the real per-image sequence lengths.
 _ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
@@ -176,9 +301,7 @@ def _build_trt_vision_tower(vision_cfg, dtype=torch.float32, device="cuda"):
     # The engine builds the encoder AttentionMetadata after model load via
     # `_set_up_multimodal_encoder_attn_metadata`; standalone tests must mirror
     # that before the encoder forward.
-    tower.setup_attn_metadata(
-        max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS, max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS
-    )
+    tower.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
     return tower
 
 
@@ -702,6 +825,143 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         # TRT-LLM class, not ``transformers.AutoModel`` output.
         self.assertIsInstance(model.vision_tower, Gemma4VisionModel)
 
+    def test_encoder_cache_reuses_image_embedding_across_requests(self):
+        """Persistent cache reuse applies to the shared dense/MoE Gemma4 wrapper."""
+        self.assertTrue(issubclass(Gemma4ForConditionalGeneration, MultimodalModelMixin))
+        self.assertTrue(Gemma4ForConditionalGeneration.supports_encoder_cache)
+
+        model = _Gemma4EncoderCacheHarness()
+        first = model._get_or_encode_multimodal_embeddings([_make_keyed_image_param()])
+        second = model._get_or_encode_multimodal_embeddings([_make_keyed_image_param()])
+
+        self.assertEqual(model.encoder_calls, 1)
+        torch.testing.assert_close(second, first)
+        self.assertEqual(len(model._multimodal_encoder_cache), 1)
+
+    def test_encoder_cache_partial_hit_slices_gemma4_image_input(self):
+        """A partial hit encodes only the missing Gemma4 image."""
+        model = _Gemma4EncoderCacheHarness()
+        shared_hash = [1] * 8
+        model._get_or_encode_multimodal_embeddings(
+            [_make_keyed_image_param(item_hashes=[shared_hash])]
+        )
+
+        embeddings = model._get_or_encode_multimodal_embeddings(
+            [_make_keyed_image_param(item_hashes=[shared_hash, [2] * 8])]
+        )
+
+        self.assertEqual(model.encoder_calls, 2)
+        torch.testing.assert_close(embeddings[:2], torch.ones(2, model.embedding_dim))
+        torch.testing.assert_close(embeddings[2:], torch.full((2, model.embedding_dim), 2.0))
+        self.assertEqual(len(model._multimodal_encoder_cache), 2)
+
+    def test_build_multimodal_encoder_input_slices_gemma4_image_metadata(self):
+        """Gemma4 image position metadata follows the selected images."""
+        param = _make_keyed_image_param(item_hashes=[[0] * 8, [1] * 8, [2] * 8])
+        source_image = param.multimodal_data["image"]
+
+        residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
+
+        residual_image = residual.multimodal_data["image"]
+        torch.testing.assert_close(
+            residual_image["pixel_values"], source_image["pixel_values"][[2, 0]]
+        )
+        torch.testing.assert_close(
+            residual_image["image_position_ids"], source_image["image_position_ids"][[2, 0]]
+        )
+        self.assertEqual(residual_image["image_seq_lens"], [1, 1])
+
+    def test_build_multimodal_encoder_input_slices_gemma4_audio_input(self):
+        """Gemma4 audio features and their mask remain item-aligned."""
+        audio_features = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2)
+        audio_mask = torch.arange(12).reshape(3, 4)
+        param = MultimodalParams(
+            multimodal_data={
+                "audio": {
+                    "audio_features": audio_features,
+                    "audio_features_mask": audio_mask,
+                },
+                "multimodal_embedding_lengths": [1, 1, 1],
+            }
+        )
+
+        residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
+
+        residual_audio = residual.multimodal_data["audio"]
+        torch.testing.assert_close(residual_audio["audio_features"], audio_features[[2, 0]])
+        torch.testing.assert_close(residual_audio["audio_features_mask"], audio_mask[[2, 0]])
+
+    def test_encoder_cache_partial_hit_slices_gemma4_audio_input(self):
+        """A partial hit encodes only the missing Gemma4 audio item."""
+        model = _Gemma4EncoderCacheHarness()
+        shared_hash = [1] * 8
+        model._get_or_encode_multimodal_embeddings([_make_keyed_audio_param([shared_hash])])
+
+        embeddings = model._get_or_encode_multimodal_embeddings(
+            [_make_keyed_audio_param([shared_hash, [2] * 8])]
+        )
+
+        self.assertEqual(model.encoder_calls, 2)
+        torch.testing.assert_close(embeddings[:2], torch.ones(2, model.embedding_dim))
+        torch.testing.assert_close(embeddings[2:], torch.full((2, model.embedding_dim), 2.0))
+        self.assertEqual(len(model._multimodal_encoder_cache), 2)
+
+    def test_encoder_cache_partial_hit_with_unsupported_item_axis_becomes_full_miss(self):
+        """Unexpected Gemma4 image and audio layouts bypass partial cache reuse."""
+        model = _Gemma4EncoderCacheHarness()
+        shared_hash = [1] * 8
+        cases = (
+            ("image", "pixel_values", _make_keyed_image_param),
+            ("audio", "audio_features", _make_keyed_audio_param),
+        )
+
+        for modality, input_key, make_param in cases:
+            with self.subTest(modality=modality):
+                model._get_or_encode_multimodal_embeddings([make_param([shared_hash])])
+                param = make_param([shared_hash, [2] * 8])
+                input_tensor = param.multimodal_data[modality][input_key]
+                param.multimodal_data[modality][input_key] = torch.cat(
+                    (input_tensor, input_tensor[:1]), dim=0
+                )
+
+                with unittest.mock.patch(
+                    "tensorrt_llm._torch.models.modeling_gemma4mm.logger.warning_once"
+                ) as warning_once:
+                    partition = model.partition_encoder_cache(
+                        param, model._multimodal_encoder_cache
+                    )
+
+                self.assertTrue(partition.is_full_miss)
+                self.assertEqual(partition.hits, {})
+                self.assertEqual(partition.miss_indices, [0, 1])
+                warning_once.assert_called_once()
+
+    def test_encoder_cache_reuses_full_video_hits_and_reencodes_partial_hits(self):
+        """Gemma4 video reuses full hits and re-encodes complete partial-hit requests."""
+        model = _Gemma4EncoderCacheHarness()
+        shared_hash = [1] * 8
+        first = model._get_or_encode_multimodal_embeddings([_make_keyed_video_param([shared_hash])])
+        full_hit = model._get_or_encode_multimodal_embeddings(
+            [_make_keyed_video_param([shared_hash])]
+        )
+        with unittest.mock.patch(
+            "tensorrt_llm._torch.models.modeling_gemma4mm.logger.warning_once"
+        ) as warning_once:
+            partial_hit = model._get_or_encode_multimodal_embeddings(
+                [_make_keyed_video_param([shared_hash, [2] * 8])]
+            )
+        repeated = model._get_or_encode_multimodal_embeddings(
+            [_make_keyed_video_param([shared_hash, [2] * 8])]
+        )
+
+        warning_once.assert_called_once()
+        self.assertEqual(model.encoder_calls, 2)
+        torch.testing.assert_close(full_hit, first)
+        torch.testing.assert_close(first, torch.ones(2, model.embedding_dim))
+        torch.testing.assert_close(partial_hit, torch.full((4, model.embedding_dim), 2.0))
+        torch.testing.assert_close(repeated, partial_hit)
+        self.assertEqual(len(model._multimodal_encoder_cache), 2)
+
     def test_chunked_prefill_reuses_cached_vision_embeddings(self):
         """Later active chunks slice cached features without rerunning vision."""
         model = self._make_model()
@@ -724,7 +984,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             model, "_get_image_features", return_value=expected_embeddings
         ) as image_encoder:
             all_embeddings = get_multimodal_embeddings(
-                model._forward_multimodal_encoder, [multimodal_param]
+                model.encode_multimodal_inputs, [multimodal_param]
             )
             first_chunk = find_input_mm_embeds(all_embeddings, [multimodal_param])
 
@@ -734,7 +994,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 embed_mask_cumsum=embed_mask_cumsum,
             )
             all_embeddings = get_multimodal_embeddings(
-                model._forward_multimodal_encoder, [multimodal_param]
+                model.encode_multimodal_inputs, [multimodal_param]
             )
             second_chunk = find_input_mm_embeds(all_embeddings, [multimodal_param])
 
@@ -752,8 +1012,9 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 embed_mask_cumsum=torch.tensor([0, 0, 1, 2], dtype=torch.int64),
             ),
         )
-        self.assertFalse(
-            Gemma4ForConditionalGeneration._has_active_multimodal_tokens(multimodal_param)
+        self.assertEqual(
+            Gemma4ForConditionalGeneration.select_multimodal_params(None, [multimodal_param], 1),
+            [],
         )
 
     def test_mixed_modality_batch_preserves_request_order(self):
@@ -791,7 +1052,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             "_get_image_features",
             side_effect=lambda pixel_values, **_: pixel_values[:, 0],
         ):
-            embeddings = get_multimodal_embeddings(model._forward_multimodal_encoder, params)
+            embeddings = get_multimodal_embeddings(model.encode_multimodal_inputs, params)
 
         expected = torch.tensor([[2.0], [1.0], [3.0]])
         torch.testing.assert_close(embeddings[0], expected)
@@ -800,8 +1061,8 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 param.multimodal_data["multimodal_embedding"], expected_embedding.unsqueeze(0)
             )
 
-    def test_single_request_with_multiple_modalities_is_allowed(self):
-        """The request-order fix does not reject an existing mixed request."""
+    def test_single_request_with_multiple_modalities_raises(self):
+        """Mixed-modality requests are rejected until prompt-order handling is supported."""
         model = self._make_model()
         multimodal_param = MultimodalParams(
             multimodal_data={
@@ -810,14 +1071,11 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             }
         )
 
-        with unittest.mock.patch.object(
-            model,
-            "_get_image_features",
-            side_effect=lambda pixel_values, **_: pixel_values[:, 0],
+        with self.assertRaisesRegex(
+            ValueError,
+            "requests containing multiple multimodal input types are not supported",
         ):
-            embeddings = model._forward_multimodal_encoder([multimodal_param])
-
-        torch.testing.assert_close(embeddings, torch.tensor([[1.0], [2.0]]))
+            model.encode_multimodal_inputs([multimodal_param])
 
     def test_instantiation_without_vision(self):
         """VLM wrapper works text-only when vision_config is None."""
@@ -861,6 +1119,7 @@ def _model_available():
     return os.path.isfile(os.path.join(MODEL_26B_PATH, "config.json"))
 
 
+@pytest.mark.cpu_only
 class TestGemma4InputProcessor(unittest.TestCase):
     """Tests for Gemma4InputProcessor with real model tokenizer/processor files."""
 

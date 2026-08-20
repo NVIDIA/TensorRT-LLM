@@ -18,7 +18,7 @@ os.environ["UCX_TLS"] = "^ib,gdr_copy"
 # progress thread is enough here: these tests verify transfer logic, not
 # transfer-engine threading.
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
@@ -29,7 +29,13 @@ import tensorrt_llm
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
-import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
+
+try:
+    import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
+except ImportError as e:
+    TRANSFER_AGENT_BINDING_IMPORT_ERROR = e
+else:
+    TRANSFER_AGENT_BINDING_IMPORT_ERROR = None
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
@@ -47,7 +53,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
 
 # Default to 4 worker threads for all KV transfer tests in this module.
@@ -83,18 +89,20 @@ class KvCacheConfigV2:
     disk_prefetch_num_reqs: int = 4
     pool_ratio: Optional[List[float]] = None
     avg_seq_len: Optional[int] = None
-    block_reuse_policy: str = "all_reusable"
+    block_reuse_config: BlockReuseConfig = field(default_factory=BlockReuseConfig)
     enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
 
 
+@pytest.mark.cpu_only
 def test_token_range_valid():
     tr = TokenRange(start=0, end=10)
     assert tr.start == 0
     assert tr.end == 10
 
 
+@pytest.mark.cpu_only
 def test_token_range_invalid_negative():
     with pytest.raises(ValueError, match="non-negative"):
         TokenRange(start=-1, end=5)
@@ -102,6 +110,7 @@ def test_token_range_invalid_negative():
         TokenRange(start=0, end=-1)
 
 
+@pytest.mark.cpu_only
 def test_token_range_invalid_start_ge_end():
     with pytest.raises(ValueError, match="Invalid range"):
         TokenRange(start=5, end=5)
@@ -109,12 +118,14 @@ def test_token_range_invalid_start_ge_end():
         TokenRange(start=10, end=3)
 
 
+@pytest.mark.cpu_only
 def test_layer_range_valid():
     lr = LayerRange(start=0, end=32)
     assert lr.start == 0
     assert lr.end == 32
 
 
+@pytest.mark.cpu_only
 def test_layer_range_invalid_negative():
     with pytest.raises(ValueError, match="non-negative"):
         LayerRange(start=-1, end=5)
@@ -122,6 +133,7 @@ def test_layer_range_invalid_negative():
         LayerRange(start=0, end=-1)
 
 
+@pytest.mark.cpu_only
 def test_layer_range_invalid_start_ge_end():
     with pytest.raises(ValueError, match="Invalid range"):
         LayerRange(start=5, end=5)
@@ -129,6 +141,7 @@ def test_layer_range_invalid_start_ge_end():
         LayerRange(start=10, end=3)
 
 
+@pytest.mark.cpu_only
 def test_kv_slice_construction():
     tr = TokenRange(0, 128)
     lr = LayerRange(0, 32)
@@ -151,6 +164,7 @@ def test_kv_slice_construction():
     assert s2.is_last_slice is False
 
 
+@pytest.mark.cpu_only
 def test_session_status_enum():
     expected = [
         "INIT",
@@ -1480,6 +1494,113 @@ def test_session_has_transferring_tasks_false():
     finally:
         ctx_transfer_worker.shutdown()
         gen_transfer_worker.shutdown()
+
+
+@pytest.mark.timeout(120)
+def test_incompatible_peer_fails_only_affected_requests():
+    """An incompatible context peer must fail only the requests targeting it.
+
+    When MambaPolicy.validate_peer_compatible rejects a peer during first
+    registration, the receiver must (a) not raise out of receive() — the
+    session fails through the normal transfer-error path (WaitResult.FAILED)
+    with the diagnostic preserved; (b) cache the incompatibility so later
+    requests to the same endpoint fail fast without re-validating; and
+    (c) keep serving transfers from compatible peers through the same
+    Receiver.
+    """
+    tensorrt_llm.logger.set_level("info")
+    # setup_good provides the gen worker under test and a compatible ctx
+    # peer; setup_bad provides a second, independent ctx instance whose
+    # endpoint gets poisoned (the incompatibility cache is permanent per
+    # endpoint, so the bad peer cannot be reused for the healthy transfer).
+    setup_good = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    setup_bad = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    gen_tw = setup_good["gen_transfer_workers"][0]
+    receiver = gen_tw._receiver
+    bad_endpoint = setup_bad["ctx_info_endpoint"]
+
+    sampling_params = SamplingParams(temperature=0)
+    sc = tensorrt_llm.bindings.SamplingConfig(sampling_params._get_sampling_config())
+
+    def make_gen_request(request_id):
+        rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+        req = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=list(range(16)),
+            sampling_config=sc,
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        )
+        req.py_disaggregated_params = DisaggregatedParams(
+            ctx_request_id=request_id,
+            ctx_dp_rank=0,
+            ctx_info_endpoint=bad_endpoint,
+            disagg_request_id=rid,
+        )
+        return req
+
+    # dispatch_task fails at peer validation, before any block transfer, so
+    # empty per-layer-group block lists suffice (no KV sequence needed).
+    page_table = gen_tw._rank_info.page_table
+    empty_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64) for _ in page_table.layer_groups],
+    )
+
+    validate_calls = []
+
+    def raiser(*args, **kwargs):
+        validate_calls.append(1)
+        raise ValueError("synthetic recurrent-state mismatch")
+
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(transfer_mod.MambaPolicy, "validate_peer_compatible", staticmethod(raiser))
+
+            # (a) First request to the incompatible peer: receive() must not
+            # raise; the session fails with the diagnostic preserved.
+            rx1 = gen_tw.create_rx_session(make_gen_request(500))
+            rx1.receive(empty_slice)
+            assert rx1.wait_complete(blocking=True) == WaitResult.FAILED
+            # The non-blocking polling path must report the same terminal
+            # failure for an errored task (no None / spurious success).
+            assert rx1.wait_complete(blocking=False) == WaitResult.FAILED
+            assert rx1.has_failed()
+            exc = rx1._kv_tasks[0]._exception
+            assert exc is not None
+            assert "synthetic recurrent-state mismatch" in str(exc)
+            assert len(validate_calls) == 1
+            rx1.close()
+
+            # (b) Second request to the same endpoint: fails fast from the
+            # cache — no re-validation (call count unchanged) and no
+            # registration of the bad peer.
+            rx2 = gen_tw.create_rx_session(make_gen_request(501))
+            rx2.receive(empty_slice)
+            assert rx2.wait_complete(blocking=True) == WaitResult.FAILED
+            assert rx2.wait_complete(blocking=False) == WaitResult.FAILED
+            assert rx2.has_failed()
+            assert "synthetic recurrent-state mismatch" in str(rx2._kv_tasks[0]._exception)
+            assert len(validate_calls) == 1
+            assert bad_endpoint in receiver._incompatible_peers
+            assert bad_endpoint not in receiver._sender_ep_instance_map
+            rx2.close()
+
+        # (c) The same gen Receiver still completes a real transfer from a
+        # compatible ctx peer (real validate_peer_compatible restored).
+        add_and_verify_request(setup_good, 0, 1, setup_good["request_len"], send_first=True)
+        assert setup_good["ctx_info_endpoint"] in receiver._sender_ep_instance_map
+    finally:
+        for s in (setup_good, setup_bad):
+            for worker in s["ctx_transfer_workers"]:
+                worker.shutdown()
+            for worker in s["gen_transfer_workers"]:
+                worker.shutdown()
 
 
 if __name__ == "__main__":

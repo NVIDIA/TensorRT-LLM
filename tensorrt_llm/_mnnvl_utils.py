@@ -109,12 +109,16 @@ class MnnvlMemory:
         if not MnnvlMemory.initialized:
             # use a dummy torch CUDA tensor to trigger CUDA context initialization
             _ = torch.empty(1, device="cuda")
-            # ensure nvml is initialized.
-            try:
-                pynvml.nvmlDeviceGetCount()
-            except pynvml.NVMLError_Uninitialized:
-                pynvml.nvmlInit()
+            MnnvlMemory._ensure_nvml_initialized()
             MnnvlMemory.initialized = True
+
+    @staticmethod
+    def _ensure_nvml_initialized() -> None:
+        """Initialize NVML when it has not already been initialized."""
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
 
     @classmethod
     def get_comm(cls, mapping: Mapping):
@@ -202,7 +206,13 @@ class MnnvlMemory:
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
-        if cls.current_mem_offset + aligned_size > cls.current_rank_stride:
+        previous_address_state = (
+            cls.current_start_address,
+            cls.current_rank_stride,
+            cls.current_mem_offset,
+        )
+        reserved_new_address = cls.current_mem_offset + aligned_size > cls.current_rank_stride
+        if reserved_new_address:
             cls.new_mnnvl_memory_address(mapping, aligned_size)
 
         assert cls.current_mem_offset + aligned_size <= cls.current_rank_stride
@@ -292,26 +302,55 @@ class MnnvlMemory:
         madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
 
         mem_handles = [None] * comm_size
+        mem_handles[comm_rank] = allocated_mem_handle
+        mapped_rank_ptrs = []
 
-        for i, remote_handle_data in enumerate(all_handles_data):
-            rank_ptr = (
-                cls.current_start_address + cls.current_rank_stride * i + cls.current_mem_offset
-            )
-            if i == comm_rank:
-                # Local memory mapping
-                mem_handles[i] = allocated_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, allocated_mem_handle, 0))
-            else:
-                # Fabric memory mapping
-                imported_mem_handle = _check_cu_result(
-                    cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, allocation_prop.requestedHandleTypes
-                    )
+        try:
+            for i, remote_handle_data in enumerate(all_handles_data):
+                rank_ptr = (
+                    cls.current_start_address + cls.current_rank_stride * i + cls.current_mem_offset
                 )
-                mem_handles[i] = imported_mem_handle
-                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0))
+                if i != comm_rank:
+                    # Fabric memory mapping
+                    mem_handles[i] = _check_cu_result(
+                        cuda.cuMemImportFromShareableHandle(
+                            remote_handle_data, allocation_prop.requestedHandleTypes
+                        )
+                    )
 
-            _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
+                _check_cu_result(cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handles[i], 0))
+                mapped_rank_ptrs.append(rank_ptr)
+                _check_cu_result(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
+        except Exception:
+            # Clean up partially imported and mapped memory before propagating
+            # the failure to the caller.
+            for rank_ptr in reversed(mapped_rank_ptrs):
+                try:
+                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
+                except RuntimeError as e:
+                    logger.warning("cuMemUnmap failed during error cleanup: %s", e)
+            for mem_handle in mem_handles:
+                if mem_handle is None:
+                    continue
+                try:
+                    _check_cu_result(cuda.cuMemRelease(mem_handle))
+                except RuntimeError as e:
+                    logger.warning("cuMemRelease failed during error cleanup: %s", e)
+            if reserved_new_address:
+                try:
+                    device_ptr = cuda.CUdeviceptr(cls.current_start_address)
+                    _check_cu_result(
+                        cuda.cuMemAddressFree(device_ptr, comm_size * cls.current_rank_stride)
+                    )
+                except RuntimeError as e:
+                    logger.warning("cuMemAddressFree failed during error cleanup: %s", e)
+                else:
+                    (
+                        cls.current_start_address,
+                        cls.current_rank_stride,
+                        cls.current_mem_offset,
+                    ) = previous_address_state
+            raise
 
         ptr = cls.current_start_address + cls.current_mem_offset
         stride = cls.current_rank_stride
@@ -355,16 +394,13 @@ class MnnvlMemory:
     @staticmethod
     @functools.cache
     def support_nvlink(dev_id: int, need_all_up: bool = True):
-        # ensure nvml is initialized; do not rely on other modules having
-        # initialized it as an import side effect.
-        try:
-            pynvml.nvmlDeviceGetCount()
-        except pynvml.NVMLError_Uninitialized:
-            pynvml.nvmlInit()
+        # Do not rely on other modules having initialized NVML as an import side effect.
+        MnnvlMemory._ensure_nvml_initialized()
         handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
         link_count = pynvml.NVML_NVLINK_MAX_LINKS
         active_links = 0
         available_links = 0
+        probed_links = link_count
         for link_idx in range(link_count):
             try:
                 if pynvml.nvmlDeviceGetNvLinkCapability(
@@ -374,13 +410,66 @@ class MnnvlMemory:
                     is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
                     if is_active:
                         active_links += 1
-            except pynvml.NVMLError_NotSupported:
+            except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
                 continue
-        return (
+            except pynvml.NVMLError_InvalidArgument:
+                # NVML_NVLINK_MAX_LINKS (36) is an upper bound over all architectures;
+                # the driver rejects indices past this GPU's link count (18 on GB200).
+                probed_links = link_idx
+                break
+        supported = (
             active_links == available_links and available_links > 0
             if need_all_up
             else available_links > 0
         )
+        logger.info(
+            f"[MnnvlMemory] dev {dev_id} NVLink: {active_links}/{available_links} links up "
+            f"({probed_links} of {link_count} link indices accepted by the driver), "
+            f"need_all_up={need_all_up}, supported={supported}"
+        )
+        return supported
+
+    @staticmethod
+    @functools.cache
+    def _is_pcie_nvl_sku(dev_id: int) -> bool:
+        """Return whether visible H100/H200 GPUs form PCIe-connected NVLink islands."""
+        # H100/H200 NVL PCIe SKUs bond GPUs into local NVLink islands joined
+        # only through PCIe/SYS. Per-device NVLink state therefore cannot
+        # distinguish them from an NVSwitch fabric.
+        device_name = torch.cuda.get_device_name(dev_id).upper()
+        # NVML may report SYSTEM between peers on later NVSwitch platforms, so
+        # use this fallback only for the affected Hopper SKUs.
+        if not any(sku in device_name for sku in ("H100", "H200")):
+            return False
+
+        if " NVL" in device_name:
+            return True
+
+        try:
+            MnnvlMemory._ensure_nvml_initialized()
+            self_handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            for peer_id in range(pynvml.nvmlDeviceGetCount()):
+                if peer_id == dev_id:
+                    continue
+                peer_handle = pynvml.nvmlDeviceGetHandleByIndex(peer_id)
+                if (
+                    pynvml.nvmlDeviceGetTopologyCommonAncestor(self_handle, peer_handle)
+                    == pynvml.NVML_TOPOLOGY_SYSTEM
+                ):
+                    # SYSTEM is only a distance classification. A dual-socket
+                    # HGX can still provide NVLink P2P to such a peer through
+                    # NVSwitch. Split islands instead have local NVLink but no
+                    # NVLink P2P path to the SYSTEM peer.
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        self_handle,
+                        peer_handle,
+                        pynvml.NVML_P2P_CAPS_INDEX_NVLINK,
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
+                        return MnnvlMemory.support_nvlink(dev_id, need_all_up=False)
+        except pynvml.NVMLError:
+            return False
+        return False
 
     @staticmethod
     def supports_mnnvl() -> bool:
@@ -394,6 +483,8 @@ class MnnvlMemory:
         if get_sm_version() in (120, 121):
             return False
         dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
+            return False
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(dev_id, True)
         return support_nvlink_and_all_up
 

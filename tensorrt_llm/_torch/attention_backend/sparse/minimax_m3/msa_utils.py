@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
+import functools
 import importlib.util
-import sys
-from pathlib import Path
+import types
 from typing import Optional, Tuple
 
 import torch
@@ -19,55 +19,51 @@ from .common import _INIT_SCORE, _LOCAL_SCORE, write_kv_slots
 MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
 
-# Path of the fmha_sm100 package inside the MSA git submodule relative to the
-# repository root (see 3rdparty/MSA/LICENSE and 3rdparty/MSA/NOTICE).
-_MSA_PYTHON_RELPATH = Path("3rdparty") / "MSA" / "python"
+
+def _install_msa_cutlass_compatibility() -> None:
+    """Provide the CUTLASS 4.5 names still referenced by the packaged MSA sources."""
+    try:
+        import cutlass.cute as cute
+    except ImportError:
+        return
+
+    # MSA has not yet migrated these two aliases to their CUTLASS DSL 4.6
+    # names. Keep this shim local to the MSA import path and remove it once the
+    # packaged sources use cute.ThrMma and cute.make_rmem_tensor directly.
+    if not hasattr(cute.core, "ThrMma"):
+        setattr(cute.core, "ThrMma", cute.ThrMma)
+    if not hasattr(cute, "make_fragment"):
+        setattr(cute, "make_fragment", cute.make_rmem_tensor)
 
 
-def _find_msa_python_dir() -> Optional[Path]:
-    """Locate the fmha_sm100 package dir by walking up from this file.
-
-    Returns None in installed layouts where the 3rdparty submodule is not
-    shipped. Walking up avoids hardcoding this module's depth below the
-    repository root.
-    """
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / _MSA_PYTHON_RELPATH
-        if candidate.is_dir():
-            return candidate
-    return None
-
-
-def _ensure_msa_on_path() -> None:
-    """Prepend the MSA python package directory to sys.path if present."""
-    msa_python = _find_msa_python_dir()
-    if msa_python is not None and str(msa_python) not in sys.path:
-        sys.path.insert(0, str(msa_python))
-
-
+@functools.lru_cache(maxsize=1)
 def msa_package_available() -> bool:
-    """True if fmha_sm100 can be imported (submodule checkout or installed)."""
-    _ensure_msa_on_path()
-    return importlib.util.find_spec("fmha_sm100") is not None
+    """Prepare and report whether the packaged fmha_sm100 module can be imported.
+
+    Cached: each call scans sys.path until fmha_sm100 is first imported, and
+    create_fmha_libs asks once per attention layer. Whether the package is
+    installed cannot change within a process.
+    """
+    if importlib.util.find_spec("fmha_sm100") is None:
+        return False
+    _install_msa_cutlass_compatibility()
+    return True
 
 
-def require_msa_module():
-    """Import fmha_sm100 from the MSA submodule or raise a clear error.
+def require_msa_module() -> types.ModuleType:
+    """Import the packaged fmha_sm100 module or raise a clear error.
 
     The import is deferred to first kernel use so the MSA backend can be
     advertised in the config schema on systems where the kernels cannot load.
-    The 3rdparty/MSA/python directory is added to sys.path first, so a source
-    checkout with the submodule initialized resolves without a separate install.
     A missing package is a hard error, never a silent fallback to another backend.
     """
-    _ensure_msa_on_path()
+    _install_msa_cutlass_compatibility()
     try:
         import fmha_sm100
     except ImportError as exc:
         raise RuntimeError(
-            "MiniMax-M3 MSA attention requires the fmha_sm100 kernels from the "
-            "MSA git submodule at 3rdparty/MSA. Initialize it with "
-            "'git submodule update --init --recursive', or install fmha_sm100."
+            "MiniMax-M3 MSA attention requires the fmha_sm100 kernels packaged "
+            "with TensorRT-LLM. Reinstall TensorRT-LLM from a complete build."
         ) from exc
     return fmha_sm100
 

@@ -20,7 +20,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalModelMixin,
+    _assemble_multimodal_encoder_embeddings,
+)
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
@@ -76,6 +79,8 @@ class TensorEncoderMultimodalModel(DummyMultimodalModel):
 
 
 class NoEmbeddingMetadataMultimodalModel(DummyMultimodalModel):
+    supports_encoder_cache = True
+
     @property
     def embedding_dim(self) -> int:
         raise NotImplementedError
@@ -86,6 +91,8 @@ class NoEmbeddingMetadataMultimodalModel(DummyMultimodalModel):
 
 
 class CountingEncoderMultimodalModel(DummyMultimodalModel):
+    supports_encoder_cache = True
+
     def __init__(
         self,
         embedding: Embedding,
@@ -172,6 +179,7 @@ def make_keyed_multimodal_param(
     )
 
 
+@pytest.mark.cpu_only
 def test_cast_multimodal_encoder_dtype_keeps_meta_tensors_meta():
     module = torch.nn.Linear(4, 4, device="meta")
 
@@ -217,8 +225,7 @@ def test_prepare_multimodal_inputs_forwards_precomputed_indices(device):
     torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
 
 
-@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
-def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
+def _test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
     hidden = 8
     mm_token_id = 7
     emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
@@ -251,6 +258,15 @@ def test_prepare_multimodal_inputs_accepts_tensor_encoder_output(device):
     torch.testing.assert_close(out.inputs_embeds[text_idx], emb(input_ids[text_idx]))
 
 
+@pytest.mark.cpu_only
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cpu():
+    _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cpu")
+
+
+def test_prepare_multimodal_inputs_accepts_tensor_encoder_output_cuda():
+    _test_prepare_multimodal_inputs_accepts_tensor_encoder_output("cuda")
+
+
 def test_encoder_cache_first_request_writes_per_item_entries():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -267,6 +283,15 @@ def test_encoder_cache_first_request_writes_per_item_entries():
     assert model.encode_calls == 1
     assert embeddings.shape == (3, 4)
     assert len(model._multimodal_encoder_cache) == 2
+
+
+def test_encoder_cache_requires_model_opt_in():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+
+    assert not model.encoder_cache_active
 
 
 def test_encoder_cache_creation_logs_embedding_row_capacity():
@@ -576,12 +601,23 @@ def test_assemble_full_embedding_preserves_item_order():
         2: torch.tensor([[2.0]]),
     }
     torch.testing.assert_close(
-        MultimodalModelMixin.assemble_full_embedding(per_item, 3),
+        _assemble_multimodal_encoder_embeddings(per_item, 3),
         torch.tensor([[0.0], [1.0], [1.5], [2.0]]),
     )
-    # Single-item fast path returns the item tensor without an extra copy.
+    # Even a single item is copied into request-owned storage. The sources here
+    # are cache entries, which `TensorLRUCache.get` returns as aliases of
+    # cache-owned tensors; handing one straight to a request would leave the two
+    # sharing storage and the cache's byte accounting short by an entry it can
+    # no longer actually free.
     single = per_item[1]
-    assert MultimodalModelMixin.assemble_full_embedding({0: single}, 1) is single
+    assembled = _assemble_multimodal_encoder_embeddings({0: single}, 1)
+    assert assembled is not single
+    torch.testing.assert_close(assembled, single)
+
+
+def test_assemble_full_embedding_rejects_incompatible_items():
+    with pytest.raises(ValueError, match="matching output shape, dtype, and device"):
+        _assemble_multimodal_encoder_embeddings({0: torch.ones(1, 2), 1: torch.ones(1, 3)}, 2)
 
 
 def test_build_multimodal_encoder_input_slices_packed_grid_thw():
@@ -695,7 +731,7 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
     "mm_data, expected_match",
     [
         # `_encoder_cache_modality` returns None -> single-modality guard fires.
-        ({}, "only supports single-modality"),
+        ({}, "cannot infer the modality"),
         # Modality present but layout is neither pattern A (image_sizes) nor pattern B
         # (grid_thw); default has nothing to dispatch on.
         ({"image": {"pixel_values": torch.zeros(2)}}, "cannot slice image layout"),

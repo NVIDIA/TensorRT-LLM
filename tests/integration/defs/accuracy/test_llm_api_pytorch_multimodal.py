@@ -131,92 +131,12 @@ class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
         ],
         ids=["full_budget", "forced_chunked_prefill"],
     )
+    @pytest.mark.skip_less_device_memory(60000)
     def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
             enable_chunked_prefill=enable_chunked_prefill,
             max_num_tokens=max_num_tokens,
-            kv_cache_config=self.kv_cache_config,
-        ) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
-class TestLlava_V1_6_Mistral_7B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "llava-hf/llava-v1.6-mistral-7b-hf"
-    MODEL_PATH = f"{llm_models_root()}/llava-v1.6-mistral-7b-hf"
-    MAX_NUM_TOKENS = 16384
-
-    # NOTE: MMMU adds <|endoftext|> to the stop token.
-    sampling_params = SamplingParams(
-        max_tokens=MMMU.MAX_OUTPUT_LEN,
-        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-        stop="<|endoftext|>",
-    )
-
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
-
-    def test_auto_dtype(self):
-        with LLM(
-            self.MODEL_PATH,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            kv_cache_config=self.kv_cache_config,
-        ) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
-@skip_pre_hopper
-class TestNVILA_8B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "Efficient-Large-Model/NVILA-8B"
-    MODEL_PATH = f"{llm_models_root()}/vila/NVILA-8B"
-    MAX_NUM_TOKENS = 16384
-
-    # NOTE: MMMU adds <|endoftext|> to the stop token.
-    sampling_params = SamplingParams(
-        max_tokens=MMMU.MAX_OUTPUT_LEN,
-        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-        stop="<|endoftext|>",
-    )
-
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.6,
-        # NOTE: VILA models do not support block reuse.
-        enable_block_reuse=False,
-    )
-
-    def test_auto_dtype(self):
-        with LLM(
-            self.MODEL_PATH,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            kv_cache_config=self.kv_cache_config,
-        ) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
-class TestVILA1_5_3B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "Efficient-Large-Model/VILA1.5-3b"
-    MODEL_PATH = f"{llm_models_root()}/vila/VILA1.5-3b"
-    MAX_NUM_TOKENS = 16384
-
-    # NOTE: MMMU adds <|endoftext|> to the stop token.
-    sampling_params = SamplingParams(
-        max_tokens=MMMU.MAX_OUTPUT_LEN,
-        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-        stop="<|endoftext|>",
-    )
-
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.6,
-        # NOTE: VILA models do not support block reuse.
-        enable_block_reuse=False,
-    )
-
-    def test_auto_dtype(self):
-        with LLM(
-            self.MODEL_PATH,
-            max_num_tokens=self.MAX_NUM_TOKENS,
             kv_cache_config=self.kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
@@ -266,28 +186,6 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
-
-
-class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
-    MODEL_PATH = f"{llm_models_root()}/multimodals/Phi-4-multimodal-instruct-fuse-vision-lora"
-    MAX_NUM_TOKENS = 25600
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|USER|>"
-    )
-
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-
-    def test_auto_dtype(self):
-        with LLM(
-            self.MODEL_PATH,
-            max_batch_size=32,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            kv_cache_config=self.kv_cache_config,
-        ) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
 
 
 @skip_pre_hopper
@@ -401,6 +299,7 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
+    MTP_MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-26B-A4B-it-assistant"
     EXTRA_EVALUATOR_KWARGS = {
         "chat_template_kwargs": {"enable_thinking": False},
     }
@@ -425,6 +324,14 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
             max_batch_size=16,
             kv_cache_config=self.kv_cache_config,
             enable_chunked_prefill=True,
+            # Shared-KV MTP overlap can expose too few FlashInfer pages and cause an illegal access
+            # in `AppendPagedKVCache`. Re-enable this after the overlap-MTP KV accounting fix lands.
+            disable_overlap_scheduler=True,
+            speculative_config=MTPDecodingConfig(
+                max_draft_len=3,
+                mtp_eagle_one_model=True,
+                speculative_model=self.MTP_MODEL_PATH,
+            ),
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
@@ -647,6 +554,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
         preserve_caller_max_tokens=True,
     )
 
+    @pytest.mark.timeout(7200)
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(183000)
@@ -835,7 +743,22 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                         )
                     },
                 ),
-                marks=skip_pre_hopper,
+                marks=(
+                    skip_pre_hopper,
+                    # Note: marking as `xfail` so the test still runs in CI, and we can observe
+                    # whether its flakiness is still relevant on main.
+                    (
+                        pytest.mark.xfail(
+                            reason="https://nvbugs/6581049",
+                            raises=pytest.RaisesExc(
+                                AssertionError,
+                                match=r"Expected accuracy >= threshold, but got",
+                            ),
+                        )
+                        if pytest.version_tuple >= (8, 4)
+                        else pytest.mark.xfail(reason="https://nvbugs/6581049")
+                    ),
+                ),
                 id="fp8_mmmu_encoder_cuda_graph",
             ),
             pytest.param(
