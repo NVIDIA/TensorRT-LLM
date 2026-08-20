@@ -450,8 +450,9 @@ class Flux2Pipeline(BasePipeline):
                 Each prompt's embeddings are repeated and independent noise is
                 sampled, producing N different images per prompt.
             image: Reference image or shared list of reference images for
-                image conditioning. Public ``VisualGenParams`` requests use
-                file paths or encoded bytes; direct calls may also use PIL images.
+                image conditioning. References arrive here as encoded bytes,
+                whatever wire form the request declared; direct calls may also
+                use PIL images.
 
         Returns:
             PipelineOutput with image tensor (B, H, W, C) where

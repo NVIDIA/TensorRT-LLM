@@ -17,9 +17,11 @@ import pickle
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
+from unittest import mock
 
 import numpy as np
 import pytest
+import torch
 from fastapi import UploadFile
 from PIL import Image
 
@@ -1138,24 +1140,69 @@ class TestReferenceBroadcastSplit:
         assert peer.ref_sizes == req.ref_sizes
         assert peer.ref_sizes[:2] == [1024, 7]
 
+    @staticmethod
+    def _blocks_of(req):
+        """The shared-memory files this request's handles point at.
+
+        Named per handle rather than scanned out of /dev/shm, which is global
+        to the machine and picks up unrelated processes.
+        """
+        return [
+            Path("/dev/shm") / base64.b64decode(e["handle"]["storage_handle"]).decode().lstrip("/")
+            for e in req.ref_handles or []
+        ]
+
     def test_dropped_request_releases_its_shared_memory(self):
-        """A handle that is never consumed keeps its shared-memory block mapped
-        until the process exits, so a request that fails on its way to rank0
-        has to consume its own handles on the way out."""
+        """An unconsumed handle keeps its block mapped until the process exits,
+        so a request that fails on its way to rank0 has to consume its own
+        handles on the way out."""
         import gc
-        import glob
 
-        def blocks():
-            return set(glob.glob("/dev/shm/torch_*"))
-
-        before = blocks()
         req = self._request(os.urandom(1024 * 1024))
         req.refs_to_handles()
-        gc.collect()
-        assert len(blocks() - before) == len(req.ref_handles)
+        blocks = self._blocks_of(req)
+        assert blocks and all(b.exists() for b in blocks)
 
         # What the sender thread does when the request never reaches rank0.
         req.refs_to_bytes()
         del req
         gc.collect()
-        assert blocks() - before == set()
+        assert not any(b.exists() for b in blocks)
+
+    def test_attach_rejects_a_count_mismatch(self):
+        """Peers size their collectives from ``ref_sizes``, so a payload list
+        that does not match the reference count is a bug worth raising on
+        rather than silently leaving references empty."""
+        req = self._request(os.urandom(64), os.urandom(64))
+        detached = req.refs_detach()
+
+        with pytest.raises(ValueError, match="expected 3 reference payloads, got 2"):
+            req.refs_attach(detached[:2])
+
+    def test_partial_handle_failure_stays_reclaimable(self):
+        """If a later reference cannot reach shared memory, the blocks already
+        taken must still be reachable, or nothing can free them."""
+        import gc
+
+        req = self._request(os.urandom(256 * 1024), os.urandom(256 * 1024))
+        real = torch.frombuffer
+        calls = {"n": 0}
+
+        def flaky(buffer, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:  # the third of this request's three references
+                raise RuntimeError("shared memory exhausted")
+            return real(buffer, **kwargs)
+
+        with mock.patch.object(torch, "frombuffer", flaky):
+            with pytest.raises(RuntimeError, match="shared memory exhausted"):
+                req.refs_to_handles()
+
+        blocks = self._blocks_of(req)
+        assert len(blocks) == 2, "handles taken before the failure must stay reachable"
+        assert all(b.exists() for b in blocks)
+
+        req.refs_to_bytes()
+        del req
+        gc.collect()
+        assert not any(b.exists() for b in blocks)

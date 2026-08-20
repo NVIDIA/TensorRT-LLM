@@ -274,7 +274,10 @@ class DiffusionRequest:
         """
         if self.params is None:
             return
-        handles = []
+        # Publish the list before filling it: if a later reference fails to
+        # reach shared memory, the blocks already taken are still reachable
+        # for the reclaim path instead of leaking.
+        self.ref_handles = handles = []
         for slot in ("image_reference", "video_reference", "audio_reference"):
             for index, ref in enumerate(getattr(self.params, slot, None) or []):
                 # bytearray() because the shared storage must be writable.
@@ -287,7 +290,8 @@ class DiffusionRequest:
                     }
                 )
                 ref.content = b""
-        self.ref_handles = handles or None
+        if not handles:
+            self.ref_handles = None
 
     def refs_to_bytes(self) -> None:
         """Restore reference payloads from shared memory, in place (consumer side)."""
@@ -318,7 +322,12 @@ class DiffusionRequest:
 
     def refs_attach(self, payloads: List[bytes]) -> None:
         """Put the separately broadcast payloads back, in place."""
-        for ref, payload in zip(self._refs(), payloads):
+        refs = list(self._refs())
+        if len(refs) != len(payloads):
+            # zip() would silently leave the tail of either side behind, and
+            # clearing ref_sizes below would erase the evidence.
+            raise ValueError(f"expected {len(refs)} reference payloads, got {len(payloads)}.")
+        for ref, payload in zip(refs, payloads):
             ref.content = payload
         self.ref_sizes = None
 
@@ -463,6 +472,13 @@ class DiffusionExecutor:
         object into a tensor first and that copy dominates the collective.
         """
         payloads = req.refs_detach() if self.rank == 0 and req is not None else []
+        if self.rank == 0 and len(payloads) != len(getattr(req, "ref_sizes", None) or []):
+            # Peers derive their collective count from ref_sizes, so a mismatch
+            # here would hang every rank. Fail on rank0, before the first one.
+            raise RuntimeError(
+                f"reference payload/size mismatch: {len(payloads)} payloads, "
+                f"{len(getattr(req, 'ref_sizes', None) or [])} sizes."
+            )
         obj_list = [req]
         dist.broadcast_object_list(obj_list, src=0)
         req = obj_list[0]
@@ -1119,6 +1135,21 @@ class DiffusionRemoteClient:
 
         self._cleanup_ipc()
 
+    def _reclaim_pending_handles(self) -> None:
+        """Consume the handles of requests that will never be sent.
+
+        A request abandoned in the queue still holds shared-memory blocks that
+        nothing downstream will consume, and they stay mapped until this
+        process exits.
+        """
+        while True:
+            try:
+                req = self.pending_requests.get_nowait()
+            except queue.Empty:
+                return
+            if req is not None and req.ref_handles:
+                req.refs_to_bytes()
+
     def shutdown(self):
         """Shutdown client and workers."""
         logger.info("DiffusionClient: Shutting down")
@@ -1129,6 +1160,7 @@ class DiffusionRemoteClient:
             logger.warning("DiffusionClient: Force stopping background thread")
             self.shutdown_event.set()
             self.background_thread.join(timeout=1.0)
+            self._reclaim_pending_handles()
 
         # Shutdown workers
         logger.info("DiffusionClient: Stopping workers")
