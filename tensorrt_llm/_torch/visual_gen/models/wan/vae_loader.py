@@ -31,6 +31,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from .wan_vae import WanVAE, WanVAEConfig
 
 TRTLLM_USE_DIFFUSER_VAE_ENV = "TRTLLM_USE_DIFFUSER_VAE"
+_NVFP4_DYNAMIC_MIN_CHANNELS = 64
 
 
 def _use_diffuser_vae_env() -> bool:
@@ -176,7 +177,7 @@ def _load_nvfp4_wan_vae(
     if n != len(selected) and enable_fp4:
         raise ValueError(
             f"NVFP4 checkpoint selects {len(selected)} quantized convolutions, "
-            f"but only {n} are supported Wan residual convolutions"
+            f"but only {n} are kernel-compatible Wan convolutions"
         )
     if enable_fp4:
         logger.info(
@@ -205,19 +206,21 @@ def _load_native_wan_vae(
 
 
 def _select_dynamic_fp4_convs(vae: WanVAE, quant_config: QuantConfig) -> set[str]:
-    """Return supported residual convolutions not excluded by the VAE config."""
-    from .wan_vae import WanCausalConv3d, WanResidualBlock
+    """Select dynamic-FP4 Conv3d modules by kernel geometry and channel shape."""
+    from .wan_vae import NVFP4WanCausalConv3d, _supports_nvfp4_conv3d
 
     selected: set[str] = set()
     for name, module in vae.named_modules():
-        if not isinstance(module, WanResidualBlock):
-            continue
-        for attr in ("conv1", "conv2"):
-            conv_name = f"{name}.{attr}"
-            if isinstance(getattr(module, attr), WanCausalConv3d) and not (
-                quant_config.is_module_excluded_from_quantization(conv_name)
-            ):
-                selected.add(conv_name)
+        if (
+            not isinstance(module, NVFP4WanCausalConv3d)
+            and _supports_nvfp4_conv3d(module)
+            # Small VAE boundary projections have little arithmetic payoff
+            # and are disproportionately sensitive to uncalibrated FP4.
+            and module.in_channels >= _NVFP4_DYNAMIC_MIN_CHANNELS
+            and module.out_channels >= _NVFP4_DYNAMIC_MIN_CHANNELS
+            and not quant_config.is_module_excluded_from_quantization(name)
+        ):
+            selected.add(name)
     return selected
 
 
