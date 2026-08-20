@@ -121,6 +121,16 @@ BASE_EXAMPLE_CLASSES = {
     ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
+    # Pre-move module paths, so older artifacts still load.  find_class()
+    # matches the key exactly and rejects before the forwarding module is
+    # imported, so the shims alone do not cover this path.  Removed together
+    # with the forwarding modules.
+    #
+    # lora_helper is the module a real pre-move LoraConfig pickle names -- it
+    # was absent here, so those artifacts have never loaded.  lora_manager is
+    # the key that was present; it is kept as it was.
+    "tensorrt_llm.lora_helper": ["LoraConfig"],
+    "tensorrt_llm.lora_manager": ["LoraConfig"],
 }
 
 

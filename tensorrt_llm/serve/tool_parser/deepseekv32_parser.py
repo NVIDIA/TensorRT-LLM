@@ -170,7 +170,9 @@ class DeepSeekV32Parser(BaseToolParser):
         self._buffer += new_text
         current_text = self._buffer
 
-        has_tool_call = self.bot_token in current_text or self._INVOKE_HEADER_PREFIX in current_text
+        start_tokens = [self.bot_token, self._INVOKE_HEADER_PREFIX]
+        start_indices = [idx for idx in map(current_text.find, start_tokens) if idx != -1]
+        has_tool_call = bool(start_indices)
 
         # Hold the buffer back only while its tail could still complete into one of
         # the DSML delimiters.
@@ -191,6 +193,14 @@ class DeepSeekV32Parser(BaseToolParser):
             for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
                 normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text)
+
+        # Text before the earliest start token is content, so stream it and keep the
+        # buffer from that token onwards.
+        prefix_len = min(start_indices, default=0)
+        normal_text = current_text[:prefix_len]
+        if normal_text:
+            current_text = current_text[prefix_len:]
+            self._buffer = current_text
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
@@ -292,11 +302,11 @@ class DeepSeekV32Parser(BaseToolParser):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

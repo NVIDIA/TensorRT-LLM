@@ -119,6 +119,7 @@
 /tensorrt_llm/commands/utils.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/grpc @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs
 /tensorrt_llm/inputs @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/llmapi @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/llmapi/mm_encoder.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
@@ -144,6 +145,7 @@
 /tests/unittest/_torch/speculative @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/speculative_hw_agnostic @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/executor @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs
 /tests/unittest/inputs @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/llmapi @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/llmapi/apps/*multimodal* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
@@ -461,6 +463,16 @@
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
+
+# ===== COMPATIBILITY FORWARDING MODULES =====
+# Definition-free re-export modules left at a retired import path so external
+# callers keep working through the migration window (Epic TRTLLM-14558).  Each
+# one keeps the owner its pre-move path had -- without these lines the paths
+# fall through to the repository default, which would be an ownership change
+# nobody asked for.  Removed together with the modules themselves.
+/tensorrt_llm/lora_helper.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/prompt_adapter_manager.py @NVIDIA/trt-llm-runtime-devs
 
 # ===== GOVERNANCE / LEGAL GATES =====
 /.github/CODEOWNERS @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
