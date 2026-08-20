@@ -26,6 +26,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import \
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
@@ -65,7 +66,6 @@ from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 
 from .test_llm import llama_model_path
@@ -704,11 +704,68 @@ class TestKvCacheManagerV2AutoResolution:
             "Qwen3_5ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
             assert model_cls is not None
             assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
+
+    def test_registered_models_keep_v2_on_nixl(self):
+        """Models preferring V2 and the Python transceiver keep V2 on NIXL.
+
+        Both sentinels start at 'auto'; production resolves the transceiver
+        runtime first, then the KV cache manager. MiniMax-M2 is absent from
+        this list: it silently resolves to V1 on this route (its
+        disaggregated serving is unvalidated -- the missing preference is
+        deliberate).
+        """
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "GptOssForCausalLM",
+            "KimiK25ForConditionalGeneration",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "DeepseekV4ForCausalLM",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
+        )
+        for architecture in architectures:
+            model_cls = get_registered_model_class(architecture)
+            assert model_cls is not None, architecture
+
+            llm_args = TorchLlmArgs(
+                model="/tmp/dummy_model",
+                cache_transceiver_config=CacheTransceiverConfig(
+                    backend="NIXL", transceiver_runtime="auto"),
+            )
+            _resolve_transceiver_runtime_auto(llm_args, model_cls)
+            assert _resolve_kv_cache_manager_v2_auto(
+                llm_args, model_cls) is True, architecture
+            assert (llm_args.cache_transceiver_config.transceiver_runtime ==
+                    "PYTHON"), architecture
 
 
 @pytest.mark.cpu_only

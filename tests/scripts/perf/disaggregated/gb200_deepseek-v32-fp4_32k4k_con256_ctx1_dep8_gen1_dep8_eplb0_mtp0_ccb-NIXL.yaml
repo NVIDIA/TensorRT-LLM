@@ -52,13 +52,13 @@ worker_config:
     pipeline_parallel_size: 1
     context_parallel_size: 1
     enable_attention_dp: true
-    max_batch_size: 8
+    max_batch_size: 32
     max_num_tokens: 8192
     max_seq_len: 121000
     allreduce_strategy: MNNVL
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 8
+      max_batch_size: 32
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9

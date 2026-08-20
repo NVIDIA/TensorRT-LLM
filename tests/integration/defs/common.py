@@ -27,9 +27,9 @@ import yaml
 from packaging import version
 
 from tensorrt_llm import LLM as LLM_torch
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .trt_test_alternative import (check_call, check_output, print_info,
