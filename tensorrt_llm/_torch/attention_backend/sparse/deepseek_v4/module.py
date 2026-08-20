@@ -1219,6 +1219,11 @@ def forward_sparse_attn(
     self._fused_kv_norm_active = False
     self._fused_kv_norm_hoisted = False
 
+    # Join the prev_topk copy forked in sparse_attn_indexer; CUDA graph
+    # capture requires the join within the same layer's forward.
+    if self.indexer is not None:
+        self.indexer.maybe_join_prev_topk_copy()
+
 
 class DeepSeekV4Hooks(MLASparseHooks):
     """Typed DeepSeek-V4 adapter for the shared MLA module."""
