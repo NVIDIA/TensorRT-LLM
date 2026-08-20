@@ -497,6 +497,10 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if value:
                 extra_attrs[key] = value
 
+        # Surface model workflow variant selection.
+        if "workflow" in resolved_pipeline_config:
+            extra_attrs["workflow"] = resolved_pipeline_config["workflow"]
+
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
         component_config_dicts: Dict[str, Dict[str, Any]] = {}

@@ -22,3 +22,5 @@ class LTX23Modality(Modality):
     """LTX-2 Modality plus the global denoising sigma."""
 
     sigma: torch.Tensor = field(kw_only=True)  # (B,) drives prompt K/V
+    # Optional global sigma for the audio-video cross-attention gate.
+    cross_modality_sigma: torch.Tensor | None = field(default=None, kw_only=True)

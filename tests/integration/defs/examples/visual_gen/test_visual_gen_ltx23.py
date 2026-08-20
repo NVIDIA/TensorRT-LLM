@@ -27,15 +27,21 @@ import numpy as np
 import pytest
 import soundfile as sf
 import torch
+import yaml
+from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
     REPO_ROOT,
     _assert_lpips_below_threshold,
     _cleanup_cuda,
+    _golden_media_path,
     _lpips_deterministic_algorithms,
     _lpips_model_path,
+    _preserve_lpips_candidate_on_failure,
     _run_lpips_eval,
+    _run_reusable_video_lpips_eval,
     _save_lpips_video_mp4,
     _skip_if_missing,
+    _visual_gen_output_path,
 )
 
 LTX23_MODEL_PATH = os.environ.get("LTX23_MODEL_PATH", _lpips_model_path("LTX-2.3"))
@@ -64,6 +70,18 @@ LTX23_LPIPS_SEED = 42
 
 LTX23_LPIPS_THRESHOLD = 0.05
 LTX23_AUDIO_MEL_L1_THRESHOLD = float(os.environ.get("LTX23_AUDIO_MEL_L1_THRESHOLD", "0.45"))
+
+LTX23_RETAKE_EXPECTED_FRAMES = 209
+LTX23_RETAKE_EXPECTED_HEIGHT = 1280
+LTX23_RETAKE_EXPECTED_WIDTH = 704
+LTX23_RETAKE_EXPECTED_FPS = 30.0
+LTX23_RETAKE_EXPECTED_AUDIO_RATE = 48000
+LTX23_RETAKE_CHECKPOINT_ENV = "LTX23_RETAKE_CHECKPOINT"
+LTX23_RETAKE_LORA_ENV = "LTX23_RETAKE_LORA"
+LTX23_RETAKE_LPIPS_FRAME_START = 89
+LTX23_RETAKE_LPIPS_FRAME_STOP = 118
+LTX23_RETAKE_LPIPS_THRESHOLD = 0.05
+LTX23_RETAKE_PROMPT_CONDITIONING = "default_prompt_conditioning.safetensors"
 
 
 def _save_wav(audio, path, sample_rate):
@@ -201,3 +219,140 @@ def test_ltx23_example(tmp_path, config_name):
     )
     assert result.returncode == 0, "LTX-2.3 example script exited non-zero"
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def _generate_ltx23_retake_native_bf16_video(llm_root, llm_venv, tmp_path, output_path):
+    """Run the native delete-disfluency retake example and return its output."""
+    source = _golden_media_path(
+        tmp_path,
+        "ltx2_retake_lpips_input_video.mp4",
+        "LTX-2.3 delete-disfluency retake input",
+    )
+    prompt_conditioning = _golden_media_path(
+        tmp_path,
+        LTX23_RETAKE_PROMPT_CONDITIONING,
+        "LTX-2.3 retake prompt conditioning",
+    )
+    checkpoint = os.environ.get(LTX23_RETAKE_CHECKPOINT_ENV) or os.path.join(
+        LTX23_MODEL_PATH, "ltx-2.3-22b-distilled.safetensors"
+    )
+    _skip_if_missing(checkpoint, "LTX-2.3 retake checkpoint")
+    lora = os.environ.get(LTX23_RETAKE_LORA_ENV) or _lpips_model_path(
+        "LTX-2.3", "talkvid-id-lora.safetensors"
+    )
+    _skip_if_missing(lora, "TalkVid retake LoRA")
+    example = os.path.join(llm_root, "examples", "visual_gen", "models", "ltx23_retake.py")
+    base_config = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "ltx23-retake-1gpu.yaml"
+    )
+    with open(base_config, encoding="utf-8") as config_file:
+        config_data = yaml.safe_load(config_file)
+    config_data["runtime_lora_config"] = {"path": lora}
+    config = tmp_path / "ltx23-retake-1gpu.yaml"
+    with open(config, "w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config_data, config_file, sort_keys=False)
+    venv_check_call(
+        llm_venv,
+        [
+            example,
+            "--model",
+            checkpoint,
+            "--visual_gen_args",
+            str(config),
+            "--source",
+            str(source),
+            "--start",
+            "2.9667",
+            "--end",
+            "3.9333",
+            "--prompt_conditioning_path",
+            str(prompt_conditioning),
+            "--output_path",
+            str(output_path),
+        ],
+    )
+    assert os.path.isfile(output_path), f"retake pipeline did not produce {output_path}"
+    return output_path
+
+
+@pytest.fixture(scope="session")
+def _ltx23_retake_deps(_visual_gen_deps, llm_venv):
+    llm_venv.run_cmd(
+        [
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--index-url",
+            "https://download.pytorch.org/whl/cpu",
+            "torchaudio==2.11.0+cpu",
+        ]
+    )
+
+
+@pytest.fixture(scope="session")
+def ltx23_retake_bf16_video_path(_ltx23_retake_deps, llm_root, llm_venv, tmp_path_factory):
+    output_path = _visual_gen_output_path(llm_venv, "ltx23_retake_bf16")
+    if os.path.isfile(output_path):
+        return output_path
+    work_dir = tmp_path_factory.mktemp("ltx23_retake")
+    return _generate_ltx23_retake_native_bf16_video(llm_root, llm_venv, work_dir, output_path)
+
+
+def test_ltx23_retake_native_bf16_smoke(ltx23_retake_bf16_video_path):
+    """Check the native delete-disfluency output container and frame count."""
+    import av
+
+    from tensorrt_llm._torch.visual_gen.models.ltx23.media_io import (
+        decode_video_by_frame,
+        get_videostream_metadata,
+    )
+
+    metadata = get_videostream_metadata(str(ltx23_retake_bf16_video_path))
+    assert metadata.frames == LTX23_RETAKE_EXPECTED_FRAMES
+    assert metadata.height == LTX23_RETAKE_EXPECTED_HEIGHT
+    assert metadata.width == LTX23_RETAKE_EXPECTED_WIDTH
+    assert metadata.fps == pytest.approx(LTX23_RETAKE_EXPECTED_FPS)
+    assert (
+        sum(1 for _ in decode_video_by_frame(str(ltx23_retake_bf16_video_path)))
+        == LTX23_RETAKE_EXPECTED_FRAMES
+    )
+
+    container = av.open(str(ltx23_retake_bf16_video_path))
+    try:
+        audio_streams = list(container.streams.audio)
+        assert len(audio_streams) == 1
+        assert audio_streams[0].rate == LTX23_RETAKE_EXPECTED_AUDIO_RATE
+        assert audio_streams[0].codec_context.channels == 2
+    finally:
+        container.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx23_retake_native_bf16_lpips(
+    request,
+    tmp_path,
+    ltx23_retake_bf16_video_path,
+    _visual_gen_lpips_scorer,
+):
+    golden_path = _golden_media_path(
+        tmp_path,
+        "ltx2_retake_lpips_golden_video.mp4",
+        "LTX-2.3 retake LPIPS golden video",
+    )
+    score = _run_reusable_video_lpips_eval(
+        "ltx23_retake",
+        golden_path,
+        ltx23_retake_bf16_video_path,
+        _visual_gen_lpips_scorer,
+        frame_start=LTX23_RETAKE_LPIPS_FRAME_START,
+        frame_stop=LTX23_RETAKE_LPIPS_FRAME_STOP,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX23_RETAKE_LPIPS_THRESHOLD,
+        ltx23_retake_bf16_video_path,
+        "ltx23_retake_generated.mp4",
+    )
+    _assert_lpips_below_threshold(score, LTX23_RETAKE_LPIPS_THRESHOLD)

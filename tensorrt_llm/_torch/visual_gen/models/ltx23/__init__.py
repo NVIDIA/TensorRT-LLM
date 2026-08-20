@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
 from .pipeline_ltx23 import LTX23Pipeline
+from .pipeline_ltx23_retake import LTX23RetakePipeline
 
 __all__ = [
     "LTX23Pipeline",
+    "LTX23RetakePipeline",
 ]

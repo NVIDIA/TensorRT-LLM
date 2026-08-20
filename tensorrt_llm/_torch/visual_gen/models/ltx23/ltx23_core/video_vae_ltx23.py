@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2.3 video VAE decoder.
+"""LTX-2.3 video VAE components.
 
 LTX-2.3 reuses LTX-2's VAE primitives and forward/tiled-decode machinery, but
 its channel recipe differs: compress_time and compress_space reduce channels by
@@ -9,20 +9,50 @@ their multiplier, where LTX-2 only did that for compress_all. conv_in is
 therefore latent_channels times the product of every multiplier, not just the
 compress_all ones -- 128 * (2*1*2*2) = 1024 for the checkpoint recipe.
 
-This subclasses LTX-2's VideoDecoder to inherit that machinery unchanged and
-rebuilds only the channel-bearing modules with the corrected flow.
+The decoder subclasses LTX-2's implementation and rebuilds only the
+channel-bearing modules. The encoder reuses LTX-2's architecture and adds the
+overlap-aware tiled encode required for full retake clips.
 """
 
-from typing import List, Tuple, Union
+import logging
+from collections.abc import Callable
+from dataclasses import replace
+from typing import Any, List, Tuple, Union
 
+import torch
 import torch.nn as nn
 
 from ...ltx2.ltx2_core.normalization import PixelNorm
+from ...ltx2.ltx2_core.types import (
+    VIDEO_SCALE_FACTORS,
+    SpatioTemporalScaleFactors,
+    VideoLatentShape,
+)
 from ...ltx2.ltx2_core.video_vae.convolution import make_conv_nd
 from ...ltx2.ltx2_core.video_vae.enums import NormLayerType, PaddingModeType
+from ...ltx2.ltx2_core.video_vae.ops import PerChannelStatistics
 from ...ltx2.ltx2_core.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
 from ...ltx2.ltx2_core.video_vae.sampling import DepthToSpaceUpsample
+from ...ltx2.ltx2_core.video_vae.tiling import (
+    DEFAULT_MAPPING_OPERATION,
+    DEFAULT_SPLIT_OPERATION,
+    DimensionIntervals,
+    Tile,
+    TilingConfig,
+    compute_rectangular_mask_1d,
+    create_tiles,
+)
 from ...ltx2.ltx2_core.video_vae.video_vae import VideoDecoder as LTX2VideoDecoder
+from ...ltx2.ltx2_core.video_vae.video_vae import VideoEncoder as LTX2VideoEncoder
+from ...ltx2.ltx2_core.video_vae.video_vae import (
+    make_mapping_operation,
+    split_with_symmetric_overlaps,
+)
+
+logger = logging.getLogger(__name__)
+
+_MIN_SPATIAL_OVERLAP_PIXELS = 64
+_MIN_TEMPORAL_OVERLAP_FRAMES = 16
 
 _COMPRESS_STRIDES = {
     "compress_time": (2, 1, 1),
@@ -201,4 +231,155 @@ class LTX23VideoDecoderConfigurator:
             norm_layer=NormLayerType(vae.get("norm_layer", "pixel_norm")),
             causal=vae.get("causal_decoder", False),
             spatial_padding_mode=PaddingModeType(padding_mode),
+        )
+
+
+class _LTX23PerChannelStatistics(PerChannelStatistics):
+    """Statistics buffers present in the LTX-2.3 encoder checkpoint."""
+
+    def __init__(self, latent_channels: int = 128) -> None:
+        nn.Module.__init__(self)
+        self.register_buffer("std-of-means", torch.empty(latent_channels))
+        self.register_buffer("mean-of-means", torch.empty(latent_channels))
+
+
+def _split_temporal_frames(tile_size: int, overlap: int) -> Callable[[int], DimensionIntervals]:
+    non_causal_split = split_with_symmetric_overlaps(tile_size, overlap)
+
+    def split(dimension_size: int) -> DimensionIntervals:
+        if dimension_size <= tile_size:
+            return DEFAULT_SPLIT_OPERATION(dimension_size)
+        intervals = non_causal_split(dimension_size)
+        ends = list(intervals.ends)
+        ends[:-1] = [end + 1 for end in ends[:-1]]
+        return replace(intervals, ends=ends, right_ramps=[0] * len(ends))
+
+    return split
+
+
+def _map_temporal_interval(
+    begin: int, end: int, left_ramp: int, right_ramp: int, scale: int
+) -> tuple[slice, torch.Tensor]:
+    start = begin // scale
+    stop = (end - 1) // scale + 1
+    left = 0 if left_ramp == 0 else 1 + (left_ramp - 1) // scale
+    right = right_ramp // scale
+    if right:
+        raise ValueError(f"LTX-2.3 encode tiles require a zero right ramp; got {right_ramp}")
+    return slice(start, stop), compute_rectangular_mask_1d(stop - start, left, right)
+
+
+def _map_spatial_interval(
+    begin: int, end: int, left_ramp: int, right_ramp: int, scale: int
+) -> tuple[slice, torch.Tensor]:
+    start = begin // scale
+    stop = end // scale
+    return slice(start, stop), compute_rectangular_mask_1d(
+        stop - start,
+        max(0, left_ramp // scale - 1),
+        0 if right_ramp == 0 else 1,
+    )
+
+
+def _prepare_encode_tiles(
+    video: torch.Tensor,
+    tiling_config: TilingConfig,
+    scales: SpatioTemporalScaleFactors,
+) -> list[Tile]:
+    splitters = [DEFAULT_SPLIT_OPERATION] * video.ndim
+    mappers = [DEFAULT_MAPPING_OPERATION] * video.ndim
+    if tiling_config.spatial_config is not None:
+        config = tiling_config.spatial_config
+        overlap = max(config.tile_overlap_in_pixels, _MIN_SPATIAL_OVERLAP_PIXELS)
+        for axis, scale in ((3, scales.height), (4, scales.width)):
+            splitters[axis] = split_with_symmetric_overlaps(config.tile_size_in_pixels, overlap)
+            mappers[axis] = make_mapping_operation(_map_spatial_interval, scale=scale)
+    if tiling_config.temporal_config is not None:
+        config = tiling_config.temporal_config
+        overlap = max(config.tile_overlap_in_frames, _MIN_TEMPORAL_OVERLAP_FRAMES)
+        splitters[2] = _split_temporal_frames(config.tile_size_in_frames, overlap)
+        mappers[2] = make_mapping_operation(_map_temporal_interval, scale=scales.time)
+    return create_tiles(video.shape, splitters, mappers)
+
+
+class LTX23VideoEncoder(LTX2VideoEncoder):
+    """LTX-2.3 video encoder with overlap-aware tiled encoding."""
+
+    def __init__(
+        self,
+        convolution_dimensions: int = 3,
+        in_channels: int = 3,
+        out_channels: int = 128,
+        encoder_blocks: list[tuple[str, int | dict[str, Any]]] | None = None,
+        patch_size: int = 4,
+        norm_layer: NormLayerType = NormLayerType.PIXEL_NORM,
+        causal: bool = True,
+        encoder_spatial_padding_mode: PaddingModeType = PaddingModeType.ZEROS,
+    ) -> None:
+        super().__init__(
+            convolution_dimensions=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            encoder_blocks=encoder_blocks or [],
+            patch_size=patch_size,
+            norm_layer=norm_layer,
+            causal=causal,
+            timestep_conditioning=False,
+            encoder_spatial_padding_mode=encoder_spatial_padding_mode,
+        )
+        self.per_channel_statistics = _LTX23PerChannelStatistics(out_channels)
+
+    def tiled_encode(
+        self,
+        video: torch.Tensor,
+        tiling_config: TilingConfig | None = None,
+    ) -> torch.Tensor:
+        if tiling_config is None:
+            return self(video)
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        scales = VIDEO_SCALE_FACTORS
+        batch, _, frames, height, width = video.shape
+        remainder = (frames - 1) % scales.time
+        if remainder:
+            logger.warning("Cropping %d video frame(s) for causal VAE encode", remainder)
+            video = video[:, :, :-remainder]
+            frames = video.shape[2]
+
+        latent_shape = VideoLatentShape(
+            batch=batch,
+            channels=self.out_channels,
+            frames=(frames - 1) // scales.time + 1,
+            height=height // scales.height,
+            width=width // scales.width,
+        )
+        latents = torch.zeros(latent_shape.to_torch_shape(), device=device, dtype=dtype)
+        weights = torch.zeros_like(latents)
+        for tile in _prepare_encode_tiles(video, tiling_config, scales):
+            latent_tile = self(video[tile.in_coords].to(device=device, dtype=dtype))
+            mask = tile.blend_mask(device, dtype)
+            latents[tile.out_coords] += latent_tile * mask
+            weights[tile.out_coords] += mask
+        return latents / weights.clamp(min=1e-8)
+
+
+class LTX23VideoEncoderConfigurator:
+    """Create an LTX-2.3 video encoder from the native config."""
+
+    @classmethod
+    def from_config(cls, config: dict) -> LTX23VideoEncoder:
+        vae = config.get("vae", {})
+        padding_mode = vae.get(
+            "spatial_padding_mode", vae.get("encoder_spatial_padding_mode", "zeros")
+        )
+        return LTX23VideoEncoder(
+            convolution_dimensions=vae.get("dims", 3),
+            in_channels=vae.get("in_channels", vae.get("out_channels", 3)),
+            out_channels=vae.get("latent_channels", 128),
+            encoder_blocks=vae.get("encoder_blocks", []),
+            patch_size=vae.get("patch_size", 4),
+            norm_layer=NormLayerType(vae.get("norm_layer", "pixel_norm")),
+            causal=vae.get("causal_encoder", True),
+            encoder_spatial_padding_mode=PaddingModeType(padding_mode),
         )

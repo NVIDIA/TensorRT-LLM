@@ -191,8 +191,8 @@ def detect_native_ltx_pipeline(config: dict) -> str:
 @register_pipeline(
     "LTX23Pipeline",
     hf_ids=["Lightricks/LTX-2.3"],
-    defaults={"text_encoder_path": "google/gemma-3-12b-it"},
-    doc="Lightricks LTX-2.3 text-to-video generation with audio.",
+    defaults={"text_encoder_path": "google/gemma-3-12b-it", "workflow": "generation"},
+    doc="Lightricks LTX-2.3 text-to-video generation and retake with audio.",
 )
 class LTX23Pipeline(BasePipeline):
     """Text-to-video pipeline for the LTX-2.3 checkpoint (native single-file safetensors)."""
@@ -204,6 +204,17 @@ class LTX23Pipeline(BasePipeline):
         "audio_embeddings_connector.",
         "video_embeddings_connector.",
     ]
+
+    @classmethod
+    def resolve_variant(cls, config):
+        workflow = config.extra_attrs.get("workflow", "generation")
+        if workflow == "retake":
+            from .pipeline_ltx23_retake import LTX23RetakePipeline
+
+            return LTX23RetakePipeline
+        if workflow != "generation":
+            raise ValueError(f"Unsupported LTX-2.3 workflow: {workflow!r}")
+        return cls
 
     @property
     def dtype(self):
@@ -319,6 +330,7 @@ class LTX23Pipeline(BasePipeline):
                 cfg, "positional_embedding_max_pos", [20, 2048, 2048]
             ),
             timestep_scale_multiplier=getattr(cfg, "timestep_scale_multiplier", 1000),
+            av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
             use_middle_indices_grid=getattr(cfg, "use_middle_indices_grid", True),
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
@@ -416,30 +428,32 @@ class LTX23Pipeline(BasePipeline):
                 dtype,
             )
 
-        logger.info("Loading native text feature extractor + connectors...")
-        self.feature_extractor = _load(
-            LTX23GemmaFeaturesExtractor.from_config(config),
-            "text_embedding_projection.",
-            dtype,
-        )
-        self.video_connector = _load(
-            LTX23VideoConnectorConfigurator.from_config(config),
-            "model.diffusion_model.video_embeddings_connector.",
-            dtype,
-        )
-        self.audio_connector = _load(
-            LTX23AudioConnectorConfigurator.from_config(config),
-            "model.diffusion_model.audio_embeddings_connector.",
-            dtype,
-        )
+        if "connectors" not in skip_components:
+            logger.info("Loading native text feature extractor + connectors...")
+            self.feature_extractor = _load(
+                LTX23GemmaFeaturesExtractor.from_config(config),
+                "text_embedding_projection.",
+                dtype,
+            )
+            self.video_connector = _load(
+                LTX23VideoConnectorConfigurator.from_config(config),
+                "model.diffusion_model.video_embeddings_connector.",
+                dtype,
+            )
+            self.audio_connector = _load(
+                LTX23AudioConnectorConfigurator.from_config(config),
+                "model.diffusion_model.audio_embeddings_connector.",
+                dtype,
+            )
 
-        if PipelineComponent.VAE not in skip_components:
+        if PipelineComponent.VAE not in skip_components and "audio_decoder" not in skip_components:
             logger.info("Loading native audio decoder...")
             self.audio_decoder = _load(
                 AudioDecoderConfigurator.from_config(config),
                 ["audio_vae.decoder.", "audio_vae."],
                 dtype,
             )
+        if PipelineComponent.VAE not in skip_components and "vocoder" not in skip_components:
             logger.info("Loading native vocoder (BigVGAN-v2 + BWE)...")
             self.vocoder = _load(
                 LTX23VocoderConfigurator.from_config(config), "vocoder.", torch.float32
@@ -448,7 +462,7 @@ class LTX23Pipeline(BasePipeline):
         patch_size = self.transformer._transformer_config.get("patch_size", 1)
         self.video_patchifier = VideoLatentPatchifier(patch_size=patch_size)
 
-        if PipelineComponent.VAE not in skip_components:
+        if PipelineComponent.VAE not in skip_components and hasattr(self, "audio_decoder"):
             self.audio_patchifier = self.audio_decoder.patchifier
             self.audio_sampling_rate = self.audio_decoder.sample_rate
             self.audio_hop_length = self.audio_decoder.mel_hop_length

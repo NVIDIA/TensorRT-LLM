@@ -417,6 +417,22 @@ class LTX23Model(LTXModel):
             pe, cross_pe = text_cache.video_pe, text_cache.video_cross_pe
             adaln = self.prompt_adaln_single
         args = preprocessor.prepare(modality, context, mask, pe, cross_pe)
+        cross_sigma = modality.cross_modality_sigma
+        if cross_sigma is not None:
+            batch_size = args.x.shape[0]
+            if cross_sigma.ndim > 1 or cross_sigma.numel() != batch_size:
+                raise ValueError(
+                    "cross modality sigma must be scalar per batch: "
+                    f"got shape {tuple(cross_sigma.shape)} for batch size {batch_size}"
+                )
+            gate, _ = preprocessor.cross_gate_adaln(
+                (cross_sigma * preprocessor.av_ca_timestep_scale_multiplier).flatten(),
+                hidden_dtype=modality.latent.dtype,
+            )
+            gate = gate.view(batch_size, -1, gate.shape[-1])
+            if gate.shape[1] != args.cross_scale_shift_timestep.shape[1]:
+                gate = gate.expand(-1, args.cross_scale_shift_timestep.shape[1], -1).contiguous()
+            args = replace(args, cross_gate_timestep=gate)
         prompt_ts = self._compute_prompt_timestep(
             adaln, modality.sigma, modality.latent.shape[0], modality.latent.dtype
         )
