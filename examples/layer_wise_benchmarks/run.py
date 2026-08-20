@@ -49,6 +49,8 @@ parser.add_argument("--kv-cache-dtype", type=str, choices=["fp8", "nvfp4", "auto
 parser.add_argument(
     "--mamba-ssm-cache-dtype", type=str, choices=["auto", "float16", "bfloat16", "float32"]
 )
+parser.add_argument("--kv-pool-headroom", type=int, default=1)
+parser.add_argument("--enable-swa-scratch-reuse", action="store_true")
 # Model init args
 parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
@@ -90,6 +92,11 @@ group.add_argument("--replay-verify-metadata", action="store_true", dest="replay
 group.add_argument(
     "--no-replay-verify-metadata", action="store_false", dest="replay_verify_metadata"
 )
+# Without this the "default on" below is dead code. In a mutually exclusive group
+# argparse seeds the dest from the FIRST action's default -- store_true's False --
+# so replay_verify_metadata is always a real bool and never None, and passing
+# neither flag silently disabled verification instead of enabling it.
+parser.set_defaults(replay_verify_metadata=None)
 # Schedule
 parser.add_argument("--warmup-times", type=int, default=20)
 parser.add_argument("--run-times", type=int, default=100)
@@ -166,6 +173,8 @@ kv_cache_manager = Runner.create_kv_cache_manager(
     kv_cache_dtype=args.kv_cache_dtype,
     mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
     layer_indices=args.layer_indices,
+    kv_pool_headroom=args.kv_pool_headroom,
+    enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
 )
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
 logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
@@ -244,7 +253,7 @@ if args.run_type == "GEN":
     ctx_attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
     with mock.patch.dict(
         os.environ,
-        {"TRTLLM_FORCE_ALLTOALL_METHOD": "NotEnabled", "TRTLLM_FORCE_COMM_METHOD": "ALLGATHER"},
+        {"TRTLLM_FORCE_COMM_METHOD": "ALLGATHER"},
         clear=False,
     ):
         ctx_runner = Runner(
