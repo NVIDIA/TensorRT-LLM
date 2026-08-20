@@ -465,14 +465,57 @@ class TestPollerShutdown:
 
         # shutdown() ran the event's onTerminal, so the context is already back.
         assert pool.free_count() == 1
-        # LOOP1-FINDING: after CompletionPoller.shutdown() with an in-flight copy, the pool's
-        # context is released (onTerminal) while its kernel may still be running. The
-        # BatchedCopyPool destructor only waits for the free list to fill, so it can
-        # cudaFreeHost the pinned plan buffer the live kernel is still reading (device
-        # use-after-free). The test synchronizes before dropping the pool to stay on the
-        # supported teardown order; the hazard is in the implementation's dtor gating.
+        # LOOP1-FINDING (fixed in round 3): the dtor now unregisters still-pending events
+        # from a live poller and destroyContexts() stream-synchronizes before freeing the
+        # pinned plan buffers — see test_pool_destruction_with_inflight_context_and_live_
+        # poller_is_bounded for the live-poller teardown path. Here shutdown() already
+        # cudaEventSynchronize'd the entry, so the kernel is done; the synchronize below is
+        # belt-and-braces for the supported teardown order.
         torch.cuda.synchronize()
         del pool
+
+    def test_pool_destruction_with_inflight_context_and_live_poller_is_bounded(self):
+        """Round-3 fix for the LOOP1-FINDING: ~BatchedCopyPool detaches safely.
+
+        A slow-sweep poller (first sweep at thread start, next one ~6 s later)
+        keeps the submitted copy's event registered well past teardown, so the
+        pool is destroyed with the context still in flight and the poller
+        LIVE. The fixed destructor waits at most ~2 s, then unregisters its
+        pending events from the poller before destroying them; the
+        unregistered id then simply never reports. The old destructor waited
+        until the free list filled (here: the ~6 s sweep; up to 10 s) and the
+        swept id WAS published — both observably different from Python.
+        """
+        poller = tab.CompletionPoller(poll_interval_us=6_000_000)
+        try:
+            pool = tab.BatchedCopyPool(
+                num_streams=1, max_plan_entries=4096, device_id=DEVICE, poller=poller
+            )
+            buf = torch.zeros(MIB, dtype=torch.uint8, device="cuda")
+            torch.cuda.synchronize()
+            cid = pool.submit_copy(
+                _u64([buf.data_ptr()]), _u64([buf.data_ptr() + 512 * KIB]), _u32([256 * KIB])
+            )
+            assert cid != tab.BatchedCopyPool.BUSY
+            # Precondition: no sweep recycled the context yet (the next sweep
+            # is ~6 s away; getting here from poller construction takes ms).
+            assert pool.free_count() == 0, "sweep beat the teardown; timing precondition broken"
+
+            t0 = time.monotonic()
+            del pool  # in-flight context + LIVE poller: the fixed dtor path
+            elapsed = time.monotonic() - t0
+            assert elapsed < 4.5, (
+                f"pool destruction took {elapsed:.1f}s with an in-flight context "
+                f"(old dtor waited for the poller sweep / its 10 s cap)"
+            )
+        finally:
+            poller.shutdown()  # joins once the poll thread's sleep slice ends
+        # The unregistered event must never report: neither the shutdown
+        # terminal batch nor any later drain may carry its id (the old dtor
+        # left it registered and the sweep/shutdown published it).
+        assert cid not in [r[0] for r in poller.drain(0).tolist()]
+        assert poller.drain(0).shape == (0, 3)
+        torch.cuda.synchronize()
 
     def test_shutdown_idempotent_when_idle(self, pool, poller):
         poller.shutdown()

@@ -761,6 +761,46 @@ def test_grant_length_is_raw_bytes_not_rounded_buddy_block() -> None:
     assert s.free_bytes() + s.region_bytes(g[0].offset) == 4 * K_REGION
 
 
+# ---- on_want internal validation guard (round-3 fix, NB-3) -----------------
+
+
+def test_on_want_rejects_oversized_chunk_outright() -> None:
+    """An announcement with any chunk > arena capacity is rejected WHOLE.
+
+    Internal last-line guard, independent of the reactor's caller-side WANT
+    validation: no grants, no flow state (an unallocatable head chunk would
+    otherwise age into drain mode and stall ALL remote granting), and the
+    same key still works with a valid announcement afterwards.
+    """
+    s = make_sched(4, 16)
+    cap = s.arena_capacity
+    assert s.on_want("A", [cap + 1]) == []
+    assert s.tracked_flows() == 0, "rejected announcement still registered flow state"
+    assert free_regions(s) == 4
+    # One bad chunk poisons the WHOLE announcement, even with valid siblings.
+    assert s.on_want("A", [K_REGION, cap + K_REGION]) == []
+    assert s.tracked_flows() == 0
+    assert free_regions(s) == 4
+    # The same key recovers: a subsequent valid WANT grants normally.
+    g = s.on_want("A", want(2))
+    assert len(g) == 2
+    assert s.held_count("A") == 2
+    check_conservation(s, ["A"], 4)
+
+
+def test_on_want_rejects_zero_and_negative_chunks() -> None:
+    """A chunk size <= 0 rejects the whole announcement (no grants, no flow)."""
+    s = make_sched(4, 16)
+    assert s.on_want("A", [0]) == []
+    assert s.on_want("A", [-K_REGION]) == []
+    assert s.on_want("A", [K_REGION, 0]) == []
+    assert s.tracked_flows() == 0
+    assert free_regions(s) == 4
+    g = s.on_want("A", want(1))
+    assert len(g) == 1
+    check_conservation(s, ["A"], 4)
+
+
 # ---- concurrency smoke: cross-thread acquire_local vs reactor-side events --
 
 
