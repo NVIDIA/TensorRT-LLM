@@ -35,9 +35,7 @@ SKIP_COMPONENTS = [
     PipelineComponent.SCHEDULER,
 ]
 
-CHECKPOINT_PATH_BF16 = os.environ.get(
-    "LTX23_MODEL_PATH", os.path.join(_MODELS_ROOT, "LTX-2.3")
-)
+CHECKPOINT_PATH_BF16 = os.environ.get("LTX23_MODEL_PATH", os.path.join(_MODELS_ROOT, "LTX-2.3"))
 GEMMA3_PATH = os.environ.get(
     "LTX23_TEXT_ENCODER_PATH", os.path.join(_MODELS_ROOT, "gemma", "gemma-3-12b-it")
 )
@@ -133,9 +131,7 @@ def test_cuda_graph_runner_tracks_all_ltx23_input_state():
     sigma changes on every denoise step, so a runner that drops it from the
     graph key or from the input copy replays a stale prompt modulation.
     """
-    from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23 import (
-        _LTX23CUDAGraphRunner,
-    )
+    from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23 import _LTX23CUDAGraphRunner
 
     modality = _ltx23_modality(1.0)
     static = _LTX23CUDAGraphRunner._clone_value(modality)
@@ -188,9 +184,7 @@ def test_attention_backend_comparison(ltx23_bf16_checkpoint_exists):
             attention_config=AttentionConfig(backend=backend),
             pipeline_config={"text_encoder_path": GEMMA3_PATH},
         )
-        pipeline = PipelineLoader(args).load(
-            skip_warmup=True, skip_components=SKIP_COMPONENTS
-        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         return pipeline, pipeline.transformer
 
     pipeline, transformer = _load("VANILLA")
@@ -214,9 +208,7 @@ def test_attention_backend_comparison(ltx23_bf16_checkpoint_exists):
             f"{name} shape mismatch: VANILLA={ref.shape}, TRTLLM={out.shape}"
         )
         assert torch.isfinite(out).all(), f"TRTLLM {name} output is not finite"
-        cos_sim = F.cosine_similarity(
-            out.float().flatten(), ref.float().flatten(), dim=0
-        ).item()
+        cos_sim = F.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0).item()
         assert cos_sim > 0.99, f"TRTLLM {name} should match VANILLA: cos_sim={cos_sim:.6f}"
 
     del pipeline, transformer

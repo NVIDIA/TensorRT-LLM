@@ -60,11 +60,16 @@ def _build_model(model_type_name, config, dtype=torch.bfloat16):
     from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModelType
     from tensorrt_llm._torch.visual_gen.models.ltx23.transformer_ltx23 import LTX23Model
 
-    model = LTX23Model(
-        model_type=getattr(LTXModelType, model_type_name),
-        model_config=_model_config(),
-        **config,
-    ).to(_DEVICE).to(dtype).eval()
+    model = (
+        LTX23Model(
+            model_type=getattr(LTXModelType, model_type_name),
+            model_config=_model_config(),
+            **config,
+        )
+        .to(_DEVICE)
+        .to(dtype)
+        .eval()
+    )
     # TRT-LLM Linear allocates with torch.empty(), so unfilled weights give NaN.
     with torch.no_grad():
         for name, p in model.named_parameters():
@@ -100,16 +105,27 @@ def _inputs(cfg, dtype=torch.bfloat16, sigma=0.5):
     v_pos = _positions(_FRAMES, _GRID, _GRID)
     a_pos = _positions(_AUDIO_PATCHES)
     video, v_ctx = _modality(
-        _FRAMES * _GRID * _GRID, cfg["in_channels"], cfg["cross_attention_dim"],
-        v_pos, dtype, sigma,
+        _FRAMES * _GRID * _GRID,
+        cfg["in_channels"],
+        cfg["cross_attention_dim"],
+        v_pos,
+        dtype,
+        sigma,
     )
     audio, a_ctx = _modality(
-        _AUDIO_PATCHES, cfg["audio_in_channels"], cfg["audio_cross_attention_dim"],
-        a_pos, dtype, sigma,
+        _AUDIO_PATCHES,
+        cfg["audio_in_channels"],
+        cfg["audio_cross_attention_dim"],
+        a_pos,
+        dtype,
+        sigma,
     )
     cache_kwargs = dict(
-        video_context=v_ctx, video_positions=v_pos,
-        audio_context=a_ctx, audio_positions=a_pos, dtype=dtype,
+        video_context=v_ctx,
+        video_positions=v_pos,
+        audio_context=a_ctx,
+        audio_positions=a_pos,
+        dtype=dtype,
     )
     return video, audio, cache_kwargs
 
@@ -161,9 +177,7 @@ class TestLTX23TextFeatures(unittest.TestCase):
             self.assertTrue(
                 torch.allclose(out, F.linear(x * scale, proj.weight, proj.bias), atol=1e-5)
             )
-            self.assertFalse(
-                torch.allclose(out, F.linear(x, proj.weight, proj.bias), atol=1e-4)
-            )
+            self.assertFalse(torch.allclose(out, F.linear(x, proj.weight, proj.bias), atol=1e-4))
 
     def test_from_config_stacks_all_gemma_hidden_states(self):
         from tensorrt_llm._torch.visual_gen.models.ltx23.ltx23_core.connector import (
@@ -222,13 +236,17 @@ class TestLTX23ModelStructure(unittest.TestCase):
 
         for adaln, prompt_adaln, table, prompt_table, dim in (
             (
-                model.adaln_single, model.prompt_adaln_single,
-                block.scale_shift_table, block.prompt_scale_shift_table,
+                model.adaln_single,
+                model.prompt_adaln_single,
+                block.scale_shift_table,
+                block.prompt_scale_shift_table,
                 model.inner_dim,
             ),
             (
-                model.audio_adaln_single, model.audio_prompt_adaln_single,
-                block.audio_scale_shift_table, block.audio_prompt_scale_shift_table,
+                model.audio_adaln_single,
+                model.audio_prompt_adaln_single,
+                block.audio_scale_shift_table,
+                block.audio_prompt_scale_shift_table,
                 model.audio_inner_dim,
             ),
         ):
@@ -390,9 +408,7 @@ class TestLTX23PipelineDetection(unittest.TestCase):
     }
 
     def test_detection(self):
-        from tensorrt_llm._torch.visual_gen.pipeline_registry import (
-            _detect_native_ltx_pipeline,
-        )
+        from tensorrt_llm._torch.visual_gen.pipeline_registry import _detect_native_ltx_pipeline
 
         self.assertEqual(
             _detect_native_ltx_pipeline({"transformer": dict(self._LTX23_TRANSFORMER)}),

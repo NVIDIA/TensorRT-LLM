@@ -67,9 +67,7 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
         beta = 0.0
     window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
     time = (
-        torch.arange(-half_size, half_size) + 0.5
-        if even
-        else torch.arange(kernel_size) - half_size
+        torch.arange(-half_size, half_size) + 0.5 if even else torch.arange(kernel_size) - half_size
     )
     if cutoff == 0:
         filter_ = torch.zeros_like(time)
@@ -251,7 +249,12 @@ class AMPBlock1(nn.Module):
         self.convs2 = nn.ModuleList(
             [
                 nn.Conv1d(
-                    channels, channels, kernel_size, 1, dilation=1, padding=get_padding(kernel_size, 1)
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=1,
+                    padding=get_padding(kernel_size, 1),
                 )
                 for _ in range(3)
             ]
@@ -474,9 +477,7 @@ class VocoderWithBWE(nn.Module):
         with torch.autocast(device_type=mel_spec.device.type, dtype=torch.float32):
             x = self.vocoder(mel_spec.float())
             _, _, length_low_rate = x.shape
-            output_length = (
-                length_low_rate * self.output_sampling_rate // self.input_sampling_rate
-            )
+            output_length = length_low_rate * self.output_sampling_rate // self.input_sampling_rate
 
             remainder = length_low_rate % self.hop_length
             if remainder != 0:

@@ -31,10 +31,10 @@ from ..ltx2.ltx2_core.types import (
 )
 from ..ltx2.ltx2_core.video_vae import TilingConfig
 from ..ltx2.pipeline_ltx2 import (
-    _LTX2CUDAGraphRunner,
     _find_safetensors_files,
     _load_component_weights,
     _load_ltx2_transformer_weights,
+    _LTX2CUDAGraphRunner,
     _prefetch_ltx2_safetensors_files,
     _read_safetensors_config,
 )
@@ -139,13 +139,9 @@ class _LTX23CUDAGraphRunner(_LTX2CUDAGraphRunner):
             dst.sigma.copy_(src.sigma)
             dst.positions.copy_(src.positions)
             dst.context.copy_(src.context)
-            _LTX23CUDAGraphRunner._copy_optional_tensor(
-                dst.context_mask, src.context_mask
-            )
+            _LTX23CUDAGraphRunner._copy_optional_tensor(dst.context_mask, src.context_mask)
             return dst
-        if isinstance(src, LTX23TextConditioning) and isinstance(
-            dst, LTX23TextConditioning
-        ):
+        if isinstance(src, LTX23TextConditioning) and isinstance(dst, LTX23TextConditioning):
             copy_tensor = _LTX23CUDAGraphRunner._copy_optional_tensor
             copy_pair = _LTX23CUDAGraphRunner._copy_tensor_pair
             copy_tensor(dst.video_context, src.video_context)
@@ -258,9 +254,7 @@ class LTX23Pipeline(BasePipeline):
             CUDAGraphRunnerConfig(use_cuda_graph=True),
         )
         self.transformer.register_cuda_graph_extra_key_fns(runner)
-        compile_note = (
-            " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
-        )
+        compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
             "CUDA graph runner: wrapping transformer.forward "
             f"(LTX-2.3 Modality-aware){compile_note}"
@@ -740,6 +734,7 @@ class LTX23Pipeline(BasePipeline):
                 text_cache=text_cache,
                 timestep=timestep_val.new_tensor(0.0),
             )
+
             # x0 prediction (rectified flow): x0 = sample - v * sigma.
             def to_x0(latent, velocity):
                 sigma = timestep_val.float()
