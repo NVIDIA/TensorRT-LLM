@@ -1656,6 +1656,12 @@ public:
         return mState == LlmRequestState::kCONTEXT_PREFETCH_COMPLETE;
     }
 
+    [[nodiscard]] bool isContextResourceInitState() const noexcept
+    {
+        return isContextInitState() || isContextPrefetchInitState() || isDisaggGenerationInitState()
+            || isDisaggGenerationTransmissionComplete();
+    }
+
     [[nodiscard]] bool isContextFinished() const noexcept
     {
         return isGenerationInProgressState() || mState == LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS;
@@ -1762,8 +1768,7 @@ public:
 
     [[nodiscard]] SizeType32 getContextChunkSize() const
     {
-        TLLM_CHECK_WITH_INFO(
-            isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
+        TLLM_CHECK_WITH_INFO(isContextResourceInitState(),
             "getContextChunkSize is only possible during the context phase or generation init phase.");
         return mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
     }
@@ -1773,8 +1778,7 @@ public:
     /// remaining length.
     void setContextChunkSize(SizeType32 size)
     {
-        TLLM_CHECK_WITH_INFO(
-            isContextInitState() || isDisaggGenerationInitState() || isDisaggGenerationTransmissionComplete(),
+        TLLM_CHECK_WITH_INFO(isContextResourceInitState(),
             "setContextChunkSize is only possible during the context phase or generation init phase.");
         TLLM_CHECK_WITH_INFO(size >= 0, "The chunk size of context (%d) can't be negative.", size);
         auto& contextChunkSize = mUseDraftModel ? mContextChunkSizeDraft : mContextChunkSizeTarget;
