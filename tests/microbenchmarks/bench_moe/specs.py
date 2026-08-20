@@ -433,11 +433,10 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         quant_algo=None,
         routing_method="RENORMALIZE",
     ),
-    # Kimi-K3
-    # Activation is "situ" (situ(g) * up, situ(g) = b*tanh(g/b)*sigmoid(g)), which
-    # TensorRT-LLM does not implement here. situ is *gated*, so SWIGLU has the
-    # same fc1 fan-out, GEMM shapes and comm volume -- a faithful perf proxy,
-    # differing only in the epilogue elementwise math.
+    # Kimi-K3. SiTU is gated, so ``activation_type`` stays SWIGLU (same fc1
+    # geometry). ``build._situ_kwargs`` switches the epilogue for the backends
+    # that implement it (TRTLLM / MEGAMOE_DEEPGEMM on W4A8_MXFP4_MXFP8,
+    # MEGAMOE_CUTEDSL on NVFP4); other combinations keep the SwiGLU proxy.
     "kimi_k3": ModelSpec(
         name="kimi_k3",
         num_experts=896,
