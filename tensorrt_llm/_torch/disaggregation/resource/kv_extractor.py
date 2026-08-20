@@ -528,8 +528,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 for iid, gid in zip(all_internal_layer_ids, all_global_layer_ids)
             ]
 
-            # Bucket buffer entries by (pool, mapper kind). One PoolView is
-            # emitted per bucket and spans every layer of that role class,
+            # Bucket buffer entries by (pool, mapper kind, HND token groups).
+            # One PoolView is emitted per bucket and spans every layer of
+            # that role class,
             # so the view count per layer group is bounded by the number of
             # role classes — never by the layer count. A physical pool may
             # hold several classes (V2 storage coalesces buffers purely by
@@ -543,20 +544,39 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             # buffer lives at ``i * single_buffer_size``.
             bucket_entries: Dict[tuple, list] = defaultdict(list)
             bucket_roles: Dict[tuple, set] = defaultdict(set)
+            get_hnd_token_groups = getattr(manager, "get_disagg_hnd_token_groups", None)
             for pool_idx, coalesced_buffer in enumerate(variant.coalesced_buffers):
                 single_buffer_size = int(coalesced_buffer.single_buffer_size)
                 offset = 0
                 for buffer_id in coalesced_buffer.buffer_ids:
                     kind = role_mapper_kinds.get(buffer_id.role, default_mapper_kind)
-                    bucket_key = (pool_idx, kind)
+                    hnd_token_groups = (
+                        int(get_hnd_token_groups(int(buffer_id.layer_id), buffer_id.role))
+                        if get_hnd_token_groups is not None
+                        else 1
+                    )
+                    if hnd_token_groups <= 0 or config.tokens_per_block % hnd_token_groups != 0:
+                        raise ValueError(
+                            "Invalid HND token-group count: "
+                            f"tokens_per_block={config.tokens_per_block}, "
+                            f"hnd_token_groups={hnd_token_groups}, "
+                            f"layer={buffer_id.layer_id}, role={buffer_id.role!s}"
+                        )
+                    if hnd_token_groups != 1 and kind is not MapperKind.INDEXED:
+                        raise ValueError(
+                            "Grouped HND transfer requires MapperKind.INDEXED; "
+                            f"got {kind.name} for layer {buffer_id.layer_id}, "
+                            f"role {buffer_id.role!s}"
+                        )
+                    bucket_key = (pool_idx, kind, hnd_token_groups)
                     bucket_entries[bucket_key].append(
                         (int(buffer_id.layer_id), offset, single_buffer_size)
                     )
                     bucket_roles[bucket_key].add(str(buffer_id.role))
                     offset += single_buffer_size
 
-            # Emit this layer group's views: one per (pool, mapper-kind
-            # class of roles). Roles sharing a kind share a view
+            # Emit this layer group's views: one per (pool, mapper-kind,
+            # HND-token-group class of roles). Roles sharing a kind share a view
             # (KEY+VALUE); roles with different kinds in the same physical
             # pool get separate views (M3 coalesced index-K).
             # All ordering below is canonicalization — the page table is
@@ -569,7 +589,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 key=lambda key: (key[0], min(entry[1] for entry in bucket_entries[key])),
             )
             for bucket_key in lg_bucket_keys:
-                pool_idx, mapper_kind = bucket_key
+                pool_idx, mapper_kind, hnd_token_groups = bucket_key
                 roles = frozenset(bucket_roles[bucket_key])
                 entries = np.array(
                     sorted(bucket_entries[bucket_key], key=lambda entry: entry[1]),
@@ -592,6 +612,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                         buffer_entries=entries,
                         pool_role=roles,
                         mapper_kind=mapper_kind,
+                        hnd_token_groups=hnd_token_groups,
                         bytes_per_layer=bytes_per_layer,
                     )
                 )

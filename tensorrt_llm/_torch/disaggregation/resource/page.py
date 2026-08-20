@@ -182,6 +182,10 @@ class PoolView:
             are equal. Disagg never enumerates the role-name vocabulary —
             adding a new role on the manager side requires no disagg change.
         mapper_kind: Closed-set discriminator for picking the Mapper family.
+        hnd_token_groups: Number of independently head-major token groups in
+            an INDEXED (HND) buffer. Ordinary HND is one ``[H, N, D]`` group;
+            a flat subpage alias may expose ``[G, H, N/G, D]`` instead.
+            Head-mismatched transfer must slice heads inside every group.
         bytes_per_layer: Uniform byte size of one layer's region within the
             slot. The per-layer *offsets* live in ``buffer_entries``; only
             the size is uniform, because a slot may interleave other role
@@ -194,6 +198,7 @@ class PoolView:
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
     pool_role: FrozenSet[str] = field(default_factory=frozenset)
     mapper_kind: MapperKind = MapperKind.INDEXED
+    hnd_token_groups: int = 1
     bytes_per_layer: Optional[int] = None
 
     def to_dict(self) -> dict:
@@ -202,6 +207,7 @@ class PoolView:
             "buffer_entries": self.buffer_entries.tolist(),
             "pool_role": sorted(self.pool_role),
             "mapper_kind": int(self.mapper_kind),
+            "hnd_token_groups": int(self.hnd_token_groups),
             "bytes_per_layer": (
                 int(self.bytes_per_layer) if self.bytes_per_layer is not None else None
             ),
@@ -220,6 +226,7 @@ class PoolView:
             ),
             pool_role=frozenset(data["pool_role"]),
             mapper_kind=MapperKind(int(data["mapper_kind"])),
+            hnd_token_groups=int(data.get("hnd_token_groups", 1)),
             bytes_per_layer=(
                 int(data["bytes_per_layer"]) if data.get("bytes_per_layer") is not None else None
             ),

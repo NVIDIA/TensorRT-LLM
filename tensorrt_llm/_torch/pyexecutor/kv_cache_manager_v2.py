@@ -1897,6 +1897,17 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
 
+    def get_disagg_hnd_token_groups(self, local_layer_id: int, role: DataRole) -> int:
+        """Return the number of independently head-major groups in an HND buffer.
+
+        Most cache buffers use their manager's physical page layout directly.
+        A specialized manager may expose selected INDEXED buffers through a
+        grouped HND view; heterogeneous-head transfer must then slice each
+        group independently because flat physical head coordinates depend on
+        the local KV-head count.
+        """
+        return 1
+
     @property
     def blocks_in_primary_pool(self) -> int:
         """
