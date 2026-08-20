@@ -1884,6 +1884,15 @@ class PyTorchModelEngine(ModelEngine):
 
             with self.no_cuda_graph(), self._release_batch_context(
                     warmup_request, resource_manager) as batch:
+                if batch is None and self.mapping.has_cp_helix():
+                    # The helix floor may exceed tiny token/KV budgets; a
+                    # skipped warmup leaves Triton autotuning to the first
+                    # real request.
+                    logger.warning(
+                        f"Helix: skipping attention warmup shape "
+                        f"(num_tokens={num_tokens}, "
+                        f"num_gen_requests={num_gen_requests}); it does not "
+                        f"fit the token/KV budgets.")
                 if batch is None and self.mapping.tp_size <= 1:
                     continue  # Not enough KV cache space (single rank, safe to skip)
                 self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
