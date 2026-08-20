@@ -30,12 +30,14 @@ from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import (
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
     NVFP4WanCausalConv3d,
     WanCausalConv3d,
+    WanConv2d,
     WanResidualBlock,
     WanVAE,
     WanVAEConfig,
     _decode_chunk_slices,
     _fp4_align_input_channels,
     _fp4_align_output_channels,
+    _supports_nvfp4_conv3d,
     swap_wan_convs_to_fp4,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -89,6 +91,13 @@ def test_fp4_conv_rejects_unsupported_geometry():
 
     with pytest.raises(ValueError, match="stride-1 3x3x3"):
         NVFP4WanCausalConv3d(base)
+
+
+def test_fp4_conv_capability_uses_geometry_not_parent_type():
+    assert _supports_nvfp4_conv3d(WanCausalConv3d(3, 8, 3, padding=1))
+    assert not _supports_nvfp4_conv3d(WanCausalConv3d(8, 8, 1))
+    assert not _supports_nvfp4_conv3d(WanCausalConv3d(8, 8, (3, 1, 1), padding=(1, 0, 0)))
+    assert not _supports_nvfp4_conv3d(WanConv2d(8, 8, 3, padding=1))
 
 
 @pytest.mark.parametrize("use_cache", [False, True])
@@ -167,18 +176,43 @@ def test_swap_fp4_respects_checkpoint_module_names():
     assert isinstance(model[0].conv2, NVFP4WanCausalConv3d)
 
 
-def test_dynamic_fp4_selection_reuses_quant_config_exclusions():
-    model = torch.nn.Sequential(WanResidualBlock(8, 8).eval())
+def test_dynamic_fp4_selection_uses_geometry_and_config_exclusions():
+    class _MixedConvs(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.spatial = WanCausalConv3d(64, 64, 3, padding=1)
+            self.small_input = WanCausalConv3d(16, 64, 3, padding=1)
+            self.small_output = WanCausalConv3d(64, 3, 3, padding=1)
+            self.temporal = WanCausalConv3d(64, 64, (3, 1, 1), padding=(1, 0, 0))
+            self.pointwise = WanCausalConv3d(64, 64, 1)
+            self.image = WanConv2d(64, 64, 3, padding=1)
+            self.block = WanResidualBlock(64, 64).eval()
+
+    model = _MixedConvs()
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.NVFP4,
-        exclude_modules=["0.conv1"],
+        exclude_modules=["block.conv1"],
     )
 
-    assert _select_dynamic_fp4_convs(model, quant_config) == {"0.conv2"}
+    selected = _select_dynamic_fp4_convs(model, quant_config)
+    assert selected == {"spatial", "block.conv2"}
+
+    replaced, static = swap_wan_convs_to_fp4(model, only_names=selected)
+
+    assert replaced == 2
+    assert static == 0
+    assert isinstance(model.spatial, NVFP4WanCausalConv3d)
+    assert isinstance(model.block.conv2, NVFP4WanCausalConv3d)
+    assert not isinstance(model.block.conv1, NVFP4WanCausalConv3d)
+    assert not isinstance(model.small_input, NVFP4WanCausalConv3d)
+    assert not isinstance(model.small_output, NVFP4WanCausalConv3d)
+    assert not isinstance(model.temporal, NVFP4WanCausalConv3d)
+    assert not isinstance(model.pointwise, NVFP4WanCausalConv3d)
+    assert isinstance(model.image, WanConv2d)
 
 
 def test_vae_quant_config_enables_dynamic_fp4_from_bf16(monkeypatch):
-    model = torch.nn.Sequential(WanResidualBlock(8, 8).eval())
+    model = torch.nn.Sequential(WanResidualBlock(64, 64).eval())
     monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
     monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: False)
     monkeypatch.setattr(vae_loader, "_load_native_wan_vae", lambda *args: model)

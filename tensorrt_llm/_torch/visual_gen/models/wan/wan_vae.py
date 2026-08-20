@@ -438,6 +438,19 @@ def _fp4_align_output_channels(channels: int) -> int:
     return _round_up(channels, 8 if channels <= 128 else 256)
 
 
+def _supports_nvfp4_conv3d(module: nn.Module) -> bool:
+    """Return whether a native Wan Conv3d satisfies the FP4 kernel contract."""
+    return (
+        isinstance(module, WanCausalConv3d)
+        and module.kernel_size == (3, 3, 3)
+        and module.stride == (1, 1, 1)
+        and module.dilation == (1, 1, 1)
+        and module.groups == 1
+        and module.padding == (0, 1, 1)
+        and module._padding == (0, 0, 0, 0, 2, 0)
+    )
+
+
 @lru_cache(maxsize=1)
 def _fp4_imports() -> tuple[Any, ...]:
     import cuda.bindings.driver as cudadrv
@@ -763,16 +776,10 @@ class NVFP4WanCausalConv3d(WanCausalConv3d):
         norm_gamma: torch.Tensor | None = None,
         norm_scale: float | None = None,
     ) -> None:
-        supported_geometry = (
-            base.kernel_size == (3, 3, 3)
-            and base.stride == (1, 1, 1)
-            and base.dilation == (1, 1, 1)
-            and base.groups == 1
-            and base.padding == (0, 1, 1)
-        )
-        if not supported_geometry:
+        if not _supports_nvfp4_conv3d(base):
             raise ValueError(
-                "NVFP4WanCausalConv3d supports only dense stride-1 3x3x3 Wan convolutions"
+                "NVFP4WanCausalConv3d supports only dense stride-1 3x3x3 Wan convolutions "
+                "with causal temporal and same spatial padding"
             )
 
         super().__init__(base.in_channels, base.out_channels, 3, stride=1, padding=1)
@@ -985,49 +992,50 @@ def swap_wan_convs_to_fp4(
     input_scales: dict[str, float] | None = None,
     only_names: set[str] | None = None,
 ) -> tuple[int, int]:
-    """Replace selected residual-block convolutions with the NVFP4 implementation.
+    """Replace selected kernel-compatible convolutions with the NVFP4 implementation.
 
     Args:
         vae: Native Wan VAE containing the convolutions to replace.
         input_scales: Calibrated ModelOpt input scales keyed by module name.
-        only_names: Optional set of checkpoint module names that are quantized.
+        only_names: Optional set of module names to replace.
 
     Returns:
         The total number of replacements and the number with static input scales.
     """
     input_scales = input_scales or {}
 
-    # Calibrated static convs absorb the preceding SiLU, and RMSNorm when its
-    # unbiased form is structurally compatible. Dynamic convs retain the
-    # standalone operations because their activation scale is data-dependent.
+    # Calibrated residual-block convs absorb the preceding SiLU, and RMSNorm
+    # when its unbiased form is structurally compatible. Other supported convs
+    # use the same FP4 kernel without graph-pattern fusion. Dynamic convs retain
+    # standalone input operations because their activation scale is data-dependent.
     norm_attr = {"conv1": "norm1", "conv2": "norm2"}
     replaced = static = 0
-    for name, module in vae.named_modules():
-        if isinstance(module, WanResidualBlock):
-            for attr in ("conv1", "conv2"):
-                conv = getattr(module, attr)
-                if isinstance(conv, WanCausalConv3d) and not isinstance(conv, NVFP4WanCausalConv3d):
-                    conv_name = f"{name}.{attr}"
-                    if only_names is not None and conv_name not in only_names:
-                        continue
-                    input_scale = input_scales.get(conv_name)
-                    gamma = scale = None
-                    norm = getattr(module, norm_attr[attr], None)
-                    if isinstance(norm, WanRMSNorm) and not isinstance(norm.bias, nn.Parameter):
-                        gamma = norm.gamma.detach().reshape(-1)
-                        scale = norm.scale
-                    replacement = NVFP4WanCausalConv3d(
-                        conv,
-                        input_scale=input_scale,
-                        absorb_silu=True,
-                        absorb_norm=True,
-                        norm_gamma=gamma,
-                        norm_scale=scale,
-                    ).to(conv.weight.device, conv.weight.dtype)
-                    replacement.train(conv.training)
-                    setattr(module, attr, replacement)
-                    replaced += 1
-                    static += int(input_scale is not None)
+    for parent_name, parent in list(vae.named_modules()):
+        for attr, conv in list(parent.named_children()):
+            if isinstance(conv, NVFP4WanCausalConv3d) or not _supports_nvfp4_conv3d(conv):
+                continue
+            conv_name = f"{parent_name}.{attr}" if parent_name else attr
+            if only_names is not None and conv_name not in only_names:
+                continue
+            input_scale = input_scales.get(conv_name)
+            gamma = scale = None
+            residual_conv = isinstance(parent, WanResidualBlock) and attr in norm_attr
+            norm = getattr(parent, norm_attr[attr], None) if residual_conv else None
+            if isinstance(norm, WanRMSNorm) and not isinstance(norm.bias, nn.Parameter):
+                gamma = norm.gamma.detach().reshape(-1)
+                scale = norm.scale
+            replacement = NVFP4WanCausalConv3d(
+                conv,
+                input_scale=input_scale,
+                absorb_silu=residual_conv,
+                absorb_norm=residual_conv,
+                norm_gamma=gamma,
+                norm_scale=scale,
+            ).to(conv.weight.device, conv.weight.dtype)
+            replacement.train(conv.training)
+            setattr(parent, attr, replacement)
+            replaced += 1
+            static += int(input_scale is not None)
     return replaced, static
 
 
