@@ -2071,6 +2071,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
 
 
 @skip_arm
+@skip_pre_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2086,10 +2087,11 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["UCX_TLS"] = get_ucx_tls()
     env["UCX_MM_ERROR_HANDLING"] = "y"
 
-    # No arch gate: placement is controlled by the test lists (l0_dgx_h100,
-    # l0_dgx_b200 pre_merge, l0_dgx_b300). A stale Hopper-only @skip_no_hopper
-    # used to silently skip this test on its B200/B300 registrations; dropping
-    # it makes them live.
+    # @skip_pre_hopper (SM >= 90), not @skip_no_hopper (SM == 90): placement is
+    # controlled by the test lists (l0_dgx_h100, l0_dgx_b200 pre_merge,
+    # l0_dgx_b300), which cover Hopper and Blackwell. The old Hopper-only
+    # @skip_no_hopper silently skipped this test on its B200/B300 registrations;
+    # skip_pre_hopper keeps those live while still gating out pre-Hopper.
     #
     # On SM100/103 this test doubles as the decode-only smoke for the CuTe DSL
     # MLA decode FMHA lib: a disagg generation server runs decode-only batches,
