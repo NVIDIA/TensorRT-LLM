@@ -17,7 +17,7 @@ re-checked here.
 
 from typing import Iterable, Optional, Set
 
-from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.quantization.mode import QuantMode
 
 # Canonical routed-expert MoE LoRA module names (single source of truth).

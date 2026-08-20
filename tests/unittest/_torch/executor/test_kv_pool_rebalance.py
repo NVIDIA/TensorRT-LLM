@@ -906,6 +906,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe.device_id = 0
     exe.enable_iter_perf_stats = False
     exe.iter_counter = 0
+    exe._mm_encoder_item_scheduling_enabled = False
 
     # Rebalance state.  _uses_kv_manager_v2() reads the explicit flag first.
     exe._is_kv_manager_v2 = True
