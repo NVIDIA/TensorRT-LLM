@@ -231,6 +231,76 @@ def test_vae_quant_config_enables_dynamic_fp4_from_bf16(monkeypatch):
     assert isinstance(model[0].conv2, NVFP4WanCausalConv3d)
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"dynamic_weight_quant": False}, "weights.dynamic=false"),
+        ({"dynamic_activation_quant": False}, "input_activations.dynamic=false"),
+    ],
+)
+def test_bf16_vae_rejects_unavailable_static_fp4_modes(monkeypatch, kwargs, message):
+    model = torch.nn.Sequential(WanResidualBlock(64, 64).eval())
+    monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
+    monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: False)
+    monkeypatch.setattr(vae_loader, "_load_native_wan_vae", lambda *args: model)
+
+    with pytest.raises(ValueError, match=message):
+        load_wan_vae(
+            "/unused",
+            torch.device("cpu"),
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            **kwargs,
+        )
+
+
+def test_bf16_vae_validates_dynamic_modes_after_exclusions(monkeypatch):
+    model = torch.nn.Sequential(WanResidualBlock(64, 64).eval())
+    monkeypatch.setattr(vae_loader, "_use_native_wan_vae", lambda: True)
+    monkeypatch.setattr(vae_loader, "_is_nvfp4_vae_ckpt", lambda _: False)
+    monkeypatch.setattr(vae_loader, "_load_native_wan_vae", lambda *args: model)
+
+    loaded = load_wan_vae(
+        "/unused",
+        torch.device("cpu"),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, exclude_modules=["*"]),
+        dynamic_weight_quant=False,
+        dynamic_activation_quant=False,
+    )
+
+    assert loaded is model
+    assert not any(isinstance(module, NVFP4WanCausalConv3d) for module in model.modules())
+
+
+@pytest.mark.parametrize("checkpoint_is_fp4", [False, True])
+def test_dynamic_weight_request_must_match_checkpoint_source(checkpoint_is_fp4):
+    incompatible_request = checkpoint_is_fp4
+
+    with pytest.raises(ValueError, match="weights.dynamic"):
+        vae_loader._validate_dynamic_weight_request(
+            checkpoint_is_fp4=checkpoint_is_fp4,
+            selected={"decoder.conv"},
+            dynamic_weight_quant=incompatible_request,
+        )
+
+
+def test_dynamic_activation_request_resolves_checkpoint_scales():
+    scales = {"decoder.conv1": 0.5}
+
+    assert vae_loader._resolve_input_scales({"decoder.conv1"}, scales, None) == scales
+    assert vae_loader._resolve_input_scales({"decoder.conv1"}, scales, False) == scales
+    assert vae_loader._resolve_input_scales({"decoder.conv1"}, scales, True) == {}
+
+    with pytest.raises(ValueError, match="decoder.conv2"):
+        vae_loader._resolve_input_scales(
+            {"decoder.conv1", "decoder.conv2"},
+            scales,
+            False,
+        )
+
+    with pytest.raises(ValueError, match="missing or invalid"):
+        vae_loader._resolve_input_scales({"decoder.conv1"}, {"decoder.conv1": 0.0}, False)
+
+
 def test_explicit_bf16_config_dequantizes_fp4_checkpoint(monkeypatch):
     sentinel = torch.nn.Identity()
     call: dict[str, object] = {}
