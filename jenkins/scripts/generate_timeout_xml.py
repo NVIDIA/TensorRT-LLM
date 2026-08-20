@@ -305,7 +305,7 @@ def generate_timeout_xml(
     xmlContent = (
         f'<?xml version="1.0" encoding="UTF-8"?><testsuites>\n'
         f'        <testsuite name="{stage_name_escaped}" errors="{num_tests}" '
-        f'failures="0" skipped="0" tests="{num_tests}" '
+        f'tests="{num_tests}" '
         f'unfinished_test="{num_tests}" timeout="{timeout_count}" unknown="{unknown_count}" '
         f'time="{sum(durations.values()):.2f}">\n'
     )
