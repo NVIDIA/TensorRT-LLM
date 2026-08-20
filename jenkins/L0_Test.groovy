@@ -4103,9 +4103,11 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     // with no trailing newline, so `wc -l` undercounts by one -- it reports 0
     // for a single-test render, which would trip the empty-list guard below
     // (and mis-report every stage's count by one). `grep -c .` is agnostic to
-    // the missing terminator; `|| true` keeps the zero-match exit 1 from
-    // aborting the step.
-    def testCount = sh(returnStdout: true, script: "grep -c . ${testList} || true").trim()
+    // the missing terminator. It exits 1 for no matches (a legitimately empty
+    // render -> count "0"); accept only that, so a read failure (exit 2:
+    // missing file, unreadable, etc.) still aborts the step instead of being
+    // silently masked.
+    def testCount = sh(returnStdout: true, script: "grep -c . -- ${testList} || test \$? -eq 1").trim()
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
