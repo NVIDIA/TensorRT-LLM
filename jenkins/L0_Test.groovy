@@ -2373,8 +2373,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         fi
                     done
 
-                    # Kill tail -f process
-                    kill \$tailPid
+                    # Stop and reap the log follower. It may have already exited
+                    # when the remote log stream closes; that is not a test failure.
+                    kill \$tailPid 2>/dev/null || true
+                    wait \$tailPid 2>/dev/null || true
 
                     # Wait briefly to ensure accounting is consistent
                     sleep 10
@@ -6424,7 +6426,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
                             // Remove stale nvidia-cutlass-dsl from the base image to prevent namespace
                             // directory corruption when pip upgrades to the version required by tensorrt_llm.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true")
+                            trtllm_utils.llmExecStepWithRetry(
+                                pipeline,
+                                script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base " +
+                                    "nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 " +
+                                    "nvidia-cutlass-dsl-libs-cu13 || true")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: 'rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*')
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
