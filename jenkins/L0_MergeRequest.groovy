@@ -454,6 +454,8 @@ def mergeWaiveList(pipeline, globalVars)
 def checkTestList(pipeline)
 {
     sh "git config --global --add safe.directory \"*\""
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip")
+    sh "pip3 config set global.break-system-packages true"
     // --no-install-wheel installs only requirements-check-test-list.txt (torch
     // CPU build + pytest plugins) and trt-test-db — no GPU or trtllm wheel
     // needed. conftest.py stubs out tensorrt_llm.bindings when absent so
