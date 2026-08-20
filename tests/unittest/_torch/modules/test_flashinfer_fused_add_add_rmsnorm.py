@@ -8,7 +8,7 @@ import torch
 
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tests.unittest.utils.util import getSMVersion
+from tensorrt_llm._utils import is_sm_100f
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer.norm
@@ -25,12 +25,12 @@ TOKEN_COUNTS = tuple(range(1, 33))
 
 
 pytestmark = pytest.mark.skipif(
-    getSMVersion() < 100
+    not is_sm_100f()
     or not IS_FLASHINFER_AVAILABLE
     or not IS_CUTLASS_DSL_AVAILABLE
     or os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
     or (IS_FLASHINFER_AVAILABLE and getattr(flashinfer.norm, "_USE_CUDA_NORM", True)),
-    reason="Requires SM100+, FlashInfer 0.6.15 CuTe RMSNorm, and CUTLASS DSL",
+    reason="Requires SM100f, FlashInfer 0.6.15 CuTe RMSNorm, and CUTLASS DSL",
 )
 
 
@@ -107,3 +107,35 @@ def test_matches_current_sequence_cuda_graph(num_tokens: int) -> None:
         graph.replay()
         torch.cuda.synchronize()
         _assert_exact(actual_shared, actual_residual, expected_shared, expected_residual)
+
+
+@pytest.mark.parametrize(
+    ("invalid_case", "message"),
+    [
+        ("rank", "must all be 2D"),
+        ("shape", "must match input shape"),
+        ("dtype", "must match input dtype"),
+        ("weight_shape", "weight must have shape"),
+        ("weight_device", "weight must match input dtype and device"),
+        ("hidden_stride", "must be contiguous in the hidden dimension"),
+    ],
+)
+def test_rejects_invalid_tensor_contract(invalid_case: str, message: str) -> None:
+    shared, routed, residual, weight = _make_inputs(2)
+    if invalid_case == "rank":
+        shared = shared.unsqueeze(0)
+    elif invalid_case == "shape":
+        routed = routed[:1]
+    elif invalid_case == "dtype":
+        residual = residual.to(torch.float16)
+    elif invalid_case == "weight_shape":
+        weight = weight[:-1]
+    elif invalid_case == "weight_device":
+        weight = weight.cpu()
+    elif invalid_case == "hidden_stride":
+        shared = shared.as_strided(shared.shape, (1, shared.shape[0]))
+    else:
+        raise AssertionError(f"Unhandled invalid case: {invalid_case}")
+
+    with pytest.raises(ValueError, match=message):
+        flashinfer_fused_add_add_rmsnorm(shared, routed, residual, weight, EPSILON)
