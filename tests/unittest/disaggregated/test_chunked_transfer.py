@@ -34,7 +34,6 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import (
-    _KV_RESULT_PREFIX,
     AgentResult,
     KVSendTask,
     RecvReqInfo,
@@ -42,7 +41,6 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Sender,
     TaskStatus,
     TxSession,
-    WriteMeta,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -383,45 +381,6 @@ def test_build_kv_write_meta_echoes_peer_slice_id():
     )
 
     assert write_meta.slice_id == 3
-
-
-# ---------------------------------------------------------------------------
-# KV_AGENT_RESULT slice-id addressing tests
-# ---------------------------------------------------------------------------
-
-
-def _make_write_meta(slice_id) -> WriteMeta:
-    empty = np.array([], dtype=np.int64)
-    return WriteMeta(
-        task=MagicMock(),
-        expected_transfers=1,
-        peer_name="decode0",
-        peer_rank=0,
-        peer_endpoint="tcp://decode:0",
-        unique_rid=42,
-        src_ptrs=empty,
-        dst_ptrs=empty,
-        sizes=empty,
-        slice_id=slice_id,
-    )
-
-
-def test_send_kv_result_uses_peer_slice_id():
-    """The result-frame slice field addresses the peer's own task."""
-    sender = Sender.__new__(Sender)
-    sender._instance_rank = 5
-    dealer = MagicMock()
-    sender._get_or_connect_thread_dealer = MagicMock(return_value=dealer)
-
-    sender._send_kv_result_to_receiver(
-        _make_write_meta(slice_id=2),
-        is_last=True,
-        result=AgentResult.SUCCESS,
-    )
-
-    (msg,), _ = dealer.send.call_args
-    rank, rid, slice_id, is_last, _code, _size = _KV_RESULT_PREFIX.unpack(msg[1])
-    assert (rank, rid, slice_id, is_last) == (5, 42, 2, True)
 
 
 def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():

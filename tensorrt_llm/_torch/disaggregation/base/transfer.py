@@ -10,37 +10,6 @@ import numpy as np
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
-
-def project_blocks_to_global_chunk(
-    block_ids: np.ndarray,
-    chunk_block_offset: int,
-    chunk_block_count: int,
-    resident_block_end: int,
-) -> np.ndarray:
-    """Project a global block chunk into a suffix-resident block list.
-
-    ``block_ids`` represents the resident suffix of the logical range
-    ``[0, resident_block_end)``. ``chunk_block_offset`` and
-    ``chunk_block_count`` describe a chunk in that global coordinate space.
-    """
-    if chunk_block_count <= 0 or len(block_ids) == 0:
-        return block_ids[:0]
-
-    resident_start = max(0, resident_block_end - len(block_ids))
-    resident_end = resident_block_end
-    chunk_start = chunk_block_offset
-    chunk_end = chunk_start + chunk_block_count
-
-    overlap_start = max(chunk_start, resident_start)
-    overlap_end = min(chunk_end, resident_end)
-    if overlap_start >= overlap_end:
-        return block_ids[:0]
-
-    local_start = overlap_start - resident_start
-    local_end = overlap_end - resident_start
-    return block_ids[local_start:local_end]
-
-
 @dataclass
 class TokenRange:
     """Half-open token range [start, end) within one request.
