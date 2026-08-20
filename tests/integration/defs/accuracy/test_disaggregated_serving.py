@@ -609,7 +609,7 @@ def run_parallel_test(model_name: str,
                       test_sets: List[LlmapiAccuracyTestHarness],
                       ctx_model: str = None,
                       gen_model: str = None,
-                      cache_transceiver_backend: str = "DEFAULT"):
+                      cache_transceiver_backend: str = "NIXL"):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -829,6 +829,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
+                "use_kv_cache_manager_v2": eagle3_one_model,
                 "enable_block_reuse": True  # reuse on context requests
             },
             "max_num_tokens": 13393 * 2,
@@ -844,7 +845,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
-                "enable_block_reuse": False
+                "enable_block_reuse": False,
+                "use_kv_cache_manager_v2": eagle3_one_model,
             },
             "max_num_tokens": 13393 * 2,
             "max_batch_size": 16,
@@ -982,6 +984,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.8,
+                "use_kv_cache_manager_v2": eagle3_one_model,
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
@@ -995,6 +998,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.8,
+                "use_kv_cache_manager_v2": eagle3_one_model,
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
@@ -1190,6 +1194,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
+            "use_kv_cache_manager_v2": False,
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
@@ -1204,6 +1209,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # backend but NIXL. Transport coverage is unchanged by this move.
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
         }
@@ -1224,6 +1230,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
+                "transceiver_runtime": "CPP",
                 "max_tokens_in_buffer": 8192,
             },
             "enable_attention_dp": enable_attention_dp,
@@ -1755,7 +1762,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             },
             "kv_cache_config": kv_cache_config,
@@ -1764,7 +1771,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": overlap_scheduler,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             },
             "kv_cache_config": kv_cache_config,
@@ -1797,7 +1804,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             },
             "enable_chunked_prefill": True,
@@ -1808,7 +1815,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
                 "max_tokens_in_buffer": 4096
             },
             "max_batch_size": max_batch_size,
@@ -1852,9 +1859,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
+            "use_kv_cache_manager_v2": False,
         }
         cache_transceiver_config = {
             "backend": "DEFAULT",
+            "transceiver_runtime": "CPP",
             "max_tokens_in_buffer": 8192,
         }
         ctx_server_config = {

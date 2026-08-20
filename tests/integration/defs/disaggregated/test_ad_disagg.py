@@ -180,9 +180,14 @@ def base_config(extra_config=None):
 
 
 def disagg_config(extra_config=None):
+    config = base_config(extra_config)
+    config["kv_cache_config"] = {
+        **config["kv_cache_config"],
+        "use_kv_cache_manager_v2": False,
+    }
     return dict(
-        base_config(extra_config),
-        cache_transceiver_config={"backend": "DEFAULT"},
+        config,
+        cache_transceiver_config={"backend": "DEFAULT", "transceiver_runtime": "CPP"},
     )
 
 

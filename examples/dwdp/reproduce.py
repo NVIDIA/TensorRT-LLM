@@ -220,7 +220,7 @@ def build_worker_config(experiment: Dict[str, Any]) -> Dict[str, Any]:
             "backend": "CUTEDSL",
         },
         "cache_transceiver_config": {
-            "backend": "UCX",
+            "backend": "NIXL",
             "max_tokens_in_buffer": max_tokens_in_buffer,
         },
         "num_postprocess_workers": 4,
@@ -255,7 +255,7 @@ def build_worker_config(experiment: Dict[str, Any]) -> Dict[str, Any]:
             "free_gpu_memory_fraction": 0.3,
         },
         "cache_transceiver_config": {
-            "backend": "UCX",
+            "backend": "NIXL",
             "max_tokens_in_buffer": max_tokens_in_buffer,
         },
         "moe_config": {

@@ -157,11 +157,11 @@ def add_llm_args(parser):
                         action='store_true')
     parser.add_argument(
         '--use_kv_cache_manager_v2',
-        default='auto',
+        default=True,
         type=_parse_kv_cache_manager_v2,
         metavar='{auto,true,false}',
         help=
-        'Whether to use KVCacheManagerV2 for KV cache management (PyTorch backend). Defaults to model-specific auto selection.',
+        'Whether to use KVCacheManagerV2 for KV cache management (PyTorch backend). Defaults to true; use auto for model-specific selection.',
     )
 
     # Runtime

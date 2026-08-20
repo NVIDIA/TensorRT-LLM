@@ -658,7 +658,8 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
         pytest.skip(f"Required models not found")
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    free_gpu_memory_fraction=0.6)
+                                    free_gpu_memory_fraction=0.6,
+                                    use_kv_cache_manager_v2=eagle3_one_model)
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
@@ -750,8 +751,10 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     else:
         cuda_graph_config = None
 
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=False)
     llm_spec = LLM(model=target_model_dir,
                    speculative_config=spec_config,
+                   kv_cache_config=kv_cache_config,
                    max_batch_size=1,
                    cuda_graph_config=cuda_graph_config,
                    disable_overlap_scheduler=True)
@@ -765,6 +768,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     llm_spec.shutdown()
 
     llm_ref = LLM(model=target_model_dir,
+                  kv_cache_config=kv_cache_config,
                   max_batch_size=1,
                   cuda_graph_config=None,
                   disable_overlap_scheduler=False)
@@ -955,7 +959,8 @@ def test_multi_eagle3(use_one_model: bool):
         max_batch_size = 16
         max_draft_len = 3
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                        free_gpu_memory_fraction=0.5)
+                                        free_gpu_memory_fraction=0.5,
+                                        use_kv_cache_manager_v2=use_one_model)
         cuda_graph_config = CudaGraphConfig(
             batch_sizes=[1]) if use_cuda_graph else None
 
@@ -1005,7 +1010,8 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
     max_batch_size = 1
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
-                                    max_tokens=8192)
+                                    max_tokens=8192,
+                                    use_kv_cache_manager_v2=False)
     cuda_graph_config = CudaGraphConfig(batch_sizes=[1, 2, 4],
                                         enable_padding=True)
 

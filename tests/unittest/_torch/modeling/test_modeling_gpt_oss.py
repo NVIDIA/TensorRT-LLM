@@ -63,9 +63,10 @@ def _resolve_gpt_oss_kv_cache_manager_v2(**llm_args_kwargs) -> bool:
     return _resolve_kv_cache_manager_v2_auto(llm_args, GptOssForCausalLM)
 
 
-def test_gpt_oss_model_preference_selects_v2():
+def test_gpt_oss_auto_selects_model_preference():
     """GPT-OSS is VSWA, so "auto" resolves to KVCacheManagerV2."""
-    assert _resolve_gpt_oss_kv_cache_manager_v2() is True
+    assert _resolve_gpt_oss_kv_cache_manager_v2(kv_cache_config=KvCacheConfig(
+        use_kv_cache_manager_v2="auto")) is True
 
 
 @pytest.mark.parametrize("user_setting", [False, True])

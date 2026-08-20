@@ -10,10 +10,12 @@ context_servers:
     enable_block_reuse: false
     enable_partial_reuse: false
     tokens_per_block: 32
+    use_kv_cache_manager_v2: false
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   cache_transceiver_config:
     backend: UCX
+    transceiver_runtime: CPP
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -27,5 +29,7 @@ generation_servers:
     enable_block_reuse: false
     enable_partial_reuse: false
     tokens_per_block: 32
+    use_kv_cache_manager_v2: false
   cache_transceiver_config:
     backend: UCX
+    transceiver_runtime: CPP

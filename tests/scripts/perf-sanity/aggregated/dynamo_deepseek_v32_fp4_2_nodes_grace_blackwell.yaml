@@ -35,10 +35,12 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
+      use_kv_cache_manager_v2: false
       free_gpu_memory_fraction: 0.9
       tokens_per_block: 64
     cache_transceiver_config:
       backend: UCX
+      transceiver_runtime: CPP
       max_tokens_in_buffer: 120000
     client_configs:
       - name: "con4_iter10_8k1k"

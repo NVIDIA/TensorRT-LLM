@@ -69,6 +69,13 @@ from dataclasses import replace
 # isort: on
 
 
+def _kv_cache_config_for_transceiver_runtime(
+        config: KvCacheConfig,
+        transceiver_runtime: Optional[str]) -> KvCacheConfig:
+    return config.model_copy(
+        update={"use_kv_cache_manager_v2": transceiver_runtime == "PYTHON"})
+
+
 @force_ampere
 @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
 @pytest.mark.part2
@@ -227,7 +234,8 @@ def test_llm_reward_model():
 @pytest.mark.part3
 def test_llm_perf_metrics():
     with LLM(model=llama_model_path,
-             kv_cache_config=global_kvcache_config) as llm:
+             kv_cache_config=global_kvcache_config.model_copy(
+                 update={"use_kv_cache_manager_v2": False})) as llm:
         sampling_params = SamplingParams(max_tokens=10,
                                          return_perf_metrics=True)
         outputs = llm.generate(prompts, sampling_params)
@@ -265,7 +273,8 @@ def test_llm_prefix_cache_reuse(attn_backend):
     with LLM(
             model=model_path,
             attn_backend=attn_backend,
-            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                          use_kv_cache_manager_v2=False),
             cuda_graph_config=None,
     ) as llm:
         cold_output = llm.generate(prompt, sampling_params).outputs[0]
@@ -1498,7 +1507,8 @@ def test_llm_context_only_timed_out(transceiver_runtime):
     # Python transceiver (V2) only supports NIXL/DEFAULT backends
     backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm = LLM(model=llama_model_path,
-              kv_cache_config=global_kvcache_config,
+              kv_cache_config=_kv_cache_config_for_transceiver_runtime(
+                  global_kvcache_config, transceiver_runtime),
               tensor_parallel_size=tp_size,
               cache_transceiver_config=CacheTransceiverConfig(
                   backend=backend,
@@ -1593,9 +1603,10 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.1,
-                                    max_tokens=1000,
-                                    enable_block_reuse=False)
+    kv_cache_config = _kv_cache_config_for_transceiver_runtime(
+        KvCacheConfig(free_gpu_memory_fraction=0.1,
+                      max_tokens=1000,
+                      enable_block_reuse=False), transceiver_runtime)
     llm = LLM(model=llama_model_path,
               kv_cache_config=kv_cache_config,
               tensor_parallel_size=tp_size,
@@ -1672,7 +1683,8 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
     # Python transceiver (V2) only supports NIXL/DEFAULT backends
     backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm_ctx = LLM(model=llama_model_path,
-                  kv_cache_config=global_kvcache_config_no_reuse,
+                  kv_cache_config=_kv_cache_config_for_transceiver_runtime(
+                      global_kvcache_config_no_reuse, transceiver_runtime),
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
                       backend=backend,
@@ -1681,7 +1693,8 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
-                  kv_cache_config=global_kvcache_config_no_reuse,
+                  kv_cache_config=_kv_cache_config_for_transceiver_runtime(
+                      global_kvcache_config_no_reuse, transceiver_runtime),
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
                       backend=backend,
@@ -1854,7 +1867,8 @@ async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
     # Python transceiver (V2) only supports NIXL/DEFAULT backends
     backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm_ctx = LLM(model=llama_model_path,
-                  kv_cache_config=global_kvcache_config_no_reuse,
+                  kv_cache_config=_kv_cache_config_for_transceiver_runtime(
+                      global_kvcache_config_no_reuse, transceiver_runtime),
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
                       backend=backend,
@@ -1863,7 +1877,8 @@ async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
-                  kv_cache_config=global_kvcache_config_no_reuse,
+                  kv_cache_config=_kv_cache_config_for_transceiver_runtime(
+                      global_kvcache_config_no_reuse, transceiver_runtime),
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
                       backend=backend,

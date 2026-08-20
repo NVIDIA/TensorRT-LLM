@@ -841,6 +841,36 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
 
 
 @pytest.mark.parametrize(
+    ("is_v2", "cp_config", "expected_skip_est"),
+    [
+        (True, {}, True),
+        (False, {}, False),
+        (True, {"cp_type": "ring"}, False),
+    ],
+)
+def test_vanilla_attention_uses_capacity_fallback_for_v2(
+    is_v2: bool,
+    cp_config: dict,
+    expected_skip_est: bool,
+) -> None:
+    creator = object.__new__(KvCacheCreator)
+    creator._skip_est = False
+    creator._mapping = SimpleNamespace(cp_config=cp_config)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                attn_backend="VANILLA",
+                is_encoder_decoder=False,
+            )
+        )
+    )
+    creator._is_kv_cache_manager_v2 = is_v2
+
+    assert creator.try_prepare_estimation() is False
+    assert creator._skip_est is expected_skip_est
+
+
+@pytest.mark.parametrize(
     ("estimating_kv_cache", "expected_avg_seq_len"),
     [(True, 2045), (False, 2055)],
 )
