@@ -1,31 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2.3 ("V2") video VAE decoder.
+"""LTX-2.3 video VAE decoder.
 
-LTX-2.3 reuses LTX-2's VAE *primitives* (ResnetBlock3D / UNetMidBlock3D /
-DepthToSpaceUpsample / convs) and forward/tiled-decode machinery, but its
-decoder channel recipe differs in one structural way that LTX-2's ``VideoDecoder``
-cannot express:
+LTX-2.3 reuses LTX-2's VAE primitives and forward/tiled-decode machinery, but
+its channel recipe differs: compress_time and compress_space reduce channels by
+their multiplier, where LTX-2 only did that for compress_all. conv_in is
+therefore latent_channels times the product of every multiplier, not just the
+compress_all ones -- 128 * (2*1*2*2) = 1024 for the checkpoint recipe.
 
-* In LTX-2, only ``res_x_y`` and ``compress_all`` change channels; the spatial
-  upsamplers ``compress_time`` / ``compress_space`` keep channels unchanged.
-* In LTX-2.3, **``compress_time`` and ``compress_space`` also reduce channels by
-  their ``multiplier``** (exactly like ``compress_all``), i.e. their internal
-  conv emits ``in * prod(stride) // multiplier`` channels and the depth-to-space
-  rearrange yields ``in // multiplier``.
-
-Consequently the ``conv_in`` feature width is ``latent_channels`` times the
-product of **every** compress/res_x_y multiplier (reversed order), not just the
-``compress_all`` ones. For the LTX-2.3 checkpoint recipe
-(compress_all=2, compress_all=1, compress_time=2, compress_space=2) that is
-``128 * (2*1*2*2) = 1024`` -- matching ``conv_in.conv.weight [1024, 128, 3,3,3]``.
-
-We subclass LTX-2's ``VideoDecoder`` so all of its ``forward`` / ``tiled_decode``
-/ per-channel-statistics / tiling logic is inherited unchanged, and rebuild only
-the channel-bearing modules (``conv_in``, ``up_blocks``, ``conv_norm_out``,
-``conv_out``) with the corrected channel flow. LTX-2.3 also uses a single shared
-``spatial_padding_mode`` config key (vs LTX-2's per-role decoder/encoder keys).
+This subclasses LTX-2's VideoDecoder to inherit that machinery unchanged and
+rebuilds only the channel-bearing modules with the corrected flow.
 """
 
 from typing import List, Tuple, Union
@@ -38,10 +23,8 @@ from ...ltx2.ltx2_core.video_vae.convolution import make_conv_nd
 from ...ltx2.ltx2_core.video_vae.enums import NormLayerType, PaddingModeType
 from ...ltx2.ltx2_core.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
 from ...ltx2.ltx2_core.video_vae.sampling import DepthToSpaceUpsample
-from ...ltx2.ltx2_core.video_vae.video_vae import VideoDecoder
+from ...ltx2.ltx2_core.video_vae.video_vae import VideoDecoder as LTX2VideoDecoder
 
-# Spatial/temporal strides per compress block (LTX-2.3 == LTX-2 spatially; the
-# only difference is the channel reduction below).
 _COMPRESS_STRIDES = {
     "compress_time": (2, 1, 1),
     "compress_space": (1, 2, 2),
@@ -50,11 +33,7 @@ _COMPRESS_STRIDES = {
 
 
 def _channel_multiplier(block_name: str, block_config: dict) -> int:
-    """Factor by which this block reduces channels in the forward pass.
-
-    Used to pre-size ``conv_in`` (the reversed product of these factors). Blocks
-    that do not change channels (``res_x`` / ``attn_res_x``) return 1.
-    """
+    """Factor by which this block reduces channels, used to pre-size conv_in."""
     if block_name == "res_x_y":
         return block_config.get("multiplier", 2)
     if block_name in _COMPRESS_STRIDES:
@@ -72,7 +51,7 @@ def _make_ltx23_decoder_block(
     norm_num_groups: int,
     spatial_padding_mode: PaddingModeType,
 ) -> Tuple[nn.Module, int]:
-    """Like LTX-2's ``_make_decoder_block`` but compress_time/space reduce channels."""
+    """Like LTX-2's _make_decoder_block, but compress_time/space reduce channels."""
     out_channels = in_channels
     if block_name == "res_x":
         block = UNetMidBlock3D(
@@ -113,9 +92,7 @@ def _make_ltx23_decoder_block(
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name in _COMPRESS_STRIDES:
-        # LTX-2.3: compress_* reduces channels by `multiplier` (LTX-2 only did
-        # this for compress_all). out = in // multiplier; the internal conv emits
-        # in * prod(stride) // multiplier.
+        # The internal conv emits in * prod(stride) // multiplier.
         multiplier = block_config.get("multiplier", 1)
         out_channels = in_channels // multiplier
         block = DepthToSpaceUpsample(
@@ -131,7 +108,7 @@ def _make_ltx23_decoder_block(
     return block, out_channels
 
 
-class LTX23VideoDecoder(VideoDecoder):
+class LTX23VideoDecoder(LTX2VideoDecoder):
     """LTX-2.3 video decoder: LTX-2 primitives, LTX-2.3 channel recipe."""
 
     def __init__(
@@ -146,10 +123,8 @@ class LTX23VideoDecoder(VideoDecoder):
         timestep_conditioning: bool = False,
         spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
     ):
-        # Build the LTX-2 decoder first so every non-block attribute
-        # (per_channel_statistics, downscale factors, decode params) and all
-        # inherited forward/tiled_decode methods are set up. Its conv_in/up_blocks
-        # use LTX-2 channel math (wrong for LTX-2.3); we overwrite them below.
+        # Build the LTX-2 decoder first so every non-block attribute is set up.
+        # Its conv_in and up_blocks are overwritten below.
         super().__init__(
             convolution_dimensions=convolution_dimensions,
             in_channels=in_channels,
@@ -165,8 +140,6 @@ class LTX23VideoDecoder(VideoDecoder):
         dims = convolution_dimensions
         patched_out_channels = out_channels * patch_size**2
 
-        # conv_in width = latent_channels * product of all channel multipliers
-        # (reversed order), so the whole decoder narrows back down to `in_channels`.
         feature_channels = in_channels
         for block_name, block_params in list(reversed(decoder_blocks)):
             cfg = block_params if isinstance(block_params, dict) else {}
@@ -217,8 +190,8 @@ class LTX23VideoDecoder(VideoDecoder):
             spatial_padding_mode=spatial_padding_mode,
         )
 
-        # LTX-2.3 checkpoint has timestep_conditioning=False; keep the branch
-        # correct anyway (rebuild sized to the corrected final channels).
+        # Unused by the LTX-2.3 checkpoint, but must be sized to the corrected
+        # final channel count if a config ever enables it.
         if timestep_conditioning:
             from ...ltx2.ltx2_core.timestep_embedding import (
                 PixArtAlphaCombinedTimestepSizeEmbeddings,
@@ -231,13 +204,12 @@ class LTX23VideoDecoder(VideoDecoder):
 
 
 class LTX23VideoDecoderConfigurator:
-    """Create an ``LTX23VideoDecoder`` from the native LTX-2.3 config dict."""
+    """Create an LTX23VideoDecoder from the native LTX-2.3 config dict."""
 
     @classmethod
     def from_config(cls, config: dict) -> LTX23VideoDecoder:
         vae = config.get("vae", {})
-        # LTX-2.3 uses a single shared `spatial_padding_mode` key (LTX-2 split it
-        # into decoder_/encoder_ variants).
+        # LTX-2.3 uses one shared key where LTX-2 split it per role.
         padding_mode = vae.get(
             "spatial_padding_mode", vae.get("decoder_spatial_padding_mode", "reflect")
         )

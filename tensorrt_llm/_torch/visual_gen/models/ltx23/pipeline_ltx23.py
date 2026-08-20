@@ -1,33 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2.3 ("V2") text-to-video pipeline (Phase-0: BF16, 1 GPU, eager, video-only).
-
-This is a *separate* pipeline from ``LTX2Pipeline`` (it does not subclass it),
-matching the reviewer guidance: the two share the module-level helpers and the
-reusable native components, but LTX-2.3 diverges in ways that live inside the
-text path and denoise loop:
-
-* Text features: all 49 Gemma hidden states are stacked, **per-token RMS
-  normalized** (``text_encoder_norm_type=per_token_rms``, not LTX-2's masked
-  min-max), then projected by a **split** feature extractor
-  (``video_aggregate_embed`` / ``audio_aggregate_embed``) before the connectors.
-* The transformer needs a global ``sigma`` per step for the sigma-driven text
-  cross-attention K/V modulation (``prompt_adaln_single`` /
-  ``prompt_scale_shift_table``), so the text K/V cannot be pre-projected once
-  like LTX-2 — it is (re)projected inside each denoise step.
-
-Phase-0 scope (agreed): text-to-video only, plain CFG, BF16, single GPU, eager.
-Audio VAE + BigVGAN-v2 BWE vocoder (48 kHz) and the optimization stack
-(FP8/NVFP4, CUDA graph, torch.compile, Ulysses) are added in later phases.
-
-Reused verbatim from LTX-2 (same numerical contract):
-* ``self.denoise`` — CFG is applied in x0-space in LTX-2.3, which is
-  algebraically identical to velocity-space CFG for rectified flow
-  (x0 = sample - v*sigma is affine in v), so the base CFG combine is exact.
-* ``self.decode_latents`` + tiled video VAE decode + ``postprocess_video_tensor``.
-* The RoPE / patchifier / scheduler / shape utilities.
-"""
 
 import copy
 import os
@@ -37,33 +10,17 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
+from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
-
-def _ltx_bench_emit(msg: str) -> None:
-    """Perf-only: surface a bench line regardless of logger routing.
-
-    The pipeline runs inside the DiffusionClient worker, whose ``logger.info``
-    output does not always reach the driver stdout. Print (flushed) is reliably
-    captured, and we also append to ``LTX_BENCH_FILE`` when set so the A/B runner
-    can read the numbers straight from a file.
-    """
-    print(msg, flush=True)
-    path = os.environ.get("LTX_BENCH_FILE")
-    if path:
-        try:
-            with open(path, "a") as f:
-                f.write(msg + "\n")
-        except OSError:
-            pass
-
-# Reuse the LTX-2 native components + module-level loaders (shared utilities).
+# Reuse the LTX-2 native components and module-level loaders (shared utilities).
 from ..ltx2.ltx2_core.audio_vae import AudioDecoderConfigurator, decode_audio
-from ..ltx2.ltx2_core.patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
+from ..ltx2.ltx2_core.patchifier import VideoLatentPatchifier, get_pixel_coords
 from ..ltx2.ltx2_core.rope import LTXRopeType
 from ..ltx2.ltx2_core.scheduler_adapter import NativeSchedulerAdapter
 from ..ltx2.ltx2_core.types import (
@@ -74,6 +31,7 @@ from ..ltx2.ltx2_core.types import (
 )
 from ..ltx2.ltx2_core.video_vae import TilingConfig
 from ..ltx2.pipeline_ltx2 import (
+    _LTX2CUDAGraphRunner,
     _find_safetensors_files,
     _load_component_weights,
     _load_ltx2_transformer_weights,
@@ -86,21 +44,127 @@ from .ltx23_core.connector import (
     LTX23GemmaFeaturesExtractor,
     LTX23VideoConnectorConfigurator,
 )
+from .ltx23_core.modality import LTX23Modality
 from .ltx23_core.video_vae_ltx23 import LTX23VideoDecoderConfigurator
 from .ltx23_core.vocoder_ltx23 import LTX23VocoderConfigurator
-from .ltx23_core.modality import LTX23Modality
+from .text_conditioning_ltx23 import LTX23TextConditioning
 from .transformer_ltx23 import LTX23Model
 
-# Gemma-3-12b-it exposes 49 hidden states (48 layers + embeddings). The split
-# feature extractor's [out, 3840*49] weights expect all of them stacked.
-_NUM_GEMMA_HIDDEN_STATES = 49
+
+class _LTX23CUDAGraphRunner(_LTX2CUDAGraphRunner):
+    """CUDAGraphRunner extended for LTX-2.3's dataclass-based transformer inputs.
+
+    LTX-2.3 passes tensors inside LTX23Modality and LTX23TextConditioning, so
+    those tensors are cloned into static buffers at capture time and copied
+    in-place at replay time. sigma is included because it changes on every
+    denoise step and drives the prompt K/V modulation.
+    """
+
+    @staticmethod
+    def _tensor_pair_shapes(pair):
+        if pair is None:
+            return None
+        return tuple(tuple(t.shape) for t in pair)
+
+    def _key_parts_for(self, prefix, value):
+        if isinstance(value, LTX23Modality):
+            yield (f"{prefix}.latent", tuple(value.latent.shape))
+            yield (f"{prefix}.timesteps", tuple(value.timesteps.shape))
+            yield (f"{prefix}.sigma", tuple(value.sigma.shape))
+            yield (f"{prefix}.positions", tuple(value.positions.shape))
+            yield (f"{prefix}.context", tuple(value.context.shape))
+            yield (f"{prefix}.enabled", value.enabled)
+            yield (
+                f"{prefix}.context_mask",
+                tuple(value.context_mask.shape) if value.context_mask is not None else None,
+            )
+            return
+        if isinstance(value, LTX23TextConditioning):
+            for name in ("video_context", "video_mask", "audio_context", "audio_mask"):
+                tensor = getattr(value, name)
+                yield (
+                    f"{prefix}.{name}",
+                    tuple(tensor.shape) if tensor is not None else None,
+                )
+            for name in ("video_pe", "video_cross_pe", "audio_pe", "audio_cross_pe"):
+                yield (
+                    f"{prefix}.{name}",
+                    self._tensor_pair_shapes(getattr(value, name)),
+                )
+            return
+        yield from super()._key_parts_for(prefix, value)
+
+    @staticmethod
+    def _clone_value(value):
+        if isinstance(value, LTX23Modality):
+            return LTX23Modality(
+                latent=value.latent.clone(),
+                timesteps=value.timesteps.clone(),
+                sigma=value.sigma.clone(),
+                positions=value.positions.clone(),
+                context=value.context.clone(),
+                enabled=value.enabled,
+                context_mask=(
+                    value.context_mask.clone() if value.context_mask is not None else None
+                ),
+            )
+        if isinstance(value, LTX23TextConditioning):
+            clone_pair = _LTX23CUDAGraphRunner._clone_tensor_pair
+            return LTX23TextConditioning(
+                video_context=(
+                    value.video_context.clone() if value.video_context is not None else None
+                ),
+                video_mask=value.video_mask.clone() if value.video_mask is not None else None,
+                video_pe=clone_pair(value.video_pe),
+                video_cross_pe=clone_pair(value.video_cross_pe),
+                audio_context=(
+                    value.audio_context.clone() if value.audio_context is not None else None
+                ),
+                audio_mask=value.audio_mask.clone() if value.audio_mask is not None else None,
+                audio_pe=clone_pair(value.audio_pe),
+                audio_cross_pe=clone_pair(value.audio_cross_pe),
+            )
+        return _LTX2CUDAGraphRunner._clone_value(value)
+
+    @staticmethod
+    def _copy_optional_tensor(dst, src):
+        if dst is not None and src is not None:
+            dst.copy_(src)
+
+    @staticmethod
+    def _copy_value(dst, src):
+        if isinstance(src, LTX23Modality) and isinstance(dst, LTX23Modality):
+            dst.latent.copy_(src.latent)
+            dst.timesteps.copy_(src.timesteps)
+            dst.sigma.copy_(src.sigma)
+            dst.positions.copy_(src.positions)
+            dst.context.copy_(src.context)
+            _LTX23CUDAGraphRunner._copy_optional_tensor(
+                dst.context_mask, src.context_mask
+            )
+            return dst
+        if isinstance(src, LTX23TextConditioning) and isinstance(
+            dst, LTX23TextConditioning
+        ):
+            copy_tensor = _LTX23CUDAGraphRunner._copy_optional_tensor
+            copy_pair = _LTX23CUDAGraphRunner._copy_tensor_pair
+            copy_tensor(dst.video_context, src.video_context)
+            copy_tensor(dst.video_mask, src.video_mask)
+            copy_pair(dst.video_pe, src.video_pe)
+            copy_pair(dst.video_cross_pe, src.video_cross_pe)
+            copy_tensor(dst.audio_context, src.audio_context)
+            copy_tensor(dst.audio_mask, src.audio_mask)
+            copy_pair(dst.audio_pe, src.audio_pe)
+            copy_pair(dst.audio_cross_pe, src.audio_cross_pe)
+            return dst
+        return _LTX2CUDAGraphRunner._copy_value(dst, src)
 
 
 @register_pipeline(
     "LTX23Pipeline",
     hf_ids=["Lightricks/LTX-2.3"],
     defaults={"text_encoder_path": "google/gemma-3-12b-it"},
-    doc="Lightricks LTX-2.3 audio-video generation (Phase-0: video-only, BF16).",
+    doc="Lightricks LTX-2.3 text-to-video generation with audio.",
 )
 class LTX23Pipeline(BasePipeline):
     """Text-to-video pipeline for the LTX-2.3 checkpoint (native single-file safetensors)."""
@@ -114,17 +178,9 @@ class LTX23Pipeline(BasePipeline):
         "video_embeddings_connector.",
     ]
 
-    def __init__(self, model_config):
-        super().__init__(model_config)
-
     @property
     def dtype(self):
         return self.pipeline_config.torch_dtype
-
-    @classmethod
-    def resolve_variant(cls, config):
-        # Phase-0: single-stage only (no spatial upsampler / distilled LoRA path).
-        return cls
 
     @property
     def default_warmup_resolutions(self):
@@ -145,6 +201,72 @@ class LTX23Pipeline(BasePipeline):
             guidance_scale=4.0,
             seed=42,
         )
+
+    def warmup(self) -> None:
+        """Tune with capture suppressed, then capture from the warm tactic cache.
+
+        Tuning and capturing in one pass records the autotuner's torch.rand
+        candidate-input kernels into the graph, where they replay on every
+        denoise step. Other configurations defer to the base implementation.
+        """
+        if not (
+            self.pipeline_config.torch_compile.enable_autotune
+            and self.pipeline_config.cuda_graph.enable
+            and self.world_size == 1
+        ):
+            super().warmup()
+            return
+
+        shapes, steps = self.resolve_warmup_plan()
+        if not shapes:
+            super().warmup()
+            return
+
+        shape_list = ", ".join(f"{h}x{w}x{f}" for h, w, f in shapes)
+        logger.info(
+            f"Running warmup for {self.__class__.__name__}: {len(shapes)} shape(s) "
+            f"[{shape_list}], {steps} steps, tuning pass then capture pass..."
+        )
+        warmup_start = time.time()
+
+        self._is_warmup = True
+        try:
+            with (
+                self.disallow_cuda_graph_capture(),
+                autotune(
+                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
+                    skip_dynamic_tuning_buckets=True,
+                ),
+            ):
+                self._run_warmup_pass(shapes, steps)
+            # Hits the warm tactic cache, so the graph holds only model kernels.
+            self._run_warmup_pass(shapes, steps)
+        finally:
+            self._is_warmup = False
+
+        self._warmed_up_shapes = set(
+            self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
+        )
+        logger.info(f"Warmup completed in {time.time() - warmup_start:.2f}s")
+
+    def _setup_cuda_graphs(self):
+        """Wrap the transformer with LTX-2.3-aware CUDA graph capture/replay."""
+        if not self.pipeline_config.cuda_graph.enable:
+            return
+
+        runner = _LTX23CUDAGraphRunner(
+            CUDAGraphRunnerConfig(use_cuda_graph=True),
+        )
+        self.transformer.register_cuda_graph_extra_key_fns(runner)
+        compile_note = (
+            " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
+        )
+        logger.info(
+            "CUDA graph runner: wrapping transformer.forward "
+            f"(LTX-2.3 Modality-aware){compile_note}"
+        )
+        self.transformer.forward = runner.wrap(self.transformer.forward)
+        self._cuda_graph_runners["transformer"] = runner
 
     # ------------------------------------------------------------------
     # Transformer init + weight loading
@@ -172,9 +294,7 @@ class LTX23Pipeline(BasePipeline):
             f"apply_gated_attention={apply_gated_attention} (AudioVideo)"
         )
 
-        # Phase-1: AudioVideo. The dual-stream block + bidirectional A<->V
-        # cross-attention are already implemented; enabling the audio stream
-        # here makes the transformer emit (video_velocity, audio_velocity).
+        # AudioVideo mode: the transformer emits (video_velocity, audio_velocity).
         self.transformer = LTX23Model(
             model_type=LTXModelType.AudioVideo,
             num_attention_heads=getattr(cfg, "num_attention_heads", 32),
@@ -287,19 +407,15 @@ class LTX23Pipeline(BasePipeline):
     ) -> None:
         skip_components = skip_components or []
 
-        # Video decoder (config-driven; the LTX-2 VAE configurator reads the
-        # LTX-2.3 decoder_blocks recipe from the same native config).
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading native video decoder...")
             self.video_decoder = LTX23VideoDecoderConfigurator.from_config(config)
             _load_component_weights(sft_paths, self.video_decoder, ["vae.decoder.", "vae."])
             self.video_decoder = self.video_decoder.to(device=device, dtype=dtype)
 
-        # Split feature extractor (video + audio projections) + video connector.
-        # Phase-0 is video-only, so the audio connector is skipped; the audio
-        # projection weights are still loaded (both keys live under
-        # text_embedding_projection.*) and simply unused this phase.
-        logger.info("Loading native text feature extractor + video connector...")
+        # The video and audio projection weights both live under
+        # text_embedding_projection.*, and each feeds its own connector.
+        logger.info("Loading native text feature extractor + connectors...")
         self.feature_extractor = LTX23GemmaFeaturesExtractor.from_config(config)
         _load_component_weights(sft_paths, self.feature_extractor, "text_embedding_projection.")
         self.feature_extractor = self.feature_extractor.to(device=device, dtype=dtype)
@@ -312,8 +428,6 @@ class LTX23Pipeline(BasePipeline):
         )
         self.video_connector = self.video_connector.to(device=device, dtype=dtype)
 
-        # Audio connector (32 x 64 = 2048, 8 layers, gated) consuming its own
-        # audio projection from the split feature extractor.
         self.audio_connector = LTX23AudioConnectorConfigurator.from_config(config)
         _load_component_weights(
             sft_paths,
@@ -322,8 +436,6 @@ class LTX23Pipeline(BasePipeline):
         )
         self.audio_connector = self.audio_connector.to(device=device, dtype=dtype)
 
-        # Audio VAE decoder (reused verbatim from LTX-2; config-driven and
-        # matches the LTX-2.3 audio_vae recipe). Latent -> mel spectrogram.
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading native audio decoder...")
             self.audio_decoder = AudioDecoderConfigurator.from_config(config)
@@ -332,24 +444,18 @@ class LTX23Pipeline(BasePipeline):
             )
             self.audio_decoder = self.audio_decoder.to(device=device, dtype=dtype)
 
-            # Vocoder (BigVGAN-v2 AMP1 + BWE -> 48 kHz). Kept in fp32: the BWE
-            # forward runs fp32 regardless, and bf16 accumulation degrades the
-            # spectral output across the ~108 sequential convs.
+            # Kept in fp32: the BWE forward runs fp32 regardless, and bf16
+            # accumulation degrades the spectral output across ~108 sequential convs.
             logger.info("Loading native vocoder (BigVGAN-v2 + BWE)...")
             self.vocoder = LTX23VocoderConfigurator.from_config(config)
             _load_component_weights(sft_paths, self.vocoder, "vocoder.")
             self.vocoder = self.vocoder.to(device=device, dtype=torch.float32)
 
-        # Patchifier (structural, no weights).
-        t_cfg = self.transformer._transformer_config
-        patch_size = t_cfg.get("patch_size", 1)
+        patch_size = self.transformer._transformer_config.get("patch_size", 1)
         self.video_patchifier = VideoLatentPatchifier(patch_size=patch_size)
 
-        # Audio decode-side properties (mirror LTX-2). The audio VAE decoder
-        # exposes the patchifier and the mel/sample-rate metadata; the *output*
-        # sample rate is the vocoder's (48 kHz via BWE), not the VAE's 16 kHz.
-        # These are only meaningful when the audio decoder was loaded (skipped
-        # alongside the VAE component in transformer-only loads / unit tests).
+        # Audio decode-side metadata comes off the audio VAE decoder, so it is
+        # only available when that component was loaded.
         if PipelineComponent.VAE not in skip_components:
             self.audio_patchifier = self.audio_decoder.patchifier
             self.audio_sampling_rate = self.audio_decoder.sample_rate
@@ -362,25 +468,15 @@ class LTX23Pipeline(BasePipeline):
 
     @staticmethod
     def _per_token_rms_pack(hidden_states: List[torch.Tensor], eps: float = 1e-6) -> torch.Tensor:
-        """Stack all Gemma hidden states, per-token RMS normalize, flatten.
+        """Stack all Gemma hidden states, per-token RMS normalize, then flatten.
 
-        ``hidden_states``: tuple of ``num_layers+1`` tensors ``[B, S, 3840]``.
-        Returns ``[B, S, 3840 * num_states]`` to feed the split feature
-        extractor's ``[out, 3840*49]`` projections.
-
-        LTX-2.3 uses ``text_encoder_norm_type='per_token_rms'`` with
-        ``caption_proj_input_norm=False`` (the norm is applied here, before the
-        projection, not inside caption projection). We normalize each token's
-        hidden vector per layer by its RMS over the hidden dim — the placement
-        the vLLM-Omni reference documents (unflatten -> per_token_rms -> project).
-
-        NOTE (Phase-0 validation target): the exact reduction axis for
-        per_token_rms (per-layer hidden dim vs. flattened across all layers) is
-        the first thing to check against a reference render if colors/structure
-        look off. Isolated here for that reason.
+        hidden_states is a tuple of num_layers+1 tensors [B, S, 3840]; returns
+        [B, S, 3840 * num_states] for the split feature extractor. LTX-2.3 sets
+        text_encoder_norm_type=per_token_rms with caption_proj_input_norm=False,
+        so the norm belongs here rather than in the caption projection.
         """
         stacked = torch.stack(hidden_states, dim=-1)  # [B, S, 3840, num_states]
-        # RMS over the hidden dim (3840), per token and per layer.
+        # RMS over the hidden dim, per token and per layer.
         rms = torch.sqrt(stacked.float().pow(2).mean(dim=2, keepdim=True) + eps)
         normed = (stacked.float() / rms).to(dtype=stacked.dtype)
         return normed.flatten(2, 3)  # [B, S, 3840 * num_states]
@@ -424,7 +520,7 @@ class LTX23Pipeline(BasePipeline):
     def _process_connectors(self, prompt_embeds: torch.Tensor, attention_mask: torch.Tensor):
         """Split feature extractor -> video + audio connectors.
 
-        Returns ``(video_embeds, audio_embeds, video_mask)``. The connector
+        Returns (video_embeds, audio_embeds, video_mask). The connector
         (register-augmented) mask is shared across modalities in LTX-2.3.
         """
         additive_mask = (1 - attention_mask.to(prompt_embeds.dtype)) * -1000000.0
@@ -645,26 +741,13 @@ class LTX23Pipeline(BasePipeline):
                 timestep=timestep_val.new_tensor(0.0),
             )
             # x0 prediction (rectified flow): x0 = sample - v * sigma.
-            sigma = timestep_val.float()
-            while sigma.dim() < vel_v.dim():
-                sigma = sigma.unsqueeze(-1)
-            dn_v = v_latents_f32 - vel_v.float() * sigma
+            def to_x0(latent, velocity):
+                sigma = timestep_val.float()
+                while sigma.dim() < velocity.dim():
+                    sigma = sigma.unsqueeze(-1)
+                return latent - velocity.float() * sigma
 
-            sigma_a = timestep_val.float()
-            while sigma_a.dim() < vel_a.dim():
-                sigma_a = sigma_a.unsqueeze(-1)
-            dn_a = a_latents_f32 - vel_a.float() * sigma_a
-            return dn_v, dn_a
-
-        # Perf-only: accumulate transformer (DiT) GPU time per forward call so we
-        # can isolate it from scheduler/CFG-combine cost. Guarded by LTX_BENCH=1.
-        _bench = os.environ.get("LTX_BENCH", "0") == "1"
-        _bench_events: List[tuple] = []
-        if _bench:
-            _ltx_bench_emit(
-                f"[LTX_BENCH] enabled (steps={len(timesteps)}, "
-                f"FREEZE_TEXT_KV={os.environ.get('LTX23_FREEZE_TEXT_KV', '0')})"
-            )
+            return to_x0(v_latents_f32, vel_v), to_x0(a_latents_f32, vel_a)
 
         def forward_fn(
             video_latents,
@@ -674,21 +757,6 @@ class LTX23Pipeline(BasePipeline):
             encoder_hidden_states,
             extra_tensors,
         ):
-            if _bench and torch.cuda.is_available():
-                ev0 = torch.cuda.Event(enable_timing=True)
-                ev1 = torch.cuda.Event(enable_timing=True)
-                ev0.record()
-                dn_v, dn_a = _run_transformer(
-                    video_latents,
-                    extra_stream_latents["audio"],
-                    timestep,
-                    encoder_hidden_states,
-                    extra_tensors.get("audio_embeds", audio_embeds),
-                    extra_tensors.get("attention_mask", connector_mask),
-                )
-                ev1.record()
-                _bench_events.append((ev0, ev1))
-                return dn_v, {"audio": dn_a}
             dn_v, dn_a = _run_transformer(
                 video_latents,
                 extra_stream_latents["audio"],
@@ -699,24 +767,7 @@ class LTX23Pipeline(BasePipeline):
             )
             return dn_v, {"audio": dn_a}
 
-        # Perf-only A/B: re-prime the frozen text-K/V cache each generation so it
-        # rebuilds on step 0 (see LTX23_FREEZE_TEXT_KV in transformer_ltx23.py).
-        if os.environ.get("LTX23_FREEZE_TEXT_KV", "0") == "1" and hasattr(
-            self.transformer, "reset_text_kv_cache"
-        ):
-            self.transformer.reset_text_kv_cache()
-
-        if _bench:
-            _ltx_bench_emit(
-                f"LTX_BENCH workload: video_latents={tuple(latents.shape)} "
-                f"audio_latents={tuple(audio_latents.shape)} "
-                f"do_cfg={do_cfg} (LTX23)"
-            )
-
         timer.mark_denoise_start()
-        if _bench and torch.cuda.is_available():
-            torch.cuda.synchronize()
-            _denoise_t0 = time.time()
         result = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -738,27 +789,6 @@ class LTX23Pipeline(BasePipeline):
         )
         latents, extra_stream_latents = result
         audio_latents = extra_stream_latents["audio"]
-
-        if _bench and torch.cuda.is_available():
-            torch.cuda.synchronize()
-            _denoise_dt = time.time() - _denoise_t0
-            _n_steps = len(timesteps)
-            _freeze = os.environ.get("LTX23_FREEZE_TEXT_KV", "0") == "1"
-            # Authoritative denoise-phase wall time (includes scheduler + CFG).
-            _ltx_bench_emit(f"Denoising done: {_denoise_dt:.4f}s")
-            _ltx_bench_emit(
-                f"LTX_BENCH denoise: {_denoise_dt:.4f}s over {_n_steps} steps "
-                f"= {_denoise_dt / max(_n_steps, 1):.4f}s/step "
-                f"(FREEZE_TEXT_KV={int(_freeze)})"
-            )
-            if _bench_events:
-                _trans_ms = sum(e0.elapsed_time(e1) for e0, e1 in _bench_events)
-                _calls = len(_bench_events)
-                _ltx_bench_emit(
-                    f"LTX_BENCH transformer: {_trans_ms / 1000:.4f}s total over "
-                    f"{_calls} forward calls = {_trans_ms / max(_calls, 1):.2f}ms/call "
-                    f"(FREEZE_TEXT_KV={int(_freeze)})"
-                )
 
         timer.mark_post_start()
 

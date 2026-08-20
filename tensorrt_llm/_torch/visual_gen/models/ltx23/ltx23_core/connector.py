@@ -1,27 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2.3 ("V2") embeddings connector + split feature extractor.
+"""LTX-2.3 embeddings connector and split feature extractor.
 
-Differences from LTX-2 that this module encodes (all verified against the
-LTX-2.3 checkpoint weight shapes):
+Two differences from LTX-2, both matching the checkpoint weight shapes:
 
-* Feature extraction is **split per modality and happens before the connector**
-  (``caption_proj_before_connector=True``):
-    - ``video_aggregate_embed``: Linear(3840*49 -> 4096, bias=True)
-    - ``audio_aggregate_embed``: Linear(3840*49 -> 2048, bias=True)
-  vs LTX-2's single shared ``aggregate_embed`` Linear(3840*49 -> 3840, bias=False).
+- Feature extraction is split per modality and happens before the connector
+  (caption_proj_before_connector=True): video_aggregate_embed 3840*49 -> 4096
+  and audio_aggregate_embed 3840*49 -> 2048, both biased, where LTX-2 had a
+  single shared unbiased projection to 3840.
+- Two connectors instead of one, video 32x128 and audio 32x64, both 8 layers,
+  gated, 128 registers, where LTX-2 had one 30x128 2-layer ungated connector.
 
-* Two separate connectors with distinct dims / depth / gating:
-    - video: 32 heads x 128 = 4096, 8 layers, gated, 128 registers
-    - audio: 32 heads x 64  = 2048, 8 layers, gated, 128 registers
-  vs LTX-2's single 30x128=3840, 2-layer, ungated connector consuming a shared
-  projection.
-
-The ``Embeddings1DConnector`` nn.Module itself is structurally identical to
-LTX-2 (it already supports configurable heads/dim/layers/registers and gated
-attention), so we reuse it and only provide V2 configurators + the split
-feature extractor here.
+LTX-2's Embeddings1DConnector already takes configurable heads, dims, layers,
+registers and gating, so it is reused as-is and only the LTX-2.3 configurators
+and the split feature extractor live here.
 """
 
 import math
@@ -31,9 +24,8 @@ import torch
 from ...ltx2.ltx2_core.connector import Embeddings1DConnector
 from ...ltx2.ltx2_core.rope import LTXRopeType
 
-# Gemma-3-12b-it exposes 49 hidden states (48 transformer layers + embeddings),
-# each of width ``caption_channels`` (3840). The feature extractor flattens all
-# of them, matching the checkpoint's [out, 3840*49] projection weights.
+# Gemma-3-12b-it exposes 49 hidden states (48 layers plus embeddings), all of
+# which are flattened to match the checkpoint's [out, 3840*49] weights.
 _NUM_GEMMA_HIDDEN_STATES = 49
 
 
@@ -44,8 +36,8 @@ def _transformer_cfg(config: dict) -> dict:
 class LTX23GemmaFeaturesExtractor(torch.nn.Module):
     """Split Gemma feature extractor (video + audio), pre-connector.
 
-    Maps to checkpoint keys ``text_embedding_projection.video_aggregate_embed``
-    and ``text_embedding_projection.audio_aggregate_embed``.
+    Maps to checkpoint keys text_embedding_projection.video_aggregate_embed and
+    text_embedding_projection.audio_aggregate_embed.
     """
 
     def __init__(
@@ -57,20 +49,17 @@ class LTX23GemmaFeaturesExtractor(torch.nn.Module):
     ) -> None:
         super().__init__()
         in_features = caption_channels * num_hidden_states
-        # Per-modality norm rescale reference: the flattened, per-token-RMS'd
-        # features are rescaled by sqrt(out_dim / embedding_dim) before each
-        # projection (ltx-core FeatureExtractorV2._rescale_norm). embedding_dim
-        # is the Gemma hidden width (caption_channels), NOT the flattened size.
+        # The rescale in forward() divides by the Gemma hidden width, not the
+        # flattened size (ltx-core FeatureExtractorV2._rescale_norm).
         self.embedding_dim = caption_channels
         self.video_aggregate_embed = torch.nn.Linear(in_features, video_dim, bias=True)
         self.audio_aggregate_embed = torch.nn.Linear(in_features, audio_dim, bias=True)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """x: flattened Gemma features [..., caption_channels * num_hidden_states].
+        """Project flattened Gemma features into (video_dim, audio_dim).
 
-        Returns (video_features -> video_dim, audio_features -> audio_dim).
-        Applies the modality-specific ``sqrt(out_dim / embedding_dim)`` rescale
-        (matching ltx-core ``FeatureExtractorV2``) before each projection.
+        Each projection is preceded by its own sqrt(out_dim / embedding_dim)
+        rescale, matching ltx-core FeatureExtractorV2.
         """
         v_scale = math.sqrt(self.video_aggregate_embed.out_features / self.embedding_dim)
         a_scale = math.sqrt(self.audio_aggregate_embed.out_features / self.embedding_dim)
@@ -94,8 +83,8 @@ def _build_connector(
     num_attention_heads: int,
     attention_head_dim: int,
 ) -> Embeddings1DConnector:
-    # LTX-2.3 default is SPLIT (matches ltx-core); the 2.3 checkpoint sets this
-    # explicitly, so the default only guards future/partial configs.
+    # The checkpoint sets rope_type explicitly; SPLIT is the ltx-core default and
+    # only guards a partial config.
     rope_type = LTXRopeType(cfg.get("rope_type", "split"))
     double_precision_rope = cfg.get("frequencies_precision", False) == "float64"
     return Embeddings1DConnector(
