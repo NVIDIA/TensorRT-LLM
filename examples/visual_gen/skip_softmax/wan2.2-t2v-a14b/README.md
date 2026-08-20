@@ -12,6 +12,11 @@ so each component has its own overlay:
 - `transformer_sparse_attention.json` applies to `transformer/config.json`.
 - `transformer_2_sparse_attention.json` applies to `transformer_2/config.json`.
 
+Each overlay also contains an `ignore` list. Matching attention layers remain dense; Skip Softmax
+is applied only to the calibrated layers outside that list. The two transformers can have
+different formulas and ignore lists, so do not combine the overlays or reuse them for another
+model.
+
 ## Apply the calibration metadata
 
 Set `MODEL_DIR` to a local copy of the public Diffusers checkpoint, then run:
@@ -33,6 +38,11 @@ The included [`visual_gen.yaml`](visual_gen.yaml) selects the operating point us
 accompanying video-generation optimization blog: `target_sparsity=0.65` and
 `disabled_until_timestep=0.86`, together with dynamic NVFP4 GEMM quantization and INT8/FP8 SAGE
 attention.
+
+This dynamic quantization path is intended to reproduce the current characterization from a BF16
+checkpoint. If a matching prequantized ModelOpt checkpoint is available, use a compatible
+configuration and validate its latency and quality separately; dynamic and static quantization
+results are not interchangeable.
 
 ```bash
 trtllm-serve "$MODEL_DIR" \
