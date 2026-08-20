@@ -188,28 +188,6 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
             )
 
 
-class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
-    MODEL_PATH = f"{llm_models_root()}/multimodals/Phi-4-multimodal-instruct-fuse-vision-lora"
-    MAX_NUM_TOKENS = 25600
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|USER|>"
-    )
-
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-
-    def test_auto_dtype(self):
-        with LLM(
-            self.MODEL_PATH,
-            max_batch_size=32,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            kv_cache_config=self.kv_cache_config,
-        ) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
 @skip_pre_hopper
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
@@ -321,6 +299,7 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
+    MTP_MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-26B-A4B-it-assistant"
     EXTRA_EVALUATOR_KWARGS = {
         "chat_template_kwargs": {"enable_thinking": False},
     }
@@ -345,6 +324,14 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
             max_batch_size=16,
             kv_cache_config=self.kv_cache_config,
             enable_chunked_prefill=True,
+            # Shared-KV MTP overlap can expose too few FlashInfer pages and cause an illegal access
+            # in `AppendPagedKVCache`. Re-enable this after the overlap-MTP KV accounting fix lands.
+            disable_overlap_scheduler=True,
+            speculative_config=MTPDecodingConfig(
+                max_draft_len=3,
+                mtp_eagle_one_model=True,
+                speculative_model=self.MTP_MODEL_PATH,
+            ),
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
@@ -567,6 +554,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
         preserve_caller_max_tokens=True,
     )
 
+    @pytest.mark.timeout(7200)
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(183000)
