@@ -7,6 +7,8 @@ HND view contract passed to the packaged MSA kernel. Numerical parity against
 the Triton reference is covered by the SM100 integration accuracy test.
 """
 
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -16,6 +18,30 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3Msa
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
 from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+
+def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    cute = ModuleType("cutlass.cute")
+    cute.core = SimpleNamespace()
+    cute.ThrMma = object()
+    cute.make_rmem_tensor = object()
+    cutlass = ModuleType("cutlass")
+    cutlass.cute = cute
+    monkeypatch.setitem(sys.modules, "cutlass", cutlass)
+    monkeypatch.setitem(sys.modules, "cutlass.cute", cute)
+    monkeypatch.setattr("importlib.util.find_spec", lambda unused_name: object())
+
+    msa_package_available.cache_clear()
+    try:
+        assert msa_package_available()
+        assert cute.core.ThrMma is cute.ThrMma
+        assert cute.make_fragment is cute.make_rmem_tensor
+    finally:
+        msa_package_available.cache_clear()
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
