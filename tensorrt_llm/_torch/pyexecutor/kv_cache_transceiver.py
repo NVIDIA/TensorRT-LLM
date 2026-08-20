@@ -248,12 +248,13 @@ def create_kv_cache_transceiver(
         raise ValueError(
             "enable_pipelined_transfer is not supported with Mamba/hybrid attention models."
         )
-    is_kv_cache_sender = getenv("TRTLLM_DISAGG_ROLE") != "generation"
     if (cache_transceiver_config.enable_pipelined_transfer
-            and is_kv_cache_sender and mapping.pp_size != 1):
-        raise ValueError(
-            "pipeline_parallel_size=1 is required when enable_pipelined_transfer is set."
+            and mapping.pp_size != 1):
+        logger.warning(
+            "Pipelined KV cache transfer is not supported with pipeline "
+            "parallelism; disabling enable_pipelined_transfer."
         )
+        cache_transceiver_config.enable_pipelined_transfer = False
 
     # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)

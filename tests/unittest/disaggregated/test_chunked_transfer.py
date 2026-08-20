@@ -608,37 +608,16 @@ def test_pipelined_transfer_disabled_by_default():
     assert result is False
 
 
-def test_pipelined_transfer_rejects_pipeline_parallelism(monkeypatch):
-    """ValueError for pipeline parallelism when the disaggregated role is unknown."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
-
-    monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
-    mapping = MagicMock()
-    mapping.pp_size = 2
-    cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL",
-        enable_pipelined_transfer=True,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="pipeline_parallel_size=1 is required when enable_pipelined_transfer is set.",
-    ):
-        create_kv_cache_transceiver(
-            mapping,
-            MagicMock(),
-            MagicMock(),
-            MagicMock(),
-            cache_transceiver_config,
-        )
-
-
-def test_pipelined_transfer_allows_pipeline_parallelism_on_generation_server(monkeypatch):
-    """Pipeline parallelism is allowed when the worker only receives KV cache."""
+@pytest.mark.parametrize("disagg_role", [None, "generation"])
+def test_pipelined_transfer_disabled_for_pipeline_parallelism(monkeypatch, disagg_role):
+    """Pipeline parallelism disables pipelining without relying on the frontend role."""
     from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
     from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
 
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
+    if disagg_role is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", disagg_role)
     transceiver = MagicMock()
     transceiver_cls = MagicMock(return_value=transceiver)
     monkeypatch.setattr(transceiver_module, "KvCacheTransceiverV2", transceiver_cls)
@@ -660,6 +639,7 @@ def test_pipelined_transfer_allows_pipeline_parallelism_on_generation_server(mon
 
     assert result is transceiver
     assert cache_transceiver_config.transceiver_runtime == "PYTHON"
+    assert cache_transceiver_config.enable_pipelined_transfer is False
     transceiver_cls.assert_called_once()
 
 
@@ -703,6 +683,7 @@ def test_pipelined_transfer_requires_gen_first_flow():
     request = MagicMock()
     request.sampling_config = None
     request.py_beam_width = 1
+    request.is_context_only_request = True
     request.py_disaggregated_params = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
     )
@@ -728,7 +709,32 @@ def test_pipelined_transfer_allows_non_disaggregated_request():
     request = MagicMock()
     request.sampling_config = None
     request.py_beam_width = 1
+    request.is_context_only_request = True
     request.py_disaggregated_params = None
+
+    PyExecutor._validate_request(executor, request)
+
+    executor.sampler.validate_request.assert_called_once_with(request)
+
+
+def test_pipelined_transfer_allows_generation_only_request():
+    """Generation workers do not build prefill chunks or enforce sender-only limits."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.is_warmup = False
+    executor.max_beam_width = 2
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
+    executor._validate_token_id_range = MagicMock()
+    executor.sampler.validate_request = MagicMock()
+
+    request = MagicMock()
+    request.sampling_config = None
+    request.py_beam_width = 2
+    request.is_context_only_request = False
+    request.py_disaggregated_params = SimpleNamespace(
+        schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
+    )
 
     PyExecutor._validate_request(executor, request)
 
