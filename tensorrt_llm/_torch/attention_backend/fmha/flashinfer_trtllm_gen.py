@@ -60,6 +60,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase, _CuteDslMlaStagingKey
 from .phased import FmhaParams, PhasedFmha
+from .trtllm_gen_utils import get_trtllm_gen_context_workspace_size
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import (
@@ -327,52 +328,6 @@ def _prepare_cute_dsl_mla_buffers(
 
 
 @lru_cache(maxsize=128)
-def _get_context_workspace_layout(
-    dtype: torch.dtype,
-    batch_size: int,
-    num_tokens: int,
-    num_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int,
-    fp8_context_fmha: bool,
-) -> dict[str, int]:
-    return thop.get_trtllm_gen_context_workspace_layout(
-        dtype,
-        batch_size,
-        num_tokens,
-        num_heads,
-        head_size,
-        rotary_embedding_dim,
-        True,
-        fp8_context_fmha,
-    )
-
-
-@lru_cache(maxsize=128)
-def _get_context_workspace_size(
-    dtype: torch.dtype,
-    max_num_seq: int,
-    max_num_tokens: int,
-    num_heads: int,
-    head_size: int,
-    rotary_embedding_dim: int,
-    fp8_context_fmha: bool,
-) -> int:
-    if max_num_tokens == 0:
-        return 0
-    layout = _get_context_workspace_layout(
-        dtype,
-        max_num_seq,
-        max_num_tokens,
-        num_heads,
-        head_size,
-        rotary_embedding_dim,
-        fp8_context_fmha,
-    )
-    return int(layout["total_size"])
-
-
-@lru_cache(maxsize=128)
 def _get_generation_workspace_layout(
     dtype: torch.dtype,
     batch_beam: int,
@@ -431,7 +386,7 @@ def _get_workspace_size(
     rotary_embedding_dim: int,
     fp8_context_fmha: bool,
 ) -> int:
-    context_size = _get_context_workspace_size(
+    context_size = get_trtllm_gen_context_workspace_size(
         dtype,
         max_num_requests,
         num_tokens,
@@ -777,6 +732,24 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         tokens_per_block = meta.tokens_per_block
         if tokens_per_block is None:
             tokens_per_block = 0
+
+        if not is_mla_enable and not meta.is_cross:
+            q_hidden_size = attn.num_heads * attn.head_dim
+            qkv_hidden_size = q_hidden_size + 2 * attn.num_kv_heads * attn.head_dim
+            has_fused_qkv = (
+                fwd.is_fused_qkv and k is None and v is None and q.size(-1) == qkv_hidden_size
+            )
+            has_q_only = (
+                not fwd.is_fused_qkv
+                and not fwd.update_kv_cache
+                and k is None
+                and v is None
+                and q.size(-1) == q_hidden_size
+            )
+            if not has_fused_qkv and not has_q_only:
+                return False, "self attention requires fused QKV or Q-only cached-KV input."
+            if has_q_only and q.dtype == torch.float8_e4m3fn:
+                return False, "Q-only cached-KV preprocessing supports FP16 or BF16 input."
 
         q_dtype = q.dtype
         o_dtype = output.dtype
