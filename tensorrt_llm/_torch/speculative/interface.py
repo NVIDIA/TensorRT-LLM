@@ -171,64 +171,11 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
 
-    from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                Indexer, is_dsa_cache_manager)
-
-    # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
-    # different dual-pool layout. Only native DSA cache managers use the DSA
-    # draft-replay buffers below.
-    if (isinstance(attn_metadata, DSAtrtllmAttentionMetadata)
-            and is_dsa_cache_manager(draft_kv_cache_manager)):
-        m = attn_metadata
-        saved['saved_dsa_state'] = {
-            'host_indexer_k_cache_block_offsets':
-            m.host_indexer_k_cache_block_offsets,
-            'indexer_k_cache_block_offsets': m.indexer_k_cache_block_offsets,
-            'host_slot_mapping_fp8': m.host_slot_mapping_fp8,
-            'host_slot_mapping_scale': m.host_slot_mapping_scale,
-            'slot_mapping_fp8': m.slot_mapping_fp8,
-            'slot_mapping_scale': m.slot_mapping_scale,
-            'block_table': m.block_table,
-            'block_table_expanded': m.block_table_expanded,
-            'host_block_table_expanded': m.host_block_table_expanded,
-        }
-        # The cached-KV feature owns these references even when an optimized
-        # path aliases them to slot_mapping_*. With the feature disabled, the
-        # aliases are lazy and may not exist on the first generation replay.
-        if m.enable_context_mla_with_cached_kv:
-            saved['saved_dsa_state'].update({
-                'slot_mapping_fp8_fullkv':
-                m.slot_mapping_fp8_fullkv,
-                'slot_mapping_scale_fullkv':
-                m.slot_mapping_scale_fullkv,
-            })
-        # Rebind to the draft manager's dedicated buffers instead of
-        # overwriting the target tensors in place. Rebinding is invisible to
-        # CUDA graph capture, so the target and draft segments of the graph
-        # bake distinct addresses (like draft_kv_cache_block_offsets) and no
-        # graph-recorded copy from a transient host buffer is needed.
-        m.host_indexer_k_cache_block_offsets = (
-            m.host_draft_indexer_k_cache_block_offsets)
-        m.indexer_k_cache_block_offsets = m.draft_indexer_k_cache_block_offsets
-        m.host_slot_mapping_fp8 = m.host_draft_slot_mapping_fp8
-        m.slot_mapping_fp8 = m.draft_slot_mapping_fp8
-        m.host_slot_mapping_scale = m.host_draft_slot_mapping_scale
-        m.slot_mapping_scale = m.draft_slot_mapping_scale
-        m.block_table = m.draft_block_table
-        m.block_table_expanded = m.draft_block_table_expanded
-        m.host_block_table_expanded = m.host_draft_block_table_expanded
-        m._invalidate_pool_view_cache()
-        # Recording a capture executes no kernels, so the draft mappings only
-        # need refreshing when the transfers actually run: eager forwards
-        # (warmup) and the pre-replay call from model_engine. The per-step
-        # advance inside the captured graph re-derives slot mappings on
-        # device from the rebound block-offset buffer.
-        # kv_cache_manager was already swapped to the draft manager above.
-        if not torch.cuda.is_current_stream_capturing():
-            m.prepare_for_indexer_k_cache()
-            m._refresh_expanded_block_table()
-            Indexer.recompute_slot_mappings(m)
-        Indexer.recompute_context_kv_gather_mappings(m)
+    # Backends select any additional draft-forward state, such as native DSA
+    # indexer buffers or DeepSeek-V4 sparse tables and pool pointers.
+    backend_saved = attn_metadata.prepare_for_draft_forward()
+    if backend_saved is not None:
+        saved['saved_backend_state'] = backend_saved
     return saved
 
 
@@ -250,29 +197,8 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         # needs to invalidate the scheduler metadata; refreshing the unchanged
         # target buffers would repeat request-specific H2D work.
         attn_metadata._flash_mla_metadata_valid = False
-    saved_dsa = saved_state.get('saved_dsa_state')
-    if saved_dsa is not None:
-        m = attn_metadata
-        m.host_indexer_k_cache_block_offsets = saved_dsa[
-            'host_indexer_k_cache_block_offsets']
-        m.indexer_k_cache_block_offsets = saved_dsa[
-            'indexer_k_cache_block_offsets']
-        m.host_slot_mapping_fp8 = saved_dsa['host_slot_mapping_fp8']
-        m.host_slot_mapping_scale = saved_dsa['host_slot_mapping_scale']
-        m.slot_mapping_fp8 = saved_dsa['slot_mapping_fp8']
-        m.slot_mapping_scale = saved_dsa['slot_mapping_scale']
-        m.block_table = saved_dsa['block_table']
-        m.block_table_expanded = saved_dsa['block_table_expanded']
-        m.host_block_table_expanded = saved_dsa['host_block_table_expanded']
-        m._invalidate_pool_view_cache()
-        if 'slot_mapping_fp8_fullkv' in saved_dsa:
-            m.slot_mapping_fp8_fullkv = saved_dsa['slot_mapping_fp8_fullkv']
-            m.slot_mapping_scale_fullkv = saved_dsa['slot_mapping_scale_fullkv']
-        else:
-            # The draft recomputation rebound the aliases to the draft tensors;
-            # point them back at the restored target tensors.
-            m.slot_mapping_fp8_fullkv = m.slot_mapping_fp8
-            m.slot_mapping_scale_fullkv = m.slot_mapping_scale
+    attn_metadata.restore_after_draft_forward(
+        saved_state.get('saved_backend_state'))
 
 
 def get_force_num_accepted_tokens() -> int:
