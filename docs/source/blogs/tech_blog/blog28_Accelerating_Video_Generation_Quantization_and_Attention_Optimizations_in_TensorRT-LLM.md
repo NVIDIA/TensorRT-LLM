@@ -15,7 +15,7 @@ GEMMs for another 20.8%. These percentages describe this workload, not video-gen
 general.
 
 <p align="center">
-  <img src="../media/tech_blog27_bf16_time_breakdown.png" alt="Pie chart showing that a compiled dense BF16 path spends 71.7% of pipeline-forward time in attention, 20.8% in GEMMs, and 7.5% in other work" width="1080">
+  <img src="../media/tech_blog28_bf16_time_breakdown.png" alt="Pie chart showing that a compiled dense BF16 path spends 71.7% of pipeline-forward time in attention, 20.8% in GEMMs, and 7.5% in other work" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 1. Representative pipeline-forward breakdown for compiled dense
@@ -178,7 +178,7 @@ next to its no-skip precision-family anchor. LPIPS is measured against eager BF1
 dense BF16 anchor starts at 0.118 rather than zero.
 
 <p align="center">
-  <img src="../media/tech_blog27_quality_speed_frontier.png" alt="Scatter plot of all 96 configurations showing speedup over compiled dense BF16 against mean LPIPS distance to eager BF16, with dense family anchors marked as stars and three operating points marked by numbered arrows" width="1080">
+  <img src="../media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of all 96 configurations showing speedup over compiled dense BF16 against mean LPIPS distance to eager BF16, with dense family anchors marked as stars and three operating points marked by numbered arrows" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 2. Quality-speed frontier across all 96 configurations; ①–③
@@ -211,7 +211,7 @@ incremental gain alongside NVFP4. Adding the conservative Skip Softmax setting b
 SAGE to 1.40×.
 
 <p align="center">
-  <img src="../media/tech_blog27_latency.png" alt="Grouped bar chart showing pipeline-forward latency for BF16, FP8 block-scaled, and NVFP4 linear layers with dense attention, SAGE attention, and SAGE plus conservative Skip Softmax" width="1080">
+  <img src="../media/tech_blog28_latency.png" alt="Grouped bar chart showing pipeline-forward latency for BF16, FP8 block-scaled, and NVFP4 linear layers with dense attention, SAGE attention, and SAGE plus conservative Skip Softmax" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 3. Pipeline-forward latency as linear-layer quantization, SAGE,
