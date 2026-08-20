@@ -35,10 +35,10 @@ from tensorrt_llm.llmapi.llm_args import (
     SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
     WaitingQueuePolicy)
 # isort: on
+from tensorrt_llm._torch.peft.lora.config import (
+    LoraConfig, get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm._torch.peft.lora.manager import load_torch_lora
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import (LoraConfig,
-                                      get_default_trtllm_modules_to_hf_modules)
-from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
@@ -1390,6 +1390,16 @@ class KvCacheCreator:
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
+            return False
+
+        sparse_cfg = self._sparse_attention_config
+        if (sparse_cfg is not None
+                and getattr(sparse_cfg, "algorithm", None) == "deepseek_v4"
+                and self._mapping.pp_size > 1):
+            logger.info(
+                "DeepSeek-V4 separate draft KV cache is only supported for PP=1; "
+                "folding draft layers into the unified manager for pp_size=%d.",
+                self._mapping.pp_size)
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
@@ -3061,6 +3071,8 @@ def create_py_executor_instance(
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+            # A disaggregated generation worker must not replay context locally.
+            enable_recompute_pause=not is_disagg,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
@@ -3392,7 +3404,8 @@ def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
     import json
 
     try:
-        from tensorrt_llm.lora_manager import get_model_path, load_state_dict
+        from tensorrt_llm.models.convert_utils import (get_model_path,
+                                                       load_state_dict)
         model_path = get_model_path(adapter_dir, "adapter_model")
         if model_path is None:
             return 0

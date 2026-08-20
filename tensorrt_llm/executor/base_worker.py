@@ -28,6 +28,8 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.peft.lora.manager import LoraManager
+from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
@@ -37,8 +39,6 @@ from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..lora_manager import LoraManager
-from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
@@ -982,6 +982,25 @@ class BaseWorker(GenerationExecutor):
         if self.engine is None or self.engine.kv_cache_transceiver is None:
             return b""
         return self.engine.kv_cache_transceiver.get_data_transceiver_state()
+
+    def get_startup_metrics(self) -> dict:
+        """Return rank-local startup metrics for the PyTorch backend."""
+        if not self._is_pytorch_backend or self.engine is None:
+            return {}
+
+        startup_metrics = {}
+        model_engine = getattr(self.engine, "model_engine", None)
+        model_loader = getattr(model_engine, "model_loader", None)
+        if model_loader is not None:
+            startup_metrics["model_loader"] = dict(model_loader.metrics)
+
+        draft_model_engine = getattr(self.engine, "draft_model_engine", None)
+        draft_model_loader = getattr(draft_model_engine, "model_loader", None)
+        if draft_model_loader is not None:
+            startup_metrics["draft_model_loader"] = dict(
+                draft_model_loader.metrics)
+
+        return startup_metrics
 
     @staticmethod
     def _stats_serializer(stats) -> str:
