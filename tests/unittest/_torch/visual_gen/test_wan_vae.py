@@ -106,6 +106,32 @@ def test_fp4_device_capability_is_sm100_family(monkeypatch, capability, expected
     assert not _supports_nvfp4_device(torch.device("cpu"))
 
 
+def test_implicit_fp4_checkpoint_falls_back_on_unsupported_device(monkeypatch):
+    monkeypatch.setattr(vae_loader, "_supports_nvfp4_device", lambda _: False)
+
+    with patch.object(vae_loader.logger, "warning") as warning:
+        enabled = vae_loader._nvfp4_enabled_for_device(
+            torch.device("cuda"),
+            {"decoder.conv1"},
+            explicit_request=False,
+        )
+
+    assert not enabled
+    warning.assert_called_once()
+    assert "dequantized BF16 operators" in warning.call_args.args[0]
+
+
+def test_explicit_fp4_request_rejects_unsupported_device(monkeypatch):
+    monkeypatch.setattr(vae_loader, "_supports_nvfp4_device", lambda _: False)
+
+    with pytest.raises(ValueError, match="SM100-family"):
+        vae_loader._nvfp4_enabled_for_device(
+            torch.device("cuda"),
+            {"decoder.conv1"},
+            explicit_request=True,
+        )
+
+
 def test_fp4_conv_rejects_unsupported_geometry():
     base = WanCausalConv3d(8, 8, 1)
 

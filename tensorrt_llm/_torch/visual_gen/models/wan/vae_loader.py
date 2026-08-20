@@ -35,6 +35,24 @@ TRTLLM_USE_DIFFUSER_VAE_ENV = "TRTLLM_USE_DIFFUSER_VAE"
 _NVFP4_DYNAMIC_MIN_CHANNELS = 64
 
 
+def _nvfp4_enabled_for_device(
+    device: torch.device,
+    selected: set[str],
+    *,
+    explicit_request: bool,
+) -> bool:
+    """Resolve NVFP4 execution when selected convolutions cannot run on ``device``."""
+    if not selected or _supports_nvfp4_device(device):
+        return True
+    if explicit_request:
+        raise ValueError("NVFP4 Wan VAE requires an SM100-family GPU")
+    logger.warning(
+        "The NVFP4 VAE checkpoint will use dequantized BF16 operators "
+        "because the selected device is not an SM100-family GPU."
+    )
+    return False
+
+
 def _use_diffuser_vae_env() -> bool:
     """Whether the Diffusers Wan VAE is forced via the debug env var.
 
@@ -224,14 +242,11 @@ def _load_nvfp4_wan_vae(
             input_scales,
             dynamic_activation_quant,
         )
-        if selected and not _supports_nvfp4_device(device):
-            if quant_config is not None:
-                raise ValueError("NVFP4 Wan VAE requires an SM100-family GPU")
-            logger.warning(
-                "The NVFP4 VAE checkpoint will use dequantized BF16 operators "
-                "because the selected device is not an SM100-family GPU."
-            )
-            enable_fp4 = False
+        enable_fp4 = _nvfp4_enabled_for_device(
+            device,
+            selected,
+            explicit_request=quant_config is not None,
+        )
     _warn_dequantized_nvfp4_weights(quantized, selected, enable_fp4)
     n = n_static = 0
     if enable_fp4:
@@ -344,8 +359,7 @@ def load_wan_vae(
             dynamic_weight_quant=dynamic_weight_quant,
         )
         _resolve_input_scales(selected, {}, dynamic_activation_quant)
-        if selected and not _supports_nvfp4_device(device):
-            raise ValueError("NVFP4 Wan VAE requires an SM100-family GPU")
+        _nvfp4_enabled_for_device(device, selected, explicit_request=True)
         n, n_static = swap_wan_convs_to_fp4(wan_vae, only_names=selected)
         if n != len(selected):
             raise ValueError(
