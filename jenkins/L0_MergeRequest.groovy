@@ -451,6 +451,17 @@ def mergeWaiveList(pipeline, globalVars)
     }
 }
 
+def checkTestList(pipeline)
+{
+    sh "git config --global --add safe.directory \"*\""
+    // --no-install-wheel installs only requirements-check-test-list.txt (torch
+    // CPU build + pytest plugins) and trt-test-db — no GPU or trtllm wheel
+    // needed. conftest.py stubs out tensorrt_llm.bindings when absent so
+    // pytest --co succeeds in this CPU-only pod.
+    sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${LLM_ROOT} LLM_BACKEND_ROOT=${LLM_ROOT}/triton_backend " +
+       "python3 ${LLM_ROOT}/scripts/check_test_list.py --l0 --qa --waive --no-install-wheel"
+}
+
 def preparation(pipeline, testFilter, globalVars)
 {
     image = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
@@ -458,6 +469,9 @@ def preparation(pipeline, testFilter, globalVars)
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
+        }
+        stage("Check Test List") {
+            checkTestList(pipeline)
         }
         stage("Merge Test Waive List") {
             mergeWaiveList(pipeline, globalVars)

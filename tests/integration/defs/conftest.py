@@ -48,8 +48,20 @@ from _pytest.mark import ParameterSet
 # is harmless.
 from test_common import session_prefetcher_hooks as _prefetch_hooks
 
-from tensorrt_llm.bindings import ipc_nvls_supported
-from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
+try:
+    from tensorrt_llm.bindings import ipc_nvls_supported
+    from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
+except (ImportError, ModuleNotFoundError):
+    # tensorrt_llm is not installed (e.g. pytest --collect-only from a source
+    # checkout without a built wheel). Provide no-op stubs so collection
+    # succeeds; these functions are only called during test execution, not
+    # during collection.
+    def ipc_nvls_supported():
+        return False
+
+    def get_mpi_world_size():
+        return 1
+
 
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
