@@ -24,6 +24,7 @@ from unittest.mock import Mock
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
+import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.transfer import (
@@ -34,6 +35,9 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _BounceProbe:
@@ -463,3 +467,338 @@ def test_cancel_before_dispatch_releases_late_idle_reservation() -> None:
     )
     assert session.status == SessionStatus.CANCELLED
     assert task.resources_drained
+
+
+def _make_owned_sender() -> transfer_mod.Sender:
+    sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = True
+    sender._sessions_lock, sender._sessions = threading.Lock(), {}
+    sender._shutdown = sender._shutdown_requested = False
+    sender._agent_operation_gate = transfer_mod._AgentOperationGate()
+    sender._ownership_poisoned, sender._ownership_poison_lock = None, threading.Lock()
+    sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
+    return sender
+
+
+def test_receiver_bridge_ownership_boundaries() -> None:
+    params = DisaggregatedParams(
+        disagg_request_id=82, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+    )
+    receiver, cohorts = _ReceiverProbe(), [{0, 1}, {2, 3}]
+
+    def prepare(rid: int) -> tuple[RxSession, KVRecvTask]:
+        params.disagg_request_id = rid
+        session = RxSession(rid, params, receiver)
+        task = session.prepare_receive(KVSlice(is_last_slice=True))
+        assert task is not None
+        task.expected_transfers = 2
+        return session, task
+
+    session, task = prepare(83)
+    assert session.try_begin_transfer(0, set(), candidate_cohorts=cohorts)
+    assert session._accept_candidate_writer(0, True)
+    aux = session._aux_physical_owner
+    assert aux is not None
+    assert task._get_physical_owner()._writer_cohort == aux._writer_cohort == {0, 1}
+    with pytest.raises(RuntimeError, match="ambiguous ADP writer-cohort"):
+        session._accept_candidate_writer(2, True)
+
+    partial_session, _ = prepare(84)
+    with pytest.raises(RuntimeError, match="partial publication"):
+        partial_session.try_begin_transfer(
+            0,
+            set(),
+            candidate_cohorts=cohorts,
+            publish=Mock(side_effect=RuntimeError("partial publication")),
+        )
+    assert not partial_session.resources_drained()
+    partial_session._timeout_s = 0
+    assert partial_session.wait_complete(blocking=True) is None
+
+    incompatible_session, incompatible_task = prepare(85)
+    incompatible_receiver = object.__new__(Receiver)
+    incompatible_receiver._enforce_physical_ownership = True
+    incompatible_receiver._build_recv_req_info = Mock()
+    incompatible_receiver._get_session = Mock(return_value=incompatible_session)
+    incompatible_receiver._get_sender_info = Mock(
+        side_effect=transfer_mod.PeerIncompatibleError("incompatible")
+    )
+    incompatible_receiver.dispatch_task(incompatible_task)
+    assert incompatible_task.is_done and incompatible_session.resources_drained()
+
+
+def test_sender_operation_ownership_covers_ambiguous_and_success_paths() -> None:
+    sender = _make_owned_sender()
+    sender._agent = SimpleNamespace()
+    destructor_gate_counts: list[int] = []
+
+    class _Request:
+        def __del__(self) -> None:
+            destructor_gate_counts.append(sender._agent_operation_gate._active_transfers)
+
+    sender._agent.submit_transfer_requests = lambda _request: SimpleNamespace(wait=lambda: True)
+    succeeded = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=92))
+    assert succeeded.begin_physical_operation(7)
+    request = _Request()
+    assert sender._submit_transfer(succeeded, 7, request) == (True, None)
+    del request
+    succeeded.finish_physical_operation(7)
+    assert destructor_gate_counts == [1] and succeeded.resources_drained
+
+    ambiguous = SimpleNamespace(wait=lambda: False, last_status_str=lambda: "in progress")
+    sender._agent.submit_transfer_requests = lambda _request: ambiguous
+    retained = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=93))
+    assert retained.begin_physical_operation(7)
+    assert sender._submit_transfer(retained, 7, Mock()) == (False, "in progress")
+    assert not retained.resources_drained and sender._ownership_poisoned is not None
+
+    metadata_entered = threading.Event()
+
+    def mutate_metadata() -> None:
+        with sender._agent_operation_gate.metadata():
+            metadata_entered.set()
+
+    metadata_thread = threading.Thread(target=mutate_metadata, daemon=True)
+    metadata_thread.start()
+    with sender._agent_operation_gate._condition:
+        assert sender._agent_operation_gate._condition.wait_for(
+            lambda: sender._agent_operation_gate._metadata_pending, timeout=10
+        )
+    assert not metadata_entered.is_set()
+    retained.finish_physical_operation(7)
+    metadata_thread.join(timeout=10)
+    assert metadata_entered.is_set()
+
+
+def test_sender_duplicate_admission_is_idempotent(monkeypatch) -> None:
+    sender = _make_owned_sender()
+    rid, peer = 94, 7
+    sender._registrar = Mock()
+    sender._registrar.get_peer_rank_info.return_value = SimpleNamespace(
+        self_endpoint="tcp://receiver"
+    )
+    sender._num_threads, sender._send_task_queues = 1, [queue.Queue()]
+    sender._sessions[rid] = SimpleNamespace(
+        lock=threading.Lock(), _closed=False, has_failed=Mock(return_value=False)
+    )
+    sender._build_aux_write_meta = Mock(return_value=object())
+    sender._enqueue = Mock()
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=rid))
+    info = SimpleNamespace(instance_name="ctx", instance_rank=peer, unique_rid=rid)
+
+    sender._dispatch_task_to_peer(task, info)
+    sender._dispatch_task_to_peer(task, info)
+
+    sender._enqueue.assert_called_once()
+    assert sender._send_task_queues[0].empty()
+
+    rejected = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=rid + 1))
+    sender._sessions[rid + 1] = SimpleNamespace(
+        lock=threading.Lock(), _closed=True, has_failed=Mock(return_value=False)
+    )
+    sender._dispatch_task_to_peer(
+        rejected, SimpleNamespace(instance_name="ctx", instance_rank=peer, unique_rid=rid + 1)
+    )
+    assert rejected.is_done and rejected.resources_drained
+    sender._send_task_queues[0].put(None)
+    sender._device_id, sender._thread_local = 0, threading.local()
+    dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", Mock())
+    monkeypatch.setattr(transfer_mod, "CUASSERT", Mock())
+    sender._process_task_queue(0)
+    dealer.send.assert_called_once()
+
+
+def test_stale_request_data_does_not_republish_closed_session(monkeypatch) -> None:
+    sender, rid = _make_owned_sender(), 95
+    session = SimpleNamespace(lock=threading.Lock(), _closed=False, kv_tasks=[])
+    sender._sessions[rid] = session
+    sender._save_peer_req_info = Mock()
+    sender._send_failed_result_to_receiver = Mock()
+    info = SimpleNamespace(unique_rid=rid)
+    monkeypatch.setattr(transfer_mod.RecvReqInfo, "from_bytes", Mock(return_value=info))
+    captured = threading.Event()
+    get_session = sender._get_session
+
+    def get_and_capture(unique_rid):
+        result = get_session(unique_rid)
+        captured.set()
+        return result
+
+    sender._get_session = get_and_capture
+    with session.lock:
+        worker = threading.Thread(
+            target=sender._respond_with_kv, args=(b"", [b"", b"info"]), daemon=True
+        )
+        worker.start()
+        assert captured.wait(timeout=10)
+        with sender._sessions_lock:
+            sender._sessions.pop(rid)
+        session._closed = True
+    worker.join(timeout=10)
+    assert not sender._save_peer_req_info.called
+    sender._send_failed_result_to_receiver.assert_called_once_with(info)
+
+
+def test_sender_shutdown_waits_for_remote_agent_registration(monkeypatch) -> None:
+    sender = _make_owned_sender()
+    sender._device_id, sender._registrar, sender._agent = 0, Mock(), Mock()
+    sender._messenger, sender._send_task_queues = Mock(), []
+    sender._worker_threads, sender._dealers = [], {}
+    ri = SimpleNamespace(instance_name="ctx", instance_rank=0, transfer_engine_info=b"descriptor")
+    monkeypatch.setattr(transfer_mod.RankInfo, "from_bytes", staticmethod(lambda _data: ri))
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", Mock())
+    monkeypatch.setattr(transfer_mod, "CUASSERT", Mock())
+    load_started, release_load = threading.Event(), threading.Event()
+
+    def load_remote_agent(*_args) -> None:
+        load_started.set()
+        assert release_load.wait(timeout=10)
+
+    sender._agent.load_remote_agent.side_effect = load_remote_agent
+    release_transfer = sender._agent_operation_gate.acquire_transfer()
+    registration = threading.Thread(
+        target=sender._register_peer_rank, args=(b"", [b"", b"rank"]), daemon=True
+    )
+    registration.start()
+    with sender._agent_operation_gate._condition:
+        assert sender._agent_operation_gate._condition.wait_for(
+            lambda: sender._agent_operation_gate._metadata_pending, timeout=10
+        )
+    assert not load_started.is_set()
+    release_transfer()
+    assert load_started.wait(timeout=10)
+    shutdown = threading.Thread(target=sender.shutdown, daemon=True)
+    shutdown.start()
+    with sender._agent_operation_gate._condition:
+        assert sender._agent_operation_gate._condition.wait_for(
+            lambda: sender._agent_operation_gate._closing, timeout=10
+        )
+    sender._agent.invalidate_remote_agent.assert_not_called()
+    release_load.set()
+    registration.join(timeout=10)
+    shutdown.join(timeout=10)
+    sender._agent.invalidate_remote_agent.assert_called_once_with("ctx0")
+    assert sender._shutdown and sender._loaded_remote_agents == set()
+    with pytest.raises(RuntimeError, match="closing"):
+        sender._register_peer_rank(b"", [b"", b"rank"])
+    assert sender._agent.load_remote_agent.call_count == 1
+
+
+def test_transceiver_pairs_requests_before_transfer_admission() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._validate_bridge_req = Mock()
+    transceiver._send_sessions, transceiver._send_reqs = {}, {}
+    transceiver._recv_sessions, transceiver._recv_reqs = {}, {}
+    transceiver._create_kv_slice = Mock(return_value=KVSlice(is_last_slice=True))
+    transceiver._slice_num_bytes = Mock(return_value=1)
+    transceiver._kv_size_rank_factor = 1
+    transceiver._dp_rank, transceiver._context_info_endpoint = 0, "ctx"
+    transceiver._transfer_worker = Mock()
+
+    def request(rid: int):
+        return Mock(
+            py_disaggregated_params=DisaggregatedParams(
+                disagg_request_id=rid,
+                schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
+            ),
+            state=None,
+        )
+
+    send_req, send_session = request(96), Mock()
+    transceiver._transfer_worker.create_tx_session.return_value = send_session
+
+    def observe_send(_slice) -> None:
+        assert transceiver._send_sessions[96] is send_session
+        assert transceiver._send_reqs[96] is send_req
+
+    send_session.send.side_effect = observe_send
+    send_session.send_aux.side_effect = RuntimeError("aux admission")
+    with pytest.raises(RuntimeError, match="aux admission"):
+        transceiver.respond_and_send_async(send_req)
+    assert transceiver._send_reqs[96] is send_req
+    send_session.set_exception.assert_called_once()
+
+    recv_req, recv_session = request(97), Mock()
+    transceiver._transfer_worker.create_rx_session.return_value = recv_session
+
+    def fail_receive(_slice) -> None:
+        assert transceiver._recv_sessions[97] is recv_session
+        assert transceiver._recv_reqs[97] is recv_req
+        raise RuntimeError("partial publication")
+
+    recv_session.receive.side_effect = fail_receive
+    with pytest.raises(RuntimeError, match="partial publication"):
+        transceiver.request_and_receive_async(recv_req)
+    assert transceiver._recv_reqs[97] is recv_req
+    recv_session.fail_admission.assert_called_once()
+
+
+def test_fp4_mla_bridge_accepts_only_exact_no_retry_profile(monkeypatch) -> None:
+    mapping = SimpleNamespace(enable_attention_dp=True, pp_size=1, cp_size=1)
+    manager = SimpleNamespace(is_disagg=True, get_fp4_mla_page_table_spec=lambda: None)
+    config = SimpleNamespace(kv_cache_bounce_size_mb=0)
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    assert not transceiver_mod._validate_fp4_mla_bridge_profile(mapping, SimpleNamespace(), config)
+    assert transceiver_mod._validate_fp4_mla_bridge_profile(mapping, manager, config)
+    profile = (mapping, manager, config)
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, "is_disagg", False)
+        assert not transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+    for owner, attribute, value in (
+        (mapping, "enable_attention_dp", False),
+        (mapping, "pp_size", 2),
+        (mapping, "cp_size", 2),
+        (config, "kv_cache_bounce_size_mb", 1),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(owner, attribute, value)
+            with pytest.raises(ValueError):
+                transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+    for name in ("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "TRTLLM_DISAGG_LAYERWISE"):
+        with monkeypatch.context() as patch:
+            patch.setenv(name, "1")
+            with pytest.raises(ValueError):
+                transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "0")
+    with pytest.raises(ValueError):
+        transceiver_mod._validate_fp4_mla_bridge_profile(*profile)
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._fp4_mla_bridge_enabled = True
+    transceiver._wait_reqs, transceiver._send_sessions = {}, {}
+    params = DisaggregatedParams(disagg_request_id=1)
+    request = SimpleNamespace(py_disaggregated_params=params)
+    for style, rid, synchronous in (
+        (DisaggScheduleStyle.CONTEXT_FIRST, 1, False),
+        (DisaggScheduleStyle.GENERATION_FIRST, -1, False),
+        (DisaggScheduleStyle.GENERATION_FIRST, True, False),
+        (DisaggScheduleStyle.GENERATION_FIRST, 1, True),
+    ):
+        params.schedule_style, params.disagg_request_id = style, rid
+        with pytest.raises(ValueError):
+            transceiver._validate_bridge_req(request, synchronous=synchronous)
+    params.schedule_style, params.disagg_request_id = DisaggScheduleStyle.CONTEXT_FIRST, 1
+    with pytest.raises(ValueError):
+        transceiver.prepare_context_requests([request])
+    assert transceiver._wait_reqs == {}
+
+
+def test_transceiver_shutdown_refusal_is_retryable() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    session, worker = Mock(), Mock()
+    session.resources_drained.side_effect = [False, True]
+    session.close.return_value = True
+    transceiver._shutdown = False
+    transceiver._fp4_mla_bridge_enabled = True
+    transceiver._send_sessions, transceiver._recv_sessions = {1: session}, {}
+    transceiver._send_reqs, transceiver._recv_reqs = {}, {}
+    transceiver._transfer_worker = worker
+    with pytest.raises(RuntimeError, match="ownership is active"):
+        transceiver.shutdown()
+    assert not transceiver._shutdown and not worker.shutdown.called
+    transceiver.shutdown()
+    assert transceiver._shutdown and worker.shutdown.call_count == 1
