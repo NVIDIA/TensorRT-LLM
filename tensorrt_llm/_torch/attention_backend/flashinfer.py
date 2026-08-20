@@ -233,6 +233,7 @@ class MLAPlanParams:
 @dataclass(kw_only=True)
 class FlashInferWrappers:
     is_planned: bool
+    cuda_graph_plan_captured: bool = False
     decode_wrapper: Optional[
         flashinfer.BatchDecodeWithPagedKVCacheWrapper] = None
     prefill_wrapper: Optional[
@@ -1440,7 +1441,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # corresponding forward pass. So, flush them out here as they won't be relevant for
             # subsequent forward calls.
             if plan_params.attention_mask_data is None and plan_params.multi_item_params is None:
-                self._plan_params_to_wrappers[plan_params].is_planned = False
+                wrappers = self._plan_params_to_wrappers[plan_params]
+                # The captured tensor-core kernel owns this plan's launch
+                # configuration and workspace state. Runtime prepare() still
+                # refreshes the stable page-table buffers below.
+                if self.is_cuda_graph and wrappers.cuda_graph_plan_captured:
+                    continue
+                wrappers.is_planned = False
                 if not defer_plan:
                     self._plan_with_params(plan_params)
             else:
@@ -1895,6 +1902,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                           plan_params: PlanParams,
                           flashinfer_backend: str = "fa2") -> PlanParams:
         if not self.needs_plan(plan_params):
+            if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+                wrappers = self._plan_params_to_wrappers[plan_params]
+                if (plan_params.head_dim > 128
+                        and wrappers.decode_wrapper is not None
+                        and wrappers.decode_wrapper.use_tensor_cores):
+                    wrappers.cuda_graph_plan_captured = True
             return plan_params
 
         if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
@@ -2015,6 +2028,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         if wrappers.decode_wrapper is None:
             use_tensor_cores = self._use_tensor_cores(plan_params)
+            # Gemma4's H256/H512 plans need one immutable tensor-core plan for
+            # graph capture and replay. The CUDA-core plan is re-planned as KV
+            # pages change and can mutate state owned by the captured graph.
+            use_graph_tensor_cores = self.is_cuda_graph and plan_params.head_dim > 128
 
             wrappers.decode_wrapper = \
                 flashinfer.BatchDecodeWithPagedKVCacheWrapper(
@@ -2024,7 +2041,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     paged_kv_indptr_buffer=self.paged_kv_indptr_decode,
                     paged_kv_indices_buffer=self._paged_kv_indices,
                     paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
-                    use_tensor_cores=use_tensor_cores
+                    use_tensor_cores=use_tensor_cores or use_graph_tensor_cores
                     or flashinfer_backend == "trtllm-gen",
                     backend=flashinfer_backend
                     if flashinfer_backend != "fa2" else
@@ -2032,6 +2049,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         9, 0) else "auto"),
                 )
         decode_wrapper = wrappers.decode_wrapper
+        use_graph_tensor_cores = self.is_cuda_graph and plan_params.head_dim > 128
 
         def decode_plan():
             assert decode_wrapper is not None
@@ -2068,6 +2086,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 block_tables=block_tables,
                 # Keep FlashInfer's recorded graph shape aligned with the wrapper cache key.
                 q_len_per_req=plan_params.q_len_per_req,
+                # Split-K can change its launch grid as KV lengths grow.
+                # Graph replay must retain the grid captured by this plan.
+                disable_split_kv=use_graph_tensor_cores,
             )
             self._publish_decode_wrapper_kv_lens(decode_wrapper)
 

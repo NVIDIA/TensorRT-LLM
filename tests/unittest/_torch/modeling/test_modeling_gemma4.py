@@ -897,6 +897,17 @@ GEMMA4_31B_REAL_DIMS_CONFIG = {
     "attention_k_eq_v": True,
 }
 
+# 12B-real-dims: GQA=2 sliding (16/8), GQA=16 full K=V (16/1),
+# hd=256/512.
+GEMMA4_12B_REAL_DIMS_CONFIG = {
+    **GEMMA4_E2B_REAL_DIMS_CONFIG,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "num_global_key_value_heads": 1,
+    "attention_k_eq_v": True,
+}
+
 # 26B-real-dims: GQA=2 sliding (16/8), GQA=2 full K=V (16/8), hd=256/512.
 GEMMA4_26B_REAL_DIMS_CONFIG = {
     **GEMMA4_E2B_REAL_DIMS_CONFIG,
@@ -3384,7 +3395,15 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
-    def _run_cuda_graph_real_headdim(self, config_dict, label=""):
+    def _run_cuda_graph_real_headdim(
+        self,
+        config_dict,
+        label="",
+        batch_size=2,
+        initial_cached=None,
+        replay_cached=None,
+        num_blocks=16,
+    ) -> None:
         """Helper: CUDA graph decode test with real head_dim configs."""
         from tensorrt_llm._torch.attention_backend import (
             FlashInferAttention,
@@ -3393,17 +3412,30 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config = Gemma4TextConfig(**config_dict)
-        batch_size = 2
         kv_cache_manager = self._get_kv_cache_manager(
-            config, num_blocks=16, tokens_per_block=32, batch_size=batch_size
+            config,
+            num_blocks=num_blocks,
+            tokens_per_block=32,
+            batch_size=batch_size,
         )
 
         self.assertTrue(kv_cache_manager.is_vswa, f"{label}: Expected VSWA manager")
 
         request_ids = list(range(batch_size))
-        initial_cached = [30, 45]
-        token_nums = [t + 1 for t in initial_cached]
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        if initial_cached is None:
+            initial_cached = [30, 45]
+        self.assertEqual(len(initial_cached), batch_size)
+        if replay_cached is not None:
+            self.assertEqual(len(replay_cached), batch_size)
+        reserved_cached = initial_cached
+        if replay_cached is not None:
+            reserved_cached = [
+                max(initial, replay)
+                for initial, replay in zip(initial_cached, replay_cached, strict=True)
+            ]
+        token_nums = [t + 1 for t in reserved_cached]
+        requests = kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        self.assertIsNotNone(requests)
 
         for i in range(config.num_hidden_layers):
             buf = kv_cache_manager.get_buffers(i)
@@ -3478,21 +3510,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 )
             )
 
-        # --- Reference (eager) ---
-        ref_metadata = FlashInferAttentionMetadata(
-            seq_lens=seq_lens,
-            num_contexts=0,
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=initial_cached),
-            max_num_requests=batch_size,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-        )
-        ref_metadata.prepare()
-        ref_results = []
-        for i in range(num_layers):
-            ref_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], ref_metadata))
-
         # --- CUDA graph ---
         workspace = torch.empty(320 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         cg_metadata = FlashInferAttentionMetadata(
@@ -3517,7 +3534,34 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         with torch.cuda.graph(graph):
             for i in range(num_layers):
                 cg_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata))
+
+        reference_cached = initial_cached
+        if replay_cached is not None:
+            reference_cached = replay_cached
+            cg_metadata.kv_cache_params = KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=replay_cached,
+            )
+            cg_metadata.prepare()
         graph.replay()
+
+        # --- Reference (eager) ---
+        ref_metadata = FlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=reference_cached,
+            ),
+            max_num_requests=batch_size,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+        )
+        ref_metadata.prepare()
+        ref_results = []
+        for i in range(num_layers):
+            ref_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], ref_metadata))
 
         for i in range(num_layers):
             torch.testing.assert_close(
@@ -3542,6 +3586,38 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     def test_cuda_graph_decode_real_headdim(self):
         """E2B-like: GQA=8, hd=256/512, non-K=V."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG), "E2B")
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_long_multi_request(self) -> None:
+        """FA2 CUDA Graph decode matches eager with split-K-sized inputs."""
+        batch_size = 8
+        self._run_cuda_graph_real_headdim(
+            deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG),
+            "E2B long multi-request",
+            batch_size=batch_size,
+            initial_cached=[1024 + 7 * i for i in range(batch_size)],
+            replay_cached=[30 + i for i in range(batch_size)],
+            num_blocks=2048,
+        )
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_decode_long_multi_request_12b_like(self) -> None:
+        """12B-like FA2 CUDA Graph decode matches eager after capture."""
+        batch_size = 1
+        self._run_cuda_graph_real_headdim(
+            deepcopy(GEMMA4_12B_REAL_DIMS_CONFIG),
+            "12B long multi-request",
+            batch_size=batch_size,
+            initial_cached=[1024],
+            replay_cached=[30],
+            num_blocks=2048,
+        )
 
     @torch.no_grad()
     @unittest.mock.patch(
