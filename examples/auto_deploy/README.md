@@ -40,7 +40,7 @@ Below is a non-exhaustive list of common configuration options:
 | Configuration Key | Description |
 |-------------------|-------------|
 | `--model` | The HF model card or path to a HF checkpoint folder |
-| `--use-registry` | Auto-populate `args.yaml_extra` from `model_registry/models.yaml` for the chosen model |
+| `--use-registry` | Auto-populate `args.yaml_extra` from the AutoDeploy model registry for the chosen model |
 | `--registry-config-id` | Select a specific registry `config_id` when a model has multiple registry entries |
 | `--args.model-factory` | Choose model factory implementation (`"AutoModelForCausalLM"`, ...) |
 | `--args.skip-loading-weights` | Only load the architecture, not the weights |
@@ -70,7 +70,7 @@ python build_and_run_ad.py \
 --args.attn-backend "flashinfer" \
 --benchmark.enabled True
 
-# Pull yaml_extra directly from model_registry/models.yaml
+# Pull yaml_extra directly from the AutoDeploy model registry
 python build_and_run_ad.py \
 --model "meta-llama/Llama-3.1-8B-Instruct" \
 --use-registry

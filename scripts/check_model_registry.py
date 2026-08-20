@@ -24,7 +24,9 @@ import typing
 
 import yaml
 
-MODEL_REGISTRY_PATH = pathlib.Path("examples/auto_deploy/model_registry/models.yaml")
+MODEL_REGISTRY_PATH = pathlib.Path(
+    "tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/models.yaml"
+)
 REQUIRED_MODEL_KEYS = {"name", "yaml_extra"}
 OPTIONAL_MODEL_KEYS = {"config_id"}
 ALLOWED_MODEL_KEYS = REQUIRED_MODEL_KEYS | OPTIONAL_MODEL_KEYS
