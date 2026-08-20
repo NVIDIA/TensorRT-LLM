@@ -23,6 +23,7 @@ from typing import Sequence, Tuple, Type
 
 import cutlass.cute as cute
 from cutlass.cute import depth, leading_dim
+from cutlass.cute.testing import assert_ as runtime_assert
 from cutlass.cutlass_dsl import (
     Int8,
     Int32,
@@ -319,7 +320,8 @@ def create_tensor_map_ragged_from_tensor(
         auto-detect from ``tensor.element_type``.
     :raises ValueError: For unsupported rank (``R ∉ {2, 3}``),
         invalid ``ragged_dim``, ragged axis being the innermost, or
-        ambiguous stride ordering.
+        ambiguous stride ordering, or static TMA strides that are
+        smaller than 16 bytes or not 16-byte aligned.
     :return: A :class:`TensorMap` of TMA rank ``R + 2``.
     :rtype: TensorMap
 
@@ -390,9 +392,25 @@ def create_tensor_map_ragged_from_tensor(
     # (and create_tensor_map_tiled) expects: length rank - 1, drops the
     # innermost stride.
     elem_bits = tensor.element_type.width
-    global_strides = [
-        tma_strides_orig[i + 1] * elem_bits // 128 for i in range(rank - 1)
-    ]
+    global_strides = []
+    for i in range(rank - 1):
+        element_stride = tma_strides_orig[i + 1]
+        stride_bits = element_stride * elem_bits
+        if is_dynamic_expression(stride_bits):
+            runtime_assert(
+                stride_bits >= 128,
+                f"TMA dimension {i + 1} stride must be at least 16 bytes",
+            )
+            runtime_assert(
+                stride_bits % 128 == 0,
+                f"TMA dimension {i + 1} stride must be a multiple of 16 bytes",
+            )
+        elif stride_bits < 128 or stride_bits % 128 != 0:
+            raise ValueError(
+                f"stride {element_stride} for TMA dimension {i + 1} must be "
+                f"a positive multiple of 16 bytes for a {elem_bits}-bit element type"
+            )
+        global_strides.append(stride_bits // 128)
 
     fmt = (
         tma_format

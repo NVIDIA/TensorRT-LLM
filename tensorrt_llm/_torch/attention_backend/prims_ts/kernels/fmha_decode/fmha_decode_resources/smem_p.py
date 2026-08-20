@@ -25,7 +25,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.memory import (
@@ -55,6 +55,7 @@ from .helpers_common import (
     _TASK_CACHE_WARP_IDX,
     _decode_gen_task_cache,
     _fp8_log2_quant_scale,
+    _is_last_loop_iteration,
     _keeps_col_base,
     _keeps_row_idx,
     _keeps_tcgen05_st,
@@ -62,6 +63,7 @@ from .helpers_common import (
     _neg_max_f32,
     _pack_float2_to_bf16,
     _pack_float2_to_fp16,
+    _wait_for_mbarrier_phase,
 )
 from .helpers_output import (
     _keeps_p_smem_block_offset_bytes,
@@ -85,7 +87,10 @@ class SmemPResource(DecodeGenResourceBase):
     """P operand resource consumed by BMM2.
 
     Softmax producers convert S to P, store it in the profile's TMEM or SMEM
-    layout, and publish local sums back to TmemS.
+    layout, and publish local sums back to TmemS. Most profiles use the generic
+    full/empty P pipeline. KV256 instead publishes four independently ready
+    K32 TMEM fragments; BMM2 consumes those fragments in order, while the
+    matching TmemO full barrier prevents the next QK from overwriting aliased P.
     """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
@@ -119,11 +124,14 @@ class SmemPResource(DecodeGenResourceBase):
     scale_softmax_log2: Float32 = None
     use_variable_seqlens_kv: Constexpr[bool] = False
     tmem_s_ref: Constexpr[TmemSResource] = None
+    tmem_o_ref: Constexpr[object] = None
     _alloc: Constexpr[SmemAllocation | None] = None
+    _fragment_ready_alloc: Constexpr[SmemAllocation | None] = None
     _tmem_alloc: Constexpr[TmemAllocation | None] = None
     _tmem_base_addr: Int32 = None
     _smem_base_p: cutlass.Array = None
     _smem_base_p_i32: cutlass.Array = None
+    _fragment_ready: cutlass.Array = None
     p_desc_0_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     p_desc_1_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     p_tmem_addr_0_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -139,9 +147,20 @@ class SmemPResource(DecodeGenResourceBase):
         self._smem_base_p_i32 = _placeholder_smem_array(
             Int32, self.cfg.smem_p_tile_bytes // 4
         )
+        self._fragment_ready = _placeholder_smem_array(
+            Int64, self.cfg.num_softmax_score_fragments
+        )
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
-        """Allocate the SMEM P tile used by non-TMEM profiles."""
+        """Allocate P storage or the KV256 fragment-ready barriers."""
+        if self.cfg.streams_tmem_p_fragments:
+            if self._fragment_ready_alloc is None:
+                self._fragment_ready_alloc = SmemAllocation(
+                    name=f"{self.name}_fragmentReady",
+                    size_bytes=self.cfg.num_softmax_score_fragments * 8,
+                    alignment=16,
+                )
+            return [self._fragment_ready_alloc]
         if self.cfg.uses_tmem_p:
             return []
         if self._alloc is None:
@@ -152,17 +171,63 @@ class SmemPResource(DecodeGenResourceBase):
             )
         return [self._alloc]
 
+    @cute.jit
+    def _bind_fragment_ready(self, context: ResourceContext | None = None) -> None:
+        """Bind the one-way KV256 P-ready barriers from the SMEM context."""
+        if cutlass.const_expr(
+            self.cfg.streams_tmem_p_fragments
+            and context is not None
+            and context.smem_base is not None
+            and self._fragment_ready_alloc is not None
+        ):
+            self._fragment_ready = cutlass.Array(
+                context.smem_base.data_ptr() + self._fragment_ready_alloc.offset,
+                dtype=Int64,
+                shape=(self.cfg.num_softmax_score_fragments,),
+                addrspace=3,
+            )
+
+    @cute.jit
+    def create_function_variables(
+        self, context: ResourceContext | None = None
+    ) -> ResourceVars:
+        """Bind and initialize KV256's per-fragment ready barriers."""
+        self._bind_fragment_ready(context)
+        if cutlass.const_expr(self.cfg.streams_tmem_p_fragments):
+            tidx, _, _ = cute.arch.thread_idx()
+            producer_warps = (
+                self.cfg.softmax0_num_warps
+                if self.inst_id == 0
+                else self.cfg.softmax1_num_warps
+            )
+            if tidx == Int32(0):
+                for fragment_idx in cutlass.range_constexpr(
+                    self.cfg.num_softmax_score_fragments
+                ):
+                    prims.mbarrier_init(
+                        self._fragment_ready.data_ptr() + fragment_idx,
+                        producer_warps,
+                    )
+        return {}
+
+    @cute.jit
+    def initialize_runtime_state_internal(
+        self,
+        context: ResourceContext | None = None,
+        captured_schedule: bool = False,
+    ) -> None:
+        """Initialize generic resource state and bind fragment barriers."""
+        super().initialize_runtime_state_internal(context, captured_schedule)
+        self._bind_fragment_ready(context)
+
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Allocate the TMEM columns occupied by the Keeps P operand."""
         if not self.cfg.uses_tmem_p:
             return []
         if self._tmem_alloc is None:
-            num_columns = self.cfg.tmem_p_cols
-            if self.cfg.uses_two_inst_tmem_p:
-                num_columns = self.cfg.tile_size_kv * self.cfg.q_dtype_bytes // 4
             self._tmem_alloc = TmemAllocation(
                 name=f"{self.name}_tmem",
-                num_columns=num_columns,
+                num_columns=self.cfg.tmem_p_cols_per_inst,
             )
         return [self._tmem_alloc]
 
@@ -171,6 +236,7 @@ class SmemPResource(DecodeGenResourceBase):
         self, context: ResourceContext | None = None
     ) -> ResourceVars:
         """Bind P storage and initialize operand task locals."""
+        self._bind_fragment_ready(context)
         if cutlass.const_expr(
             not self.cfg.uses_tmem_p
             and context is not None
@@ -233,6 +299,100 @@ class SmemPResource(DecodeGenResourceBase):
         # work can publish a valid descriptor or TMEM address for this tile.
         self._create_initial_task_locals(stage_info.context)
 
+    @producer_work
+    @cute.jit
+    def compute_p_fragment(
+        self,
+        stage_info: StageInfo,
+        *,
+        fragment_idx: Constexpr[int],
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+    ) -> None:
+        """Convert one KV256 K32 score fragment and publish its TMEM P slice."""
+        cfg = self.cfg
+        assert cfg.streams_tmem_p_fragments
+        assert not cfg.use_fp8_qkv and cfg.uses_two_inst_tmem_p
+        assert cfg.softmax_score_fragment_regs == 32
+
+        new_max = new_max_arr[0]
+        safe_new_max = new_max
+        if safe_new_max == _neg_max_f32():
+            safe_new_max = Float32(0.0)
+        minus_max_scale = Float32(-self.scale_softmax_log2 * safe_new_max)
+
+        # Eight independent chains keep the denominator update off one long
+        # dependency chain. Reuse s_arr for probabilities so only one K32 score
+        # fragment remains live while P is packed.
+        sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
+        for chain_idx in cutlass.range_constexpr(8):
+            sum_chains[chain_idx] = Float32(0.0)
+        for pair_idx in cutlass.range_constexpr(16):
+            value_idx = pair_idx * 2
+            p0, p1 = cute.arch.fma_packed_f32x2(
+                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
+                (self.scale_softmax_log2, self.scale_softmax_log2),
+                (minus_max_scale, minus_max_scale),
+            )
+            p0 = Float32(cute.math.exp2(p0, fastmath=True))
+            p1 = Float32(cute.math.exp2(p1, fastmath=True))
+            s_arr[value_idx] = p0
+            s_arr[value_idx + 1] = p1
+            chain_idx = (pair_idx & 3) * 2
+            sum_chains[chain_idx], sum_chains[chain_idx + 1] = (
+                cute.arch.add_packed_f32x2(
+                    (sum_chains[chain_idx], sum_chains[chain_idx + 1]),
+                    (p0, p1),
+                )
+            )
+
+        # Collapse the eight reduction chains before packing P and publishing
+        # its barrier. This keeps only one sum scalar live across STTM instead
+        # of overlapping the full reduction state with packed P and addresses.
+        sum01 = cute.arch.add_packed_f32x2(
+            (sum_chains[0], sum_chains[1]),
+            (sum_chains[2], sum_chains[3]),
+        )
+        sum23 = cute.arch.add_packed_f32x2(
+            (sum_chains[4], sum_chains[5]),
+            (sum_chains[6], sum_chains[7]),
+        )
+        total_pair = cute.arch.add_packed_f32x2(sum01, sum23)
+        local_sum = Float32(total_pair[0] + total_pair[1])
+
+        packed_p = (
+            s_arr.data_ptr().load(count=32, alignment=4).to(cfg.q_dtype).bitcast(Int32)
+        )
+
+        fragment_cols = cfg.softmax_score_fragment_regs // 2
+        p_tmem_addr = (
+            self._tmem_base_addr
+            + Int32(self._tmem_alloc.offset)
+            + Int32(fragment_idx * fragment_cols)
+        )
+        _keeps_tcgen05_st(
+            cfg,
+            prims.make_tmem_ptr(p_tmem_addr, Int32),
+            packed_p,
+            offset=cfg.tmem_p_cols_per_inst,
+        )
+        # This lowers to the warp-collective tcgen05.wait::st. The explicit
+        # proxy fence then makes every lane's completed STTM visible through
+        # the lane-0 mbarrier publication consumed by the MMA warp.
+        cute.arch.fence_view_async_tmem_store()
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+
+        # KV256 aliases P with the score tile that produced it. Each softmax
+        # warp publishes its own rows after the TMEM store drains; BMM2 waits
+        # for all producer warps before consuming the fragment.
+        tidx, _, _ = cute.arch.thread_idx()
+        if (tidx & Int32(31)) == Int32(0):
+            prims.mbarrier_arrive(self._fragment_ready.data_ptr() + Int32(fragment_idx))
+
+        if cutlass.const_expr(fragment_idx != 0):
+            local_sum += self.tmem_s_ref.load_p_local_sum(0)
+        self.tmem_s_ref.store_p_local_sum(0, local_sum)
+
     @cute.jit
     def _compute_keeps_p(
         self,
@@ -241,7 +401,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
     ) -> None:
-        """Materialize one row-major Keeps probability fragment.
+        """Materialize one non-KV256 row-major Keeps probability tile.
 
         TQ128 gives each warp-group thread a complete 128-column row. TQ64
         gives paired lanes the low/high 64-column halves of one row. Each lane
@@ -249,6 +409,8 @@ class SmemPResource(DecodeGenResourceBase):
         BMM2.
         """
         cfg = self.cfg
+        # KV256 uses compute_p_fragment so only one K32 score fragment is live.
+        assert not cfg.streams_tmem_p_fragments
         task_cache = _decode_gen_task_cache(stage_info)
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -376,9 +538,9 @@ class SmemPResource(DecodeGenResourceBase):
                     packed_p.data_ptr().load(count=4, alignment=4), alignment=16
                 )
         if cutlass.const_expr(cfg.uses_two_inst_tmem_p):
-            # FP8 publishes Q64/Q128 with one x16/x32 TMEM store. FP16/BF16 uses x16
-            # slices to limit Softmax register pressure, producing two/four
-            # stores. Every slice targets this instance's consumed S region.
+            # FP8 publishes a complete row with one x16/x32 STTM. FP16/BF16
+            # uses x16 slices to limit Softmax register pressure. This is the
+            # complete-row Q128/KV128 path; KV256 publishes K32 fragments.
             assert cfg.num_packed_p_regs in (16, 32, 64)
             regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_qkv else 16
             assert cfg.num_packed_p_regs % regs_per_store == 0
@@ -394,8 +556,8 @@ class SmemPResource(DecodeGenResourceBase):
                     (packed_p.data_ptr() + packed_offset).load(
                         count=regs_per_store, alignment=4
                     ),
-                    # Q64's 16x32bx2 mapping uses this as the low/high-half
-                    # split: 16 columns for FP8 and 32 for FP16/BF16.
+                    # Separate the paired Softmax destinations by one packed
+                    # row (the half-row split for x16/x32 TMEM layouts).
                     offset=cfg.num_packed_p_regs,
                 )
             if cutlass.const_expr(cfg.ordered_softmax_early_release):
@@ -416,7 +578,6 @@ class SmemPResource(DecodeGenResourceBase):
         # Publish the selected memory view before the task-level P pipeline
         # exposes this stage to BMM2.
         if cutlass.const_expr(cfg.uses_tmem_p):
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             cute.arch.fence_view_async_tmem_store()
             if cutlass.const_expr(cfg.uses_staged_one_inst_tmem_p):
                 # Synchronize the D256 producer warp group after its TMEM stores
@@ -748,6 +909,37 @@ class SmemPResource(DecodeGenResourceBase):
             )
             if cutlass.const_expr(
                 not self.use_variable_seqlens_kv
+                and not cfg.uses_runtime_q_kv_union
+                and not cfg.use_split_kv
+                and cfg.has_odd_kv_tail
+                and self.inst_id == 1
+            ):
+                # In the static nonsplit profile the final inst1 wave is only
+                # structural padding. Publish an exact zero contribution so
+                # the paired instance cannot perturb final normalization.
+                if _is_last_loop_iteration(stage_info):
+                    packed_p[0] = Int32(0)
+                    packed_p[1] = Int32(0)
+                    local_sum[0] = Float32(0.0)
+                    local_sum[1] = Float32(0.0)
+                else:
+                    packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
+                        _compute_fp8_p_regs_and_local_sums(
+                            self.scale_softmax_log2,
+                            new_max_arr[0],
+                            new_max_arr[1],
+                            s_arr[0],
+                            s_arr[1],
+                            s_arr[2],
+                            s_arr[3],
+                            s_arr[4],
+                            s_arr[5],
+                            s_arr[6],
+                            s_arr[7],
+                        )
+                    )
+            elif cutlass.const_expr(
+                not self.use_variable_seqlens_kv
                 and cfg.total_kv_tiles > 0
                 and (cfg.total_kv_tiles % cfg.num_insts_kv) == 0
             ):
@@ -817,8 +1009,11 @@ class SmemPResource(DecodeGenResourceBase):
                 and cfg.total_kv_tiles > 0
                 and (cfg.total_kv_tiles % cfg.num_insts_kv) == 0
             ):
-                # Dense full-tile cases can compute P and both local sums with
-                # the straight-line helper because no mask can suppress entries.
+                # The straight-line helper may synthesize P for an entirely
+                # masked sparse instance whose maximum stayed at -inf. This is
+                # intentionally safe: reduce_sums' guarded rescale and the
+                # correction path's uses_instN gate both key on that sentinel
+                # and discard the instance before its P/O contribution is visible.
                 p_result = _compute_p_values_and_local_sums_dense(
                     self.scale_softmax_log2,
                     new_max_arr[0],
@@ -939,10 +1134,13 @@ class SmemPResource(DecodeGenResourceBase):
             # ConsWork: select the physical TMEM stage paired with the P
             # pipeline token that was just waited. The allocation aliases the
             # stats-free columns of the corresponding S stage.
-            p_tmem_addr = (
-                self._tmem_base_addr
-                + Int32(self._tmem_alloc.offset)
-                + stage_info.stage_idx * cfg.tmem_s_cols
+            p_stage_cols = cfg.tmem_s_cols
+            if cutlass.const_expr(cfg.streams_tmem_p_fragments):
+                # KV256's four pipeline stages are K32 fragments of one P
+                # operand, not four independent full S/P stages.
+                p_stage_cols = cfg.softmax_score_fragment_regs // 2
+            p_tmem_addr = self._tmem_base_addr + Int32(
+                self._tmem_alloc.offset + stage_info.stage_idx * p_stage_cols
             )
             if cutlass.const_expr(self.inst_id == 0):
                 p_tmem_addr_0 = p_tmem_addr
@@ -963,3 +1161,49 @@ class SmemPResource(DecodeGenResourceBase):
             else:
                 p_desc_1 = p_desc
         return p_desc_0, p_desc_1, p_tmem_addr_0, p_tmem_addr_1
+
+    @consumer_work(returns=p_tmem_addr_0_slot)
+    @cute.jit
+    def wait_p_fragment(
+        self,
+        stage_info: StageInfo,
+        *,
+        fragment_idx: Constexpr[int],
+    ) -> Int32:
+        """Wait for and return the next KV256 P-fragment TMEM address."""
+        cfg = self.cfg
+        _ = stage_info
+        assert cfg.streams_tmem_p_fragments
+        _wait_for_mbarrier_phase(
+            self._fragment_ready.data_ptr() + Int32(fragment_idx),
+            self.tmem_s_ref.producer_state.phase,
+        )
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+
+        fragment_cols = cfg.softmax_score_fragment_regs // 2
+        p_tmem_addr = self._tmem_base_addr + Int32(
+            self._tmem_alloc.offset + fragment_idx * fragment_cols
+        )
+        return p_tmem_addr
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def wait_until_reusable_before_qk(self, stage_info: StageInfo) -> None:
+        """Wait until the previous same-instance PV has stopped reading P.
+
+        KV256 aliases each streamed P instance with its next S accumulator.
+        The existing two-stage O pipeline commits stage ``inst_id`` only when
+        the matching PV completes, so its full barrier is also the P-reuse
+        credit. The S producer phase supplies the generation: the first QK
+        waits on the initially complete opposite parity, and every later QK
+        waits for the preceding PV without another commit or barrier.
+        """
+        _ = stage_info
+        cfg = self.cfg
+        assert cfg.streams_tmem_p_fragments
+        assert cfg.o_stages == cfg.num_insts_kv == 2
+        barrier = self.tmem_o_ref.pipeline.sync_object_full.get_barrier(
+            Int32(self.inst_id)
+        )
+        _wait_for_mbarrier_phase(barrier, self.tmem_s_ref.producer_state.phase)
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)

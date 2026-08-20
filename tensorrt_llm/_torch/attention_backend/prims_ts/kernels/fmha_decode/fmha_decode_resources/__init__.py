@@ -34,6 +34,13 @@ SMEM resources
                             TMA copies.  Multiple consecutive tiles whose page
                             IDs share a 32-page window reuse the same stage.
 
+- SmemBlockSparseKvMetadataResource : Pipeline-free prepared route metadata
+                            retained from one K load through the matching V.
+
+- SmemBlockSparseSoftmaxMetadataResource : Staged prepared route/token metadata
+                            copied to Softmax task-local registers before the
+                            corresponding pipeline stage is released.
+
 - SmemKvResource          : Shared SMEM ring for K and V tiles.  K and V
                             alternate in one allocation/pipeline; consumer
                             descriptors target the same SMEM but may use
@@ -42,6 +49,9 @@ SMEM resources
                             (paged or contiguous, depending on cfg).  Consumers
                             (MmaTask): build tcgen05 K descriptors (BMM1 B
                             operand) and V descriptors (BMM2 B operand).
+
+- SmemKvTileResource      : Dedicated SMEM tile used by split-head-dimension
+                            profiles for one K or V producer instance.
 
 - SmemPResource           : P operand for BMM2.  The validated one-instance
                             staged-D256 Keeps profile places P in two TMEM views
@@ -76,6 +86,9 @@ TMEM resources
                             (Correction): loads the stats to drive O rescaling
                             (LOOP) and final normalization (TAIL).
 
+- TmemSoftmaxOrderResource : Barrier-only ordering resource for softmax-stat
+                             publication and correction consumption.
+
 - TmemStatsDoneResource   : Barrier-only lifetime credit for TMEM columns
                             shared by S and local stats. MMA acquires it before
                             overwriting S; Correction returns it after loading
@@ -108,6 +121,10 @@ from .smem_resources import (
     SmemPageOffsetsKvResource,
     SmemQResource,
 )
+from .smem_block_sparse_metadata import (
+    SmemBlockSparseKvMetadataResource,
+    SmemBlockSparseSoftmaxMetadataResource,
+)
 from .tmem_corr import TmemCorrResource
 from .tmem_o import TmemOResource
 from .smem_p import SmemPResource
@@ -121,13 +138,15 @@ from .tmem_softmax_stats import (
 
 __all__ = [
     "DecodeGenResourceBase",
-    "SmemKvTileResource",
     "SmemKvResource",
+    "SmemKvTileResource",
     "SmemPageOffsetsKvResource",
+    "SmemPResource",
     "SmemQResource",
+    "SmemBlockSparseKvMetadataResource",
+    "SmemBlockSparseSoftmaxMetadataResource",
     "TmemCorrResource",
     "TmemOResource",
-    "SmemPResource",
     "TmemSResource",
     "TmemStatsDoneResource",
     "TmemSoftmaxGlobalResource",

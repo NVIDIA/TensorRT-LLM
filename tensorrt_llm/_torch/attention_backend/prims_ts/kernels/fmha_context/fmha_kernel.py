@@ -594,7 +594,6 @@ def build_context_task_manager(
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
     exhaustive_deadlock_race_check: bool = True,
-    debug_print: bool = False,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -653,9 +652,6 @@ def build_context_task_manager(
     exhaustive_deadlock_race_check : bool
         Whether TaskManager runs the exhaustive schedule checker during
         construction.
-    debug_print : bool
-        Whether to enable debug prints in generated tasks.
-
     Returns
     -------
     tuple
@@ -1139,7 +1135,6 @@ def build_context_task_manager(
         work_queue,
         smem_page_offsets_kv=smem_page_offsets_kv,
         smem_page_offsets_v=smem_page_offsets_v,
-        debug_print=debug_print,
         **domain_n_kwargs,
     )
     mma_task = create_mma_task(
@@ -1152,7 +1147,6 @@ def build_context_task_manager(
         tmem_stats_done_0,
         tmem_stats_done_1,
         work_queue,
-        debug_print=debug_print,
         **mma_domain_kwargs,
     )
 
@@ -1165,7 +1159,6 @@ def build_context_task_manager(
         tmem_p0,
         s0s1_seq,
         work_queue,
-        debug_print=debug_print,
         **softmax0_domain_kwargs,
     )
     softmax1_task: Task | None = None
@@ -1179,7 +1172,6 @@ def build_context_task_manager(
             None,
             s0s1_seq,
             work_queue,
-            debug_print=debug_print,
             **softmax1_domain_kwargs,
         )
     correction_task = create_correction_task(
@@ -1193,7 +1185,6 @@ def build_context_task_manager(
         tmem_stats_done_0,
         tmem_stats_done_1,
         work_queue,
-        debug_print=debug_print,
         **domain_n_minus_1_kwargs,
     )
     epilogue_task: Task | None = None
@@ -1216,7 +1207,6 @@ def build_context_task_manager(
             gmem_o_0,
             gmem_o_1,
             work_queue,
-            debug_print=debug_print,
             **domain_n_kwargs,
         )
     scheduler_task: Task | None = None
@@ -1759,8 +1749,8 @@ def _configure_single_instance_warp_layout(cfg: FmhaConfig) -> None:
     cfg.epilogue_warp_id = 10
     cfg.empty_warp_id = 11
     cfg.block_warps = 12
-    # Match TRT-LLM-GEN's generated setmaxnreg split for Config_1_d256:
-    # 4 softmax warps, 4 correction warps, and 4 producer/scheduler warps.
+    # Use the validated D256 register split: four softmax warps, four
+    # correction warps, and four producer/scheduler warps.
     cfg.num_regs_softmax = 200
     cfg.num_regs_correction = 192
     cfg.num_regs_other = 112
@@ -1782,9 +1772,8 @@ def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
     cfg.num_o_head_dim_stages = cfg.epi_tile[1] // cfg.head_dim_per_stage_kv
     cfg.stage_kv_by_head_dim = True
     cfg.stage_o_by_head_dim = True
-    # Match TRT-LLM-GEN's d>128 policy: K, V, and O are staged as 128-wide
-    # head-dimension slices so the K/V pipeline can run deeper without
-    # exceeding Blackwell's SMEM budget.
+    # Stage K, V, and O as 128-wide head-dimension slices so the d>128 K/V
+    # pipeline can run deeper without exceeding Blackwell's SMEM budget.
 
 
 def _configure_head_paired_tilers(
@@ -2249,10 +2238,10 @@ class FmhaTs:
 
     def __init__(
         self,
-        qk_acc_dtype: type = None,
-        pv_acc_dtype: type = None,
-        in_dtype: type = None,
-        out_dtype: type = None,
+        qk_acc_dtype: type | None = None,
+        pv_acc_dtype: type | None = None,
+        in_dtype: type | None = None,
+        out_dtype: type | None = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         d: int = 128,
         is_persistent: bool = True,

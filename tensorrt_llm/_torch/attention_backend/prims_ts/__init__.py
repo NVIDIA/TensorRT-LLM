@@ -14,6 +14,12 @@
 
 """Experimental task-scheduled attention entry points."""
 
+from .block_sparse import (
+    BlockSparsePagedTSWrapper,
+    BlockSparseTSWrapper,
+    block_sparse_attention,
+    block_sparse_attention_with_paged_kv_cache,
+)
 from .decode import (
     BatchDecodePagedTSWrapper,
     batch_decode_with_paged_kv_cache,
@@ -34,6 +40,10 @@ from .mla_decode import (
 )
 
 __all__ = [
+    "BlockSparseTSWrapper",
+    "BlockSparsePagedTSWrapper",
+    "block_sparse_attention",
+    "block_sparse_attention_with_paged_kv_cache",
     "BatchPrefillTSWrapper",
     "BatchPrefillPagedTSWrapper",
     "batch_prefill",

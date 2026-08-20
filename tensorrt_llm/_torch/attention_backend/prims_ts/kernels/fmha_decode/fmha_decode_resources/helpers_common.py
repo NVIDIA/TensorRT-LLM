@@ -41,7 +41,18 @@ fadd2 = partial(cute.arch.add_packed_f32x2, ftz=False, rnd="rn")
 fmul2 = partial(cute.arch.mul_packed_f32x2, ftz=False, rnd="rn")
 ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
 
-TaskCache = tuple[Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32]
+TaskCache = tuple[
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+    Int32,
+]
 DescriptorValue = prims.Tcgen05SmemDesc | cutlass.Int64
 ResourceVarValue = (
     Int32 | Float32 | Uint32 | cutlass.Int64 | cutlass.Array | DescriptorValue
@@ -60,6 +71,42 @@ _TASK_CACHE_KV_PAGE_IDX_UB = 6
 _TASK_CACHE_KV_RAW_TILE_BASE = 7
 _TASK_CACHE_KV_VALID_TILE_END = 8
 _TASK_CACHE_KV_WINDOW_START = 9
+# Block-sparse rows share the two generic KV-span words with paged decode.
+# Semantic aliases keep sparse consumers independent of page-table naming
+# without extending the stable ten-word task-cache ABI.
+_TASK_CACHE_SPARSE_ROUTE_BEGIN = _TASK_CACHE_KV_REQUEST_BEGIN
+_TASK_CACHE_SPARSE_ROUTE_COUNT = _TASK_CACHE_KV_PAGE_IDX_UB
+
+
+@cute.jit
+def _sparse_task_cache_route_begin(task_cache: TaskCache) -> Int32:
+    """Load the first prepared-route ordinal for one sparse row."""
+
+    return Int32(task_cache[_TASK_CACHE_SPARSE_ROUTE_BEGIN])
+
+
+@cute.jit
+def _sparse_task_cache_route_count(task_cache: TaskCache) -> Int32:
+    """Load the live prepared-route count for one sparse row."""
+
+    return Int32(task_cache[_TASK_CACHE_SPARSE_ROUTE_COUNT])
+
+
+@cute.jit
+def _warp_broadcast_i32(value: Int32, source_lane: Constexpr[int]) -> Int32:
+    """Broadcast one source-lane scalar as a warp-uniform Int32 value."""
+
+    return cute.arch.make_warp_uniform(
+        Int32(
+            prims.shfl_sync(
+                thread_mask=0xFFFFFFFF,
+                val=value,
+                offset=source_lane,
+                mask_and_clamp=0x1F,
+                kind=prims.Shfl.IDX,
+            )
+        )
+    )
 
 
 def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
@@ -80,6 +127,18 @@ def _freeze_smem_descriptor(desc):
         write_only_types=[Int64],
         read_only_args=[desc],
     )
+
+
+@cute.jit
+def _wait_for_mbarrier_phase(barrier, phase: Int32) -> None:
+    """Wait for one parity of a CTA-local reusable mbarrier."""
+
+    while not prims.mbarrier_try_wait_parity(
+        barrier,
+        phase,
+        time_limit=10_000_000,
+    ):
+        pass
 
 
 def _softmax_scale_pair_width(num_scale_groups: int, scale_base: int) -> int:
@@ -140,6 +199,10 @@ def _keeps_q64_col_base(lane_idx: Int32, half_cols: int) -> Int32:
 @cute.jit
 def _keeps_row_idx(cfg: Constexpr[FmhaDecodeConfig], warp_grp_thread_idx: Int32):
     """Map a correction lane to the logical output row it owns."""
+    if cutlass.const_expr(cfg.tile_size_kv == 256):
+        # KV256's 2x2 datapath exposes two spatial KV128 partials for each
+        # logical Q row. Threads [0, 64) and [64, 128) therefore share rows.
+        return warp_grp_thread_idx & Int32(63)
     if cutlass.const_expr(cfg.tile_size_q == 128):
         return warp_grp_thread_idx
     return _keeps_q64_row_idx(warp_grp_thread_idx)
@@ -150,9 +213,34 @@ def _keeps_col_base(
     cfg: Constexpr[FmhaDecodeConfig], lane_idx: Int32, half_cols: int
 ) -> Int32:
     """Return the lane's keepsMmaAb output-column base."""
+    if cutlass.const_expr(cfg.tile_size_kv == 256):
+        return Int32(0)
     if cutlass.const_expr(cfg.tile_size_q == 128):
         return Int32(0)
     return _keeps_q64_col_base(lane_idx, half_cols)
+
+
+@cute.jit
+def _keeps_score_col(
+    cfg: Constexpr[FmhaDecodeConfig],
+    warp_grp_thread_idx: Int32,
+    reg_idx: Constexpr[int],
+    col_base: Int32,
+) -> Int32:
+    """Return the semantic KV column represented by one Keeps score register."""
+    if cutlass.const_expr(cfg.tile_size_kv == 256):
+        # A physical thread owns four K32 fragments. The spatial half selects
+        # alternating KV64 blocks; the temporal fragment selects the low/high
+        # K32 sub-block inside that semantic KV64 block.
+        spatial = warp_grp_thread_idx >> Int32(6)
+        fragment = reg_idx // 32
+        semantic_block = Int32(2 * (fragment // 2)) + spatial
+        return (
+            semantic_block * Int32(64)
+            + Int32((fragment % 2) * 32)
+            + Int32(reg_idx % 32)
+        )
+    return col_base + Int32(reg_idx)
 
 
 @cute.jit
@@ -164,7 +252,7 @@ def _keeps_tcgen05_ld(
     offset: Constexpr[int],
 ):
     """Load keepsMmaAb TMEM fragments using the tileSizeQ-specific shape."""
-    if cutlass.const_expr(cfg.tile_size_q == 128):
+    if cutlass.const_expr(cfg.tile_size_kv == 256 or cfg.tile_size_q == 128):
         return prims.tcgen05_ld(
             "32x32b",
             tmem_addr,
@@ -190,7 +278,7 @@ def _keeps_tcgen05_st(
     offset: Constexpr[int],
 ) -> None:
     """Store keepsMmaAb TMEM fragments using the tileSizeQ-specific shape."""
-    if cutlass.const_expr(cfg.tile_size_q == 128):
+    if cutlass.const_expr(cfg.tile_size_kv == 256 or cfg.tile_size_q == 128):
         prims.tcgen05_st(
             "32x32b",
             tmem_addr,
@@ -294,7 +382,18 @@ def _decode_gen_task_cache(stage_info: StageInfo) -> TaskCache:
     """Return the task cache or a zero-filled placeholder cache."""
     if cutlass.const_expr(stage_info.task_cache is None):
         zero = Int32(0)
-        return (zero, zero, zero, zero, zero, zero, zero, zero, zero, zero)
+        return (
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+            zero,
+        )
     return stage_info.task_cache
 
 

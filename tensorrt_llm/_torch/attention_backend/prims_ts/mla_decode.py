@@ -559,12 +559,13 @@ def _resolve_mla_decode_launch_spec(
     )
     from .kernels.mla_decode.throughput_2cta.config import (
         compute_split_kv,
-        compute_workspace_size,
+        compute_workspace_size as compute_2cta_workspace_size,
     )
     from .kernels.mla_decode.throughput_2cta.kernel import MlaDecodeTs
     from .kernels.mla_decode.throughput_latency_1cta.config import (
         GroupsTokensHeadsLaunchShape,
         auto_tile_size_q_for_mla_gen,
+        compute_workspace_size as compute_1cta_workspace_size,
         fp8_q16_extended_family_probe_split_kv,
         resolve_auto_mla_gen_groups_tokens_heads_q_shape,
         resolve_runtime_cluster_reduction_mode,
@@ -835,8 +836,11 @@ def _resolve_mla_decode_launch_spec(
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
-            workspace_heads = int(launch_shape.num_heads_q)
-            workspace_seq_len_q = int(launch_shape.seq_len_q)
+            workspace_size = compute_1cta_workspace_size(
+                cfg=final_cfg,
+                partial_o_dtype=cutlass.BFloat16,
+                lse_dtype=cutlass.Float32,
+            )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
                 split_kv=split_kv,
@@ -912,8 +916,15 @@ def _resolve_mla_decode_launch_spec(
                 batch_size=batch_size,
                 mask_type=mask_type,
             )
-            workspace_heads = int(launch_shape.num_heads_q)
-            workspace_seq_len_q = int(launch_shape.seq_len_q)
+            workspace_size = compute_2cta_workspace_size(
+                num_heads=int(launch_shape.num_heads_q),
+                seq_len_q=int(launch_shape.seq_len_q),
+                latent_dim=kv_lora_rank,
+                batch_size=batch_size,
+                split_kv=split_kv,
+                partial_o_dtype=cutlass.BFloat16,
+                lse_dtype=cutlass.Float32,
+            )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
                 split_kv=split_kv,
@@ -938,17 +949,7 @@ def _resolve_mla_decode_launch_spec(
                 ("separate_reducer_impl", separate_reducer_impl),
                 ("reducer_cluster_size", reducer_cluster_size),
             )
-
         _validate_mla_policy_coordinate_span(policy)
-        workspace_size = compute_workspace_size(
-            num_heads=workspace_heads,
-            seq_len_q=workspace_seq_len_q,
-            latent_dim=kv_lora_rank,
-            batch_size=batch_size,
-            split_kv=split_kv,
-            partial_o_dtype=cutlass.BFloat16,
-            lse_dtype=cutlass.Float32,
-        )
 
     return _MLADecodeLaunchSpec(
         kernel=kernel,
@@ -1432,6 +1433,35 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     must retain stable ``qo_indptr`` storage; its values may change only while
     that packed-offset contract and the captured query/output extent remain
     valid. No backend fallback or scheduling knob is exposed.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Fixed or packed query tensor with concatenated latent and RoPE heads.
+    kv_cache : torch.Tensor
+        Compact paged latent K/V cache.
+    workspace_buffer : torch.Tensor
+        Caller-owned byte workspace for this semantic key.
+    kv_lora_rank, qk_rope_head_dim : int
+        Latent and RoPE dimensions.
+    block_tables : torch.Tensor
+        Dense physical-page table for each request.
+    seq_lens : torch.Tensor
+        Live K/V sequence lengths.
+    max_seq_len : int
+        Static maximum K/V length used for policy selection and JIT caching.
+    qo_indptr : torch.Tensor, optional
+        Cumulative query offsets selecting packed-query mode.
+    max_seq_len_q : int, optional
+        Static packed-query length bound.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
+    bmm1_scale, bmm2_scale : float
+        QK and value/output scaling factors.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    out_dtype : torch.dtype
+        Output dtype.
     """
 
     packed_query = qo_indptr is not None
@@ -1574,6 +1604,7 @@ class BatchMLADecodePagedTSWrapper:
 
     @flashinfer_api
     def __init__(self, workspace_buffer: Optional[torch.Tensor] = None) -> None:
+        """Initialize an unplanned task-scheduled paged-MLA wrapper."""
         self._caller_workspace_buffer = workspace_buffer
         self._planned = False
 
@@ -1647,6 +1678,44 @@ class BatchMLADecodePagedTSWrapper:
         workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         """Prepare metadata, automatic policy, compiled callable, and scratch.
+
+        ``qo_indptr`` selects compact query storage and contains cumulative Q
+        offsets. Planning always validates those offsets and their final total
+        with one device-to-host synchronization. If ``max_seq_len_q`` is
+        omitted, their exact maximum delta becomes the plan bound; an explicit
+        bound may be larger. Planning also reads and validates every K/V length;
+        an explicit KV bound is checked against all rows. With
+        ``qo_indptr=None``, the Q bound is the exact fixed query length and
+        defaults to one. ``seq_len_q`` remains a backward-compatible alias for
+        the same static bound. CUDA graph use requires stable ``qo_indptr``
+        storage. Interior offsets may change only when they remain strictly
+        increasing, every delta stays within the plan bound, and the final
+        offset continues to match the packed query/output extent fixed by the
+        plan. ``seq_lens`` is also live. For a causal plan, every replay must
+        preserve ``q_len[b] <= seq_lens[b]`` for each request. One wrapper
+        instance supports only one in-flight run or captured-graph replay because
+        it owns mutable scratch; use separate wrappers for concurrent execution.
+
+        Parameters
+        ----------
+        block_tables : torch.Tensor
+            Dense physical-page table for each request.
+        seq_lens : torch.Tensor
+            Live K/V sequence lengths.
+        num_heads, kv_lora_rank, qk_rope_head_dim, page_size : int
+            MLA head geometry and K/V page size.
+        seq_len_q : int, optional
+            Backward-compatible fixed-query length alias.
+        qo_indptr : torch.Tensor, optional
+            Cumulative query offsets selecting packed-query mode.
+        max_seq_len_q : int, optional
+            Static packed-query length bound.
+        q_data_type, kv_data_type, o_data_type : torch.dtype
+            Query, K/V, and output dtypes used to compile the plan.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        max_kv_len : int, optional
+            Static K/V length bound; defaults to the metadata maximum.
 
         With ``live_metadata=False``, planning preserves the legacy lifecycle:
         it reads and validates every K/V length, retains ``block_tables`` and
@@ -1871,6 +1940,17 @@ class BatchMLADecodePagedTSWrapper:
     ) -> torch.Tensor:
         """Launch the most recently planned MLA decode on the current stream.
 
+        Parameters
+        ----------
+        query : torch.Tensor
+            Runtime fixed or packed query tensor matching the plan.
+        kv_cache : torch.Tensor
+            Runtime compact paged latent K/V cache.
+        bmm1_scale, bmm2_scale : float
+            QK and value/output scaling factors.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+
         In retained metadata mode, omit all three metadata arguments. In live
         mode, each argument optionally replaces its plan-time default for this
         run without changing the compiled plan. The caller must keep metadata
@@ -1955,7 +2035,35 @@ def batch_decode_mla_with_paged_kv_cache(
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """One-shot convenience wrapper for fixed or packed-query MLA decode."""
+    """One-shot convenience wrapper for fixed or packed-query MLA decode.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Fixed or packed query tensor with concatenated latent and RoPE heads.
+    kv_cache : torch.Tensor
+        Compact paged latent K/V cache.
+    block_tables : torch.Tensor
+        Dense physical-page table for each request.
+    seq_lens : torch.Tensor
+        Live K/V sequence lengths.
+    qo_indptr : torch.Tensor, optional
+        Cumulative query offsets selecting packed-query mode.
+    max_seq_len_q : int, optional
+        Static packed-query length bound.
+    kv_lora_rank, qk_rope_head_dim : int
+        Latent and RoPE dimensions.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    max_kv_len : int, optional
+        Static K/V length bound; defaults to the metadata maximum.
+    bmm1_scale, bmm2_scale : float
+        QK and value/output scaling factors.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
+    out_dtype : torch.dtype
+        Output dtype.
+    """
 
     packed_query = qo_indptr is not None
     _validate_query(query, packed_query=packed_query)

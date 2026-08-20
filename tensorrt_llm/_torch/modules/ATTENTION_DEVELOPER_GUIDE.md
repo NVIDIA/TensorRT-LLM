@@ -278,13 +278,17 @@ The FMHA package is split by role:
   through to the next library.
   The complete `prims_ts` Python source tree is managed as the
   `flashinfer-prims-ts` vendor. Its lock selects
-  [`flashinfer/attention/prims_ts` source](https://github.com/yuxianq/flashinfer/tree/ca9b08ae1fe894545300db42cbeff6151f2204b9/flashinfer/attention/prims_ts)
-  from the `trtllm-prims-ts-reusable-wrappers` branch of
-  [`yuxianq/flashinfer`](https://github.com/yuxianq/flashinfer) at commit
-  `ca9b08ae1fe894545300db42cbeff6151f2204b9`, excludes the upstream README
-  files, and applies the recorded TRT-LLM compatibility patch. Exact upstream
-  files retain FlashInfer's headers. Before editing this tree, read the
-  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Use a
+  [`flashinfer/attention/prims_ts` source](https://github.com/flashinfer-ai/flashinfer/tree/ad8bb37b26281de4d3dd52447edc952924e6562a/flashinfer/attention/prims_ts)
+  from the `main` branch of
+  [`flashinfer-ai/flashinfer`](https://github.com/flashinfer-ai/flashinfer) at
+  commit `ad8bb37b26281de4d3dd52447edc952924e6562a`, including the reusable
+  block-sparse APIs added by FlashInfer PR #4474. The vendor excludes upstream
+  README files and applies the recorded TRT-LLM compatibility patch. That patch
+  retains the reusable live-metadata and caller-workspace wrapper interfaces
+  from FlashInfer commit `ca9b08ae1fe894545300db42cbeff6151f2204b9` and
+  disables trace templates unavailable in TRT-LLM's pinned FlashInfer package.
+  Exact upstream files retain FlashInfer's headers. Before editing this tree,
+  read the [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Use a
   persistent patch for TRT-LLM-only adaptations, export an upstream-worthy
   destination change and pin its committed upstream revision, or use
   `sync --commit FULL_SHA` to migrate a clean vendor to a newer revision.

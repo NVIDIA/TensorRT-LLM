@@ -159,32 +159,38 @@ class TmemPResource(MlaResource):
                 neg_scaled_max[0] + fp8_log2_quant_scale(),
                 neg_scaled_max[0] + fp8_log2_quant_scale(),
             )
+            has_finite_max = new_max_arr[0] != neg_max_f32()
             for packed_idx in cutlass.range_constexpr(packed_p_reg_count):
                 s_base = packed_idx * 4
-                scaled01 = fadd2(
-                    fmul2(
-                        (
-                            s_arr[s_base + 0],
-                            s_arr[s_base + 1],
+                p0 = Float32(0.0)
+                p1 = Float32(0.0)
+                p2 = Float32(0.0)
+                p3 = Float32(0.0)
+                if has_finite_max:
+                    scaled01 = fadd2(
+                        fmul2(
+                            (
+                                s_arr[s_base + 0],
+                                s_arr[s_base + 1],
+                            ),
+                            log2_scale_pair,
                         ),
-                        log2_scale_pair,
-                    ),
-                    neg_scaled_pair,
-                )
-                scaled23 = fadd2(
-                    fmul2(
-                        (
-                            s_arr[s_base + 2],
-                            s_arr[s_base + 3],
+                        neg_scaled_pair,
+                    )
+                    scaled23 = fadd2(
+                        fmul2(
+                            (
+                                s_arr[s_base + 2],
+                                s_arr[s_base + 3],
+                            ),
+                            log2_scale_pair,
                         ),
-                        log2_scale_pair,
-                    ),
-                    neg_scaled_pair,
-                )
-                p0 = cute.math.exp2(scaled01[0], fastmath=True)
-                p1 = cute.math.exp2(scaled01[1], fastmath=True)
-                p2 = cute.math.exp2(scaled23[0], fastmath=True)
-                p3 = cute.math.exp2(scaled23[1], fastmath=True)
+                        neg_scaled_pair,
+                    )
+                    p0 = cute.math.exp2(scaled01[0], fastmath=True)
+                    p1 = cute.math.exp2(scaled01[1], fastmath=True)
+                    p2 = cute.math.exp2(scaled23[0], fastmath=True)
+                    p3 = cute.math.exp2(scaled23[1], fastmath=True)
                 local_sums[0] += p0
                 local_sums[0] += p1
                 local_sums[0] += p2
@@ -195,19 +201,19 @@ class TmemPResource(MlaResource):
                 p_vals = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
                 for elem_idx in cutlass.range_constexpr(4):
                     s_idx = packed_idx * 4 + elem_idx
-                    scale_idx = 0
-                    if cutlass.const_expr(cfg.kernel_variant != "keeps_mma_ab"):
-                        pair_idx = s_idx // 2
-                        scale_base = (
-                            (pair_idx % (2 * max(cfg.tile_size_q // 8, 1))) // 2
-                        ) * 2
-                        scale_idx = scale_base + (s_idx % 2)
-                    p_val = cute.math.exp2(
-                        s_arr[s_idx] * self.scale_softmax_log2
-                        + neg_scaled_max[scale_idx]
-                        + fp8_log2_quant_scale(),
-                        fastmath=True,
-                    )
+                    pair_idx = s_idx // 2
+                    scale_base = (
+                        (pair_idx % (2 * max(cfg.tile_size_q // 8, 1))) // 2
+                    ) * 2
+                    scale_idx = scale_base + (s_idx % 2)
+                    p_val = Float32(0.0)
+                    if new_max_arr[scale_idx] != neg_max_f32():
+                        p_val = cute.math.exp2(
+                            s_arr[s_idx] * self.scale_softmax_log2
+                            + neg_scaled_max[scale_idx]
+                            + fp8_log2_quant_scale(),
+                            fastmath=True,
+                        )
                     p_vals[elem_idx] = p_val
                     local_sums[scale_idx] += p_val
                 regs_p[packed_idx] = pack_float4_to_fp8_e4m3(

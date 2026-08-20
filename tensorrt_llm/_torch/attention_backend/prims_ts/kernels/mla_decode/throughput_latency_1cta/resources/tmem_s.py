@@ -22,7 +22,6 @@ from cutlass.experimental import primitives as prims
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Float32, Int32, Int64, Uint32
-from cutlass.experimental import primitives as cprims
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from cutlass.experimental.task_scheduling.memory import SmemAllocation, TmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
@@ -333,7 +332,7 @@ class TmemSResource(MlaResource):
             Float32,
         )
         if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
-            idesc = cprims.Tcgen05InstrDesc.build(
+            idesc = prims.Tcgen05InstrDesc.build(
                 c_dtype=Float32,
                 a_dtype=qkv_dtype(cfg),
                 b_dtype=qkv_dtype(cfg),
@@ -341,7 +340,7 @@ class TmemSResource(MlaResource):
                 m_dim=cfg.tile_size_q,
             )
         else:
-            idesc = cprims.Tcgen05InstrDesc.build(
+            idesc = prims.Tcgen05InstrDesc.build(
                 c_dtype=Float32,
                 a_dtype=qkv_dtype(cfg),
                 b_dtype=qkv_dtype(cfg),
@@ -612,12 +611,12 @@ class TmemSResource(MlaResource):
             local_max = cute.math.max(
                 local_max,
                 Float32(
-                    cprims.shfl_sync(
+                    prims.shfl_sync(
                         thread_mask=0xFFFFFFFF,
                         val=local_max,
                         offset=16,
                         mask_and_clamp=0x1F,
-                        kind=cprims.Shfl.BFLY,
+                        kind=prims.Shfl.BFLY,
                     )
                 ),
                 ftz=True,
@@ -643,12 +642,12 @@ class TmemSResource(MlaResource):
                 local_max = cute.math.max(
                     local_max,
                     Float32(
-                        cprims.shfl_sync(
+                        prims.shfl_sync(
                             thread_mask=0xFFFFFFFF,
                             val=local_max,
                             offset=16,
                             mask_and_clamp=0x1F,
-                            kind=cprims.Shfl.BFLY,
+                            kind=prims.Shfl.BFLY,
                         )
                     ),
                     ftz=True,
@@ -656,12 +655,12 @@ class TmemSResource(MlaResource):
                 local_max = cute.math.max(
                     local_max,
                     Float32(
-                        cprims.shfl_sync(
+                        prims.shfl_sync(
                             thread_mask=0xFFFFFFFF,
                             val=local_max,
                             offset=8,
                             mask_and_clamp=0x1F,
-                            kind=cprims.Shfl.BFLY,
+                            kind=prims.Shfl.BFLY,
                         )
                     ),
                     ftz=True,
@@ -773,7 +772,7 @@ class TmemSResource(MlaResource):
             new_max_1 = new_max_arr[scale_base + 1]
             local_sum_0 = local_sum_arr[scale_base]
             local_sum_1 = local_sum_arr[scale_base + 1]
-            if self.p_ref is not None:
+            if cutlass.const_expr(self.p_ref is not None):
                 local_sum_0 = self._p_local_sum_arr[scale_base]
                 local_sum_1 = self._p_local_sum_arr[scale_base + 1]
             sum_0 = sum_arr[scale_base]

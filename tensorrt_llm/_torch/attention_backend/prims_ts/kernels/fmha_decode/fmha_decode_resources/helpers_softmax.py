@@ -42,17 +42,7 @@ def _pack_float4_to_fp8_e4m3(
     v0: Float32, v1: Float32, v2: Float32, v3: Float32
 ) -> Int32:
     """Pack four FP32 values into one FP8 E4M3x4 register."""
-    return cute.arch.inline_ptx(
-        "{\n"
-        "  .reg .b16 lo;\n"
-        "  .reg .b16 hi;\n"
-        "  cvt.rn.satfinite.e4m3x2.f32 lo, {$r1}, {$r0};\n"
-        "  cvt.rn.satfinite.e4m3x2.f32 hi, {$r3}, {$r2};\n"
-        "  mov.b32 {$w0}, {lo, hi};\n"
-        "}",
-        write_only_types=[Int32],
-        read_only_args=[v0, v1, v2, v3],
-    )
+    return _pack_float4_to_fp8_e4m3_inline(v0, v1, v2, v3)
 
 
 @cute.jit

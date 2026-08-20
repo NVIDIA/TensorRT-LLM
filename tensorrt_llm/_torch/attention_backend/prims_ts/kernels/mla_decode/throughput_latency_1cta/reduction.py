@@ -27,7 +27,11 @@ from ..helpers.ops import (
     warp_reduce_sum_f32,
     vector_from_scalars,
 )
-from ..helpers.query import groups_tokens_heads_q_row_state, public_query_flat_row
+from ..helpers.query import (
+    groups_tokens_heads_q_row_state,
+    public_query_flat_row,
+    split_o_element_offset,
+)
 from ..helpers.tile import runtime_seq_len_kv_for_q
 
 
@@ -361,21 +365,13 @@ def run_gmem_reduction_kernel(
                         if has_finite_mass
                         else kernel.acc_dtype(0.0)
                     )
-                    acc_elem_offset = Int64(
-                        batch_idx
-                        * Int32(
-                            cfg.seq_len_q
-                            * cfg.num_heads_q
-                            * cfg.num_ctas_per_seq_kv
-                            * cfg.head_dim_v
-                        )
-                        + cta_idx_q
-                        * Int32(
-                            cfg.num_heads_q * cfg.num_ctas_per_seq_kv * cfg.head_dim_v
-                        )
-                        + head_idx * Int32(cfg.num_ctas_per_seq_kv * cfg.head_dim_v)
-                        + Int32(split_idx) * Int32(cfg.head_dim_v)
-                        + dim_idx
+                    acc_elem_offset = split_o_element_offset(
+                        cfg,
+                        batch_idx,
+                        cta_idx_q,
+                        head_idx,
+                        Int32(split_idx),
+                        dim_idx,
                     )
                     partial_vec = (
                         (acc_ptr + acc_elem_offset)
@@ -552,19 +548,13 @@ def run_gmem_reduction_kernel(
                         + Int32(split_idx)
                     ]
                 )
-                acc_elem_offset = Int64(
-                    batch_idx
-                    * Int32(
-                        cfg.seq_len_q
-                        * cfg.num_heads_q
-                        * cfg.num_ctas_per_seq_kv
-                        * cfg.head_dim_v
-                    )
-                    + q_idx
-                    * Int32(cfg.num_heads_q * cfg.num_ctas_per_seq_kv * cfg.head_dim_v)
-                    + global_head_idx * Int32(cfg.num_ctas_per_seq_kv * cfg.head_dim_v)
-                    + Int32(split_idx) * Int32(cfg.head_dim_v)
-                    + dim_idx
+                acc_elem_offset = split_o_element_offset(
+                    cfg,
+                    batch_idx,
+                    q_idx,
+                    global_head_idx,
+                    Int32(split_idx),
+                    dim_idx,
                 )
                 partial_vec = (
                     (acc_ptr + acc_elem_offset)
@@ -720,19 +710,13 @@ def run_gmem_reduction_kernel(
                         row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
                     ]
                 )
-                acc_elem_offset = Int64(
-                    batch_idx
-                    * Int32(
-                        cfg.seq_len_q
-                        * cfg.num_heads_q
-                        * cfg.num_ctas_per_seq_kv
-                        * cfg.head_dim_v
-                    )
-                    + q_idx
-                    * Int32(cfg.num_heads_q * cfg.num_ctas_per_seq_kv * cfg.head_dim_v)
-                    + head_idx * Int32(cfg.num_ctas_per_seq_kv * cfg.head_dim_v)
-                    + split_idx * Int32(cfg.head_dim_v)
-                    + dim_idx
+                acc_elem_offset = split_o_element_offset(
+                    cfg,
+                    batch_idx,
+                    q_idx,
+                    head_idx,
+                    Int32(split_idx),
+                    dim_idx,
                 )
                 partial_vec = (
                     (acc_ptr + acc_elem_offset)

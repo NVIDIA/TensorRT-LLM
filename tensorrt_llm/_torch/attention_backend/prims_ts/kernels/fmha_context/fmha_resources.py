@@ -2425,7 +2425,7 @@ class TmemSPResource(MemoryResource):
         )
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
-        s_data = _tmem_sp_sdata[id(self)]
+        s_data = _tmem_sp_sdata.pop(id(self))
         if cutlass.const_expr(self.enable_early_tile_sum):
             # Keep four independent scalar dependency chains while expressing
             # them as two packed float2 values.  The explicit packed primitive
@@ -2551,7 +2551,7 @@ class TmemSPResource(MemoryResource):
         words_per_chunk = 2 * store_group_words
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
-        s_data = _tmem_sp_sdata[id(self)]
+        s_data = _tmem_sp_sdata.pop(id(self))
         local_sum_chains = cutlass.Array(
             Float32,
             4,
@@ -2712,7 +2712,7 @@ class TmemSPResource(MemoryResource):
         num_values = self.cfg.qk_mma_tiler[1]
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
-        s_data = _tmem_sp_sdata[id(self)]
+        s_data = _tmem_sp_sdata.pop(id(self))
 
         fma_values: tuple[Any, ...] = ()
         for flat_idx in cutlass.range_constexpr(0, 8, 2):
@@ -3266,8 +3266,8 @@ class TmemSPResource(MemoryResource):
         acc_scale = cute.math.exp2(acc_scale_, fastmath=True) * 0.5
         scaled_sum = row_sum * acc_scale
         if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
-            # Match TRT-LLM-gen's four independent float2 accumulation chains
-            # for D256. A single 64-pair chain serializes every FADD behind the
+            # Use four independent float2 accumulation chains for D256. A
+            # single 64-pair chain serializes every FADD behind the
             # preceding result and leaves no row-sum ILP after P publication.
             local_sum_0 = (scaled_sum, scaled_sum)
             local_sum_1 = (Float32(0.0), Float32(0.0))

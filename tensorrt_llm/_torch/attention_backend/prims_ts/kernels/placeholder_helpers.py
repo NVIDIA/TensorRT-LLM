@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-"""Trace-time placeholder constructors shared by FMHA TS examples."""
+"""Trace-time placeholder constructors shared by the FMHA TS kernels."""
 
 import cutlass
 from cutlass.experimental import primitives as prims

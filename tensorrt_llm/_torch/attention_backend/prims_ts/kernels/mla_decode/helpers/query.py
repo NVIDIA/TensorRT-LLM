@@ -16,7 +16,7 @@
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
+from cutlass import Int32, Int64
 
 
 def groups_tokens_heads_q_capacity(logical_num_heads_q: int, tile_size_q: int) -> int:
@@ -119,6 +119,55 @@ def public_query_flat_row(cfg, storage_flat_query_row, batch_idx, cu_seqlens_q):
             cfg.logical_seq_len_q * cfg.logical_num_heads_q
         ) + Int32(storage_flat_query_row)
     return Int32(storage_flat_query_row)
+
+
+@cute.jit
+def split_o_element_offset(
+    cfg,
+    batch_idx,
+    q_idx,
+    head_idx,
+    split_idx,
+    dim_idx,
+):
+    """Return a partial-O offset without overflowing intermediate products.
+
+    The workspace geometry is compile-time constant.  Keep the common, bounded
+    layouts in 32-bit arithmetic and widen the final element offset; use fully
+    widened arithmetic only when the flattened workspace can exceed ``Int32``.
+    """
+
+    if cutlass.const_expr(
+        cfg.batch_size
+        * cfg.seq_len_q
+        * cfg.num_heads_q
+        * cfg.num_ctas_per_seq_kv
+        * cfg.head_dim_v
+        <= (1 << 31) - 1
+    ):
+        return Int64(
+            batch_idx
+            * Int32(
+                cfg.seq_len_q
+                * cfg.num_heads_q
+                * cfg.num_ctas_per_seq_kv
+                * cfg.head_dim_v
+            )
+            + q_idx * Int32(cfg.num_heads_q * cfg.num_ctas_per_seq_kv * cfg.head_dim_v)
+            + head_idx * Int32(cfg.num_ctas_per_seq_kv * cfg.head_dim_v)
+            + split_idx * Int32(cfg.head_dim_v)
+            + dim_idx
+        )
+
+    return (
+        (
+            (Int64(batch_idx) * Int64(cfg.seq_len_q) + Int64(q_idx))
+            * Int64(cfg.num_heads_q)
+            + Int64(head_idx)
+        )
+        * Int64(cfg.num_ctas_per_seq_kv)
+        + Int64(split_idx)
+    ) * Int64(cfg.head_dim_v) + Int64(dim_idx)
 
 
 @cute.jit

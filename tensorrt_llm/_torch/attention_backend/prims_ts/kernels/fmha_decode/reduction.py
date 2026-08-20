@@ -144,7 +144,7 @@ def _reduce_exact_splits_body(
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_attention_sinks: cute.Pointer,
-    g_h_r: Int32,
+    g_q_output_rows: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
 ) -> None:
@@ -162,7 +162,7 @@ def _reduce_exact_splits_body(
     # Flatten batch and KV-head so the partial buffers use one contiguous
     # logical tile index independent of the reducer launch grid layout.
     logical_kv_idx = Int64(b_idx) * Int64(grid_h_k) + Int64(h_k_idx)
-    attention_sink_h_r = _attention_sink_head_stride(cfg, g_h_r)
+    attention_sink_h_r = _attention_sink_head_stride(cfg, g_q_output_rows)
 
     # One CTA owns one contiguous byte slice of the final output tile. Within
     # the CTA, each thread maps to one 16-byte fragment and derives both the
@@ -182,19 +182,19 @@ def _reduce_exact_splits_body(
             cfg,
             g_seqlens_kv,
             b_idx,
-            g_h_r,
+            g_q_output_rows,
             reduce_row_idx,
             seq_len_q,
         )
     valid_reduce_row = _q_logical_output_row_is_valid_for_seq(
         cfg,
-        g_h_r,
+        g_q_output_rows,
         reduce_row_idx,
         seq_len_q,
     )
     output_row_idx = _q_physical_output_row_from_logical(
         cfg,
-        g_h_r,
+        g_q_output_rows,
         grid_h_k,
         b_idx,
         h_k_idx,
@@ -203,7 +203,7 @@ def _reduce_exact_splits_body(
     )
     attention_sink_head_idx = _local_head_from_q_output_row(
         cfg,
-        g_h_r,
+        g_q_output_rows,
         reduce_row_idx,
     )
 
@@ -229,7 +229,7 @@ def _reduce_exact_splits_body(
                     logical_kv_idx,
                     split_idx,
                     reduce_row_idx,
-                    g_h_r,
+                    g_q_output_rows,
                     cfg,
                 )
                 stats_offset = workspace_row * Int64(
@@ -292,7 +292,7 @@ def decode_gen_separate_reduction_kernel(
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_attention_sinks: cute.Pointer,
-    g_h_r: Int32,
+    g_q_output_rows: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
 ) -> None:
@@ -305,7 +305,7 @@ def decode_gen_separate_reduction_kernel(
         g_partial_o,
         g_partial_stats,
         g_attention_sinks,
-        g_h_r,
+        g_q_output_rows,
         cfg,
         static_full_split_prefix,
     )
@@ -438,7 +438,7 @@ def decode_gen_parallel_separate_reduction_kernel(
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_attention_sinks: cute.Pointer,
-    g_h_r: Int32,
+    g_q_output_rows: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
 ) -> None:
@@ -463,7 +463,7 @@ def decode_gen_parallel_separate_reduction_kernel(
             g_partial_o,
             g_partial_stats,
             g_attention_sinks,
-            g_h_r,
+            g_q_output_rows,
             cfg,
             static_full_split_prefix,
         )
@@ -474,7 +474,7 @@ def decode_gen_parallel_separate_reduction_kernel(
     _, grid_h_k, _ = cute.arch.grid_dim()
     cluster_rank = cute.arch.block_idx_in_cluster()
     logical_kv_idx = Int64(b_idx) * Int64(grid_h_k) + Int64(h_k_idx)
-    attention_sink_h_r = _attention_sink_head_stride(cfg, g_h_r)
+    attention_sink_h_r = _attention_sink_head_stride(cfg, g_q_output_rows)
 
     bytes_per_output_row = Int32(cfg.headdim * PARTIAL_O_ELEMENT_BYTES)
     slice_idx = block_idx_x // Int32(cfg.parallel_reduction_cluster_size)
@@ -492,19 +492,19 @@ def decode_gen_parallel_separate_reduction_kernel(
             cfg,
             g_seqlens_kv,
             b_idx,
-            g_h_r,
+            g_q_output_rows,
             reduce_row_idx,
             seq_len_q,
         )
     valid_reduce_row = _q_logical_output_row_is_valid_for_seq(
         cfg,
-        g_h_r,
+        g_q_output_rows,
         reduce_row_idx,
         seq_len_q,
     )
     output_row_idx = _q_physical_output_row_from_logical(
         cfg,
-        g_h_r,
+        g_q_output_rows,
         grid_h_k,
         b_idx,
         h_k_idx,
@@ -513,7 +513,7 @@ def decode_gen_parallel_separate_reduction_kernel(
     )
     attention_sink_head_idx = _local_head_from_q_output_row(
         cfg,
-        g_h_r,
+        g_q_output_rows,
         reduce_row_idx,
     )
 
@@ -554,7 +554,7 @@ def decode_gen_parallel_separate_reduction_kernel(
                     logical_kv_idx,
                     split_idx,
                     reduce_row_idx,
-                    g_h_r,
+                    g_q_output_rows,
                     cfg,
                 )
                 stats_offset = workspace_row * Int64(
@@ -823,9 +823,10 @@ def fmha_decode_separate_reduction_launch(
 
     The serial reference grid is ``(slice, kv_head, batch)`` with 8 KiB slices.
     The production reducer keeps that geometry for compact S2-S4 and otherwise
-    maps cluster ranks into grid.x for each 2 KiB slice. Producer CTAs already
-    applied ``scale_s`` to log2-LSE and ``output_scale`` to normalized partial
-    O. ``seqlens_kv_iter`` is internal reducer metadata used only to
+    maps cluster ranks into grid.x for each 2 KiB slice. ``scale_s`` and
+    ``output_scale`` remain parameters for launch-ABI compatibility; producer
+    CTAs already applied them to log2-LSE and normalized partial O, respectively.
+    ``seqlens_kv_iter`` is internal reducer metadata used only to
     bound the runtime split prefix; the decode launch ABI remains unchanged.
     """
     b, h_q, h_k, _, _ = problem_shape
@@ -843,7 +844,12 @@ def fmha_decode_separate_reduction_launch(
     # Multiple CTAs cover wide dimensions or grouped SQ rows without changing
     # the producer workspace layout.
     num_reduction_slices = max(
-        (grid_q_output_rows * cfg.headdim * 2 + bytes_per_slice - 1) // bytes_per_slice,
+        (
+            grid_q_output_rows * cfg.headdim * PARTIAL_O_ELEMENT_BYTES
+            + bytes_per_slice
+            - 1
+        )
+        // bytes_per_slice,
         1,
     )
     if cutlass.const_expr(cfg.use_parallel_separate_reduction):

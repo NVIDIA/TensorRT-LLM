@@ -38,7 +38,7 @@ from .constants import (
     SWIZZLE_ROW_MASK,
     TCGEN05_SECOND_PANEL_ADDR_OFFSET,
 )
-from .math import ceil_div
+from .math import ceil_div, mma_k_step_for_qkv
 
 
 # Per-task cache tuple slots.  Tasks share these indices when passing common
@@ -111,7 +111,9 @@ def num_fp8_output_regs(cfg: MlaConfig) -> int:
 
 def q_p_desc_k_block_wrap_bytes(cfg: MlaConfig) -> int:
     """Return Q/P descriptor K-wrap distance in bytes."""
-    return cfg.tile_size_q * 128 - 3 * (16 * cfg.qkv_dtype_bytes)
+    k_block_bytes = mma_k_step_for_qkv(cfg) * cfg.qkv_dtype_bytes
+    k_blocks_per_smem_row = 128 // k_block_bytes
+    return cfg.tile_size_q * 128 - (k_blocks_per_smem_row - 1) * k_block_bytes
 
 
 def q_p_desc_k_block_wrap_units(cfg: MlaConfig) -> int:

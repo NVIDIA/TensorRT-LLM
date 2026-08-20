@@ -1375,7 +1375,7 @@ def create_throughput_latency_scheduler_task(
     @schedule
     def scheduler_schedule(work_queue, schedule_token_throttle=None):
         """Fetch and publish the next dynamic persistent work tile."""
-        work_tile, _ = work_queue.init_work_tile()
+        _work_tile, _ = work_queue.init_work_tile()
         with domain_loop(0, 0, 1):
             pass
         schedule_token_throttle_tail(schedule_token_throttle)
