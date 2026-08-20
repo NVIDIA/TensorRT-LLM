@@ -16,7 +16,7 @@
 
 Covers the framework-side logic that does NOT need the full draft model:
 ``DSparkSpecMetadata`` hidden-state capture (incl. the mHC hc-mean reduction)
-and ``DSparkWorker`` slot / rolling-KV-window management. The end-to-end block
+and ``DSv4DSparkWorker`` slot / rolling-KV-window management. The end-to-end block
 draft and acceptance path is covered by the DSpark test in
 ``integration/defs/accuracy/test_llm_api_pytorch.py``.
 """
@@ -26,7 +26,7 @@ import types
 import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata, DSparkWorker
+from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata, DSv4DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
 pytestmark = pytest.mark.skipif(
@@ -101,7 +101,7 @@ def _make_worker():
     )
     from tensorrt_llm.mapping import Mapping
 
-    return DSparkWorker(cfg, Mapping())
+    return DSv4DSparkWorker(cfg, Mapping())
 
 
 def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):

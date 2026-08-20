@@ -1823,7 +1823,7 @@ class DSv4DSparkForCausalLM(nn.Module):
 
     Wraps :class:`DSv4DSparkDraftModel` (the ``n_mtp_layers``-stage ``mtp.*`` backbone)
     for the single-engine external-drafter flow: created by ``get_draft_model``,
-    appended to the target's epilogue, and driven by ``DSparkWorker``.
+    appended to the target's epilogue, and driven by ``DSv4DSparkWorker``.
 
     ``embed_tokens`` / ``lm_head`` are shared with the target model
     (:meth:`load_weights_from_target_model`). The draft weights live in the SAME
