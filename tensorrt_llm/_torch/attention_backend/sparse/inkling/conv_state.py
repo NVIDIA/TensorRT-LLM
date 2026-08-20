@@ -58,21 +58,15 @@ CONV_ROLES = (InklingRole.CONV_K, InklingRole.CONV_V, InklingRole.CONV_ATTN, Ink
 class InklingConvStateCache:
     """Runtime-owned per-request short-conv state pool for the whole decoder.
 
-    Carries the four causal short-convs of every decoder layer per request
-    across decode steps, with the same lifetime as the paged KV cache.
-
     Per layer it holds the four :class:`InklingConvState` buffers, each
-    ``[num_slots, channels, kernel_size - 1]``. The k/v conv channels follow the
-    fused-qkv k/v split (TP-sharded); the residual-stream convs are replicated.
-
+    ``[num_slots, channels, kernel_size - 1]``; the k/v conv channels follow the
+    fused-qkv k/v split (TP-sharded), the residual-stream convs are replicated.
     The buffers come from the ``allocate`` callback, which
     :class:`InklingHybridCacheManager` wires to V2 SSM-layer pool memory: this
     class owns the request-to-row mapping, V2 owns the bytes.
 
-    The row count is fixed at construction -- ``num_request_slots`` real rows plus
-    the reserved ones, the ``MambaCacheManager`` layout. Padding rows must not
-    consume real-request capacity, and every buffer keeps a stable device address
-    and is mutated in place so a captured graph replays cleanly.
+    The row count is fixed at construction and every buffer keeps a stable device
+    address, mutated in place, so a captured graph replays cleanly.
     """
 
     @staticmethod
@@ -251,12 +245,10 @@ class InklingConvRuntime:
     def from_metadata(cls, attn_metadata) -> Optional["InklingConvRuntime"]:
         """Build this forward's split, or ``None`` for the stateless conv path.
 
-        Called from ``model.forward``. The pool-row slice is a view of the buffer
-        ``InklingAttentionMetadata.prepare`` already refreshed, so the captured
-        decode path allocates nothing and copies nothing. The varlen offsets below
-        do allocate, but only when the batch carries context requests, and a
-        captured batch never does -- decode graphs are generation-only, which
-        ``page_table.validate_decode_layout`` also enforces.
+        Called from ``model.forward``, so the pool rows come back as a view of the
+        buffer ``prepare()`` already refreshed. The varlen offsets below do
+        allocate, but only for a batch carrying context requests, and a captured
+        batch never does -- decode graphs are generation-only.
         """
         mgr = getattr(attn_metadata, "kv_cache_manager", None)
         cache = getattr(mgr, "conv_state_cache", None)

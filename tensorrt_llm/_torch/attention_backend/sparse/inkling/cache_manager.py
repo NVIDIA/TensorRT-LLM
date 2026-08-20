@@ -80,10 +80,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     """
 
     def __init__(self, *args, pretrained_config, mapping, max_batch_size, **kwargs):
-        # The only thing that must be resolved before super().__init__(): the
-        # base does not keep ``pretrained_config``, and _build_cache_config runs
-        # inside it. Everything else the conv sizing needs (mapping,
-        # max_batch_size, pp_layers, max_draft_len) is on ``self`` by then.
+        # Resolved before super().__init__() because _build_cache_config runs
+        # inside it and the base does not keep pretrained_config. Everything else
+        # the conv sizing needs is on self by then.
         self._conv_config = getattr(pretrained_config, "text_config", pretrained_config)
         self._conv_dtype = _resolve_conv_dtype(pretrained_config)
         super().__init__(
@@ -114,8 +113,8 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     # ---- conv geometry, all derived from what the base already resolved -----
     @property
     def _conv_tp_size(self) -> int:
-        """k/v conv width follows the attention kv-head split, so this takes the
-        attention TP, not the global one -- as V2 does for the paged pool."""
+        # The attention TP, not the global one: the k/v convs follow the kv-head
+        # split, as V2 does for the paged pool.
         return 1 if self.mapping.enable_attention_dp else self.mapping.tp_size
 
     @property
@@ -124,20 +123,19 @@ class InklingHybridCacheManager(KVCacheManagerV2):
 
     @property
     def _num_conv_request_slots(self) -> int:
-        """One row per resident sequence; each pipeline stage holds a microbatch."""
+        # One row per resident sequence; each pipeline stage holds a microbatch.
         return self.max_batch_size * self.mapping.pp_size
 
     @property
     def _num_reserved_conv_slots(self) -> int:
-        """Asked of the pool rather than re-derived: the two counts must agree or
-        slots_for indexes the V2 buffer out of bounds."""
+        # Asked of the pool rather than re-derived: the two counts must agree or
+        # slots_for indexes the V2 buffer out of bounds.
         return InklingConvStateCache.reserved_slot_count(
             reserve_attention_dp_slot=self._reserve_attention_dp_slot
         )
 
     def _conv_bytes_per_slot(self, global_layer_idx: int) -> List[int]:
-        """Bytes one request occupies in each of the layer's four conv states, in
-        ``InklingConvState`` order."""
+        """Bytes one request occupies in each of the layer's four conv states."""
         config = self._conv_config
         kv_dim = (
             config.layer_num_kv_heads(global_layer_idx) * config.layer_head_dim(global_layer_idx)

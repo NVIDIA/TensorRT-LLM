@@ -12,15 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Decode-time views into a plain ``TrtllmAttentionMetadata`` for Inkling.
+"""Decode-time views into the attention metadata for Inkling's Triton kernels.
 
-The Triton decode kernel needs each generation request's total KV length and page
-table through fixed-pointer GPU buffers. Both are slices of the base metadata's
-``kv_lens_cuda`` and ``kv_cache_block_offsets``, which ``prepare()`` already fills
-and keeps graph-stable, so these are free functions over the base metadata rather
-than fields on a subclass. The page table is laid out for the C++ attention op:
-plane 0 serves both K and V, but its entries count pages while the kernel's views
-count blocks, hence :func:`page_div`.
+The kernel needs each generation request's total KV length and page table through
+fixed-pointer GPU buffers. Both are slices of ``kv_lens_cuda`` and
+``kv_cache_block_offsets``, which ``prepare()`` already fills and keeps
+graph-stable, so these are free functions rather than fields on a subclass. The
+page table is laid out for the C++ attention op: plane 0 serves both K and V, but
+its entries count pages while the kernel's views count blocks, hence
+:func:`page_div`.
 """
 
 import os
@@ -91,8 +91,7 @@ def gen_seq_lens(md, num_gen: int) -> torch.Tensor:
 def validate_decode_layout(md, layer: int, num_gen: int) -> None:
     """Check the borrowed layout before the decode kernel reads it.
 
-    Cheap enough to run per layer: a dict lookup plus three comparisons. The
-    crosscheck below is the expensive one and stays behind its env gate.
+    Cheap enough to run per layer: a dict lookup plus three comparisons.
     """
     num_contexts = md.num_contexts
     # The captured kernel reads both borrowed buffers at a fixed generation

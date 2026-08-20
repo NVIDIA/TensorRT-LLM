@@ -20,13 +20,10 @@ from ...trtllm import TrtllmAttentionMetadata
 class InklingAttentionMetadata(TrtllmAttentionMetadata):
     """``TrtllmAttentionMetadata`` plus the short-conv pool's per-step slot write.
 
-    Carries no fields of its own. The decode kernel's seq lens and page table are
-    slices of the base's buffers (see ``page_table.py``) and the per-forward conv
-    split is sliced in ``model.forward`` (see ``InklingConvRuntime``), so the only
-    thing that cannot live elsewhere is the write below: it is a host->device copy
-    into a buffer the captured decode graph aliases, so it has to run every step
-    and outside the captured region, and ``prepare()`` is the only hook that runs
-    there and sees the CUDA-graph padding rows.
+    Carries no fields of its own. The write is a host->device copy into a buffer
+    the captured decode graph aliases, so it has to run every step and outside
+    that region -- ``prepare()`` is the only hook that does both and still sees
+    the CUDA-graph padding rows.
     """
 
     def prepare(self) -> None:

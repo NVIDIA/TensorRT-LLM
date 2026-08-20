@@ -35,9 +35,8 @@ class InklingTritonAttention(TrtllmAttention):
     """Runs Inkling's Triton attention over the paged KV cache.
 
     Inkling's two private forward inputs (``rel_logits``, ``allow_mixed``) ride
-    ``AttentionForwardArgs.sparse_backend_args``. The metadata adds nothing but
-    the conv pool's pre-capture slot write; the decode kernel's seq lens and page
-    table are slices of buffers the base already keeps graph-stable (see
+    ``AttentionForwardArgs.sparse_backend_args``; the decode kernel's seq lens and
+    page table are slices of buffers the metadata already keeps graph-stable (see
     ``page_table.py``). ``sm_scale`` / ``rel_extent`` / ``window_left`` are
     assigned by ``InklingAttention`` after construction, since
     ``create_attention()`` has a fixed kwarg list.

@@ -543,23 +543,17 @@ def test_metadata_page_div_recovers_the_block_index():
 
 
 def test_metadata_stages_no_page_table_of_its_own():
-    """Regression on the reason for this refactor.
-
-    The previous version built a pinned host table, filled it in a Python loop
-    over requests and blocks, and issued one non-blocking H2D per KV geometry --
-    every decode step, on the host-bound path. Assert that per-step work is gone:
-    nothing is staged on the metadata, and the manager is asked only for the
-    cheap row-mapping constants, never for the block table that drove the copy.
-    """
+    """Regression on the reason for this refactor: the previous version built a
+    pinned host table in a Python loop and issued one H2D per KV geometry, every
+    decode step, on the host-bound path."""
     md = _ink_metadata(pp_layers=(0, 1), layer_pools={0: 0, 1: 0})
 
     _validate(md)
 
     assert not hasattr(md, "_ink_pt_host")
     assert not hasattr(md, "ink_page_table")
-    # The row lookup is host arithmetic over manager constants, recomputed per
-    # layer rather than cached; get_batch_cache_indices -- the accessor the H2D
-    # path needed -- is never reached.
+    # Only the cheap row-mapping constants are read; get_batch_cache_indices --
+    # the accessor the H2D path needed -- is never reached.
     assert {kind for kind, _ in md.kv_cache_manager.calls} == {"scale"}
 
 
@@ -970,13 +964,10 @@ def test_conv_pool_dtype_refuses_to_guess():
 
 
 def test_prepare_publishes_the_pool_rows_and_nothing_else():
-    """The metadata subclass exists for exactly one line.
-
-    The slot write is a host->device copy into a buffer the captured decode graph
-    aliases, so it has to run every step and outside that region; ``prepare()`` is
-    the only hook that qualifies. Everything else the decode path needs is a view
-    of the base's buffers, so the subclass must add no fields of its own.
-    """
+    """The metadata subclass exists for exactly one line: the slot write, which is
+    a host->device copy into a buffer the captured decode graph aliases and so has
+    to run every step outside that region. Everything else the decode path needs
+    is a view of the base's buffers, so the subclass must add no fields."""
     from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
     from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
