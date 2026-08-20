@@ -1638,13 +1638,13 @@ class DFlashForCausalLM(nn.Module):
         if not is_sliding_layer:
             return False, (-1, -1)
 
-        causal = self._sliding_layers_causal
+        causal = self._sliding_layers_causal or sliding_window is not None
         if sliding_window is None:
             # Legacy drafters without an explicit window preserve their prior
             # non-windowed behavior.
             return causal, (-1, -1)
         # FlashAttention's bounds are inclusive: W tokens are current + W-1 left.
-        return causal, (sliding_window - 1, 0 if causal else sliding_window - 1)
+        return causal, (sliding_window - 1, 0)
 
     def _prepare_dflash_trtllm_gen_buffers(
         self,

@@ -297,9 +297,9 @@ def test_dflash_attention_mask_args():
         )
     )
 
-    assert wrapper._get_attention_mask_args(0) == (False, (4095, 4095))
+    assert wrapper._get_attention_mask_args(0) == (True, (4095, 0))
     assert wrapper._get_attention_mask_args(1) == (False, (-1, -1))
-    assert wrapper._get_attention_mask_args(2) == (False, (4095, 4095))
+    assert wrapper._get_attention_mask_args(2) == (True, (4095, 0))
 
     with patch("tensorrt_llm._torch.models.modeling_speculative.logger.warning") as warning:
         wrapper._warn_inferred_attention_windows()
