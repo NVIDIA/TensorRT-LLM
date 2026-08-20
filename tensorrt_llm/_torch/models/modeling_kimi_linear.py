@@ -112,6 +112,7 @@ from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
+from ..modules.fused_moe.interface import _compute_ep_partition
 from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear as TrtllmLinear
@@ -1073,7 +1074,18 @@ class KimiK3MoERuntime(nn.Module):
             )
 
         if routed_moe_model_config.moe_backend == "CUTLASS":
-            local_num_experts = self.num_experts // routed_moe_model_config.mapping.moe_ep_size
+            # Size the per-expert SiTU constants with the same ceil/floor
+            # partition the MoE backend uses for ``expert_size_per_partition``.
+            # A plain ``num_experts // ep_size`` is one element short on the
+            # first ``num_experts % ep_size`` ranks, which trips the
+            # ``swiglu_alpha must have num_experts_on_rank elements`` check in
+            # moeOp.cpp. K3's 384 experts divide evenly at EP8/EP16, so the
+            # mismatch is latent there but real for any uneven split.
+            local_num_experts, _, _ = _compute_ep_partition(
+                self.num_experts,
+                routed_moe_model_config.mapping.moe_ep_size,
+                routed_moe_model_config.mapping.moe_ep_rank,
+            )
             device = torch.device("cuda", torch.cuda.current_device())
             self.routed_situ_alpha = torch.full(
                 (local_num_experts,), float(situ_beta), dtype=torch.float32, device=device
@@ -1103,6 +1115,13 @@ class KimiK3MoERuntime(nn.Module):
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
             )
+        # MEGAMOE_CUTEDSL has no branch on purpose. ``MegaMoECuteDsl`` resolves
+        # SiTU from the pretrained config in ``_resolve_activation_config``
+        # (``activation=None`` -> "situ" when ``activation_situ_beta`` is
+        # present), and ``create_moe`` currently rejects the explicit
+        # ``activation``/``situ_beta``/``situ_linear_beta`` trio for anything
+        # other than ``MegaMoEDeepGemm``, so passing them here would raise.
+        # Unifying that plumbing is tracked in TRTLLM-15649.
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
