@@ -174,7 +174,9 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
-                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202505221445_docker_dind_withbash
+                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202608172149_docker_dind_mtu_helper
+                    command: ['/usr/local/bin/dind-mtu']
+                    args: ['start']
                     tty: true
                     resources:
                       requests:
@@ -331,6 +333,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
 
     // Step 2: Build the images
     stage ("Install Package") {
+        sh(label: "Validate Docker bridge MTU", script: "/usr/local/bin/dind-mtu validate")
         sh "pwd && ls -alh"
         sh "env | sort"
         sh "apk add make git"
