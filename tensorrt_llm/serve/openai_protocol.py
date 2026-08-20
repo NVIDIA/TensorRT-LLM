@@ -1939,6 +1939,15 @@ class VideoJob(OpenAIBaseModel):
         exclude=True,
         description=
         "Server-side paths for n>1 (internal; excluded from the wire).")
+    # exclude=True internal timings, never on the wire (status/list
+    # model_dump() stays status-only). ``request_started`` is a
+    # ``perf_counter()`` stamped at the POST handler; the background task
+    # computes ``total`` from it and stores the header timings
+    # (``generation``/``denoise``/``total``) in ``timing_metrics`` so
+    # ``/content`` emits the same Server-Timing header as the sync route.
+    request_started: Optional[float] = Field(default=None, exclude=True)
+    timing_metrics: Optional[Dict[str, float]] = Field(default=None,
+                                                       exclude=True)
     response_format: Optional[Literal["file", "path"]] = Field(
         default=None,
         description=(

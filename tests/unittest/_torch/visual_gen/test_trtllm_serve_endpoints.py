@@ -119,6 +119,16 @@ def _assert_visual_gen_server_timing(headers) -> None:
     assert "denoise;dur=750.000000" in server_timing
 
 
+def _server_timing_ms(headers, name: str) -> float:
+    """Parse the ``dur`` (ms) of one metric out of the Server-Timing header."""
+    server_timing = headers[SERVER_TIMING_HEADER]
+    for part in server_timing.split(","):
+        part = part.strip()
+        if part.startswith(f"{name};dur="):
+            return float(part[len(f"{name};dur=") :])
+    raise AssertionError(f"{name!r} not in Server-Timing: {server_timing!r}")
+
+
 def _drive_job_to_completion(client, video_id, timeout: float = 5.0):
     """Poll ``GET /v1/videos/{id}`` until the job reaches a terminal state.
 
@@ -1314,6 +1324,25 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "video/mp4"
         _assert_visual_gen_server_timing(resp.headers)
+
+    def test_sync_video_server_timing_has_total(self, video_client):
+        """The sync Server-Timing header carries generation, denoise, and the
+        new ``total`` (full server time; real wall-clock, so only checked > 0)."""
+        resp = video_client.post(
+            "/v1/videos/sync",
+            json={
+                "prompt": "timing",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert _server_timing_ms(resp.headers, "generation") == 1250.0
+        assert _server_timing_ms(resp.headers, "denoise") == 750.0
+        assert _server_timing_ms(resp.headers, "total") > 0
         assert len(resp.content) > 0
 
     def test_deprecated_generations_alias_routes_to_sync(self, video_client):
@@ -2838,6 +2867,31 @@ class TestAsyncVideoTransport:
         # The returned server-side path points at non-empty bytes.
         assert os.path.exists(body["output_path"])
         assert os.path.getsize(body["output_path"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_async_content_server_timing_has_total(self, async_video_client):
+        """`/content` carries the same Server-Timing header as the sync route,
+        rebuilt from the timings the background task stored on the job."""
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "timing",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "avi",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+        assert await _adrive_job_to_completion(async_video_client, video_id) == "completed"
+
+        content = await async_video_client.get(f"/v1/videos/{video_id}/content")
+        assert content.status_code == 200
+        assert _server_timing_ms(content.headers, "generation") == 1250.0
+        assert _server_timing_ms(content.headers, "denoise") == 750.0
+        assert _server_timing_ms(content.headers, "total") > 0
 
     @pytest.mark.asyncio
     async def test_async_file_still_returns_file_response(self, async_video_client):

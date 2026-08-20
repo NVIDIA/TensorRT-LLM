@@ -102,8 +102,8 @@ from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
-from tensorrt_llm.serve.visual_gen_metrics import \
-    build_visual_gen_timing_headers
+from tensorrt_llm.serve.visual_gen_metrics import (
+    build_visual_gen_server_timings, build_visual_gen_timing_headers)
 from tensorrt_llm.serve.visual_gen_utils import (
     cleanup_materialized_conditioning_inputs, parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
@@ -2636,7 +2636,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} generated and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
-            headers = build_visual_gen_timing_headers(metrics)
+            headers = build_visual_gen_timing_headers(
+                build_visual_gen_server_timings(metrics))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
@@ -2869,7 +2870,8 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info(f"Image {image_id} edited and encoded: "
                         f"latency={latency:.3f}s generation={generation:.3f}s "
                         f"denoise={denoise:.3f}s")
-            headers = build_visual_gen_timing_headers(metrics)
+            headers = build_visual_gen_timing_headers(
+                build_visual_gen_server_timings(metrics))
 
             return JSONResponse(content=response.model_dump(), headers=headers)
 
