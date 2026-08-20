@@ -433,6 +433,29 @@ jobs:
         "zongfeijing"
         ]'), github.actor)
     steps:
+      # Runs before the authorization check so the comment author gets a receipt without
+      # waiting on the vulnerability scan or the Jenkins queue. No `permissions:` block:
+      # adding one drops every unlisted scope to none, including those blossom-ci needs.
+      - name: Acknowledge receipt
+        id: ack
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          curl --silent --show-error --fail-with-body --max-time 10 \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -d '{"content":"eyes"}'
+
+      - name: Warn if the receipt reaction failed
+        if: steps.ack.outcome == 'failure'
+        run: echo "::warning::Could not react to the triggering comment. CI is unaffected."
+
       - name: Check if comment is issued by authorized person
         run: blossom-ci
         env:
