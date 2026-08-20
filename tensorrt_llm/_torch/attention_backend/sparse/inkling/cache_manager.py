@@ -105,9 +105,10 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             max_batch_size=max_batch_size,
             **kwargs,
         )
-        # The layer group the conv buffers live in; V2 reports a request's slot
-        # within it. Taken from the first conv layer, as Mamba does.
-        self._conv_layer_group_id = self.impl.get_layer_group_id(self._conv_layer_id(0))
+        # Resolved on first use, not here: `impl` is not guaranteed to exist by
+        # the end of __init__, and a manager built for a unit test has none at
+        # all. Taken from the first conv layer, as Mamba does.
+        self._conv_layer_group_id = None
         self._conv_cache = InklingConvStateCache(
             pretrained_config,
             self._conv_tp_size,
@@ -142,6 +143,8 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None:
             return None
+        if self._conv_layer_group_id is None:
+            self._conv_layer_group_id = self.impl.get_layer_group_id(self._conv_layer_id(0))
         slot = kv_cache.get_ssm_block_base_index(self._conv_layer_group_id)
         return None if slot < 0 else int(slot)
 

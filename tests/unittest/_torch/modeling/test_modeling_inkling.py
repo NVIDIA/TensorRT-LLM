@@ -437,6 +437,7 @@ def _mm_request(hashes=None, mm_data=None, request_id=7):
     )
 
 
+@pytest.fixture
 def passthrough_base(monkeypatch):
     """Make the base augmentation the identity, so what these assert on is the
     Inkling override alone rather than the multimodal rewrite underneath it."""
