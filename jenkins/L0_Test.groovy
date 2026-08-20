@@ -4035,6 +4035,15 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         }
     }
 
+    // Log the resolved mako match on every render, tagged with stage+context.
+    // transformMakoArgsToJson already echoes the bare JSON ("Test DB Mako opts:"),
+    // but unlabeled and far upstream of the render; the preDefinedMakoOpts path
+    // skips it entirely. This co-locates the match with the stage/context and the
+    // "-> N tests" summary below under one greppable renderTestDB: prefix, so a
+    // wrong-but-non-empty render (a stale/unexpected sysinfo value selecting the
+    // wrong block) is diagnosable per stage, not just the "na"/empty cases.
+    echo "renderTestDB: stage=${stageName} context=${testContext} mako match: ${makoOpts}"
+
     if (makoOpts.contains('"na"')) {
         // "na" is a sysinfo probe failure sentinel (see get_sysinfo.py). Blocks
         // conditioned on the failed property silently drop out of the render, so
