@@ -508,6 +508,15 @@ _MIXED_BATCH_TEST_CASES = [
     ),
     _mixed_batch_test_case(
         model_name="t5-small",
+        torch_dtype="float32",
+        use_kv_cache_manager_v2=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="fp32-kv-v1-decoder-cuda-graph-on-greedy-batch2",
+    ),
+    _mixed_batch_test_case(
+        model_name="t5-small",
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=True,
         num_beams=1,
@@ -564,6 +573,19 @@ def _decoder_cuda_graph_config(
         batch_sizes=batch_sizes or [1],
         enable_padding=True,
     )
+
+
+def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
+    """Introspect the in-process engine (single-process mode only).
+
+    Guards against the engine silently declining decoder graphs: without it a
+    workspace-sizing regression that disables capture would still pass the
+    output checks. The enc-dec encoder step stays eager.
+    """
+    model_engine = llm._executor.engine.model_engine
+    assert not model_engine.encoder_cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.enabled
+    assert model_engine.cuda_graph_runner.graphs
 
 
 class _SleepLogitsProcessor:
@@ -751,6 +773,9 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
     exact_match: bool,
 ) -> None:
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    # Single-process worker so _assert_decoder_cuda_graphs_captured can reach the engine; the
+    # default proxy executor runs it in another process.
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     model_path = _get_t5_model_path(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -790,6 +815,7 @@ def test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
         )
 
         assert len(responses) == len(_MIXED_ENCODER_SOURCE_TEXTS)
+        _assert_decoder_cuda_graphs_captured(llm)
 
         for request_idx, response in enumerate(responses):
             expected_token_ids = (
