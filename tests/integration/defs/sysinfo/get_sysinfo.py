@@ -108,6 +108,9 @@ def is_power():
     return platform.processor() == "ppc64le"
 
 
+# TODO(#17993): cherry-picked from PR #17993 to unblock this PR's CI (distro->'na'
+# empty-render bug). Drop this and take main's version when resolving the rebase
+# conflict after #17993 lands.
 def get_linux_distribution():
     try:
         import distro
@@ -116,9 +119,13 @@ def get_linux_distribution():
         # distro is not a direct test dependency historically; it used to arrive
         # transitively (e.g. via openai<3.3.1) and silently disappeared when that
         # dependency was dropped. Fall back to the stdlib rather than to 'na'.
-        pass
+        distro_reason = "distro module not installed"
     except Exception as e:
-        logger.warning(f"distro probe failed ({e}); falling back to os-release")
+        # Best-effort probe: distro imported but id()/version()/codename() raised.
+        # Any failure here should degrade to os-release, not crash the render, so
+        # the broad catch is deliberate; the reason is preserved for the log below.
+        distro_reason = f"distro probe raised {type(e).__name__}: {e}"
+        logger.warning(f"{distro_reason}; falling back to os-release")
     try:
         # Python 3.10+; reads /etc/os-release, same source distro uses.
         os_release = platform.freedesktop_os_release()
@@ -126,10 +133,10 @@ def get_linux_distribution():
                 os_release.get("VERSION_CODENAME", "na"))
     except OSError:
         logger.error(
-            "Cannot determine the Linux distribution (no distro module and no "
-            "/etc/os-release); reporting ('na', 'na', 'na'). Test-db conditions "
-            "matching linux_distribution_name (e.g. ubuntu*) will select ZERO "
-            "tests and the rendered test list will be empty.")
+            f"Cannot determine the Linux distribution ({distro_reason}; "
+            "/etc/os-release also unreadable); reporting ('na', 'na', 'na'). "
+            "Test-db conditions matching linux_distribution_name (e.g. ubuntu*) "
+            "will select ZERO tests and the rendered test list will be empty.")
         return ("na", "na", "na")
 
 

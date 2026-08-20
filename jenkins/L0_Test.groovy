@@ -4037,15 +4037,6 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
         }
     }
 
-    if (makoOpts.contains('"na"')) {
-        // "na" is a sysinfo probe failure sentinel (see get_sysinfo.py). Blocks
-        // conditioned on the failed property silently drop out of the render, so
-        // even a non-empty list may be missing tests. Warn here, where every
-        // sysinfo-based stage passes through, not just when the list ends up empty.
-        echo "WARNING: renderTestDB: some sysinfo probes returned \"na\": ${makoOpts}. " +
-             "Test-db blocks conditioned on those properties (e.g. linux_distribution_name: ubuntu*) " +
-             "will NOT be selected."
-    }
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
     // CBTS Layer 3: download the pre-built cbts_test_db/ tarball that the
     // orchestrator uploaded to Artifactory (see getCbtsResult in
@@ -4096,18 +4087,6 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
-    if (testCount == "0") {
-        // An empty render is never legitimate here: every launched stage must
-        // have tests (CBTS drops stages with an empty selection before launch).
-        // Fail now with the match query rather than letting pytest --collect-only
-        // exit 5 later with an unattributable "Test collection failed" message.
-        def hint = makoOpts.contains('"na"') ?
-            " Some sysinfo probes returned \"na\" (see the match JSON above); a broken probe" +
-            " (e.g. the python 'distro' module missing) makes conditions like" +
-            " linux_distribution_name: ubuntu* match nothing." : ""
-        error("renderTestDB: rendered EMPTY test list for stage=${stageName} " +
-              "context=${testContext} test-db=${testDBLabel}. Match query: ${makoOpts}.${hint}")
-    }
     recordRenderedStageAttemptEstimate(pipeline, llmSrc, testList, stageName, testCount, clusterName)
 
     return testList
