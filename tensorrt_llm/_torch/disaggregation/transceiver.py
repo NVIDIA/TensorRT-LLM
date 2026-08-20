@@ -766,14 +766,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         is_last_chunk = req.context_remaining_length == 0
         # The scheduler is free to cut a chunk anywhere. Both bounds round down
         # The last chunk rounds up instead: its tail is computed and nothing follows.
-        chunk_start_block = 0 if is_first_chunk else chunk_start_pos // tpb
-        chunk_end_block = (
+        chunk_start = 0 if is_first_chunk else chunk_start_pos // tpb
+        chunk_end = (
             (chunk_end_pos + tpb - 1) // tpb if is_last_chunk else chunk_end_pos // tpb
         )
-        total_blocks = (req.prompt_len + tpb - 1) // tpb
 
-        chunk_start = min(chunk_start_block, total_blocks)
-        chunk_end = min(chunk_end_block, total_blocks)
         # The next chunk's start rounds down to here, so the skipped blocks travel with
         # it. The last chunk always sends: it carries is_last_slice.
         if chunk_end <= chunk_start and not is_last_chunk:
