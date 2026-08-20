@@ -21,6 +21,7 @@ import shutil
 import sys
 import sysconfig
 import tempfile
+import time
 import warnings
 from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
@@ -28,7 +29,8 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
-from subprocess import DEVNULL, CalledProcessError, check_output, run
+from subprocess import (DEVNULL, PIPE, CalledProcessError, Popen, check_output,
+                        run)
 from typing import Optional, Sequence
 
 try:
@@ -95,11 +97,20 @@ def get_source_dir():
     return get_project_dir() / "cpp"
 
 
-def get_build_dir(build_dir, build_type, build_root=None):
+def get_build_dir(build_dir, build_type, build_root=None, out_of_tree=False):
     if build_dir is None:
         dir_name = "build" if build_type == "Release" else f"build_{build_type}"
         if build_root is not None:
-            build_dir = Path(build_root).resolve() / f"cpp-{dir_name}"
+            # Isolate out-of-tree build state in its own CMake directory so
+            # that toggling --out-of-tree against an existing conventional
+            # build under the same --build_root always triggers a fresh
+            # configure (first_build) instead of reusing a CMakeCache whose
+            # redirected FMHA/version.h paths don't match the mode. Without
+            # this, switching modes without --clean/--configure_cmake would
+            # skip configure and silently write into the checkout despite
+            # --out-of-tree.
+            suffix = "-oot" if out_of_tree else ""
+            build_dir = Path(build_root).resolve() / f"cpp-{dir_name}{suffix}"
         else:
             build_dir = get_source_dir() / dir_name
     else:
@@ -306,12 +317,38 @@ def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
     return fmha_v2_cu_dir / ".generation_complete"
 
 
-def generate_fmha_cu(project_dir, venv_python):
-    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+def get_fmha_gen_dirs(project_dir, gen_root=None):
+    """Return (fmha_v2_cu_dir, cubin_dir) for generated FMHA sources.
+
+    gen_root=None keeps the historical in-source locations; otherwise both
+    live under gen_root (consumed by CMake via TRTLLM_FMHA_GEN_DIR).
+    """
+    base = (project_dir /
+            "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention"
+            if gen_root is None else gen_root)
+    return base / "fmha_v2_cu", base / "cubin"
+
+
+def generate_fmha_cu(project_dir, venv_python, gen_root=None):
+    fmha_v2_cu_dir, cubin_dir = get_fmha_gen_dirs(project_dir, gen_root)
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
+    cubin_dir.mkdir(parents=True, exist_ok=True)
     _fmha_generation_stamp(fmha_v2_cu_dir).unlink(missing_ok=True)
 
     fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
+    if gen_root is not None:
+        # The generator writes ./generated, ./temp and ./obj relative to its
+        # own directory; run it from a scratch copy so a (possibly read-only)
+        # checkout is never written.
+        work_dir = gen_root / "fmha_v2-work"
+        if work_dir.exists():
+            rmtree(work_dir)
+        copytree(fmha_v2_dir,
+                 work_dir,
+                 symlinks=False,
+                 ignore=shutil.ignore_patterns("generated", "temp", "obj",
+                                               "__pycache__"))
+        fmha_v2_dir = work_dir
 
     env = os.environ.copy()
     env.update({
@@ -344,7 +381,6 @@ def generate_fmha_cu(project_dir, venv_python):
             shutil.move(src, dst)
 
     # Copy generated header file when cu path is active and cubins are deleted.
-    cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
     move_if_updated(fmha_v2_dir / "generated/fmha_cubin.h",
                     cubin_dir / "fmha_cubin.h")
 
@@ -545,6 +581,193 @@ def build_kv_cache_manager_v2(project_dir,
     print("-- Done building kv_cache_manager_v2.")
 
 
+def _tar_pipe_copy(src: Path, dst: Path) -> bool:
+    """Populate dst from src as one streamed tar pipeline.
+
+    A single reader/writer pair with kernel-buffered pipe I/O is much faster
+    than per-file copies on network filesystems. Dereferences symlinks (-h)
+    and preserves mtimes, matching copytree(symlinks=False) + copystat.
+    Returns False if tar is unavailable or fails, so callers can fall back.
+    """
+    tar_bin = shutil.which("tar")
+    if tar_bin is None:
+        return False
+    dst.mkdir(parents=True, exist_ok=True)
+    # posix (pax) format keeps sub-second mtimes; the gnu default truncates
+    # to whole seconds, which would defeat sync_tree's mtime comparison.
+    #
+    # Chain the producer and consumer tars directly through an OS pipe rather
+    # than a shell string. Checking both return codes reports a failing
+    # producer (e.g. an unreadable source file) that a shell pipeline would
+    # mask behind the consumer's exit status, without depending on a bash that
+    # supports `set -o pipefail`; it also avoids shell quoting entirely.
+    producer = Popen(
+        [tar_bin, "--format=posix", "-C",
+         str(src), "-chf", "-", "."],
+        stdout=PIPE)
+    consumer = Popen([tar_bin, "-C", str(dst), "-xf", "-"],
+                     stdin=producer.stdout)
+    # Close our copy of the write end so the consumer sees EOF when the
+    # producer exits (and the producer gets SIGPIPE if the consumer dies).
+    producer.stdout.close()
+    consumer.wait()
+    producer.wait()
+    return producer.returncode == 0 and consumer.returncode == 0
+
+
+# How recently a source file must have been written for its mtime to be
+# untrustworthy as a change marker. Inode timestamps come from a coarse clock
+# (one timer tick on Linux) and some filesystems store whole seconds, so a file
+# rewritten shortly after being copied can still report the mtime the copy
+# recorded. A size+mtime comparison would then call it unchanged and leave a
+# stale copy behind. Two seconds covers a whole-second-granularity destination
+# (which can make an mtime look up to a second older than it is) on top of the
+# tick granularity of the source.
+_MTIME_RACE_WINDOW = 2.0
+
+
+def _demote_racy_mtime(dst_file: Path, src_stat: Optional[os.stat_result],
+                       now: float) -> None:
+    """Break the mtime match for a copy whose source was just written.
+
+    A copy normally records the source's mtime so the next sync can skip it.
+    That is only sound once the source mtime has aged out of the window above;
+    before that the source can change again without its mtime moving. Backdating
+    the copy makes the next sync's comparison mismatch, so the file is re-copied
+    instead of silently kept stale. It costs one extra copy of files written
+    right before a sync, and converges: the re-copy records the real mtime.
+    """
+    if src_stat is None or src_stat.st_mtime <= now - _MTIME_RACE_WINDOW:
+        return
+    try:
+        os.utime(dst_file,
+                 (src_stat.st_atime, src_stat.st_mtime - _MTIME_RACE_WINDOW))
+    except OSError:
+        pass
+
+
+def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
+    """Mirror the src directory into dst, touching only what changed.
+
+    Replaces the rmtree+copytree pattern for artifact copy-back: files are
+    rewritten only when size or mtime differs and entries missing from src
+    are deleted, so incremental rebuilds cause almost no I/O on the
+    destination (which may be a slow network filesystem). A missing dst is
+    populated via a streamed tar pipeline instead of per-file copies.
+    Symlinks are dereferenced like copytree(symlinks=False); mtimes are
+    preserved so the next sync can compare against them, except for sources
+    written within _MTIME_RACE_WINDOW of the copy, whose mtimes cannot yet
+    prove the content settled. exclude lists fnmatch patterns for entry names
+    to skip.
+    """
+    import fnmatch
+
+    src = Path(src).resolve()
+    dst = Path(dst)
+    now = time.time()
+
+    def excluded(name: str) -> bool:
+        return any(fnmatch.fnmatch(name, pat) for pat in exclude)
+
+    def demote_racy_mtimes() -> None:
+        # A cold populate (tar or copytree) copies source mtimes verbatim, so
+        # apply the same guard the incremental path applies per file. Walk the
+        # source rather than the freshly written destination: the source is
+        # local and warm, and only the few racy entries need a write.
+        for root, dirs, files in os.walk(src, followlinks=True):
+            dirs[:] = [d for d in dirs if not excluded(d)]
+            rel = Path(root).relative_to(src)
+            for name in files:
+                if excluded(name):
+                    continue
+                try:
+                    src_stat = (Path(root) / name).stat()
+                except OSError:
+                    continue
+                _demote_racy_mtime(dst / rel / name, src_stat, now)
+
+    if dst.is_symlink():
+        dst.unlink()
+    elif dst.exists() and src == dst.resolve():
+        return
+
+    if not dst.exists():
+        if not exclude and _tar_pipe_copy(src, dst):
+            demote_racy_mtimes()
+            return
+        copytree(src,
+                 dst,
+                 symlinks=False,
+                 ignore=shutil.ignore_patterns(*exclude) if exclude else None)
+        demote_racy_mtimes()
+        return
+
+    for root, dirs, files in os.walk(src, followlinks=True):
+        rel = Path(root).relative_to(src)
+        dirs[:] = [d for d in dirs if not excluded(d)]
+        files = [f for f in files if not excluded(f)]
+        dst_root = dst / rel
+        if dst_root.exists() and not dst_root.is_dir():
+            dst_root.unlink()
+        dst_root.mkdir(exist_ok=True)
+        keep = set(dirs) | set(files)
+        for stale in os.listdir(dst_root):
+            if stale not in keep:
+                stale_path = dst_root / stale
+                if stale_path.is_dir() and not stale_path.is_symlink():
+                    rmtree(stale_path)
+                else:
+                    stale_path.unlink()
+        for name in files:
+            src_file = Path(root) / name
+            dst_file = dst_root / name
+            src_stat = None
+            try:
+                src_stat = src_file.stat()
+                dst_stat = dst_file.stat()
+                # Trust the match only once the source mtime has aged past the
+                # race window; a just-written source can be rewritten again
+                # without the mtime moving, which would strand a stale copy.
+                if (src_stat.st_size == dst_stat.st_size
+                        and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3
+                        and src_stat.st_mtime <= now - _MTIME_RACE_WINDOW):
+                    continue
+            except OSError:
+                pass
+            if dst_file.is_dir() and not dst_file.is_symlink():
+                rmtree(dst_file)
+            # copy2: mtime must survive for the next sync's comparison.
+            shutil.copy2(src_file, dst_file)
+            _demote_racy_mtime(dst_file, src_stat, now)
+
+
+def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
+    """Copy the sources setup.py packages into an out-of-tree staging project.
+
+    Out-of-tree builds install compiled artifacts into this staging tree and
+    build the wheel from it, so nothing is ever written into the checkout.
+    """
+    print(f"-- Staging python package sources into {staging_dir} ...")
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    # examples: setup.py's root-level find_packages() ships the
+    # examples.configs.database package from it.
+    for tree in ("tensorrt_llm", "triton_kernels", "examples"):
+        sync_tree(project_dir / tree,
+                  staging_dir / tree,
+                  exclude=("__pycache__", "*.pyc"))
+    top_level_files = [
+        "setup.py", "pyproject.toml", "requirements.txt",
+        "requirements-dev.txt", "constraints.txt", "LICENSE", "README.md"
+    ]
+    top_level_files += [
+        f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
+    ]
+    for name in top_level_files:
+        src = project_dir / name
+        if src.exists():
+            copy(src, staging_dir / name)
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -564,6 +787,7 @@ def main(*,
          configure_cmake: bool = False,
          configure_only: bool = False,
          use_ccache: bool = False,
+         out_of_tree: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
@@ -586,7 +810,6 @@ def main(*,
         clean_wheel = True
 
     project_dir = get_project_dir()
-    apply_version_override(project_dir, version_override)
 
     # Out-of-tree build state: everything metadata-heavy (venv, wheel
     # staging, ccache, intermediate objects) goes under build_root, keeping
@@ -604,18 +827,28 @@ def main(*,
         os.environ.setdefault("TRTLLM_WHEEL_STAGING_DIR",
                               str(build_root / "wheel-staging"))
 
+    if out_of_tree:
+        # Out-of-tree: never write into the checkout; the wheel is assembled in
+        # an out-of-tree staging project. Validated by building with the
+        # checkout mounted read-only.
+        if build_root is None:
+            raise RuntimeError("--out-of-tree requires --build_root")
+        if platform.system() == "Windows":
+            raise RuntimeError("--out-of-tree is not supported on Windows")
+        if skip_building_wheel or linking_install_binary or install:
+            raise RuntimeError(
+                "--out-of-tree is incompatible with --skip_building_wheel, "
+                "--linking_install_binary and --install: editable installs "
+                "import compiled artifacts from the checkout, which a "
+                "out-of-tree build never writes.")
+        if version_override:
+            raise RuntimeError(
+                "--out-of-tree does not support --version-override (it would "
+                "modify tensorrt_llm/version.py in the checkout)")
+
+    apply_version_override(project_dir, version_override)
     os.chdir(project_dir)
 
-    # Get all submodules and check their folder exists. If not,
-    # invoke git submodule update
-    with open(project_dir / ".gitmodules", "r") as submodules_f:
-        submodules = [
-            l.split("=")[1].strip() for l in submodules_f.readlines()
-            if "path = " in l
-        ]
-    if any(not (project_dir / submodule / ".git").exists()
-           for submodule in submodules):
-        build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
 
@@ -692,7 +925,7 @@ def main(*,
             raise RuntimeError("Mooncake is not supported on Windows.")
         cmake_def_args.append(f"-DMOONCAKE_ROOT={mooncake_root}")
 
-    build_dir = get_build_dir(build_dir, build_type, build_root)
+    build_dir = get_build_dir(build_dir, build_type, build_root, out_of_tree)
     first_build = not Path(build_dir, "CMakeFiles").exists()
 
     if clean and build_dir.exists():
@@ -771,10 +1004,18 @@ def main(*,
 
     source_dir = get_source_dir()
 
-    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    fmha_gen_root = build_root / "fmha-gen" if out_of_tree else None
+    fmha_v2_cu_dir, _ = get_fmha_gen_dirs(project_dir, fmha_gen_root)
     if (clean or generate_fmha
             or not _fmha_generation_stamp(fmha_v2_cu_dir).exists()):
-        generate_fmha_cu(project_dir, venv_python)
+        generate_fmha_cu(project_dir, venv_python, fmha_gen_root)
+
+    if out_of_tree:
+        cmake_def_args.append(f"-DTRTLLM_FMHA_GEN_DIR={fmha_gen_root}")
+        # Write the configured executor/version.h into the build tree
+        # instead of cpp/include (the checkout may be read-only).
+        cmake_def_args.append(
+            f"-DTRTLLM_VERSION_H_INCLUDE_DIR={build_dir}/generated-include")
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:
@@ -823,16 +1064,25 @@ def main(*,
         assert not install, "Installing is not supported for cpp_only builds"
         return
 
-    pkg_dir = project_dir / "tensorrt_llm"
+    if out_of_tree:
+        # Assemble the wheel in an out-of-tree staging project; the checkout
+        # is only read from this point on.
+        wheel_project_dir = build_root / "package"
+        stage_python_package(project_dir, wheel_project_dir)
+    else:
+        wheel_project_dir = project_dir
+
+    pkg_dir = wheel_project_dir / "tensorrt_llm"
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
     include_dir = pkg_dir / "include"
     if lib_dir.exists():
         clear_folder(lib_dir)
-    if include_dir.exists():
-        clear_folder(include_dir)
+    # include_dir is not cleared: its subtrees are synced with deletion of
+    # extraneous entries (sync_tree) or guarded by generation stamps, so
+    # incremental rebuilds skip the ~10k-file rewrite of the include tree.
     # Remove auto-generated attributions file from previous builds
-    auto_attr_file = project_dir / "ATTRIBUTIONS.md"
+    auto_attr_file = wheel_project_dir / "ATTRIBUTIONS.md"
     if auto_attr_file.exists():
         os.remove(auto_attr_file)
 
@@ -864,21 +1114,7 @@ def main(*,
 
     install_file = safe_copy
 
-    # Wrapper for copytree that checks if source and destination are the same
-    def safe_copytree(src, dst, dirs_exist_ok=True):
-        """Copy tree, but skip if source and destination resolve to the same directory."""
-        src_path = Path(src).resolve()
-        dst_path = Path(dst)
-        if dst_path.is_symlink():
-            dst_path.unlink()
-        elif src_path == dst_path.resolve():
-            # Source and destination are the same, skip copying
-            return
-        if dst_path.exists() and dirs_exist_ok:
-            rmtree(dst_path)
-        copytree(src_path, dst_path, dirs_exist_ok=dirs_exist_ok)
-
-    install_tree = safe_copytree
+    install_tree = sync_tree
     if skip_building_wheel and linking_install_binary:
 
         def symlink_remove_dst(src, dst):
@@ -892,10 +1128,12 @@ def main(*,
 
         install_file = symlink_remove_dst
 
-        def symlink_remove_dst_tree(src, dst, dirs_exist_ok=True):
+        def symlink_remove_dst_tree(src, dst):
             src = os.path.abspath(src)
             dst = os.path.abspath(dst)
-            if dirs_exist_ok and os.path.lexists(dst):
+            if os.path.isdir(dst) and not os.path.islink(dst):
+                rmtree(dst)  # left behind by a previous copy-mode build
+            elif os.path.lexists(dst):
                 os.remove(dst)
             os.symlink(src, dst)
 
@@ -904,8 +1142,7 @@ def main(*,
     lib_dir.mkdir(parents=True, exist_ok=True)
     include_dir.mkdir(parents=True, exist_ok=True)
     install_tree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
-                 include_dir / "deep_gemm",
-                 dirs_exist_ok=True)
+                 include_dir / "deep_gemm")
 
     # Copy FMHA kernel generation headers for JIT compilation
     fmha_build_dir = build_dir / "tensorrt_llm" / "kernels" / "trtllmGenKernels" / "fmha"
@@ -1040,7 +1277,7 @@ def main(*,
                 ucx_dir = lib_dir / "ucx"
                 if ucx_dir.exists():
                     clear_folder(ucx_dir)
-                install_tree("/usr/local/ucx/lib", ucx_dir, dirs_exist_ok=True)
+                install_tree("/usr/local/ucx/lib", ucx_dir)
                 build_run(
                     f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
                 )
@@ -1062,7 +1299,7 @@ def main(*,
                     nixl_lib_path = "/opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu"
                 if not os.path.exists(nixl_lib_path):
                     nixl_lib_path = "/opt/nvidia/nvda_nixl/lib64"
-                install_tree(nixl_lib_path, nixl_dir, dirs_exist_ok=True)
+                install_tree(nixl_lib_path, nixl_dir)
                 build_run(
                     f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
                 )
@@ -1072,9 +1309,8 @@ def main(*,
         agent_binding_so = list(
             nixl_utils_dir.glob("tensorrt_llm_transfer_agent_binding*.so"))
         if agent_binding_so:
-            trtllm_dir = project_dir / "tensorrt_llm"
             install_file(agent_binding_so[0],
-                         trtllm_dir / agent_binding_so[0].name)
+                         pkg_dir / agent_binding_so[0].name)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so"
@@ -1094,20 +1330,11 @@ def main(*,
         install_file(build_dir / "tensorrt_llm/runtime/utils/libpg_utils.so",
                      lib_dir / "libpg_utils.so")
 
+    # deep_ep/deep_gemm are synced in place below (sync_tree removes stale
+    # entries); deep_ep is deleted explicitly when this build does not
+    # produce it.
     deep_ep_dir = pkg_dir / "deep_ep"
-    if deep_ep_dir.is_symlink():
-        deep_ep_dir.unlink()
-    elif deep_ep_dir.is_dir():
-        clear_folder(deep_ep_dir)
-        deep_ep_dir.rmdir()
-
-    # Handle deep_gemm installation
     deep_gemm_dir = pkg_dir / "deep_gemm"
-    if deep_gemm_dir.is_symlink():
-        deep_gemm_dir.unlink()
-    elif deep_gemm_dir.is_dir():
-        clear_folder(deep_gemm_dir)
-        deep_gemm_dir.rmdir()
 
     scripts_dir = pkg_dir / "scripts"
     if scripts_dir.exists():
@@ -1134,13 +1361,17 @@ def main(*,
         with (build_dir / "tensorrt_llm" / "deep_ep" /
               "cuda_architectures.txt").open() as f:
             deep_ep_cuda_architectures = f.read().strip().strip(";")
+        if not deep_ep_cuda_architectures and deep_ep_dir.exists():
+            if deep_ep_dir.is_symlink():
+                deep_ep_dir.unlink()
+            else:
+                rmtree(deep_ep_dir)
         if deep_ep_cuda_architectures:
             install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"),
                          pkg_dir)
-            install_tree(build_dir / "tensorrt_llm" / "deep_ep" / "python" /
-                         "deep_ep",
-                         deep_ep_dir,
-                         dirs_exist_ok=True)
+            install_tree(
+                build_dir / "tensorrt_llm" / "deep_ep" / "python" / "deep_ep",
+                deep_ep_dir)
             (lib_dir / "nvshmem").mkdir(exist_ok=True)
             install_file(
                 build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
@@ -1156,10 +1387,9 @@ def main(*,
 
         install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
                      pkg_dir)
-        install_tree(build_dir / "tensorrt_llm" / "deep_gemm" / "python" /
-                     "deep_gemm",
-                     deep_gemm_dir,
-                     dirs_exist_ok=True)
+        install_tree(
+            build_dir / "tensorrt_llm" / "deep_gemm" / "python" / "deep_gemm",
+            deep_gemm_dir)
 
         with (build_dir / "tensorrt_llm" / "flash_mla" /
               "cuda_architectures.txt").open() as f:
@@ -1167,10 +1397,38 @@ def main(*,
         if flash_mla_cuda_architectures:
             install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
                          pkg_dir)
-            install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
-                         "flash_mla",
-                         pkg_dir / "flash_mla",
-                         dirs_exist_ok=True)
+            install_tree(
+                build_dir / "tensorrt_llm" / "flash_mla" / "python" /
+                "flash_mla", pkg_dir / "flash_mla")
+
+        # Stage the FetchContent-patched MSA package for setup.py packaging.
+        msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
+        cutlass_src = build_dir / "_deps" / "cutlass-src"
+        msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
+        if not (msa_src / "cute" / "interface.py").is_file():
+            raise FileNotFoundError(
+                f"MSA package missing at {msa_src}; CMake FetchContent for msa "
+                "did not populate the expected sources.")
+        if msa_dst.is_symlink():
+            msa_dst.unlink()
+        elif msa_dst.exists():
+            rmtree(msa_dst)
+        msa_dst.mkdir(parents=True)
+        for python_source in msa_src.glob("*.py"):
+            install_file(python_source, msa_dst)
+        for source_dir, relative_dir in (
+            (msa_src / "csrc", Path("csrc")),
+            (msa_src / "cute", Path("cute")),
+            (cutlass_src / "include", Path("cutlass/include")),
+            (cutlass_src / "tools/util/include",
+             Path("cutlass/tools/util/include")),
+        ):
+            (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
+            install_tree(
+                source_dir,
+                msa_dst / relative_dir,
+            )
+        install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
 
         if not skip_stubs:
             with working_directory(pkg_dir):
@@ -1183,14 +1441,14 @@ def main(*,
                         nixl_root is not None or mooncake_root is not None,
                         binding_lib_file_name)
 
-    build_kv_cache_manager_v2(project_dir,
+    build_kv_cache_manager_v2(wheel_project_dir,
                               venv_python,
                               use_mypyc=mypyc,
                               build_root=build_root)
 
     if not skip_building_wheel:
         if dist_dir is None:
-            dist_dir = project_dir / "build"
+            dist_dir = build_root / "dist" if out_of_tree else project_dir / "build"
         else:
             dist_dir = Path(dist_dir)
 
@@ -1249,14 +1507,11 @@ def main(*,
 
         # Copy auto-generated ATTRIBUTIONS.md to project root for wheel packaging
         if auto_attr.exists():
-            install_file(auto_attr, project_dir / "ATTRIBUTIONS.md")
+            install_file(auto_attr, wheel_project_dir / "ATTRIBUTIONS.md")
             print(
-                f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
+                f"Copied auto-generated attributions to {wheel_project_dir / 'ATTRIBUTIONS.md'}"
             )
 
-        build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
-        )
         env = os.environ.copy()
         if mypyc:
             env["TRTLLM_ENABLE_MYPYC"] = "1"
@@ -1264,7 +1519,7 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {wheel_project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
@@ -1378,6 +1633,17 @@ def add_arguments(parser: ArgumentParser):
         "directory instead of the checkout. Point it at fast local storage (e.g. "
         "/tmp) when the checkout lives on a network filesystem. Individual "
         "options like --build_dir and CCACHE_DIR still override their piece.")
+    parser.add_argument(
+        "--out-of-tree",
+        action="store_true",
+        help=
+        "Never write into the checkout: generated FMHA sources and version.h "
+        "go to the build tree, and the wheel is assembled from an out-of-tree "
+        "staging copy of the Python package (default wheel output: "
+        "<build_root>/dist). Requires --build_root; the checkout may be "
+        "mounted read-only. Incompatible with editable-install workflows "
+        "(--skip_building_wheel, --linking_install_binary, --install) and "
+        "with --version-override (it edits tensorrt_llm/version.py in place).")
     parser.add_argument(
         "--build_dir",
         type=Path,

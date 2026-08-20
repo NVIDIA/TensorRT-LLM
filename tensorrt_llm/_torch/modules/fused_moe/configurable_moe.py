@@ -29,12 +29,18 @@ Design Principles:
 
 import copy
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Type, Union
 
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKind
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEProblem,
+    MoERejectReason,
+)
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.utils import (
@@ -81,7 +87,8 @@ class ConfigurableMoE(MoE):
 
     This class orchestrates the MoE execution flow by composing:
     - moe_backend: Existing FusedMoE implementation used as a pluggable backend.
-                   Currently supported backends (see ``create_moe.get_moe_cls``):
+                   Currently supported backends (see
+                   ``moe_resolution.IMPL_PRIORITY``):
                    CutlassFusedMoE, TRTLLMGenFusedMoE, DeepGemmFusedMoE,
                    CuteDslFusedMoE, DenseGEMMFusedMoE, MegaMoEDeepGemm.
                    Note: Current FusedMoE implementations are used as backends (transitional).
@@ -111,40 +118,29 @@ class ConfigurableMoE(MoE):
 
     Auto-Detection:
         - EPLB: Enabled if get_moe_load_balancer() is not None
-        - Backend: Selected by ``model_config.moe_backend`` via ``create_moe.get_moe_cls``;
-                   defaults to CutlassFusedMoE when the requested backend is unsupported
-                   for the active quant/SM config.
+        - Backend: Resolved from ``model_config.moe_backend`` by
+                   ``moe_resolution.resolve_moe_impl``, which degrades to
+                   CutlassFusedMoE when the requested backend cannot serve the
+                   layer and records the reason in the returned report.
+                   ``create_moe`` passes the resolved class in as ``moe_cls``;
+                   constructing this wrapper directly resolves on demand.
         - Communication: Auto-selected based on hardware (NVLINK > DeepEP > AllGather);
                          skipped entirely for FUSED_COMM backends (e.g. MegaMoEDeepGemm).
     """
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo,
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ):
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Always ineligible: ConfigurableMoE delegates, it does not compute.
+
+        Answering ``False`` rather than raising is what lets a registry walk
+        include this class harmlessly. Query the backend it would delegate to
+        (``CutlassFusedMoE``, ``TRTLLMGenFusedMoE``, ...) instead.
         """
-        ConfigurableMoE is a wrapper class that delegates to specific backends.
-
-        To check capability, query the specific backend class directly:
-        - CutlassFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
-        - TRTLLMGenFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
-        - etc.
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation data type
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled
-
-        Returns:
-            Tuple[bool, Optional[str]]: Always returns (False, reason)
-        """
-        del quant_algo, dtype_activation, swiglu_gptoss_style  # Unused - wrapper class
-        return False, (
+        del p, d  # a wrapper's answer cannot depend on the question
+        return _reject(
+            MoERejectReason.NOT_AN_IMPL,
             "ConfigurableMoE is a wrapper class. "
-            "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly."
+            "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly.",
         )
 
     def __init__(
@@ -162,6 +158,10 @@ class ConfigurableMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
+        moe_cls: Optional[Type] = None,
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
         trtllm_gen_activation_alpha: Optional[float] = None,
         trtllm_gen_activation_beta: Optional[float] = None,
@@ -197,6 +197,10 @@ class ConfigurableMoE(MoE):
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
+            moe_cls=moe_cls,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             trtllm_gen_activation_type=trtllm_gen_activation_type,
             trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
@@ -283,9 +287,13 @@ class ConfigurableMoE(MoE):
         model_config: ModelConfig,
         routing_method: BaseMoeRoutingMethod,
         override_quant_config: Optional["QuantConfig"],
-        trtllm_gen_activation_type: Optional[ActType_TrtllmGen],
-        trtllm_gen_activation_alpha: Optional[float],
-        trtllm_gen_activation_beta: Optional[float],
+        moe_cls: Optional[Type] = None,
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
+        trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
+        trtllm_gen_activation_alpha: Optional[float] = None,
+        trtllm_gen_activation_beta: Optional[float] = None,
         **kwargs,
     ) -> None:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
@@ -304,15 +312,30 @@ class ConfigurableMoE(MoE):
         """
         from tensorrt_llm._torch.modules.fused_moe.create_moe import (
             create_moe_backend,
+            infer_swiglu_gptoss_style,
             resolve_moe_cls,
         )
 
-        moe_cls = resolve_moe_cls(
-            model_config,
-            routing_method,
-            self.dtype,
-            override_quant_config=override_quant_config,
-        )
+        # create_moe already resolved; direct constructors resolve here.
+        if moe_cls is None:
+            moe_cls = resolve_moe_cls(
+                model_config,
+                override_quant_config=override_quant_config,
+                dtype=self.dtype,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                swiglu_gptoss_style=infer_swiglu_gptoss_style(
+                    bias=kwargs.get("bias", False),
+                    swiglu_alpha=kwargs.get("swiglu_alpha"),
+                    swiglu_beta=kwargs.get("swiglu_beta"),
+                    activation_type=self.activation_type,
+                ),
+                bias=kwargs.get("bias", False),
+                activation_type=self.activation_type,
+                routing=self.routing_method,
+                layer_idx=self.layer_idx,
+            )
 
         backend_model_config = model_config
         if override_quant_config is not None:
@@ -340,6 +363,9 @@ class ConfigurableMoE(MoE):
                 swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
                 activation_type=self.activation_type,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
                 trtllm_gen_activation_type=trtllm_gen_activation_type,
                 trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
                 trtllm_gen_activation_beta=trtllm_gen_activation_beta,
@@ -461,6 +487,11 @@ class ConfigurableMoE(MoE):
         """
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
+        elif self.enable_dwdp:
+            # DWDP prefetches expert weights instead of dispatching tokens, so a
+            # rank only ever processes its own tokens, never more. Keyed off
+            # ``enable_dwdp`` so no non-DWDP path changes the branch it takes.
+            num_rows = max(all_rank_num_tokens)
         else:
             # non-DP: no cross-rank dispatch. The scheduler fills all_rank_num_tokens
             # from [x.shape[0]] before calling here, so it must be a single-element list.
