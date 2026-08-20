@@ -30,7 +30,7 @@ jobs:
 
       - name: Install dependencies
         continue-on-error: true
-        run: pip install 'requests>=2.32.2,<3'
+        run: pip install 'requests>=2.32.4,<3'
 
       - name: Label PR by component
         continue-on-error: true

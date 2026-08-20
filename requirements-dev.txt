@@ -13,10 +13,12 @@ distro==1.9.0
 # the distro failure mode above. Ranges, NOT == (unlike distro, which is pip-
 # only): the CI base image ships these as Debian packages (python3-yaml,
 # python3-requests) with no pip RECORD, so an exact pin forces an uninstall pip
-# cannot perform (uninstall-no-record-file). The floor is the real requirement;
-# the ceiling blocks an unvetted major.
-pyyaml>=6.0.1,<7
-requests>=2.32.2,<3
+# cannot perform (uninstall-no-record-file). Floors are the real requirement
+# (requests>=2.32.4 also clears CVE-2024-47081); ceilings block unvetted
+# releases -- pyyaml<6.0.3 excludes 6.0.3, which fails to import on Python 3.12
+# (pyyaml issue #891).
+pyyaml>=6.0.1,<6.0.3
+requests>=2.32.4,<3
 boto3
 einops
 # Reference implementation for KDA kernel parity tests.
