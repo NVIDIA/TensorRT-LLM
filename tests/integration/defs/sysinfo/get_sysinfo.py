@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -112,10 +112,24 @@ def get_linux_distribution():
     try:
         import distro
         return (distro.id(), distro.version(), distro.codename())
-    except:
-        logger.warning(
-            "Unable to use distro module, defaulting operating system to ('na', 'na', 'na')"
-        )
+    except ImportError:
+        # distro is not a direct test dependency historically; it used to arrive
+        # transitively (e.g. via openai<3.3.1) and silently disappeared when that
+        # dependency was dropped. Fall back to the stdlib rather than to 'na'.
+        pass
+    except Exception as e:
+        logger.warning(f"distro probe failed ({e}); falling back to os-release")
+    try:
+        # Python 3.10+; reads /etc/os-release, same source distro uses.
+        os_release = platform.freedesktop_os_release()
+        return (os_release.get("ID", "na"), os_release.get("VERSION_ID", "na"),
+                os_release.get("VERSION_CODENAME", "na"))
+    except OSError:
+        logger.error(
+            "Cannot determine the Linux distribution (no distro module and no "
+            "/etc/os-release); reporting ('na', 'na', 'na'). Test-db conditions "
+            "matching linux_distribution_name (e.g. ubuntu*) will select ZERO "
+            "tests and the rendered test list will be empty.")
         return ("na", "na", "na")
 
 
