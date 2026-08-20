@@ -20,8 +20,8 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
-#include <cuda.h>
 #include <cstddef>
+#include <cuda.h>
 #include <stdexcept>
 #include <string>
 

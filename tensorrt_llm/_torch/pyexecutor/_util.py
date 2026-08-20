@@ -40,7 +40,8 @@ from tensorrt_llm._torch.peft.lora.config import (
 from tensorrt_llm._torch.peft.lora.manager import load_torch_lora
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, InsufficientQuotaError
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (CacheTier,
+                                                      InsufficientQuotaError)
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
@@ -1920,13 +1921,14 @@ class KvCacheCreator:
                 guidance = (
                     "Increase kv_cache_config.max_gpu_total_bytes (if set) or "
                     "kv_cache_config.free_gpu_memory_fraction, or decrease "
-                    "max_batch_size, max_seq_len, or max_num_tokens."
-                )
+                    "max_batch_size, max_seq_len, or max_num_tokens.")
             elif error.cache_tier == CacheTier.HOST_MEM:
                 guidance = "Increase kv_cache_config.host_cache_size."
             else:
                 guidance = "Increase kv_cache_config.disk_cache_size."
-            raise ValueError(f"Failed to create KV cache manager: {error}. {guidance}") from error
+            raise ValueError(
+                f"Failed to create KV cache manager: {error}. {guidance}"
+            ) from error
 
     def _build_managers(self,
                         resources: Dict,
