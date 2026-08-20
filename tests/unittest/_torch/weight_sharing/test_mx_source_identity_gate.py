@@ -18,8 +18,6 @@ from tensorrt_llm._torch.weight_sharing import (
     SOURCE_IDENTITY_FORMAT_VERSION,
 )
 
-pytestmark = pytest.mark.cpu_only
-
 
 def _identity(*, transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1):
     return replace(

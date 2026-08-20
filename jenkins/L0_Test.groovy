@@ -73,7 +73,7 @@ ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
 
-MODEL_EXPRESS_VERSION = "0.4.1"
+MODEL_EXPRESS_VERSION = "0.5.1"
 MODEL_EXPRESS_NIXL_VERSION = "1.3.1"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
 MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
@@ -3542,7 +3542,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     - name: TRTLLM_MX_E2E_REQUIRED
                       value: "1"
         """
-        // Mirrors the ModelExpress v0.4.1 Redis deployment and image contract.
+        // Mirrors the ModelExpress Redis deployment and image contract.
         // The image exposes /app/modelexpress-server and accepts the port/backend settings below.
         // Use regular containers because the Jenkins Kubernetes launcher does not
         // reliably attach to pods containing restartable init-container sidecars.
@@ -4731,7 +4731,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
             if (stageName.contains("-ModelExpress-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
-                // ModelExpress 0.4.1 imports nixl._api, while requirements-dev.txt
+                // ModelExpress imports nixl._api, while requirements-dev.txt
                 // installs only the nixl-cu13 backend. Install the matching
                 // namespace shim without pulling the unused CUDA 12 backend.
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --no-deps nixl==${MODEL_EXPRESS_NIXL_VERSION}")

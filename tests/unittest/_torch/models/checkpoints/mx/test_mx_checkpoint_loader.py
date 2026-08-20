@@ -460,7 +460,10 @@ def test_cleanup_continues_when_mx_cleanup_fails(monkeypatch):
     )
     loader, weight_loader, config_loader = _loader(mx_server_url="mx:8001")
     loader.load_weights("checkpoint", **_load_kwargs())
-    instances[0].cleanup.side_effect = RuntimeError("cleanup failed")
+    cleanup_error = RuntimeError("cleanup failed")
+    instances[0].cleanup.side_effect = cleanup_error
+    warning = MagicMock()
+    monkeypatch.setattr(checkpoint_loader_mod.logger, "warning", warning)
 
     loader.cleanup()
 
@@ -468,3 +471,6 @@ def test_cleanup_continues_when_mx_cleanup_fails(monkeypatch):
     weight_loader.cleanup.assert_called_once_with()
     config_loader.cleanup.assert_called_once_with()
     assert loader._mx_loader is None
+    warning.assert_called_once_with(
+        f"Failed to clean up ModelExpress loader {instances[0]!r}: {cleanup_error!r}"
+    )

@@ -613,7 +613,8 @@ def test_cleanup_releases_active_checkpoint_loader(monkeypatch):
 def test_cleanup_swallows_checkpoint_loader_failure(monkeypatch):
     loader = _make_loader(monkeypatch, events=[])
     checkpoint_loader = MagicMock(name="checkpoint_loader")
-    checkpoint_loader.cleanup.side_effect = RuntimeError("cleanup failed")
+    cleanup_error = RuntimeError("cleanup failed")
+    checkpoint_loader.cleanup.side_effect = cleanup_error
     loader._checkpoint_loader = checkpoint_loader
     warning = MagicMock()
     monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
@@ -623,16 +624,15 @@ def test_cleanup_swallows_checkpoint_loader_failure(monkeypatch):
     checkpoint_loader.cleanup.assert_called_once_with()
     assert loader._checkpoint_loader is None
     warning.assert_called_once_with(
-        "Failed to clean up checkpoint loader %r",
-        checkpoint_loader,
-        exc_info=True,
+        f"Failed to clean up checkpoint loader {checkpoint_loader!r}: {cleanup_error!r}"
     )
 
 
 def test_cleanup_continues_after_gms_failure(monkeypatch):
     loader = _make_loader(monkeypatch, events=[])
     gms_backend = MagicMock(name="gms_backend")
-    gms_backend.cleanup.side_effect = RuntimeError("gms cleanup failed")
+    cleanup_error = RuntimeError("gms cleanup failed")
+    gms_backend.cleanup.side_effect = cleanup_error
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     loader._gms_backend = gms_backend
     loader._checkpoint_loader = checkpoint_loader
@@ -646,9 +646,7 @@ def test_cleanup_continues_after_gms_failure(monkeypatch):
     assert loader._gms_backend is None
     assert loader._checkpoint_loader is None
     warning.assert_called_once_with(
-        "Failed to clean up GMS backend %r",
-        gms_backend,
-        exc_info=True,
+        f"Failed to clean up GMS backend {gms_backend!r}: {cleanup_error!r}"
     )
 
 
@@ -1111,7 +1109,6 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     assert decision.qualified
 
 
-@pytest.mark.cpu_only
 def test_staged_llama_finalization_preserves_mx_tensor_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

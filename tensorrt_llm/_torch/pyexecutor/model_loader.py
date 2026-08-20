@@ -1493,21 +1493,15 @@ class ModelLoader:
             self._gms_backend = None
             try:
                 gms_backend.cleanup()
-            except Exception:  # noqa: BLE001 - shutdown must remain best effort
+            except Exception as exc:  # noqa: BLE001 - shutdown must remain best effort
                 logger.warning(
-                    "Failed to clean up GMS backend %r",
-                    gms_backend,
-                    exc_info=True,
-                )
+                    f"Failed to clean up GMS backend {gms_backend!r}: {exc!r}")
         if self._checkpoint_loader is not None:
             try:
                 self._checkpoint_loader.cleanup()
-            except Exception:  # noqa: BLE001 - shutdown must remain best effort
-                logger.warning(
-                    "Failed to clean up checkpoint loader %r",
-                    self._checkpoint_loader,
-                    exc_info=True,
-                )
+            except Exception as exc:  # noqa: BLE001 - shutdown must remain best effort
+                logger.warning(f"Failed to clean up checkpoint loader "
+                               f"{self._checkpoint_loader!r}: {exc!r}")
             finally:
                 self._checkpoint_loader = None
 

@@ -266,9 +266,5 @@ class MXCheckpointLoader(HfCheckpointLoader):
             return
         try:
             mx_loader.cleanup()
-        except Exception:  # noqa: BLE001 - cleanup is best effort
-            logger.warning(
-                "Failed to clean up ModelExpress loader %r",
-                mx_loader,
-                exc_info=True,
-            )
+        except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+            logger.warning(f"Failed to clean up ModelExpress loader {mx_loader!r}: {exc!r}")
