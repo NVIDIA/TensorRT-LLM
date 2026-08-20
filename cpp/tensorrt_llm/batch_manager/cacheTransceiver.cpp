@@ -1640,6 +1640,10 @@ RequestStatuses CacheTransceiver::checkRequesterTransferStatusImpl(
         {
             requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
         }
+        else if (requestIt->second->isContextPrefetchInProgressState())
+        {
+            requestIt->second->setState(LlmRequestState::kCONTEXT_INIT);
+        }
         mTimedOutRequesterIds.erase(requestId);
         mCancelRequestedRequesterIds.erase(requestId);
         eraseLocalTransferOutcome(
@@ -1661,6 +1665,10 @@ RequestStatuses CacheTransceiver::checkRequesterTransferStatusImpl(
         {
             requestIt->second->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
             completedRequests.push_back(requestIt->second.get());
+        }
+        else if (requestIt->second->isContextPrefetchInProgressState())
+        {
+            requestIt->second->setState(LlmRequestState::kCONTEXT_PREFETCH_COMPLETE);
         }
         mTimedOutRequesterIds.erase(requestId);
         mCancelRequestedRequesterIds.erase(requestId);

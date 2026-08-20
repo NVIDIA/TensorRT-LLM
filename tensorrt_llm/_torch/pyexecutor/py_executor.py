@@ -7674,7 +7674,10 @@ class PyExecutor:
             req = requests_by_id.get(req_id)
             if req is None:
                 continue
-            if req.state == LlmRequestState.CONTEXT_PREFETCH_IN_PROGRESS:
+            if (req.state in (LlmRequestState.CONTEXT_PREFETCH_IN_PROGRESS,
+                              LlmRequestState.CONTEXT_INIT)
+                    and req.context_phase_params is not None
+                    and not req.is_generation_only_request()):
                 logger.warning(
                     "Context KV cache prefetch for request "
                     f"{req.py_request_id} failed; falling back to local "

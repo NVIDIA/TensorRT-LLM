@@ -1658,7 +1658,8 @@ public:
 
     [[nodiscard]] bool isContextResourceInitState() const noexcept
     {
-        return isContextInitState() || isContextPrefetchInitState() || isDisaggGenerationInitState()
+        return isContextInitState() || isContextPrefetchInitState() || isContextPrefetchInProgressState()
+            || isContextPrefetchCompleteState() || isDisaggGenerationInitState()
             || isDisaggGenerationTransmissionComplete();
     }
 
