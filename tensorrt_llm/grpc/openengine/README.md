@@ -1,7 +1,7 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# TensorRT-LLM OpenEngine stub server
+# TensorRT-LLM OpenEngine server
 
 `trtllm-serve` can expose an experimental OpenEngine gRPC server instead of its normal OpenAI HTTP server. SMG remains the default gRPC protocol.
 
@@ -25,7 +25,13 @@ trtllm-serve <model> \
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
 
-This initial integration is a protocol stub. Every OpenEngine RPC returns gRPC status `UNIMPLEMENTED`; no request reaches the TensorRT-LLM engine. OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
+The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
+
+Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
+
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: OpenEngine KV sessions and prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. The AutoDeploy backend is rejected at startup until it supports request cancellation. Other `Control` RPCs remain unimplemented.
+
+OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
 
 ## Dependency provenance
 
