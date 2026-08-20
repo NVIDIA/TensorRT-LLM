@@ -400,6 +400,7 @@ from pathlib import Path
 
 from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
     _summarize_denoising_step_times,
+    _summarize_total_pipeline_times,
 )
 
 result_path = Path(sys.argv[1])
@@ -439,6 +440,11 @@ if len(decode_values) >= expected_requests + 1:
     result["mean_vision_decode"] = sum(measured_decode_values) / len(measured_decode_values)
     if save_detailed:
         result["vision_decodes"] = measured_decode_values
+
+total_pipeline_summary = _summarize_total_pipeline_times(run_lines, expected_requests)
+result.update(total_pipeline_summary)
+if not save_detailed:
+    result.pop("total_pipeline_times", None)
 
 if resolved_steps:
     measured_steps = resolved_steps[-expected_requests:]
@@ -482,6 +488,13 @@ if "mean_vision_decode" in result:
 else:
     print("  Avg. Vision Decode Time (s): unavailable; inspect the server log")
 print(f"  Request Latency (s): {result['mean_latency']:.4f}")
+if "mean_total_pipeline_time" in result:
+    print(
+        "  Avg. Total Pipeline Time (s): "
+        f"{result['mean_total_pipeline_time']:.4f} (server log)"
+    )
+else:
+    print("  Avg. Total Pipeline Time (s): unavailable; inspect the server log")
 PY
 
 echo "Benchmark complete. Artifacts:"
@@ -489,4 +502,3 @@ echo "  Server log:    ${SERVER_LOG}"
 echo "  Benchmark log: ${BENCHMARK_LOG}"
 echo "  Result JSON:   ${RESULT_JSON}"
 echo "  Metadata JSON: ${METADATA_JSON}"
-echo "Total pipeline time has no benchmark-schema field and remains in the server log."
