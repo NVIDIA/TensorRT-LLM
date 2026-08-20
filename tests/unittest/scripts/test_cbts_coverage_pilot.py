@@ -17,8 +17,10 @@
 import importlib.util
 import json
 import urllib.error
+import urllib.request
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, TracebackType
+from typing import NoReturn, TypeAlias, Union
 
 import pytest
 
@@ -26,6 +28,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 PILOT_PATH = REPO_ROOT / "jenkins" / "scripts" / "cbts" / "coverage_pilot.py"
 PR_API_URL = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/pulls/123"
 TEST_PILOT_USERS = frozenset({"pilot-user"})
+JSONValue: TypeAlias = Union[
+    None,
+    bool,
+    int,
+    float,
+    str,
+    list["JSONValue"],
+    dict[str, "JSONValue"],
+]
 
 
 @pytest.fixture(scope="module")
@@ -39,13 +50,18 @@ def pilot_module() -> ModuleType:
 
 
 class _Response:
-    def __init__(self, payload: object) -> None:
+    def __init__(self, payload: JSONValue) -> None:
         self._payload = json.dumps(payload).encode()
 
-    def __enter__(self):
+    def __enter__(self) -> "_Response":
         return self
 
-    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
         return None
 
     def read(self) -> bytes:
@@ -65,14 +81,18 @@ class _Response:
         ([], (False, "", "PR API response is not an object")),
     ),
 )
-def test_evaluate_pr_info(pilot_module: ModuleType, pr_info: object, expected: tuple) -> None:
+def test_evaluate_pr_info(
+    pilot_module: ModuleType,
+    pr_info: JSONValue,
+    expected: tuple[bool, str, str],
+) -> None:
     assert pilot_module.evaluate_pr_info(pr_info, pilot_users=TEST_PILOT_USERS) == expected
 
 
 def test_check_pilot_eligibility_uses_token(
     pilot_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def urlopen(request, timeout):
+    def urlopen(request: urllib.request.Request, timeout: int) -> _Response:
         assert request.full_url == PR_API_URL
         assert request.get_header("Authorization") == "Bearer token"
         assert timeout == 15
@@ -92,7 +112,10 @@ def test_check_pilot_eligibility_uses_token(
 def test_check_pilot_eligibility_rejects_untrusted_url(
     pilot_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def unexpected_urlopen(_request, _timeout):
+    def unexpected_urlopen(
+        _request: urllib.request.Request,
+        _timeout: int,
+    ) -> NoReturn:
         raise AssertionError("untrusted URLs must not be requested")
 
     monkeypatch.setattr(pilot_module.urllib.request, "urlopen", unexpected_urlopen)
@@ -108,7 +131,7 @@ def test_check_pilot_eligibility_rejects_untrusted_url(
 def test_check_pilot_eligibility_fails_closed_on_api_error(
     pilot_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def urlopen(_request, *, timeout):
+    def urlopen(_request: urllib.request.Request, *, timeout: int) -> NoReturn:
         assert timeout == 15
         raise urllib.error.URLError("unavailable")
 
@@ -123,13 +146,17 @@ def test_check_pilot_eligibility_fails_closed_on_api_error(
 def test_main_reads_bot_trigger_payload(
     pilot_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     trigger_phrase = json.dumps({"github_pr_api_url": PR_API_URL})
     monkeypatch.setenv("gitlabTriggerPhrase", trigger_phrase)
     monkeypatch.setenv("GITHUB_API_TOKEN", "token")
 
-    def check_pilot_eligibility(pr_api_url, *, token):
+    def check_pilot_eligibility(
+        pr_api_url: str,
+        *,
+        token: str,
+    ) -> tuple[bool, str, str]:
         assert pr_api_url == PR_API_URL
         assert token == "token"
         return True, "pilot-user", "author is allowlisted"
