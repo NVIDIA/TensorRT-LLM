@@ -44,6 +44,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_cache_dit.py
+  - unittest/_torch/visual_gen/test_executor_lifecycle.py
   - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
@@ -95,6 +96,7 @@ l0_cpu:
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_utils.py
+  - unittest/llmapi/test_visual_gen_startup_shutdown.py
   - unittest/metrics/test_collector.py
   - unittest/models/test_quant_config_utils.py
   - unittest/others
