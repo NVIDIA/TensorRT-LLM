@@ -72,14 +72,10 @@ _MINIMAX_M3_ARCHITECTURES = {
     "MiniMaxM3SparseForConditionalGeneration",
 }
 
-# Inkling is NOT a sparse-attention model. Its architectures are listed here
-# because `from_pretrained` populates `sparse_attention_config` for them, which
-# is what makes `sparse/registry.py` the single selection path for its backend
-# and cache manager -- consumers that hold no ModelConfig (PyTorchModelEngine,
-# the KV-cache creator, the vision encoders) go through the registry too, and
-# with the field left None they resolved the base family instead. The config is
-# a standalone BaseModel outside the user-facing union; see
-# `attention_backend/sparse/inkling/params.py` for the full rationale and cost.
+# Inkling is NOT a sparse-attention model. Populating `sparse_attention_config`
+# for these architectures is what makes `sparse/registry.py` the single selection
+# path for its backend and cache manager, including for consumers that hold no
+# ModelConfig; see `attention_backend/sparse/inkling/params.py`.
 _INKLING_ARCHITECTURES = {
     "InklingForCausalLM",
     "InklingForConditionalGeneration",
@@ -1182,9 +1178,8 @@ class ModelConfig(Generic[TConfig]):
                       and pretrained_config.architectures[0]
                       in _INKLING_ARCHITECTURES
                       and kwargs.get('sparse_attention_config') is None):
-                    # Derived from the architecture, never user-supplied: Inkling
-                    # has one correct backend and no alternative to choose
-                    # between.
+                    # Architecture-derived, never user-supplied: Inkling has one
+                    # correct backend and no alternative to choose between.
                     from .attention_backend.sparse.inkling import \
                         InklingSparseAttentionConfig
                     kwargs[

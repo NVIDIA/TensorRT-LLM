@@ -89,12 +89,10 @@ def ceil_div(a: int, b: int) -> int:
 
 
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
-    # Models with per-layer head_dim / num_kv_heads (Gemma4 hybrid attention,
-    # Inkling's local/global KV-head split) require KVCacheManagerV2 for
-    # per-layer buffer sizes. The identity tests are a backstop: both models
-    # declare use_kv_cache_manager_v2 in get_model_defaults, but this runs before
-    # the model is instantiated, so an explicit use_kv_cache_manager_v2=False
-    # would otherwise silently produce a mis-sized per-layer pool.
+    # Per-layer head_dim / num_kv_heads needs V2's per-layer buffer sizes. The
+    # identity tests are a backstop against an explicit
+    # use_kv_cache_manager_v2=False: this runs before the model exists, so
+    # get_model_defaults cannot be the mechanism here.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config) or is_inkling(config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
@@ -625,11 +623,9 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
-        # Inkling's short-conv window is per-request state outside the KV cache;
-        # block reuse and chunked prefill would both silently drop it. Checked
-        # here because this is the one place that sees the *resolved*
-        # kv_cache_config (model defaults already deep-merged with the user's
-        # settings) alongside llm_args.
+        # Checked here because this is the one place that sees the resolved
+        # kv_cache_config -- model defaults already deep-merged with the user's
+        # settings -- alongside llm_args.
         reject_unsupported_inkling_kv_cache_features(
             model_config.pretrained_config,
             enable_block_reuse=kv_cache_config.enable_block_reuse,
@@ -719,10 +715,8 @@ class KvCacheCreator:
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
                 if is_inkling(config):
-                    # Same structural V2 requirement as Gemma4's per-layer
-                    # head_dim: V1's unified pool would coerce the per-layer
-                    # KV-head split to one value and mis-size the pool. Fail
-                    # loudly rather than produce wrong outputs.
+                    # V1's unified pool would coerce the per-layer KV-head split
+                    # to one value and mis-size the pool.
                     raise NotImplementedError(
                         f"Inkling hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
@@ -856,11 +850,9 @@ class KvCacheCreator:
         # The MM encoder is profiled independently at its own token budget.
         requests = []
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
-        # Dummy warmup requests must pass the same token-range check real
-        # requests do. When the input-embedding vocab is padded above the output
-        # head vocab (as in Inkling), sampling ids up to the padded vocab_size
-        # lands in the gap and fails capacity estimation, so bound the dummy
-        # range to the head.
+        # When the input-embedding vocab is padded above the output head vocab
+        # (as in Inkling), ids in the gap fail the same token-range check real
+        # requests take, so bound the dummy range to the head.
         lm_head = getattr(self._model_engine.model, "lm_head", None)
         head_vocab = getattr(lm_head, "num_embeddings", None)
         if head_vocab:
@@ -2230,10 +2222,8 @@ def _create_kv_cache_manager(
     num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
         config, 'num_key_value_heads', num_attention_heads)
     if is_inkling(config):
-        # Hybrid per-layer geometry: local (sliding-window) layers use 16 KV
-        # heads, global layers 8; head_dim is uniform (128). V2 divides each by
-        # tp_size and allocates the paged pool per layer accordingly (the generic
-        # V2 branch below consumes this list directly).
+        # Local (sliding-window) layers carry more KV heads than global ones;
+        # head_dim is uniform, so only this list varies per layer.
         num_key_value_heads = config.num_kv_heads_per_layer()
     if not isinstance(head_dim, int):
         head_dim = getattr(config, "head_dim", None)
