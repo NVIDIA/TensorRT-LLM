@@ -124,6 +124,11 @@ class ModelSpec:
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
     activation_type: str = "SWIGLU"
+    # SiTU constants (Kimi-K3: activation_situ_beta / activation_situ_linear_beta).
+    # SiTU is gated, so ``activation_type`` stays SWIGLU and only the epilogue
+    # changes; backends take it through their own parameters (see build.py).
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.n_shared_experts < 0:
@@ -132,6 +137,15 @@ class ModelSpec:
             raise ValueError(
                 f"shared_expert_mode must be 'fused' or 'unfused', got {self.shared_expert_mode!r}."
             )
+        if (self.situ_beta is None) != (self.situ_linear_beta is None):
+            raise ValueError("situ_beta and situ_linear_beta must be set together.")
+        if self.situ_beta is not None:
+            if self.situ_beta <= 0 or self.situ_linear_beta <= 0:
+                raise ValueError("SiTU betas must be positive.")
+            if self.activation_type != "SWIGLU":
+                raise ValueError("SiTU requires the SwiGLU fc1 geometry (activation_type=SWIGLU).")
+            if self.swiglu_limit != float("inf"):
+                raise ValueError("SiTU is mutually exclusive with a gate/up clamp.")
 
     @property
     def routing_method_cls(self) -> type:
@@ -275,6 +289,9 @@ class RunResult:
     actual_backend: Optional[str] = None
     actual_comm_method: Optional[str] = None
     actual_comm_fallback_reason: Optional[str] = None
+    # Epilogue the built module ran ("swiglu" / "situ"), read back rather
+    # than echoed from the spec.
+    actual_epilogue_activation: Optional[str] = None
     scheduler_kind: Optional[str] = None
     moe_ep_size: Optional[int] = None
     moe_tp_size: Optional[int] = None
@@ -431,5 +448,7 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         routing_method="DEEPSEEK_V3",
         n_group=1,
         topk_group=1,
+        situ_beta=4.0,  # text_config.activation_situ_beta
+        situ_linear_beta=25.0,  # text_config.activation_situ_linear_beta
     ),
 }
