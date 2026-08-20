@@ -457,6 +457,38 @@ _SMALL_MODEL_CONFIGS = {
             "num_experts": 16,
         },
     },
+    "Qwen/Qwen3.5-4B": {
+        "model_factory": "AutoModelForImageTextToText",
+        "model_kwargs": {
+            "text_config": {
+                "num_hidden_layers": 4,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_num_key_heads": 4,
+                "linear_num_value_heads": 4,
+                "layer_types": [
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention",
+                ],
+            },
+            "vision_config": {
+                "depth": 1,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_heads": 4,
+                "num_position_embeddings": 16,
+                "out_hidden_size": 64,
+            },
+        },
+    },
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
         "model_factory": "AutoModelForImageTextToText",
         "model_kwargs": {
@@ -492,15 +524,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 2,
             "num_experts_per_tok": 2,
             "q_lora_rank": 128,
-        },
-    },
-    "Qwen/Qwen2.5-3B-Instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
         },
     },
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {

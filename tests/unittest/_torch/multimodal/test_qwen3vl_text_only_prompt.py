@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Text-only prompts on the Qwen VL input processors carry no MRoPE metadata.
+"""Text-only prompts on the Qwen3-VL input processor carry no MRoPE metadata.
 
 Without vision spans the M-RoPE coordinates degenerate to the scalar token
 positions and the position delta is zero, so the processor emits no
@@ -15,19 +15,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_qwen2vl import (
-    Qwen2_5VLInputProcessorBase,
-    Qwen2VLInputProcessorBase,
-)
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
 
 _TOKEN_IDS = [151644, 872, 198, 9707, 151645]
-
-PROCESSOR_CLASSES = [
-    Qwen2VLInputProcessorBase,
-    Qwen2_5VLInputProcessorBase,
-    Qwen3VLInputProcessorBase,
-]
 
 
 class _FakeTokenizer:
@@ -37,8 +27,8 @@ class _FakeTokenizer:
         return SimpleNamespace(input_ids=torch.tensor([_TOKEN_IDS]))
 
 
-def _make_processor(processor_cls):
-    processor = object.__new__(processor_cls)
+def _make_processor():
+    processor = object.__new__(Qwen3VLInputProcessorBase)
     processor._tokenizer = _FakeTokenizer()
 
     def _fail(*args, **kwargs):
@@ -48,10 +38,9 @@ def _make_processor(processor_cls):
     return processor
 
 
-@pytest.mark.parametrize("processor_cls", PROCESSOR_CLASSES)
 @pytest.mark.parametrize("mm_data", [None, {}], ids=["mm_data_none", "mm_data_empty"])
-def test_text_only_prompt_emits_no_multimodal_data(processor_cls, mm_data):
-    processor = _make_processor(processor_cls)
+def test_text_only_prompt_emits_no_multimodal_data(mm_data):
+    processor = _make_processor()
 
     token_ids, extra = processor.call_with_text_prompt(
         {"prompt": "text prompt", "multi_modal_data": mm_data},
@@ -62,10 +51,9 @@ def test_text_only_prompt_emits_no_multimodal_data(processor_cls, mm_data):
     assert extra is None
 
 
-@pytest.mark.parametrize("processor_cls", PROCESSOR_CLASSES)
-def test_text_only_prompt_without_multi_modal_data_key(processor_cls):
+def test_text_only_prompt_without_multi_modal_data_key():
     """`multi_modal_data` absent entirely takes the same path."""
-    processor = _make_processor(processor_cls)
+    processor = _make_processor()
 
     token_ids, extra = processor.call_with_text_prompt(
         {"prompt": "text prompt"},

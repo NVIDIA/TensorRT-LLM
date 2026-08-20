@@ -433,13 +433,13 @@ def test_construct_checkpoint_loader_passes_mx_config():
         None,
         "MX",
         mx_config=mx_config,
-        mx_model_name="Qwen/Qwen2.5-7B-Instruct",
+        mx_model_name="Qwen/Qwen3-8B",
     )
 
     assert isinstance(checkpoint_loader, MXCheckpointLoader)
     assert checkpoint_loader.mx_server_url == "http://mx:8001"
     assert checkpoint_loader.query_timeout_s == 17
-    assert checkpoint_loader.model_name == "Qwen/Qwen2.5-7B-Instruct"
+    assert checkpoint_loader.model_name == "Qwen/Qwen3-8B"
 
 
 def _format_documented_values(

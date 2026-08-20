@@ -340,10 +340,6 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
     )
 
 
-# The pinned DeepSeek-V3-Lite NVFP4 checkpoint requires SM100+; on older
-# architectures the benchmark crashes the test process (seen on A10, where
-# this module runs as part of the unittest/tools directory).
-@skip_pre_blackwell
 @pytest.mark.parametrize("world_size", [1, 4])
 def test_performance_alignment(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
