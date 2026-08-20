@@ -896,8 +896,18 @@ def main():
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif benchmark_mode == "gen_only":
             concurrency = benchmark_config.get("concurrency", 1)
-            # GEN worker only: the same flag on the CTX worker has been seen to
-            # hang gen_only runs with KV blocks never released.
+            # TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP is empirically
+            # load-bearing on the CTX worker for gen_only throughput on
+            # NIXL disagg (removing it on CTX regressed deepseek-r1-fp4
+            # 8k1k dep4/tep8 by -27.9 %; see NVBug 6627789 / PR #17535).
+            # Default: apply on both workers, matching the pre-PR
+            # contract. Workloads that observed the CTX-side hang the PR
+            # was scoped for can opt out by exporting
+            # TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP_CTX=0.
+            if os.environ.get("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP_CTX", "1") != "0":
+                ctx_worker_env_vars = (
+                    f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
+                )
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
