@@ -16,19 +16,14 @@
 
 Two responsibilities:
 
-1. **Accounting (authoritative, CPU-testable).** :func:`inkling_expected_text_keys`
-   and :func:`inkling_account_checkpoint` derive the exact set of ``model.llm.*``
-   checkpoint keys the text loader consumes, and classify every checkpoint key as
-   consumed-text / intentionally-deferred (audio, vision, MTP) / unaccounted.
-   Pinned by ``tests/unittest/_torch/modeling/test_modeling_inkling.py`` against
-   the real checkpoint index (no GPU). It guarantees no missing q/k-norm,
-   rel-bias, short-conv, route/global-scale or unpadded-logit tensor can hide.
+1. Accounting. :func:`inkling_expected_text_keys` and
+   :func:`inkling_account_checkpoint` derive the exact set of ``model.llm.*`` keys
+   the text loader consumes and classify every checkpoint key as consumed-text /
+   deferred (audio, vision, MTP) / unaccounted.
 
-2. **Name/layout remapping (the load path).** :class:`InklingHfWeightMapper`
-   renames the checkpoint's keys (``wq_du``, ``w13_weight`` …) to
-   the TRT-LLM module tree, fuses q/k/v into the attention ``qkv_proj``, and
-   unfuses the NVFP4 routed experts (``w13_weight`` -> per-expert ``w1``/``w3``
-   with their block scales) into the layout the fused-MoE loader expects.
+2. Name and layout remapping. :class:`InklingHfWeightMapper` renames the
+   checkpoint's keys to the TRT-LLM module tree, fuses q/k/v into ``qkv_proj``,
+   and unfuses the NVFP4 routed experts into the fused-MoE loader's layout.
 """
 
 from __future__ import annotations
@@ -111,10 +106,8 @@ _NON_LAYER_TEXT_KEYS: Tuple[str, ...] = (
 def _experts_are_nvfp4(layer_idx: int, exclude_modules: Set[str], quantized: bool = True) -> bool:
     """Routed experts of an MoE layer are NVFP4 unless explicitly excluded.
 
-    ``quantized=False`` for a checkpoint that ships no ``hf_quant_config.json``
-    (the BF16 release): there the exclusion list is empty not because every
-    layer is NVFP4 but because nothing is, and reading the emptiness as
-    "all quantized" would expect scale sidecars the checkpoint never ships.
+    ``quantized=False`` for the BF16 release, where the exclusion list is empty
+    because nothing is quantized rather than because everything is.
     """
     if not quantized:
         return False
@@ -152,13 +145,10 @@ def inkling_account_checkpoint(
     exclude_modules: Set[str],
     quantized: bool = True,
 ) -> Dict[str, Set[str]]:
-    """Classify every checkpoint key into consumed-text / deferred /
-    unaccounted.
+    """Classify every checkpoint key into consumed-text / deferred / unaccounted.
 
     ``unaccounted`` and ``missing`` must both be empty for the checkpoint to be
-    fully and exactly accounted. The audio, vision and MTP blocks are carried by
-    the checkpoint but not loaded by the text tower, so their keys land in
-    ``deferred`` (see ``INKLING_DEFERRED_PREFIXES``).
+    fully accounted for.
     """
     expected = inkling_expected_text_keys(config, exclude_modules, quantized)
     consumed_text = all_keys & expected
@@ -231,24 +221,15 @@ _DENSE_W13_RE = re.compile(r"layers\.(\d+)\.mlp\.w13_dn\.weight$")
 
 
 def _split_interleaved_gate_up(t: torch.Tensor, dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split an Inkling gate/up-INTERLEAVED fused tensor into ``(gate, up)`` STRIDED
-    VIEWS (no copy) along ``dim``: gate = even indices, up = odd indices.
+    """Split a gate/up-interleaved fused tensor into ``(gate, up)`` strided views
+    along ``dim``: gate = even indices, up = odd indices.
 
-    The Inkling checkpoint stores every fused gate+up weight with the two
-    projections INTERLEAVED along the output (``2*inter``) dim:
-    ``[g0, u0, g1, u1, ...]``, i.e. the reference SwiGLU reads it as
-    ``silu(z[..., ::2]) * z[..., 1::2]``. TRT-LLM's fused gate_up / fused-MoE
-    loaders instead want separate gate/up; a plain contiguous ``chunk(2)``
-    (``[first half | second half]``) would pair the WRONG gate/up channels in
-    every dense-MLP, routed-expert and shared-expert SwiGLU.
-
-    Returns STRIDED VIEWS rather than a contiguous copy on purpose: the fused-MoE
-    / gate_up loaders shard each rank's slice then call ``.contiguous()`` on that
-    small shard (see quantization.py ``load_expert_w3_w1_weight``), so no
-    full-tensor host copy is needed. A contiguous de-interleave here instead
-    materialized a private per-rank copy of the ~hundreds-of-GiB fused w13,
-    doubling host memory and OOM-killing the TP=4 load. Reorders whole output
-    rows only -> valid for a packed NVFP4 weight and its per-block fp8 scale.
+    The checkpoint interleaves the two projections along the output dim, so a
+    contiguous ``chunk(2)`` would pair the wrong channels in every SwiGLU. The
+    result is a view rather than a copy because the fused-MoE / gate_up loaders
+    call ``.contiguous()`` on the small per-rank shard themselves; de-interleaving
+    eagerly instead OOM-killed the TP=4 load. It reorders whole output rows, so it
+    holds for a packed NVFP4 weight and its per-block scale alike.
     """
     dim = dim % t.dim()
     if t.shape[dim] % 2 != 0:
@@ -276,11 +257,9 @@ class InklingHfWeightMapper(HfWeightMapper):
     def _text_config(self) -> InklingTextConfig:
         """The text sub-config the mapped weights actually describe.
 
-        ``ModelLoader.load`` initializes the mapper with the TOP-LEVEL
+        ``ModelLoader.load`` initializes the mapper with the top-level
         ``InklingConfig``, which carries the decoder geometry under
-        ``text_config`` and has no ``vocab_size`` / ``n_routed_experts`` of its
-        own. Resolving here covers both entry points: the loader-supplied mapper
-        and the one ``InklingForConditionalGeneration.load_weights`` builds.
+        ``text_config`` and has no ``vocab_size`` of its own.
         """
         cfg = self.config.pretrained_config
         return getattr(cfg, "text_config", cfg)
@@ -298,11 +277,9 @@ class InklingHfWeightMapper(HfWeightMapper):
         for name, tensor in weights.items():
             if name in _SIMPLE_RENAMES:
                 if name == "unembed.weight" and tensor.shape[0] > unpadded_vocab:
-                    # The checkpoint LM-head matrix is padded to ``vocab_size``
-                    # while the tower emits logits only over the unpadded vocab.
-                    # Dropping the padding rows is the required "slice logits to
-                    # unpadded"; embed_tokens keeps the full matrix so input ids
-                    # stay in range.
+                    # The checkpoint LM head is padded to vocab_size while the
+                    # tower emits logits only over the unpadded vocab.
+                    # embed_tokens keeps the full matrix so input ids stay valid.
                     tensor = tensor[:unpadded_vocab]
                 new_weights[_SIMPLE_RENAMES[name]] = tensor
                 continue
@@ -346,15 +323,11 @@ class InklingHfWeightMapper(HfWeightMapper):
     ) -> None:
         """Unfuse a stacked expert tensor into per-expert fused-MoE keys.
 
-        ``w13_weight[e]`` is ``[2*inter, hidden]`` with gate and up INTERLEAVED
-        along the output dim (``[g0, u0, g1, u1, ...]``), so ``w1`` (gate) is the
-        even rows and ``w3`` (up) the odd ones -- see
-        :func:`_split_interleaved_gate_up`. It is NOT ``[first half | second
-        half]``: reading it that way pairs the wrong gate/up channels in every
-        SwiGLU. ``w2_weight[e]`` is the down projection. NVFP4 sidecars map to the
-        fused-MoE scale names: ``.scale`` -> ``weight_scale`` (block),
-        ``.scale2`` -> ``weight_scale_2`` (per-expert), ``.input_amax`` ->
-        ``input_scale``. ``.original_shape`` is metadata and is dropped.
+        ``w13_weight[e]`` is gate/up-interleaved along the output dim, so ``w1``
+        is the even rows and ``w3`` the odd ones (see
+        :func:`_split_interleaved_gate_up`); ``w2_weight[e]`` is the down
+        projection. NVFP4 sidecars map to the fused-MoE scale names, and
+        ``.original_shape`` is dropped as layout metadata.
         """
         layer_idx, which, sidecar = match.group(1), match.group(2), match.group(3)
         prefix = f"model.layers.{layer_idx}.mlp.experts"
@@ -369,12 +342,9 @@ class InklingHfWeightMapper(HfWeightMapper):
             return
 
         if sidecar == ".input_amax":
-            # The checkpoint stores the routed-expert activation calibration as a
-            # raw amax, but the fused-MoE loader expects the ModelOpt per-tensor
-            # ``input_scale = amax / (E2M1_MAX * E4M3_MAX)``. Without the
-            # conversion the activation block scales underflow e4m3 and every
-            # routed expert diverges. Only the activation input scale needs it --
-            # the weight / block-scale / scale2 layout is already correct.
+            # The checkpoint stores a raw amax, but the fused-MoE loader expects
+            # ModelOpt's input_scale = amax / (E2M1_MAX * E4M3_MAX); without the
+            # conversion the activation block scales underflow e4m3.
             tensor = tensor.to(torch.float32) / (_NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX)
 
         n_experts = int(getattr(self._text_config, "n_routed_experts", tensor.shape[0]))
@@ -390,10 +360,8 @@ class InklingHfWeightMapper(HfWeightMapper):
         if tensor.dim() >= 2 and tensor.shape[0] == n_experts:
             for e in range(n_experts):
                 if which == "w13_weight":
-                    # w13 (packed fp4 weight and its per-block fp8 scale) is
-                    # gate/up-interleaved along the per-expert output dim; split
-                    # into w1 (even rows) / w3 (odd rows) as strided views. This
-                    # reorders whole rows, so it holds for weight and scale alike.
+                    # Reorders whole rows, so this holds for the packed fp4
+                    # weight and its per-block fp8 scale alike.
                     per = _split_interleaved_gate_up(tensor[e], dim=0)
                 else:
                     per = (tensor[e],)

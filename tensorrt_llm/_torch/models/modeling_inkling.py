@@ -103,14 +103,9 @@ from .modeling_multimodal_utils import (
 def _module_excluded_from_quant(model_config: ModelConfig, name: str) -> bool:
     """True if ``name`` (or an ancestor) is bf16, not NVFP4.
 
-    This plain-NVFP4 checkpoint lists its bf16 modules in
-    ``hf_quant_config.json`` ``quantization.exclude_modules`` (read into
-    ``quant_config.exclude_modules`` by ``from_pretrained``) rather than in
-    ``per_layer_quant_configs`` (only populated for MIXED_PRECISION checkpoints).
-    ``QuantConfig.is_module_excluded_from_quantization`` walks the dotted
-    ancestry, so a listed ``model.llm.layers.5.attn`` covers the qkv/o
-    projections under it. Used to build attention (all ``.attn`` excluded) and
-    layer-2 routed experts (``.mlp.experts`` excluded) as bf16.
+    The checkpoint lists its bf16 modules in ``quant_config.exclude_modules``, and
+    the lookup walks the dotted ancestry, so a listed ``...layers.5.attn`` covers
+    the projections under it.
     """
     qc = model_config.quant_config
     return (
@@ -126,12 +121,10 @@ def _module_excluded_from_quant(model_config: ModelConfig, name: str) -> bool:
 class InklingMoeRoutingMethod(BaseMoeRoutingMethod):
     """Sigmoid gate + additive-bias top-k selection + log-sigmoid renorm.
 
-    The renorm denominator spans the selected routed logits *and* the shared
-    logits together (``shared_expert_sink``), so this cannot be expressed by the
-    stock sigmoid/MiniMax routing methods. ``apply`` returns only the routed
-    ``(topk_ids, topk_weights)`` needed by the fused MoE; the shared gammas come
-    from the same joint renorm and are recomputed in :class:`InklingMoE` for the
-    shared-expert branch (see :func:`inkling_joint_renorm`).
+    The renorm denominator spans the selected routed logits and the shared logits
+    together, which the stock routing methods cannot express. ``apply`` returns
+    only the routed pair the fused MoE needs; :class:`InklingMoE` recomputes the
+    shared gammas from the same joint renorm.
     """
 
     def __init__(
@@ -212,18 +205,13 @@ def inkling_joint_renorm(
 class InklingShortConv(nn.Module):
     """Causal depthwise short convolution (kernel 4) with an internal residual.
 
-    The weight matches the checkpoint layout ``[channels, 1, kernel]``. At
-    prefill this runs :func:`causal_conv1d_fn`; at cached decode it runs
-    :func:`causal_conv1d_update` against the per-request conv state carried by
-    the state cache manager. ``conv_state`` (and the runtime metadata that
-    selects the per-request slot) is threaded in by the caller; when it is
-    ``None`` the module falls back to a self-contained causal convolution over
-    the provided sequence.
+    Prefill runs :func:`causal_conv1d_fn`, cached decode
+    :func:`causal_conv1d_update` against the per-request conv state; with no
+    ``conv_state`` the module falls back to a self-contained causal convolution.
 
-    TP sharding (``tp_shard=True``): the k/v short convs act on the per-rank
-    slice of the fused qkv projection, so their channels are sharded by kv-head
-    like that projection and :meth:`load_weights` slices the rank's block out of
-    the full checkpoint weight. The residual-stream convs are replicated.
+    Under ``tp_shard`` the channels follow the fused qkv projection's kv-head
+    sharding and :meth:`load_weights` slices the rank's block out of the
+    checkpoint weight. The residual-stream convs are replicated.
     """
 
     def __init__(self, channels: int, kernel_size: int, mapping=None, tp_shard: bool = False):
@@ -261,22 +249,16 @@ class InklingShortConv(nn.Module):
     ) -> torch.Tensor:
         """x: [num_tokens, channels]; internal residual ``y = conv(x) + x``.
 
-        The stateless (no-cache) branch runs the conv in fp32 (per the source);
-        the fused cached branches run in the input dtype (the ``causal_conv1d``
-        ops require ``weight.dtype == x.dtype``, so the fp32 conv Parameter is
-        cast to ``x.dtype`` and ``conv_state`` -- the bf16 state pool -- matches).
-        Output is cast back to the input dtype. ``conv_state`` is updated in place
-        by the fused ops.
+        The stateless branch runs in fp32 (per the source); the fused cached
+        branches run in the input dtype, since the ``causal_conv1d`` ops require
+        ``weight.dtype == x.dtype``. ``conv_state`` is updated in place.
         """
         in_dtype = x.dtype
         residual = x
-        # Fused ops need weight and state in the input dtype (bf16); the fp32
-        # conv Parameter is cast here (the stateless branch below uses fp32).
         w = self.weight.squeeze(1).to(x.dtype)  # [channels, kernel]
         if conv_state is not None and is_decode:
-            # Cached decode. ``causal_conv1d_update`` writes in place into its
-            # ``x`` argument, so pass a copy -- otherwise it clobbers
-            # ``residual`` and the internal residual becomes conv(x) + conv(x).
+            # causal_conv1d_update writes in place into its x argument, so pass a
+            # copy -- otherwise the internal residual becomes conv(x) + conv(x).
             y = causal_conv1d_update(
                 x.clone(),
                 conv_state,
@@ -323,29 +305,17 @@ class InklingAttention(QKNormRoPEAttention):
     Reuses :class:`QKNormRoPEAttention` for the fused qkv/o projections and
     per-head q/k RMSNorm (``skip_rope=True`` gives qk-norm without RoPE), and
     owns the extra ``r`` projection, the k/v short convolutions, and the
-    relative-logit projection. Inkling's learned relative bias is a
-    per-(query, head, relative-distance) additive ``score_mod``, which no fused,
-    CUDA-graph-safe TensorRT-LLM backend exposes; it is precomputed torch-side
-    here into a ``rel_logits`` ``[num_query_tokens, local_heads, rel_extent]``
-    tensor and gathered+added by the Triton kernels. Local layers apply the
-    sliding window natively in the kernel; global layers fold the log-scaling
-    ``tau`` into ``rel_logits``.
+    relative-logit projection. The learned relative bias is a per-(query, head,
+    relative-distance) additive ``score_mod`` that no fused backend exposes, so it
+    is precomputed here into ``rel_logits`` and gathered+added by the Triton
+    kernels. Local layers apply the sliding window natively in the kernel; global
+    layers fold the log-scaling ``tau`` into ``rel_logits``.
 
-    Everything below that -- the KV write, page-table construction and the
-    prefill/decode dispatch over ``KVCacheManagerV2``'s HND paged layout -- runs
-    in :meth:`InklingTritonAttention.forward`, per
-    ``ATTENTION_DEVELOPER_GUIDE.md`` §1.1, reached through the standard backend
-    contract with ``rel_logits`` carried in
-    ``AttentionForwardArgs.sparse_backend_args``. The three per-layer scalars
-    that compute needs (``sm_scale``, ``rel_extent``, ``window_left``) are handed
-    to the backend in ``__init__`` because ``create_attention()`` takes a fixed
-    kwarg list.
-
-    ``forward`` overrides the base rather than reusing ``Attention.forward``:
-    the k/v short-convs must run between ``split_qkv`` and ``apply_qk_norm``, and
-    ``rel_logits`` is projected from ``hidden_states`` -- which the base's
-    ``forward_impl`` (and therefore ``AttentionSparseHooks.forward``) never
-    receives, since by then only q/k/v remain.
+    The KV write, page-table construction and prefill/decode dispatch run in
+    :meth:`InklingTritonAttention.forward`, reached through the standard backend
+    contract. ``forward`` overrides the base because the k/v short-convs must run
+    between ``split_qkv`` and ``apply_qk_norm``, and ``rel_logits`` is projected
+    from ``hidden_states``, which ``forward_impl`` never receives.
     """
 
     def __init__(self, model_config: ModelConfig[InklingTextConfig], layer_idx: int):
@@ -360,11 +330,8 @@ class InklingAttention(QKNormRoPEAttention):
         self.log_scaling_n_floor = None if self.is_local else config.log_scaling_n_floor
         self.log_scaling_alpha = config.log_scaling_alpha
 
-        # Attention is bf16, not NVFP4 -- the checkpoint excludes
-        # ``model.llm.layers.{i}.attn``. Hand the base a shallow ModelConfig copy
+        # Attention is bf16, not NVFP4: hand the base a shallow ModelConfig copy
         # with an empty quant_config so qkv_proj/o_proj are built unquantized.
-        # (``ModelConfig.__setattr__`` whitelists ``quant_config`` for exactly
-        # this per-module override.)
         attn_model_config = model_config
         if _module_excluded_from_quant(model_config, f"model.llm.layers.{layer_idx}.attn"):
             from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -399,26 +366,16 @@ class InklingAttention(QKNormRoPEAttention):
         # inclusive radius: query p attends to keys [p - (w - 1), p].
         self.sm_scale = 1.0 / float(head_dim)
         self.window_left = (self.attention_window_size - 1) if self.is_local else -1
-        # The compute lives in the backend (see the class docstring), and
-        # ``create_attention()`` has no passthrough for model-specific kwargs, so
-        # hand it the three per-layer scalars here. They differ between local
-        # (sliding-window) and global (full-causal) layers, so they must be set
-        # per module instance, not derived in the backend. Assignment is
-        # unconditional: if some other backend were built, ``forward`` fails
-        # loudly on the unexpected ``sparse_backend_args`` type rather than
-        # silently running a different attention.
+        # These three differ between local and global layers, and
+        # create_attention() has no passthrough for model-specific kwargs.
         self.attn.sm_scale = self.sm_scale
         self.attn.rel_extent = self.rel_extent
         self.attn.window_left = self.window_left
 
-        # Attention-scoped TP. Under attention DP every rank runs the full head
-        # set over its own requests, so the base built qkv_proj / o_proj with
-        # tp_size=1. The Inkling-only tensors below (r_proj, k/v sconv) hang off
-        # the same head/kv-head split and must follow the attention TP, not the
-        # global one -- otherwise they silently mismatch qkv_proj's shape.
+        # Attention-scoped TP: the Inkling-only tensors below (r_proj, k/v sconv)
+        # hang off the same head/kv-head split as qkv_proj, so they must follow
+        # the attention TP rather than the global one.
         tp_size = 1 if model_config.mapping.enable_attention_dp else model_config.mapping.tp_size
-        # Cross-check against the base so a change to how modules/attention.py
-        # scopes attention TP fails here at load rather than silently.
         assert self.num_heads == num_heads // tp_size, (
             f"attention TP disagrees with the base Attention: base kept "
             f"{self.num_heads} of {num_heads} heads, this rule expects "
@@ -426,10 +383,8 @@ class InklingAttention(QKNormRoPEAttention):
             f"{model_config.mapping.enable_attention_dp}, "
             f"mapping.tp_size={model_config.mapping.tp_size})"
         )
-        # r projection: per-head relative states (num_heads * d_rel), sharded by
-        # head like q. Output is not gathered (consumed locally to build bias).
-        # Under attention DP it is replicated: no mapping / no TP mode, matching
-        # how DeepSeek-V3 builds its non-expert Linears under ADP.
+        # r projection: per-head relative states, sharded by head like q and not
+        # gathered (consumed locally to build the bias). Replicated under ADP.
         self.r_proj = Linear(
             config.hidden_size,
             num_heads * self.d_rel,
@@ -445,9 +400,8 @@ class InklingAttention(QKNormRoPEAttention):
         # length is per-layer (local layers store only the sliding-window extent),
         # so this must use ``self.rel_extent``, not ``config.rel_extent``.
         self.rel_logits_proj = nn.Parameter(torch.empty(self.d_rel, self.rel_extent))
-        # k/v short convs act on the k/v stream of the fused qkv projection, so
-        # they are sharded by kv-head like it. Pass the full channel count and
-        # let InklingShortConv slice this rank's block at load.
+        # k/v short convs act on the k/v stream of the fused qkv projection and
+        # are sharded by kv-head like it; InklingShortConv slices at load.
         full_kv_dim = num_kv_heads * head_dim
         sconv_tp_shard = not model_config.mapping.enable_attention_dp
         self.k_sconv = InklingShortConv(
@@ -468,11 +422,9 @@ class InklingAttention(QKNormRoPEAttention):
         """Fused qkv projection -> split -> k/v short-conv -> per-head qk RMSNorm.
 
         Returns ``(q, k, v)`` shaped ``[T, local_heads, head_dim]`` /
-        ``[T, local_kv_heads, head_dim]``. With ``conv_pool_kv=(pool_k, pool_v)``
-        + ``conv_rt`` the k/v short-convs run through the runtime state pool
-        (seed for context tokens, in-place update at the per-request slots for
-        generation tokens; fused ops, CUDA-graph safe, mixed-batch capable);
-        without them they run the stateless full-sequence causal conv.
+        ``[T, local_kv_heads, head_dim]``. With ``conv_pool_kv`` + ``conv_rt`` the
+        k/v short-convs run through the runtime state pool; without them they run
+        the stateless full-sequence causal conv.
         """
         D = self.head_dim
         num_tokens = hidden_states.shape[0]
@@ -529,10 +481,8 @@ class InklingAttention(QKNormRoPEAttention):
     ):
         """Inkling attention through the Triton score_mod path.
 
-        ``conv_pool_kv=(pool_k, pool_v)`` + ``conv_rt`` drive the k/v short-convs
-        through the runtime state pool (seed on context, in-place update at the
-        per-request slots on generation, mixed-batch capable, CUDA-graph safe);
-        without them the short-convs run stateless over the whole sequence.
+        ``conv_pool_kv`` + ``conv_rt`` drive the k/v short-convs through the
+        runtime state pool; without them they run stateless over the sequence.
         """
         num_tokens = hidden_states.shape[0]
         # The pre-attention RMSNorm can emit fp32 while the attention/r
@@ -566,11 +516,8 @@ class InklingDenseMLP(nn.Module):
         super().__init__()
         config = model_config.pretrained_config
         inter = config.dense_intermediate_size
-        # Under attention DP the dense MLP goes data-parallel too: each rank
-        # holds the full weight and runs it over its own tokens. Keeping the
-        # column/row split would be a correctness bug -- the row-parallel
-        # down_proj would all-reduce partials belonging to different requests.
-        # Mirrors DeepSeek-V3's ``_compute_mlp_tp_size``.
+        # Under attention DP the dense MLP goes data-parallel too: keeping the
+        # column/row split would all-reduce partials from different requests.
         dp = model_config.mapping.enable_attention_dp
         mlp_mapping = None if dp else model_config.mapping
         self.gate_up_proj = Linear(
@@ -646,9 +593,8 @@ class InklingSharedExperts(nn.Module):
         self.n_shared = config.n_shared_experts
         inter = config.intermediate_size
         hidden = config.hidden_size
-        # [n_shared, 2*inter, hidden] fused gate+up; [n_shared, hidden, inter] down.
-        # Created in the model dtype: these run as raw bmms against the bf16
-        # hidden stream, and the checkpoint stores them bf16 (not quantized).
+        # [n_shared, 2*inter, hidden] fused gate+up; [n_shared, hidden, inter]
+        # down. Model dtype: these run as raw bmms and load unquantized.
         self.shared_w13 = nn.Parameter(
             torch.empty(self.n_shared, 2 * inter, hidden, dtype=config.torch_dtype)
         )
@@ -658,14 +604,12 @@ class InklingSharedExperts(nn.Module):
         self.act_fn = torch.nn.functional.silu
 
     def forward(self, hidden_states: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:
-        # hidden_states: [T, hidden]; gammas: [T, n_shared] fp32. Both bmms stay
-        # in the activation dtype and the gamma is applied in fp32 after the
-        # (linear) down projection, where it commutes.
+        # hidden_states: [T, hidden]; gammas: [T, n_shared] fp32, applied after
+        # the (linear) down projection where it commutes.
         x = hidden_states.unsqueeze(0).expand(self.n_shared, -1, -1)
         gate_up = torch.bmm(x, self.shared_w13.transpose(1, 2))
-        # ``shared_w13`` loads raw, with gate/up interleaved along its 2*inter
-        # output dim, so gate = even channels and up = odd. A contiguous
-        # chunk(2) here would pair the wrong channels.
+        # shared_w13 loads raw with gate/up interleaved along its output dim, so
+        # gate = even channels and up = odd; chunk(2) would pair the wrong ones.
         gate, up = gate_up[..., 0::2], gate_up[..., 1::2]
         activated = self.act_fn(gate) * up
         out = torch.bmm(activated, self.shared_w2.transpose(1, 2))  # [S, T, hidden]
@@ -710,14 +654,8 @@ class InklingMoE(nn.Module):
 
     @staticmethod
     def _experts_quant_config(model_config: ModelConfig, layer_idx: int):
-        """Per-layer expert quant: NVFP4 unless the checkpoint excludes it.
-
-        The checkpoint lists its bf16 modules in ``hf_quant_config.json``
-        ``quantization.exclude_modules``, which is the authoritative per-layer
-        signal here (``per_layer_quant_configs`` is only populated for
-        MIXED_PRECISION checkpoints). Excluded expert modules get an empty
-        ``QuantConfig`` so ``create_moe`` builds an unquantized bf16 MoE.
-        """
+        """Per-layer expert quant: NVFP4 unless the checkpoint excludes it, in
+        which case an empty ``QuantConfig`` gives ``create_moe`` a bf16 MoE."""
         if _module_excluded_from_quant(model_config, f"model.llm.layers.{layer_idx}.mlp.experts"):
             from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -729,12 +667,8 @@ class InklingMoE(nn.Module):
         hidden_states: torch.Tensor,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
-        """Routed + shared experts.
-
-        ``all_rank_num_tokens`` is the per-rank token count this step, taken from
-        ``attn_metadata``; ``FusedMoE`` needs it to pad and gather across ranks
-        under DP. ``None`` is the non-DP case.
-        """
+        """Routed + shared experts. ``all_rank_num_tokens`` is this step's
+        per-rank token count, which ``FusedMoE`` needs to gather under DP."""
         router_logits = self.gate(hidden_states)  # [T, 258] fp32
         routed = self.experts(
             hidden_states,
@@ -807,12 +741,9 @@ class InklingDecoderLayer(nn.Module):
         """Pre-norm attention + MLP, each followed by a short-conv (internal
         residual), then the residual add.
 
-        With ``conv_rt`` given, ``conv_state`` holds this layer's four
-        ``[max_batch, C, K-1]`` pool buffers
-        (:meth:`InklingConvStateCache.layer_state`) and each short-conv seeds the
-        pool for context tokens and updates it in place at the per-request slots
-        for generation tokens (fused ops, mixed-batch + CUDA-graph safe).
-        Without it the short-convs run stateless over the whole sequence.
+        With ``conv_rt`` given, ``conv_state`` holds this layer's four pool
+        buffers and each short-conv runs through them; without it they run
+        stateless over the whole sequence.
         """
         if conv_rt is None:
             residual = hidden_states
@@ -879,15 +810,13 @@ class InklingModel(DecoderModel):
         inputs_embeds_prenormed: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        """Decoder stack. The runtime short-conv state pool and the
-        context/generation split come from ``attn_metadata``; each layer reads
-        its own four state buffers. A metadata without them (no conv-capable
-        cache manager) keeps the stateless conv.
+        """Decoder stack. The short-conv state pool and the context/generation
+        split come from ``attn_metadata``; a metadata without them keeps the
+        stateless conv.
 
-        ``inputs_embeds_prenormed``: on the multimodal path the wrapper has
-        already applied ``embed_norm`` to the text embeddings and scattered the
-        raw tower rows in afterwards, so the fused stream must not be re-normed
-        here. Text-only callers pass raw ``inputs_embeds`` and keep the norm."""
+        ``inputs_embeds_prenormed`` is set on the multimodal path, where the
+        wrapper has already applied ``embed_norm`` to the text embeddings before
+        scattering the raw tower rows in."""
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         conv_cache = getattr(attn_metadata, "ink_conv_cache", None)
@@ -933,21 +862,12 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
 
     @staticmethod
     def _assert_inkling_attn_backend(model_config) -> None:
-        """Fail at load if the attention backend *family* was overridden.
+        """Fail at load if the attention backend family was overridden.
 
         Inkling's backend is registered in ``sparse/registry.py`` under the
-        ``TRTLLM`` family only: ``get_attention_backend`` consults the registry
-        per family, and the ``VANILLA`` / ``FLASHINFER`` ones do not know the
-        ``"inkling"`` algorithm. Left to itself that surfaces as "Unsupported
-        sparse attention algorithm in vanilla attention backend", which names
-        neither Inkling nor the setting responsible.
-
-        A stray ``attn_backend`` in ``--extra_llm_api_options`` -- easy to carry
-        over from another model's serve config -- is the realistic way to get
-        here; model defaults are a deep-merge in which an explicit user value
-        wins. ``TRTLLM`` is accepted because that *is* the family Inkling runs
-        under and is also the framework default, so leaving ``attn_backend``
-        unset is the normal path.
+        ``TRTLLM`` family only; the ``VANILLA`` / ``FLASHINFER`` registries do not
+        know the ``"inkling"`` algorithm and fail with a message naming neither
+        Inkling nor the setting responsible.
         """
         backend = getattr(model_config, "attn_backend", None)
         if backend is not None and str(backend).upper() != "TRTLLM":
@@ -965,22 +885,10 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
     def _assert_inkling_moe_parallel(model_config) -> None:
         """Reject an expert-parallel layout the MoE backend cannot serve.
 
-        Inkling's routed experts go through the generic ``create_moe`` factory,
-        so expert parallelism needs no Inkling-specific code: ``Mapping``
-        derives ``moe_ep_size`` / ``moe_tp_size``, ``FusedMoE`` slices the 256
-        experts with ``_compute_ep_partition``, and CutlassFusedMoE remaps the
-        NVFP4 per-expert scales onto the local slice. What it does NOT have is
-        a check that the requested split is one the backend supports.
-
-        ``FusedMoE._supports_non_divisible_ep`` is opt-in and the CUTLASS
-        backend -- the only routed-expert backend Inkling ships -- does not opt
-        in, so a non-divisible ``moe_expert_parallel_size`` fails somewhere
-        inside expert-slot bookkeeping rather than at load. 256 divides evenly
-        by every power of two, so this only bites on values like 3, 5 or 6.
-
-        Note this deliberately does NOT constrain moe_tp_size: with
-        ``moe_ep_size = 1`` (the default) the experts are TP-sharded, which is
-        what every Inkling accuracy run to date measured.
+        The CUTLASS backend -- the only routed-expert backend Inkling ships --
+        does not opt into ``_supports_non_divisible_ep``, so a non-divisible
+        ``moe_expert_parallel_size`` fails inside expert-slot bookkeeping rather
+        than at load.
         """
         mapping = getattr(model_config, "mapping", None)
         if mapping is None:
@@ -1010,19 +918,9 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
                 f"expert-slot bookkeeping instead of here. Pick a divisor of "
                 f"{num_experts}."
             )
-        # Measured, not theoretical. On 4 GPUs, against the golden GSM8K run:
-        #
-        #   ep 1 / 2, cuda_graph on   acc 0.9667, zero score flips
-        #   ep 4,     cuda_graph OFF  acc 0.9667, zero score flips
-        #   ep 4,     cuda_graph on   SIGSEGV in warmup, all four ranks
-        #
-        # So the expert split itself is sound at every size tried, including
-        # moe_tp_size 1 -- pure EP reproduces the TP-only result per item. What
-        # breaks is pure EP together with CUDA-graph capture; changing
-        # max_batch_size / max_num_tokens does not move it, which rules out the
-        # expert GEMM shape. Root cause not yet found, so reject only that
-        # combination rather than the whole layout, and point at the
-        # configuration that works.
+        # Pure EP (moe_tp_size 1) reproduces the TP-only accuracy per item but
+        # segfaults during CUDA-graph capture; root cause not yet found, so
+        # reject only that combination rather than the whole layout.
         moe_tp_size = getattr(mapping, "moe_tp_size", None)
         use_cuda_graph = getattr(model_config, "use_cuda_graph", False)
         if moe_tp_size is not None and moe_tp_size < 2 and use_cuda_graph:
@@ -1040,19 +938,12 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
 
         Under CUDA-graph capture a symmetric all-reduce corrupts the run when its
         send buffer is unregistered while its recv buffer is a registered NCCL
-        window; Inkling's decode message size hits that case exactly and decode
-        collapses to a repeated token.
-
-        The affected all-reduces are built by generic modules (attention
-        ``o_proj``, MoE ``down_proj``), so rebuilding them here keeps the
-        mitigation model-local. Pinning ONESHOT also drops the NCCL window
-        requirement. The cost is giving up the symmetric tactic everywhere,
-        eager included.
+        window; Inkling's decode message size hits that case and decode collapses
+        to a repeated token. The affected all-reduces are built by generic
+        modules, so rebuilding them here keeps the mitigation model-local.
         """
         for mod in self.modules():
             old = getattr(mod, "all_reduce", None)
-            # ``None`` means the module reduces nothing; adding an AllReduce here
-            # would add a collective rather than remove a tactic.
             if not isinstance(old, AllReduce):
                 continue
             # Carry the module's own mapping and dtype over so the rebuild
@@ -1073,9 +964,8 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
         inputs_embeds_prenormed: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # The short-conv state pool is owned by InklingHybridCacheManager and
-        # reaches the decoder through attn_metadata, published outside the
-        # captured region -- no conv kwargs and no ResourceManager lookup here.
+        # The short-conv state pool reaches the decoder through attn_metadata, so
+        # there are no conv kwargs and no ResourceManager lookup here.
         hidden_states = self.model(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
@@ -1094,13 +984,9 @@ def _encode_inkling_image_embeds(
 ) -> List[torch.Tensor]:
     """Run the hMLP vision tower over the context requests' patch features.
 
-    Reads ``multimodal_data['image']['vision_patches_bthwc']`` (the tensor the
-    :class:`InklingInputProcessor` attaches) from each context
-    ``MultimodalParams``, concatenates them, and runs the tower on the tower's
-    device/dtype. Returns a single-element list ``[feats]`` with ``feats`` of
-    shape ``(sum_patches, decoder_dmodel)`` -- the same shape
-    ``get_multimodal_embeddings`` returns and ``find_input_mm_embeds`` slices --
-    or ``[]`` when no context request carries image features."""
+    Returns ``[feats]`` of shape ``(sum_patches, decoder_dmodel)`` -- the shape
+    ``find_input_mm_embeds`` slices -- or ``[]`` when no context request carries
+    image features."""
     patches = []
     for param in multimodal_params:
         data = getattr(param, "multimodal_data", None) or {}
@@ -1120,12 +1006,8 @@ def _encode_inkling_audio_embeds(
 ) -> List[torch.Tensor]:
     """Run the dMel audio tower over the context requests' audio features.
 
-    Reads ``multimodal_data['audio']['dmel_bins']`` (the tensor the
-    :class:`InklingInputProcessor` attaches) from each context
-    ``MultimodalParams``, concatenates them, and runs the tower. Returns a
-    single-element list ``[feats]`` with ``feats`` of shape
-    ``(sum_frames, decoder_dmodel)`` -- the same shape contract as the image
-    encoder -- or ``[]`` when no context request carries audio features."""
+    Returns ``[feats]`` of shape ``(sum_frames, decoder_dmodel)``, the same shape
+    contract as the image encoder, or ``[]`` when there is no audio."""
     frames = []
     for param in multimodal_params:
         data = getattr(param, "multimodal_data", None) or {}
@@ -1155,19 +1037,12 @@ def _build_replicated_bf16_tower(tower_cls, tower_config):
     ``deferred_config`` means ``load_weights`` must rebuild the tower before
     loading into it.
 
-    The deferral is not an optimization, it is what keeps meta init working at
-    all. ``MetaInitMode`` allocates parameters on the ``meta`` device and only
-    permits random-init ops on them; ``.to(torch.bfloat16)`` dispatches
-    ``aten._to_copy.default``, which raises ``MetaInitException``. The model
-    loader wraps that mode around the ENTIRE ``from_config`` call, so a single
-    tower raising there costs the whole text stack its meta init and the model
-    is rebuilt with real allocations -- which is precisely what meta init exists
-    to avoid ("skip memory allocation when creating weights, which avoids OOM
-    when GPU memory is not enough for all weights"). The failure is silent: it
-    is logged at INFO as "Fallback to regular model init".
-
-    Same shape as ``modeling_kimi_k3_vl`` / ``modeling_kimi_k25``, which defer
-    their vision encoders for this reason.
+    The deferral is what keeps meta init working: ``MetaInitMode`` permits only
+    random-init ops on meta parameters, so the tower's ``.to(torch.bfloat16)``
+    raises ``MetaInitException``. The loader wraps that mode around the entire
+    ``from_config`` call, so one tower raising there silently costs the whole text
+    stack its meta init. ``modeling_kimi_k3_vl`` defers its encoder for the same
+    reason.
     """
     if tower_config is None or not getattr(tower_config, "decoder_dmodel", None):
         return None, None
@@ -1197,45 +1072,22 @@ def _build_replicated_bf16_tower(tower_cls, tower_config):
 class InklingForConditionalGeneration(InklingForCausalLM):
     """Registered entry point for the multimodal ``inkling_mm_model`` checkpoint.
 
-    Text-only requests route straight to the text :class:`InklingForCausalLM`
-    over the ``text_config`` sub-config and consume only ``model.llm.*`` weights.
-    Image requests are preprocessed by the registered
-    :class:`InklingInputProcessor`, which expands the ``<image>`` placeholder to
-    one token per vision patch and attaches the ``vision_patches_bthwc``
-    features; the hMLP vision tower (:class:`InklingVisionModel`) is built as a
-    replicated bf16 submodule ``self.visual`` and its per-patch outputs are fused
-    into ``inputs_embeds`` at the placeholder positions before the text decoder
-    (OOV-safe ``fuse_input_embeds``). Audio requests flow through the identical
-    fusion path: the processor expands the ``<audio>`` placeholder to one token
-    per dMel frame and the dMel audio tower (:class:`InklingAudioModel`,
-    replicated bf16 ``self.audio_tower``) emits one row per frame. Video is
-    multi-frame images through the vision tower. MTP is not implemented. See
-    ``checkpoints/hf/inkling_weight_mapper.py`` for the HF -> TRT name mapping
-    and consumed/deferred accounting.
+    Text-only requests route straight to :class:`InklingForCausalLM` over the
+    ``text_config`` sub-config. Media requests are preprocessed by
+    :class:`InklingInputProcessor`, which expands each placeholder to one token
+    per vision patch / dMel frame; the replicated bf16 towers (``self.visual``,
+    ``self.audio_tower``) emit one row per position and those rows are fused into
+    ``inputs_embeds`` before the text decoder. Video is multi-frame images
+    through the vision tower. MTP is not implemented.
     """
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        # ``use_kv_cache_manager_v2``: Inkling's per-layer KV-head split (local
-        # layers carry more KV heads than global ones) needs V2's per-layer
-        # geometry; V1's unified pool would mis-size the per-layer KV bytes.
-        # ``_util`` already forces the V2 class for Inkling -- declaring it here
-        # keeps the resolved flag (and its readers) agreeing with that.
-        #
-        # ``enable_block_reuse``: the short-conv window is per-request state
-        # outside the KV cache and every context request is seeded empty, so a
-        # reused prefix would convolve against padding -- wrong outputs, not just
-        # a cache miss. ``MixedMambaHybridCacheManager`` has the same limitation.
-        # An explicit user setting still wins the deep-merge.
-        #
-        # No ``attn_backend`` entry: Inkling runs under the framework-default
-        # TRTLLM family, and its backend and cache manager are both selected from
-        # ``sparse/registry.py`` keyed on the architecture-derived
-        # ``sparse_attention_config`` (see
-        # ``attention_backend/sparse/inkling/params.py``). Selecting from the
-        # model architecture rather than from a backend-name string is what makes
-        # every consumer -- including the ones holding no ModelConfig -- resolve
-        # the same backend and metadata.
+        # use_kv_cache_manager_v2: the per-layer KV-head split needs V2's
+        # per-layer geometry; V1's unified pool would mis-size the KV bytes.
+        # enable_block_reuse: the short-conv window is per-request state outside
+        # the KV cache and every context request is seeded empty, so a reused
+        # prefix would convolve against padding.
         return {
             "kv_cache_config": {
                 "use_kv_cache_manager_v2": True,
@@ -1247,28 +1099,20 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         text_model_config = _text_sub_model_config(model_config)
         super().__init__(text_model_config)
         self._top_model_config = model_config
-        # The hMLP vision tower is a replicated bf16 submodule: excluded from
-        # NVFP4 and not TP-sharded, since every rank runs the identical tower
-        # over identical patches. ``None`` for a text-only checkpoint.
-        # Both towers are built through ``_build_replicated_bf16_tower``, which
-        # returns ``None`` under ``MetaInitMode`` and records the config for
-        # ``load_weights`` to rebuild from. Constructing them eagerly here used
-        # to abort meta init for the WHOLE model -- see that helper.
+        # Both towers are replicated bf16 submodules -- every rank runs the
+        # identical tower over identical inputs -- and are built through
+        # _build_replicated_bf16_tower, which returns None under MetaInitMode and
+        # records the config for load_weights to rebuild from.
         vision_config = getattr(model_config.pretrained_config, "vision_config", None)
         self.visual, self._deferred_vision_config = _build_replicated_bf16_tower(
             InklingVisionModel, vision_config
         )
-        # The dMel audio tower follows the same rules as the vision tower, with
-        # one row per dMel frame. ``None`` when the config has no ``audio_config``.
         audio_config = getattr(model_config.pretrained_config, "audio_config", None)
         self.audio_tower, self._deferred_audio_config = _build_replicated_bf16_tower(
             InklingAudioModel, audio_config
         )
-        # The media placeholder ids the Inkling chat template emits. They must be
-        # in-vocab, since the executor rejects out-of-range request token ids.
-        # Surfaced to the model engine's ``_prepare_multimodal_indices`` so it can
-        # locate the media rows; the audio id is registered only when the audio
-        # tower exists, leaving vision/text-only checkpoints unchanged.
+        # The media placeholder ids the chat template emits, surfaced to the model
+        # engine's _prepare_multimodal_indices so it can locate the media rows.
         self.image_token_id = int(
             getattr(model_config.pretrained_config, "image_token_id", DEFAULT_IMAGE_TOKEN_ID)
         )

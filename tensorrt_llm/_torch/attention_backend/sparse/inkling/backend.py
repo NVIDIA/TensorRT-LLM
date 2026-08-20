@@ -33,20 +33,12 @@ from .params import InklingBackendForwardArgs
 class InklingTritonAttention(TrtllmAttention):
     """Runs Inkling's Triton attention over the paged KV cache.
 
-    Standard :meth:`AttentionBackend.forward`. Inkling's two private inputs
-    (``rel_logits``, ``allow_mixed``) ride
-    ``AttentionForwardArgs.sparse_backend_args``, the registered slot for
-    exactly this; ``params.py`` covers why neither widening the shared dataclass
-    nor reusing T5's ``relative_attention_bias`` works.
-
-    Subclasses ``TrtllmAttention``, not ``AttentionBackend``:
-    :class:`InklingAttentionMetadata` extends the Trtllm metadata to reuse its
-    ``prepare()``, and the model engine gates warmup on that same subclass check.
-
+    Inkling's two private forward inputs (``rel_logits``, ``allow_mixed``) ride
+    ``AttentionForwardArgs.sparse_backend_args``. Subclasses ``TrtllmAttention``
+    so :class:`InklingAttentionMetadata` can reuse its ``prepare()``.
     ``sm_scale`` / ``rel_extent`` / ``window_left`` are assigned by
-    ``InklingAttention`` after construction -- ``create_attention()`` has a fixed
-    kwarg list. ``layer_idx`` is the *global* index, which is what
-    ``KVCacheManagerV2`` expects.
+    ``InklingAttention`` after construction, since ``create_attention()`` has a
+    fixed kwarg list.
     """
 
     Metadata = InklingAttentionMetadata
@@ -60,16 +52,13 @@ class InklingTritonAttention(TrtllmAttention):
         forward_args: Optional[AttentionForwardArgs] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Dispatch prefill / decode over the paged cache, supporting mixed
-        context+generation batches.
+        """Dispatch prefill / decode over the paged cache.
 
         The runtime packs context requests first, then one-token generation
         requests, so slicing at that boundary feeds the prefill and paged-decode
-        kernels respectively; the pure cases fall out as single slices.
-
-        Overriding ``forward`` rather than delegating to
-        ``TrtllmAttention.forward`` is what keeps Inkling off the sparse
-        prediction hooks that method calls.
+        kernels respectively. ``forward`` is overridden rather than delegated to
+        keep Inkling off the sparse prediction hooks ``TrtllmAttention.forward``
+        calls.
         """
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         args = forward_args.sparse_backend_args
@@ -84,8 +73,7 @@ class InklingTritonAttention(TrtllmAttention):
         rel_logits = args.rel_logits
         allow_mixed = args.allow_mixed
         attn_metadata = metadata
-        # KVCacheManagerV2 takes the global layer index and maps it through
-        # ``layer_offsets`` itself.
+        # KVCacheManagerV2 takes the global layer index.
         cache_layer = self.layer_idx
         kv = attn_metadata.kv_cache_manager.get_buffers(cache_layer, kv_layout="HND")
         # kv: [num_pages, 2, num_kv_heads, page_size, head_dim]
@@ -99,9 +87,8 @@ class InklingTritonAttention(TrtllmAttention):
         num_seqs = len(seq_lens)
         ctx_tokens = sum(seq_lens[:num_contexts])
 
-        # A mixed context+generation batch needs the per-request short-conv state
-        # pool: the stateless path would convolve across the context/generation
-        # boundary. Refuse it unless the pool path is active.
+        # A mixed batch needs the per-request short-conv state pool; the
+        # stateless path would convolve across the context/generation boundary.
         if 0 < num_contexts < num_seqs and not allow_mixed:
             raise NotImplementedError(
                 "InklingAttention: mixed context+generation batch needs the "
@@ -181,16 +168,11 @@ class InklingTritonAttention(TrtllmAttention):
         cu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
         cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
         max_seqlen = max(seq_lens)
-        # NOTE: this attends only to the tokens of THIS call. The write above
-        # honours ``num_cached``, but ``inkling_prefill_attention`` takes no
-        # paged-KV argument, so a context request carrying cached history
-        # (chunked prefill, or a reused prefix) would silently drop all of it.
-        # Both are refused up front by
-        # ``reject_unsupported_inkling_kv_cache_features``; adding either one
-        # means giving Inkling a chunked-context prefill path that reads the
-        # pages back while carrying rel_logits and the sliding window across the
-        # boundary. ``num_cached`` is non-zero here only in that unsupported
-        # case, which is why the write path already accounts for it.
+        # NOTE: this attends only to the tokens of THIS call --
+        # inkling_prefill_attention takes no paged-KV argument, so a context
+        # request carrying cached history would silently drop it. Chunked prefill
+        # and block reuse are refused by
+        # reject_unsupported_inkling_kv_cache_features for that reason.
         return inkling_prefill_attention(
             q, k, v, cu, max_seqlen, self.sm_scale, rel_logits, self.rel_extent, self.window_left
         )
@@ -211,16 +193,10 @@ class InklingTritonAttention(TrtllmAttention):
         attn_metadata,
     ):
         device = q.device
-        # --- Runtime CUDA-graph-safe path. ---------------------------------
-        # Zero host->device copy: slice the base metadata's graph-stable
-        # ``kv_lens_cuda`` and ``kv_cache_block_offsets``, then persist the new
-        # K/V with an in-graph scatter whose indices are derived on-GPU. Padding
-        # rows carry dummy request slots, so the scatter never touches a real
-        # request's page.
+        # CUDA-graph-safe path: no host->device copy. Slice the base metadata's
+        # graph-stable kv_lens_cuda and kv_cache_block_offsets, then persist the
+        # new K/V with an in-graph scatter whose indices are derived on-GPU.
         num_req = q.shape[0]
-        # Guard on the metadata *type*, explicitly: the previous version relied
-        # on a ``getattr(..., 0)`` default to route a foreign metadata object
-        # here, which is not a stated check.
         if (
             isinstance(attn_metadata, InklingAttentionMetadata)
             and attn_metadata.num_generations == num_req
@@ -252,10 +228,8 @@ class InklingTritonAttention(TrtllmAttention):
                 self.window_left,
                 page_div=page_div,
             )
-        # Eager fallback (never captured): the decode metadata was not published,
-        # so build it here from the host block table, like the context path. This
-        # path is illegal under CUDA graph, and the usual cause is an
-        # ``attn_backend`` override that swapped the metadata type -- say so.
+        # Eager fallback: the decode metadata was not published, so build it here
+        # from the host block table. Illegal under CUDA graph.
         if getattr(attn_metadata, "is_cuda_graph", False):
             raise RuntimeError(
                 "Inkling decode metadata is unusable for a CUDA-graph batch: "
@@ -284,10 +258,8 @@ class InklingTritonAttention(TrtllmAttention):
         decode_seq_lens = torch.tensor(total, dtype=torch.int32, device=device)
         max_pages = max(len(b) for b in block_ids)
         decode_page_table = build_page_table(block_ids, max_pages, device)
-        # No ``page_div`` here (it defaults to 1): unlike the graph path's
-        # ``kv_cache_block_offsets`` slice, ``get_batch_cache_indices`` already
-        # divides by ``kv_factor`` itself (see
-        # ``_get_batch_cache_indices_by_pool_id``), so these are block indices.
+        # No page_div here: get_batch_cache_indices already divides by kv_factor,
+        # so these are block indices rather than page indices.
         return inkling_decode_attention(
             q,
             k_cache,

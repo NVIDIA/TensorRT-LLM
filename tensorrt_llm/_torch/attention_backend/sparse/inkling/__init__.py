@@ -14,18 +14,10 @@
 # limitations under the License.
 """Inkling attention: Triton kernels, per-step metadata, backend, cache manager.
 
-**Inkling is not a sparse-attention algorithm** -- its attention is dense (full
-causal, sliding window on local layers, plus a learned relative-bias
-``score_mod``). It lives under ``sparse/`` because that is where every
-*model-specific* attention backend already lives: the package name is
-historical, and what unifies its members is needing a private
-``AttentionBackend`` + metadata + cache manager, which is Inkling's shape
-exactly.
-
-Selection goes through ``sparse/registry.py`` like its neighbours, so
-``attention_backend/utils.py`` needs no model-specific branch; ``params.py``
-covers the config that makes that reachable and what it costs. Nothing here
-depends on sparsity semantics.
+Inkling's attention is dense (full causal, sliding window on local layers, plus a
+learned relative-bias ``score_mod``), not sparse. It lives under ``sparse/``
+because that is where every model-specific attention backend already lives, and
+selection goes through ``sparse/registry.py`` like its neighbours.
 """
 
 from .backend import InklingTritonAttention

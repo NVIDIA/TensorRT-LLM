@@ -14,19 +14,13 @@
 # limitations under the License.
 """Config classes for the Inkling multimodal checkpoint.
 
-The checkpoint publishes ``config.json`` with ``model_type ==
-"inkling_mm_model"`` and ``architectures ==
-["InklingForConditionalGeneration"]``. Transformers does not ship Inkling, so
-these classes reconstruct the config from the checkpoint's nested dicts without
-any transformers shim.
+Transformers does not ship Inkling, so these classes reconstruct the config from
+the checkpoint's nested dicts without a transformers shim. The audio, vision and
+MTP sub-configs are kept verbatim as ``PretrainedConfig`` blobs, which the towers
+read their geometry off directly.
 
-The audio, vision, and MTP sub-configs are kept verbatim (as
-``PretrainedConfig`` blobs); the vision and audio towers read their geometry
-directly off them (see ``models/modeling_inkling_multimodal.py``).
-
-Field names mirror the checkpoint ``text_config``. All numeric defaults are the
-real checkpoint values, but a ``config.json`` that spells a field out overrides
-the default via ``from_dict``.
+Field names mirror the checkpoint ``text_config`` and the numeric defaults are the
+real checkpoint values, overridable through ``from_dict``.
 """
 
 from transformers.configuration_utils import PretrainedConfig
@@ -173,12 +167,8 @@ class InklingTextConfig(PretrainedConfig):
     def num_kv_heads_per_layer(self) -> list[int]:
         """Per-layer KV-head counts for the hybrid attention geometry.
 
-        Local (sliding-window) layers use ``swa_num_key_value_heads`` (16) and
-        global layers use ``num_key_value_heads`` (8). ``KVCacheManagerV2``
-        accepts this ``List[int]`` as ``num_kv_heads`` (it divides each by
-        ``tp_size``), so the paged KV cache allocates the right per-layer head
-        count instead of a single uniform value. ``head_dim`` is uniform (128)
-        across local and global layers, so only the KV-head count varies.
+        ``KVCacheManagerV2`` takes this list as ``num_kv_heads`` so the paged pool
+        is sized per layer; ``head_dim`` is uniform, so only the count varies.
         """
         return [self.layer_num_kv_heads(i) for i in range(self.num_hidden_layers)]
 
@@ -201,10 +191,9 @@ class InklingConfig(PretrainedConfig):
         vision_config=None,
         mtp_config=None,
         eos_token_id: int = 200006,
-        # Multimodal placeholder ids: the in-vocab chat-template tokens the
-        # input processor expands to one token per patch / audio frame. They must
-        # be in-vocab, since the executor rejects out-of-range request token ids.
-        # The checkpoint's config.json omits them, so the defaults apply.
+        # In-vocab chat-template placeholder ids, omitted from the checkpoint's
+        # config.json. They must be in-vocab: the executor rejects out-of-range
+        # request token ids.
         image_token_id: int = 200054,
         audio_token_id: int = 200053,
         tie_word_embeddings: bool = False,

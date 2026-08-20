@@ -18,8 +18,6 @@ and the helper that runs one short convolution through them.
 This is runtime state, not model weights: it has the lifetime of the paged KV
 cache, is owned by :class:`~.cache_manager.InklingHybridCacheManager`, and is
 published each step from :meth:`~.metadata.InklingAttentionMetadata.prepare`.
-It therefore lives beside the cache manager and the metadata rather than in
-``models/modeling_inkling.py``, which owns only the weight-bearing modules.
 """
 
 from collections import namedtuple
@@ -42,12 +40,8 @@ InklingConvState = namedtuple("InklingConvState", ["k", "v", "attn", "mlp"])
 class InklingRole:
     """V2 pool roles for the four short convolutions of a decoder layer.
 
-    Four roles despite only two widths: a role is a buffer's identity, and
-    k/v/attn/mlp merely happen to pair up in size today. V2 coalesces same-sized
-    buffers on its own, so naming them apart is free.
-
-    Lives here so the pool and its roles are declared together, and so this
-    module and ``cache_manager`` do not import each other.
+    Four roles despite only two widths: k/v and attn/mlp merely happen to pair up
+    in size today, and V2 coalesces same-sized buffers on its own.
     """
 
     CONV_K = DataRole("inkling_conv_k")
@@ -72,35 +66,21 @@ class InklingConvStateCache:
 
     The buffers come from the ``allocate`` callback, which
     :class:`InklingHybridCacheManager` wires to V2 SSM-layer pool memory: this
-    class owns the request-to-row mapping, V2 owns the bytes -- the same split
-    ``MambaHybridCacheManagerV2`` uses.
+    class owns the request-to-row mapping, V2 owns the bytes.
 
-    The row count is fixed at construction: ``num_request_slots`` real rows,
-    plus one row shared by every CUDA-graph padding sentinel, plus one for the
-    attention-DP idle dummy when enabled. This is the ``MambaCacheManager``
-    layout (``_padding_slot`` / ``_attention_dp_dummy_slot``), fixed for two
-    reasons. Padding rows must not consume real-request capacity -- the
-    CUDA-graph runner keeps one sentinel per runtime draft length, so charging
-    each a real row silently shrinks the servable batch. And every buffer,
-    including the int32 ``state_indices``, keeps a stable device address and is
-    mutated in place, so a captured graph replays cleanly; a pool that
-    reallocated to grow would strand captured pointers, and replaying against a
-    freed buffer does not raise -- it reads whatever the allocator handed out
-    next.
+    The row count is fixed at construction -- ``num_request_slots`` real rows plus
+    the reserved ones, the ``MambaCacheManager`` layout. Padding rows must not
+    consume real-request capacity, and every buffer keeps a stable device address
+    and is mutated in place so a captured graph replays cleanly.
     """
 
     @staticmethod
     def reserved_slot_count(*, reserve_attention_dp_slot: bool) -> int:
-        """Rows sitting above the per-request ones.
+        """Rows sitting above the per-request ones: one shared by every CUDA-graph
+        padding sentinel, plus one for the attention-DP idle dummy when enabled.
 
-        One row shared by every CUDA-graph padding sentinel, plus one for the
-        attention-DP idle dummy when enabled.
-
-        Static because the count is needed twice -- here to size the pool, and in
-        ``_InklingConvGeometry`` to declare V2's min-slots floor. They must agree
-        exactly (a buffer sized from a smaller count is indexed out of bounds by
-        :meth:`slots_for`), and the layout is this class's to define, so the
-        geometry asks rather than re-deriving.
+        Static because ``_InklingConvGeometry`` needs the same count to declare
+        V2's min-slots floor, and the two must agree exactly.
         """
         return 1 + int(reserve_attention_dp_slot)
 
@@ -116,8 +96,6 @@ class InklingConvStateCache:
         max_draft_len: int = 0,
         allocate: Optional[Callable[[int, object, List[int]], torch.Tensor]] = None,
     ):
-        # Takes the pretrained config + tp_size rather than a ``ModelConfig`` so
-        # the KV cache manager can build the pool from what it already has.
         # Accept either the text config or the top-level multimodal one.
         config = getattr(pretrained_config, "text_config", pretrained_config)
         kwin = config.sconv_kernel_size - 1
@@ -135,13 +113,10 @@ class InklingConvStateCache:
         self.num_slots = num_slots
         self.kwin = kwin
 
-        # ``allocate`` hands back V2 pool memory when the cache manager built us,
-        # which is what puts these bytes inside V2's quota. Standalone callers
-        # (unit tests) fall back to a private allocation of the same shapes.
-        #
-        # Pool memory arrives UNINITIALIZED. Safe only because ``slots_for``
-        # zeroes a row when it first hands it out, and every row that is read was
-        # handed out first. A reader that skips claiming needs a zero-fill.
+        # ``allocate`` hands back V2 pool memory when the cache manager built us;
+        # standalone callers fall back to a private allocation of the same shapes.
+        # Pool memory arrives uninitialized, which is safe only because
+        # ``slots_for`` zeroes a row when it first hands it out.
         if allocate is None:
 
             def allocate(_layer_idx, _role, state_shape):
@@ -166,11 +141,9 @@ class InklingConvStateCache:
                     )
             self._layers.append(InklingConvState(*(b[:num_slots] for b in bufs)))
         # Refreshed in place per forward so a captured graph aliases it and every
-        # replay sees the current batch. Indexed by batch position, not by slot,
-        # so it needs one entry per row the padded batch can carry.
+        # replay sees the current batch. Indexed by batch position, not by slot.
         self.state_indices = torch.arange(num_slots, dtype=torch.int32, device=device)
-        # Pinned host staging for that write: one async H2D copy per forward,
-        # legal under graph capture. Kept in lock-step size with ``state_indices``.
+        # Pinned host staging for that write: one async H2D copy per forward.
         self.state_indices_cpu = torch.zeros(
             num_slots, dtype=torch.int32, pin_memory=prefer_pinned()
         )
@@ -188,10 +161,8 @@ class InklingConvStateCache:
     def _reserved_slot_for(self, request_id: int) -> Optional[int]:
         """The reserved row ``request_id`` aliases, or None for a real request.
 
-        Padding rows carry no state anyone reads back, so every sentinel shares
-        one row. ``cuda_graph_runner`` caches one dummy id per runtime draft
-        length (``CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len``), so the whole
-        descending range has to map here, not just the exact sentinel.
+        ``cuda_graph_runner`` caches one dummy id per runtime draft length, so the
+        whole descending range maps here, not just the exact sentinel.
         """
         from ....pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
         from ....pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
@@ -207,12 +178,8 @@ class InklingConvStateCache:
 
         Fresh requests get a zero-initialised row; existing ones keep theirs so
         their conv windows persist across decode steps. Padding sentinels and the
-        attention-DP dummy alias their reserved rows.
-
-        Raises on exhaustion. The pool covers every sequence that can be resident
-        at once, so running out means a request held a row past its
-        ``free_resources``; the alternative to raising is handing it a row
-        another request is still carrying state in, which corrupts silently.
+        attention-DP dummy alias their reserved rows. Raises on exhaustion rather
+        than handing out a row another request is still carrying state in.
         """
         slots = []
         for r in request_ids:
@@ -237,10 +204,9 @@ class InklingConvStateCache:
 
     def write_state_indices(self, request_ids: List[int]) -> List[int]:
         """Resolve ``request_ids`` to pool rows and publish them into the stable
-        ``state_indices`` CUDA buffer -- the eager, pre-capture slot write.
+        ``state_indices`` CUDA buffer, in packed batch order (contexts first).
 
-        Returns the resolved slots in packed batch order (contexts first). A
-        captured decode graph aliases ``state_indices``, so this must run every
+        A captured decode graph aliases ``state_indices``, so this must run every
         forward from eager input-prep, not inside ``model.forward``.
         """
         slots = self.slots_for(request_ids)
@@ -269,10 +235,8 @@ class InklingConvRuntime:
     """Per-forward short-conv plumbing for the pool path (all layers share it).
 
     Splits the packed ``[context tokens | one-token generation]`` batch at the
-    context boundary so each of the four short-convs seeds the pool for context
-    requests (varlen ``causal_conv1d_fn``) and updates it in place for generation
-    requests (``causal_conv1d_update``), exactly like the paged attention split
-    in :meth:`InklingAttention._attention`.
+    context boundary so each short-conv seeds the pool for context requests and
+    updates it in place for generation requests, like the paged attention split.
     """
 
     num_ctx_tokens: int
@@ -285,10 +249,8 @@ class InklingConvRuntime:
     def build(cls, attn_metadata, cache: InklingConvStateCache) -> "InklingConvRuntime":
         """Publish this batch's pool rows, then build the context/generation split.
 
-        The split mirrors the attention split: context requests first (each with
-        its full new-token span), then one-token generation requests. Called from
-        ``InklingAttentionMetadata.prepare()``, so the host->device slot write
-        lands outside the captured ``model.forward``.
+        Called from ``InklingAttentionMetadata.prepare()`` so the host->device
+        slot write lands outside the captured ``model.forward``.
         """
         slots = cache.write_state_indices(list(attn_metadata.request_ids))
         seq_lens = attn_metadata.seq_lens.tolist()
@@ -308,13 +270,10 @@ class InklingConvRuntime:
             )
             query_start_loc = cu
             # Fresh prefill carries no prior conv window -- correct only because
-            # KV block reuse and chunked prefill are refused up front by
-            # ``reject_unsupported_inkling_kv_cache_features``.
-            #
-            # Do NOT "fix" this line alone. Deriving has_initial_state from
-            # num_cached_tokens_per_seq is necessary but NOT sufficient:
-            # ``_run_context`` attends only to its own call's tokens, so a
-            # request with cached history would still lose it, silently.
+            # KV block reuse and chunked prefill are refused by
+            # reject_unsupported_inkling_kv_cache_features. Deriving this from
+            # num_cached_tokens_per_seq is not enough on its own: _run_context
+            # attends only to its own call's tokens.
             has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
         return cls(
             num_ctx_tokens=num_ctx_tokens,
@@ -334,11 +293,8 @@ def apply_short_conv(
     """Run one short-conv over a (possibly mixed) batch through the state pool.
 
     ``rt is None`` -> stateless full-sequence causal conv (no pool registered).
-    Otherwise the context slice seeds ``pool_buf`` (varlen prefill) and the
-    generation slice updates it in place at ``rt.gen_indices`` (decode), then the
-    two outputs are concatenated in packed order. ``pool_buf`` is this conv's
-    ``[max_batch, channels, kernel-1]`` state buffer from
-    :class:`InklingConvStateCache`.
+    Otherwise the context slice seeds ``pool_buf`` and the generation slice
+    updates it in place, then the two outputs are concatenated in packed order.
     """
     if rt is None:
         return sconv(x)

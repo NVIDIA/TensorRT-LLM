@@ -23,8 +23,7 @@ from tensorrt_llm.logger import logger
 
 from ...trtllm import TrtllmAttentionMetadata
 
-#: Per-process latch: the crosscheck is silent on success, so without this line
-#: "it passed" and "it never ran" look identical. The harness requires it.
+# Per-process latch: the crosscheck is silent on success, so announce it once.
 _INK_XCHK_ANNOUNCED = False
 
 
@@ -32,46 +31,31 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
     """Per-step decode metadata for the Inkling Triton kernels.
 
     The decode kernel needs each generation request's total KV length and page
-    table through fixed-pointer GPU buffers. Neither is this class's to own: it
-    slices the base's ``kv_lens_cuda`` and ``kv_cache_block_offsets``, which
-    ``TrtllmAttentionMetadata.prepare`` already fills and keeps graph-stable.
-
-    The latter is laid out for the C++ attention op, but pool-major is what we
-    want (one table per KV geometry, for free), plane 0 serves both K and V, and
-    absent blocks are already 0. The one real difference is that entries count
-    pages while the kernel's views count blocks -- hence :attr:`ink_page_div`,
-    once per KV tile. Borrowing also removes an assumption: the hand-built table
-    packed valid ids to the front, which matches the kernel's
-    ``k_pos // page_size`` addressing only while no request has an interior hole.
-
-    No per-step publication counter: ``num_generations`` already is
-    ``len(request_ids) - num_contexts``, padding rows included, so the backend
-    guards on the metadata *type* instead.
+    table through fixed-pointer GPU buffers. Both are sliced off the base's
+    ``kv_lens_cuda`` and ``kv_cache_block_offsets``, which
+    ``TrtllmAttentionMetadata.prepare`` already fills and keeps graph-stable. The
+    latter is laid out for the C++ attention op: plane 0 serves both K and V, but
+    its entries count pages while the kernel's views count blocks, hence
+    :attr:`ink_page_div`.
     """
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        # Short-conv pool and this forward's context/generation split: per-step
-        # host work that must land in stable buffers before graph capture.
+        # Short-conv pool and this forward's context/generation split.
         self.ink_conv_cache = None
         self.ink_conv_rt = None
 
     def _ink_layers(self) -> List[int]:
-        """Global decoder-layer indices this rank owns (``pp_layers`` is already
-        the local slice; the cache is addressed by global index)."""
+        """Global decoder-layer indices this rank owns."""
         return list(getattr(self.kv_cache_manager, "pp_layers", []))
 
     def _ink_pt_row(self, layer: int) -> int:
         """Row of ``kv_cache_block_offsets`` holding ``layer``'s page table.
 
-        That tensor's leading axis is per *pool* by default, but per attention-op
-        *layer* under ``enable_swa_scratch_reuse`` (scratch pages are per layer);
-        reading one as the other returns another layer's pages.
-
-        The scale check is not decoration: the C++ copy encodes with the
-        pool-level ``index_scales[pool_id]`` while ``get_layer_page_index_scale``
-        allows layers in one pool to differ. They agree for Inkling, but a
-        mismatch would be a wrong address rather than a crash.
+        The tensor's leading axis is per pool by default but per attention-op
+        layer under ``enable_swa_scratch_reuse``; reading one as the other returns
+        another layer's pages. The scale check guards the same confusion: the C++
+        copy encodes with the pool-level scale, which need not equal the layer's.
         """
         mgr = self.kv_cache_manager
         offset = mgr.layer_offsets[layer]
@@ -95,9 +79,7 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
     def ink_gen_page_table(self, layer: int) -> torch.Tensor:
         """Generation-row page table for ``layer``: a view into the base
         ``kv_cache_block_offsets`` K plane, entries scaled by
-        :attr:`ink_page_div`. A captured graph reads a fixed offset here because
-        :meth:`_prepare_inkling_decode` refuses a graph batch with contexts.
-        """
+        :attr:`ink_page_div`."""
         row = self._ink_pt_row(layer)
         start = self.num_contexts
         return self.kv_cache_block_offsets[row, start : start + self.num_generations, 0]
@@ -110,12 +92,8 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
 
     def ink_gen_seq_lens(self, num_gen: int) -> torch.Tensor:
         """Total-KV length per generation request, sliced off the base's
-        ``kv_lens_cuda`` -- ``num_cached + 1``, since a generation row has
-        ``seq_lens_kv == 1``.
-
-        Deliberately *not* ``kv_lens``: the host-side twin adds
-        ``num_extra_kv_tokens``, which this kernel must not see.
-        """
+        ``kv_lens_cuda``. Deliberately not ``kv_lens``: the host-side twin adds
+        ``num_extra_kv_tokens``, which this kernel must not see."""
         start = self.num_contexts
         return self.kv_lens_cuda[start : start + num_gen]
 
@@ -127,12 +105,8 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
     def _prepare_inkling_conv(self) -> None:
         """Publish the short-conv pool rows for this batch.
 
-        Runs here, not in PyTorchModelEngine: prepare() is the pre-forward hook
-        on every input-prep path, so the host->device slot write stays outside
-        the captured region.
-
-        Tests for the pool, not the concrete manager class -- the manager owns
-        the pool's lifetime but nothing about a per-forward batch split.
+        Runs here rather than in the model engine so the host->device slot write
+        stays outside the CUDA-graph capture region.
         """
         from .conv_state import InklingConvRuntime
 
@@ -145,9 +119,8 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
 
     def _prepare_inkling_decode(self) -> None:
         # Publishes nothing -- the accessors read buffers the base refreshes each
-        # step. This only validates the borrowed layout. The early returns mean "no decode work in this batch"; none is
-        # reachable from the backend, which needs a manager, generation rows and
-        # owned layers to get there at all.
+        # step. This only validates the borrowed layout; the early returns mean
+        # "no decode work in this batch".
         mgr = self.kv_cache_manager
         if mgr is None or self.request_ids is None or self.kv_cache_params is None:
             return
@@ -192,21 +165,17 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                 f"exceeds kv_cache_block_offsets' {offsets.shape[1]} sequence "
                 "rows (max_num_sequences)."
             )
-        # Premise of slicing by num_generations instead of a private counter:
-        # model_engine assigns it from the same scheduled batch as request_ids.
+        # The accessors slice by num_generations; it must agree with request_ids.
         assert self.num_generations == num_gen, (self.num_generations, num_gen)
         if os.environ.get("TLLM_INKLING_PT_CROSSCHECK") == "1":
             self._ink_crosscheck_page_table(layers)
 
     def _ink_crosscheck_page_table(self, layers: List[int]) -> None:
-        """Assert the borrowed table equals the one this class used to build.
+        """Assert the borrowed table matches ``get_batch_cache_indices``.
 
-        Gated on ``TLLM_INKLING_PT_CROSSCHECK=1`` because it drags the deleted
-        host path back per step. Run once on a real workload to settle what
-        static reading cannot: that plane 0 holds ``index_scale *
-        base_page_index`` (inferred from the C++ copy's argument split, not
-        traced), and that ``get_batch_cache_indices`` leaves no interior hole --
-        out-of-window SWA blocks being the way that could stop being true.
+        Gated on ``TLLM_INKLING_PT_CROSSCHECK=1`` because it rebuilds the host
+        page table every step; run it once on a real workload after touching the
+        borrowed layout.
         """
         global _INK_XCHK_ANNOUNCED
         mgr = self.kv_cache_manager
@@ -231,13 +200,10 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                         f"{gen_ids[i]}: borrowed//{div}={got} vs "
                         f"get_batch_cache_indices={want}"
                     )
-                # Reported, not asserted: whether the host mirror is re-zeroed
-                # when a slot is reused by a shorter request is not established,
-                # and the kernel provably never reads past seq_len. Asserting
-                # would put a false-alarm path on this gate.
+                # Reported, not asserted: the kernel masks every access by
+                # seq_len, so stale padding past the last block is harmless.
                 tail = borrowed[i][len(want) :]
                 if any(p != 0 for p in tail):
-                    # Must not contain the harness's failure-grep strings.
                     logger.warning(
                         f"Inkling page-table crosscheck: layer {layer} request "
                         f"{gen_ids[i]} carries stale values {tail[:8]} past its "
@@ -248,8 +214,6 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                 checked += 1
         if not _INK_XCHK_ANNOUNCED:
             _INK_XCHK_ANNOUNCED = True
-            # f-string, not %-args: tensorrt_llm.logger concatenates rather than
-            # %-formatting, so the lazy form prints a literal "%d".
             logger.info(
                 f"INKLING_PT_CROSSCHECK ACTIVE: {checked} layer/request pairs "
                 f"agreed (borrowed kv_cache_block_offsets // {div} == "

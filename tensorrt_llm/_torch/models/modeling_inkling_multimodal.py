@@ -14,26 +14,17 @@
 # limitations under the License.
 """Inkling multimodal towers and the shared multimodal input processor.
 
-The module is organised in four sections:
+Four sections:
 
-* **Vision tower** -- :class:`InklingImagePreprocessor` turns raw images into the
-  ``vision_patches_bthwc`` tensor (long-edge rescale, an asymmetric
-  ``W // patch + 1`` patch grid, CLIP-style mean/std normalization with a
-  ``-1/255`` pad value, temporal duplication ``T=2``), and
-  :class:`InklingVisionModel` is the hierarchical-MLP (hMLP) encoder that maps
-  those patches to one text-hidden row per patch.
-* **Audio tower** -- :class:`InklingAudioPreprocessor` turns raw waveforms into
-  discrete "dMel" bins (log-mel spectrogram on the Slaney mel scale, quantized
-  per bin), and :class:`InklingAudioModel` embeds them through a shared codebook
-  to one text-hidden row per dMel frame.
-* **Video tower** -- Inkling has no separate video encoder: a clip is decoded to
-  frames, :func:`sample_video_frames` selects a subset, and each sampled frame is
-  fed as an ordinary image through the vision tower.
-* **Input processor** -- :class:`InklingInputProcessor` registers the placeholder
-  paths with TRT-LLM's input-processor registry. It expands one ``<image>``
-  placeholder token into one token per vision patch and one ``<audio>``
-  placeholder into one token per dMel frame, preserves text-only passthrough, and
-  fails loudly when the placeholder count and the feature-row count disagree.
+* Vision -- :class:`InklingImagePreprocessor` turns raw images into the
+  ``vision_patches_bthwc`` tensor and :class:`InklingVisionModel` is the
+  hierarchical-MLP encoder that maps those patches to one text-hidden row each.
+* Audio -- :class:`InklingAudioPreprocessor` turns waveforms into discrete "dMel"
+  bins and :class:`InklingAudioModel` embeds them to one row per frame.
+* Video -- there is no separate video encoder: sampled frames are fed as ordinary
+  images through the vision tower.
+* Input processor -- :class:`InklingInputProcessor` expands each placeholder token
+  into one token per feature row, and fails loudly when the counts disagree.
 
 The preprocessing is pure vectorized numpy + torch, so the production path
 carries no third-party kernel-cache dependency.
@@ -347,16 +338,10 @@ def _prime_factors(n: int) -> List[int]:
 def _assign_monotone(cost: np.ndarray) -> List[int]:
     """Minimum-cost assignment of every row to a distinct, increasing column.
 
-    ``cost[i][j] = |a_i - b_j|`` with both ``a`` (the ideal log-spaced sizes) and
-    ``b`` (the candidate scales' size reductions) strictly increasing, so the
-    matrix is Monge and an optimal assignment is guaranteed to be non-crossing.
-    That makes this O(rows*cols) DP exact, and lets the tower avoid a runtime
-    ``scipy`` dependency that the package does not declare.
-
-    Non-crossing also matters on its own: the caller consumes the result as an
-    ordered scale progression, so a crossing assignment of equal total cost --
-    which a general solver may return -- would hand back a non-monotonic
-    progression and a fold that does not divide.
+    Both axes are strictly increasing, so the cost matrix is Monge and the optimal
+    assignment is non-crossing -- which makes this O(rows*cols) DP exact and keeps
+    the tower off a runtime ``scipy`` dependency. Non-crossing matters on its own
+    too: the caller consumes the result as an ordered scale progression.
     """
     n_rows, n_cols = cost.shape
     inf = float("inf")
@@ -390,16 +375,9 @@ def plan_out_scales(
     """Plan the ``(time, height, width, channels)`` scale at each hMLP layer.
 
     Builds the candidate scale progression (spatial folds first, then temporal,
-    channels rounded up to a multiple of 64), then assigns ``n_layers + 1``
-    scales to the ideal log-spaced size reductions -- ``argmin`` when
-    ``n_layers >= len(scales)`` else a minimum-cost assignment
-    (:func:`_assign_monotone`) -- pinning the first scale to the raw patch and
-    the last to the full patch.
-
-    For the checkpoint geometry (``T=2``, ``P=40``, ``n_layers=4``, ``C=3``) this
-    resolves to ``[(1,1,1,3), (1,5,5,128), (1,10,10,320), (1,40,40,4800),
-    (2,40,40,9600)]``, giving four Linear layers 75->128, 512->320, 5120->4800,
-    9600->6144 plus ``norm_0..2`` and ``final_norm``.
+    channels rounded up to a multiple of 64), then assigns ``n_layers + 1`` scales
+    to the ideal log-spaced size reductions, pinning the first scale to the raw
+    patch and the last to the full patch.
     """
     if patch_size <= 1:
         raise ValueError("patch_size must be greater than 1")
@@ -473,15 +451,10 @@ class InklingVisionModel(nn.Module):
     """Inkling hMLP vision tower: ``vision_patches_bthwc`` -> one text-hidden row
     per patch.
 
-    The encoder repeatedly folds a temporal/spatial neighborhood of the input
-    into the channel depth, projects with a bias-free Linear, and (for all but
-    the last layer) applies RMSNorm + exact GELU. The last layer projects to the
-    text hidden width (``decoder_dmodel``); a final RMSNorm then yields exactly
-    one text-hidden row per input patch.
-
-    The module tree mirrors the checkpoint ``model.visual.*`` layout exactly:
-    ``layers.linear_{i}`` (bias-free Linear), ``layers.norm_{i}`` (RMSNorm, all
-    but the last layer), and ``final_norm`` (present when ``use_vision_norm``).
+    The encoder repeatedly folds a temporal/spatial neighborhood into the channel
+    depth, projects with a bias-free Linear, and (for all but the last layer)
+    applies RMSNorm + exact GELU. The module tree mirrors the checkpoint
+    ``model.visual.*`` layout exactly.
     """
 
     def __init__(self, vision_config: Any) -> None:
@@ -609,15 +582,11 @@ class InklingAudioPreprocessor:
     """Raw audio -> Inkling dMel bin tensor for the audio tower.
 
     Raw waveform -> log-mel spectrogram (Slaney mel scale, area-normalized) ->
-    per-bin nearest-center quantization into ``num_dmel_bins`` discrete levels
-    ("dMel"). One STFT frame == one audio token
-    (``hop_length == audio_token_duration_s * sample_rate``), matching the tower,
-    which emits one text-hidden row per dMel frame.
+    per-bin nearest-center quantization into ``num_dmel_bins`` discrete levels.
+    One STFT frame is one audio token, matching the tower's one row per frame.
 
-    ``encode_one`` accepts an already-decoded mono waveform (``torch.Tensor`` /
-    ``np.ndarray``) OR raw file bytes / a local path; ``soundfile`` and
-    ``torchaudio`` are imported lazily and only when decoding raw file bytes, so
-    passing a decoded waveform needs neither dependency.
+    ``encode_one`` accepts a decoded mono waveform or raw file bytes / a path;
+    ``soundfile`` and ``torchaudio`` are imported lazily, only when decoding.
     """
 
     def __init__(
@@ -797,15 +766,10 @@ def _require_ac(audio_config: Any, name: str) -> Any:
 class InklingAudioModel(nn.Module):
     """Inkling dMel audio tower: dMel bins -> one text-hidden row per frame.
 
-    ``audio_mode='dmel'``: each of the ``n_mel_bins`` per-frame bin indices
-    selects a row from a shared ``nn.Embedding(n_mel_bins * mel_vocab_size,
-    decoder_dmodel)`` codebook (bin ``m`` occupies rows ``[m*mel_vocab_size,
-    (m+1)*mel_vocab_size)``); the per-bin embeddings are summed per frame, then
-    an optional ``final_norm`` (RMSNorm, ``use_audio_norm``) yields one
-    ``decoder_dmodel`` row per frame.
-
-    The module tree mirrors the checkpoint ``model.audio.*`` layout exactly:
-    ``encoder`` (the codebook embedding) and ``final_norm``.
+    Each of the ``n_mel_bins`` per-frame bin indices selects a row from a shared
+    codebook (bin ``m`` occupies rows ``[m*mel_vocab_size, (m+1)*mel_vocab_size)``)
+    and the per-bin embeddings are summed per frame. The module tree mirrors the
+    checkpoint ``model.audio.*`` layout exactly.
     """
 
     def __init__(self, audio_config: Any) -> None:
@@ -860,20 +824,15 @@ class InklingAudioModel(nn.Module):
 # Video tower: frame sampling onto the image path
 # ===========================================================================
 # Inkling has no separate video tower: a video is decoded to frames and each
-# sampled frame is fed as an ordinary image through the same hMLP vision tower.
-# The only video-specific logic is choosing which frames to keep; preprocessing,
-# tower forward and fusion all reuse the image path.
+# sampled frame is fed as an ordinary image through the same hMLP vision tower,
+# so the only video-specific logic is choosing which frames to keep.
 
 
 class DecodedVideo:
     """A minimal decoded-video view over an ordered list of frame images.
 
-    Wraps already-decoded frames (PIL images, numpy arrays, or raw image bytes --
-    whatever :class:`InklingImagePreprocessor` accepts) plus the clip's average
-    FPS so :func:`sample_video_frames` can select a subset. This deliberately does
-    NOT own codec/decoding: real serving decodes the container upstream, and
-    taking the decoded frames directly keeps this free of a third-party
-    video-decoder dependency.
+    Wraps already-decoded frames plus the clip's average FPS. Decoding itself is
+    deliberately upstream, which keeps this free of a video-decoder dependency.
     """
 
     def __init__(self, frames: Sequence[Any], avg_fps: float) -> None:
@@ -911,14 +870,8 @@ def sample_video_frames(video: Any, *, desired_fps: int, max_frames: int) -> Lis
 
 
 def sample_video_as_images(video: DecodedVideo, *, desired_fps: int, max_frames: int) -> List[Any]:
-    """Video -> the sampled frames as an ordered list of images.
-
-    Selects frame indices with :func:`sample_video_frames` and returns those
-    frames in temporal order. The caller renders one ``<image>`` content part per
-    returned frame; :meth:`InklingInputProcessor.assemble` then expands each
-    ``<image>`` placeholder into that frame's own patch span and the shared hMLP
-    tower + fusion handle the rest -- no separate video tower.
-    """
+    """Video -> the sampled frames as an ordered list of images, in temporal
+    order. The caller renders one ``<image>`` content part per returned frame."""
     idxs = sample_video_frames(video, desired_fps=desired_fps, max_frames=max_frames)
     return [video.frames[i] for i in idxs]
 
@@ -929,26 +882,16 @@ def sample_video_as_images(video: DecodedVideo, *, desired_fps: int, max_frames:
 class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     """Inkling multimodal input processor.
 
-    Registered on ``InklingForConditionalGeneration`` via
-    ``@register_input_processor`` with placeholders
-    ``{"image": "<image>", "audio": "<audio>"}``.
+    Registered on ``InklingForConditionalGeneration`` with placeholders
+    ``{"image": "<image>", "audio": "<audio>"}``. Inherits
+    :class:`BaseMultimodalDummyInputsBuilder` as well, the two-base pattern the
+    in-tree VLM processors use, because ``trtllm-serve`` and the KV-cache encoder
+    profiler call hooks that live on the builder.
 
-    Inherits :class:`BaseMultimodalDummyInputsBuilder` alongside
-    :class:`BaseMultimodalInputProcessor`, the two-base pattern the in-tree VLM
-    processors use: ``trtllm-serve`` and the KV-cache encoder profiler call
-    hooks that live on the builder, so a processor inheriting only the base
-    crashes at startup. The builder's empty defaults are correct here.
-
-    Contract:
-
-      * text-only requests pass straight through (tokenize -> ids, no MM data);
-      * each ``<image>`` placeholder token is expanded into ``num_patches``
-        tokens -- one per vision patch, since the hMLP emits one text-hidden row
-        per patch;
-      * each ``<audio>`` placeholder token is expanded into ``num_frames`` tokens
-        -- one per dMel frame;
-      * a placeholder/media count mismatch, or an expanded-token vs feature-row
-        count mismatch, FAILS LOUDLY (never drops or pads media silently).
+    Text-only requests pass straight through; each ``<image>`` placeholder is
+    expanded into one token per vision patch and each ``<audio>`` placeholder into
+    one token per dMel frame. Any count mismatch fails loudly rather than dropping
+    or padding media.
     """
 
     # Accept a pre-tokenized ``prompt_token_ids`` stream carrying one placeholder
@@ -1049,12 +992,9 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     ) -> Tuple[List[int], Dict[str, Any]]:
         """Expand ``<image>`` / ``<audio>`` placeholders and attach media features.
 
-        Returns ``(expanded_ids, multimodal_data)`` where ``multimodal_data`` is
-        ``{}`` for a text-only request, or carries an ``"image"`` and/or
-        ``"audio"`` entry. Each image placeholder expands to one token per vision
-        patch and each audio placeholder to one token per dMel frame. Raises
-        ``ValueError`` on any placeholder/media/feature-row count mismatch (media
-        is never dropped or padded silently).
+        Returns ``(expanded_ids, multimodal_data)``, the latter ``{}`` for a
+        text-only request. Raises ``ValueError`` on any placeholder / media /
+        feature-row count mismatch.
         """
         input_ids = list(input_ids)
         image_data = list(image_data) if image_data else []
@@ -1152,11 +1092,8 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     def call_with_text_prompt(self, inputs, sampling_params):
         """Turn a text prompt (optionally with media) into ``(ids, extra)``.
 
-        Text-only requests are delegated verbatim to the stock
-        ``DefaultInputProcessor``, so registering this processor does not change
-        the text path. Media requests tokenize the prompt the same way -- the
-        stream must already carry one placeholder per media item -- then delegate
-        to :meth:`assemble`, which fails loudly if it does not.
+        Text-only requests are delegated verbatim to ``DefaultInputProcessor``, so
+        registering this processor does not change the text path.
         """
         mm_data = inputs.get("multi_modal_data") or {}
         images = self._as_list(mm_data, "image")
@@ -1174,16 +1111,10 @@ class InklingInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     def call_with_token_ids(self, inputs, sampling_params):
         """Pre-tokenized multimodal entry (``supports_token_id_mm_expansion``).
 
-        The LLM API dispatches here (``registry.InputProcessor.__call__``) when a
-        request carries ``prompt_token_ids`` + ``multi_modal_data`` and no
-        ``prompt`` string. ``prompt_token_ids`` must already contain exactly one
-        placeholder per media item; :meth:`assemble` expands each and attaches
-        the preprocessed features (fail-loud on any count mismatch).
-
-        Overrides the base ``call_with_token_ids`` (which drives an HF processor
-        over a synthetic dummy prompt): Inkling ships no HF AutoProcessor, and
-        the placeholder is already in the stream, so the base dummy-prompt
-        machinery is neither needed nor applicable.
+        ``prompt_token_ids`` must already contain exactly one placeholder per
+        media item. The base implementation drives an HF processor over a
+        synthetic dummy prompt, which does not apply: Inkling ships no HF
+        AutoProcessor and the placeholder is already in the stream.
         """
         ids = list(inputs.get("prompt_token_ids") or [])
         mm_data = inputs.get("multi_modal_data") or {}
