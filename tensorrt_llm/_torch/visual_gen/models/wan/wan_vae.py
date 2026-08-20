@@ -451,6 +451,15 @@ def _supports_nvfp4_conv3d(module: nn.Module) -> bool:
     )
 
 
+def _supports_nvfp4_device(device: torch.device) -> bool:
+    """Return whether ``device`` belongs to the validated SM100 family."""
+    return (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device)[0] == 10
+    )
+
+
 @lru_cache(maxsize=1)
 def _fp4_imports() -> tuple[Any, ...]:
     import cuda.bindings.driver as cudadrv
@@ -585,8 +594,8 @@ def _fp4_conv_run(
     """
     if not x.is_cuda:
         raise ValueError("FP4 Conv3d requires a CUDA input")
-    if torch.cuda.get_device_capability(x.device)[0] < 10:
-        raise ValueError("FP4 Conv3d requires a Blackwell-class GPU")
+    if not _supports_nvfp4_device(x.device):
+        raise ValueError("FP4 Conv3d requires an SM100-family GPU")
     if x.dtype is not torch.bfloat16:
         raise ValueError(f"FP4 Conv3d requires a bfloat16 input, got {x.dtype}")
     if gs_static is not None and (
@@ -783,7 +792,11 @@ class NVFP4WanCausalConv3d(WanCausalConv3d):
             )
 
         super().__init__(base.in_channels, base.out_channels, 3, stride=1, padding=1)
-        self.load_state_dict(base.state_dict())
+        # The base module is replaced immediately after construction. Reuse its
+        # parameters instead of copying GPU weights through a CPU-initialized
+        # temporary Conv3d.
+        self.weight = base.weight
+        self.bias = base.bias
         self._fp4_pq: _FP4PrequantizedWeight | None = None
         self._fp4_static_gs: torch.Tensor | None = None
         self._fp4_bias: torch.Tensor | None = None

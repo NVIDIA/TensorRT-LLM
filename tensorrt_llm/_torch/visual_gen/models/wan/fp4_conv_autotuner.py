@@ -84,18 +84,20 @@ class FP4ConvTunableRunner(TunableRunner):
         self,
         *,
         signature: tuple[object, ...],
+        problem_shape: tuple[int, ...],
         compile_tactic: Callable[[FP4ConvTactic], object],
         launch: Callable[[object], None],
         output: torch.Tensor,
     ) -> None:
         self.signature = signature
+        self.problem_shape = problem_shape
         self.compile_tactic = compile_tactic
         self.launch = launch
         self.output = output
-        self._runner_key = (_tactic_set_key(), *signature)
+        self._runner_key = (_tactic_set_key(), *signature, problem_shape)
         # Runners are rebuilt for each invocation. Share failures for an exact
-        # signature so capture/replay does not re-enumerate a tactic that
-        # compiled successfully but failed during profiling launch.
+        # signature and problem shape so capture/replay does not re-enumerate a
+        # tactic that compiled successfully but failed during profiling launch.
         self._failed_tactics = _failed_tactics.setdefault(self._runner_key, set())
 
     def unique_id(self) -> tuple[object, ...]:
@@ -153,8 +155,14 @@ class FP4ConvTunableRunner(TunableRunner):
                     self._failed_tactics.add(tactic_id)
                     logger.warning_once(
                         "Wan NVFP4 Conv3d could not compile "
-                        f"tactic {tactic_id} for {self.signature}: {error}",
-                        key=("wan_nvfp4_conv3d", "compile_failure", self.signature, tactic_id),
+                        f"tactic {tactic_id} for {self.signature}, {self.problem_shape}: {error}",
+                        key=(
+                            "wan_nvfp4_conv3d",
+                            "compile_failure",
+                            self.signature,
+                            self.problem_shape,
+                            tactic_id,
+                        ),
                     )
             return self.output
 
@@ -196,6 +204,7 @@ def run_tuned_fp4_conv(
 
     runner = FP4ConvTunableRunner(
         signature=signature,
+        problem_shape=problem_shape,
         compile_tactic=compile_tactic,
         launch=launch,
         output=output,

@@ -76,6 +76,7 @@ def test_fp4_conv_tuner_uses_fixed_tactic_as_fallback():
 def test_fp4_conv_tactic_definitions_version_persistent_key(monkeypatch):
     runner = FP4ConvTunableRunner(
         signature=("version-test",),
+        problem_shape=(1, 2, 3),
         compile_tactic=lambda tactic: tactic,
         launch=lambda _compiled: None,
         output=torch.empty(1),
@@ -101,6 +102,7 @@ def test_fp4_conv_tuner_precompiles_candidates_before_launching():
 
     runner = FP4ConvTunableRunner(
         signature=("test",),
+        problem_shape=(1, 2, 3),
         compile_tactic=compile_tactic,
         launch=launched.append,
         output=output,
@@ -128,6 +130,7 @@ def test_fp4_conv_tuner_isolates_candidate_compile_failure():
 
     runner = FP4ConvTunableRunner(
         signature=("compile-failure-test",),
+        problem_shape=(1, 2, 3),
         compile_tactic=compile_tactic,
         launch=lambda _compiled: None,
         output=torch.empty(1),
@@ -151,6 +154,7 @@ def test_fp4_conv_tuner_shares_launch_failures_across_runners():
 
     first = FP4ConvTunableRunner(
         signature=("launch-failure-test",),
+        problem_shape=(1, 2, 3),
         compile_tactic=lambda tactic: tactic,
         launch=launch,
         output=torch.empty(1),
@@ -160,11 +164,21 @@ def test_fp4_conv_tuner_shares_launch_failures_across_runners():
 
     second = FP4ConvTunableRunner(
         signature=("launch-failure-test",),
+        problem_shape=(1, 2, 3),
         compile_tactic=lambda tactic: tactic,
         launch=launch,
         output=torch.empty(1),
     )
     assert failed_id not in second.get_valid_tactics([], None)
+
+    different_shape = FP4ConvTunableRunner(
+        signature=("launch-failure-test",),
+        problem_shape=(4, 5, 6),
+        compile_tactic=lambda tactic: tactic,
+        launch=launch,
+        output=torch.empty(1),
+    )
+    assert failed_id in different_shape.get_valid_tactics([], None)
 
 
 def test_selected_tactic_fast_cache_obeys_tuning_and_capture(monkeypatch):
