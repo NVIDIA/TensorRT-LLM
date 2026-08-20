@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -173,14 +173,14 @@ class StressTestConfig:
 @dataclass(frozen=True)
 class PerformanceParams:
     """Dataclass to store test parameters for aiperf"""
-    input_len_mean: int = 64  # customized for tinyllama and llama-v3-8b-instruct-hf
+    input_len_mean: int = 64  # Customized for TinyLlama.
     input_len_std: int = 16
-    output_len_mean: int = 128  # customized for tinyllama and llama-v3-8b-instruct-hf
+    output_len_mean: int = 128  # Customized for TinyLlama.
     output_len_std: int = 32
     # test_timeout:
     # Maximum time allowed for the entire performance test to complete
     # Ensure indefinite runs specially for different concurrency values
-    test_timeout: int = 3600  # 1 hours for tinyllama and llama-v3-8b-instruct-hf
+    test_timeout: int = 3600  # One hour for TinyLlama.
     concurrency_list: List[int] = field(
         default_factory=lambda: [8, 16, 32, 64, 128, 256])
 
@@ -432,11 +432,6 @@ def is_port_available(port: int,
         # Configuration for TinyLlama model
         # memory_requirement is in MiB (12 GB = 12288 MiB)
         ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-                    tp_size=1,
-                    memory_requirement=12288),
-        # Configuration for Llama-v3 model
-        # memory_requirement is in MiB (12 GB = 12288 MiB)
-        ModelConfig(model_dir="llama-models-v3/llama-v3-8b-instruct-hf",
                     tp_size=1,
                     memory_requirement=12288),
         # Configuration for DeepSeek-V3 model
