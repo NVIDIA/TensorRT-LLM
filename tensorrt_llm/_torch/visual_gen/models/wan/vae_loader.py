@@ -77,6 +77,21 @@ def _is_nvfp4_vae_ckpt(vae_dir: Path) -> bool:
     )
 
 
+def _warn_dequantized_nvfp4_weights(
+    quantized: set[str],
+    selected: set[str],
+    enable_fp4: bool,
+) -> None:
+    """Warn when a BF16 operator cannot restore the checkpoint's original weights."""
+    dequantized_bf16 = quantized - selected if enable_fp4 else quantized
+    if dequantized_bf16:
+        logger.warning(
+            f"{len(dequantized_bf16)} VAE convolution(s) will use BF16 operators with "
+            "weights dequantized from the NVFP4 checkpoint. This changes the operator "
+            "precision but cannot recover the original BF16 weights."
+        )
+
+
 def _load_nvfp4_wan_vae(
     checkpoint_dir: str,
     device: torch.device,
@@ -154,6 +169,7 @@ def _load_nvfp4_wan_vae(
         for name in quantized
         if quant_config is None or not quant_config.is_module_excluded_from_quantization(name)
     }
+    _warn_dequantized_nvfp4_weights(quantized, selected, enable_fp4)
     n = n_static = 0
     if enable_fp4:
         n, n_static = swap_wan_convs_to_fp4(wan_vae, input_scales, only_names=selected)
