@@ -264,13 +264,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _create_kv_slice(
         self,
         req: LlmRequest,
-        resident_block_end: Optional[int] = None,
+        end_block: Optional[int] = None,
     ) -> KVSlice:
         """Create a KV slice from the source's currently resident blocks.
 
         Args:
             req: Request whose KV blocks are being described.
-            resident_block_end: Exclusive logical block boundary to include.
+            end_block: Exclusive logical block boundary to include.
                 Pipelined prefill passes the current chunk end to exclude
                 full-prompt blocks that V1 reserved but has not computed yet.
                 ``None`` includes the complete prompt.
@@ -288,10 +288,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # on MTP and other speculative decoding paths is currently unclear;
         # revisit whether these extra KV slots need to be transferred.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
+        assert end_block < prompt_blocks
         resident_blocks = (
             prompt_blocks
-            if resident_block_end is None
-            else min(max(0, resident_block_end), prompt_blocks)
+            if end_block is None
+            else end_block
         )
 
         is_gen_only = req.is_generation_only_request()
@@ -760,19 +761,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         chunk_start_pos, chunk_end_pos = req.py_last_context_chunk
         tpb = self._kv_cache_manager.tokens_per_block
 
-        # A ctx-side prefix-reuse hit starts the first chunk at
-        # prepopulated_prompt_len, so no chunk covers [0, prepopulated_prompt_len).
-        # Those blocks are resident and valid and the generation server still needs
-        # them, so the first slice extends back to block 0. req.is_first_context_chunk
-        # cannot be used here: it compares context_current_position against
-        # prepopulated_prompt_len, and _update_request_states has already advanced the
-        # cursor by the time _send_kv_async runs. The recorded chunk start is the
-        # pre-advance value.
+        # First chunk starts at pre-populated prompt length
         is_first_chunk = chunk_start_pos == req.prepopulated_prompt_len
         is_last_chunk = req.context_remaining_length == 0
-        # The scheduler is free to cut a chunk anywhere. Both bounds round down, so
-        # consecutive chunks tile block space exactly and the block holding an
-        # unaligned boundary is sent once, by the chunk that computes the rest of it.
+        # The scheduler is free to cut a chunk anywhere. Both bounds round down
         # The last chunk rounds up instead: its tail is computed and nothing follows.
         chunk_start_block = 0 if is_first_chunk else chunk_start_pos // tpb
         chunk_end_block = (
@@ -787,10 +779,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if chunk_end <= chunk_start and not is_last_chunk:
             return None
         chunk_block_count = max(0, chunk_end - chunk_start)
-        # V1 reserves the full prompt up front, while V2 grows its source list
-        # incrementally. Normalize both to the current chunk boundary before
-        # projecting so full-prompt SWA pages are never treated as current pages.
-        base_slice = self._create_kv_slice(req, resident_block_end=chunk_end)
+
+        base_slice = self._create_kv_slice(req, end_block=chunk_end)
         all_block_ids = base_slice.block_ids_per_layer_groups
         chunk_block_ids = [
             project_blocks_to_global_chunk(

@@ -1554,6 +1554,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     @parametrize_with_ids("enable_block_reuse", [True])
     @parametrize_with_ids("use_kv_cache_manager_v2", [True, False])

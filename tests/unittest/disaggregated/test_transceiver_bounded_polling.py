@@ -681,6 +681,7 @@ def test_tx_session_first_send_anchors_deadline_once(monkeypatch) -> None:
         request_id=31,
         params=params,
         sender=sender,
+        prompt_len=8,
         timeout_s=0.25,
         overall_timeout_s=2.0,
     )
