@@ -220,31 +220,13 @@ def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(monkeypatch)
     assert combine_low_precision.call_args.kwargs["stage_recv_metadata"] is True
 
 
-def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeypatch):
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.modules.fused_moe.moe_scheduler.get_calibrator",
-        lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
-    )
-    x = torch.empty(4, 8, dtype=torch.bfloat16)
-    selected_slots = torch.zeros(4, 1, dtype=torch.int32)
-    final_scales = torch.ones(4, 1, dtype=torch.float32)
-    input_scale = torch.tensor(0.75, dtype=torch.float32)
-
-    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
-    comm.supports_post_quant_dispatch = MagicMock(return_value=True)
-    comm.should_fuse_bf16_nvfp4_dispatch = MagicMock(return_value=True)
-    comm.dispatch = MagicMock(return_value=(x, None, selected_slots, final_scales))
-    comm.combine = MagicMock(side_effect=lambda output, **_kwargs: output)
-
-    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
-    backend._weights_created = True
-    backend.fc31_input_scale = input_scale
-    backend._supports_load_balancer = MagicMock(return_value=False)
-    backend.quantize_input = MagicMock(
-        side_effect=AssertionError("standalone NVFP4 quantization must not run")
-    )
-    backend.run_moe = MagicMock(return_value=x)
-
+def _run_deep_ep_dispatch_scheduler(
+    backend: MoE,
+    comm: DeepEPLowLatency,
+    x: torch.Tensor,
+    selected_slots: torch.Tensor,
+    final_scales: torch.Tensor,
+) -> None:
     moe = SimpleNamespace(
         backend=backend,
         comm=comm,
@@ -269,13 +251,46 @@ def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeyp
 
     scheduler._forward_chunk_impl(
         x,
-        torch.empty(4, 1),
+        torch.empty(x.shape[0], 1),
         torch.bfloat16,
-        [4],
+        [x.shape[0]],
         False,
         True,
         True,
     )
+
+
+def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fused_moe.moe_scheduler.get_calibrator",
+        lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
+    )
+    x = torch.empty(4, 8, dtype=torch.bfloat16)
+    selected_slots = torch.zeros(4, 1, dtype=torch.int32)
+    final_scales = torch.ones(4, 1, dtype=torch.float32)
+    input_scale = torch.tensor(0.75, dtype=torch.float32)
+
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm.supports_post_quant_dispatch = MagicMock(return_value=True)
+    comm.should_fuse_bf16_nvfp4_dispatch = MagicMock(return_value=True)
+    comm.dispatch = MagicMock(return_value=(x, None, selected_slots, final_scales))
+    comm.combine = MagicMock(side_effect=lambda output, **_kwargs: output)
+
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_nvfp4=lambda: True))
+    backend.force_dynamic_quantization = False
+    backend.fc31_act_scale = None
+    backend.fc31_input_scale = input_scale
+    backend.hidden_size = x.shape[-1]
+    backend.unpadded_hidden_size = x.shape[-1]
+    backend._supports_load_balancer = MagicMock(return_value=False)
+    backend.quantize_input = MagicMock(
+        side_effect=AssertionError("standalone NVFP4 quantization must not run")
+    )
+    backend.run_moe = MagicMock(return_value=x)
+
+    _run_deep_ep_dispatch_scheduler(backend, comm, x, selected_slots, final_scales)
 
     backend.quantize_input.assert_not_called()
     dispatch_kwargs = comm.dispatch.call_args.kwargs
@@ -283,6 +298,67 @@ def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeyp
     assert dispatch_kwargs["hidden_states_sf"] is None
     assert dispatch_kwargs["fuse_bf16_nvfp4_quantization"] is True
     assert dispatch_kwargs["nvfp4_input_scale"] is input_scale
+
+
+@pytest.mark.parametrize("unsupported_case", ["dynamic", "awq", "padding", "subclass"])
+def test_cutedsl_deep_ep_nvfp4_dispatch_capability_fails_closed(
+    unsupported_case: str,
+) -> None:
+    class UnvalidatedCuteDslBackend(CuteDslFusedMoE):
+        pass
+
+    backend_type = UnvalidatedCuteDslBackend if unsupported_case == "subclass" else CuteDslFusedMoE
+    backend = backend_type.__new__(backend_type)
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_nvfp4=lambda: True))
+    backend.force_dynamic_quantization = unsupported_case == "dynamic"
+    backend.fc31_act_scale = (
+        torch.ones(1, 8, dtype=torch.float32) if unsupported_case == "awq" else None
+    )
+    backend.fc31_input_scale = torch.tensor(0.75, dtype=torch.float32)
+    backend.hidden_size = 16 if unsupported_case == "padding" else 8
+    backend.unpadded_hidden_size = 8
+
+    x = torch.empty(4, 8, dtype=torch.bfloat16)
+    assert backend.get_deep_ep_nvfp4_dispatch_input_scale(x) is None
+
+
+def test_unvalidated_backend_cannot_bypass_quantize_input_for_deep_ep_dispatch(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fused_moe.moe_scheduler.get_calibrator",
+        lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
+    )
+    x = torch.empty(4, 8, dtype=torch.bfloat16)
+    selected_slots = torch.zeros(4, 1, dtype=torch.int32)
+    final_scales = torch.ones(4, 1, dtype=torch.float32)
+    quantized_x = x.view(torch.float4_e2m1fn_x2)
+    quantized_sf = torch.empty(4, 1, dtype=torch.uint8)
+
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm.supports_post_quant_dispatch = MagicMock(return_value=True)
+    comm.should_fuse_bf16_nvfp4_dispatch = MagicMock(return_value=True)
+    comm.dispatch = MagicMock(
+        return_value=(quantized_x, quantized_sf, selected_slots, final_scales)
+    )
+    comm.combine = MagicMock(side_effect=lambda output, **_kwargs: output)
+
+    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    backend.fc31_input_scale = torch.tensor(0.75, dtype=torch.float32)
+    backend._supports_load_balancer = MagicMock(return_value=False)
+    backend.quantize_input = MagicMock(return_value=(quantized_x, quantized_sf))
+    backend.run_moe = MagicMock(return_value=x)
+
+    _run_deep_ep_dispatch_scheduler(backend, comm, x, selected_slots, final_scales)
+
+    backend.quantize_input.assert_called_once_with(x)
+    comm.should_fuse_bf16_nvfp4_dispatch.assert_not_called()
+    dispatch_kwargs = comm.dispatch.call_args.kwargs
+    assert dispatch_kwargs["hidden_states"] is quantized_x
+    assert dispatch_kwargs["hidden_states_sf"] is quantized_sf
+    assert "fuse_bf16_nvfp4_quantization" not in dispatch_kwargs
+    assert "nvfp4_input_scale" not in dispatch_kwargs
 
 
 def test_deep_ep_bf16_nvfp4_fusion_gate_falls_back_for_unsupported_input():
