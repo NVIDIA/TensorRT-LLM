@@ -1591,7 +1591,7 @@ def _register_fake():
     def _(host_pool_pointers: torch.Tensor, host_pool_mapping: torch.Tensor,
           global_indices: torch.Tensor, output: torch.Tensor,
           compact_indices: torch.Tensor, global_dequant_scale: torch.Tensor,
-          layer_idx: int, num_pool_tokens: int) -> None:
+          layer_idx: int, residual_dim: int, num_pool_tokens: int) -> None:
         return None
 
     @torch.library.register_fake("trtllm::nvfp4_mla_context_kv_cache_gather")
@@ -1601,7 +1601,7 @@ def _register_fake():
           output: torch.Tensor, compact_indices: torch.Tensor,
           global_dequant_scale: torch.Tensor, layer_idx: int,
           total_kv_tokens: int, tokens_per_block: int, page_stride: int,
-          layer_id: int, num_pool_tokens: int) -> None:
+          layer_id: int, residual_dim: int, num_pool_tokens: int) -> None:
         return None
 
     @torch.library.register_fake("trtllm::indexer_k_cache_gather_op")

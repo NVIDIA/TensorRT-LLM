@@ -39,17 +39,148 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-template <typename T>
-inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& scaleCache, int32_t batchIdx, int32_t tokenIdx,
-    int32_t inBlockIdx, uint32_t* dst, PackedVec<T>& values, float secondLevelScale)
+__device__ __forceinline__ float decodeMlaE2m1(uint8_t value)
 {
-    uint8_t* scaleOut = nullptr;
-    if ((inBlockIdx & 1) == 0)
+    constexpr float kMagnitude[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
+    float const magnitude = kMagnitude[value & 0x7U];
+    return (value & 0x8U) == 0 ? magnitude : -magnitude;
+}
+
+template <typename T>
+inline __device__ void quantizeAndWriteMlaFp4Residual(PackedVec<T> const& values, float secondLevelScale,
+    uint32_t* mainOut, uint32_t* residualOut, uint8_t* mainScaleOut, uint8_t* residualScaleOut, bool firstHalf)
+{
+    static_assert(sizeof(PackedVec<T>) == sizeof(uint4));
+    static_assert(sizeof(T) * 8 == sizeof(PackedVec<T>));
+
+    uint4 const local = reinterpret_cast<uint4 const&>(values);
+    uint32_t const activeMask = __activemask();
+    uint4 partner;
+    partner.x = __shfl_xor_sync(activeMask, local.x, 1);
+    partner.y = __shfl_xor_sync(activeMask, local.y, 1);
+    partner.z = __shfl_xor_sync(activeMask, local.z, 1);
+    partner.w = __shfl_xor_sync(activeMask, local.w, 1);
+    if (!firstHalf)
     {
-        auto* blockScales = reinterpret_cast<uint8_t*>(scaleCache.getKBlockPtr(batchIdx, tokenIdx));
-        scaleOut = blockScales + inBlockIdx / 2;
+        return;
     }
-    dst[inBlockIdx] = cvt_warp_fp16_to_fp4<T, 16, false>(values, secondLevelScale, scaleOut);
+
+    float input[16];
+    auto const* localValues = reinterpret_cast<T const*>(&local);
+    auto const* partnerValues = reinterpret_cast<T const*>(&partner);
+#pragma unroll
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        input[index] = static_cast<float>(localValues[index]) * secondLevelScale;
+        input[index + 8] = static_cast<float>(partnerValues[index]) * secondLevelScale;
+    }
+
+    float maxValue = 0.F;
+#pragma unroll
+    for (int32_t index = 0; index < 16; ++index)
+    {
+        maxValue = fmaxf(maxValue, fabsf(input[index]));
+    }
+    constexpr float kMinFp4Scale = 0.001953125F;
+    float const mainScale = fmaxf(maxValue * reciprocal_approximate_ftz(6.F), kMinFp4Scale);
+    __nv_fp8_e4m3 const storedMainScale(mainScale);
+    *mainScaleOut = storedMainScale.__x;
+    float const narrowedMainScale = static_cast<float>(storedMainScale);
+    float const mainInvScale = narrowedMainScale == 0.F ? 0.F : reciprocal_approximate_ftz(narrowedMainScale);
+
+    float mainLow[8];
+    float mainHigh[8];
+#pragma unroll
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        mainLow[index] = input[index] * mainInvScale;
+        mainHigh[index] = input[index + 8] * mainInvScale;
+    }
+    uint32_t const packedMainLow = fp32_vec_to_e2m1(mainLow);
+    uint32_t const packedMainHigh = fp32_vec_to_e2m1(mainHigh);
+    mainOut[0] = packedMainLow;
+    mainOut[1] = packedMainHigh;
+
+    float residual[16];
+#pragma unroll
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        residual[index]
+            = input[index] - decodeMlaE2m1(static_cast<uint8_t>(packedMainLow >> (index * 4))) * narrowedMainScale;
+        residual[index + 8]
+            = input[index + 8] - decodeMlaE2m1(static_cast<uint8_t>(packedMainHigh >> (index * 4))) * narrowedMainScale;
+    }
+
+    maxValue = 0.F;
+#pragma unroll
+    for (int32_t index = 0; index < 16; ++index)
+    {
+        maxValue = fmaxf(maxValue, fabsf(residual[index]));
+    }
+    float const residualScale = fmaxf(maxValue * reciprocal_approximate_ftz(6.F), kMinFp4Scale);
+    __nv_fp8_e4m3 const storedResidualScale(residualScale);
+    *residualScaleOut = storedResidualScale.__x;
+    float const narrowedResidualScale = static_cast<float>(storedResidualScale);
+    float const residualInvScale
+        = narrowedResidualScale == 0.F ? 0.F : reciprocal_approximate_ftz(narrowedResidualScale);
+
+    float residualLow[8];
+    float residualHigh[8];
+#pragma unroll
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        residualLow[index] = residual[index] * residualInvScale;
+        residualHigh[index] = residual[index + 8] * residualInvScale;
+    }
+    residualOut[0] = fp32_vec_to_e2m1(residualLow);
+    residualOut[1] = fp32_vec_to_e2m1(residualHigh);
+}
+
+template <typename T, int32_t kMainVecsPerToken, int32_t kResidualVecsPerToken>
+inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& dataCache, KVBlockArray const& scaleCache,
+    int32_t batchIdx, int32_t tokenIdx, int32_t inBlockIdx, uint32_t* dst, PackedVec<T>& values, float secondLevelScale)
+{
+    static_assert(kMainVecsPerToken % 2 == 0);
+    static_assert(kResidualVecsPerToken % 2 == 0);
+    int32_t const dataBytesPerToken = dataCache.mBytesPerBlock / dataCache.mTokensPerBlock;
+    int32_t const scaleBytesPerToken = scaleCache.mBytesPerBlock / scaleCache.mTokensPerBlock;
+    constexpr int32_t kResidualDataBytesPerToken
+        = (kMainVecsPerToken + kResidualVecsPerToken) * static_cast<int32_t>(sizeof(uint32_t));
+    constexpr int32_t kResidualScaleBytesPerToken = (kMainVecsPerToken + kResidualVecsPerToken) / 2;
+    bool const useResidualQuant
+        = dataBytesPerToken == kResidualDataBytesPerToken && scaleBytesPerToken == kResidualScaleBytesPerToken;
+
+    if (!useResidualQuant)
+    {
+        uint8_t* scaleOut = nullptr;
+        if ((inBlockIdx & 1) == 0)
+        {
+            auto* blockScales = reinterpret_cast<uint8_t*>(scaleCache.getKBlockPtr(batchIdx, tokenIdx));
+            scaleOut = blockScales + inBlockIdx / 2;
+        }
+        dst[inBlockIdx] = cvt_warp_fp16_to_fp4<T, 16, false>(values, secondLevelScale, scaleOut);
+        return;
+    }
+
+    int32_t const tokenLocalIdx = inBlockIdx / kMainVecsPerToken;
+    int32_t const vecIdx = inBlockIdx % kMainVecsPerToken;
+    int32_t const dataTokenOffset = tokenLocalIdx * (kMainVecsPerToken + kResidualVecsPerToken);
+    int32_t const scaleTokenOffset = tokenLocalIdx * kResidualScaleBytesPerToken;
+    constexpr int32_t kResidualStartVec = kMainVecsPerToken - kResidualVecsPerToken;
+    auto* blockScales = reinterpret_cast<uint8_t*>(scaleCache.getKBlockPtr(batchIdx, tokenIdx));
+    if (vecIdx < kResidualStartVec)
+    {
+        uint8_t* scaleOut = (vecIdx & 1) == 0 ? blockScales + scaleTokenOffset + vecIdx / 2 : nullptr;
+        dst[dataTokenOffset + vecIdx] = cvt_warp_fp16_to_fp4<T, 16, false>(values, secondLevelScale, scaleOut);
+        return;
+    }
+
+    int32_t const residualVecIdx = vecIdx - kResidualStartVec;
+    int32_t const residualGroup = residualVecIdx / 2;
+    int32_t const groupDataOffset = dataTokenOffset + kResidualStartVec + residualGroup * 4;
+    int32_t const groupScaleOffset = scaleTokenOffset + kResidualStartVec / 2 + residualGroup * 2;
+    quantizeAndWriteMlaFp4Residual(values, secondLevelScale, dst + groupDataOffset, dst + groupDataOffset + 2,
+        blockScales + groupScaleOffset, blockScales + groupScaleOffset + 1, (residualVecIdx & 1) == 0);
 }
 
 // A stateful callback functor that maintains the running sum between consecutive scans.
@@ -599,8 +730,24 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                                 if constexpr (!std::is_same_v<T, float>)
                                 {
                                     auto& packed = reinterpret_cast<PackedVec<T>&>(data);
-                                    quantizeAndWriteMlaFp4(kv_scale_cache, batch_idx, token_kv_idx, inBlockIdx,
-                                        reinterpret_cast<uint32_t*>(kDst), packed, quant_scale_kv_val);
+                                    if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+                                    {
+                                        quantizeAndWriteMlaFp4<T, TOTAL_VEC_PER_HEAD, VECS_PER_HEAD>(kv_cache,
+                                            kv_scale_cache, batch_idx, token_kv_idx, inBlockIdx,
+                                            reinterpret_cast<uint32_t*>(kDst), packed, quant_scale_kv_val);
+                                    }
+                                    else
+                                    {
+                                        uint8_t* scaleOut = nullptr;
+                                        if ((inBlockIdx & 1) == 0)
+                                        {
+                                            auto* blockScales = reinterpret_cast<uint8_t*>(
+                                                kv_scale_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                                            scaleOut = blockScales + inBlockIdx / 2;
+                                        }
+                                        reinterpret_cast<uint32_t*>(kDst)[inBlockIdx]
+                                            = cvt_warp_fp16_to_fp4<T, 16, false>(packed, quant_scale_kv_val, scaleOut);
+                                    }
                                 }
                             }
                             else
@@ -676,8 +823,24 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                                 VecT data
                                     = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
                                 auto& packed = reinterpret_cast<PackedVec<T>&>(data);
-                                quantizeAndWriteMlaFp4(kv_scale_cache, batch_idx, token_kv_idx, inBlockIdx,
-                                    reinterpret_cast<uint32_t*>(kDst), packed, quant_scale_kv_val);
+                                if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+                                {
+                                    quantizeAndWriteMlaFp4<T, TOTAL_VEC_PER_HEAD, VECS_PER_HEAD>(kv_cache,
+                                        kv_scale_cache, batch_idx, token_kv_idx, inBlockIdx,
+                                        reinterpret_cast<uint32_t*>(kDst), packed, quant_scale_kv_val);
+                                }
+                                else
+                                {
+                                    uint8_t* scaleOut = nullptr;
+                                    if ((inBlockIdx & 1) == 0)
+                                    {
+                                        auto* blockScales = reinterpret_cast<uint8_t*>(
+                                            kv_scale_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                                        scaleOut = blockScales + inBlockIdx / 2;
+                                    }
+                                    reinterpret_cast<uint32_t*>(kDst)[inBlockIdx]
+                                        = cvt_warp_fp16_to_fp4<T, 16, false>(packed, quant_scale_kv_val, scaleOut);
+                                }
                             }
                         }
                         else
@@ -1121,8 +1284,9 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, KV
                         if constexpr (!std::is_same_v<T, float>)
                         {
                             auto& packed = reinterpret_cast<PackedVec<T>&>(data);
-                            quantizeAndWriteMlaFp4(kv_scale_cache, batch_idx, token_idx_in_kv_cache, inBlockIdx,
-                                reinterpret_cast<uint32_t*>(kDst), packed, quant_scale_kv_val);
+                            quantizeAndWriteMlaFp4<T, TOTAL_VECS_PER_HEAD, VECS_PER_HEAD>(kv_cache, kv_scale_cache,
+                                batch_idx, token_idx_in_kv_cache, inBlockIdx, reinterpret_cast<uint32_t*>(kDst), packed,
+                                quant_scale_kv_val);
                         }
                     }
                     else if constexpr (std::is_same_v<TCache, T>)
@@ -1183,8 +1347,9 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, KV
                         VecT data
                             = *reinterpret_cast<VecT const*>(&latent_cache_ptr[src_k_global_offset + head_dim_idx]);
                         auto& packed = reinterpret_cast<PackedVec<T>&>(data);
-                        quantizeAndWriteMlaFp4(kv_scale_cache, batch_idx, token_idx_in_kv_cache, inBlockIdx,
-                            reinterpret_cast<uint32_t*>(kDst), packed, quant_scale_kv_val);
+                        quantizeAndWriteMlaFp4<T, TOTAL_VECS_PER_HEAD, VECS_PER_HEAD>(kv_cache, kv_scale_cache,
+                            batch_idx, token_idx_in_kv_cache, inBlockIdx, reinterpret_cast<uint32_t*>(kDst), packed,
+                            quant_scale_kv_val);
                     }
                 }
                 else if constexpr (std::is_same_v<TCache, T>)

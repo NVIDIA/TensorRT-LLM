@@ -38,10 +38,13 @@ constexpr int32_t kGenerationBlocksPerSm = 8;
 constexpr int32_t kAsyncCopyBytes = 16;
 constexpr int32_t kScaleCopyBytes = 4;
 constexpr int32_t kMlaHeadDim = 576;
+constexpr int32_t kMlaResidualDim = 64;
 constexpr int32_t kMlaPackedHeadDim = kMlaHeadDim / 2;
 constexpr int32_t kMlaScalesPerToken = kMlaHeadDim / 16;
-constexpr int32_t kMlaStagingRowBytes
-    = (kMlaPackedHeadDim + kMlaScalesPerToken + kAsyncCopyBytes - 1) / kAsyncCopyBytes * kAsyncCopyBytes;
+constexpr int32_t kMlaResidualPackedHeadDim = (kMlaHeadDim + kMlaResidualDim) / 2;
+constexpr int32_t kMlaResidualScalesPerToken = (kMlaHeadDim + kMlaResidualDim) / 16;
+constexpr int32_t kMlaStagingRowBytes = (kMlaResidualPackedHeadDim + kMlaResidualScalesPerToken + kAsyncCopyBytes - 1)
+    / kAsyncCopyBytes * kAsyncCopyBytes;
 constexpr int32_t kMlaStagingBuffers = 3;
 constexpr size_t kWorkspaceAlignment = 256;
 
@@ -184,24 +187,81 @@ __device__ __forceinline__ uint4 convertUnitScaledE2m1x16ToE4m3(uint2 packed, __
     return make_uint4(low.x, low.y, high.x, high.y);
 }
 
-__device__ __forceinline__ void prefetchMlaRow(
-    uint8_t* stagingRow, uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane)
+__device__ __forceinline__ uint32_t convertResidualE2m1x4ToE4m3(
+    uint16_t mainPacked, uint16_t residualPacked, __nv_fp8_e4m3 mainScale, __nv_fp8_e4m3 residualScale)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    uint2 const mainFp16 = convertE2m1x4ToFp16x4(mainPacked);
+    uint2 const residualFp16 = convertE2m1x4ToFp16x4(residualPacked);
+    __half2 const mainScale2 = __half2half2(static_cast<__half>(mainScale));
+    __half2 const residualScale2 = __half2half2(static_cast<__half>(residualScale));
+    __half2 const low = __hadd2(__hmul2(reinterpret_cast<__half2 const&>(mainFp16.x), mainScale2),
+        __hmul2(reinterpret_cast<__half2 const&>(residualFp16.x), residualScale2));
+    __half2 const high = __hadd2(__hmul2(reinterpret_cast<__half2 const&>(mainFp16.y), mainScale2),
+        __hmul2(reinterpret_cast<__half2 const&>(residualFp16.y), residualScale2));
+    return __nv_fp8x4_e4m3(low, high).__x;
+#else
+    float4 mainValues = convertE2m1x4ToFloat4(mainPacked);
+    float4 residualValues = convertE2m1x4ToFloat4(residualPacked);
+    float const mainScaleFloat = static_cast<float>(mainScale);
+    float const residualScaleFloat = static_cast<float>(residualScale);
+    mainValues.x = mainValues.x * mainScaleFloat + residualValues.x * residualScaleFloat;
+    mainValues.y = mainValues.y * mainScaleFloat + residualValues.y * residualScaleFloat;
+    mainValues.z = mainValues.z * mainScaleFloat + residualValues.z * residualScaleFloat;
+    mainValues.w = mainValues.w * mainScaleFloat + residualValues.w * residualScaleFloat;
+    return convertFloat4ToE4m3(mainValues);
+#endif
+}
+
+__device__ __forceinline__ uint4 convertResidualE2m1x16ToE4m3(
+    uint2 mainPacked, uint2 residualPacked, __nv_fp8_e4m3 mainScale, __nv_fp8_e4m3 residualScale)
+{
+    uint4 output;
+    output.x = convertResidualE2m1x4ToE4m3(
+        static_cast<uint16_t>(mainPacked.x), static_cast<uint16_t>(residualPacked.x), mainScale, residualScale);
+    output.y = convertResidualE2m1x4ToE4m3(static_cast<uint16_t>(mainPacked.x >> 16),
+        static_cast<uint16_t>(residualPacked.x >> 16), mainScale, residualScale);
+    output.z = convertResidualE2m1x4ToE4m3(
+        static_cast<uint16_t>(mainPacked.y), static_cast<uint16_t>(residualPacked.y), mainScale, residualScale);
+    output.w = convertResidualE2m1x4ToE4m3(static_cast<uint16_t>(mainPacked.y >> 16),
+        static_cast<uint16_t>(residualPacked.y >> 16), mainScale, residualScale);
+    return output;
+}
+
+__device__ __forceinline__ void prefetchMlaRow(uint8_t* stagingRow, uint8_t const* dataPool,
+    __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane, bool compactLayout, int32_t residualDim)
 {
     bool const valid = globalIdx >= 0;
-    auto const* packedRow = valid ? dataPool + static_cast<int64_t>(globalIdx) * kMlaPackedHeadDim : dataPool;
-    auto const* scaleRow = valid ? scalePool + static_cast<int64_t>(globalIdx) * kMlaScalesPerToken : scalePool;
+    int32_t const packedHeadDim = kMlaPackedHeadDim + residualDim / 2;
+    int32_t const scalesPerToken = kMlaScalesPerToken + residualDim / 16;
+    if (compactLayout)
+    {
+        int32_t const compactRowBytes
+            = (packedHeadDim + scalesPerToken + kAsyncCopyBytes - 1) / kAsyncCopyBytes * kAsyncCopyBytes;
+        auto const* compactRow = valid ? dataPool + static_cast<int64_t>(globalIdx) * compactRowBytes : dataPool;
+        if (lane < compactRowBytes / kAsyncCopyBytes)
+        {
+            copyAsync16(
+                stagingRow + lane * kAsyncCopyBytes, compactRow + lane * kAsyncCopyBytes, valid ? kAsyncCopyBytes : 0U);
+        }
+        commitAsyncCopies();
+        return;
+    }
+
+    auto const* packedRow = valid ? dataPool + static_cast<int64_t>(globalIdx) * packedHeadDim : dataPool;
+    auto const* scaleRow = valid ? scalePool + static_cast<int64_t>(globalIdx) * scalesPerToken : scalePool;
     uint32_t const dataBytes = valid ? kAsyncCopyBytes : 0U;
     uint32_t const scaleBytes = valid ? kScaleCopyBytes : 0U;
-    constexpr int32_t kDataCopyLanes = kMlaPackedHeadDim / kAsyncCopyBytes;
-    constexpr int32_t kScaleCopyLanes = kMlaScalesPerToken / kScaleCopyBytes;
-    if (lane < kDataCopyLanes)
+    int32_t const dataCopyLanes = packedHeadDim / kAsyncCopyBytes;
+    int32_t const scaleCopyLanes = scalesPerToken / kScaleCopyBytes;
+    if (lane < dataCopyLanes)
     {
         copyAsync16(stagingRow + lane * kAsyncCopyBytes, packedRow + lane * kAsyncCopyBytes, dataBytes);
     }
-    else if (lane < kDataCopyLanes + kScaleCopyLanes)
+    else if (lane < dataCopyLanes + scaleCopyLanes)
     {
-        int32_t const scaleLane = lane - kDataCopyLanes;
-        copyAsync4(stagingRow + kMlaPackedHeadDim + scaleLane * kScaleCopyBytes, scaleRow + scaleLane * kScaleCopyBytes,
+        int32_t const scaleLane = lane - dataCopyLanes;
+        copyAsync4(stagingRow + packedHeadDim + scaleLane * kScaleCopyBytes, scaleRow + scaleLane * kScaleCopyBytes,
             scaleBytes);
     }
     commitAsyncCopies();
@@ -224,10 +284,11 @@ __device__ __forceinline__ int32_t fetchGlobalIndex(
 template <bool kUnitGlobalScale>
 __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPool,
     __nv_fp8_e4m3 const* __restrict__ scalePool, __nv_fp8_e4m3* __restrict__ output, int32_t globalIdx,
-    int32_t outputIdx, int32_t headDim, float dequantScale, int32_t lane)
+    int32_t outputIdx, int32_t headDim, int32_t residualDim, float dequantScale, int32_t lane)
 {
-    int32_t const packedHeadDim = headDim / 2;
-    int32_t const scalesPerToken = headDim / 16;
+    int32_t const packedHeadDim = (headDim + residualDim) / 2;
+    int32_t const scalesPerToken = (headDim + residualDim) / 16;
+    int32_t const residualStartGroup = (headDim - residualDim) / 16;
     auto const* packedRow = dataPool + static_cast<int64_t>(globalIdx) * packedHeadDim;
     auto const* scaleRow = scalePool + static_cast<int64_t>(globalIdx) * scalesPerToken;
     auto* outputRow = output + static_cast<int64_t>(outputIdx) * headDim;
@@ -236,14 +297,30 @@ __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPo
     {
         // E2M1 times E4M3 is exactly representable in FP16, so each lane can
         // convert a complete 16-value scaling group and emit one 16-byte store.
-        for (int32_t groupBase = 0; groupBase < scalesPerToken; groupBase += kWarpSize)
+        int32_t const outputGroups = headDim / 16;
+        for (int32_t groupBase = 0; groupBase < outputGroups; groupBase += kWarpSize)
         {
             int32_t const group = groupBase + lane;
-            if (group < scalesPerToken)
+            if (group < outputGroups)
             {
-                uint2 const packed = *reinterpret_cast<uint2 const*>(packedRow + static_cast<int64_t>(group) * 8);
-                *reinterpret_cast<uint4*>(outputRow + static_cast<int64_t>(group) * 16)
-                    = convertUnitScaledE2m1x16ToE4m3(packed, scaleRow[group]);
+                uint4 values;
+                if (group < residualStartGroup)
+                {
+                    uint2 const packed = *reinterpret_cast<uint2 const*>(packedRow + static_cast<int64_t>(group) * 8);
+                    values = convertUnitScaledE2m1x16ToE4m3(packed, scaleRow[group]);
+                }
+                else
+                {
+                    int32_t const residualGroup = group - residualStartGroup;
+                    auto const* residualData = packedRow + static_cast<int64_t>(residualStartGroup) * 8
+                        + static_cast<int64_t>(residualGroup) * 16;
+                    uint2 const mainPacked = *reinterpret_cast<uint2 const*>(residualData);
+                    uint2 const residualPacked = *reinterpret_cast<uint2 const*>(residualData + 8);
+                    int32_t const scaleIdx = residualStartGroup + residualGroup * 2;
+                    values = convertResidualE2m1x16ToE4m3(
+                        mainPacked, residualPacked, scaleRow[scaleIdx], scaleRow[scaleIdx + 1]);
+                }
+                *reinterpret_cast<uint4*>(outputRow + static_cast<int64_t>(group) * 16) = values;
             }
         }
     }
@@ -252,24 +329,54 @@ __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPo
         // Four neighboring lanes cooperatively convert one scaling group. FP32
         // math preserves the result for arbitrary global dequantization scales.
         int32_t const groupLane = lane % 4;
-        for (int32_t groupBase = 0; groupBase < scalesPerToken; groupBase += kWarpSize / 4)
+        int32_t const outputGroups = headDim / 16;
+        for (int32_t groupBase = 0; groupBase < outputGroups; groupBase += kWarpSize / 4)
         {
             int32_t const group = groupBase + lane / 4;
-            bool const active = group < scalesPerToken;
+            bool const active = group < outputGroups;
             uint32_t const activeMask = __ballot_sync(0xFFFFFFFFU, active);
             if (!active)
             {
                 continue;
             }
-            uint16_t const packed
-                = *reinterpret_cast<uint16_t const*>(packedRow + static_cast<int64_t>(group) * 8 + groupLane * 2);
-            float scale = groupLane == 0 ? static_cast<float>(scaleRow[group]) * dequantScale : 0.F;
-            scale = __shfl_sync(activeMask, scale, lane - groupLane);
-            float4 values = convertE2m1x4ToFloat4(packed);
-            values.x *= scale;
-            values.y *= scale;
-            values.z *= scale;
-            values.w *= scale;
+            uint16_t mainPacked;
+            uint16_t residualPacked = 0;
+            int32_t mainScaleIdx;
+            int32_t residualScaleIdx = -1;
+            if (group < residualStartGroup)
+            {
+                mainPacked
+                    = *reinterpret_cast<uint16_t const*>(packedRow + static_cast<int64_t>(group) * 8 + groupLane * 2);
+                mainScaleIdx = group;
+            }
+            else
+            {
+                int32_t const residualGroup = group - residualStartGroup;
+                auto const* residualData = packedRow + static_cast<int64_t>(residualStartGroup) * 8
+                    + static_cast<int64_t>(residualGroup) * 16;
+                mainPacked = *reinterpret_cast<uint16_t const*>(residualData + groupLane * 2);
+                residualPacked = *reinterpret_cast<uint16_t const*>(residualData + 8 + groupLane * 2);
+                mainScaleIdx = residualStartGroup + residualGroup * 2;
+                residualScaleIdx = mainScaleIdx + 1;
+            }
+            float mainScale = groupLane == 0 ? static_cast<float>(scaleRow[mainScaleIdx]) * dequantScale : 0.F;
+            mainScale = __shfl_sync(activeMask, mainScale, lane - groupLane);
+            float4 values = convertE2m1x4ToFloat4(mainPacked);
+            values.x *= mainScale;
+            values.y *= mainScale;
+            values.z *= mainScale;
+            values.w *= mainScale;
+            if (residualScaleIdx >= 0)
+            {
+                float residualScale
+                    = groupLane == 0 ? static_cast<float>(scaleRow[residualScaleIdx]) * dequantScale : 0.F;
+                residualScale = __shfl_sync(activeMask, residualScale, lane - groupLane);
+                float4 residualValues = convertE2m1x4ToFloat4(residualPacked);
+                values.x += residualValues.x * residualScale;
+                values.y += residualValues.y * residualScale;
+                values.z += residualValues.z * residualScale;
+                values.w += residualValues.w * residualScale;
+            }
             *reinterpret_cast<uint32_t*>(outputRow + static_cast<int64_t>(group) * 16 + groupLane * 4)
                 = convertFloat4ToE4m3(values);
         }
@@ -279,15 +386,18 @@ __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPo
 __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp4MlaKvCacheGatherKernel(
     uint8_t const* __restrict__ dataPool, __nv_fp8_e4m3 const* __restrict__ scalePool,
     int32_t const* __restrict__ globalIndices, __nv_fp8_e4m3* __restrict__ output, int32_t* __restrict__ compactIndices,
-    float const* __restrict__ globalDequantScale, int64_t numPairs, int32_t headDim, int64_t numPoolTokens)
+    float const* __restrict__ globalDequantScale, int64_t numPairs, int32_t headDim, int32_t residualDim,
+    int64_t numPoolTokens)
 {
     int32_t const warp = threadIdx.x / kWarpSize;
     int32_t const lane = threadIdx.x % kWarpSize;
     float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
+    int32_t const packedHeadDim = kMlaPackedHeadDim + residualDim / 2;
+    bool const compactLayout = reinterpret_cast<uint8_t const*>(scalePool) == dataPool + packedHeadDim;
     __shared__ __align__(16) uint8_t staging[kMlaStagingBuffers][kWarpsPerBlock][kMlaStagingRowBytes];
     int64_t pair = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
     int64_t const pairStride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
-    if (dequantScale == 1.F && headDim == kMlaHeadDim)
+    if (headDim == kMlaHeadDim && (residualDim == 0 || residualDim == kMlaResidualDim))
     {
         if (pair >= numPairs)
         {
@@ -296,14 +406,14 @@ __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp
 
         int32_t globalIdx = fetchGlobalIndex(globalIndices, compactIndices, pair, numPoolTokens, lane);
         int32_t stage = 0;
-        prefetchMlaRow(staging[stage][warp], dataPool, scalePool, globalIdx, lane);
+        prefetchMlaRow(staging[stage][warp], dataPool, scalePool, globalIdx, lane, compactLayout, residualDim);
         int64_t nextPair = pair + pairStride;
         bool hasNext = nextPair < numPairs;
         int32_t nextGlobalIdx = -1;
         if (hasNext)
         {
             nextGlobalIdx = fetchGlobalIndex(globalIndices, compactIndices, nextPair, numPoolTokens, lane);
-            prefetchMlaRow(staging[1][warp], dataPool, scalePool, nextGlobalIdx, lane);
+            prefetchMlaRow(staging[1][warp], dataPool, scalePool, nextGlobalIdx, lane, compactLayout, residualDim);
         }
         while (true)
         {
@@ -325,15 +435,24 @@ __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp
                 followingGlobalIdx
                     = fetchGlobalIndex(globalIndices, compactIndices, followingPair, numPoolTokens, lane);
                 int32_t const prefetchStage = stage == 0 ? 2 : stage - 1;
-                prefetchMlaRow(staging[prefetchStage][warp], dataPool, scalePool, followingGlobalIdx, lane);
+                prefetchMlaRow(staging[prefetchStage][warp], dataPool, scalePool, followingGlobalIdx, lane,
+                    compactLayout, residualDim);
             }
 
             if (globalIdx >= 0)
             {
-                auto const* stagedScales
-                    = reinterpret_cast<__nv_fp8_e4m3 const*>(staging[stage][warp] + kMlaPackedHeadDim);
-                dequantizeRow<true>(
-                    staging[stage][warp], stagedScales, output, 0, static_cast<int32_t>(pair), kMlaHeadDim, 1.F, lane);
+                auto const* stagedScales = reinterpret_cast<__nv_fp8_e4m3 const*>(
+                    staging[stage][warp] + kMlaPackedHeadDim + residualDim / 2);
+                if (dequantScale == 1.F)
+                {
+                    dequantizeRow<true>(staging[stage][warp], stagedScales, output, 0, static_cast<int32_t>(pair),
+                        kMlaHeadDim, residualDim, 1.F, lane);
+                }
+                else
+                {
+                    dequantizeRow<false>(staging[stage][warp], stagedScales, output, 0, static_cast<int32_t>(pair),
+                        kMlaHeadDim, residualDim, dequantScale, lane);
+                }
             }
             if (!hasNext)
             {
@@ -363,13 +482,13 @@ __global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp
         {
             if (dequantScale == 1.F)
             {
-                dequantizeRow<true>(
-                    dataPool, scalePool, output, globalIdx, static_cast<int32_t>(pair), headDim, dequantScale, lane);
+                dequantizeRow<true>(dataPool, scalePool, output, globalIdx, static_cast<int32_t>(pair), headDim,
+                    residualDim, dequantScale, lane);
             }
             else
             {
-                dequantizeRow<false>(
-                    dataPool, scalePool, output, globalIdx, static_cast<int32_t>(pair), headDim, dequantScale, lane);
+                dequantizeRow<false>(dataPool, scalePool, output, globalIdx, static_cast<int32_t>(pair), headDim,
+                    residualDim, dequantScale, lane);
             }
         }
     }
@@ -422,7 +541,7 @@ __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ d
     __nv_fp8_e4m3 const* __restrict__ scalePool, int32_t const* __restrict__ selectedFlags,
     int32_t const* __restrict__ selectedOffsets, int32_t const* __restrict__ selectedGlobalIndices,
     __nv_fp8_e4m3* __restrict__ output, float const* __restrict__ globalDequantScale, int32_t totalKvTokens,
-    int32_t headDim, int64_t numPoolTokens)
+    int32_t headDim, int32_t residualDim, int64_t numPoolTokens)
 {
     int32_t const warp = threadIdx.x / kWarpSize;
     int32_t const lane = threadIdx.x % kWarpSize;
@@ -456,11 +575,13 @@ __global__ void nvFp4MlaContextKvCacheGatherKernel(uint8_t const* __restrict__ d
         {
             if (dequantScale == 1.F)
             {
-                dequantizeRow<true>(dataPool, scalePool, output, globalIdx, outputIdx, headDim, dequantScale, lane);
+                dequantizeRow<true>(
+                    dataPool, scalePool, output, globalIdx, outputIdx, headDim, residualDim, dequantScale, lane);
             }
             else
             {
-                dequantizeRow<false>(dataPool, scalePool, output, globalIdx, outputIdx, headDim, dequantScale, lane);
+                dequantizeRow<false>(
+                    dataPool, scalePool, output, globalIdx, outputIdx, headDim, residualDim, dequantScale, lane);
             }
         }
     }
@@ -503,7 +624,7 @@ int32_t getPersistentBlockCount(int64_t workItems, int32_t blocksPerSm = kBlocks
 
 void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t const* globalIndices,
     __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale, int32_t numRows, int32_t topK,
-    int32_t headDim, int64_t numPoolTokens, cudaStream_t stream)
+    int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream)
 {
     if (numRows == 0 || topK == 0)
     {
@@ -511,13 +632,15 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
     }
     TLLM_CHECK_WITH_INFO(headDim > 0 && headDim % 16 == 0,
         "NVFP4 MLA gather requires head_dim to be a positive multiple of 16, got %d", headDim);
+    TLLM_CHECK_WITH_INFO(residualDim >= 0 && residualDim <= headDim && residualDim % 16 == 0,
+        "NVFP4 MLA gather residual_dim must be a multiple of 16 in [0, head_dim], got %d", residualDim);
 
     int64_t const numPairs = static_cast<int64_t>(numRows) * topK;
     TLLM_CHECK_WITH_INFO(
         numPairs <= std::numeric_limits<int32_t>::max(), "NVFP4 MLA gather compact indices exceed int32 capacity");
     int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
     nvFp4MlaKvCacheGatherKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool, globalIndices, output,
-        compactIndices, globalDequantScale, numPairs, headDim, numPoolTokens);
+        compactIndices, globalDequantScale, numPairs, headDim, residualDim, numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -540,7 +663,7 @@ void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 c
     int64_t const* cuKvLengths, __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale,
     void* workspace, size_t workspaceSize, int32_t numQueryRows, int32_t topK, int32_t numRequests,
     int32_t maxBlocksPerRequest, int32_t totalKvTokens, int32_t tokensPerBlock, int32_t pageStride, int32_t layerId,
-    int32_t headDim, int64_t numPoolTokens, cudaStream_t stream)
+    int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream)
 {
     if (numQueryRows == 0 || topK == 0 || totalKvTokens == 0)
     {
@@ -548,6 +671,8 @@ void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 c
     }
     TLLM_CHECK_WITH_INFO(headDim > 0 && headDim % 16 == 0,
         "NVFP4 MLA context gather requires head_dim to be a positive multiple of 16, got %d", headDim);
+    TLLM_CHECK_WITH_INFO(residualDim >= 0 && residualDim <= headDim && residualDim % 16 == 0,
+        "NVFP4 MLA context gather residual_dim must be a multiple of 16 in [0, head_dim], got %d", residualDim);
     TLLM_CHECK_WITH_INFO(tokensPerBlock > 0, "tokens_per_block must be positive");
     TLLM_CHECK_WITH_INFO(numRequests > 0, "num_requests must be positive");
 
@@ -574,7 +699,7 @@ void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 c
     int32_t const gatherBlocks = getPersistentBlockCount(totalKvTokens);
     nvFp4MlaContextKvCacheGatherKernel<<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
         selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, totalKvTokens, headDim,
-        numPoolTokens);
+        residualDim, numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
 
     int64_t const numPairs = static_cast<int64_t>(numQueryRows) * topK;

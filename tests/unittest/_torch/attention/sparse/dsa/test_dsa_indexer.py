@@ -221,7 +221,8 @@ def test_nvfp4_context_topk_uses_device_compaction_path():
     )
     cache_manager = SimpleNamespace(
         dtype=DataType.NVFP4,
-        head_dim=16,
+        head_dim=576,
+        mla_kv_cache_residual_dim=64,
         get_primary_pool_page_index_params=Mock(return_value=(2, 1)),
     )
     metadata = SimpleNamespace(
@@ -285,6 +286,7 @@ def test_nvfp4_context_topk_uses_device_compaction_path():
     assert gather.call_args.args[11] == 64
     assert gather.call_args.args[12] == 128
     assert gather.call_args.args[13] == 1
+    assert gather.call_args.args[14] == 64
     assert metadata.nvfp4_mla_context_fp8_scratch is scratch
     assert forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr == scratch.data_ptr()
 
@@ -440,6 +442,23 @@ def test_transform_local_topk_uses_v2_page_mapping():
 
     torch.testing.assert_close(actual, expected_indices)
     convert.assert_called_once_with(req_idx, block_table, topk_indices, 4, 1, 12, 1)
+
+
+def test_dsa_cache_manager_v2_allocates_rope_residual_storage():
+    cache_manager = object.__new__(DSACacheManagerV2)
+    cache_manager.dtype = DataType.NVFP4
+    cache_manager.kv_factor = 1
+    cache_manager.num_kv_heads_per_layer = [1]
+    cache_manager.head_dim_per_layer = [576]
+    cache_manager.mla_kv_cache_residual_dim = 64
+    cache_manager.indexer_k_cache_local_layer_mask = [False]
+    cache_manager.index_head_dim = 128
+    cache_manager.quant_block_size = 128
+    cache_manager.use_fp4 = False
+
+    assert cache_manager.get_layer_bytes_per_token(0, Role.KEY) == 320
+    assert cache_manager.get_layer_bytes_per_token(0, Role.KEY_BLOCK_SCALE) == 40
+    assert cache_manager.get_layer_bytes_per_token(0, Role.ALL) == 360
 
 
 def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
