@@ -128,6 +128,8 @@ _SEND_HWM = 1 << 16
 #: hardcoded so the pure-Python reactor stays importable without it).
 _KIND_EVENT = 0
 _KIND_XFER = 1
+#: Runtime stats log cadence (one INFO line; only when counters changed).
+_STATS_LOG_S = 30.0
 
 # Failure-reason strings mirror the C++ BounceFailReason::toString set.
 FAIL_PLAN_REJECTED = "bounce: plan rejected (request did not fit a transfer plan)"
@@ -307,6 +309,14 @@ class BounceReactor:
         self._ack_batch: dict[str, dict[int, list[AckEntry]]] = {}
         self._next_lease_sweep = 0.0
 
+        # --- runtime stats (A/B attribution: which mechanisms actually
+        # fired, per role). Increment via _bump(); logged one line per
+        # _STATS_LOG_S when changed, plus a final snapshot at shutdown. ---
+        self._stats_mu = threading.Lock()
+        self._stats: dict[str, int] = {}
+        self._last_stats_snapshot: dict[str, int] = {}
+        self._next_stats_log = time.monotonic() + _STATS_LOG_S
+
         # --- lifecycle / watchdog ---
         self._cmds: deque[tuple] = deque()  # cross-thread commands, drained per tick
         self._cmd_mu = threading.Lock()
@@ -335,6 +345,27 @@ class BounceReactor:
         """Seconds since the reactor last began a tick (the heartbeat is
         written at the top of the loop; equivalent for wedge detection)."""
         return time.monotonic() - self._heartbeat
+
+    def _bump(self, key: str, n: int = 1) -> None:
+        with self._stats_mu:
+            self._stats[key] = self._stats.get(key, 0) + n
+
+    def stats(self) -> dict[str, int]:
+        """Snapshot of the runtime counters (tests / diagnostics)."""
+        with self._stats_mu:
+            return dict(self._stats)
+
+    def _maybe_log_stats(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now < self._next_stats_log:
+            return
+        self._next_stats_log = now + _STATS_LOG_S
+        snap = self.stats()
+        if not snap or snap == self._last_stats_snapshot:
+            return
+        self._last_stats_snapshot = snap
+        line = " ".join(f"{k}={v}" for k, v in sorted(snap.items()))
+        logger.info(f"bounce_v2({self._self_name}): stats {line}")
 
     def add_peer(self, peer: str, endpoint: str) -> bool:
         """Create (idempotently) the DEALER route to ``peer``. Thread-safe."""
@@ -436,6 +467,8 @@ class BounceReactor:
         if plan.num_chunks == 0:
             _resolve(future, BounceResult(True))
             return future
+        self._bump("tx_submits")
+        self._bump("tx_chunks", plan.num_chunks)
 
         chunk_bytes = [c.packed_bytes for c in plan.chunks]
         with self._req_mu:
@@ -469,6 +502,7 @@ class BounceReactor:
             return
         self._stop.set()
         self._thread.join(timeout=5)
+        self._maybe_log_stats(force=True)
         if self._thread.is_alive():
             # Wedged reactor: libzmq sockets are NOT thread-safe, and the
             # stuck thread may still be inside a ROUTER poll/recv. Closing
@@ -507,6 +541,7 @@ class BounceReactor:
                 self._check_sender_timeouts()
                 self._check_receiver_lease()
                 self._flush_acks()
+                self._maybe_log_stats()
                 if not did_work:
                     # The ONE blocking point: <=1 ms on the ROUTER (GIL
                     # released). Completions ride the same cap via the
@@ -699,6 +734,7 @@ class BounceReactor:
             if copy_id == self._pool_busy:
                 grants.extend(self._sched.release_local(local_off))
                 break  # every copy stream busy: retry next tick
+            self._bump("tx_gather_credit" if have_credit else "tx_gather_eager")
             posted = _Posted(
                 chunk_idx=chunk_idx,
                 local_offset=local_off,
@@ -765,7 +801,12 @@ class BounceReactor:
             self._poller,
         )
         if reserved < 0:
+            # Lost the race to the gather's own completion (or C++ refused):
+            # the classic path proceeds; count it so an A/B run can tell how
+            # often the chain actually fired vs fell back.
+            self._bump("tx_chain_arm_race")
             return False
+        self._bump("tx_chain_armed")
         self._completions.pop(posted.copy_id, None)
         posted.xfer_id = int(reserved)
         posted.state = _PostState.WRITING
@@ -787,12 +828,14 @@ class BounceReactor:
         if xfer_id < 0:
             self._fail_request_locked(rid, req, FAIL_WRITE)
             return
+        self._bump("tx_post_classic")
         posted.xfer_id = xfer_id
         posted.state = _PostState.WRITING
         self._completions[xfer_id] = ("xfer", rid)
         req.last_progress = time.monotonic()
 
     def _on_gather_done(self, rid: int, copy_id: int, ok: bool) -> None:
+        self._bump("tx_gather_events")
         with self._req_mu:
             req = self._requests.get(rid)
             if req is None:
@@ -857,7 +900,9 @@ class BounceReactor:
             )
             target.state = _PostState.SENT
             req.last_progress = time.monotonic()
+        self._bump("tx_xfer_events")
         if data_msg is not None:
+            self._bump("tx_data_sent")
             self._send_to(*data_msg)
 
     def _on_ack(self, peer: str, header: BounceMsgHeader, blob: bytes) -> None:
@@ -899,6 +944,7 @@ class BounceReactor:
                 grants.extend(self._sched.release_local(req.posted[target_idx].local_offset))
                 del req.posted[target_idx]
                 req.acked += 1
+                self._bump("tx_acked_chunks")
                 req.last_progress = time.monotonic()
             if req.acked >= req.num_chunks:
                 done_future = req.future
@@ -1063,8 +1109,11 @@ class BounceReactor:
                 f"({len(chunk_sizes)} chunks announced)"
             )
             return
+        self._bump("rx_wants")
         self._rx_flows[key] = len(chunk_sizes)
-        self._send_grants(self._sched.on_want(key, chunk_sizes))
+        grants = self._sched.on_want(key, chunk_sizes)
+        self._bump("rx_credits_at_want", len(grants))
+        self._send_grants(grants)
 
     def _on_data(self, peer: str, header: BounceMsgHeader, blob: bytes) -> None:
         runs = decode_scatter(blob, header)
@@ -1096,6 +1145,7 @@ class BounceReactor:
             self._flow_chunk_done(key)
             self._send_grants(self._sched.on_scatter_done(key, offset))
             return
+        self._bump("rx_data")
         self._scattering[offset] = False
         if job.srcs.shape[0] == 0:
             self._finish_scatter(job, ok=True)  # empty plan: vacuous success
@@ -1240,6 +1290,7 @@ class BounceReactor:
             # failed scatter would otherwise leak the _rx_flows entry).
             self._flow_chunk_done(job.key)
         if ok and not orphaned:
+            self._bump("rx_scatter_ok")
             self._ack_batch.setdefault(job.peer, {}).setdefault(job.rid, []).append(
                 AckEntry(job.chunk_idx, job.offset)
             )
@@ -1264,6 +1315,7 @@ class BounceReactor:
         batch, self._ack_batch = self._ack_batch, {}
         for peer, by_rid in batch.items():
             for rid, entries in by_rid.items():
+                self._bump("rx_ack_entries", len(entries))
                 self._send_to(peer, encode_ack(rid, entries))
 
     def _check_receiver_lease(self) -> None:
@@ -1391,6 +1443,7 @@ class BounceReactor:
     def _send_grants(self, grants: list[Grant]) -> None:
         if not grants:
             return
+        self._bump("rx_credits_sent", len(grants))
         by_flow: dict[str, list[CreditEntry]] = {}
         for g in grants:
             by_flow.setdefault(g.flow, []).append(
@@ -1398,6 +1451,7 @@ class BounceReactor:
                 # the region handle (arena offset) is echoed back in DATA.
                 CreditEntry(g.addr, g.length, self._device_id, g.offset)
             )
+        self._bump("rx_grant_msgs", len(by_flow))
         for flow, credits in by_flow.items():
             peer, rid = self._split_key(flow)
             self._send_to(peer, encode_grant(rid, credits))

@@ -364,6 +364,12 @@ def test_cpp_chain_arms_instead_of_classic_post(harness_factory) -> None:
     result = fut.result(timeout=DEADLINE_S)
     assert result.ok, result.reason
     assert h.agent.posts == []
+    stats = h.reactor.stats()
+    assert stats.get("tx_chain_armed") == N_CHUNKS
+    assert stats.get("tx_post_classic") is None
+    assert stats.get("tx_gather_eager") == N_CHUNKS  # launched before credit
+    assert stats.get("tx_data_sent") == N_CHUNKS
+    assert stats.get("tx_acked_chunks") == N_CHUNKS
 
 
 def test_cpp_chain_arm_race_falls_back_to_classic(harness_factory) -> None:
@@ -391,6 +397,9 @@ def test_cpp_chain_arm_race_falls_back_to_classic(harness_factory) -> None:
     _ack_all_data(h, rid)
     result = fut.result(timeout=DEADLINE_S)
     assert result.ok, result.reason
+    stats = h.reactor.stats()
+    assert stats.get("tx_chain_arm_race") == N_CHUNKS  # every arm refused
+    assert stats.get("tx_post_classic") == N_CHUNKS
 
 
 def test_cpp_chain_disabled_never_arms(harness_factory) -> None:
@@ -410,6 +419,10 @@ def test_cpp_chain_disabled_never_arms(harness_factory) -> None:
         h.poller.push(xid, KIND_XFER, 1)
     _ack_all_data(h, rid)
     assert fut.result(timeout=DEADLINE_S).ok
+    stats = h.reactor.stats()
+    assert stats.get("tx_chain_armed") is None
+    assert stats.get("tx_chain_arm_race") is None  # chain disabled: no arm attempts
+    assert stats.get("tx_post_classic") == N_CHUNKS
 
 
 def test_cpp_chain_legacy_binding_falls_back(harness_factory) -> None:
