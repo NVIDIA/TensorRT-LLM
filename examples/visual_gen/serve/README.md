@@ -152,7 +152,7 @@ Traffic controls are `NUM_PROMPTS`, `REQUEST_RATE`, `BURSTINESS`,
 directory by default and retains:
 
 - `server.log`, including model-only timings such as `Total pipeline time`
-- `benchmark.log`, the client console output
+- `benchmark.log`, the client console output and validated measurement summary
 - `result.json`, validated to have all requests complete and the expected GPU count
 - `metadata.json`, including model, config, mode, worker count, traffic settings,
   and conditioning-media basename (never the media bytes)
@@ -160,8 +160,14 @@ directory by default and retains:
 The result reports average diffusion (`mean_denoise`), generation
 (`mean_generation`), request latency (`mean_latency`), seconds per denoising
 step when the resolved step count is known, and Cosmos3 vision-decode time when
-the server log exposes it. `Total pipeline time` has no exact benchmark-schema
-equivalent and remains only in `server.log`.
+the server log exposes it. The wrapper also parses the individual measured
+`Step i/N` log lines into `mean_denoising_step_time` and
+`percentiles_denoising_step_time` (`p95` and `p99`); `SAVE_DETAILED=true` also
+retains the raw `denoising_step_times` samples. These are per-step tail timings,
+not percentiles across whole requests. The log-derived mean can differ slightly
+from `mean_seconds_per_denoising_step` because step log lines are rounded.
+`Total pipeline time` has no exact benchmark-schema equivalent and remains only
+in `server.log`.
 
 ## Examples
 
