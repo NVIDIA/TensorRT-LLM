@@ -150,7 +150,7 @@ pipeline {
                     sh """
                         apt-get update -qq && \
                         apt-get install -y -qq git python3-pip curl && \
-                        pip3 install --quiet --break-system-packages requests pyyaml
+                        pip3 install --quiet --break-system-packages 'requests>=2.32.2,<3' 'pyyaml>=6.0.1,<7'
                     """
                 }
             }
