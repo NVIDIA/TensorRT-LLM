@@ -27,7 +27,18 @@ import urllib.request
 from collections.abc import Mapping, Set
 from typing import Optional
 
-PILOT_USERS: frozenset[str] = frozenset({"crazydemo", "QiJune"})
+PILOT_USERS: frozenset[str] = frozenset(
+    {
+        "crazydemo",
+        "QiJune",
+        "sunnyqgg",
+        "Barry-Delaney",
+        "xxi-nv",
+        "leslie-fang25",
+        "rosong11",
+        "tongyuantongyu",
+    }
+)
 
 _GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
 _TRIGGER_PHRASE_ENV = "gitlabTriggerPhrase"
