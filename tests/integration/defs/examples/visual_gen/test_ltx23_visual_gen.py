@@ -278,8 +278,11 @@ def test_ltx23_audio_against_golden(ltx23_av_candidate):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx23_example(tmp_path):
-    """The LTX-2 example driver in --model_type ltx23 mode produces an MP4."""
+@pytest.mark.parametrize(
+    "config_name", ["ltx23-t2v-bf16-1gpu.yaml", "ltx23-t2v-fp8-1gpu.yaml"], ids=["bf16", "fp8"]
+)
+def test_ltx23_example(tmp_path, config_name):
+    """Each shipped config renders an MP4 through the --model_type ltx23 driver."""
     _skip_if_missing(LTX23_MODEL_PATH, "LTX-2.3 checkpoint", is_dir=True)
     _skip_if_missing(LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (gemma-3-12b-it)", is_dir=True)
 
@@ -294,7 +297,7 @@ def test_ltx23_example(tmp_path):
             "--model",
             LTX23_MODEL_PATH,
             "--visual_gen_args",
-            os.path.join(examples_root, "configs", "ltx23-t2v-bf16-1gpu.yaml"),
+            os.path.join(examples_root, "configs", config_name),
             "--text_encoder_path",
             LTX23_TEXT_ENCODER_PATH,
             "--output_path",
