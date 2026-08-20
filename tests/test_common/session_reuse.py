@@ -511,9 +511,22 @@ class SessionReuseCache:
         for pool, _ in still_alive:
             pool.release_exit_joins()
 
-        if still_alive:
+        # release_exit_joins() *unblocks* the wedged shutdown (it drops the
+        # exit joins the thread is parked on) rather than merely marking it
+        # abandoned, so the thread normally finishes just after. Join it here
+        # instead of returning immediately: drain runs inside a test (RPC
+        # construction seam, opt-out setup, failure fence), so a thread that
+        # terminates a moment later takes its transport threads with it across
+        # the test boundary, and pytest-threadleak charges the leak to whatever
+        # test happens to be running next.
+        release_deadline = time.monotonic() + min(max(timeout, 1.0), 30.0)
+        for _, t in still_alive:
+            t.join(timeout=max(0.0, release_deadline - time.monotonic()))
+
+        leaked = [pool for pool, thread in still_alive if thread.is_alive()]
+        if leaked:
             print(
-                f"[session-reuse] WARNING: {len(still_alive)} pool shutdown thread(s) "
+                f"[session-reuse] WARNING: {len(leaked)} pool shutdown thread(s) "
                 "remain after worker termination",
                 flush=True,
             )

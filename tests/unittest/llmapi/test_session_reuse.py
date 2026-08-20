@@ -357,6 +357,7 @@ def test_drain_releases_exit_joins_when_shutdown_remains_wedged(
     reuse_cache: SessionReuseCache,
 ) -> None:
     import threading
+    import time
 
     class _ManagerWedgedPool(_FakePool):
         def __init__(
@@ -370,6 +371,10 @@ def test_drain_releases_exit_joins_when_shutdown_remains_wedged(
 
         def shutdown(self) -> None:
             self.shutdown_released.wait()
+            # Dropping the exit joins only unparks the thread; the real
+            # shutdown still has to unwind (close the transport, reap its
+            # connection threads) before it returns.
+            time.sleep(0.05)
             self.shut = True
 
         def release_exit_joins(self) -> None:
@@ -381,7 +386,13 @@ def test_drain_releases_exit_joins_when_shutdown_remains_wedged(
     session.shutdown()
     reuse_cache.drain(timeout=0.01)
     assert pool.exit_joins_released
-    assert pool.shutdown_released.wait(timeout=1.0)
+    assert pool.shutdown_released.is_set()
+    # drain must not return while the released shutdown is still unwinding:
+    # it runs inside a test, so a thread that finishes a moment later drags
+    # its transport threads across the test boundary and pytest-threadleak
+    # blames whichever test runs next.
+    assert pool.shut
+    assert not [t for t in threading.enumerate() if t.name == "session-reuse-drain"]
 
 
 def test_kill_recorded_workers_skips_recycled_pid(
