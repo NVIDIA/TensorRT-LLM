@@ -3,8 +3,10 @@
 
 import argparse
 import asyncio
+import base64
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -164,7 +166,10 @@ def test_known_non_audio_checkpoint_rejected(monkeypatch: pytest.MonkeyPatch) ->
 
 class _Response:
     status = 200
-    headers = {"Server-Timing": "generation;dur=2000, denoise;dur=1500"}
+
+    def __init__(self, body: bytes = b"generated video", headers: dict[str, str] | None = None):
+        self.body = body
+        self.headers = headers or {"Server-Timing": "generation;dur=2000, denoise;dur=1500"}
 
     async def __aenter__(self):
         return self
@@ -173,7 +178,7 @@ class _Response:
         return False
 
     async def read(self) -> bytes:
-        return b"generated video"
+        return self.body
 
 
 class _Session:
@@ -198,6 +203,7 @@ def test_media_file_is_closed_after_each_request(tmp_path: Path) -> None:
         benchmark._do_post(
             request_input,
             benchmark._build_video_payload(request_input),
+            "video",
             pbar=None,
             session=session,
         )
@@ -205,6 +211,70 @@ def test_media_file_is_closed_after_each_request(tmp_path: Path) -> None:
 
     assert output.success
     assert session.media_file.closed
+
+
+@pytest.mark.parametrize(
+    ("media_kind", "payload", "response", "expected_suffix", "expected_content"),
+    [
+        (
+            "image",
+            {"response_format": "b64_json", "format": "jpeg"},
+            _Response(
+                body=json.dumps(
+                    {
+                        "data": [{"b64_json": base64.b64encode(b"jpeg bytes").decode("ascii")}],
+                        "output_format": "jpeg",
+                    }
+                ).encode("utf-8")
+            ),
+            ".jpeg",
+            b"jpeg bytes",
+        ),
+        (
+            "video",
+            {},
+            _Response(
+                body=b"video bytes",
+                headers={
+                    "Server-Timing": "generation;dur=2000, denoise;dur=1500",
+                    "Content-Disposition": 'attachment; filename="generated.mp4"',
+                    "Content-Type": "video/mp4",
+                },
+            ),
+            ".mp4",
+            b"video bytes",
+        ),
+    ],
+)
+def test_client_saves_measured_response_media(
+    tmp_path: Path,
+    media_kind: str,
+    payload: dict[str, Any],
+    response: _Response,
+    expected_suffix: str,
+    expected_content: bytes,
+) -> None:
+    class _DirectSession:
+        def post(self, **kwargs):
+            return response
+
+    output_stem = tmp_path / "media/request-0001"
+    request_input = _request_input(media_output_stem=str(output_stem))
+
+    output = asyncio.run(
+        benchmark._do_post(
+            request_input,
+            payload,
+            media_kind,
+            pbar=None,
+            session=_DirectSession(),
+        )
+    )
+
+    expected_path = output_stem.with_suffix(expected_suffix)
+    assert output.success
+    assert request_input.saved_media_paths == [str(expected_path)]
+    assert expected_path.read_bytes() == expected_content
 
 
 def test_initial_and_measured_requests_have_identical_payloads(
@@ -220,6 +290,11 @@ def test_initial_and_measured_requests_have_identical_payloads(
         session=None,
     ) -> VisualGenRequestOutput:
         seen_inputs.append(request_input)
+        if request_input.media_output_stem is not None:
+            media_path = Path(request_input.media_output_stem).with_suffix(".mp4")
+            media_path.parent.mkdir(parents=True, exist_ok=True)
+            media_path.write_bytes(b"video")
+            request_input.saved_media_paths = [str(media_path)]
         return VisualGenRequestOutput(
             success=True,
             latency=3.0,
@@ -244,6 +319,7 @@ def test_initial_and_measured_requests_have_identical_payloads(
             input_reference=str(input_reference),
             require_audio=True,
             num_gpus=1,
+            media_dir=str(tmp_path / "media"),
         )
     )
 
@@ -253,6 +329,11 @@ def test_initial_and_measured_requests_have_identical_payloads(
     )
     assert seen_inputs[0].input_reference == seen_inputs[1].input_reference
     assert [request.validate_audio for request in seen_inputs] == [True, True]
+    assert [request.media_output_stem for request in seen_inputs] == [
+        None,
+        str(tmp_path / "media/request-0001"),
+    ]
+    assert result["media_files"] == ["request-0001.mp4"]
     assert result["mean_seconds_per_denoising_step"] == pytest.approx(0.375)
     assert "percentiles_seconds_per_denoising_step" not in result
 
@@ -269,9 +350,7 @@ def test_denoising_step_percentiles_use_individual_measured_steps() -> None:
         "Step 4/4 | 2.78s",
     ]
 
-    result = benchmark._summarize_denoising_step_times(
-        log_lines, expected_requests=1, step_count=4
-    )
+    result = benchmark._summarize_denoising_step_times(log_lines, expected_requests=1, step_count=4)
 
     assert result["denoising_step_times"] == [3.82, 2.78, 2.78, 2.78]
     assert result["mean_denoising_step_time"] == pytest.approx(3.04)
@@ -410,6 +489,25 @@ def test_shell_argument_construction_with_spaces_and_json(tmp_path: Path) -> Non
     }
 
 
+def test_shell_enables_client_media_retention(tmp_path: Path) -> None:
+    result = _run_shell(
+        tmp_path,
+        MODE="t2i",
+        SAVE_MEDIA="true",
+        OUTPUT_FORMAT="jpeg",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--media-dir" in result.stdout
+    assert str(tmp_path / "results/media") in result.stdout
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["save_media"] is True
+    assert metadata["request_body"] == {
+        "format": "jpeg",
+        "extra_params": {"output_type": "image"},
+    }
+
+
 def test_shell_gpu_count_ignores_import_banner(tmp_path: Path) -> None:
     config_path = tmp_path / "four gpu config.yaml"
     config_path.write_text("parallel_config: {}\n", encoding="utf-8")
@@ -441,6 +539,62 @@ else:
     assert metadata["num_gpus"] == 4
 
 
+def test_shell_rejects_occupied_server_port(tmp_path: Path) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+
+        result = _run_shell(
+            tmp_path,
+            DRY_RUN="false",
+            HOST="127.0.0.1",
+            PORT=str(port),
+            SERVER_TIMEOUT="0",
+        )
+
+    assert result.returncode == 2
+    assert f"127.0.0.1:{port}" in result.stderr
+    assert "port is already in use" in result.stderr
+    assert "Starting server" not in result.stdout
+    assert not (tmp_path / "results/server.log").exists()
+
+
+def test_shell_cleans_benchmark_owned_server_media(tmp_path: Path) -> None:
+    fake_server = tmp_path / "trtllm-serve"
+    fake_server.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$TRTLLM_MEDIA_STORAGE_PATH" > "$MEDIA_PATH_CAPTURE"
+touch "$TRTLLM_MEDIA_STORAGE_PATH/generated.mp4"
+""",
+        encoding="utf-8",
+    )
+    fake_server.chmod(0o755)
+    media_path_capture = tmp_path / "server-media-path.txt"
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    result = _run_shell(
+        tmp_path,
+        DRY_RUN="false",
+        HOST="127.0.0.1",
+        PORT=str(port),
+        SERVER_TIMEOUT="1",
+        PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+        MEDIA_PATH_CAPTURE=str(media_path_capture),
+    )
+
+    assert result.returncode == 2
+    server_media_dir = Path(media_path_capture.read_text(encoding="utf-8").strip())
+    assert server_media_dir.parent == tmp_path / "results"
+    assert server_media_dir.name.startswith(".server-media.")
+    assert not server_media_dir.exists()
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -456,6 +610,11 @@ else:
             "requires BACKEND=openai-videos",
         ),
         ({"MODE": "t2v", "EXTRA_PARAMS": "{"}, "malformed EXTRA_PARAMS JSON"),
+        (
+            {"MODE": "t2i", "OUTPUT_FORMAT": "mp4"},
+            "OUTPUT_FORMAT='mp4' is not valid for MODE=t2i",
+        ),
+        ({"SAVE_MEDIA": "sometimes"}, "SAVE_MEDIA must be true or false"),
     ],
 )
 def test_shell_mode_validation(tmp_path: Path, overrides: dict[str, str], message: str) -> None:
