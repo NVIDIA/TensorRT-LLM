@@ -6527,11 +6527,18 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                  max_batch_size=32,
                  kv_cache_config=self.kv_cache_config,
                  cuda_graph_config=self.cuda_graph_config,
-                 speculative_config=spec_config) as llm:
+                 speculative_config=spec_config,
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            acceptance_length = _compute_acceptance_length(llm)
+            print(
+                f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length("TestQwen3_5_4B::test_dflash",
+                                     acceptance_length)
 
 
 @pytest.mark.skip_less_device_memory(80000)
