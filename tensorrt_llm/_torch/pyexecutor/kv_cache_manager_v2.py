@@ -766,6 +766,109 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     output.copy_(converted.permute(0, 2, 1, 3))
 
 
+class ReusableStateSnapshotMixin:
+    """Commit blocks at the snapshot points a request declared.
+
+    The base manager commits a context request's blocks once, when prefill
+    finishes -- enough when everything reusable lives in the KV pages. A model
+    that also carries per-request recurrent state (a Mamba conv/SSM state, an
+    Inkling short-conv window) needs that state captured *at* the boundary a
+    later reuse hit can land on, and V2 attaches it to the block committed at
+    that ordinal. So the commit has to happen at each snapshot point, not only
+    at the end.
+
+    Which points those are is the manager's business
+    (``prepare_expect_snapshot_points`` writes ``request.expect_snapshot_points``
+    and the scheduler will not end a context chunk anywhere else). What to do at
+    them is identical for every such model, which is why it lives here rather
+    than in any one manager.
+
+    Requires ``commit_min_snapshot``, which registering any SSM layer forces.
+    """
+
+    def _mark_context_position_as_history(self, request: LlmRequest, kv_cache) -> None:
+        """Advance history without making later recurrent state reusable."""
+        history_length = request.context_current_position
+        if history_length <= kv_cache.history_length:
+            return
+        capacity = max(kv_cache.capacity, history_length)
+        if not kv_cache.resize(capacity, history_length=history_length):
+            raise ValueError(
+                "Failed to resize history length of V2 Mamba cache for "
+                f"request {request.py_request_id} to {history_length} tokens"
+            )
+
+    def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
+        should_block_reuse = (
+            self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
+        )
+        if not should_block_reuse:
+            return
+
+        if kv_cache is None:
+            kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return
+
+        snapshot_points = request.expect_snapshot_points
+        commit_limit = (
+            min(max(snapshot_points), request.prompt_len) if snapshot_points else request.prompt_len
+        )
+        commit_end = min(request.context_current_position, commit_limit)
+        if (
+            request.context_current_position in request.expect_snapshot_points
+            and commit_end > kv_cache.num_committed_tokens
+        ):
+            tokens = self._augment_tokens_for_block_reuse(
+                request.get_tokens(DEFAULT_BEAM_INDEX),
+                request,
+                start=kv_cache.num_committed_tokens,
+                end=commit_end,
+            )
+            kv_cache.commit(tokens)
+        if request.context_current_position >= commit_limit:
+            self._mark_context_position_as_history(request, kv_cache)
+        if request.context_remaining_length == 0:
+            kv_cache.stop_committing()
+
+    def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
+        for request in scheduled_batch.context_requests:
+            kv_cache = self.kv_cache_map.get(request.py_request_id)
+            if kv_cache is None or not kv_cache.is_active:
+                continue
+
+            should_block_reuse = (
+                self.enable_block_reuse and not self.is_draft and not request.is_dummy_request
+            )
+            is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            is_snapshot_boundary = (
+                request.context_current_position in request.expect_snapshot_points
+            )
+            has_pending_snapshot = any(
+                point > request.context_current_position for point in request.expect_snapshot_points
+            )
+            should_resize = not should_block_reuse or (
+                not is_all_reusable and not has_pending_snapshot
+            )
+            should_commit = (
+                is_all_reusable or is_snapshot_boundary or request.context_remaining_length == 0
+            )
+
+            if should_resize and not kv_cache.resize(None, request.context_current_position):
+                raise ValueError(
+                    "Failed to resize history length of V2 Mamba cache for "
+                    f"request {request.py_request_id} to "
+                    f"{request.context_current_position} tokens at context "
+                    "update"
+                )
+            if should_commit:
+                self.try_commit_blocks(request, kv_cache)
+            if request.context_remaining_length == 0:
+                if self.conversation_manager is not None:
+                    self.conversation_manager.save_drop_plan(request, kv_cache)
+                kv_cache.enable_swa_scratch_reuse = False
+
+
 class KVCacheManagerV2(BaseResourceManager):
     def __init__(
         self,

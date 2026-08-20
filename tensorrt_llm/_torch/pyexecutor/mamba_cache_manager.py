@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
-    BlockReusePolicy, KVCacheManagerV2, Role)
+    BlockReusePolicy, KVCacheManagerV2, ReusableStateSnapshotMixin, Role)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -44,8 +44,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
-                                                      BatchDesc, BufferConfig,
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (BatchDesc, BufferConfig,
                                                       DataRole, KVCacheDesc)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
@@ -2824,7 +2823,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         )
 
 
-class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
+class MambaHybridCacheManagerV2(ReusableStateSnapshotMixin, KVCacheManagerV2,
+                                MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
     Attention KV pages and Mamba recurrent-state pages are both owned by the
@@ -3703,82 +3703,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 accepted_positions,
                 state_indices_d,
             )
-
-    def _mark_context_position_as_history(self, request: LlmRequest,
-                                          kv_cache) -> None:
-        """Advance history without making later recurrent state reusable."""
-        history_length = request.context_current_position
-        if history_length <= kv_cache.history_length:
-            return
-        capacity = max(kv_cache.capacity, history_length)
-        if not kv_cache.resize(capacity, history_length=history_length):
-            raise ValueError(
-                "Failed to resize history length of V2 Mamba cache for "
-                f"request {request.py_request_id} to {history_length} tokens")
-
-    def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
-        should_block_reuse = (self.enable_block_reuse and not self.is_draft
-                              and not request.is_dummy_request)
-        if not should_block_reuse:
-            return
-
-        if kv_cache is None:
-            kv_cache = self.kv_cache_map.get(request.py_request_id)
-        if kv_cache is None:
-            return
-
-        snapshot_points = request.expect_snapshot_points
-        commit_limit = (min(max(snapshot_points), request.prompt_len)
-                        if snapshot_points else request.prompt_len)
-        commit_end = min(request.context_current_position, commit_limit)
-        if (request.context_current_position in request.expect_snapshot_points
-                and commit_end > kv_cache.num_committed_tokens):
-            tokens = self._augment_tokens_for_block_reuse(
-                request.get_tokens(DEFAULT_BEAM_INDEX),
-                request,
-                start=kv_cache.num_committed_tokens,
-                end=commit_end,
-            )
-            kv_cache.commit(tokens)
-        if request.context_current_position >= commit_limit:
-            self._mark_context_position_as_history(request, kv_cache)
-        if request.context_remaining_length == 0:
-            kv_cache.stop_committing()
-
-    def update_context_resources(self,
-                                 scheduled_batch: ScheduledRequests) -> None:
-        for request in scheduled_batch.context_requests:
-            kv_cache = self.kv_cache_map.get(request.py_request_id)
-            if kv_cache is None or not kv_cache.is_active:
-                continue
-
-            should_block_reuse = (self.enable_block_reuse and not self.is_draft
-                                  and not request.is_dummy_request)
-            is_all_reusable = (
-                self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE)
-            is_snapshot_boundary = (request.context_current_position
-                                    in request.expect_snapshot_points)
-            has_pending_snapshot = any(
-                point > request.context_current_position
-                for point in request.expect_snapshot_points)
-            should_resize = (not should_block_reuse or
-                             (not is_all_reusable and not has_pending_snapshot))
-            should_commit = (is_all_reusable or is_snapshot_boundary
-                             or request.context_remaining_length == 0)
-
-            if should_resize and not kv_cache.resize(
-                    None, request.context_current_position):
-                raise ValueError(
-                    "Failed to resize history length of V2 Mamba cache for "
-                    f"request {request.py_request_id} to "
-                    f"{request.context_current_position} tokens at context "
-                    "update")
-            if should_commit:
-                self.try_commit_blocks(request, kv_cache)
-            if request.context_remaining_length == 0:
-                if self.conversation_manager is not None:
-                    self.conversation_manager.save_drop_plan(request, kv_cache)
-                kv_cache.enable_swa_scratch_reuse = False
 
     def shutdown(self):
         self._gdn_cached_replay_state_descriptors = None

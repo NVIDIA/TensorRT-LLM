@@ -27,6 +27,7 @@ which leaves every attention ``layer_id`` -- and therefore the paged-KV
 addressing -- untouched.
 """
 
+import hashlib
 from dataclasses import replace
 from typing import List
 
@@ -44,7 +45,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 from .....logger import logger
-from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, ReusableStateSnapshotMixin
 from .conv_state import CONV_ROLES, InklingConvState, InklingConvStateCache
 
 
@@ -70,13 +71,17 @@ def _resolve_conv_dtype(pretrained_config) -> torch.dtype:
     )
 
 
-class InklingHybridCacheManager(KVCacheManagerV2):
+class InklingHybridCacheManager(ReusableStateSnapshotMixin, KVCacheManagerV2):
     """Paged KV (V2, per-layer geometry) + the short-conv state pool.
 
     Folding the pool into the manager -- ``CppMambaHybridCacheManager``'s shape
     -- lets it reach the model through ``attn_metadata.kv_cache_manager`` and be
     released by the manager's own ``free_resources``, so conv rows and KV blocks
     cannot drift apart.
+
+    The conv window is registered as V2 SSM layers, so V2 can attach it to the
+    block committed at a snapshot ordinal and hand it back on a prefix hit --
+    which is what makes block reuse servable at all.
     """
 
     def __init__(self, *args, pretrained_config, mapping, max_batch_size, **kwargs):
@@ -85,6 +90,13 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         # the conv sizing needs is on self by then.
         self._conv_config = getattr(pretrained_config, "text_config", pretrained_config)
         self._conv_dtype = _resolve_conv_dtype(pretrained_config)
+        # prepare_expect_snapshot_points needs the snapshot interval and the
+        # base keeps no reference of its own. ``.get``, not subscripting: a
+        # missing key should not fail as a bare KeyError from in here.
+        self._kv_cache_config = args[0] if args else kwargs.get("kv_cache_config")
+        # One warning per manager, not per request: the condition is a property
+        # of the model, so a multimodal workload would emit it thousands of times.
+        self._warned_multimodal_reuse = False
         super().__init__(
             *args,
             pretrained_config=pretrained_config,
@@ -109,6 +121,111 @@ class InklingHybridCacheManager(KVCacheManagerV2):
             f"{self._conv_cache.conv_state_bytes() / (1 << 20):.1f} MiB, "
             "backed by V2 SSM layers"
         )
+
+    # ---- reusable snapshots -------------------------------------------------
+    def prepare_expect_snapshot_points(self, requests) -> None:
+        """Where this batch's requests may snapshot their short-conv window.
+
+        Found by ``py_executor`` through ``hasattr`` and consumed by the
+        scheduler, which will not end a context chunk anywhere else. That is the
+        half a model cannot do for itself: a snapshot can only be taken where an
+        iteration *ends*, so without a say in where chunks end, capture depends
+        on the operator having picked a ``max_num_tokens`` smaller than the
+        shared prefix.
+
+        The interval is ``mamba_state_config.periodic_snapshot_interval``. That
+        field is named for Mamba but means "tokens between recurrent-state
+        snapshots", and a short-conv window is that kind of state. Coarse on
+        purpose: a snapshot costs the whole model's conv window, so one per
+        block over an 8k prompt would be hundreds of MiB for one request. The
+        cost is that reuse only lands on multiples of the interval.
+        """
+        state_config = getattr(self._kv_cache_config, "mamba_state_config", None)
+        interval = getattr(state_config, "periodic_snapshot_interval", 0) or 0
+        for request in requests:
+            if not self.enable_block_reuse or not interval:
+                request.expect_snapshot_points = []
+                continue
+            request.expect_snapshot_points = list(range(interval, request.prompt_len + 1, interval))
+
+    def _augment_tokens_for_block_reuse(self, tokens, req, start=0, end=None):
+        """Keep multimodal requests out of the shared radix tree.
+
+        The base rewrites each multimodal token span into cache-key tokens
+        carrying the item's content digest, precisely because a placeholder
+        token id is the same whatever image is behind it. It can only do that
+        for a request carrying ``multimodal_hashes``, and returns the raw ids
+        for one that has none -- so two prompts holding DIFFERENT images look
+        like the same prefix and one is served the other's keys and values.
+
+        Inkling's input processor produces no such hashes, so that is the case
+        here, not a corner of it. Measured on MMMU over the same 32 items,
+        Inkling-small-NVFP4: 81.3% with reuse off, 31.3% with reuse on. Nothing
+        errors; the answers are simply wrong.
+
+        Salting position 0 with the request id gives such a request a private
+        chain: it matches nothing and nothing matches it, so reuse turns itself
+        off exactly where it cannot be correct while text requests keep it. A
+        blanket refusal for the model would be wrong -- Inkling is always
+        multimodal-capable, and the text path is measured good.
+        """
+        augmented = super()._augment_tokens_for_block_reuse(tokens, req, start, end)
+        if not self.enable_block_reuse:
+            return augmented
+        if getattr(req, "multimodal_hashes", None) is not None:
+            return augmented
+        if getattr(req, "py_multimodal_data", None) is None:
+            return augmented
+        # Only the chunk containing position 0 needs it: the radix tree chains a
+        # block's key through its parent, so a private first block makes every
+        # continuation of this request private too.
+        if start != 0 or not len(augmented):
+            return augmented
+        if not self._warned_multimodal_reuse:
+            self._warned_multimodal_reuse = True
+            logger.warning(
+                "Inkling: KV cache block reuse is disabled for multimodal "
+                "requests. Their image/video/audio spans carry no content "
+                "digest, so a shared prefix would be matched on placeholder "
+                "token ids alone and serve one item's KV for another's. Text "
+                "requests are unaffected."
+            )
+        salt = hashlib.sha256(
+            b"inkling-multimodal-no-digest-%d" % int(getattr(req, "request_id", 0))
+        ).digest()
+        poisoned = list(augmented)
+        poisoned[0] = salt
+        return poisoned
+
+    def prepare_context(self, req):
+        """Observation only: count how much prefix each request actually reused.
+
+        ``get_kv_cache_stats`` cannot serve here -- measured, it reports
+        reused/missed/alloc all zero for this configuration, so it reads the
+        same whether reuse works or never runs. Only the FIRST context chunk is
+        counted: a continuation chunk also arrives with
+        ``context_current_position > 0`` (its own earlier chunks), and counting
+        those made a reuse-disabled arm report 221 hits.
+        """
+        first = bool(getattr(req, "is_first_context_chunk", True))
+        ok = super().prepare_context(req)
+        if not first:
+            return ok
+        d = getattr(self, "_reuse_dbg", None)
+        if d is None:
+            d = self._reuse_dbg = {"n": 0, "hits": 0, "best": 0, "total": 0}
+        d["n"] += 1
+        pos = int(getattr(req, "context_current_position", 0) or 0)
+        if pos > 0:
+            d["hits"] += 1
+            d["total"] += pos
+            d["best"] = max(d["best"], pos)
+        if d["n"] % 64 == 0:
+            logger.info(
+                f"Inkling prefix reuse: {d['hits']}/{d['n']} requests, "
+                f"longest={d['best']} tokens, total={d['total']}"
+            )
+        return ok
 
     # ---- conv geometry, all derived from what the base already resolved -----
     @property

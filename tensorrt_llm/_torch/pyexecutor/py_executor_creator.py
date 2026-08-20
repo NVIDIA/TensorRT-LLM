@@ -41,6 +41,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
+                           needs_block_aligned_context_chunks,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -776,7 +777,8 @@ def create_py_executor(
     else:
         ctx_chunk_config = None
 
-    if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
+    if (kv_cache_config.enable_block_reuse
+            and needs_block_aligned_context_chunks(config)):
         # Snapshot boundaries come from expect_snapshot_points.  The unit is
         # only used to align chunks shortened by the scheduling budget.
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
