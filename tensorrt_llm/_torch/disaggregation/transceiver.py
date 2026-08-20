@@ -150,11 +150,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        try:
+            self._enable_pipelined_transfer = self._resolve_pipelined_transfer(
+                cache_transceiver_config
+            )
+        except ValueError:
+            # The transfer worker is already live by this point.
+            self._transfer_worker.shutdown()
+            raise
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
         # except under attention DP where the local count already is the total.
         self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
-        self._enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
-
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
@@ -1196,6 +1202,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"KvCacheTransceiverV2: _check_compatible: only support context parallelism is 1: "
                 f"cp_size: {self._mapping.cp_size}"
             )
+
+    def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:
+        """Whether this rank can pipeline KV cache transfers.
+        """
+        if not cfg.enable_pipelined_transfer:
+            return False
+        blockers = []
+        # Layers split across PP ranks; the sender assumes it owns every block.
+        if self._mapping.pp_size != 1:
+            blockers.append(f"pipeline_parallel_size={self._mapping.pp_size}")
+        # Bounce stages a whole request per slice; many slices break that.
+        if cfg.kv_cache_bounce_size_mb != 0:
+            blockers.append(f"kv_cache_bounce_size_mb={cfg.kv_cache_bounce_size_mb}")
+        if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
+            blockers.append("a Mamba/hybrid cache manager")
+        if blockers:
+            logger.info("Pipelined transfer KV cache transfer is not supported: " + "; ".join(blockers))
+        return not blockers
 
     def commit_blocks_for_reuse(self, req) -> None:
         self._reuse_adapter.commit_blocks_for_reuse(req)

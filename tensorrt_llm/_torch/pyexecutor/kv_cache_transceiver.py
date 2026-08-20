@@ -182,11 +182,6 @@ def resolve_cache_transceiver_config(
             f"got {effective_backend}. "
             f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
         )
-    if (enable_pipelined_transfer
-            and cache_transceiver_config.kv_cache_bounce_size_mb > 0):
-        raise ValueError(
-            "kv_cache_bounce_size_mb must be 0 when enable_pipelined_transfer is set."
-        )
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
@@ -241,20 +236,6 @@ def create_kv_cache_transceiver(
             "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             "hangs or lower-than-expected performance.")
-
-    if (cache_transceiver_config.enable_pipelined_transfer
-            and (isinstance(kv_cache_manager, MambaHybridCacheManager)
-                 or mamba_cache_manager is not None)):
-        raise ValueError(
-            "enable_pipelined_transfer is not supported with Mamba/hybrid attention models."
-        )
-    if (cache_transceiver_config.enable_pipelined_transfer
-            and mapping.pp_size != 1):
-        logger.warning(
-            "Pipelined KV cache transfer is not supported with pipeline "
-            "parallelism; disabling enable_pipelined_transfer."
-        )
-        cache_transceiver_config.enable_pipelined_transfer = False
 
     # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
