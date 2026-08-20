@@ -650,6 +650,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 "views.")
         return self._draft_metadata
 
+    def get_shared_kv_draft_metadata(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+    ) -> "FlashInferAttentionMetadata":
+        """Return the shared-target-KV draft view at the accepted prefix."""
+        draft_metadata = self.get_draft_metadata()
+        draft_metadata.update_shared_kv_draft_lengths(
+            self,
+            num_accepted_tokens,
+            num_contexts,
+        )
+        return draft_metadata
+
     def _sync_draft_view(self, target: "FlashInferAttentionMetadata") -> None:
         """Refresh a shared- or separate-KV draft metadata view."""
         if not (self._is_shared_kv_draft_view

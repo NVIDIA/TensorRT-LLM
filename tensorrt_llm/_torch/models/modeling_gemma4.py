@@ -291,7 +291,10 @@ class Gemma4Attention(QKNormRoPEAttention):
             # frequencies are paired across the full head. Apply it at the
             # module layer because fused preprocessing cannot represent that
             # pairing with only the logical rotary dimension.
-            rope_fusion=is_sliding,
+            # KV-shared layers read a frozen cache prefix, so their explicit
+            # position_ids—not the readable KV length—must select the query's
+            # RoPE position.
+            rope_fusion=is_sliding and not is_kv_shared,
         )
 
         # Restore original config head_dim
@@ -1267,7 +1270,9 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
 
         The TRTLLM attention backend uses trtllm-gen for the regular attention
         phases and a Triton context phase for bidirectional multimodal masks.
-        External shared-KV MTP still requires FlashInfer attention metadata.
+        External shared-KV MTP keeps FlashInfer as its default because the
+        production FP8-KV multimodal path is not yet supported by TRTLLM's
+        custom-mask context implementation.
         """
         speculative_config = getattr(llm_args, "speculative_config", None)
         spec_dec_mode = getattr(speculative_config, "spec_dec_mode", None)
@@ -1621,6 +1626,17 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
             hidden_size=assistant_config.hidden_size,
             vocab_size=assistant_config.vocab_size,
         )
+        # The assistant is invoked with draft-specific attention metadata.
+        # Keep its attention calls eager under torch.compile / breakable CUDA
+        # graphs so they consume that explicit metadata instead of the target
+        # model metadata registered in the custom attention op.
+        for layer in self.model.layers:
+            attention = layer.self_attn
+            if attention.register_to_config:
+                text_model_config.extra_attrs.get("attn_layers", {}).pop(
+                    attention.layer_idx_str, None
+                )
+                attention.register_to_config = False
         self.pre_projection = Linear(
             2 * assistant_config.backbone_hidden_size,
             assistant_config.hidden_size,

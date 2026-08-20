@@ -62,8 +62,21 @@ class FallbackFmha(Fmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        del q, k, v, metadata, phase
-        return forward_args.attention_mask != CustomAttentionMask.CUSTOM
+        del q, phase
+        if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
+            return False
+
+        # The fused THOP path cannot read an existing self-attention KV cache
+        # from a Q-only input.  This form is used by external shared-KV draft
+        # layers and must be handled by a phased generation implementation.
+        is_q_only_self_attention = (
+            not metadata.is_cross
+            and k is None
+            and v is None
+            and not forward_args.is_fused_qkv
+            and not forward_args.update_kv_cache
+        )
+        return not is_q_only_self_attention
 
     def forward(
         self,

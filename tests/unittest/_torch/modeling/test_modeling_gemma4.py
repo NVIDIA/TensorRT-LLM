@@ -617,11 +617,56 @@ class TestGemma4Assistant(unittest.TestCase):
 
         torch.testing.assert_close(actual, expected)
 
-    def test_assistant_uses_target_kv_sources(self):
+    @torch.no_grad()
+    def test_kv_shared_sliding_rope_uses_explicit_position_ids(self):
         assistant = Gemma4AssistantForCausalLM(_make_assistant_model_config())
-        self.assertEqual(len(assistant.model.layers), 4)
-        self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
+        attention = next(layer.self_attn for layer in assistant.model.layers if layer.is_sliding)
+        self.assertTrue(attention.is_kv_shared)
+        self.assertFalse(attention.rope_fusion)
+        self.assertIsNotNone(attention.rotary_emb)
 
+        rotary_emb = attention.rotary_emb
+        device = rotary_emb.rotary_cos_sin.device
+        attention.q_norm.to(device)
+        query = torch.arange(
+            1,
+            attention.q_size + 1,
+            dtype=attention.q_norm.weight.dtype,
+            device=device,
+        ).unsqueeze(0)
+        prefix_length = 7
+
+        def reference_rope(position: int) -> torch.Tensor:
+            normalized = attention.q_norm(query.reshape(-1, attention.head_dim)).reshape(
+                -1, attention.q_size
+            )
+            cos_sin = rotary_emb.rotary_cos_sin[position : position + 1]
+            cos = cos_sin[:, 0, :].to(normalized.dtype).unsqueeze(0)
+            sin = cos_sin[:, 1, :].to(normalized.dtype).unsqueeze(0)
+            normalized = normalized.view(1, 1, -1, attention.head_dim).transpose(1, 2)
+            rotated = rotary_emb.apply_rotary_pos_emb(
+                normalized,
+                cos,
+                sin,
+                is_neox=rotary_emb.is_neox,
+            )
+            return rotated.transpose(1, 2).contiguous().view(1, -1)
+
+        actual, k, v = attention.apply_rope(
+            query,
+            None,
+            None,
+            torch.tensor([[prefix_length]], device=device),
+        )
+        expected = reference_rope(prefix_length)
+        previous_position = reference_rope(prefix_length - 1)
+
+        self.assertIsNone(k)
+        self.assertIsNone(v)
+        torch.testing.assert_close(actual, expected)
+        self.assertFalse(torch.allclose(actual, previous_position, rtol=1e-3, atol=1e-3))
+
+    def test_assistant_uses_target_kv_sources(self):
         target_config = {
             **GEMMA4_SMALL_CONFIG,
             "layer_types": [
@@ -635,6 +680,18 @@ class TestGemma4Assistant(unittest.TestCase):
             "num_kv_shared_layers": 2,
         }
         target = Gemma4ForCausalLM(_make_model_config(target_config))
+        target_attn_layers = target.model.model_config.extra_attrs["attn_layers"].copy()
+
+        assistant = Gemma4AssistantForCausalLM(_make_assistant_model_config())
+        self.assertEqual(len(assistant.model.layers), 4)
+        self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
+        self.assertTrue(all(not layer.self_attn.rope_fusion for layer in assistant.model.layers))
+        self.assertTrue(
+            all(not layer.self_attn.register_to_config for layer in assistant.model.layers)
+        )
+        self.assertEqual(assistant.model.model_config.extra_attrs["attn_layers"], {})
+        self.assertEqual(target.model.model_config.extra_attrs["attn_layers"], target_attn_layers)
+
         assistant.load_weights_from_target_model(target)
 
         expected_source_layers = [2, 2, 2, 3]
@@ -1853,6 +1910,10 @@ class TestGemma4HFComparison(unittest.TestCase):
             if i >= first_shared:
                 self.assertTrue(layer.is_kv_shared_layer, f"Layer {i} should be KV shared")
                 self.assertTrue(layer.self_attn.is_kv_shared, f"Layer {i} attn should be KV shared")
+                self.assertFalse(
+                    layer.self_attn.rope_fusion,
+                    f"Layer {i} should apply RoPE from explicit position_ids",
+                )
             else:
                 self.assertFalse(layer.is_kv_shared_layer, f"Layer {i} should NOT be KV shared")
 
@@ -2407,7 +2468,7 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         self.assertNotIn("cuda_graph_config", defaults)
 
     def test_external_shared_kv_mtp_defaults_to_flashinfer(self):
-        """External shared-KV MTP requires FlashInfer attention metadata."""
+        """Keep the production FP8 custom-mask MTP path on FlashInfer."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
 
         spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)

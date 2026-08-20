@@ -341,6 +341,21 @@ class AttentionMetadata:
         """
         self.prepare()
 
+    def get_shared_kv_draft_metadata(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+    ) -> "AttentionMetadata":
+        """Return metadata for an external draft model sharing target KV.
+
+        Backends supporting external shared-KV drafting override this method.
+        The returned view must expose only the accepted target prefix and must
+        not mutate the target metadata.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support external shared-KV "
+            "draft attention.")
+
     def _prepare_mamba_metadata(self):
         if self.mamba_metadata is False:
             return

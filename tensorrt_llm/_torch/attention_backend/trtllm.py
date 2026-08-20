@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
 import math
 import os
@@ -81,6 +82,22 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
+
+    _draft_metadata: Optional["TrtllmAttentionMetadata"] = field(init=False,
+                                                                 default=None,
+                                                                 repr=False)
+    _draft_kv_runtime_lens: Optional[torch.Tensor] = field(init=False,
+                                                           default=None,
+                                                           repr=False)
+    _shared_kv_draft_seq_lens: Optional[torch.Tensor] = field(init=False,
+                                                              default=None,
+                                                              repr=False)
+    _shared_kv_draft_seq_lens_cuda: Optional[torch.Tensor] = field(init=False,
+                                                                   default=None,
+                                                                   repr=False)
+    _shared_kv_draft_request_types: Optional[torch.Tensor] = field(init=False,
+                                                                   default=None,
+                                                                   repr=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -272,6 +289,205 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             or self.runtime_features.has_speculative_draft_tokens
         ) if self.runtime_features is not None else False
         self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def create_cuda_graph_metadata(
+            self,
+            max_batch_size: int,
+            sub_cross_metadata: bool = False,
+            max_draft_tokens: int = 0,
+            buffers=None,
+            encode_only: bool = False) -> "TrtllmAttentionMetadata":
+        if self.is_cuda_graph:
+            return self
+        metadata = super().create_cuda_graph_metadata(
+            max_batch_size,
+            sub_cross_metadata,
+            max_draft_tokens,
+            buffers,
+            encode_only,
+        )
+        # A graph metadata object owns its lazy draft view and all of that
+        # view's fixed-address buffers. Do not inherit the eager view through
+        # AttentionMetadata's shallow copy.
+        metadata._draft_metadata = None
+        return metadata
+
+    def _validate_shared_kv_draft_metadata(self,
+                                           num_accepted_tokens: torch.Tensor,
+                                           num_contexts: int) -> None:
+        if self.is_cross:
+            raise ValueError(
+                "TRTLLM external shared-KV drafting does not support cross attention."
+            )
+        if self.kv_cache_manager is None:
+            raise ValueError(
+                "TRTLLM external shared-KV drafting requires a paged KV cache.")
+        if getattr(self.kv_cache_manager, "kv_factor", 2) != 2:
+            raise ValueError(
+                "TRTLLM external shared-KV drafting does not support MLA.")
+        if self.sparse_metadata_params is not None or self.num_sparse_topk > 0:
+            raise ValueError(
+                "TRTLLM external shared-KV drafting does not support sparse attention."
+            )
+        if self.beam_width != 1:
+            raise ValueError(
+                "TRTLLM external shared-KV drafting does not support beam search."
+            )
+        if self.draft_kv_cache_manager is not None:
+            raise ValueError(
+                "TRTLLM external shared-KV drafting cannot use a separate draft KV cache."
+            )
+        if self.kv_cache_block_offsets is None:
+            raise ValueError(
+                "TRTLLM external shared-KV drafting requires KV-cache block offsets."
+            )
+        if num_contexts != self.num_contexts:
+            raise ValueError(
+                "num_contexts must match the target attention metadata: "
+                f"got {num_contexts}, expected {self.num_contexts}.")
+        if num_accepted_tokens.ndim != 1 or num_accepted_tokens.shape[
+                0] < self.num_seqs:
+            raise ValueError(
+                "num_accepted_tokens must be a 1-D tensor covering every sequence."
+            )
+        if self.kv_lens_cuda_runtime is None or self.kv_lens_runtime is None:
+            raise RuntimeError(
+                "TRTLLM target attention metadata must be prepared before "
+                "requesting a shared-KV draft view.")
+        if num_accepted_tokens.device != self.kv_lens_cuda_runtime.device:
+            raise ValueError(
+                "num_accepted_tokens and target KV lengths must be on the same device."
+            )
+
+    def _create_shared_kv_draft_metadata(self) -> "TrtllmAttentionMetadata":
+        draft_metadata = copy.copy(self)
+        draft_metadata._draft_metadata = None
+        draft_metadata.cross = None
+        draft_metadata.cuda_graph_buffers = None
+        draft_metadata._saved_tensors = {}
+
+        max_num_sequences = self.max_num_sequences or self.max_num_requests
+        draft_metadata._shared_kv_draft_seq_lens = torch.ones(
+            (max_num_sequences, ),
+            dtype=torch.int,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        draft_metadata._shared_kv_draft_seq_lens_cuda = torch.ones(
+            (max_num_sequences, ),
+            dtype=self.kv_lens_cuda.dtype,
+            device=self.kv_lens_cuda.device,
+        )
+        draft_metadata._shared_kv_draft_request_types = torch.ones(
+            (max_num_sequences, ),
+            dtype=self.host_request_types.dtype,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        draft_metadata._draft_kv_runtime_lens = torch.empty(
+            (max_num_sequences, ),
+            dtype=self.kv_lens_cuda.dtype,
+            device=self.kv_lens_cuda.device,
+        )
+        draft_metadata.host_total_kv_lens = torch.empty_like(
+            self.host_total_kv_lens)
+
+        # The assistant issues Q-only generation requests. It must not inherit
+        # speculative-tree state from the target forward.
+        draft_metadata.is_spec_decoding_enabled = False
+        draft_metadata.use_spec_decoding = False
+        draft_metadata.is_spec_dec_tree = False
+        draft_metadata.is_spec_dec_dynamic_tree = False
+        draft_metadata.force_prepare_spec_dec_tree_mask = False
+        draft_metadata.max_total_draft_tokens = None
+        draft_metadata.spec_decoding_position_offsets = None
+        draft_metadata.spec_decoding_position_offsets_cpp = None
+        draft_metadata.spec_decoding_packed_mask = None
+        draft_metadata.spec_decoding_generation_lengths = None
+        draft_metadata.spec_decoding_bl_tree_mask_offset = None
+        draft_metadata.spec_decoding_bl_tree_mask = None
+        draft_metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
+        draft_metadata.position_offsets_stride = 0
+        draft_metadata.draft_kv_cache_manager = None
+        draft_metadata.draft_kv_cache_block_offsets = None
+        draft_metadata.padded_num_tokens = None
+        return draft_metadata
+
+    def _sync_shared_kv_draft_metadata(
+            self, target: "TrtllmAttentionMetadata") -> None:
+        """Refresh this cached draft view from prepared target metadata."""
+        if (self._shared_kv_draft_seq_lens is None
+                or self._shared_kv_draft_seq_lens_cuda is None
+                or self._shared_kv_draft_request_types is None
+                or self._draft_kv_runtime_lens is None):
+            raise RuntimeError("Shared-KV draft buffers are not initialized.")
+
+        num_seqs = target.num_seqs
+        if num_seqs > self._shared_kv_draft_seq_lens.shape[0]:
+            raise ValueError(
+                f"Draft batch size {num_seqs} exceeds the allocated capacity "
+                f"{self._shared_kv_draft_seq_lens.shape[0]}.")
+
+        self._seq_lens = self._shared_kv_draft_seq_lens[:num_seqs]
+        self._seq_lens_cuda = self._shared_kv_draft_seq_lens_cuda[:num_seqs]
+        self._seq_lens_kv = None
+        self._seq_lens_kv_cuda = None
+        self._num_contexts = 0
+        self._num_generations = num_seqs
+        self._num_ctx_tokens = 0
+        self._num_tokens = num_seqs
+
+        self.kv_cache_manager = target.kv_cache_manager
+        self.kv_cache_params = target.kv_cache_params
+        self.kv_cache_block_offsets = target.kv_cache_block_offsets
+        self.host_kv_cache_block_offsets = target.host_kv_cache_block_offsets
+        self.workspace = target.workspace
+        self.cuda_graph_workspace = target.cuda_graph_workspace
+        self.request_ids = target.request_ids
+        self.prompt_lens = target.prompt_lens
+        self.all_rank_num_tokens = target.all_rank_num_tokens
+
+        # Until accepted lengths are published, the complete target lengths
+        # are a safe initialized value for the view. The generic getter below
+        # replaces generation rows with the exact accepted prefix.
+        self._draft_kv_runtime_lens[:num_seqs].copy_(
+            target.kv_lens_cuda_runtime[:num_seqs])
+        self._bind_runtime_views(
+            kv_lens_cuda=self._draft_kv_runtime_lens[:num_seqs],
+            kv_lens=target.kv_lens_runtime[:num_seqs],
+            prompt_lens_cuda=target.prompt_lens_cuda_runtime[:num_seqs],
+            prompt_lens_cpu=target.prompt_lens_cpu_runtime[:num_seqs],
+            host_request_types=self._shared_kv_draft_request_types[:num_seqs],
+        )
+        self.host_total_kv_lens[0] = 0
+        self.host_total_kv_lens[1] = target.host_total_kv_lens.sum()
+
+    def get_shared_kv_draft_metadata(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+    ) -> "TrtllmAttentionMetadata":
+        """Return a Q-only generation view over the accepted target KV."""
+        self._validate_shared_kv_draft_metadata(num_accepted_tokens,
+                                                num_contexts)
+        if self._draft_metadata is None:
+            self._draft_metadata = self._create_shared_kv_draft_metadata()
+
+        draft_metadata = self._draft_metadata
+        draft_metadata._sync_shared_kv_draft_metadata(self)
+        num_seqs = self.num_seqs
+        if num_contexts > 0:
+            draft_metadata._draft_kv_runtime_lens[:num_contexts].copy_(
+                self.kv_lens_cuda_runtime[:num_contexts])
+        generation_slice = slice(num_contexts, num_seqs)
+        torch.sub(
+            self.kv_lens_cuda_runtime[generation_slice],
+            self.seq_lens_kv_cuda[generation_slice],
+            out=draft_metadata._draft_kv_runtime_lens[generation_slice],
+        )
+        draft_metadata._draft_kv_runtime_lens[generation_slice].add_(
+            num_accepted_tokens[generation_slice])
+        return draft_metadata
 
     def update_position_offsets_for_cpp(self, query_len: int) -> None:
         """Refresh the C++ view of spec-dec position offsets."""
@@ -786,6 +1002,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
             host_request_types=self.host_request_types[:self.num_seqs],
         )
+        if self._draft_metadata is not None:
+            self._draft_metadata._sync_shared_kv_draft_metadata(self)
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
