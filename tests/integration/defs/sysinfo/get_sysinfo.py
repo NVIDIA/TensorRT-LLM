@@ -110,6 +110,13 @@ def is_power():
 
 def get_linux_distribution() -> tuple[str, str, str]:
     try:
+        import distro
+    except ImportError:
+        pass
+    else:
+        return (distro.id(), distro.version(), distro.codename())
+
+    try:
         os_release = platform.freedesktop_os_release()
     except OSError as error:
         logger.warning(

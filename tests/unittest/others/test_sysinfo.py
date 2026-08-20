@@ -15,6 +15,7 @@
 
 import pathlib
 import sys
+import types
 
 import pytest
 
@@ -24,7 +25,22 @@ sys.path.insert(0, str(_SYSINFO_DIR))
 import get_sysinfo  # noqa: E402
 
 
+def _disable_distro(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "distro", None)
+
+
+def test_get_linux_distribution_from_distro(monkeypatch: pytest.MonkeyPatch) -> None:
+    distro = types.ModuleType("distro")
+    monkeypatch.setattr(distro, "id", lambda: "ubuntu", raising=False)
+    monkeypatch.setattr(distro, "version", lambda: "24.04", raising=False)
+    monkeypatch.setattr(distro, "codename", lambda: "noble", raising=False)
+    monkeypatch.setitem(sys.modules, "distro", distro)
+
+    assert get_sysinfo.get_linux_distribution() == ("ubuntu", "24.04", "noble")
+
+
 def test_get_linux_distribution_from_os_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disable_distro(monkeypatch)
     monkeypatch.setattr(
         get_sysinfo.platform,
         "freedesktop_os_release",
@@ -39,6 +55,8 @@ def test_get_linux_distribution_from_os_release(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_get_linux_distribution_without_os_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disable_distro(monkeypatch)
+
     def raise_os_error() -> dict[str, str]:
         raise OSError("os-release is unavailable")
 
@@ -55,6 +73,7 @@ def test_get_linux_distribution_with_missing_field(
     monkeypatch: pytest.MonkeyPatch,
     missing_field: str,
 ) -> None:
+    _disable_distro(monkeypatch)
     os_release = {
         "ID": "ubuntu",
         "VERSION_ID": "24.04",
