@@ -45,3 +45,30 @@ def test_get_linux_distribution_without_os_release(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(get_sysinfo.platform, "freedesktop_os_release", raise_os_error)
 
     assert get_sysinfo.get_linux_distribution() == ("na", "na", "na")
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["ID", "VERSION_ID", "VERSION_CODENAME"],
+)
+def test_get_linux_distribution_with_missing_field(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_field: str,
+) -> None:
+    os_release = {
+        "ID": "ubuntu",
+        "VERSION_ID": "24.04",
+        "VERSION_CODENAME": "noble",
+    }
+    del os_release[missing_field]
+    monkeypatch.setattr(
+        get_sysinfo.platform,
+        "freedesktop_os_release",
+        lambda: os_release,
+    )
+
+    assert get_sysinfo.get_linux_distribution() == (
+        os_release.get("ID", "na"),
+        os_release.get("VERSION_ID", "na"),
+        os_release.get("VERSION_CODENAME", "na"),
+    )
