@@ -56,7 +56,7 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import TerminalOutcome, apply_usage_session_config
 from tensorrt_llm.usage import config as _telemetry_config
-from tensorrt_llm.usage import (get_observed_signal, record_observed_signal,
+from tensorrt_llm.usage import (get_observed_signal,
                                 record_termination_observation,
                                 set_lifecycle_phase, set_usage_context)
 
