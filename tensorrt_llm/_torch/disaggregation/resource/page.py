@@ -232,12 +232,12 @@ class CacheKind(IntEnum):
 
     PAGED: multiple block IDs per request (attention KV cache).
            Extraction: per-block base pointers. Alignment: window/beam/SWA.
-    SLOT:  single slot ID per request (recurrent state, e.g. mamba).
+    STATE: single slot ID per request (recurrent state, e.g. mamba).
            Extraction: per-layer pointers within one slot. No block alignment.
     """
 
     PAGED = 0
-    SLOT = 1
+    STATE = 1
 
 
 @dataclass
@@ -245,7 +245,7 @@ class LayerGroup:
     """Base class for one life cycle / layer-group.
 
     Shared structure:
-      - kind: how this group's region IDs are interpreted (PAGED vs SLOT)
+      - kind: how this group's region IDs are interpreted (PAGED vs STATE)
       - pool_group_idx: index into KVCachePageTable.pool_groups
       - local_layers: local ↔ global layer ID mapping
       - pool_views: logical views into pool_groups[pool_group_idx].pools
@@ -308,11 +308,13 @@ class MambaLayerGroup(LayerGroup):
     where pool_idx=0 is conv, pool_idx=1 is ssm.
     """
 
-    kind: CacheKind = CacheKind.SLOT
+    kind: CacheKind = CacheKind.STATE
     mamba_layer_offsets: Dict[int, int] = field(default_factory=dict)
     conv_section_bytes: Optional[List[int]] = None
     ssm_bytes_per_head: Optional[int] = None
-    built_from_v2: bool = False  # True for MambaHybridCacheManagerV2 (slot-major coalesced pools)
+    slot_major_layout: bool = (
+        False  # True when pools use slot-major interleaved storage (coalesced)
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -322,6 +324,7 @@ class MambaLayerGroup(LayerGroup):
             "pool_views": [pv.to_dict() for pv in self.pool_views],
             "conv_section_bytes": self.conv_section_bytes,
             "ssm_bytes_per_head": self.ssm_bytes_per_head,
+            "slot_major_layout": self.slot_major_layout,
         }
 
     @classmethod
@@ -375,6 +378,7 @@ class MambaLayerGroup(LayerGroup):
             ssm_bytes_per_head=int(data["ssm_bytes_per_head"])
             if data.get("ssm_bytes_per_head")
             else None,
+            slot_major_layout=bool(data.get("slot_major_layout", False)),
         )
 
 

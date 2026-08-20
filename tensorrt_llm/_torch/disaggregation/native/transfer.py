@@ -853,8 +853,8 @@ class Sender(SenderBase):
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-            # Extract regions: SLOT = per-layer ptrs, PAGED = per-block ptrs
-            if lg_info.kind == CacheKind.SLOT:
+            # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
+            if lg_info.kind == CacheKind.STATE:
                 if src_block_ids.size == 0 or dst_block_ids.size == 0:
                     continue
                 src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
@@ -1697,7 +1697,7 @@ class Receiver(ReceiverBase):
         if pt is None:
             return None
         for lg_idx, lg in enumerate(pt.layer_groups):
-            if lg.kind == CacheKind.SLOT:
+            if lg.kind == CacheKind.STATE:
                 block_ids = req_info.block_ids_per_layer_groups[lg_idx]
                 if block_ids.size > 0:
                     return int(block_ids[0])

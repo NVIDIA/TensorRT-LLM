@@ -160,9 +160,9 @@ class KVRegionExtractorV1(RegionExtractorBase):
 def _build_mamba_pool_views(conv_pool, ssm_pool, mamba_layer_offsets):
     """Build pool_views for mamba: conv at pool_idx=0, ssm at pool_idx=1.
 
-    Mamba mapper dispatch is by pool_role (not mapper_kind), so mapper_kind
-    is left as default — MambaPolicy.build_cache_mapper uses the role to
-    select ConvStateMismatchMapper vs MambaHeadMismatchMapper.
+    Conv uses mapper_kind=SECTIONED (section-level granularity for TP split),
+    SSM uses mapper_kind=INDEXED (head-level granularity). MambaPolicy.build_mapper
+    dispatches ConvStateMismatchMapper vs MambaHeadMismatchMapper accordingly.
     """
     sorted_lids = [lid for _, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])]
     return [
@@ -329,7 +329,7 @@ def _build_layer_group_for_v2_mamba(
         mamba_layer_offsets=mamba_layer_offsets,
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
-        built_from_v2=True,
+        slot_major_layout=True,
     )
     return layer_group, pool_group
 
@@ -339,7 +339,7 @@ def _build_non_kv_layers(
     layer_groups: List[LayerGroup],
     pool_groups: List[PhysicalPoolGroup],
     *,
-    v2_mamba_pool_group_idx: Optional[int] = None,
+    has_v2_mamba: bool = False,
     v2_mamba_insert_idx: Optional[int] = None,
 ) -> None:
     """Append (or insert) non-KV (recurrent/state) layer groups to the page table.
@@ -348,15 +348,14 @@ def _build_non_kv_layers(
     add elif branches here for future recurrent/state layer types.
 
     Args:
-        v2_mamba_pool_group_idx: If set, the V2 manager already placed mamba
-            pools into pool_groups at this index — reuse it instead of
-            appending a new pool group.
+        has_v2_mamba: If True, the V2 manager owns mamba layers that need
+            a dedicated pool group appended.
         v2_mamba_insert_idx: If set, insert the mamba layer group at this
             position (preserving original lifecycle ordering) instead of
             appending at the end.
     """
     if isinstance(manager, MambaHybridCacheManagerV2):
-        if v2_mamba_pool_group_idx is not None and manager.local_num_mamba_layers > 0:
+        if has_v2_mamba and manager.local_num_mamba_layers > 0:
             # Append a dedicated pool group (don't mutate the shared V2 entry).
             mamba_pg_idx = len(pool_groups)
             layer_group, local_pool_group = _build_layer_group_for_v2_mamba(manager, mamba_pg_idx)
@@ -625,7 +624,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
     layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.layer_grouping)
-    v2_mamba_pool_group_idx: Optional[int] = None
+    has_v2_mamba: bool = False
     v2_mamba_layer_group_ids: set = set()  # layer_group_ids handled by _build_non_kv_layers
 
     for pg_desc in pool_group_descs:
@@ -655,8 +654,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             if isinstance(manager, MambaHybridCacheManagerV2) and any(
                 manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
             ):
-                # Record the pool_group_idx for mamba; handled by _build_non_kv_layers later.
-                v2_mamba_pool_group_idx = storage_pg_to_list_idx[storage_pg_idx]
+                # Record that V2 mamba layers exist; handled by _build_non_kv_layers later.
+                has_v2_mamba = True
                 v2_mamba_layer_group_ids.add(layer_group_id)
                 continue
 
@@ -768,7 +767,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         manager,
         layer_groups,
         pool_groups,
-        v2_mamba_pool_group_idx=v2_mamba_pool_group_idx,
+        has_v2_mamba=has_v2_mamba,
         v2_mamba_insert_idx=min(v2_mamba_layer_group_ids) if v2_mamba_layer_group_ids else None,
     )
 

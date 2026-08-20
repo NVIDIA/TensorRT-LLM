@@ -823,7 +823,7 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
         mamba_layer_offsets=mamba_layer_offsets,
         local_layers=local_layers,
         pool_views=pool_views,
-        built_from_v2=True,
+        slot_major_layout=True,
     )
     page_table = KVCachePageTable(
         tokens_per_block=16,
@@ -982,7 +982,10 @@ def test_mixed_page_table_serialization():
     page_table = KVCachePageTable(
         tokens_per_block=16,
         layer_groups=[attn_lg, mamba_lg],
-        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 10)])],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 10)]),
+            PhysicalPoolGroup(pools=[PhysicalPool(2000, 1024, 10), PhysicalPool(3000, 2048, 10)]),
+        ],
     )
 
     d = page_table.to_dict()

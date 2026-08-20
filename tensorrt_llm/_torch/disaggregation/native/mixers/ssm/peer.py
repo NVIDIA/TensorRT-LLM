@@ -24,6 +24,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import (
+    CacheKind,
     KVCachePageTable,
     MambaLayerGroup,
     MapperKind,
@@ -382,8 +383,6 @@ class MambaPolicy:
         TP info comes from ``self._ri`` and ``peer_ri``. Per-head / per-section
         metadata comes from ``self_lg`` / ``peer_lg`` (MambaLayerGroup).
         """
-        from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-
         transfer_layers = len(self_layer_offsets)
         self_mamba_tp, self_mamba_tp_rank = MambaPolicy._mamba_tp(self._ri)
         peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
@@ -412,6 +411,8 @@ class MambaPolicy:
             )
 
         # SSM state (INDEXED): head-level granularity
+        assert self_lg.ssm_bytes_per_head is not None, "ssm_bytes_per_head required for SSM mapper"
+        assert peer_lg.ssm_bytes_per_head is not None, "ssm_bytes_per_head required for SSM mapper"
         self_nheads = self_bytes_per_layer // self_lg.ssm_bytes_per_head
         peer_nheads = peer_bytes_per_layer // peer_lg.ssm_bytes_per_head
         return MambaHeadMismatchMapper(
@@ -434,7 +435,7 @@ class MambaPolicy:
         if page_table is None:
             return None
         return next(
-            (lg for lg in page_table.layer_groups if isinstance(lg, MambaLayerGroup)),
+            (lg for lg in page_table.layer_groups if lg.kind == CacheKind.STATE),
             None,
         )
 
@@ -578,12 +579,10 @@ def mamba_payload_bytes(
     receiver_ext = KVRegionExtractorV1(receiver_page_table)
 
     sender_lg_idx = next(
-        i for i, lg in enumerate(sender_page_table.layer_groups) if isinstance(lg, MambaLayerGroup)
+        i for i, lg in enumerate(sender_page_table.layer_groups) if lg.kind == CacheKind.STATE
     )
     receiver_lg_idx = next(
-        i
-        for i, lg in enumerate(receiver_page_table.layer_groups)
-        if isinstance(lg, MambaLayerGroup)
+        i for i, lg in enumerate(receiver_page_table.layer_groups) if lg.kind == CacheKind.STATE
     )
 
     total = 0

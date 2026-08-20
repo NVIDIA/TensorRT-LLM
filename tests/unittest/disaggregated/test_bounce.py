@@ -773,7 +773,7 @@ class TestHybridK3Bounce:
         assert t._recv_alloc.reserved_sizes == [67 * _K3_MLA_BLOCK_BYTES + _K3_KDA_PAYLOAD_BYTES]
 
     def test_reserve_nonempty_slot_group_with_unknown_size_skipped(self, monkeypatch):
-        # Non-attention groups (SLOT-based) carry a slot index but their bytes
+        # Non-attention groups (STATE-based) carry a slot index but their bytes
         # are in extra_bytes — bounce skips them rather than rejecting.
         t = _make_transport(monkeypatch, block_bytes_per_group=[_K3_MLA_BLOCK_BYTES, None])
         assert t.reserve(_recv_req([2, 1]), num_writers=1) is True

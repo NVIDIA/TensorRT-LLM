@@ -296,7 +296,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         groups = []
         for idx, lg in enumerate(layer_groups):
-            if lg.kind == CacheKind.SLOT:
+            if lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
                 groups.append(
                     np.array([slot], dtype=np.int64)
@@ -386,8 +386,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             lg = pt.layer_groups[lg_id]
             for pv in lg.pool_views:
                 pool = get_physical_pool(pt, lg_id, pv.pool_idx)
-                if lg.kind == CacheKind.SLOT:
-                    # SLOT: n=1 (one slot), but transfer covers all layers.
+                if lg.kind == CacheKind.STATE:
+                    # STATE: n=1 (one slot), but transfer covers all layers.
                     num_layers = len(lg.mamba_layer_offsets)
                     total += num_layers * pool.slot_bytes
                 else:
