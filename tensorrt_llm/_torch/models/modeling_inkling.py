@@ -810,17 +810,23 @@ class InklingModel(DecoderModel):
         inputs_embeds_prenormed: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        """Decoder stack. The short-conv state pool and the context/generation
-        split come from ``attn_metadata``; a metadata without them keeps the
-        stateless conv.
+        """Decoder stack. The context/generation split over the short-conv pool
+        comes from ``attn_metadata``, the pool itself from its cache manager; a
+        metadata without them keeps the stateless conv.
 
         ``inputs_embeds_prenormed`` is set on the multimodal path, where the
         wrapper has already applied ``embed_norm`` to the text embeddings before
         scattering the raw tower rows in."""
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        conv_cache = getattr(attn_metadata, "ink_conv_cache", None)
+        # conv_rt is the gate: it is published only when the manager owns a pool
+        # and this batch has requests to map onto it.
         conv_rt = getattr(attn_metadata, "ink_conv_rt", None)
+        conv_cache = (
+            getattr(attn_metadata.kv_cache_manager, "conv_state_cache", None)
+            if conv_rt is not None
+            else None
+        )
         # Per-rank token counts for this step, set on attn_metadata only under
         # attention DP; FusedMoE reads it to pad and gather across ranks.
         all_rank_num_tokens = getattr(attn_metadata, "all_rank_num_tokens", None)

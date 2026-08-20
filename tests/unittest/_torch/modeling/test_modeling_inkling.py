@@ -959,7 +959,7 @@ def test_metadata_builds_the_runtime_itself_from_the_managers_pool():
         md._prepare_inkling_conv()
 
     assert built["args"] == (md, "POOL")
-    assert (md.ink_conv_cache, md.ink_conv_rt) == ("POOL", "RUNTIME")
+    assert md.ink_conv_rt == "RUNTIME"
 
 
 def test_metadata_ignores_a_plain_kv_manager():
@@ -968,7 +968,7 @@ def test_metadata_ignores_a_plain_kv_manager():
 
     md._prepare_inkling_conv()
 
-    assert md.ink_conv_cache is None and md.ink_conv_rt is None
+    assert md.ink_conv_rt is None
 
 
 # ---------------------------------------------------------------------------

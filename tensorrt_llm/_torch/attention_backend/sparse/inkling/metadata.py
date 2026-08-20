@@ -41,8 +41,8 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        # Short-conv pool and this forward's context/generation split.
-        self.ink_conv_cache = None
+        # This forward's context/generation split over the short-conv pool. The
+        # pool itself belongs to the cache manager and is read from there.
         self.ink_conv_rt = None
 
     def _ink_layers(self) -> List[int]:
@@ -112,9 +112,8 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
 
         cache = getattr(self.kv_cache_manager, "conv_state_cache", None)
         if cache is None or self.request_ids is None:
-            self.ink_conv_cache = self.ink_conv_rt = None
+            self.ink_conv_rt = None
             return
-        self.ink_conv_cache = cache
         self.ink_conv_rt = InklingConvRuntime.build(self, cache)
 
     def _prepare_inkling_decode(self) -> None:
