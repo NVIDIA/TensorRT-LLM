@@ -300,6 +300,11 @@ def _prepare_cute_dsl_mla_buffers(
         _get_cute_dsl_mla_buffer_layout(batch_size, padded_num_pages)
     )
     workspace_bytes = workspace.view(torch.uint8).flatten()
+    if workspace_bytes.numel() <= kernel_workspace_offset:
+        raise RuntimeError(
+            f"CuTeDSL MLA workspace has {workspace_bytes.numel()} bytes; "
+            f"staging metadata alone needs {kernel_workspace_offset} bytes."
+        )
     page_table_storage = (
         workspace_bytes[:page_table_bytes].view(torch.int32).view(batch_size, padded_num_pages)
     )
@@ -970,7 +975,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "Attention CUDA graph workspace is smaller than the "
-                    f"required size for {self._mla_backend}."
+                    f"required size for {effective_mla_backend}."
                 )
             required_workspace_numel = math.ceil(required_workspace_size / workspace.element_size())
             workspace.resize_((required_workspace_numel,))
