@@ -60,6 +60,17 @@ class _BounceProbe:
         return False
 
 
+class _LateReservationBounce(_BounceProbe):
+    """Track a reservation created after cancellation already ran cleanup."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_reservations: set[tuple[int, int]] = set()
+
+    def release_idle_reservation(self, rid_slice: tuple[int, int]) -> None:
+        self.active_reservations.discard(rid_slice)
+
+
 class _TrackingLock:
     """Record when one selected thread attempts to enter a critical section."""
 
@@ -429,3 +440,26 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     assert protocol_order == ["request_data_started", "request_data_sent", "cancel_sent"], (
         "cancellation overtook an already-authorized REQUEST_DATA publication"
     )
+
+
+@pytest.mark.cpu_only
+def test_cancel_before_dispatch_releases_late_idle_reservation() -> None:
+    rid = 81
+    receiver = _ReceiverProbe()
+    bounce = _LateReservationBounce()
+    receiver._bounce = bounce
+    session = _make_rx_session(receiver, rid)
+    task = session.prepare_receive(KVSlice(is_last_slice=True))
+    assert task is not None
+
+    assert session.cancel_local()
+
+    bounce.active_reservations.add((rid, task.slice_id))
+    with pytest.raises(RuntimeError, match="became terminal before publication"):
+        session.dispatch_prepared_receive(task)
+
+    assert bounce.active_reservations == set(), (
+        "cancel-before-dispatch left a reservation allocated after cancellation cleanup"
+    )
+    assert session.status == SessionStatus.CANCELLED
+    assert task.resources_drained
