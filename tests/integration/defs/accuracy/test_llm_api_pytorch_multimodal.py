@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import ClassVar
+
 import pytest
 
 from tensorrt_llm import LLM
@@ -612,7 +614,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # and the score sinks toward the K2.5 reference floor (see
     # references/mmmu.yaml): treat such a score with clean logs as a harness
     # failure, not a model regression.
-    EXTRA_EVALUATOR_KWARGS = dict(
+    EXTRA_EVALUATOR_KWARGS: ClassVar[dict] = dict(
         post_process_fn=extract_kimi_k3_mmmu_answer,
         preserve_caller_max_tokens=True,
     )
@@ -621,7 +623,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(7200)
     @pytest.mark.skip_less_mpi_world_size(16)
     @pytest.mark.skip_less_device_memory(140000)
-    def test_w4a16_mxfp4(self):
+    def test_w4a16_mxfp4(self) -> None:
         """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
 
         No automated L0 stage schedules 16-GPU functional tests; this case is
