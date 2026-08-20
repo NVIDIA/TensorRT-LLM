@@ -47,10 +47,21 @@ pip3 install -r ${TensorRT-LLM_PATH}/requirements-dev.txt
 This directory contains various test configuration files:
 
 ### Functional Test Lists
-- `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
-- `llm_function_multinode.txt` - Multi-node functional test cases
-- `llm_function_rtx6k.txt` - RTX 6000 series specific tests
-- `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
+
+These lists select **where a test is scheduled**: the file gives the architecture floor, and each block inside it gives an exact GPU count. They do not decide whether a test runs once it gets there — that is what the test's own skip decorators do.
+
+- `llm_func_core_base.yml` - scheduled on every GPU in the pool
+- `llm_func_core_ada.yml` - scheduled on Ada and above (`compute_capability >= 8.9`)
+- `llm_func_core_hopper.yml` - scheduled on Hopper and above (`>= 9.0`)
+- `llm_func_core_blackwell.yml` - scheduled on Blackwell and above (`>= 10.0`)
+
+Other functional lists:
+
+- `llm_func_core_review.yml` - holding area for entries whose GPU count is undeclared, one comment per entry saying why. Not run by CI; empty it by declaring the counts.
+- `llm_function_core.txt` - the flat list these replace, kept for reference
+- `llm_function_multinode.txt` - multi-node cases (tp16), parsed line-by-line by the pipeline
+- `llm_function_rtx6k.txt` - RTX 6000 series
+- `llm_function_stress.txt` - stress cases
 
 ### Performance Test Files
 - `llm_perf_full.yml` - Main performance test configuration
@@ -75,7 +86,7 @@ QA tests are executed on a regular schedule:
 - **Weekly**: Automated regression testing
 - **Release**: Comprehensive validation before each release
    - **Full Cycle Testing**:
-        run all gpu with llm_function_core.txt and run config database tests with llm_config_database.yml
+        run all gpu with the functional lists and run config database tests with llm_config_database.yml
 - **On-demand**: Manual execution for specific validation needs
 
 ## Running Tests
@@ -87,8 +98,6 @@ To run specific test categories:
 ```bash
 # direct to defs folder
 cd tests/integration/defs
-# Run all fp8 functional test
-pytest --no-header -vs --test-list=../test_lists/qa/llm_function_full.txt -k fp8
 # Run a single test case
 pytest -vs accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
 ```
@@ -104,6 +113,18 @@ QA tests are typically executed through CI/CD pipelines with appropriate test se
 ## Test Guidelines
 
 ### Adding New Test Cases
-- **Primary Location**: For functional testing, new test cases should be added to `llm_function_full.txt` first
-- **Categorization**: Test cases should be categorized based on their scope and execution time
-- **Validation**: Ensure test cases are properly validated before adding to any test list
+
+Adding a test to one of these lists is a **scheduling selection** — it says which machines the test is dispatched to, and nothing else.
+
+- **The file** is the lowest architecture you want the test dispatched to — your choice, not something read off the test's `skip_pre_*` marker. `llm_func_core_blackwell.yml` means "only schedule this where `compute_capability >= 10.0`"; `llm_func_core_base.yml` means "schedule it everywhere".
+- **The block** is how many GPUs the run needs. That number sizes the allocation, so it is the one worth getting right. At 8 GPUs there are two blocks: `terms: {placement: single_node}` if all 8 must be on one node, no `terms` if 8 ranks across any topology will do.
+
+`compute_capability` is the only architecture axis these lists express. That is deliberate — a coarse floor is the thing that stays true as the machine pool changes, so it is the only thing worth maintaining here.
+
+**The lists and the skip decorators are independent.** The list decides where a test is dispatched; decorators decide whether it runs once it gets there. Neither reads the other:
+
+- A test with no decorator runs wherever the list sends it. Nothing stops it.
+- A test whose decorator is stricter than its file is dispatched and then skips — visible in the report, and it costs only a scheduling slot.
+- Anything the list cannot express — memory, GPU name, an exact SM, NVLS — belongs in a decorator. Add as many as the test needs; they do not change which file it belongs in.
+
+Keep the in-block ordering: model tests first, then integration tests.
