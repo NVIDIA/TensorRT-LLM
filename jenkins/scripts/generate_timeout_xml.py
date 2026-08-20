@@ -208,7 +208,7 @@ def generate_timeout_xml(stage_name, testList, outputFilePath, timeout_map=None)
     xmlContent = (
         f'<?xml version="1.0" encoding="UTF-8"?><testsuites>\n'
         f'        <testsuite name="{stage_name_escaped}" errors="{num_tests}" '
-        f'failures="0" skipped="0" tests="{num_tests}" time="1.00">'
+        f'tests="{num_tests}" time="1.00">'
     )
 
     for test in testList:
