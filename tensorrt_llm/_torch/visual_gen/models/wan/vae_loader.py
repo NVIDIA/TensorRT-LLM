@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -93,6 +94,46 @@ def _warn_dequantized_nvfp4_weights(
         )
 
 
+def _validate_dynamic_weight_request(
+    *, checkpoint_is_fp4: bool, selected: set[str], dynamic_weight_quant: bool | None
+) -> None:
+    """Validate an explicit weight mode against the selected checkpoint weights."""
+    if not selected or dynamic_weight_quant is None:
+        return
+    if checkpoint_is_fp4 and dynamic_weight_quant:
+        raise ValueError(
+            "vae_quant_config weights.dynamic=true requires high-precision VAE weights, "
+            "but the selected checkpoint layers contain only packed NVFP4 weights"
+        )
+    if not checkpoint_is_fp4 and not dynamic_weight_quant:
+        raise ValueError(
+            "vae_quant_config weights.dynamic=false requires packed NVFP4 VAE weights, "
+            "but the selected checkpoint layers contain high-precision weights"
+        )
+
+
+def _resolve_input_scales(
+    selected: set[str],
+    input_scales: dict[str, float],
+    dynamic_activation_quant: bool | None,
+) -> dict[str, float]:
+    """Resolve explicit or checkpoint-driven activation quantization per layer."""
+    if dynamic_activation_quant is True:
+        return {}
+    valid_input_scales = {
+        name: scale for name, scale in input_scales.items() if math.isfinite(scale) and scale > 0
+    }
+    if dynamic_activation_quant is False:
+        missing = sorted(selected - valid_input_scales.keys())
+        if missing:
+            raise ValueError(
+                "vae_quant_config input_activations.dynamic=false requires calibrated "
+                "finite positive input scales for every selected FP4 convolution; "
+                f"missing or invalid: {missing}"
+            )
+    return valid_input_scales
+
+
 def _load_nvfp4_wan_vae(
     checkpoint_dir: str,
     device: torch.device,
@@ -100,6 +141,8 @@ def _load_nvfp4_wan_vae(
     *,
     enable_fp4: bool = True,
     quant_config: QuantConfig | None = None,
+    dynamic_weight_quant: bool | None = None,
+    dynamic_activation_quant: bool | None = None,
 ) -> nn.Module:
     """Load ModelOpt weights and replace their quantized Conv3d modules.
 
@@ -170,6 +213,17 @@ def _load_nvfp4_wan_vae(
         for name in quantized
         if quant_config is None or not quant_config.is_module_excluded_from_quantization(name)
     }
+    if enable_fp4:
+        _validate_dynamic_weight_request(
+            checkpoint_is_fp4=True,
+            selected=selected,
+            dynamic_weight_quant=dynamic_weight_quant,
+        )
+        input_scales = _resolve_input_scales(
+            selected,
+            input_scales,
+            dynamic_activation_quant,
+        )
     _warn_dequantized_nvfp4_weights(quantized, selected, enable_fp4)
     n = n_static = 0
     if enable_fp4:
@@ -229,6 +283,8 @@ def load_wan_vae(
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
     quant_config: QuantConfig | None = None,
+    dynamic_weight_quant: bool | None = None,
+    dynamic_activation_quant: bool | None = None,
 ) -> nn.Module:
     requested_algo = quant_config.quant_algo if quant_config is not None else None
     if requested_algo not in (None, QuantAlgo.NVFP4):
@@ -236,6 +292,10 @@ def load_wan_vae(
             f"Wan VAE supports only NVFP4 quantization, got {requested_algo}. "
             "Use quant_config for transformer quantization."
         )
+    if (
+        dynamic_weight_quant is not None or dynamic_activation_quant is not None
+    ) and requested_algo != QuantAlgo.NVFP4:
+        raise ValueError("VAE dynamic quantization settings require quant_algo=NVFP4")
 
     if not _use_native_wan_vae():
         if requested_algo == QuantAlgo.NVFP4:
@@ -261,6 +321,8 @@ def load_wan_vae(
             dtype,
             enable_fp4=enable_fp4,
             quant_config=quant_config,
+            dynamic_weight_quant=dynamic_weight_quant,
+            dynamic_activation_quant=dynamic_activation_quant,
         )
 
     wan_vae = _load_native_wan_vae(checkpoint_dir, device, dtype)
@@ -268,6 +330,12 @@ def load_wan_vae(
         from .wan_vae import swap_wan_convs_to_fp4
 
         selected = _select_dynamic_fp4_convs(wan_vae, quant_config)
+        _validate_dynamic_weight_request(
+            checkpoint_is_fp4=False,
+            selected=selected,
+            dynamic_weight_quant=dynamic_weight_quant,
+        )
+        _resolve_input_scales(selected, {}, dynamic_activation_quant)
         n, n_static = swap_wan_convs_to_fp4(wan_vae, only_names=selected)
         if n != len(selected):
             raise ValueError(

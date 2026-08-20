@@ -682,8 +682,10 @@ class VisualGenArgs(StrictBaseModel):
         description=(
             "VAE quantization config, independent from the transformer. "
             "Accepts QuantConfig or a ModelOpt-format dict; the latter may "
-            "use ``ignore`` to exclude matching VAE modules. ``None`` lets "
-            "the VAE checkpoint select its native precision."
+            "use ``ignore`` to exclude matching VAE modules and either "
+            "top-level ``dynamic`` for weight-plus-activation shorthand or "
+            "one ``config_groups`` entry to configure them independently. "
+            "``None`` lets the VAE checkpoint select its native precision."
         ),
     )
     compilation_config: CompilationConfig = Field(

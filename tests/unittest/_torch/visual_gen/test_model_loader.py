@@ -233,6 +233,12 @@ def test_vae_quant_config_is_independent_from_transformer(tmp_path):
             vae_quant_config={
                 "quant_algo": "NVFP4",
                 "ignore": ["decoder.up_blocks.0.*"],
+                "config_groups": {
+                    "default": {
+                        "weights": {"dynamic": False},
+                        "input_activations": {"dynamic": True},
+                    }
+                },
             },
         ),
     )
@@ -244,6 +250,76 @@ def test_vae_quant_config_is_independent_from_transformer(tmp_path):
     assert config.vae_quant_config.is_module_excluded_from_quantization(
         "decoder.up_blocks.0.resnets.0.conv1"
     )
+    assert config.vae_dynamic_weight_quant is False
+    assert config.vae_dynamic_activation_quant is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"quant_algo": "NVFP4"}, (None, None)),
+        ({"quant_algo": "NVFP4", "dynamic": True}, (True, True)),
+        ({"quant_algo": "NVFP4", "dynamic": False}, (False, False)),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {
+                    "default": {
+                        "weights": {"dynamic": False},
+                        "input_activations": {"dynamic": True},
+                    }
+                },
+            },
+            (False, True),
+        ),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {"default": {"weights": {"dynamic": True}}},
+            },
+            (True, None),
+        ),
+    ],
+)
+def test_parse_vae_dynamic_quantization_modes(raw, expected):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config, dynamic_weight, dynamic_activation = (
+        DiffusionPipelineConfig.load_vae_quant_config(raw)
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.NVFP4
+    assert (dynamic_weight, dynamic_activation) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (
+            {
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+                "config_groups": {"default": {}},
+            },
+            "cannot specify both",
+        ),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {"first": {}, "second": {}},
+            },
+            "exactly one",
+        ),
+        ({"quant_algo": "NVFP4", "dynamic": 1}, "must be a boolean"),
+        ({"quant_algo": "FP8", "dynamic": True}, "require quant_algo='NVFP4'"),
+    ],
+)
+def test_reject_invalid_vae_dynamic_quantization_modes(raw, message):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+    with pytest.raises(ValueError, match=message):
+        DiffusionPipelineConfig.load_vae_quant_config(raw)
 
 
 def test_load_wan_pipeline_basic(checkpoint_exists):
