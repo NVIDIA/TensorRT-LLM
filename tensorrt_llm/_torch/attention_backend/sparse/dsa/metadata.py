@@ -285,15 +285,21 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Pre-compile the self-sampling GVR varlen engine during warmup.
 
         Mirrors ``warmup_cute_dsl_radix_topk``. The varlen launcher is keyed
-        by the exact row count, so this warms the eager first-touch tuple
-        (bs=1) plus every configured CUDA-graph batch size — capture then
-        never depends on a prior warmup-forward having compiled its key, and
-        a live request never pays the DSL JIT for those geometries. Eager
-        batches outside ``batch_sizes`` still compile lazily on first touch.
-        No-op unless the opt-in gate (TRTLLM_GVR_SELF_SAMPLING=1) selects
-        the engine.
+        by the exact row count AND the logits row stride: rows cover the
+        eager first-touch tuple (bs=1) plus every configured CUDA-graph
+        batch size, and the stride mirrors what the active paged-MQA
+        producer emits (the DSL arena rounds the row up to 256 elements;
+        DeepGEMM is exact-width) so the warmed keys are the ones dispatch
+        actually looks up. Captured geometries are also compiled by the
+        pre-capture warmup forwards; eager batches outside ``batch_sizes``
+        still compile lazily on first touch. No-op unless the opt-in gate
+        (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
         """
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
+            return
+        # same hardware gates as the dispatch flag (indexer __init__): never
+        # compile Blackwell kernels on unsupported stacks during warmup
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() < 100:
             return
         if not self.enable_heuristic_topk or self.kv_cache_manager is None:
             return
@@ -312,15 +318,30 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         rows = {int(next_n)}
         for bs in batch_sizes or ():
             rows.add(int(bs) * int(next_n))
+        msl_c = int(self.get_indexer_max_seq_len())
+        if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
+            # mirror the DSL paged-MQA arena stride (cute_dsl_custom_ops
+            # CuteDSLPagedMQALogitsRunner: compute_block_kv=128, SPLIT_KV=
+            # 2*128 -> rows round up to 256 elements). A drift here only
+            # degrades warmup to unused keys — dispatch still lazy-JITs the
+            # true key outside capture, so it can never become incorrect.
+            row_stride = (msl_c + 255) // 256 * 256
+        else:
+            # DeepGEMM emits exact-width rows; a non-float4 width falls
+            # through at the dispatch format gate, so there is nothing to warm
+            row_stride = msl_c
+            if row_stride % 4:
+                return
         # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
         # is compressed — same multiply-back as the dispatch seam)
         try:
             _ss_host.warmup_varlen(
                 int(top_k),
-                int(self.get_indexer_max_seq_len()) * cr,
+                msl_c * cr,
                 compress_ratio=cr,
                 next_n=int(next_n),
                 num_rows_list=tuple(sorted(rows)),
+                row_stride=row_stride,
             )
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines

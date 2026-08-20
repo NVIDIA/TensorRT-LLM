@@ -1463,6 +1463,7 @@ def warmup_varlen(
     compress_ratio: int = 1,
     next_n: int = 1,
     num_rows_list: Sequence[int] = (1,),
+    row_stride: int | None = None,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -1471,6 +1472,13 @@ def warmup_varlen(
     is recorded only after every launch succeeds, so a failed or interrupted
     warmup is retried on the next call instead of short-circuiting to an
     uncompiled engine.
+
+    ``row_stride`` must be the logits row stride the serving producer will
+    emit: the launcher key includes it, so a warmup at a different stride
+    compiles a variant dispatch never looks up. Callers that know the
+    producer layout (e.g. the DSL paged-MQA arena's 256-element rounding)
+    must pass it; the 64-element default only matches producers that round
+    the same way.
     """
     dev = torch.cuda.current_device()
     nn = max(1, int(next_n))
@@ -1478,12 +1486,19 @@ def warmup_varlen(
     rows_list = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
     if not rows_list:
         return
-    key = (dev, int(top_k), int(max_seq_len), int(compress_ratio), nn, tuple(rows_list))
+    n_env = max(1, int(max_seq_len) // int(compress_ratio))
+    if row_stride is None:
+        npad = (n_env + 63) // 64 * 64
+    else:
+        npad = int(row_stride)
+        if npad < n_env or npad % 4:
+            raise RuntimeError(
+                f"row_stride must be a float4-multiple >= n_env={n_env}, got {row_stride}"
+            )
+    key = (dev, int(top_k), int(max_seq_len), int(compress_ratio), nn, tuple(rows_list), npad)
     with _VARLEN_WARMUP_LOCK:
         if key in _VARLEN_WARMUP_DONE:
             return
-    n_env = max(1, int(max_seq_len) // int(compress_ratio))
-    npad = (n_env + 63) // 64 * 64
     rows_max = rows_list[-1]
     # one allocation at the largest geometry; smaller row counts run on
     # contiguous prefix views (compile keys depend on shapes only)

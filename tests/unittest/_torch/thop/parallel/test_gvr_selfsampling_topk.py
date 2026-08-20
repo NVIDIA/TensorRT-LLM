@@ -607,3 +607,53 @@ def test_selfsampling_topk_varlen_rejects_non_fp32():
     out = torch.empty(1, 512, dtype=torch.int32, device=_DEV)
     with pytest.raises(RuntimeError, match="float32"):
         ss_host.run_varlen(logits, pre, kv, out, next_n=1, compress_ratio=4, max_seq_len=32768)
+
+
+def test_selfsampling_topk_varlen_zero_window_rows():
+    """CUDA-graph padding dummy rows: kv_lens < next_n makes every MTP-window
+    row's valid length n <= 0. The kernel must clamp those rows onto the
+    zero-work short path and pad-emit -1 for the whole row, while the normal
+    request in the same batch stays exact."""
+    torch.manual_seed(0)
+    k, nn, cr, msl = 512, 4, 4, 40000
+    kv = torch.tensor([msl, 1], dtype=torch.int32, device=_DEV)
+    rows = kv.numel() * nn
+    npad = (msl // cr + 63) // 64 * 64
+    logits = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
+    pre = torch.zeros(kv.numel(), k, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
+    torch.cuda.synchronize()
+    assert (out[nn:] == -1).all().item(), "n<=0 rows must be fully -1-padded"
+    for r in range(nn):
+        n_r = (msl - nn + r + 1) // cr
+        ref = torch.topk(logits[r, :n_r], k).values.sort().values
+        got = logits[r].gather(0, out[r].long().clamp_min(0)).sort().values
+        assert torch.equal(ref, got)
+
+
+def test_selfsampling_warmup_row_stride_matches_arena():
+    """warmup_varlen(row_stride=...) must compile the SAME launcher key the
+    dispatch derives from a column-sliced arena view (row stride wider than
+    the logical width, like the DSL paged-MQA arena's 256-element rounding).
+    msl is chosen so 64-rounding != 256-rounding: with a mismatched warmup
+    stride, capture below hits the loud not-compiled raise."""
+    k, msl = 512, 8300
+    stride = (msl + 255) // 256 * 256
+    rows = 2
+    ss_host.warmup_varlen(
+        k, msl, compress_ratio=1, next_n=1, num_rows_list=(rows,), row_stride=stride
+    )
+    arena = torch.randn(rows, stride, dtype=torch.float32, device=_DEV)
+    logits = arena[:, :msl]  # non-contiguous column slice, like serving
+    kv = torch.full((rows,), msl, dtype=torch.int32, device=_DEV)
+    pre = torch.zeros(rows, k, dtype=torch.int32, device=_DEV)
+    out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(logits, pre, kv, out, max_seq_len=msl)
+    g.replay()
+    torch.cuda.synchronize()
+    ref = torch.topk(arena[:, :msl], k, dim=1).values.sort(dim=1).values
+    got = arena.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+    assert torch.equal(ref, got)
