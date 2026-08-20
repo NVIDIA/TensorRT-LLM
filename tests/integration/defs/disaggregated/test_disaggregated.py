@@ -80,7 +80,22 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
+    if sm == 90:
+        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
+        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
+        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
+        return "^gdr_copy"
     return "^ib,gdr_copy"
+
+
+# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
+# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
+# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
+# address handles to cross-rail peers and time out, hanging the workers.
+# Drop it at import time so worker environments (copied from os.environ)
+# fall back to standard GID-based address resolution; no-op when absent.
+if get_sm_version() == 90:
+    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 def cleanup_output_files():
@@ -332,6 +347,10 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_conditional.yaml",
         "ngram":
         f"{test_configs_root}/disagg_config_ngram.yaml",
+        "sa":
+        f"{test_configs_root}/disagg_config_sa.yaml",
+        "sa_python":
+        f"{test_configs_root}/disagg_config_sa_python.yaml",
         "ctxpp2_genpp2":
         f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml",
         "ctxtp2_genpp2":
@@ -346,10 +365,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml",
         "deepseek_v3_lite_fp8_mpi":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml",
-        "deepseek_v3_lite_fp8_tp1_ucx":
-        f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_ucx.yaml",
-        "deepseek_v3_lite_fp8_tp2_ucx":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_ucx.yaml",
         "deepseek_v3_lite_fp8_nixl":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml",
         "deepseek_v3_lite_fp8_tp1":
@@ -420,8 +435,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "cancel_stress_test_large":
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
-        "llama31_8b_ucx":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
+        "llama31_8b":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
         "mamba_bs1_concurrency2":
@@ -1815,6 +1830,37 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_sa(disaggregated_test_root, llm_venv,
+                          disaggregated_example_root, llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa",
+                           env=llm_venv._new_env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
+                                 disaggregated_example_root, llama_model_root):
+    """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
+
+    NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
+    covers this split only on the C++ DEFAULT backend.
+    """
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa_python",
+                           env=llm_venv._new_env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
@@ -2020,26 +2066,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
 
 @skip_no_hopper
 @skip_arm
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
-                                                disaggregated_example_root,
-                                                llm_venv,
-                                                deepseek_v3_model_root):
-
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_tp2_ucx",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
 @skip_no_hopper
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -2057,26 +2083,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@skip_arm
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_tp1_ucx",
                            env=env,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
@@ -4117,12 +4123,10 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     setup_model_symlink(llm_venv, llama_model_root,
                         "llama-3.1-model/Llama-3.1-8B-Instruct")
 
-    config_file = get_test_config("llama31_8b_ucx", disaggregated_example_root,
+    config_file = get_test_config("llama31_8b", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,

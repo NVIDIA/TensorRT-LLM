@@ -1779,6 +1779,138 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
 
 
 # ============================================================================
+# DeepSeek streaming text preservation
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        # A delta that is itself a prefix of a tool-call start token.
+        ["Use ", "<", "div> for a block element."],
+        # A delta that ends on such a prefix after other text.
+        ["The condition is a <", " b, so it holds."],
+        # Text that starts like a start token and then diverges from it, for
+        # both of the tokens the V3.2 and V4 parsers look for.
+        ["Use <｜DSML｜function", "ality and <｜DSML｜invoke", "ality"],
+    ],
+)
+def test_deepseek_streaming_preserves_withheld_text(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
+    """Withholding a delta may delay text but must never drop it."""
+    parser = parser_cls()
+
+    streamed = "".join(
+        parser.parse_streaming_increment(delta, sample_tools).normal_text
+        for delta in deltas)
+
+    expected = "".join(deltas)
+    assert streamed == expected, f"Expected {expected!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(expected,
+                                         sample_tools).normal_text == expected
+
+
+@pytest.mark.parametrize(
+    "parser_cls, tool_call_text",
+    [
+        (
+            DeepSeekV3Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+             'get_weather\n```json\n{"location": "Tokyo"}\n```'
+             "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        ),
+        (
+            DeepSeekV31Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+             '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+        ),
+        (
+            DeepSeekV32Parser,
+            ('<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+             '<｜DSML｜parameter name="location" string="true">Tokyo'
+             "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>"),
+        ),
+        (
+            DeepSeekV4Parser,
+            ('<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+             '<｜DSML｜parameter name="location" string="true">Tokyo'
+             "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"),
+        ),
+    ],
+)
+def test_deepseek_streaming_emits_text_before_tool_call(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tool_call_text: str) -> None:
+    """Text that precedes a tool call in the same delta is content."""
+    text = "Normal text" + tool_call_text
+
+    result = parser_cls().parse_streaming_increment(text, sample_tools)
+
+    assert result.normal_text == "Normal text"
+    assert result.normal_text == parser_cls().detect_and_parse(
+        text, sample_tools).normal_text
+    assert "get_weather" in [call.name for call in result.calls if call.name]
+
+
+@pytest.mark.parametrize(
+    "parser_cls, tool_call_text",
+    [
+        (
+            DeepSeekV3Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+             'get_weather\n```json\n{"location": "Tokyo"}\n```'
+             "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        ),
+        (
+            DeepSeekV31Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+             '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+        ),
+        (
+            DeepSeekV32Parser,
+            ('<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+             '{"location": "Tokyo"}</｜DSML｜invoke></｜DSML｜function_calls>'),
+        ),
+        (
+            DeepSeekV4Parser,
+            ('<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+             '{"location": "Tokyo"}</｜DSML｜invoke></｜DSML｜tool_calls>'),
+        ),
+    ],
+)
+def test_deepseek_streaming_prefix_is_delta_independent(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tool_call_text: str) -> None:
+    """The prefix is streamed verbatim however the deltas are cut."""
+    prefix = "  Normal text  "
+    text = prefix + tool_call_text
+    splits = [
+        [text],
+        [prefix, tool_call_text],
+        [text[:8], text[8:]],
+    ]
+
+    for deltas in splits:
+        parser = parser_cls()
+        results = [
+            parser.parse_streaming_increment(delta, sample_tools)
+            for delta in deltas
+        ]
+        streamed = "".join(result.normal_text for result in results)
+        names = [
+            call.name for result in results for call in result.calls
+            if call.name
+        ]
+
+        assert streamed == prefix, f"{deltas!r} streamed {streamed!r}"
+        assert names == ["get_weather"], f"{deltas!r} called {names!r}"
+
+
+# ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
 

@@ -17,6 +17,10 @@
 from .filtered_top_k_decode_varlen import FilteredTopKKernelVarlenDecode
 from .filtered_top_k_varlen_util import FilteredTopKKernelVarlen
 from .gvr_topk_decode import GvrParams, GvrTopKKernel
+from .gvr_topk_decode_direct import DirectTopKKernel
+from .gvr_topk_decode_dispatch import is_tiered_topk_supported, tiered_topk
+from .gvr_topk_decode_reg import GvrRegKernel
+from .gvr_topk_decode_tp import GvrTpKernel
 from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel
 
 __all__ = [
@@ -25,4 +29,9 @@ __all__ = [
     "FilteredTopKKernelVarlenDecode",
     "GvrParams",
     "GvrTopKKernel",
+    "GvrTpKernel",
+    "GvrRegKernel",
+    "DirectTopKKernel",
+    "tiered_topk",
+    "is_tiered_topk_supported",
 ]

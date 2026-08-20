@@ -560,8 +560,6 @@ def multimodal_model_root(request, llm_venv):
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
     tllm_model_name = request.param
-    if "VILA" in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), "vila")
     if "cogvlm-chat" in tllm_model_name:
         models_root = os.path.join(llm_models_root(), "cogvlm-chat")
     if "video-neva" in tllm_model_name:
@@ -579,8 +577,6 @@ def multimodal_model_root(request, llm_venv):
 
     if "llava-onevision" in tllm_model_name and "video" in tllm_model_name:
         multimodal_model_root = multimodal_model_root[:-6]
-    elif "llava-v1.6" in tllm_model_name and "vision-trtllm" in tllm_model_name:
-        multimodal_model_root = multimodal_model_root[:-14]
 
     assert os.path.exists(
         multimodal_model_root
@@ -649,13 +645,6 @@ def llm_gpt2_starcoder_model_root(llm_venv, request):
     return starcoder_model_root
 
 
-@pytest.fixture(scope="module")
-@cached_in_llm_models_root("starcoder2-3b", True)
-def llm_gpt2_starcoder2_model_root():
-    "get starcoder2-3b"
-    raise RuntimeError("starcoder2-3b must be cached")
-
-
 @pytest.fixture(scope="function")
 def starcoder_model_root(request):
     models_root = llm_models_root()
@@ -664,8 +653,6 @@ def starcoder_model_root(request):
         starcoder_model_root = os.path.join(models_root, "starcoder-model")
     elif request.param == "starcoder2-15b":
         starcoder_model_root = os.path.join(models_root, "starcoder2-model")
-    elif request.param == "starcoder2-3b":
-        starcoder_model_root = os.path.join(models_root, "starcoder2-3b")
     elif request.param == "starcoderplus":
         starcoder_model_root = os.path.join(models_root, "starcoderplus")
 
@@ -998,10 +985,6 @@ def llm_lora_model_root(request):
         elif item == "Upcycled-Qwen1.5-MoE2.7B-LoRA":
             model_root_list.append(
                 os.path.join(models_root, "Upcycled-Qwen1.5-MoE2.7B-LoRA"))
-        elif item == "Phi-3-mini-4k-instruct-ru-lora":
-            model_root_list.append(
-                os.path.join(models_root, "lora", "phi",
-                             "Phi-3-mini-4k-instruct-ru-lora"))
         elif item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
@@ -1122,26 +1105,6 @@ def llm_gptneox_model_root(llm_venv):
     gptneox_model_root = os.path.join(workspace, "gpt-neox-20b")
 
     return gptneox_model_root
-
-
-@pytest.fixture(scope="function")
-def llm_phi_model_root(request):
-    "return phi model root"
-    models_root = llm_models_root()
-    assert models_root, "Did you set LLM_MODELS_ROOT?"
-
-    if "Phi-3.5" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3.5/" + request.param)
-    elif "Phi-3" in request.param:
-        phi_model_root = os.path.join(models_root, "Phi-3/" + request.param)
-    else:
-        phi_model_root = os.path.join(models_root, request.param)
-
-    assert os.path.exists(
-        phi_model_root
-    ), f"{phi_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
-
-    return phi_model_root
 
 
 @pytest.fixture(scope="module")
@@ -1887,6 +1850,16 @@ def pytest_addoption(parser):
         "This helps identify which test was running when a timeout or crash occurs. "
         "Only used with --periodic-junit.",
     )
+    parser.addoption(
+        "--periodic-hang-traceback",
+        action="store_true",
+        default=False,
+        help=
+        "Dump every thread's stack to hang_traceback.txt when a test overruns its "
+        "timeout or the process is signalled (default: False). This turns an empty "
+        "'Test terminated unexpectedly' record into a diagnosable hang stack. "
+        "Only used with --periodic-junit.",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2018,6 +1991,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
+                                                   default=False)
 
         # Create output directory early (like --junitxml does) to avoid conflicts with other plugins
         # that may need to write to the same directory (e.g., pytest-split)
@@ -2035,6 +2010,7 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            dump_hang_traceback=periodic_hang_traceback,
         )
 
         # Configure and register the reporter
@@ -2047,6 +2023,7 @@ def pytest_configure(config):
         )
         print_info(f"  Batch size: {periodic_batch_size} tests")
         print_info(f"  Save unfinished test: {periodic_save_unfinished_test}")
+        print_info(f"  Hang traceback: {periodic_hang_traceback}")
     elif periodic and not output_dir:
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "

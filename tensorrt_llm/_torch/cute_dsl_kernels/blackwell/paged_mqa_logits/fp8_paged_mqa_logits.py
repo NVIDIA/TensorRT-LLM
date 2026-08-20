@@ -1283,7 +1283,7 @@ class FP8MQALogitsKernel:
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
-                w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
                 while has_work:
@@ -1518,7 +1518,7 @@ class FP8MQALogitsKernel:
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
-                w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
                 while has_work:
