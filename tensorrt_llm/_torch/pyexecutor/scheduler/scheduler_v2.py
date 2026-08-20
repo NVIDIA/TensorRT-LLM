@@ -730,11 +730,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         Last-resort defer (return 0): if the block starts at the chunk's
         left boundary (snap-down would zero the chunk anyway), defer the
         request. We never let a bidirectional MM block straddle a chunk
-        boundary — it would silently break attention correctness.
+        boundary — it would silently break attention correctness. Deferring
+        is only legitimate while the *current* budget is the constraint: a
+        later iteration with a fresh budget can then grant the snap-up.
 
-        Raises ``ValueError`` if the block itself exceeds max_context_length —
-        no chunk size can fit it, deferring would livelock; surface the
-        config error loudly rather than spin silently.
+        Raises ``ValueError`` when no iteration could ever grant the chunk —
+        either the block itself exceeds max_context_length, or snap-down is
+        impossible and the required snap-up exceeds the largest budget the
+        scheduler can ever offer. Deferring in those cases livelocks the
+        request, so surface the config error loudly rather than spin silently.
 
         Gated on ``mm_bidirectional_blocks`` written by the input processor —
         causal-MM models (Llava, Qwen-VL) skip this entirely.
@@ -850,6 +854,31 @@ class KVCacheV2Scheduler(RequestScheduler):
             down_block_start = block_start_abs
 
         if down_block_start <= lo:
+            # Snap-down cannot produce a non-empty chunk, so this request can
+            # only ever advance by snapping *up* to ``up_chunk_size``. Deferring
+            # buys a fresh budget next iteration, which helps only while the
+            # shortfall is transient (other requests are holding the budget).
+            # Against the scheduler's own ceiling it is a livelock: every future
+            # iteration recomputes the same impossible chunk, and the request
+            # sits at 0% progress holding its memory until the caller gives up.
+            ceilings = [
+                limit
+                for limit in (self.max_num_tokens, self.max_context_length)
+                if limit is not None
+            ]
+            budget_ceiling = min(ceilings) if ceilings else None
+            if budget_ceiling is not None and up_chunk_size > budget_ceiling:
+                raise ValueError(
+                    f"req {req.py_request_id}: bidirectional multimodal block "
+                    f"[{block_start_abs}, {block_end_abs}) starts at the left edge of the "
+                    f"pending chunk (context position {lo}), so it can only be scheduled by "
+                    f"extending the chunk to {up_chunk_size} tokens — more than the "
+                    f"{budget_ceiling}-token per-iteration ceiling "
+                    f"(max_num_tokens={self.max_num_tokens}, "
+                    f"max_context_length={self.max_context_length}). No future iteration can "
+                    f"grant a larger chunk, so deferring would livelock. Increase "
+                    f"max_num_tokens to at least {up_chunk_size}."
+                )
             logger.warning(
                 "req %s: MM block at chunk left edge "
                 "(lo=%s, block=[%s, %s)); snap-up does not fit "

@@ -34,6 +34,7 @@ left unchanged — audio tower refactor (Conformer migration) is a follow-up.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import unittest
 from copy import deepcopy
@@ -260,6 +261,41 @@ def _make_keyed_audio_param(item_hashes: list[list[int]]) -> MultimodalParams:
 _ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
+@contextlib.contextmanager
+def true_fp32_matmuls():
+    """Run the body with TF32 tensor cores off, so ``float32`` really is fp32.
+
+    The equivalence tests below build the tower in ``torch.float32`` precisely so
+    that two mathematically identical paths can be compared without precision
+    noise.  TF32 defeats that: it is on by default in this container
+    (``torch.backends.cuda.matmul.fp32_precision == "tf32"``) and silently
+    rounds fp32 matmul inputs to a 10-bit mantissa, so a kernel that tiles
+    differently for a different batch shape returns a different -- not merely
+    reordered -- result.
+
+    Measured on H200 (SM90) for the batched-vs-looped tower comparison:
+
+        TF32 on   max_abs 9.82e-3   (vs. outputs of magnitude ~76, i.e. ~3e-4
+                                     relative -- one TF32 ULP)
+        TF32 off  max_abs 1.14e-5   (passes the unchanged atol=1e-4)
+
+    So the tolerance was never wrong; the arithmetic underneath it was not the
+    fp32 the test asked for.  Production runs this tower in bfloat16 and is
+    unaffected either way.
+    """
+    matmul, cudnn = (
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+    )
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul
+        torch.backends.cudnn.allow_tf32 = cudnn
+
+
 def _make_dummy_pixel_input(vision_cfg, B=1, side=6, dtype=torch.float32, device="cuda"):
     """Match the smoke ``gemma4_vision_smoke.py:make_dummy_input`` contract.
 
@@ -455,23 +491,44 @@ class TestGemma4VisionTower(unittest.TestCase):
         B = 3
         pv_batched, pos_batched, output_length = _make_dummy_pixel_input(vision_cfg, B=B)
 
-        # Path 1 (legacy): per-image loop, B=1 each, then concat.
-        per_image = []
-        with torch.inference_mode():
-            for i in range(B):
-                out_i = trt_tower(
-                    pv_batched[i : i + 1],
-                    pos_batched[i : i + 1],
-                    output_length=output_length,
-                ).last_hidden_state
-                per_image.append(out_i)
-        looped = torch.cat(per_image, dim=0)
+        # This is the one comparison in the class that changes the *batch shape*
+        # between the two paths, so it is the one TF32 tiling can separate; see
+        # ``true_fp32_matmuls``.
+        with true_fp32_matmuls():
+            # Path 1 (legacy): per-image loop, B=1 each, then concat.
+            per_image = []
+            with torch.inference_mode():
+                for i in range(B):
+                    out_i = trt_tower(
+                        pv_batched[i : i + 1],
+                        pos_batched[i : i + 1],
+                        output_length=output_length,
+                    ).last_hidden_state
+                    per_image.append(out_i)
+            looped = torch.cat(per_image, dim=0)
 
-        # Path 2 (new): single batched call.
-        with torch.inference_mode():
-            batched = trt_tower(
-                pv_batched, pos_batched, output_length=output_length
-            ).last_hidden_state
+            # Path 2 (new): single batched call.
+            with torch.inference_mode():
+                batched = trt_tower(
+                    pv_batched, pos_batched, output_length=output_length
+                ).last_hidden_state
+
+            # The property this test exists to guard is that image i's output
+            # does not depend on image j's *content*.  That is exact regardless
+            # of tiling, so assert it bitwise rather than inferring it from the
+            # loop-vs-batched delta: hold image 0 fixed, redraw the others.
+            perturbed = pv_batched.clone()
+            torch.manual_seed(1234)
+            perturbed[1:] = torch.randn_like(perturbed[1:])
+            with torch.inference_mode():
+                batched_perturbed = trt_tower(
+                    perturbed, pos_batched, output_length=output_length
+                ).last_hidden_state
+        self.assertTrue(
+            torch.equal(batched[:output_length], batched_perturbed[:output_length]),
+            "image 0's rows changed when only images 1..B-1 changed: attention is "
+            "crossing image boundaries",
+        )
 
         # Shape must match (both flat, N_valid_total = B * output_length when
         # all images have full validity, as in this dummy input).
@@ -1106,7 +1163,12 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
 def _get_model_path():
     llm_models_root = os.environ.get("LLM_MODELS_ROOT")
     if llm_models_root:
-        return os.path.join(llm_models_root, "gemma4/gemma-4-26B-A4B-it")
+        # Canonical subdir is "gemma", not "gemma4": tests/test_common/llm_data.py
+        # maps "google/gemma-4-26B-A4B-it" -> "gemma/gemma-4-26B-A4B-it", and the
+        # sibling dummy-smoke module resolves it the same way. Under "gemma4" this
+        # gate never opened on a correctly laid-out models root, so the whole
+        # real-checkpoint input-processor class reported a passing skip.
+        return os.path.join(llm_models_root, "gemma/gemma-4-26B-A4B-it")
     return None
 
 
@@ -1200,6 +1262,72 @@ class TestGemma4InputProcessor(unittest.TestCase):
         img_data = mm_data["multimodal_data"]["image"]
         self.assertIn("pixel_values", img_data)
         self.assertEqual(img_data["pixel_values"].dim(), 3)
+
+    def test_pixel_values_keep_processor_precision(self):
+        """``pixel_values`` must not be rounded to the model dtype here.
+
+        Gemma 4 applies no normalization in the processor and scales in model
+        code instead: ``Gemma4VisionPatchEmbedder.forward`` computes
+        ``2 * (pixel_values - 0.5)`` and only *then* casts to the weight dtype
+        (reference ``modeling_gemma4.py`` lines 567-568).  Rescaled pixels live
+        in ``[0, 1]``, so ``x - 0.5`` is a cancelling subtraction: rounding the
+        input to bfloat16 first snaps it to a ~0.0039 grid and throws away
+        precisely the bits the subtraction exposes.
+
+        Regression for a real defect: the input processor used to cast the whole
+        processor output with ``.to(dtype=self.dtype)``.  On the checkpoint's own
+        image that perturbed 50.4 % of pixel elements with up to 98.4 %
+        per-element relative error, and it hit image requests only -- which is
+        why every text gate passed while the image path carried an order of
+        magnitude more logit error.  Layer-substituting replay tests cannot see
+        it, because they overwrite the tower's input downstream of the embedder.
+        """
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        proc = self._make_processor()
+        self.assertEqual(proc.dtype, torch.bfloat16, "this checkpoint is the BF16 baseline")
+
+        rng = np.random.default_rng(0)
+        img = Image.fromarray(rng.integers(0, 255, (224, 224, 3), dtype=np.uint8))
+        prompt = proc._processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Hi."}]}],
+            add_generation_prompt=True,
+        )
+        _, mm_data = proc(
+            {"prompt": prompt, "multi_modal_data": {"image": [img]}},
+            SamplingParams(max_tokens=4),
+        )
+        pixels = mm_data["multimodal_data"]["image"]["pixel_values"]
+
+        self.assertNotEqual(
+            pixels.dtype,
+            proc.dtype,
+            "pixel_values were rounded to the model dtype before the patch "
+            "embedder's cancelling `2 * (x - 0.5)`; the embedder casts after "
+            "the affine on purpose",
+        )
+        self.assertTrue(pixels.dtype.is_floating_point)
+        # The cast must still happen -- just later, inside the embedder. Driving
+        # the two orderings from this very tensor shows why the order matters,
+        # so the test fails loudly rather than merely asserting a dtype.
+        deferred = (2 * (pixels.float() - 0.5)).to(proc.dtype).float()
+        eager_round = (2 * (pixels.float().to(proc.dtype) - 0.5)).to(proc.dtype).float()
+        self.assertFalse(
+            torch.equal(deferred, eager_round),
+            "rounding before vs after the affine should differ on real pixels; "
+            "if they agree this test can no longer detect the regression",
+        )
+        nonzero = deferred.abs() > 0
+        worst = ((eager_round[nonzero] - deferred[nonzero]).abs() / deferred[nonzero].abs()).max()
+        self.assertGreater(
+            float(worst),
+            0.1,
+            "expected the premature rounding to cost >10% on some element",
+        )
 
     def test_image_token_expansion(self):
         """Chat template expands <image> placeholder to image tokens."""
@@ -1489,11 +1617,9 @@ class TestGemma4InputProcessor(unittest.TestCase):
 # follow-up work.
 
 
-_GEMMA4_E2E_PATH = (
-    os.path.join(os.environ["LLM_MODELS_ROOT"], "gemma4/gemma-4-26B-A4B-it")
-    if os.environ.get("LLM_MODELS_ROOT")
-    else None
-)
+# Same canonical-subdir correction as ``_get_model_path`` above: "gemma", not
+# "gemma4" (tests/test_common/llm_data.py).
+_GEMMA4_E2E_PATH = MODEL_26B_PATH
 
 
 def _gemma4_e2e_model_available() -> bool:

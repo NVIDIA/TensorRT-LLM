@@ -48,7 +48,7 @@ _GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma")
 
 # Imported after the module-level skip guard so that collecting this module on
 # a machine without LLM_MODELS_ROOT does not pull in the runtime import.
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
+from tensorrt_llm.llmapi import LLM, CudaGraphConfig, KvCacheConfig, SamplingParams  # noqa: E402
 
 # These dummy models are tiny, but the default KV-cache fraction sizes the pool
 # to most of the (very large B200) device memory, leaving nothing for the other
@@ -208,6 +208,50 @@ def test_e2e_text_26b_dummy():
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
             assert len(output[0].outputs[0].token_ids) > 0
+    finally:
+        shutil.rmtree(dummy_dir, ignore_errors=True)
+
+
+@requires_gemma4_transformers
+@pytest.mark.parametrize("overlap", [False, True], ids=["ovl0", "ovl1"])
+def test_e2e_text_26b_dummy_cuda_graph_past_sliding_window(overlap):
+    """CUDA graph replay over a KVCacheManagerV2 sliding window that evicts.
+
+    Regression for two defects that only appear together on the hybrid model
+    (two attention geometries -> two FlashInfer wrapper sets, two V2 pools):
+
+    * V2 marks blocks a sliding-window request no longer owns with
+      ``BAD_PAGE_INDEX`` (-1). FlashInfer dereferences every page a request's
+      indptr range spans, so those entries were an illegal access -- hit
+      immediately by graph capture, whose dummy requests run at ``max_seq_len``.
+    * ``prepare()`` deferred ``plan()`` to ``forward_impl`` for multi-wrapper
+      models, but graph replay never re-enters ``forward_impl``, so the
+      replayed decode ran against a plan that had been invalidated and never
+      refreshed, and the kernel never retired.
+
+    Generating well past ``sliding_window`` with graphs enabled covers both.
+    """
+    dummy_dir = _make_dummy_config_dir(MODEL_PATHS["26B"])
+    try:
+        # sliding_window is 256 in the shrunk config, so 400 new tokens force
+        # the sliding pool to evict while the global pool keeps every block.
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            max_batch_size=2,
+            max_seq_len=1024,
+            kv_cache_config=_KV_CACHE_CONFIG,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2], enable_padding=False),
+            disable_overlap_scheduler=not overlap,
+        )
+        with llm:
+            output = llm.generate(
+                ["Hello"], SamplingParams(max_tokens=400, temperature=0.0, top_k=1)
+            )
+            assert len(output) == 1
+            assert len(output[0].outputs[0].token_ids) == 400
     finally:
         shutil.rmtree(dummy_dir, ignore_errors=True)
 
