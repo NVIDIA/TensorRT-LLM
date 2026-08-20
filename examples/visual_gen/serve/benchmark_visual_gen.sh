@@ -141,14 +141,16 @@ echo "  Command: ${SERVER_CMD}"
 SERVER_LOG="${RESULT_DIR}/server.log"
 mkdir -p "${RESULT_DIR}"
 
-$SERVER_CMD > "$SERVER_LOG" 2>&1 &
-SERVER_PID=$!
 # Route SIGINT and SIGTERM through exit instead of Bash's signal-dependent
 # default handling. This guarantees the EXIT cleanup and preserves the
 # conventional caller-visible statuses, 130 and 143.
+SERVER_PID=
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+$SERVER_CMD > "$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
 
 echo "  Server PID: $SERVER_PID"
 echo "  Server log: $SERVER_LOG"

@@ -269,8 +269,11 @@ def test_worker_kills_itself_if_coordinator_exits_before_registration() -> None:
 def test_process_watchdog_kills_worker_when_watched_process_exits() -> None:
     watched_pid = os.fork()
     if watched_pid == 0:
-        while True:
-            signal.pause()
+        try:
+            while True:
+                signal.pause()
+        finally:
+            os._exit(1)
 
     read_fd, write_fd = os.pipe()
     worker_pid = os.fork()
