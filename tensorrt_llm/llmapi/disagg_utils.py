@@ -5,7 +5,6 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
-from os import PathLike
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
@@ -73,38 +72,6 @@ def _extract_internal_request_auth_key(
         top_level_key = section_keys[0][1]
 
     return top_level_key
-
-
-def _validate_disagg_config(schedule_style: str, context_servers: dict,
-                            generation_servers: dict) -> None:
-    valid_schedule_styles = {"context_first", "generation_first"}
-    if schedule_style not in valid_schedule_styles:
-        raise ValueError(
-            f"schedule_style must be one of {sorted(valid_schedule_styles)}, "
-            f"got {schedule_style!r}")
-
-    for server_group, server_config in (
-        ("context_servers", context_servers),
-        ("generation_servers", generation_servers),
-    ):
-        cache_transceiver_config = server_config.get("cache_transceiver_config")
-        if cache_transceiver_config is None:
-            continue
-        if not isinstance(cache_transceiver_config, dict):
-            raise ValueError(
-                f"{server_group}.cache_transceiver_config must be a mapping, "
-                f"got {type(cache_transceiver_config).__name__}")
-        if "enable_pipelined_transfer" not in cache_transceiver_config:
-            continue
-        enable_pipelined_transfer = validate_config_bool(
-            cache_transceiver_config["enable_pipelined_transfer"],
-            f"{server_group}.cache_transceiver_config.enable_pipelined_transfer"
-        )
-        if (enable_pipelined_transfer and schedule_style != "generation_first"):
-            raise ValueError(
-                f"{server_group}.cache_transceiver_config."
-                "enable_pipelined_transfer=True requires top-level "
-                "schedule_style='generation_first'.")
 
 
 class ServerRole(IntEnum):
@@ -258,18 +225,11 @@ def get_ctx_gen_server_addrs(
     return ctx_server_urls, gen_server_urls
 
 
-def parse_disagg_config_file(yaml_config_file: str | PathLike[str],
-                             schedule_style_override: Optional[str] = None):
+def parse_disagg_config_file(yaml_config_file: str):
 
     with open(yaml_config_file, 'r') as file:
 
         config = yaml.safe_load(file)
-        if config is None:
-            raise ValueError(
-                f"Disaggregated config file is empty: {yaml_config_file}")
-        if schedule_style_override is not None:
-            config["schedule_style"] = schedule_style_override
-
         disagg_server_config = extract_disagg_cfg(**config)
 
         return disagg_server_config
@@ -321,8 +281,6 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                 # Inherit the value from the top-level
                 servers[key] = value
 
-    _validate_disagg_config(schedule_style, context_servers, generation_servers)
-
     server_configs = []
     disagg_cluster_config = None
     ctx_router_config = extract_router_config(context_servers)
@@ -360,7 +318,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
             raise ValueError(
                 f"node_id must be in range [0, {node_id_space}), got {node_id}")
         config.node_id = node_id
-    config.schedule_style = schedule_style
+    if schedule_style:
+        config.schedule_style = schedule_style
     config.allow_request_chat_template = validate_config_bool(
         allow_request_chat_template, "allow_request_chat_template")
     config.gen_strip_message_history = gen_strip_message_history

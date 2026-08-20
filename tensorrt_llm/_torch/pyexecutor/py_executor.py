@@ -5574,6 +5574,21 @@ class PyExecutor:
                 raise ValueError("Token ID out of range")
 
     def _validate_request(self, request: LlmRequest):
+        # Validate pipelined kv cache transfer configs
+        disagg_params = request.py_disaggregated_params
+        if (self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.pipeline_transfer_enabled
+                and disagg_params is not None and request.llm_request_type
+                == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY):
+            if request.py_beam_width != 1:
+                raise ValueError(
+                    "enable_pipelined_transfer requires beam_width == 1, got "
+                    f"{request.py_beam_width}.")
+            if disagg_params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
+                raise ValueError(
+                    "enable_pipelined_transfer requires "
+                    "schedule_style='generation_first' on the request.")
+
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
