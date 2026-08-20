@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    CustomAttentionMask,
+    PredefinedAttentionMask,
+)
 
 from .interface import Fmha
 
@@ -37,6 +42,8 @@ class FmhaParams:
     workspace: torch.Tensor
     attention_input: Optional[torch.Tensor] = None
     qkv_input: Optional[torch.Tensor] = None
+    key_input: Optional[torch.Tensor] = None
+    value_input: Optional[torch.Tensor] = None
     context_buf: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
     context_lengths: Optional[torch.Tensor] = None
@@ -202,6 +209,12 @@ class PhasedFmha(Fmha):
 
             params.attention_input = q[token_offset : token_offset + num_ctx_tokens]
             params.qkv_input = params.attention_input
+            params.key_input = (
+                k[token_offset : token_offset + num_ctx_tokens] if k is not None else None
+            )
+            params.value_input = (
+                v[token_offset : token_offset + num_ctx_tokens] if v is not None else None
+            )
             params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]
@@ -239,6 +252,12 @@ class PhasedFmha(Fmha):
 
             params.attention_input = q[token_offset : token_offset + num_gen_tokens]
             params.qkv_input = params.attention_input
+            params.key_input = (
+                k[token_offset : token_offset + num_gen_tokens] if k is not None else None
+            )
+            params.value_input = (
+                v[token_offset : token_offset + num_gen_tokens] if v is not None else None
+            )
             params.context_buf = out_tensor[token_offset : token_offset + num_gen_tokens]
             params.sequence_lengths = sequence_length[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
@@ -251,6 +270,13 @@ class PhasedFmha(Fmha):
             if attn.is_mla_enable:
                 self.run_mla_generation(params)
             else:
+                # The custom mask covers only the context portion of a mixed batch.
+                if (
+                    not metadata.is_cross
+                    and params.fwd.attention_mask == CustomAttentionMask.CUSTOM
+                ):
+                    params.fwd.attention_mask = PredefinedAttentionMask.CAUSAL
+                    params.fwd.attention_mask_data = None
                 self.run_generation(params)
 
     def run_context(self, params: FmhaParams) -> None:

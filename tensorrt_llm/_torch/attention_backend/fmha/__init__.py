@@ -21,6 +21,7 @@ from .interface import Fmha, FmhaPhase
 from .msa_sparse_gqa import MsaSparseGqaFmha
 from .phased import FmhaParams, PhasedFmha
 from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
+from .triton_custom_mask import TritonCustomMaskFmha
 
 __all__ = [
     "DEFAULT_FMHA_LIBS",
@@ -35,5 +36,6 @@ __all__ = [
     "FmhaPhase",
     "MsaSparseGqaFmha",
     "PhasedFmha",
+    "TritonCustomMaskFmha",
     "get_enabled_fmha_lib_classes",
 ]

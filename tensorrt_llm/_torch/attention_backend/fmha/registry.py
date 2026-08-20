@@ -20,6 +20,7 @@ from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
+from .triton_custom_mask import TritonCustomMaskFmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
@@ -34,6 +35,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .msa_sparse_gqa import MsaSparseGqaFmha
 
     return {
+        "triton_custom_mask": TritonCustomMaskFmha,
         "cute_dsl_mla": CuteDslMlaFmha,
         "msa_sparse_gqa": MsaSparseGqaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
