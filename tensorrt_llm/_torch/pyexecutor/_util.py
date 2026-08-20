@@ -623,14 +623,13 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
-        # Checked here because this is the one place that sees the resolved
-        # kv_cache_config -- model defaults already deep-merged with the user's
-        # settings -- alongside llm_args.
+        # Inkling's short-conv window is per-request state outside the KV
+        # cache, and a reused prefix has none to restore. Checked here because
+        # this is the one place that sees the resolved kv_cache_config -- model
+        # defaults already deep-merged with the user's settings.
         reject_unsupported_inkling_kv_cache_features(
             model_config.pretrained_config,
             enable_block_reuse=kv_cache_config.enable_block_reuse,
-            enable_chunked_prefill=bool(
-                getattr(self._llm_args, "enable_chunked_prefill", False)),
             enable_cache_transceiver=(self._cache_transceiver_config is not None
                                       and self._cache_transceiver_config.backend
                                       is not None))

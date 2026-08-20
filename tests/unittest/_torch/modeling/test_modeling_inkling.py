@@ -127,33 +127,6 @@ def test_model_defaults_pin_v2_and_disable_block_reuse():
 # and InklingConvRuntime seeds every context request with
 # has_initial_state=False. Neither raises on its own -- both emit wrong logits.
 # ---------------------------------------------------------------------------
-def test_block_reuse_is_rejected_not_merely_defaulted_off():
-    """An explicit enable_block_reuse=True wins the deep-merge over the model
-    default, so the default alone cannot be the guarantee."""
-    from tensorrt_llm._torch.pyexecutor.config_utils import (
-        reject_unsupported_inkling_kv_cache_features,
-    )
-
-    with pytest.raises(NotImplementedError, match="block reuse"):
-        reject_unsupported_inkling_kv_cache_features(
-            InklingConfig(), enable_block_reuse=True, enable_chunked_prefill=False
-        )
-
-
-def test_chunked_prefill_is_rejected():
-    """slots_for keeps a request's pool row across chunks and causal_conv1d_fn
-    does write the trailing window into it, but a second chunk still declares
-    has_initial_state=False, so the carried window is never consumed."""
-    from tensorrt_llm._torch.pyexecutor.config_utils import (
-        reject_unsupported_inkling_kv_cache_features,
-    )
-
-    with pytest.raises(NotImplementedError, match="chunked prefill"):
-        reject_unsupported_inkling_kv_cache_features(
-            InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=True
-        )
-
-
 def test_disaggregated_serving_is_rejected():
     """The C++ transceiver route is already refused for every V2 manager, but
     the Python one (KvCacheTransceiverV2) is not. It would move the paged KV and
@@ -167,27 +140,22 @@ def test_disaggregated_serving_is_rejected():
         reject_unsupported_inkling_kv_cache_features(
             InklingConfig(),
             enable_block_reuse=False,
-            enable_chunked_prefill=False,
             enable_cache_transceiver=True,
         )
 
     # Default off: an aggregate deployment pays nothing.
-    reject_unsupported_inkling_kv_cache_features(
-        InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=False
-    )
+    reject_unsupported_inkling_kv_cache_features(InklingConfig(), enable_block_reuse=False)
 
 
 def test_the_supported_configuration_is_accepted():
-    """Both off -- what every Inkling accuracy run measured -- must stay silent,
-    including on the text sub-config the KV cache is sized from."""
+    """The default configuration must stay silent, including on the text
+    sub-config the KV cache is sized from."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         reject_unsupported_inkling_kv_cache_features,
     )
 
     for cfg in (InklingConfig(), InklingTextConfig()):
-        reject_unsupported_inkling_kv_cache_features(
-            cfg, enable_block_reuse=False, enable_chunked_prefill=False
-        )
+        reject_unsupported_inkling_kv_cache_features(cfg, enable_block_reuse=False)
 
 
 def test_the_rejection_is_scoped_to_inkling():
@@ -198,31 +166,67 @@ def test_the_rejection_is_scoped_to_inkling():
     )
 
     not_inkling = SimpleNamespace(model_type="llama")
-    reject_unsupported_inkling_kv_cache_features(
-        not_inkling, enable_block_reuse=True, enable_chunked_prefill=True
-    )
+    reject_unsupported_inkling_kv_cache_features(not_inkling, enable_block_reuse=True)
 
 
-def test_the_rejection_names_both_features_separately():
-    """Two independent causes; a user who hits both must not have to re-run to
-    discover the second. Block reuse is reported first because it is the one a
-    user can hit without asking for it (the framework default is True)."""
+def test_block_reuse_is_rejected_not_merely_defaulted_off():
+    """An explicit enable_block_reuse=True wins the deep-merge over the model
+    default, so the default alone cannot be the guarantee.
+
+    A prefix hit still has no conv window to restore."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         reject_unsupported_inkling_kv_cache_features,
     )
 
-    with pytest.raises(NotImplementedError) as first:
-        reject_unsupported_inkling_kv_cache_features(
-            InklingConfig(), enable_block_reuse=True, enable_chunked_prefill=True
-        )
-    assert "block reuse" in str(first.value)
-    assert "enable_block_reuse=False" in str(first.value)
+    with pytest.raises(NotImplementedError, match="block reuse"):
+        reject_unsupported_inkling_kv_cache_features(InklingConfig(), enable_block_reuse=True)
 
-    with pytest.raises(NotImplementedError) as second:
-        reject_unsupported_inkling_kv_cache_features(
-            InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=True
-        )
-    assert "enable_chunked_prefill=False" in str(second.value)
+
+def test_chunked_prefill_is_supported_and_no_longer_refused():
+    """The raise came out once the feature was validated, not before.
+
+    Evidence: the chunked-context kernel is bit-identical to one-shot prefill at
+    the layer level (job 6048348), 63 GPU parity tests including realistic page
+    layouts, and GSM8K at n=500 -- 0.940 with chunking on against 0.932 off,
+    indistinguishable at that sample size.
+    """
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    reject_unsupported_inkling_kv_cache_features(InklingConfig(), enable_block_reuse=False)
+
+
+def test_the_routing_predicate_picks_the_kernel_by_cached_tokens(monkeypatch):
+    """One request with history is enough to switch the whole batch: the batch
+    runs one kernel, and the packed one would drop that request's prefix. The
+    all-fresh case must keep the packed kernel and not pay for page indirection.
+
+    int() coercion is load-bearing -- num_cached arrives from kv_cache_params as
+    a tensor or a list of numpy ints, not python ints.
+    """
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.backend import _needs_chunked_context
+
+    monkeypatch.delenv("INKLING_FORCE_CHUNKED_ATTN", raising=False)
+    assert _needs_chunked_context([0, 0, 0]) is False
+    assert _needs_chunked_context([]) is False
+    assert _needs_chunked_context([0, 7, 0]) is True
+    assert _needs_chunked_context(torch.tensor([0, 0])) is False
+    assert _needs_chunked_context(torch.tensor([0, 3])) is True
+
+
+def test_the_force_knob_is_off_by_default_and_test_only(monkeypatch):
+    """It must flip the route, and only when set to exactly 1 -- an unset or
+    stale value must not silently change the production path."""
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.backend import _needs_chunked_context
+
+    monkeypatch.setenv("INKLING_FORCE_CHUNKED_ATTN", "1")
+    assert _needs_chunked_context([0, 0]) is True
+    for value in ("0", "", "true", "yes"):
+        monkeypatch.setenv("INKLING_FORCE_CHUNKED_ATTN", value)
+        assert _needs_chunked_context([0, 0]) is False, value
 
 
 def test_text_geometry():

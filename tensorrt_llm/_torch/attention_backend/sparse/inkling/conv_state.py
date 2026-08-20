@@ -226,6 +226,22 @@ class InklingConvStateCache:
                 self._free.append(slot)
 
 
+def _context_num_cached(attn_metadata, num_contexts):
+    """Per-context-request cached token counts, or None when unavailable.
+
+    Non-zero only for a later chunk of a chunked prefill. None when the metadata
+    carries no KV cache params at all (the cache-free unit-test path), which
+    callers read as "everything is fresh".
+    """
+    params = getattr(attn_metadata, "kv_cache_params", None)
+    if params is None:
+        return None
+    per_seq = getattr(params, "num_cached_tokens_per_seq", None)
+    if per_seq is None:
+        return None
+    return [int(c) for c in per_seq[:num_contexts]]
+
+
 @dataclass
 class InklingConvRuntime:
     """Per-forward short-conv plumbing for the pool path (all layers share it).
@@ -264,12 +280,24 @@ class InklingConvRuntime:
             cu = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
             cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
             query_start_loc = cu
-            # Fresh prefill carries no prior conv window -- correct only because
-            # KV block reuse and chunked prefill are refused by
-            # reject_unsupported_inkling_kv_cache_features. Deriving this from
-            # num_cached_tokens_per_seq is not enough on its own: _run_context
-            # attends only to its own call's tokens.
-            has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
+            # A context request that already has tokens in the KV cache -- a
+            # later chunk of a chunked prefill -- also has the conv window they
+            # left behind: slots_for keeps its pool row and causal_conv1d_fn
+            # wrote the trailing window there on the preceding call. Declaring it
+            # is what makes that state get consumed rather than ignored (the
+            # Mamba2Metadata pattern).
+            #
+            # Only *sufficient* because _run_context routes such requests to the
+            # chunked-context kernel, which reads the cached KV back. Alone, this
+            # would leave attention losing history while the convs kept it -- a
+            # subtler wrong answer than before. The two land together.
+            cached = _context_num_cached(attn_metadata, num_contexts)
+            if cached is None:
+                has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
+            else:
+                has_initial_state = torch.tensor(
+                    [c > 0 for c in cached], dtype=torch.bool, device=device
+                )
         return cls(
             num_ctx_tokens=sum(attn_metadata.seq_lens.tolist()[:num_contexts]),
             ctx_indices=state_indices[:num_contexts] if num_contexts else None,

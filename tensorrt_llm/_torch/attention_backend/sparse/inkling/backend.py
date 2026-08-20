@@ -14,6 +14,7 @@
 # limitations under the License.
 """Inkling attention backend: KV write, page tables, prefill/decode dispatch."""
 
+import os
 from typing import Optional
 
 import torch
@@ -22,6 +23,7 @@ from ...interface import AttentionForwardArgs, merge_attention_forward_args
 from ...trtllm import TrtllmAttention
 from .kernels import (
     build_page_table,
+    inkling_chunked_prefill_attention,
     inkling_decode_attention,
     inkling_prefill_attention,
     write_kv_cache_hnd,
@@ -29,6 +31,19 @@ from .kernels import (
 from .metadata import InklingAttentionMetadata
 from .page_table import gen_page_table, gen_seq_lens, page_div, validate_decode_layout
 from .params import InklingBackendForwardArgs
+
+
+def _needs_chunked_context(num_cached) -> bool:
+    """True when the context path must read cached KV back from the pages.
+
+    ``INKLING_FORCE_CHUNKED_ATTN=1`` forces it for all-fresh requests too.
+    Test-only: this model's sampled output is not reproducible between two
+    generate() calls unless the autotuner is off, so the knob is the only way to
+    exercise both kernels against one set of weights in one process.
+    """
+    if os.environ.get("INKLING_FORCE_CHUNKED_ATTN", "0") == "1":
+        return True
+    return any(int(c) > 0 for c in num_cached)
 
 
 class InklingTritonAttention(TrtllmAttention):
@@ -169,11 +184,34 @@ class InklingTritonAttention(TrtllmAttention):
         cu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
         cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
         max_seqlen = max(seq_lens)
-        # NOTE: this attends only to the tokens of THIS call --
-        # inkling_prefill_attention takes no paged-KV argument, so a context
-        # request carrying cached history would silently drop it. Chunked prefill
-        # and block reuse are refused by
-        # reject_unsupported_inkling_kv_cache_features for that reason.
+        # A request carrying cached history must attend to tokens it did not
+        # bring with it, which inkling_prefill_attention cannot do: it takes no
+        # paged-KV argument. The chunked kernel reads every key from the page
+        # table instead, and needs no gather because the write above already put
+        # this chunk's K/V in the same pages. All-fresh keeps the packed kernel
+        # -- common case, no page indirection -- and the two must agree exactly
+        # at num_cached == 0, which test_inkling_chunked_prefill pins.
+        if _needs_chunked_context(num_cached):
+            max_total = max(int(c) + int(sl) for c, sl in zip(num_cached, seq_lens))
+            max_pages = (max_total + page_size - 1) // page_size
+            page_table = build_page_table(block_ids, max_pages, device)
+            num_cached_dev = torch.tensor(
+                [int(c) for c in num_cached], dtype=torch.int32, device=device
+            )
+            return inkling_chunked_prefill_attention(
+                q,
+                k_cache,
+                v_cache,
+                cu,
+                num_cached_dev,
+                page_table,
+                page_size,
+                max_seqlen,
+                self.sm_scale,
+                rel_logits,
+                self.rel_extent,
+                self.window_left,
+            )
         return inkling_prefill_attention(
             q, k, v, cu, max_seqlen, self.sm_scale, rel_logits, self.rel_extent, self.window_left
         )
