@@ -310,8 +310,16 @@ def _reap_dead_pool(session: object) -> None:
 
     try:
         session.abandon()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # Broad on purpose: this pool is already known part-dead, so abandon()
+        # reaches into mpi4py with a rank missing and can fail in ways MPI does
+        # not enumerate. Swallowing is required -- the SIGKILL sweep below is
+        # what actually reclaims the survivors' GPU memory, and it must run
+        # whatever abandon() did. Surface it instead of passing silently.
+        print(
+            f"[session-prefetch] WARNING: abandon() failed on a part-dead pool: {exc!r}",
+            flush=True,
+        )
     mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
     process_start_time = getattr(mpi_session, "_process_start_time", None)
     if process_start_time is None:
