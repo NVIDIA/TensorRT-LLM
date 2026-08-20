@@ -310,7 +310,14 @@ class ReusableLPIPSScorer:
         batch = batch.permute(0, 3, 1, 2).to(device=self.device, dtype=torch.float32)
         return batch / 127.5 - 1.0
 
-    def score_video(self, reference_path, generated_path):
+    def score_video(
+        self,
+        reference_path,
+        generated_path,
+        *,
+        frame_start=0,
+        frame_stop=None,
+    ):
         reference = self._decode_video_to_lpips_batch(reference_path)
         generated = self._decode_video_to_lpips_batch(generated_path)
         if generated.shape[1:] != reference.shape[1:]:
@@ -319,10 +326,16 @@ class ReusableLPIPSScorer:
                 f"{tuple(generated.shape[1:])} vs {tuple(reference.shape[1:])}."
             )
         paired_frame_count = min(generated.shape[0], reference.shape[0])
+        frame_stop = paired_frame_count if frame_stop is None else frame_stop
+        if frame_start < 0 or frame_start >= frame_stop or frame_stop > paired_frame_count:
+            raise ValueError(
+                f"LPIPS frame window [{frame_start}, {frame_stop}) is outside "
+                f"the {paired_frame_count} paired frames."
+            )
         with torch.no_grad():
             scores = self._get_model()(
-                generated[:paired_frame_count],
-                reference[:paired_frame_count],
+                generated[frame_start:frame_stop],
+                reference[frame_start:frame_stop],
             ).flatten()
         return float(scores.mean().item())
 
@@ -615,10 +628,23 @@ def _run_reusable_image_lpips_eval(sample_id, reference_path, generated_path, sc
     return score
 
 
-def _run_reusable_video_lpips_eval(sample_id, reference_path, generated_path, scorer):
+def _run_reusable_video_lpips_eval(
+    sample_id,
+    reference_path,
+    generated_path,
+    scorer,
+    *,
+    frame_start=0,
+    frame_stop=None,
+):
     try:
         with _lpips_deterministic_algorithms():
-            score = scorer.score_video(reference_path, generated_path)
+            score = scorer.score_video(
+                reference_path,
+                generated_path,
+                frame_start=frame_start,
+                frame_stop=frame_stop,
+            )
     except Exception as error:
         pytest.fail(f"LPIPS video eval failed for {sample_id}: {error}")
     print(f"\n[E2E {sample_id} LPIPS] score: {score:.6f}")

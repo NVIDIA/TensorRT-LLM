@@ -404,6 +404,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-nvfp4]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-cuda-graph]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_retake_native_bf16_smoke
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_retake_native_bf16_lpips
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_lpips_matches_eager
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden

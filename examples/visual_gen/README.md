@@ -32,6 +32,7 @@ python models/hunyuan_t2v.py
 python models/wan_t2v.py --visual_gen_args configs/wan2.2-t2v-fp4-1gpu.yaml
 python models/wan_i2v.py --visual_gen_args configs/wan2.2-i2v-fp4-1gpu.yaml --image /path/to/image.png
 python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
+python models/ltx2_retake.py --model /path/to/ltx-2.3 --source /path/to/retake_input.mp4 --text_encoder_path /path/to/gemma-3-12b-it
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
 python models/cosmos3_ti2v.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"

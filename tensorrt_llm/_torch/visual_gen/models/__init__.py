@@ -38,6 +38,7 @@ from .flux import Flux2Pipeline, FluxPipeline
 from .glm_image import GlmImagePipeline
 from .hunyuan_video1_5 import HunyuanVideo15Pipeline
 from .ltx2 import LTX2Pipeline  # noqa: F401
+from .ltx2_retake import LTX2RetakePipeline
 from .qwen_image import QwenImageEditPlusPipeline, QwenImagePipeline
 from .qwen_image_layered import QwenImageLayeredPipeline
 from .wan import WanDMDPipeline, WanImageToVideoPipeline, WanPipeline
@@ -55,6 +56,7 @@ __all__ = [
     "WanDMDPipeline",
     "WanImageToVideoPipeline",
     "Cosmos3OmniMoTPipeline",
+    "LTX2RetakePipeline",
     "register_pipeline",
     "HunyuanVideo15Pipeline",
 ]

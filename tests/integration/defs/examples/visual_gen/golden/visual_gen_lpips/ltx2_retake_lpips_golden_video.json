@@ -1,0 +1,19 @@
+{
+  "video": "ltx2_retake_lpips_golden_video.mp4",
+  "model": "LTX-2.3 22B distilled retake BF16",
+  "source": "LTX2.3-eval upstream delete-disfluency pipeline",
+  "prompt": "a person talking to the camera, natural head motion, clear speech",
+  "input_video": "ltx2_retake_lpips_input_video.mp4",
+  "start_time_seconds": 2.9667,
+  "end_time_seconds": 3.9333,
+  "height": 1280,
+  "width": 704,
+  "num_frames": 209,
+  "num_inference_steps": 8,
+  "seed": 42,
+  "frame_rate": 30.0,
+  "lpips_frame_start": 89,
+  "lpips_frame_stop": 118,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05
+}

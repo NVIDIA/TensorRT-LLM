@@ -591,7 +591,7 @@ def _load_component_weights(
 # validator runs against this entry's ``defaults`` BEFORE
 # ``resolve_variant()`` swaps in ``LTX2TwoStagesPipeline``. So the
 # superset of knobs (``text_encoder_path`` + the two two-stage paths)
-# lives here; the two-stage class registers without ``hf_ids`` /
+# lives here; the two-stage and retake classes register without ``hf_ids`` /
 # ``defaults`` to avoid duplicating the discovery entry.
 @register_pipeline(
     "LTX2Pipeline",
@@ -602,13 +602,15 @@ def _load_component_weights(
         "text_encoder_path": "google/gemma-3-12b-it",
         "spatial_upsampler_path": None,
         "distilled_lora_path": None,
+        "workflow": "generation",
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
         "superset of knobs for one-stage and two-stage. Pipeline will "
         "run two-stage if both ``spatial_upsampler_path`` and "
         "``distilled_lora_path`` are not ``None``, either set by the "
-        "user or auto-discovered from the checkpoint."
+        "user or auto-discovered from the checkpoint. Set ``workflow`` "
+        "to ``retake`` to run retake."
     ),
 )
 class LTX2Pipeline(BasePipeline):
@@ -632,6 +634,14 @@ class LTX2Pipeline(BasePipeline):
 
     @classmethod
     def resolve_variant(cls, config):
+        workflow = config.extra_attrs.get("workflow", "generation")
+        if workflow == "retake":
+            from ..ltx2_retake.pipeline_ltx2_retake import LTX2RetakePipeline
+
+            return LTX2RetakePipeline
+        if workflow != "generation":
+            raise ValueError(f"Unsupported LTX-2 workflow: {workflow!r}")
+
         if getattr(config, "cache_backend", None) == "cache_dit":
             logger.info("Cache-DiT is enabled; forcing one-stage LTX2 pipeline.")
             return cls

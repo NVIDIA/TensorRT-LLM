@@ -918,6 +918,21 @@ class BasicAVTransformerBlock(nn.Module):
         """All-gather *x* along *dim* across sequence-parallel ranks."""
         return self._active_sharder.gather(x, dim=dim)
 
+    def _run_text_cross_attention(
+        self,
+        query: torch.Tensor,
+        args: TransformerArgs,
+        attention: LTX2Attention,
+        text_kv: Optional[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Run one modality's text cross-attention."""
+        return attention(
+            query,
+            context=args.context,
+            pre_projected_kv=text_kv,
+            timestep=args.timesteps,
+        )
+
     # -- Forward -------------------------------------------------------------
 
     def forward(
@@ -1014,11 +1029,11 @@ class BasicAVTransformerBlock(nn.Module):
                 )
             else:
                 attn2_q_input = rms_norm(vx, eps=self.norm_eps)
-            text_v_attn_raw = self.attn2(
+            text_v_attn_raw = self._run_text_cross_attention(
                 attn2_q_input,
-                context=video.context,
-                pre_projected_kv=text_kv_video,
-                timestep=video.timesteps,
+                video,
+                self.attn2,
+                text_kv_video,
             )
 
         # --- Audio self-attention + text cross-attention ---
@@ -1070,11 +1085,11 @@ class BasicAVTransformerBlock(nn.Module):
                 )
             else:
                 audio_attn2_q_input = rms_norm(ax, eps=self.norm_eps)
-            text_a_attn_raw = self.audio_attn2(
+            text_a_attn_raw = self._run_text_cross_attention(
                 audio_attn2_q_input,
-                context=audio.context,
-                pre_projected_kv=text_kv_audio,
-                timestep=audio.timesteps,
+                audio,
+                self.audio_attn2,
+                text_kv_audio,
             )
 
         # --- Bidirectional audio ↔ video cross-attention ---
@@ -2148,6 +2163,15 @@ class LTXModel(BaseDiffusionModel):
 
     # -- Forward -------------------------------------------------------------
 
+    def _prepare_text_kv_cache(
+        self, context: torch.Tensor, *, audio: bool
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+        """Project step-invariant text K/V tensors for every transformer block."""
+        attention_name = "audio_attn2" if audio else "attn2"
+        return [
+            getattr(block, attention_name).project_kv(context) for block in self.transformer_blocks
+        ]
+
     def prepare_text_cache(
         self,
         *,
@@ -2172,13 +2196,13 @@ class LTXModel(BaseDiffusionModel):
             v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
                 video_context, video_context_mask, video_positions, dtype
             )
-            v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
+            v_kv = self._prepare_text_kv_cache(v_ctx, audio=False)
 
         if audio_context is not None:
             a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
                 audio_context, audio_context_mask, audio_positions, dtype
             )
-            a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
+            a_kv = self._prepare_text_kv_cache(a_ctx, audio=True)
             # cos/sin are token-major: token axis is dim 1 for both SPLIT and
             # INTERLEAVED rope, matching `_make_pe_local`'s `cos[:, s:e]` shard.
             if self._audio_pad > 0:

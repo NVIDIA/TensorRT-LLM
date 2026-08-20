@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import yaml
 from defs import conftest
 from defs.common import venv_check_call
 from defs.examples.visual_gen.visual_gen_test_utils import (
@@ -51,6 +52,19 @@ LTX2_LPIPS_NUM_INFERENCE_STEPS = 8
 LTX2_LPIPS_THRESHOLD = 0.05
 LTX2_CUDA_GRAPH_LPIPS_THRESHOLD = 0.01
 
+LTX2_RETAKE_EXPECTED_FRAMES = 209
+LTX2_RETAKE_EXPECTED_HEIGHT = 1280
+LTX2_RETAKE_EXPECTED_WIDTH = 704
+LTX2_RETAKE_EXPECTED_FPS = 30.0
+LTX2_RETAKE_EXPECTED_AUDIO_RATE = 48000
+LTX2_RETAKE_CHECKPOINT_SUBPATH = ("LTX-2.3", "ltx-2.3-22b-distilled.safetensors")
+LTX2_RETAKE_CHECKPOINT_ENV = "LTX2_RETAKE_CHECKPOINT"
+LTX2_RETAKE_LORA_SUBPATH = ("LTX-2.3", "talkvid-id-lora.safetensors")
+LTX2_RETAKE_LORA_ENV = "LTX2_RETAKE_LORA"
+LTX2_RETAKE_LPIPS_FRAME_START = 89
+LTX2_RETAKE_LPIPS_FRAME_STOP = 118
+LTX2_RETAKE_LPIPS_THRESHOLD = 0.05
+LTX2_RETAKE_PROMPT_CONDITIONING = "default_prompt_conditioning.safetensors"
 LTX2_FEATURE_LPIPS_THRESHOLD = 0.05
 LTX2_SUPPORTED_FEATURES = frozenset({"fp8-blockwise", "nvfp4", "cuda-graph"})
 
@@ -372,6 +386,141 @@ def test_ltx2_lpips_against_golden(request, tmp_path, ltx2_two_stage_bf16_video_
         "ltx2_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+
+
+def _generate_ltx2_retake_native_bf16_video(llm_root, llm_venv, tmp_path, output_path):
+    """Run the native delete-disfluency retake example and return its output."""
+    source = _golden_media_path(
+        tmp_path,
+        "ltx2_retake_lpips_input_video.mp4",
+        "LTX-2.3 delete-disfluency retake input",
+    )
+    prompt_conditioning = _golden_media_path(
+        tmp_path,
+        LTX2_RETAKE_PROMPT_CONDITIONING,
+        "LTX-2.3 retake prompt conditioning",
+    )
+    checkpoint = os.environ.get(LTX2_RETAKE_CHECKPOINT_ENV) or _lpips_model_path(
+        *LTX2_RETAKE_CHECKPOINT_SUBPATH
+    )
+    _skip_if_missing(checkpoint, "LTX-2.3 retake checkpoint")
+    lora = os.environ.get(LTX2_RETAKE_LORA_ENV) or _lpips_model_path(*LTX2_RETAKE_LORA_SUBPATH)
+    _skip_if_missing(lora, "TalkVid retake LoRA")
+    example = os.path.join(llm_root, "examples", "visual_gen", "models", "ltx2_retake.py")
+    base_config = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "ltx2-retake-1gpu.yaml"
+    )
+    with open(base_config, encoding="utf-8") as config_file:
+        config_data = yaml.safe_load(config_file)
+    config_data["runtime_lora_config"] = {"path": lora}
+    config = tmp_path / "ltx2-retake-1gpu.yaml"
+    with open(config, "w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config_data, config_file, sort_keys=False)
+    venv_check_call(
+        llm_venv,
+        [
+            example,
+            "--model",
+            checkpoint,
+            "--visual_gen_args",
+            str(config),
+            "--source",
+            str(source),
+            "--start",
+            "2.9667",
+            "--end",
+            "3.9333",
+            "--prompt_conditioning_path",
+            str(prompt_conditioning),
+            "--output_path",
+            str(output_path),
+        ],
+    )
+    assert os.path.isfile(output_path), f"retake pipeline did not produce {output_path}"
+    return output_path
+
+
+@pytest.fixture(scope="session")
+def _ltx2_retake_deps(_visual_gen_deps, llm_venv):
+    llm_venv.run_cmd(
+        [
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--index-url",
+            "https://download.pytorch.org/whl/cpu",
+            "torchaudio==2.11.0+cpu",
+        ]
+    )
+
+
+@pytest.fixture(scope="session")
+def ltx2_retake_bf16_video_path(_ltx2_retake_deps, llm_root, llm_venv, tmp_path_factory):
+    output_path = _visual_gen_output_path(llm_venv, "ltx2_retake_bf16")
+    if os.path.isfile(output_path):
+        return output_path
+    work_dir = tmp_path_factory.mktemp("ltx2_retake")
+    return _generate_ltx2_retake_native_bf16_video(llm_root, llm_venv, work_dir, output_path)
+
+
+def test_ltx2_retake_native_bf16_smoke(ltx2_retake_bf16_video_path):
+    """Check the native delete-disfluency output container and frame count."""
+    import av
+
+    from tensorrt_llm._torch.visual_gen.models.ltx2_retake.ltx2_retake_core.media_io import (
+        decode_video_by_frame,
+        get_videostream_metadata,
+    )
+
+    metadata = get_videostream_metadata(str(ltx2_retake_bf16_video_path))
+    assert metadata.frames == LTX2_RETAKE_EXPECTED_FRAMES
+    assert metadata.height == LTX2_RETAKE_EXPECTED_HEIGHT
+    assert metadata.width == LTX2_RETAKE_EXPECTED_WIDTH
+    assert metadata.fps == pytest.approx(LTX2_RETAKE_EXPECTED_FPS)
+    assert (
+        sum(1 for _ in decode_video_by_frame(str(ltx2_retake_bf16_video_path)))
+        == LTX2_RETAKE_EXPECTED_FRAMES
+    )
+
+    container = av.open(str(ltx2_retake_bf16_video_path))
+    try:
+        audio_streams = list(container.streams.audio)
+        assert len(audio_streams) == 1
+        assert audio_streams[0].rate == LTX2_RETAKE_EXPECTED_AUDIO_RATE
+        assert audio_streams[0].codec_context.channels == 2
+    finally:
+        container.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx2_retake_native_bf16_lpips(
+    request,
+    tmp_path,
+    ltx2_retake_bf16_video_path,
+    _visual_gen_lpips_scorer,
+):
+    golden_path = _golden_media_path(
+        tmp_path,
+        "ltx2_retake_lpips_golden_video.mp4",
+        "LTX-2.3 upstream retake LPIPS golden video",
+    )
+    score = _run_reusable_video_lpips_eval(
+        "ltx2_retake",
+        golden_path,
+        ltx2_retake_bf16_video_path,
+        _visual_gen_lpips_scorer,
+        frame_start=LTX2_RETAKE_LPIPS_FRAME_START,
+        frame_stop=LTX2_RETAKE_LPIPS_FRAME_STOP,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_RETAKE_LPIPS_THRESHOLD,
+        ltx2_retake_bf16_video_path,
+        "ltx2_retake_generated.mp4",
+    )
+    _assert_lpips_below_threshold(score, LTX2_RETAKE_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
