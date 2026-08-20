@@ -293,7 +293,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # on MTP and other speculative decoding paths is currently unclear;
         # revisit whether these extra KV slots need to be transferred.
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
-        assert end_block < prompt_blocks
+        assert end_block is None or 0 <= end_block <= prompt_blocks
         resident_blocks = (
             prompt_blocks
             if end_block is None

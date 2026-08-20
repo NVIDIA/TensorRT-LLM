@@ -887,7 +887,8 @@ class Sender(SenderBase):
 
             # Block lists are the suffix of [..., slice_end); cached prefix
             # is implicit in their size. token_start = (total_blocks - n) * tpb.
-            slice_end = token_range.end if token_range is not None else 0
+            slice_end = token_range.end if token_range is not None else task._prompt_len
+            assert slice_end is not None, "KV send task requires prompt_len"
             total_blocks = (slice_end + tpb - 1) // tpb
 
             # Narrow the peer's whole-prompt list to this slice. Only a slice that
@@ -904,8 +905,8 @@ class Sender(SenderBase):
             ):
                 dst_block_ids = project_blocks_to_global_chunk(
                     dst_block_ids,
-                    chunk_block_start=token_range.start // tpb,
-                    chunk_block_end=total_blocks,
+                    chunk_block_offset=token_range.start // tpb,
+                    chunk_block_count=total_blocks - token_range.start // tpb,
                     resident_block_end=prompt_blocks,
                 )
 

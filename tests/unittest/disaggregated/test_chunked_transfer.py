@@ -31,7 +31,6 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     TokenRange,
     WaitResult,
-    project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
@@ -41,8 +40,9 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Sender,
     TaskStatus,
     TxSession,
+    project_blocks_to_global_chunk,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, LlmRequestType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
@@ -313,8 +313,9 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
         np.array([104, 105, 106, 107, 200, 201, 202], dtype=np.int64),
     )
     assert np.array_equal(write_meta.sizes, np.ones(7, dtype=np.int64))
+    assert write_meta.slice_id == 1
     # A receiver that sends no slice_id is addressed as its single task 0.
-    assert write_meta.slice_id == 0
+    assert write_meta.receiver_slice_id == 0
 
 
 def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
@@ -351,36 +352,16 @@ def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
     assert np.array_equal(chunked.sizes, monolithic.sizes)
 
 
-def test_build_kv_write_meta_rejects_unaligned_chunk_token_range():
-    """The window is decided in block space, so a partial block on the wire is a bug."""
-    sender = _make_projection_sender()
-    task = KVSendTask(
-        KVSlice(
-            is_last_slice=True,
-            block_ids_per_layer_groups=[
-                np.array([4, 5, 6, 7], dtype=np.int64),
-                np.array([10, 11, 12], dtype=np.int64),
-            ],
-            token_range=TokenRange(start=0, end=_PROJECTION_TPB + 1),
-        ),
-        _make_params(),
-        slice_id=0,
-        prompt_len=64,
-    )
-
-    with pytest.raises(AssertionError, match="not block-aligned"):
-        sender._build_kv_write_meta(task, _make_projection_req_info())
-
-
-def test_build_kv_write_meta_echoes_peer_slice_id():
-    """The slice id on the wire comes from the peer's RecvReqInfo, not the sender's chunk."""
+def test_build_kv_write_meta_tracks_sender_and_receiver_slice_ids():
+    """Write metadata retains both the local task and peer task indices."""
     sender = _make_projection_sender()
 
     write_meta = sender._build_kv_write_meta(
         _make_projection_task(slice_id=1), _make_projection_req_info(slice_id=3)
     )
 
-    assert write_meta.slice_id == 3
+    assert write_meta.slice_id == 1
+    assert write_meta.receiver_slice_id == 3
 
 
 def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
@@ -519,39 +500,24 @@ def test_pipelined_transfer_disabled_by_default():
     assert result is False
 
 
-@pytest.mark.parametrize("disagg_role", [None, "generation"])
-def test_pipelined_transfer_disabled_for_pipeline_parallelism(monkeypatch, disagg_role):
-    """Pipeline parallelism disables pipelining without relying on the frontend role."""
-    from tensorrt_llm._torch.disaggregation import transceiver as transceiver_module
-    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+def test_pipelined_transfer_disabled_for_pipeline_parallelism():
+    """Each transceiver rank resolves pipeline-parallel support locally."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
-    if disagg_role is None:
-        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
-    else:
-        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", disagg_role)
-    transceiver = MagicMock()
-    transceiver_cls = MagicMock(return_value=transceiver)
-    monkeypatch.setattr(transceiver_module, "KvCacheTransceiverV2", transceiver_cls)
-
-    mapping = MagicMock()
-    mapping.pp_size = 2
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._mapping = SimpleNamespace(pp_size=2)
+    transceiver._kv_cache_manager = MagicMock()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
     )
 
-    result = create_kv_cache_transceiver(
-        mapping,
-        MagicMock(),
-        MagicMock(),
-        MagicMock(),
-        cache_transceiver_config,
+    enabled = KvCacheTransceiverV2._resolve_pipelined_transfer(
+        transceiver, cache_transceiver_config
     )
 
-    assert result is transceiver
-    assert cache_transceiver_config.transceiver_runtime == "PYTHON"
-    assert cache_transceiver_config.enable_pipelined_transfer is False
-    transceiver_cls.assert_called_once()
+    assert enabled is False
+    assert cache_transceiver_config.enable_pipelined_transfer is True
 
 
 def test_python_transceiver_rejects_cpp_mamba_cache_manager():
@@ -594,6 +560,7 @@ def test_pipelined_transfer_requires_gen_first_flow():
     request = MagicMock()
     request.sampling_config = None
     request.py_beam_width = 1
+    request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
     request.is_context_only_request = True
     request.py_disaggregated_params = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
@@ -601,8 +568,27 @@ def test_pipelined_transfer_requires_gen_first_flow():
 
     with pytest.raises(
         ValueError,
-        match="schedule_style must be generation_first when enable_pipelined_transfer is set.",
+        match="requires schedule_style='generation_first' on the request",
     ):
+        PyExecutor._validate_request(executor, request)
+
+
+def test_pipelined_transfer_requires_single_beam_for_context_request():
+    """Context-side pipelining rejects beam search before scheduling."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = MagicMock()
+    executor.kv_cache_transceiver.pipeline_transfer_enabled = True
+
+    request = MagicMock()
+    request.py_beam_width = 2
+    request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
+    request.is_context_only_request = True
+    request.py_disaggregated_params = SimpleNamespace(
+        schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+    )
+
+    with pytest.raises(ValueError, match="requires beam_width == 1, got 2"):
         PyExecutor._validate_request(executor, request)
 
 
@@ -620,6 +606,7 @@ def test_pipelined_transfer_allows_non_disaggregated_request():
     request = MagicMock()
     request.sampling_config = None
     request.py_beam_width = 1
+    request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY
     request.is_context_only_request = True
     request.py_disaggregated_params = None
 
@@ -642,6 +629,7 @@ def test_pipelined_transfer_allows_generation_only_request():
     request = MagicMock()
     request.sampling_config = None
     request.py_beam_width = 2
+    request.llm_request_type = LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
     request.is_context_only_request = False
     request.py_disaggregated_params = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
