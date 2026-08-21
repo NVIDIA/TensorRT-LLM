@@ -912,7 +912,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                       "stages=${result.affected_stages.size()}")
         def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
         def multiGpuRequired = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
-        def multiGpuLabelGateOpen = !multiGpuRequired ||
+        def multiGpuLabelGateOpen = multiGpuRequired &&
             _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
         _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
                             multiGpuRequired, multiGpuLabelGateOpen)
