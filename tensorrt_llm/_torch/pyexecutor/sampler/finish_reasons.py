@@ -260,7 +260,7 @@ class FinishReasonsHandler:
         """
 
         self._temp_data.max_lens.append(
-            min(self._max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
+            min(self._max_seq_len, request.py_orig_prompt_len + request.py_max_new_tokens)
         )
         # Beam-search context-only (disaggregated prefill) requests hand off
         # after their single step, so their end id is masked to the "no end
