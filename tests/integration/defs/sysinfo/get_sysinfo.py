@@ -140,7 +140,7 @@ def get_linux_distribution() -> tuple[str, str, str]:
     except OSError:
         logger.error(
             f"Cannot determine the Linux distribution ({distro_reason}; "
-            "/etc/os-release also unreadable); reporting ('na', 'na', 'na'). "
+            "os-release metadata unavailable); reporting ('na', 'na', 'na'). "
             "Test-db conditions matching linux_distribution_name (e.g. ubuntu*) "
             "will select ZERO tests and the rendered test list will be empty.")
         return ("na", "na", "na")
