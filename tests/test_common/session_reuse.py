@@ -19,14 +19,17 @@ Eligibility is automatic:
   reach the patched seam
 - ``@pytest.mark.private_mpi_session`` -> explicit opt-out: the cache is
   drained and the test gets an untracked fresh pool
+- torch.compile tests      -> private pool; the process-global Userbuffers
+                              Manager assumes one Engine per process
 - use-count cap            -> pool retired after N handouts (default 16),
                               bounding worker state accumulation
 
-Between handouts every worker runs a torch.compile/Dynamo reset (exactly once
-per worker, barrier-pinned: ``grouped_test_utils.submit_sync_per_worker``).
-Handover cannot race the previous worker's GPU-memory release: every pool
-these layers build is constructed with ``wait_shutdown=True``, so its
-shutdown blocks until the workers actually exited.
+Between eligible handouts every worker runs a health probe and defensive
+torch.compile/Dynamo reset (exactly once per worker, barrier-pinned:
+``grouped_test_utils.submit_sync_per_worker``). Handover cannot race the
+previous worker's GPU-memory release: every pool these layers build is
+constructed with ``wait_shutdown=True``, so its shutdown blocks until the
+workers actually exited.
 
 Cache misses (first pool of a size, post-drain rebuild, post-retire
 replacement) take a shadow pool pre-spawned by the session-prefetch layer
