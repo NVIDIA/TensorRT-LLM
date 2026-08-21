@@ -411,13 +411,13 @@ class GvrTpKernel:
         # Python-unrolled register batch.
         TB = cutlass.const_expr(self.num_threads)
         copy_atom = self._copy_atom()
-        tr = cute.make_fragment((R,), cutlass.Float32)
-        cnt = cute.make_fragment((R,), cutlass.Int32)
+        tr = cute.make_rmem_tensor((R,), cutlass.Float32)
+        cnt = cute.make_rmem_tensor((R,), cutlass.Int32)
         for r in cutlass.range_constexpr(R):
             tr[r] = s_rungs[r]
             cnt[r] = cutlass.Int32(0)
         frags = [
-            cute.make_fragment((4,), cutlass.Float32) for _ in range(U)
+            cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(U)
         ]  # Python-unrolled register batch
         # Mask hoist: float4s below vmain = min(v1, n_eff >> 2) are fully
         # valid (4i+3 < n_eff), so the main loop runs mask-free (the
@@ -476,12 +476,12 @@ class GvrTpKernel:
     def sample_count(self, R: cutlass.Constexpr, row_addr, v0, v1, n_eff, tidx, s_rungs, s_ptcnt):
         TB = cutlass.const_expr(self.num_threads)
         copy_atom = self._copy_atom()
-        tr = cute.make_fragment((R,), cutlass.Float32)
-        cnt = cute.make_fragment((R,), cutlass.Int32)
+        tr = cute.make_rmem_tensor((R,), cutlass.Float32)
+        cnt = cute.make_rmem_tensor((R,), cutlass.Int32)
         for r in cutlass.range_constexpr(R):
             tr[r] = s_rungs[r]
             cnt[r] = cutlass.Int32(0)
-        frag = cute.make_fragment((4,), cutlass.Float32)
+        frag = cute.make_rmem_tensor((4,), cutlass.Float32)
         j = cutlass.Int32(tidx)
         while v0 + j * cutlass.Int32(SS) < v1:
             self._ld_float4(copy_atom, row_addr, v0 + j * cutlass.Int32(SS), frag)
@@ -559,7 +559,7 @@ class GvrTpKernel:
         copy_atom = self._copy_atom()
         m = cutlass.Float32(-FLT_MAX)
         # Explicit U=4 batched loads (CUDA `float4 a[4]` idiom).
-        frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(4)]
+        frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(4)]
         vmain = v1
         vfull = n_eff >> cutlass.Int32(2)
         if vmain > vfull:
@@ -635,8 +635,8 @@ class GvrTpKernel:
         K = cutlass.const_expr(self.top_k)
         if tidx < cutlass.Int32(64):
             s_hist[tidx] = cutlass.Int32(0)
-        hv = cute.make_fragment((4,), cutlass.Float32)
-        hok = cute.make_fragment((4,), cutlass.Int32)
+        hv = cute.make_rmem_tensor((4,), cutlass.Float32)
+        hok = cute.make_rmem_tensor((4,), cutlass.Int32)
         mn = cutlass.Float32(FLT_MAX)
         mx = cutlass.Float32(-FLT_MAX)
         for jj in cutlass.range_constexpr(4):
@@ -858,8 +858,8 @@ class GvrTpKernel:
         kcap = cutlass.const_expr(self.kC)
         R = cutlass.const_expr(2)
         copy_atom = self._copy_atom()
-        tr = cute.make_fragment((R,), cutlass.Float32)
-        cnt = cute.make_fragment((R,), cutlass.Int32)
+        tr = cute.make_rmem_tensor((R,), cutlass.Float32)
+        cnt = cute.make_rmem_tensor((R,), cutlass.Int32)
         for r in cutlass.range_constexpr(R):
             tr[r] = s_rungs[r]
             cnt[r] = cutlass.Int32(0)
@@ -872,7 +872,7 @@ class GvrTpKernel:
         # vec-tail while-loops (same fix as count_pass). Mask
         # hoist as in count_pass: [v0, vmain) mask-free (gi computed only
         # inside the rare push branch), [vmain, v1) masked epilogue.
-        frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(U)]
+        frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(U)]
         vmain = v1
         vfull = n_eff >> cutlass.Int32(2)
         if vmain > vfull:
@@ -950,7 +950,7 @@ class GvrTpKernel:
         # CUDA collect_at loop 4x with 4 LDG.E.128 issued back-to-back; a
         # 1-deep loop was the dominant stall site (36% of all warp-stall
         # samples) on cells whose reuse check fails at big npad x big BS.
-        frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(4)]
+        frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(4)]
         vmain = v1
         vfull = n_eff >> cutlass.Int32(2)
         if vmain > vfull:
@@ -1657,7 +1657,7 @@ class GvrTpKernel:
                     cute.arch.barrier()
                 nt = cutlass.Int32(K) - m_gt
                 copy_atom = self._copy_atom()
-                frag = cute.make_fragment((4,), cutlass.Float32)
+                frag = cute.make_rmem_tensor((4,), cutlass.Float32)
                 ii = v0 + tidx
                 while ii < v1:
                     self._ld_float4(copy_atom, row_addr, ii, frag)
@@ -1732,7 +1732,7 @@ class GvrTpKernel:
                                 cute.arch.barrier()
                                 if tidx < cutlass.Int32(32):
                                     b8 = tidx * cutlass.Int32(8)
-                                    h = cute.make_fragment((8,), cutlass.Int32)
+                                    h = cute.make_rmem_tensor((8,), cutlass.Int32)
                                     Ssum = cutlass.Int32(0)
                                     for q in cutlass.range_constexpr(8):
                                         h[q] = s_hist[b8 + cutlass.Int32(q)]

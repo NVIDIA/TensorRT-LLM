@@ -1418,8 +1418,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
+        "AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM", "DENSEGEMM",
+        "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"] = Field(
             default='AUTO',
             description="MoE backend to use. "

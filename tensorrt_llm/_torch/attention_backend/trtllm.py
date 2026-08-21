@@ -652,6 +652,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self._mla_ctx_cu_seqlens_valid = True
         return self.mla_ctx_cu_q_seqlens[:num_ctx + 1]
 
+    def prepare_for_draft_forward(self) -> dict | None:
+        """Prepare backend state shared by draft-forward execution paths."""
+        return None
+
+    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
+        """Restore backend state modified for draft-forward execution."""
+        return None
+
     def prepare(self) -> None:
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.

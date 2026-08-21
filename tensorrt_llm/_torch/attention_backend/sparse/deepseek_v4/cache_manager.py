@@ -1283,9 +1283,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
         dst_tensor.fill_(BAD_PAGE_INDEX)
-        dst_tensor[:, : self._num_tables, 0, :].copy_(
+        dst_tensor[:, :num_seqs, 0, :].copy_(
             self._precomputed_sliding_block_tables[
-                :, DeepseekV4AttentionType.SWA.value, : self._num_tables, :
+                :, DeepseekV4AttentionType.SWA.value, :num_seqs, :
             ],
             non_blocking=True,
         )
@@ -1303,8 +1303,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """
         assert dst_tensor.is_cuda, "copy_batch_sliding_block_tables expects a CUDA destination"
         dst_tensor.fill_(BAD_PAGE_INDEX)
-        dst_tensor[:, :, : self._num_tables, :].copy_(
-            self._precomputed_sliding_block_tables[:, :, : self._num_tables, :],
+        dst_tensor[:, :, :num_seqs, :].copy_(
+            self._precomputed_sliding_block_tables[:, :, :num_seqs, :],
             non_blocking=True,
         )
 

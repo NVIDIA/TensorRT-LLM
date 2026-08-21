@@ -1263,8 +1263,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             torch.distributed.broadcast(text_blocked, src=0)
 
         if text_blocked.item():
-            timer.mark_end()
-            return timer.fill(PipelineOutput())
+            return PipelineOutput()
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 

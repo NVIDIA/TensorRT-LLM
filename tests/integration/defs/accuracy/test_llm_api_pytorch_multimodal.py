@@ -615,6 +615,9 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
             kv_cache_config=kv_cache_config,
             enable_chunked_prefill=True,
             max_num_tokens=max_num_tokens,
+            # Size the independent encoder budget for MMMU multi-image requests, whose aggregate
+            # resident encoder output can exceed the model's largest individual image.
+            encoder_max_num_tokens=32_768,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
