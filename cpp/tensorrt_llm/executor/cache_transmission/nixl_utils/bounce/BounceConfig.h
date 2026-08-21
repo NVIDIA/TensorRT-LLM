@@ -1,0 +1,227 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cctype>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <string>
+
+namespace tensorrt_llm::executor::kv_cache::bounce
+{
+
+/// POD config for the bounce v2 pipeline. Each `fromEnv()` call reads the current
+/// `TRTLLM_NIXL_BOUNCE_*` environment.
+/// Byte-valued variables accept an optional case-insensitive binary suffix such as "256MB", "1gb",
+/// or "512KiB" (K/M/G == KiB/MiB/GiB, powers of two).
+struct BounceConfig
+{
+    bool enabled{false};                                     // TRTLLM_NIXL_BOUNCE_ENABLE
+    std::size_t arenaSizeBytes{256ULL << 20};                // TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES
+    std::size_t arenaAllocationGranularityBytes{1ULL << 20}; // TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES
+    std::size_t maxChunkSizeBytes{32ULL << 20};              // TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES
+    std::uint32_t maxInflightChunksPerRequest{8};            // TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST
+    std::uint32_t copyStreamCount{8};                        // TRTLLM_NIXL_BOUNCE_COPY_STREAM_COUNT
+    std::uint32_t scatterWorkerCount{4};                     // TRTLLM_NIXL_BOUNCE_SCATTER_WORKER_COUNT
+    std::size_t minDescriptorCount{1024};                    // TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT
+    std::size_t maxAverageDescriptorSizeBytes{16ULL << 10};  // TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES
+    int requestTimeoutMs{30000};     // TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS; <=0 DISABLES the timeout
+                                     // (checkTimeouts no-ops; used by tests that intentionally wait)
+    bool disableFabricMemory{false}; // TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY
+    // TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER: launch a chunk's gather at submit() time, before the
+    // receiver's GRANT arrives, overlapping the WANT->GRANT control round-trip with the gather
+    // kernel. Eager (credit-less) staging regions are capped at HALF the arena so that on a
+    // bidirectional deployment both sides can always still grant incoming regions (no mutual
+    // eager-starvation); the credit-backed path is unaffected by the cap.
+    bool enableEagerGather{true};
+    // TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS: carry the control messages (WANT/GRANT/DATA/ACK) over NIXL
+    // notifications (UCX active messages on the RDMA fabric) instead of ZMQ/TCP — a control hop
+    // drops from tens of microseconds to a few. Peers can use bounce together only when this setting
+    // matches; the capability handshake otherwise keeps transfers on the standard NIXL path.
+    bool useNixlNotifications{false};
+    // TRTLLM_NIXL_BOUNCE_DISABLE_SCATTER_RUN_MERGING: DEBUG ONLY — disable scatter-run coalescing so the DATA
+    // message carries one entry per desc (per-desc plan, hundreds of KB per chunk). Used to A/B the
+    // control transports under large-message load; never enable in production.
+    bool disableScatterRunMerging{false};
+    // TRTLLM_NIXL_BOUNCE_USE_CUB_COPY: use cub::DeviceMemcpy::Batched instead of the custom copy
+    // kernel (experimental; benchmark before enabling).
+    bool useCubCopy{false};
+    // TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS: the copy kernel reads [srcs|dsts|sizes] directly
+    // from pinned host memory instead of staging them in device scratch first. Faster at every plan
+    // size (same bytes over the bus, but no H2D-then-kernel serialization), so on by default.
+    bool useZeroCopyArguments{true};
+
+    [[nodiscard]] static BounceConfig fromEnv()
+    {
+        BounceConfig cfg;
+        auto envBool = [](char const* name, bool def) -> bool
+        {
+            char const* v = std::getenv(name);
+            if (v == nullptr || v[0] == '\0')
+            {
+                return def; // unset or empty -> default (don't treat "" as enabled)
+            }
+            // Case-insensitive: 0/false/no/off -> false, 1/true/yes/on -> true, anything else -> def.
+            std::string s;
+            for (char const* p = v; *p != '\0'; ++p)
+            {
+                s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+            }
+            if (s == "0" || s == "false" || s == "no" || s == "off")
+            {
+                return false;
+            }
+            if (s == "1" || s == "true" || s == "yes" || s == "on")
+            {
+                return true;
+            }
+            return def;
+        };
+        auto envU64 = [](char const* name, std::uint64_t def) -> std::uint64_t
+        {
+            char const* v = std::getenv(name);
+            if (v == nullptr || !std::isdigit(static_cast<unsigned char>(v[0])))
+            {
+                return def;
+            }
+            // Parse strictly: a garbage value (typo like "abc", or trailing junk) falls back to the
+            // default instead of yielding 0 — a 0 here would later abort the process (e.g.
+            // maxChunkSizeBytes=0 trips a TLLM_CHECK in BounceTransferPlan::build).
+            char* end = nullptr;
+            errno = 0;
+            std::uint64_t const parsed = std::strtoull(v, &end, 10);
+            if (errno == ERANGE || end == v || *end != '\0')
+            {
+                return def;
+            }
+            return parsed;
+        };
+        // Byte sizes additionally accept a binary suffix — K/KB/KiB, M/MB/MiB, G/GB/GiB
+        // (case-insensitive, no space), e.g. "256MB", "1gb", "512kib". All suffixes are
+        // powers of two (MB == MiB == 2^20). Bare numbers and a trailing "B" stay bytes.
+        auto envBytes = [](char const* name, std::uint64_t def) -> std::uint64_t
+        {
+            char const* v = std::getenv(name);
+            if (v == nullptr || !std::isdigit(static_cast<unsigned char>(v[0])))
+            {
+                return def;
+            }
+            char* end = nullptr;
+            errno = 0;
+            std::uint64_t const parsed = std::strtoull(v, &end, 10);
+            if (errno == ERANGE || end == v)
+            {
+                return def;
+            }
+            std::string suffix;
+            for (char const* p = end; *p != '\0'; ++p)
+            {
+                suffix.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
+            }
+            std::uint64_t mult = 1;
+            if (suffix.empty() || suffix == "b")
+            {
+                mult = 1;
+            }
+            else if (suffix == "k" || suffix == "kb" || suffix == "kib")
+            {
+                mult = 1ULL << 10;
+            }
+            else if (suffix == "m" || suffix == "mb" || suffix == "mib")
+            {
+                mult = 1ULL << 20;
+            }
+            else if (suffix == "g" || suffix == "gb" || suffix == "gib")
+            {
+                mult = 1ULL << 30;
+            }
+            else
+            {
+                return def; // unknown suffix -> default, same rationale as envU64
+            }
+            if (mult > 1 && parsed > std::numeric_limits<std::uint64_t>::max() / mult)
+            {
+                return def; // would overflow
+            }
+            return parsed * mult;
+        };
+        auto envSize = [&envU64](char const* name, std::size_t def, bool allowZero = true) -> std::size_t
+        {
+            auto const parsed = envU64(name, def);
+            if ((!allowZero && parsed == 0) || parsed > std::numeric_limits<std::size_t>::max())
+            {
+                return def;
+            }
+            return static_cast<std::size_t>(parsed);
+        };
+        auto envSizeBytes = [&envBytes](char const* name, std::size_t def, bool allowZero = true) -> std::size_t
+        {
+            auto const parsed = envBytes(name, def);
+            if ((!allowZero && parsed == 0) || parsed > std::numeric_limits<std::size_t>::max())
+            {
+                return def;
+            }
+            return static_cast<std::size_t>(parsed);
+        };
+        auto envU32 = [&envU64](char const* name, std::uint32_t def, bool allowZero = true) -> std::uint32_t
+        {
+            auto const parsed = envU64(name, def);
+            if ((!allowZero && parsed == 0) || parsed > std::numeric_limits<std::uint32_t>::max())
+            {
+                return def;
+            }
+            return static_cast<std::uint32_t>(parsed);
+        };
+        auto envInt = [&envU64](char const* name, int def, bool allowZero = true) -> int
+        {
+            auto const parsed = envU64(name, static_cast<std::uint64_t>(def));
+            if ((!allowZero && parsed == 0) || parsed > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+            {
+                return def;
+            }
+            return static_cast<int>(parsed);
+        };
+
+        cfg.enabled = envBool("TRTLLM_NIXL_BOUNCE_ENABLE", cfg.enabled);
+        cfg.arenaSizeBytes = envSizeBytes("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", cfg.arenaSizeBytes, false);
+        cfg.arenaAllocationGranularityBytes = envSizeBytes(
+            "TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", cfg.arenaAllocationGranularityBytes, false);
+        cfg.maxChunkSizeBytes = envSizeBytes("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", cfg.maxChunkSizeBytes, false);
+        cfg.maxInflightChunksPerRequest
+            = envU32("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", cfg.maxInflightChunksPerRequest, false);
+        cfg.copyStreamCount = envU32("TRTLLM_NIXL_BOUNCE_COPY_STREAM_COUNT", cfg.copyStreamCount, false);
+        cfg.scatterWorkerCount = envU32("TRTLLM_NIXL_BOUNCE_SCATTER_WORKER_COUNT", cfg.scatterWorkerCount, false);
+        cfg.minDescriptorCount = envSize("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", cfg.minDescriptorCount);
+        cfg.maxAverageDescriptorSizeBytes
+            = envSizeBytes("TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES", cfg.maxAverageDescriptorSizeBytes);
+        cfg.requestTimeoutMs = envInt("TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS", cfg.requestTimeoutMs);
+        cfg.disableFabricMemory = envBool("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", cfg.disableFabricMemory);
+        cfg.useCubCopy = envBool("TRTLLM_NIXL_BOUNCE_USE_CUB_COPY", cfg.useCubCopy);
+        cfg.useZeroCopyArguments = envBool("TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS", cfg.useZeroCopyArguments);
+        cfg.enableEagerGather = envBool("TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER", cfg.enableEagerGather);
+        cfg.useNixlNotifications = envBool("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS", cfg.useNixlNotifications);
+        cfg.disableScatterRunMerging
+            = envBool("TRTLLM_NIXL_BOUNCE_DISABLE_SCATTER_RUN_MERGING", cfg.disableScatterRunMerging);
+        return cfg;
+    }
+};
+
+} // namespace tensorrt_llm::executor::kv_cache::bounce
