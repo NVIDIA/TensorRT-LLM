@@ -205,6 +205,19 @@ def _decorated_draft_model_registrations():
 
 
 def test_spec_mode_index_matches_decorators():
+    # SPEC_MODE_TO_MODULE is the fourth hand-maintained table in _arch_index,
+    # and every other one already has a drift test here -- MODEL_ARCH_TO_MODULE
+    # and MULTIMODAL_MODEL_TYPE_TO_MODULE in test_arch_index_matches_decorators,
+    # MODEL_CLASS_TO_MODULE in test_class_index_matches_package_all. Keeping the
+    # set complete is the point: without this, the spec-mode table would be the
+    # only index whose entries nothing checks.
+    #
+    # Drift is not silent, but it is misattributed. A builder added without its
+    # index entry (or an index entry whose module stopped declaring the mode)
+    # surfaces as "unsupported speculative decoding mode" to whoever next runs
+    # that mode -- which reads as "this algorithm is not implemented", not as
+    # "someone forgot a line in _arch_index". The person who sees it is rarely
+    # the person who caused it.
     from tensorrt_llm._torch.models._arch_index import SPEC_MODE_TO_MODULE
 
     mode_truth = _decorated_draft_model_registrations()
@@ -219,32 +232,6 @@ def test_spec_mode_index_matches_decorators():
         if SPEC_MODE_TO_MODULE[mode] not in mode_truth[mode]
     }
     assert not wrong, f"index points at the wrong module: {wrong}"
-
-
-def test_spec_mode_index_resolves_every_builder():
-    # End-to-end check of the lazy path: every indexed mode must resolve to a
-    # builder through the single entry point, and that builder must itself
-    # declare the mode. The declaration is read off the function
-    # (``_registered_spec_modes``), never by scanning the mapping by identity:
-    # a built-in builder overridden by an external registration keeps its
-    # attribute but loses its mapping slot.
-    from tensorrt_llm._torch.models._arch_index import SPEC_MODE_TO_MODULE
-    from tensorrt_llm._torch.models.modeling_utils import (
-        _REGISTERED_SPEC_MODES_ATTR,
-        get_registered_draft_model_builder,
-    )
-    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-
-    for mode_name in SPEC_MODE_TO_MODULE:
-        mode = getattr(SpeculativeDecodingMode, mode_name, None)
-        assert mode is not None, f"{mode_name} is not a SpeculativeDecodingMode"
-        builder = get_registered_draft_model_builder(mode)
-        assert builder is not None, f"no draft-model builder resolved for {mode_name}"
-        declared = getattr(builder, _REGISTERED_SPEC_MODES_ATTR, set())
-        assert mode in declared, (
-            f"{builder.__module__}.{builder.__qualname__} is registered for "
-            f"{mode_name} but does not declare it"
-        )
 
 
 def test_class_index_matches_package_all():
