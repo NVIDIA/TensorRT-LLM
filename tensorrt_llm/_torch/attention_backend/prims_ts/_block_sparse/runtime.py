@@ -42,17 +42,21 @@ class _ContiguousKVStorage:
 
 @dataclass(frozen=True)
 class _PagedKVStorage:
-    """Live paged-K/V runtime storage validated against one frozen paged plan."""
+    """Paged K/V storage and request metadata consumed by one live run."""
 
     paged_kv_cache: PagedKVCache
+    paged_kv_indptr: torch.Tensor
     paged_kv_indices: torch.Tensor
+    seq_lens_kv: torch.Tensor
 
 
 @dataclass(frozen=True)
 class _PagedKVLaunchPayload:
     """Launch-only live paged metadata derived during shared validation."""
 
+    paged_kv_indptr: torch.Tensor
     paged_kv_indices: torch.Tensor
+    seq_lens_kv: torch.Tensor
     num_physical_kv_pages: int
     k_page_stride: int
     v_page_stride: int
@@ -72,22 +76,6 @@ class _BlockSparseRunArgs:
     kv_valid_bits_is_live: bool
     sm_scale: float
     paged_kv: _PagedKVLaunchPayload | None
-
-
-class _PagedKVPlanMetadataLike(Protocol):
-    """Minimal paged-plan metadata consumed by shared runtime validation."""
-
-    @property
-    def page_size(self) -> int: ...
-
-    @property
-    def paged_kv_indptr(self) -> torch.Tensor: ...
-
-    @property
-    def seq_lens_kv(self) -> torch.Tensor: ...
-
-    @property
-    def num_page_indices(self) -> int: ...
 
 
 class _BlockSparsePlanStateLike(Protocol):
@@ -130,6 +118,9 @@ class _BlockSparsePlanStateLike(Protocol):
     def use_kv_valid_bits(self) -> bool: ...
 
     @property
+    def page_size(self) -> int | None: ...
+
+    @property
     def dummy_kv_valid_bits(self) -> torch.Tensor | None: ...
 
     @property
@@ -143,9 +134,6 @@ class _BlockSparsePlanStateLike(Protocol):
 
     @property
     def compiled(self) -> Callable[..., object]: ...
-
-    @property
-    def paged_kv(self) -> _PagedKVPlanMetadataLike | None: ...
 
 
 def _validate_metadata_tensor(
@@ -272,17 +260,17 @@ def _resolve_effective_kv_valid_bits(
 def _require_contiguous_plan_state(
     state: _BlockSparsePlanStateLike,
 ) -> None:
-    if state.paged_kv is not None:
+    if state.page_size is not None:
         raise TypeError("contiguous K/V storage requires a contiguous plan state")
 
 
 def _require_paged_plan_state(
     state: _BlockSparsePlanStateLike,
-) -> _PagedKVPlanMetadataLike:
-    paged_kv = state.paged_kv
-    if paged_kv is None:
+) -> int:
+    page_size = state.page_size
+    if page_size is None:
         raise TypeError("paged K/V storage requires a paged plan state")
-    return paged_kv
+    return page_size
 
 
 def validate_block_sparse_run(
@@ -363,7 +351,7 @@ def validate_block_sparse_run(
             ("route_workspace", state.route_workspace),
         )
     elif isinstance(kv_storage, _PagedKVStorage):
-        paged_plan = _require_paged_plan_state(state)
+        page_size = _require_paged_plan_state(state)
         (
             k,
             v,
@@ -384,7 +372,7 @@ def validate_block_sparse_run(
         )
         expected_geometry = (
             state.num_kv_heads,
-            paged_plan.page_size,
+            page_size,
             state.head_dim,
         )
         if runtime_geometry != expected_geometry:
@@ -397,15 +385,32 @@ def validate_block_sparse_run(
                 f"K/V dtype must match the plan ({state.kv_dtype}), got {k.dtype}"
             )
         _validate_metadata_tensor(
+            kv_storage.paged_kv_indptr,
+            "paged_kv_indptr",
+            ndim=1,
+            dtype=torch.int32,
+            expected_device=state.device,
+            expected_shape=(state.batch_size + 1,),
+        )
+        _validate_metadata_tensor(
             kv_storage.paged_kv_indices,
             "paged_kv_indices",
             ndim=1,
             dtype=torch.int32,
             expected_device=state.device,
-            expected_shape=(paged_plan.num_page_indices,),
+        )
+        _validate_metadata_tensor(
+            kv_storage.seq_lens_kv,
+            "seq_lens_kv",
+            ndim=1,
+            dtype=torch.int32,
+            expected_device=state.device,
+            expected_shape=(state.batch_size,),
         )
         paged_kv = _PagedKVLaunchPayload(
+            paged_kv_indptr=kv_storage.paged_kv_indptr,
             paged_kv_indices=kv_storage.paged_kv_indices,
+            seq_lens_kv=kv_storage.seq_lens_kv,
             num_physical_kv_pages=num_physical_kv_pages,
             k_page_stride=k_page_stride,
             v_page_stride=v_page_stride,
@@ -417,9 +422,9 @@ def validate_block_sparse_run(
             ("block_indptr", block_indptr),
             ("block_indices", block_indices),
             ("kv_valid_bits", effective_kv_valid_bits),
-            ("paged_kv_indptr", paged_plan.paged_kv_indptr),
+            ("paged_kv_indptr", kv_storage.paged_kv_indptr),
             ("paged_kv_indices", kv_storage.paged_kv_indices),
-            ("seq_lens_kv", paged_plan.seq_lens_kv),
+            ("seq_lens_kv", kv_storage.seq_lens_kv),
             ("row_route_offsets", state.row_route_offsets),
             ("route_workspace", state.route_workspace),
         )
@@ -470,7 +475,9 @@ def record_block_sparse_run_args(
     if run_args.kv_valid_bits_is_live:
         run_args.kv_valid_bits.record_stream(stream)
     if run_args.paged_kv is not None:
+        run_args.paged_kv.paged_kv_indptr.record_stream(stream)
         run_args.paged_kv.paged_kv_indices.record_stream(stream)
+        run_args.paged_kv.seq_lens_kv.record_stream(stream)
 
 
 def launch_block_sparse(
@@ -496,7 +503,7 @@ def launch_block_sparse(
             run_args.sm_scale,
         )
     else:
-        paged_plan = _require_paged_plan_state(state)
+        _require_paged_plan_state(state)
         state.compiled(
             run_args.q,
             run_args.k,
@@ -505,9 +512,9 @@ def launch_block_sparse(
             run_args.block_indptr,
             run_args.block_indices,
             run_args.kv_valid_bits,
-            paged_plan.paged_kv_indptr,
+            run_args.paged_kv.paged_kv_indptr,
             run_args.paged_kv.paged_kv_indices,
-            paged_plan.seq_lens_kv,
+            run_args.paged_kv.seq_lens_kv,
             state.row_route_offsets,
             state.route_workspace,
             state.max_blocks_per_row,

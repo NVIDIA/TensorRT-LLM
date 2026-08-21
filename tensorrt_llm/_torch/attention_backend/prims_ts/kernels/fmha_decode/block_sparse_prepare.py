@@ -601,10 +601,10 @@ class _PrepareBlockSparseRoutes:
         kv_route_size: int,
         has_token_bits: bool,
         page_size: int | None = None,
-        use_variable_seqlens_kv: bool = False,
+        mask_type: str = "dense",
     ) -> None:
-        if use_variable_seqlens_kv and page_size is None:
-            raise ValueError("use_variable_seqlens_kv requires page_size")
+        if mask_type not in ("dense", "causal"):
+            raise ValueError(f"unsupported mask_type: {mask_type}")
         num_q_block_rows = (seq_len_q + q_block_size - 1) // q_block_size
         num_rows = batch_size * num_kv_heads * num_q_block_rows
         layout = _BlockSparseRouteLayout.create(
@@ -625,12 +625,7 @@ class _PrepareBlockSparseRoutes:
         )
         self.route_layout = layout
         self.page_size = page_size if page_size is not None else 1
-        self.use_variable_seqlens_kv = use_variable_seqlens_kv
-        self.required_pages_per_request = (
-            (seq_len_kv + self.page_size - 1) // self.page_size
-            if layout.is_paged
-            else 0
-        )
+        self.minimum_seq_len_kv = seq_len_q if mask_type == "causal" else 1
         self.physical_page_ids_word_offset = (
             layout.physical_page_ids_word_offset if layout.is_paged else 0
         )
@@ -711,55 +706,77 @@ class _PrepareBlockSparseRoutes:
         request_page_count = cutlass.Int32(0)
         live_num_kv_valid_words = cutlass.Int32(self.cfg.num_kv_valid_words)
         if cutlass.const_expr(self.route_layout.is_paged):
-            required_pages = cutlass.Int32(self.required_pages_per_request)
+            required_pages = cutlass.Int32(0)
             request_page_range_is_valid = cutlass.Int32(0)
             row_fits_live_k = cutlass.Int32(0)
+            live_seq_len_is_valid = cutlass.Int32(0)
             if lane_idx == cutlass.Int32(0) and row_is_valid:
-                if cutlass.const_expr(self.use_variable_seqlens_kv):
-                    live_seq_len_kv = cutlass.Int32(seq_lens_kv[batch_idx])
+                raw_seq_len_kv = cutlass.Int32(seq_lens_kv[batch_idx])
+                live_seq_len_kv = cutlass.Int32(self.minimum_seq_len_kv)
+                live_seq_len_is_valid = cutlass.Int32(
+                    raw_seq_len_kv >= cutlass.Int32(self.minimum_seq_len_kv)
+                    and raw_seq_len_kv <= cutlass.Int32(self.cfg.seq_len_kv)
+                )
+                if live_seq_len_is_valid != cutlass.Int32(0):
+                    live_seq_len_kv = raw_seq_len_kv
+
+                metadata_starts_at_zero = cutlass.Boolean(
+                    paged_kv_indptr[cutlass.Int32(0)] == cutlass.Int32(0)
+                )
+                if (
+                    live_seq_len_is_valid != cutlass.Int32(0)
+                    and metadata_starts_at_zero
+                ):
                     required_pages = _positive_i32_ceil_div(
                         live_seq_len_kv,
                         self.page_size,
                     )
-                if row_is_canonical and _bsr_row_fits_live_k(
-                    block_indices,
-                    row_begin,
-                    row_end,
-                    self.cfg.kv_block_size,
-                    live_seq_len_kv,
-                ):
-                    row_fits_live_k = cutlass.Int32(1)
-                    page_indptr_size = cutlass.Int32(cute.size(paged_kv_indptr))
-                    page_indptr_entry_is_valid = cutlass.Boolean(
-                        batch_idx >= cutlass.Int32(0)
-                        and batch_idx + cutlass.Int32(1) < page_indptr_size
-                    )
-                    if page_indptr_entry_is_valid:
-                        request_begin = cutlass.Int32(paged_kv_indptr[batch_idx])
-                        request_end = cutlass.Int32(
-                            paged_kv_indptr[batch_idx + cutlass.Int32(1)]
+                    if row_is_canonical and _bsr_row_fits_live_k(
+                        block_indices,
+                        row_begin,
+                        row_end,
+                        self.cfg.kv_block_size,
+                        live_seq_len_kv,
+                    ):
+                        row_fits_live_k = cutlass.Int32(1)
+                        page_indptr_size = cutlass.Int32(cute.size(paged_kv_indptr))
+                        page_indptr_entry_is_valid = cutlass.Boolean(
+                            batch_idx >= cutlass.Int32(0)
+                            and batch_idx + cutlass.Int32(1) < page_indptr_size
                         )
-                        num_page_indices = cutlass.Int32(cute.size(paged_kv_indices))
-                        request_page_range_is_valid = cutlass.Int32(
-                            _paged_request_page_range_is_valid(
-                                request_begin,
-                                request_end,
-                                num_page_indices,
-                                required_pages,
+                        if page_indptr_entry_is_valid:
+                            request_begin = cutlass.Int32(paged_kv_indptr[batch_idx])
+                            request_end = cutlass.Int32(
+                                paged_kv_indptr[batch_idx + cutlass.Int32(1)]
                             )
-                        )
-                        if request_page_range_is_valid != cutlass.Int32(0):
-                            request_page_count = required_pages
+                            num_page_indices = cutlass.Int32(
+                                cute.size(paged_kv_indices)
+                            )
+                            request_page_range_is_valid = cutlass.Int32(
+                                _paged_request_page_range_is_valid(
+                                    request_begin,
+                                    request_end,
+                                    num_page_indices,
+                                    required_pages,
+                                )
+                            )
+                            if request_page_range_is_valid != cutlass.Int32(0):
+                                request_page_count = required_pages
             request_begin = _warp_broadcast_i32(request_begin, 0)
             live_seq_len_kv = _warp_broadcast_i32(live_seq_len_kv, 0)
             request_page_count = _warp_broadcast_i32(request_page_count, 0)
             row_fits_live_k = _warp_broadcast_i32(row_fits_live_k, 0)
+            live_seq_len_is_valid = _warp_broadcast_i32(
+                live_seq_len_is_valid,
+                0,
+            )
             request_page_range_is_valid = _warp_broadcast_i32(
                 request_page_range_is_valid,
                 0,
             )
             row_is_canonical = cutlass.Boolean(
                 row_is_canonical
+                and live_seq_len_is_valid != cutlass.Int32(0)
                 and row_fits_live_k != cutlass.Int32(0)
                 and request_page_range_is_valid != cutlass.Int32(0)
             )

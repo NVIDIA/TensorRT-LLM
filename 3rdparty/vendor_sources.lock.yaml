@@ -1,13 +1,13 @@
 schema_version: 1
 vendors:
   flashinfer-prims-ts:
-    url: https://github.com/flashinfer-ai/flashinfer.git
-    branch: main
-    commit: ad8bb37b26281de4d3dd52447edc952924e6562a
+    url: ssh://git@gitlab-master.nvidia.com:12051/yuhangh/flashinfer.git
+    branch: user/yuhangh/primts-block-sparse-live
+    commit: c5226139cc158685c96e273478a7f24eb13978c0
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention_backend/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:1b578b2574a4cb50fbaff295b17e055343f65e3db161c8cce134c393a2ab9e57
-    digest: sha256-tree-v1:313b85855aa0472c9c52632fef8c599429d52dcd6f45ebc0498bb88c634ae1b8
+    patch_digest: sha256:45e6e7ad4c1793ba874961650867f5c0128f995271d5cf486d4c10de3b154427
+    digest: sha256-tree-v1:556eac46bba066d1c52ff923bd874f239a31a255c104c3d9325c4b739157b7f5
