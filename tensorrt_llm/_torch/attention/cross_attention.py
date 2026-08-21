@@ -26,12 +26,12 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import AttentionBackend, PredefinedAttentionMask
-from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.linear import Linear, TensorParallelMode
+from .backends import AttentionMetadata
+from .backends.interface import AttentionBackend, PredefinedAttentionMask
+from .backends.utils import create_attention
 
 
 class CrossAttention(nn.Module):

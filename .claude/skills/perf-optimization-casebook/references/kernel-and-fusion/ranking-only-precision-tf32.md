@@ -80,7 +80,7 @@ measured: []
   any selection/accuracy drift beyond tolerance, or no measured speedup (path was
   already tensor-core).
 - **Prior art:** PRs #13452, #12055, #9243. Files:
-  `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` (`_tf32_matmul_enabled`,
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa.py` (`_tf32_matmul_enabled`,
   `_fused_wk_wp_weight`, `F.linear` vs `torch.ops.trtllm.cublas_mm`). Owning
   specialist: **kernel-cuda-specialist**; dispatch check:
   **perf-nsight-compute-analysis**. Related: the [fusion-boundary case](reevaluate-fusion-boundary-per-dtype.md)

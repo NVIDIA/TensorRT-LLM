@@ -7,9 +7,9 @@ from transformers import Qwen2Config
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.qk_norm_attention import QKNormRoPEAttention
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding

@@ -105,20 +105,20 @@ common-files: &common_files |
         tensorrt_llm/__init__.py |
         tensorrt_llm/_torch/__init__.py |
         tensorrt_llm/_torch/attention/attention.py |
+        tensorrt_llm/_torch/attention/backends/__init__.py |
+        tensorrt_llm/_torch/attention/backends/flashinfer.py |
+        tensorrt_llm/_torch/attention/backends/interface.py |
+        tensorrt_llm/_torch/attention/backends/sparse/__init__.py |
+        tensorrt_llm/_torch/attention/backends/sparse/dsa.py |
+        tensorrt_llm/_torch/attention/backends/sparse/kernel.py |
+        tensorrt_llm/_torch/attention/backends/sparse/rocket.py |
+        tensorrt_llm/_torch/attention/backends/sparse/utils.py |
+        tensorrt_llm/_torch/attention/backends/star_flashinfer.py |
+        tensorrt_llm/_torch/attention/backends/trtllm.py |
+        tensorrt_llm/_torch/attention/backends/utils.py |
+        tensorrt_llm/_torch/attention/backends/vanilla.py |
         tensorrt_llm/_torch/attention/qk_norm_attention.py |
         tensorrt_llm/_torch/attention/rotary_embedding.py |
-        tensorrt_llm/_torch/attention_backend/__init__.py |
-        tensorrt_llm/_torch/attention_backend/flashinfer.py |
-        tensorrt_llm/_torch/attention_backend/interface.py |
-        tensorrt_llm/_torch/attention_backend/sparse/__init__.py |
-        tensorrt_llm/_torch/attention_backend/sparse/dsa.py |
-        tensorrt_llm/_torch/attention_backend/sparse/kernel.py |
-        tensorrt_llm/_torch/attention_backend/sparse/rocket.py |
-        tensorrt_llm/_torch/attention_backend/sparse/utils.py |
-        tensorrt_llm/_torch/attention_backend/star_flashinfer.py |
-        tensorrt_llm/_torch/attention_backend/trtllm.py |
-        tensorrt_llm/_torch/attention_backend/utils.py |
-        tensorrt_llm/_torch/attention_backend/vanilla.py |
         tensorrt_llm/_torch/autotuner.py |
         tensorrt_llm/_torch/compilation/__init__.py |
         tensorrt_llm/_torch/compilation/backend.py |
@@ -874,20 +874,20 @@ legacy-files: &legacy_files |
         tensorrt_llm/__init__.py |
         tensorrt_llm/_torch/__init__.py |
         tensorrt_llm/_torch/attention/attention.py |
+        tensorrt_llm/_torch/attention/backends/__init__.py |
+        tensorrt_llm/_torch/attention/backends/flashinfer.py |
+        tensorrt_llm/_torch/attention/backends/interface.py |
+        tensorrt_llm/_torch/attention/backends/sparse/__init__.py |
+        tensorrt_llm/_torch/attention/backends/sparse/dsa.py |
+        tensorrt_llm/_torch/attention/backends/sparse/kernel.py |
+        tensorrt_llm/_torch/attention/backends/sparse/rocket.py |
+        tensorrt_llm/_torch/attention/backends/sparse/utils.py |
+        tensorrt_llm/_torch/attention/backends/star_flashinfer.py |
+        tensorrt_llm/_torch/attention/backends/trtllm.py |
+        tensorrt_llm/_torch/attention/backends/utils.py |
+        tensorrt_llm/_torch/attention/backends/vanilla.py |
         tensorrt_llm/_torch/attention/qk_norm_attention.py |
         tensorrt_llm/_torch/attention/rotary_embedding.py |
-        tensorrt_llm/_torch/attention_backend/__init__.py |
-        tensorrt_llm/_torch/attention_backend/flashinfer.py |
-        tensorrt_llm/_torch/attention_backend/interface.py |
-        tensorrt_llm/_torch/attention_backend/sparse/__init__.py |
-        tensorrt_llm/_torch/attention_backend/sparse/dsa.py |
-        tensorrt_llm/_torch/attention_backend/sparse/kernel.py |
-        tensorrt_llm/_torch/attention_backend/sparse/rocket.py |
-        tensorrt_llm/_torch/attention_backend/sparse/utils.py |
-        tensorrt_llm/_torch/attention_backend/star_flashinfer.py |
-        tensorrt_llm/_torch/attention_backend/trtllm.py |
-        tensorrt_llm/_torch/attention_backend/utils.py |
-        tensorrt_llm/_torch/attention_backend/vanilla.py |
         tensorrt_llm/_torch/autotuner.py |
         tensorrt_llm/_torch/compilation/__init__.py |
         tensorrt_llm/_torch/compilation/backend.py |

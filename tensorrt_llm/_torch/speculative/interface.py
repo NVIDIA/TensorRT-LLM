@@ -28,9 +28,9 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
-from ..attention_backend.interface import AttentionMetadata
-from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
-                                        TrtllmAttentionMetadata)
+from ..attention.backends.interface import AttentionMetadata
+from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
+                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import (BaseResourceManager,
                                            ResourceManagerType)
@@ -2658,7 +2658,7 @@ class SpecWorkerBase(nn.Module, ABC):
             yield attn_metadata
             return
 
-        from ..attention_backend.flashinfer import FlashInferAttentionMetadata
+        from ..attention.backends.flashinfer import FlashInferAttentionMetadata
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
             yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
             return

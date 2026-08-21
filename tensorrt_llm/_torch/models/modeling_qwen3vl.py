@@ -37,10 +37,10 @@ from ...inputs import (
 )
 from ...inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from ...logger import logger
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.backends.utils import get_attention_backend
 from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.utils import get_attention_backend
 from ..modules.embedding import Embedding
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode

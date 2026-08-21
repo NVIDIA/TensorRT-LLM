@@ -6,8 +6,8 @@ from tqdm import tqdm
 from transformers import Cohere2Config
 from transformers.activations import ACT2FN
 
-from tensorrt_llm._torch.attention_backend import AttentionMetadata, FlashInferAttentionMetadata
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends import AttentionMetadata, FlashInferAttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMask,
     CustomAttentionMask,
     PositionalEmbeddingParams,

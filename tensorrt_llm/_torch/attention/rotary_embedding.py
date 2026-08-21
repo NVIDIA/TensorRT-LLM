@@ -17,8 +17,8 @@ from typing import List, Tuple
 import torch
 from torch import nn
 
-from ..attention_backend.interface import RopeParams
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from .backends.interface import RopeParams
 
 
 class RotaryEmbedding(nn.Module):

@@ -37,7 +37,7 @@ try:
     import sys
     from pathlib import Path
 
-    from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.visual_gen.attention_backend import Attention2DAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (

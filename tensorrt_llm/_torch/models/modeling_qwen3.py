@@ -10,9 +10,9 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.attention import (maybe_allgather_for_helix_cp,
                                    maybe_slice_for_helix_cp)
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.qk_norm_attention import QKNormRoPEAttention
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer

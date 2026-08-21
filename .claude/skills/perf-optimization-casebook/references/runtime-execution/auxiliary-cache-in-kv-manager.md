@@ -87,7 +87,7 @@ measured: []
 - **Prior art:** PRs #8699, #9383, #12010, #15088, #9110. Files:
   `cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp` (`createIndexerKCachePools`,
   `containsIndexerKCache`, `isEnableIndexerKCache`), `kvCacheUtils.h` (`BlockRange`),
-  `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` (`DSACacheManager`,
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa.py` (`DSACacheManager`,
   `_get_pool_block_indices`). Owning specialist: **kernel-cuda-specialist**. Related:
   the [MLA KV-cache reuse case](mla-kv-cache-reuse.md) (#9383 is the side-cache
   instance of that pattern) and [move bookkeeping into a C++ op](move-bookkeeping-into-cpp-op.md)
