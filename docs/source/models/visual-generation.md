@@ -63,13 +63,13 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
-[^2]: `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` — VSA-fine-tuned checkpoint with learned sparse-attention gates. Requires `CUTEDSL` on Blackwell sm_100+ (falls back to dense SDPA on older hardware). Ring and Attention2D not supported (no LSE output); Ulysses supported.
+[^2]: `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` — VSA-fine-tuned checkpoint with learned sparse-attention gates. Supports `CUTEDSL` and `TRTLLM` on Blackwell GPUs. `CUTEDSL` uses the CuTe DSL fine-stage kernel; `TRTLLM` uses PrimTS block-sparse attention on SM100/SM103. An unsupported PrimTS fine-stage device or tensor envelope falls back to dense SDPA while preserving VSA coarse and gate semantics. Ring and Attention2D are not supported (no LSE output); Ulysses is supported.
 
 [^3]: Wan 2.2 has two stage transformers; TeaCache requires explicit `teacache.coefficients` (high-noise) and `teacache.coefficients_2` (low-noise). There is no built-in coefficient table for Wan 2.2.
 
 [^4]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
 
-[^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition and returns the generated RGBA layer stack as a saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, Tensor Parallelism, and `trtllm-serve` image-edit routing are not enabled for this pipeline yet.
+[^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition and returns the generated RGBA layer stack as a saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention parallelism, SageAttention, VSA, Tensor Parallelism, and `trtllm-serve` image-edit routing are not enabled for this pipeline yet.
 ## Quick Start
 
 Here is a simple example to generate a video with Wan 2.1:
@@ -237,12 +237,15 @@ args = VisualGenArgs(
 
 ### Video Sparse Attention (VSA)
 
-VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs a block-sparse CuTe kernel over only those blocks. The two outputs are blended with learned gates.
+VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs a backend-selected block-sparse kernel (`CUTEDSL` CuTe DSL or `TRTLLM` PrimTS) over only those blocks. The two outputs are blended with learned gates.
+
+VSA is a VisualGen-owned sparse algorithm, not an attention backend or an FMHA library. Its common algorithm and thin TRTLLM/CuTe DSL adapters live under `visual_gen/attention_backend/sparse/vsa/`, mirroring the per-algorithm organization of the LLM sparse tree without moving VSA into the LLM stack. With `TRTLLM` selected as the attention backend, the adapter lowers only the fine-stage routes to the generic block-sparse contracts and follows the common TRTLLM path through `super().forward()`. The TRTLLM FMHA registry therefore sees a generic `PrimsTSBlockSparseFmha` request rather than a VSA-specific library.
 
 **Requirements:**
 - VSA-fine-tuned checkpoint: [`FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers`](https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers). Standard Wan checkpoints do not have the learned VSA gates.
-- Blackwell GPU (sm_100+) for the CuTe JIT kernel. Falls back to dense SDPA on older hardware with no accuracy loss.
-- `CUTEDSL` attention backend.
+- Blackwell GPU. PrimTS supports SM100/SM103. Unsupported sparse-kernel configurations fall back to dense SDPA for the fine branch.
+- `CUTEDSL` or `TRTLLM` attention backend.
+- VSA and `quant_attention_config` are mutually exclusive.
 - Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.
 
 **`vsa_sparsity`** controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.
@@ -251,12 +254,12 @@ Python API:
 
 ```python
 from tensorrt_llm import VisualGenArgs
-from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
+from tensorrt_llm.visual_gen import AttentionConfig, VideoSparseAttentionConfig
 
 args = VisualGenArgs(
     model="FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers",
     attention_config=AttentionConfig(
-        backend="CUTEDSL",
+        backend="TRTLLM",  # or "CUTEDSL"
         sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
     ),
 )
@@ -266,7 +269,7 @@ YAML (for use with `--visual_gen_args` or `trtllm-serve`):
 
 ```yaml
 attention_config:
-  backend: CUTEDSL
+  backend: TRTLLM  # or CUTEDSL
   sparse_attention_config:
     algorithm: vsa
     vsa_sparsity: 0.90
@@ -305,6 +308,7 @@ Key components:
 | `AutoPipeline` | `visual_gen/pipeline_registry.py` | Factory: auto-detects model type, selects pipeline class |
 | `PipelineLoader` | `visual_gen/pipeline_loader.py` | Resolves checkpoint, loads config/weights, creates pipeline |
 | `TeaCacheAccelerator` / `CacheDiTAccelerator` | `visual_gen/cache/` | Runtime caching backends (TeaCache, Cache-DiT) wrapping the transformer forward |
+| VisualGen sparse algorithms | `visual_gen/attention_backend/sparse/` | Algorithm orchestration and thin adapters to the selected attention backend |
 | `WeightLoader` | `visual_gen/checkpoints/` | Loads transformer weights from safetensors/bin |
 
 VisualGen is a parallel inference subsystem within TensorRT-LLM. It shares low-level primitives (`Mapping`, `QuantConfig`, `Linear`, `RMSNorm`, `ZeroMqQueue`, `TrtllmAttention`) but has its own executor, scheduler (diffusers-based), request types, and pipeline architecture separate from the LLM autoregressive decode path.

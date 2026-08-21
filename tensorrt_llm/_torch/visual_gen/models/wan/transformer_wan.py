@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from typing import Optional, Tuple
 
@@ -334,6 +349,7 @@ class WanBlock(nn.Module):
             config=model_config,
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,
+            separate_qkv_is_self_attention=True,
             module_name=f"blocks.{_layer_idx}.attn1",
         )
 
@@ -383,7 +399,7 @@ class WanBlock(nn.Module):
             reduce_output=(tp_size != 1),
         )
 
-        # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
+        # VSA gates are shared by the backend-specific fine-stage implementations.
         # G_c weights the coarse branch; G_f weights the fine branch.
         self.to_gate_compress = None
         self.to_gate_fine = None
@@ -391,7 +407,6 @@ class WanBlock(nn.Module):
         _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
         _is_vsa = (
             _attn_cfg is not None
-            and getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
@@ -409,6 +424,10 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=gate_tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(
+                    self.attn1.local_q_dim_start,
+                    self.attn1.local_q_dim_end,
+                ),
             )
             self.to_gate_fine = Linear(
                 hidden_size,
@@ -421,6 +440,10 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=gate_tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(
+                    self.attn1.local_q_dim_start,
+                    self.attn1.local_q_dim_end,
+                ),
             )
 
         # I2V: Additional K/V projections for image embeddings.
@@ -559,7 +582,12 @@ class WanBlock(nn.Module):
         # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
         # side stream; both paths return 3D [B, S, H*D].
         if self._use_async_ulysses:
-            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
+            attn1_out = self.attn1.forward_async(
+                normed,
+                freqs=freqs,
+                timestep=timestep,
+                **attn1_kwargs,
+            )
         else:
             attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
 

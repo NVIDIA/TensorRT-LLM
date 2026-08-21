@@ -199,12 +199,14 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         return None
 
 
-class VideoSparseAttentionConfig(StrictBaseModel):
-    """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
+class VideoSparseAttentionConfig(BaseSparseAttentionConfig):
+    """Video Sparse Attention (VSA) sparse-attention recipe.
 
     Two-stage hybrid attention: a coarse mean-pooled stage over (4,4,4) cubes
     and a block-sparse fine stage over the top-K cubes selected per head.
     vsa_sparsity controls the fraction of cubes dropped on the fine stage.
+    The fine stage may run on either the CuTeDSL backend or the TRTLLM PrimTS
+    backend, while the user-facing sparsity semantics stay the same.
     """
 
     algorithm: Literal["vsa"] = PydanticField(
@@ -220,3 +222,13 @@ class VideoSparseAttentionConfig(StrictBaseModel):
             "(dense fine stage); values closer to 1.0 keep fewer cubes."
         ),
     )
+
+    def to_sparse_params(self, **kwargs):
+        """Lower VSA's 4x4x4 fine-stage cubes to generic block-sparse geometry."""
+        del kwargs
+        from tensorrt_llm._torch.attention_backend.sparse.block_sparse import BlockSparseParams
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.common import (
+            VSA_BLOCK_SIZE,
+        )
+
+        return BlockSparseParams(q_block_size=VSA_BLOCK_SIZE, kv_block_size=VSA_BLOCK_SIZE)

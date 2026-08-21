@@ -5,11 +5,13 @@
 
 import itertools
 import pickle
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     CacheDiTConfig,
@@ -19,8 +21,20 @@ from tensorrt_llm.visual_gen.args import (
     QuantAttentionConfig,
     TeaCacheConfig,
     TorchCompileConfig,
+    VideoSparseAttentionConfig,
     VisualGenArgs,
 )
+
+
+def test_pipeline_without_vsa_capability_rejects_vsa() -> None:
+    pipeline_config = SimpleNamespace(
+        attention=SimpleNamespace(
+            sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9)
+        )
+    )
+
+    with pytest.raises(ValueError, match="does not support Video Sparse Attention"):
+        BasePipeline(pipeline_config)
 
 
 class TestVisualGenArgsStrictValidation:
@@ -87,6 +101,32 @@ class TestAttentionConfigQuantValidation:
                 quant_attention_config=QuantAttentionConfig(
                     qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
                 ),
+            )
+
+    @pytest.mark.parametrize(
+        ("backend", "quant_config"),
+        [
+            (
+                "TRTLLM",
+                QuantAttentionConfig(
+                    qk_dtype="fp8",
+                    q_block_size=1,
+                    k_block_size=1,
+                    v_block_size=1,
+                ),
+            ),
+            (
+                "CUTEDSL",
+                QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
+            ),
+        ],
+    )
+    def test_vsa_and_quantization_are_mutually_exclusive(self, backend, quant_config):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            AttentionConfig(
+                backend=backend,
+                quant_attention_config=quant_config,
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
             )
 
     @pytest.mark.parametrize(

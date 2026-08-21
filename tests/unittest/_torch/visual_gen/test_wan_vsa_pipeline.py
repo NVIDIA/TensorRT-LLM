@@ -148,7 +148,7 @@ def _assert_vsa_matches_dense(
     """Compare CuTe-DSL VSA against SDPA-fallback VSA (same gated formulation, different fine kernel)."""
     from unittest.mock import patch
 
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import vsa as _vsa_module
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import cute_dsl as _vsa_module
 
     common_kwargs = dict(
         prompt=PROMPT,

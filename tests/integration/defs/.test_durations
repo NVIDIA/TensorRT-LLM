@@ -1342,7 +1342,7 @@
    "unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py": 206.67422807017545,
    "unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py": 521.5535932203389,
    "unittest/_torch/visual_gen/test_attention_cute_dsl.py": 161.75197866666667,
-   "unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py": 43.49738057742782,
+   "unittest/_torch/visual_gen/test_attention_vsa.py": 43.49738057742782,
    "unittest/_torch/visual_gen/test_attention_integration.py": 107.21697574123989,
    "unittest/_torch/visual_gen/test_attention_perf.py": 219.80059466666668,
    "unittest/_torch/visual_gen/test_attention_trtllm_sage.py": 204.94523116883119,

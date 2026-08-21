@@ -36,11 +36,6 @@ from typing import Dict, Optional, Tuple
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.attention_backend import (
-    VSAMetadataBuilder,
-    set_vsa_forward_context,
-)
-
 # ============================================================================
 # Flash Attention 4 availability
 # ============================================================================
@@ -48,6 +43,10 @@ from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
     _flash_attn_fwd_import_error as _fa4_import_error,
+)
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
+    VSAMetadataBuilder,
+    set_vsa_forward_context,
 )
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -529,10 +528,8 @@ class WanAttentionPerformanceBenchmark:
             gate_compress = None
             if vsa_sparsity is not None:
                 vsa_metadata = VSAMetadataBuilder().build(
-                    current_timestep=0,
                     raw_latent_shape=latent_shape,
                     patch_size=(1, 1, 1),
-                    vsa_sparsity=vsa_sparsity,
                     device=self.device,
                 )
                 gate_compress = torch.zeros_like(hidden_states)
@@ -1080,7 +1077,9 @@ class TestVsaVsFa4KernelPerformance:
         block_size: int,
         sparsity: float,
     ):
-        from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import VSA_KERNEL_MAX_CUBES
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.cute_dsl import (
+            VSA_KERNEL_MAX_CUBES,
+        )
 
         assert seq_len % block_size == 0, "seq_len must be a multiple of block_size"
         num_cubes = seq_len // block_size

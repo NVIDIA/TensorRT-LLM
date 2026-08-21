@@ -1,10 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from enum import Enum
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-
-from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
@@ -96,19 +109,19 @@ class Attention(nn.Module):
         cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
-        _is_vsa = (
-            base_backend == "CUTEDSL"
-            and _sa_cfg is not None
-            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        is_vsa = _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa"
+
+        is_separate_qkv_cross_attention = (
+            self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
+        )
+        use_vanilla_cross_attention = is_separate_qkv_cross_attention and (
+            base_backend == "TRTLLM" or is_vsa
         )
 
-        # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
-            backend_name = "VANILLA"
-        else:
-            backend_name = base_backend
+        # Cross-attention fallback: dense TRTLLM and every VSA backend are self-attn only.
+        backend_name = "VANILLA" if use_vanilla_cross_attention else base_backend
 
-        if _is_vsa and cp_size > 1:
+        if is_vsa and cp_size > 1:
             raise ValueError(
                 f"VSA needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
@@ -211,11 +224,13 @@ class Attention(nn.Module):
             backend_num_heads = self.local_num_attention_heads
             backend_num_kv_heads = self.local_num_key_value_heads
 
-        # Resolve sparse attention params for TRTLLM backend
+        # Lower the selected sparse algorithm at the VisualGen/backend boundary.
+        # Cross-attention has already fallen back to VANILLA above, so VSA
+        # params are only attached to the TRTLLM self-attention path.
         sparse_params = None
-        ss_cfg = config.attention.sparse_attention_config
-        if isinstance(ss_cfg, SkipSoftmaxAttentionConfig) and backend_name == "TRTLLM":
-            sparse_params = ss_cfg.to_sparse_params(
+        sparse_config = config.attention.sparse_attention_config
+        if sparse_config is not None and backend_name == "TRTLLM":
+            sparse_params = sparse_config.to_sparse_params(
                 module_name=self.module_name,
                 pretrained_config=config.pretrained_config,
             )
@@ -235,12 +250,7 @@ class Attention(nn.Module):
             sparse_params=sparse_params,
         )
 
-        if (
-            enable_sequence_parallel
-            and self.qkv_mode == QKVMode.SEPARATE_QKV
-            and not separate_qkv_is_self_attention
-            and vgm is not None
-        ):
+        if enable_sequence_parallel and is_separate_qkv_cross_attention and vgm is not None:
             ring_size = vgm.ring_size
             if ring_size > 1:
                 raise ValueError(
@@ -632,6 +642,7 @@ class Attention(nn.Module):
         hidden_states: torch.Tensor,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         """Async-Ulysses self-attn driver. Structurally mirrors ``forward``:
         each closure does ``to_{q,k,v}`` + (optional) fused norm+RoPE on the
@@ -671,8 +682,8 @@ class Attention(nn.Module):
             )
 
         B, S = hidden_states.shape[:2]
-        H = self.num_attention_heads
-        KV = self.num_key_value_heads
+        H = self.local_num_attention_heads
+        KV = self.local_num_key_value_heads
         D = self.head_dim
         # Mirrors forward()'s fused gate. qkv_mode is implicitly SEPARATE_QKV
         # under async (caller-enforced), so the FUSE_QKV check in forward()
@@ -728,6 +739,17 @@ class Attention(nn.Module):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
+        for gate_key in ("gate_compress", "gate_fine"):
+            gate = kwargs.get(gate_key)
+            if gate is not None:
+                kwargs[gate_key] = gate.view(B, S, self.local_num_attention_heads, D)
+
+        out_4d = self.attn.forward_async(
+            compute_q,
+            compute_k,
+            compute_v,
+            timestep=timestep,
+            **kwargs,
+        )
         b, t = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(b, t, H * D))

@@ -12,15 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-CuTe DSL attention backend family for visual generation models.
 
-  fmha.py — CuTeDSLAttention (dense and blockscaled JIT FMHA)
-"""
+"""Video Sparse Attention algorithm for VisualGen."""
 
-from .fmha import CuTeDSLAttention, _cute_dsl_import_error
+from .common import (
+    VSA_TILE_SIZE,
+    VSAAlgorithm,
+    VSAFineStage,
+    VSAMetadata,
+    VSAMetadataBuilder,
+    VSAPreprocessor,
+    get_vsa_forward_context,
+    set_vsa_forward_context,
+)
 
 __all__ = [
-    "CuTeDSLAttention",
-    "_cute_dsl_import_error",
+    "VSA_TILE_SIZE",
+    "VSAAlgorithm",
+    "VSAFineStage",
+    "VSAMetadata",
+    "VSAMetadataBuilder",
+    "VSAPreprocessor",
+    "get_vsa_forward_context",
+    "set_vsa_forward_context",
 ]

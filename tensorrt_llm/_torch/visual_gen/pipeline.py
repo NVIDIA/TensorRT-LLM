@@ -70,6 +70,8 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
+    supports_vsa = False
+
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
@@ -82,6 +84,13 @@ class BasePipeline(nn.Module):
         return cls
 
     def __init__(self, pipeline_config: "DiffusionPipelineConfig"):
+        sparse_config = getattr(
+            getattr(pipeline_config, "attention", None),
+            "sparse_attention_config",
+            None,
+        )
+        if getattr(sparse_config, "algorithm", None) == "vsa" and not self.supports_vsa:
+            raise ValueError(f"{type(self).__name__} does not support Video Sparse Attention")
         super().__init__()
         self.pipeline_config = pipeline_config
         self.config = pipeline_config.primary_pretrained_config
@@ -1254,3 +1263,17 @@ class BasePipeline(nn.Module):
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()
+
+        # Component-scoped attention resources may own tensors captured by the
+        # graph runners above. Clear them only after every graph is released.
+        cleared_resources: set[int] = set()
+        for model_config in getattr(self.pipeline_config, "model_configs", {}).values():
+            state = getattr(model_config, "attention_metadata_state", None)
+            if not isinstance(state, dict):
+                continue
+            for resource in state.values():
+                clear = getattr(resource, "clear", None)
+                resource_id = id(resource)
+                if callable(clear) and resource_id not in cleared_resources:
+                    clear()
+                    cleared_resources.add(resource_id)

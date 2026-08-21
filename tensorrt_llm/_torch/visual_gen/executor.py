@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import os
 import queue
@@ -529,17 +544,14 @@ def run_diffusion_worker(
                     f"performance."
                 )
 
-        # NCCL_NVLS_ENABLE=0 is required to prevent a hang on Blackwell when
-        # VSA (CuTeDSL) + Ulysses is active
+        # The validated CuTe DSL VSA + Ulysses path requires NVLS disabled on
+        # Blackwell. Keep this workaround scoped to the reproduced backend.
         if torch.cuda.is_available() and visual_gen_args is not None:
             _attn = visual_gen_args.attention_config
             _sa = getattr(_attn, "sparse_attention_config", None)
-            _is_vsa = (
-                getattr(_attn, "backend", "") == "CUTEDSL"
-                and getattr(_sa, "algorithm", "") == "vsa"
-            )
+            _is_vsa = getattr(_sa, "algorithm", "") == "vsa"
             _has_ulysses = getattr(visual_gen_args.parallel_config, "ulysses_size", 1) > 1
-            if _is_vsa and _has_ulysses:
+            if _attn.backend == "CUTEDSL" and _is_vsa and _has_ulysses:
                 os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
         dist.init_process_group(

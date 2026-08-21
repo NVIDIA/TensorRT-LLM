@@ -36,9 +36,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import (
+    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
         VSAMetadataBuilder,
-        _cute_dsl_import_error,
         set_vsa_forward_context,
     )
     from tensorrt_llm._torch.visual_gen.config import (
@@ -170,10 +170,8 @@ def _vsa_forward(
     vsa_builder = VSAMetadataBuilder()
     raw_latent_shape = (hidden_states.shape[2], hidden_states.shape[3], hidden_states.shape[4])
     vsa_metadata = vsa_builder.build(
-        current_timestep=0,
         raw_latent_shape=raw_latent_shape,
         patch_size=tuple(patch_size),
-        vsa_sparsity=VSA_SPARSITY,
         device=hidden_states.device,
     )
     with set_vsa_forward_context(vsa_metadata):

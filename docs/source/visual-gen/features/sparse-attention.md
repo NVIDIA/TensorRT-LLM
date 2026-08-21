@@ -13,14 +13,14 @@ This page is an unindexed draft until the VisualGen documentation hub is introdu
 
 Visual generation models naturally operate on long image or video token sequences. Each denoising step is closer to a full-context prefill pass than to autoregressive decoding, and attention can dominate runtime for high-resolution image generation or long video generation.
 
-Sparse attention in VisualGen is configured through `VisualGenArgs.attention_config.sparse_attention_config`. The user-facing config stays in VisualGen args or model config. Checkpoint calibration metadata remains internal and is lowered into per-attention-backend `SparseParams` when each attention module is constructed.
+Sparse attention in VisualGen is configured through `VisualGenArgs.attention_config.sparse_attention_config`. The user-facing config stays in VisualGen args or model config, while `attention_config.backend` continues to select the base attention backend independently. VisualGen organizes sparse algorithms under `visual_gen/attention_backend/sparse/`, mirroring the LLM sparse tree. An algorithm package can provide thin adapters to the selected backend and lower kernel-facing data into shared core contracts; it does not become an attention backend merely by living under `sparse/`.
 
 ### Algorithms
 
 | `algorithm` | Config class | Status |
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
-| VSA | TBD | TODO |
+| `vsa` | `VideoSparseAttentionConfig` | Supported (`CUTEDSL`, `TRTLLM`) |
 
 ## Skip Softmax Attention
 
@@ -159,4 +159,12 @@ Graphs are captured lazily. The first denoising step seen for a given tensor sha
 
 ## Video Sparse Attention (VSA)
 
-TODO
+VSA combines a coarse mean-pooled branch with a top-K block-sparse fine branch. Select either `CUTEDSL` for the CuTe DSL kernel or `TRTLLM` for PrimTS block-sparse attention. Unsupported kernel configurations fall back to dense SDPA for the fine branch. VSA cannot be combined with `quant_attention_config`.
+
+VSA belongs entirely to VisualGen and lives under `visual_gen/attention_backend/sparse/vsa/`. It is a sparse algorithm, not another attention backend and not an FMHA library:
+
+- `common.py` owns coarse scoring, route selection, learned gates, and dense fine-stage fallback.
+- `trtllm.py` provides `TrtllmVSAAdapter`, which converts the selected blocks to the generic `BlockSparseParams` and `BlockSparseForwardInputs` contracts and calls the common TRTLLM path through `super().forward()`.
+- `cute_dsl.py` provides `CuTeDSLVSAAdapter` for the CuTe DSL fine-stage kernel.
+
+This mirrors the per-algorithm layout of the LLM sparse tree while preserving a one-way dependency: VisualGen consumes the generic block-sparse contracts and TRTLLM FMHA library, and the core attention stack does not import VSA. The selected base backend remains `TRTLLM` or `CUTEDSL`; the core FMHA registry contains the reusable `PrimsTSBlockSparseFmha`, not a VSA-specific entry.

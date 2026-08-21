@@ -109,6 +109,56 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     )
 
 
+def test_forward_async_redistributes_vsa_gates(monkeypatch):
+    if not MODULES_AVAILABLE:
+        pytest.skip("Required modules not available")
+
+    import tensorrt_llm._torch.visual_gen.attention_backend.parallel as parallel_backend
+
+    class _CaptureBackend:
+        preferred_layout = AttentionTensorLayout.NHD
+
+        def forward(self, q, k, v, **kwargs):
+            self.kwargs = kwargs
+            return q
+
+    inner_backend = _CaptureBackend()
+    attention = object.__new__(UlyssesAttention)
+    attention.world_size = 1
+    attention.process_group = None
+    attention.inner_backend = inner_backend
+    attention._issue_async = lambda tensor: tensor.unsqueeze(0)
+    attention._join_async = lambda: None
+    attention._output_a2a = lambda output, batch_size, seq_len: output
+    redistributed = []
+
+    def _fake_all_to_all(tensor, **kwargs):
+        redistributed.append((tensor, kwargs))
+        return tensor + 1
+
+    monkeypatch.setattr(parallel_backend, "all_to_all_4d", _fake_all_to_all)
+    q = torch.randn(1, 3, 2, 4)
+    gate_compress = torch.randn_like(q)
+    gate_fine = torch.randn_like(q)
+
+    output = attention.forward_async(
+        lambda: q,
+        lambda: q,
+        lambda: q,
+        gate_compress=gate_compress,
+        gate_fine=gate_fine,
+    )
+
+    assert output.shape == q.shape
+    assert redistributed[0][0] is gate_compress
+    assert redistributed[1][0] is gate_fine
+    assert all(entry[1]["scatter_dim"] == 2 for entry in redistributed)
+    assert all(entry[1]["gather_dim"] == 1 for entry in redistributed)
+    assert inner_backend.kwargs["batch_size"] == q.shape[0]
+    torch.testing.assert_close(inner_backend.kwargs["gate_compress"], gate_compress + 1)
+    torch.testing.assert_close(inner_backend.kwargs["gate_fine"], gate_fine + 1)
+
+
 # =============================================================================
 # Test logic functions (module-level so they can be pickled by mp.spawn)
 # =============================================================================

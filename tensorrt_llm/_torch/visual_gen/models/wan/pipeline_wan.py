@@ -25,7 +25,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
-from tensorrt_llm._torch.visual_gen.attention_backend import (
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
@@ -112,6 +112,8 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     doc="Wan 2.1 & 2.2 text-to-video family.",
 )
 class WanPipeline(BasePipeline):
+    supports_vsa = True
+
     def __init__(self, pipeline_config):
         # Wan2.2 A14B two-stage denoising parameters
         self.transformer_2 = None
@@ -135,6 +137,16 @@ class WanPipeline(BasePipeline):
             )
 
         super().__init__(pipeline_config)
+        # CUDA graphs capture the VSA partition/mask tensor addresses. Keep
+        # their shape cache alive across requests so replay never references
+        # metadata owned by a completed forward call.
+        self._vsa_metadata_builder = VSAMetadataBuilder()
+
+    def cleanup(self):
+        """Release CUDA graphs before clearing captured attention state."""
+
+        super().cleanup()
+        self._vsa_metadata_builder.clear()
 
     def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
@@ -537,22 +549,20 @@ class WanPipeline(BasePipeline):
                 f"guidance_scale={guidance_scale}, guidance_scale_2={guidance_scale_2}"
             )
 
-        # VSA: build metadata builder once per forward() call; reused across timesteps.
+        # VSA metadata is cached at pipeline scope and reused across requests.
         _attn_cfg = self.pipeline_config.primary_model_config.attention
         _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
         _vsa_active = (
-            getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            getattr(_attn_cfg, "backend", "VANILLA") in ("CUTEDSL", "TRTLLM")
             and _sparse_cfg is not None
             and getattr(_sparse_cfg, "algorithm", None) == "vsa"
         )
-        _vsa_builder = VSAMetadataBuilder() if _vsa_active else None
+        _vsa_builder = self._vsa_metadata_builder if _vsa_active else None
         _vsa_patch_size = tuple(getattr(self.config, "patch_size", [1, 2, 2]))  # (pT, pH, pW)
-        _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
 
         # Denoising with two-stage support
         # Track which model was used in last step (for logging model transitions)
         last_model_used = [None]
-        _vsa_step_counter = [0]
 
         def forward_fn(
             latents,
@@ -605,13 +615,10 @@ class WanPipeline(BasePipeline):
                 # latents: [B, C, T_latent, H_latent, W_latent]
                 raw_latent_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
                 vsa_metadata = _vsa_builder.build(
-                    current_timestep=_vsa_step_counter[0],
                     raw_latent_shape=raw_latent_shape,
                     patch_size=_vsa_patch_size,
-                    vsa_sparsity=_vsa_sparsity,
                     device=latents.device,
                 )
-                _vsa_step_counter[0] += 1
                 with set_vsa_forward_context(vsa_metadata):
                     return current_model(
                         hidden_states=latents,

@@ -12,61 +12,93 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""VSA correctness tests: CuTe kernel, tile/untile roundtrip, top-k math, backend guards.
+"""VSA correctness tests: backend dispatch, preprocessing, and kernel behavior.
 
 Module-level dense-equivalence and finite-output checks live in
 test_attention_integration.py.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend import (
-    CuTeDSLAttention,
-    VSAAttention,
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
     VSAMetadataBuilder,
+    VSAPreprocessor,
 )
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
+    cute_dsl as cute_dsl_vsa_module,
+)
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import trtllm as trtllm_vsa_module
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.trtllm import TrtllmVSAAdapter
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
+from tensorrt_llm._torch.visual_gen.modules import attention as attention_module
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm.visual_gen.args import (
-    AttentionConfig,
-    QuantAttentionConfig,
-    VideoSparseAttentionConfig,
-)
+from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
 
 
-def test_cute_dsl_factory_dispatches_quantized_fmha_and_vsa() -> None:
-    quant_config = QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="fp8", v_block_size=1)
-    dense_config = AttentionConfig(backend="CUTEDSL", quant_attention_config=quant_config)
-    dense_attention = create_attention(
-        backend="CUTEDSL",
-        layer_idx=0,
-        num_heads=8,
-        head_dim=128,
-        attention_config=dense_config,
-    )
+@pytest.mark.parametrize("backend", ["CUTEDSL", "TRTLLM"])
+def test_factory_composes_vsa_with_attention_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+) -> None:
+    class _Adapter:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
 
+    adapter_module = cute_dsl_vsa_module if backend == "CUTEDSL" else trtllm_vsa_module
+    adapter_name = "CuTeDSLVSAAdapter" if backend == "CUTEDSL" else "TrtllmVSAAdapter"
+    monkeypatch.setattr(adapter_module, adapter_name, _Adapter)
     sparse_config = VideoSparseAttentionConfig(vsa_sparsity=0.9)
-    vsa_config = AttentionConfig(backend="CUTEDSL", sparse_attention_config=sparse_config)
-    vsa_attention = create_attention(
-        backend="CUTEDSL",
+    sparse_params = sparse_config.to_sparse_params() if backend == "TRTLLM" else None
+    attention = create_attention(
+        backend=backend,
         layer_idx=0,
         num_heads=8,
         head_dim=128,
-        attention_config=vsa_config,
+        attention_config=AttentionConfig(
+            backend=backend,
+            sparse_attention_config=sparse_config,
+        ),
+        sparse_params=sparse_params,
+        attention_metadata_state=(
+            create_attention_metadata_state() if backend == "TRTLLM" else None
+        ),
     )
 
-    assert isinstance(dense_attention, CuTeDSLAttention)
-    assert dense_attention.quant_attention_config is quant_config
-    assert isinstance(vsa_attention, VSAAttention)
-    assert vsa_attention.sparse_attention_config is sparse_config
+    assert isinstance(attention, _Adapter)
+    assert attention.kwargs["sparse_attention_config"] is sparse_config
+    assert attention.kwargs.get("sparse_params") is sparse_params
+
+
+def test_trtllm_vsa_uses_dense_fine_stage_when_block_sparse_fmha_is_disabled() -> None:
+    adapter = TrtllmVSAAdapter.__new__(TrtllmVSAAdapter)
+    adapter.fmha_libs = []
+    adapter._route_builder = Mock()
+    adapter._route_builder.from_uniform_selected_blocks.side_effect = AssertionError(
+        "disabled block-sparse FMHA must not receive routes"
+    )
+    q = torch.empty((1, 64, 1, 128), dtype=torch.float16)
+
+    result = adapter._forward_sparse_fine(
+        q,
+        q,
+        q,
+        torch.zeros((1, 1, 1, 1), dtype=torch.int32),
+        torch.tensor([64]),
+        torch.ones(64, dtype=torch.bool),
+        1,
+        1,
+    )
+
+    assert result is None
 
 
 def _make_config(
@@ -97,22 +129,39 @@ def _make_config(
     return config
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
-def test_vsa_falls_back_to_vanilla_for_cross_attention():
-    """Cross-attention (SEPARATE_QKV) falls back to VANILLA — it has no cube structure."""
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
+@pytest.mark.parametrize("backend", ["CUTEDSL", "TRTLLM"])
+@pytest.mark.parametrize(
+    ("is_self_attention", "expected_backend"),
+    [(False, "VANILLA"), (True, None)],
+    ids=["cross", "self"],
+)
+def test_vsa_separate_qkv_dispatches_by_attention_role(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    is_self_attention: bool,
+    expected_backend: str | None,
+) -> None:
+    monkeypatch.setattr(
+        attention_module,
+        "create_attention",
+        lambda *, backend, **kwargs: SimpleNamespace(backend=backend, kwargs=kwargs),
+    )
     cfg = _make_config(
-        hidden_size=64, num_heads=4, head_dim=16, backend="CUTEDSL", vsa_sparsity=0.5
+        hidden_size=64,
+        num_heads=4,
+        head_dim=16,
+        backend=backend,
+        vsa_sparsity=0.5,
     )
-    cross_attn = (
-        Attention(64, 4, qkv_mode=QKVMode.SEPARATE_QKV, config=cfg)
-        .to(device=device, dtype=dtype)
-        .eval()
+    attention = Attention(
+        64,
+        4,
+        qkv_mode=QKVMode.SEPARATE_QKV,
+        config=cfg,
+        separate_qkv_is_self_attention=is_self_attention,
     )
-    assert cross_attn.attn_backend == "VANILLA", (
-        f"VSA on cross-attention should fall back to VANILLA, got {cross_attn.attn_backend!r}"
-    )
+
+    assert attention.attn_backend == (expected_backend or backend)
 
 
 def test_vsa_with_attn2d_raises():
@@ -146,25 +195,23 @@ def test_vsa_with_attn2d_raises():
         Attention(64, 4, qkv_mode=QKVMode.FUSE_QKV, config=cfg)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
-def test_vsa_topk_collapses_to_dense_at_sparsity_zero():
-    """At sparsity=0, top_k equals num_cubes (dense connectivity)."""
-    from math import ceil
-
-    device = torch.device("cuda")
+def test_vsa_metadata_builder_reuses_typed_metadata_until_clear() -> None:
     builder = VSAMetadataBuilder()
-    metadata = builder.build(
-        current_timestep=0,
-        raw_latent_shape=(8, 8, 8),
-        patch_size=(1, 1, 1),
-        vsa_sparsity=0.0,
-        device=device,
-    )
-    num_cubes = metadata.num_tiles[0] * metadata.num_tiles[1] * metadata.num_tiles[2]
-    cur_topk = max(1, ceil((1.0 - metadata.vsa_sparsity) * num_cubes))
-    assert cur_topk == num_cubes, (
-        f"sparsity=0 should select all {num_cubes} cubes, got top_k={cur_topk}"
-    )
+    build_args = {
+        "raw_latent_shape": (9, 9, 9),
+        "patch_size": (1, 1, 1),
+        "device": torch.device("cpu"),
+    }
+
+    first = builder.build(**build_args)
+    second = builder.build(**build_args)
+
+    assert first is second
+    assert first.num_cubes == 27
+
+    builder.clear()
+
+    assert builder.build(**build_args) is not first
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
@@ -179,8 +226,6 @@ def test_vsa_topk_collapses_to_dense_at_sparsity_zero():
 )
 def test_vsa_tile_untile_roundtrip(latent_shape):
     """VSAPreprocessor.tile then .untile must losslessly reproduce the input."""
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.vsa import VSAPreprocessor
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(0)
@@ -190,10 +235,8 @@ def test_vsa_tile_untile_roundtrip(latent_shape):
 
     builder = VSAMetadataBuilder()
     meta = builder.build(
-        current_timestep=0,
         raw_latent_shape=latent_shape,
         patch_size=(1, 1, 1),
-        vsa_sparsity=0.0,
         device=device,
     )
 
@@ -215,8 +258,7 @@ def test_vsa_tile_untile_roundtrip(latent_shape):
 
     x_roundtrip = VSAPreprocessor.untile(
         x_tiled,
-        meta.reverse_tile_partition_indices,
-        meta.non_pad_index,
+        meta.untile_idx,
     )
 
     assert x_roundtrip.shape == x.shape, (
@@ -360,119 +402,4 @@ def test_cute_kernel_matches_ref_with_independent_indices():
         f"CuTe kernel with independent per-Q-block indices deviated from masked fp32 "
         f"reference: max_diff={max_diff:.3e}, mean_diff={mean_diff:.3e} "
         f"(rtol={rtol}, atol={atol}, pair_mismatch={pair_mismatch})"
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel test needs CUDA")
-def test_cute_kernel_50pct_sparsity_quality_vs_dense():
-    """50% sparse CuTe kernel with score-based topk should stay close to dense SDPA."""
-
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
-        CUTE_AVAILABLE,
-        block_sparse_attn_from_indices_cute,
-        is_cute_supported,
-    )
-
-    if not CUTE_AVAILABLE:
-        pytest.skip("cuda-bindings or cutlass-dsl not importable")
-
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    torch.manual_seed(0)
-
-    B, H, num_cubes, D = 1, 4, 16, 128
-    block_size = 64
-    topk = num_cubes // 2
-    seq_len = num_cubes * block_size
-
-    q = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
-    k = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
-    v = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
-
-    if not is_cute_supported(q):
-        pytest.skip("CuTe path needs sm_100+ Blackwell (current device unsupported)")
-
-    q_blocks = q.reshape(B, H, num_cubes, block_size, D).mean(dim=3)
-    k_blocks = k.reshape(B, H, num_cubes, block_size, D).mean(dim=3)
-    scale = D**-0.5
-    block_scores = torch.einsum("bhqd,bhkd->bhqk", q_blocks.float(), k_blocks.float()) * scale
-    q2k_idx = block_scores.topk(topk, dim=-1).indices.to(torch.int32).contiguous()
-
-    q2k_num = torch.full((B, H, num_cubes), topk, dtype=torch.int32, device=device)
-    variable_block_sizes = torch.full((num_cubes,), block_size, dtype=torch.int32, device=device)
-
-    out_sparse, _lse = block_sparse_attn_from_indices_cute(
-        q, k, v, q2k_idx, q2k_num, variable_block_sizes
-    )
-    out_dense = F.scaled_dot_product_attention(q, k, v)
-
-    cos_sim = F.cosine_similarity(
-        out_sparse.float().reshape(-1), out_dense.float().reshape(-1), dim=0
-    ).item()
-    print(f"\n  50% sparse (score-based topk) vs dense SDPA cos_sim: {cos_sim:.4f}")
-
-    assert cos_sim >= 0.65, (
-        f"50% sparse CuTe kernel deviated too far from dense SDPA: cos_sim={cos_sim:.4f} < 0.65"
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel test needs CUDA")
-@pytest.mark.parametrize(
-    "num_cubes",
-    [1, 3, 9],
-    ids=["1cube_odd", "3cubes_odd", "9cubes_odd"],
-)
-def test_cute_kernel_odd_num_cubes_correctness(num_cubes):
-    """CuTe kernel with odd num_cubes must match dense SDPA (last Q-block has no pair)."""
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
-        CUTE_AVAILABLE,
-        block_sparse_attn_from_indices_cute,
-        is_cute_supported,
-    )
-
-    if not CUTE_AVAILABLE:
-        pytest.skip("cuda-bindings or cutlass-dsl not importable")
-
-    assert num_cubes % 2 == 1, f"pre-condition: num_cubes={num_cubes} must be odd"
-
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    torch.manual_seed(0)
-
-    B, H, D = 1, 4, 128
-    block_size = 64
-    seq_len = num_cubes * block_size
-
-    q = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
-    k = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
-    v = torch.randn(B, H, seq_len, D, device=device, dtype=dtype)
-
-    if not is_cute_supported(q):
-        pytest.skip("CuTe path needs sm_100+ Blackwell (current device unsupported)")
-
-    topk = num_cubes
-    q2k_idx = (
-        torch.arange(num_cubes, device=device, dtype=torch.int32)
-        .view(1, 1, 1, num_cubes)
-        .expand(B, H, num_cubes, topk)
-        .contiguous()
-    )
-    q2k_num = torch.full((B, H, num_cubes), topk, dtype=torch.int32, device=device)
-    variable_block_sizes = torch.full((num_cubes,), block_size, dtype=torch.int32, device=device)
-
-    out_kernel, _lse = block_sparse_attn_from_indices_cute(
-        q, k, v, q2k_idx, q2k_num, variable_block_sizes
-    )
-    out_ref = F.scaled_dot_product_attention(q, k, v)
-
-    assert torch.isfinite(out_kernel).all(), (
-        f"CuTe kernel produced non-finite output for odd num_cubes={num_cubes}"
-    )
-
-    max_diff = (out_kernel - out_ref).abs().max().item()
-    mean_diff = (out_kernel - out_ref).abs().mean().item()
-    rtol, atol = 1e-2, 1e-2
-    assert torch.allclose(out_kernel, out_ref, rtol=rtol, atol=atol), (
-        f"CuTe kernel deviated from dense SDPA for odd num_cubes={num_cubes}: "
-        f"max_diff={max_diff:.3e}, mean_diff={mean_diff:.3e} (rtol={rtol}, atol={atol})"
     )

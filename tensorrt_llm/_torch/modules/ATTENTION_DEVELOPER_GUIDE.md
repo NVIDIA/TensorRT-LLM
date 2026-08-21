@@ -8,10 +8,12 @@ This guide covers the TRT-LLM PyTorch attention stack:
 - `tensorrt_llm/_torch/modules/mla.py`
 - `tensorrt_llm/_torch/attention_backend/`
 - `tensorrt_llm/_torch/attention_backend/sparse/`
+- `tensorrt_llm/_torch/visual_gen/attention_backend/sparse/`
 
 Use it when modifying the current implementation or adding a new model's
 attention behavior. It covers standard `Attention`, Multi-head Latent
-Attention (MLA), dense backends, and sparse backends. It does not cover
+Attention (MLA), dense backends, sparse implementations, and the boundary where
+VisualGen sparse algorithms reuse the common attention stack. It does not cover
 `tensorrt_llm/_torch/attention_backend/star_flashinfer.py`, which is planned
 for deprecation.
 
@@ -138,18 +140,29 @@ Base backend families:
 | `VANILLA` | `VanillaAttention` | `VanillaAttentionMetadata` | Torch fallback path |
 | `FLASHINFER` | `FlashInferAttention` | `FlashInferAttentionMetadata` | FlashInfer planning/runtime path |
 
-### 2.2 Sparse backend families
+### 2.2 Sparse algorithms and backend integration
 
-Sparse attention is not selected by a separate top-level module. User-facing
-`SparseAttentionConfig` objects live in LLM / VisualGen args and `ModelConfig`.
-Attention modules use those configs to select sparse backend classes, then
-lower the configs into `SparseParams` for backend construction. KV-cache
-managers stay model-scope and consume the user-facing config directly.
-Sparse metadata consumes `SparseMetadataParams`, derived independently from the
-same user-facing config.
+The `attention_backend/sparse/` tree organizes sparse algorithms and their
+integration code. Directory membership does not imply that an algorithm is a
+separate `AttentionBackend` or an FMHA library. Some LLM sparse algorithms do
+select a backend subclass with dedicated metadata and cache behavior. Others
+lower typed sparse inputs into an existing backend and let one of that
+backend's internal FMHA libraries execute them.
 
-Sparse registrations are defined in `attention_backend/sparse/utils.py`. Check
-that file for the current supported combinations, as they may change over time.
+User-facing `SparseAttentionConfig` objects live in LLM / VisualGen args and
+`ModelConfig`. For LLM sparse algorithms that select backend subclasses,
+registrations are defined in `attention_backend/sparse/utils.py`; check that
+file for the current supported combinations. KV-cache managers stay
+model-scope and consume the user-facing config directly. Sparse metadata
+consumes `SparseMetadataParams`, derived independently from the same
+user-facing config.
+
+VisualGen mirrors this organization under
+`visual_gen/attention_backend/sparse/`, but keeps its sparse algorithms owned
+by VisualGen. Its base attention backend is still selected independently by
+`attention_config.backend`. For example, VSA provides thin TRTLLM and CuTe DSL
+adapters around one common algorithm; it is not registered as a third backend
+family.
 
 ### 2.3 Backend contract
 
@@ -180,8 +193,9 @@ Check each backend's capability hooks (`support_fused_rope()`,
 currently supports all three; other backends may not. These capabilities can
 change over time.
 
-Sparse subclasses inherit the base backend family and then add sparse-specific
-metadata and cache behavior.
+Sparse implementations that need dedicated metadata or cache behavior may
+inherit a base backend family. Algorithm adapters can instead compose with the
+already selected backend without defining another backend family.
 
 ## 3. Runtime Contract Reference
 
@@ -248,6 +262,8 @@ The main differences across backends:
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
 libraries. `MsaSparseGqaFmha` provides the specialized MiniMax-M3 sparse path,
+`PrimsTSBlockSparseFmha` executes generic typed block-sparse requests over
+contiguous or supported paged KV storage,
 `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
 `PrimsTSFmha` integrates the vendored task-scheduled Blackwell paged context,
 decode, and MLA-decode kernels,
@@ -255,14 +271,16 @@ decode, and MLA-decode kernels,
 the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
-`TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`msa_sparse_gqa,prims_ts,cute_dsl_mla,flashinfer_trtllm_gen,fallback`; use
-`TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-msa_sparse_gqa,-prims_ts,-cute_dsl_mla,-flashinfer_trtllm_gen`
-to force the fallback path. PrimsTS precedes the other dense Blackwell libraries,
-so every request admitted by its request-level support check dispatches to it.
-Each FMHA library exposes `is_available()` for module/static environment checks
-and `is_supported()` for per-forward request checks.
+`TLLM_FMHA_LIBS` controls the ordered list. Unset enables, in order,
+`msa_sparse_gqa`, `prims_ts_block_sparse`, `prims_ts`, `cute_dsl_mla`,
+`flashinfer_trtllm_gen`, and `fallback`. Use `TLLM_FMHA_LIBS=fallback` to force
+the fallback path for ordinary attention requests, or use `-name` entries to
+disable individual libraries. Generic block-sparse requests fail closed if
+`prims_ts_block_sparse` is disabled because the regular fallback does not
+implement their sparse semantics. PrimsTS precedes the other dense Blackwell
+libraries, so every request admitted by its request-level support check
+dispatches to it. Each FMHA library exposes `is_available()` for module/static
+environment checks and `is_supported()` for per-forward request checks.
 
 The FMHA package is split by role:
 
@@ -270,23 +288,43 @@ The FMHA package is split by role:
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
   requests and dispatches them to phase-specific hooks.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/prims_ts_block_sparse.py` implements the common PrimTS block-sparse
+  runtime and `PrimsTSBlockSparseFmha`. Generic requests carry static block
+  geometry in `BlockSparseParams` and live canonical BSR routes plus optional
+  token-validity bits in `BlockSparseForwardInputs`; dense fallback is not
+  permitted to ignore these inputs. The runtime supports both contiguous
+  tensors and paged KV cache while keeping their storage lowering separate.
+  Layers in one serialized execution lane may share component-scoped PrimTS plans;
+  concurrent execution lanes require separate runtime state because a plan
+  owns mutable route workspace.
+- VSA is neither an attention backend nor an FMHA library. It remains owned by
+  VisualGen under `visual_gen/attention_backend/sparse/vsa/`, following the
+  same per-algorithm organization as the core sparse tree. `common.py` owns
+  coarse scoring, top-K routing, learned gates, and dense fine-stage fallback;
+  `trtllm.py` and `cute_dsl.py` provide the thin backend-specific adapters.
+  `TrtllmVSAAdapter` lowers the fine stage to `BlockSparseParams` and
+  `BlockSparseForwardInputs`, then uses the common VisualGen
+  `TrtllmAttention` / `super().forward()` path. The normal TRTLLM registry
+  dispatches that generic request to `PrimsTSBlockSparseFmha`; no VSA-specific
+  entry is registered. An unsupported PrimTS tensor or device envelope falls
+  back only at the VSA algorithm layer, while a generic typed block-sparse
+  request remains fail closed.
 - `fmha/prims_ts.py` adapts TRT-LLM QKV preprocessing and paged-cache metadata
   to the vendored PrimTS kernels. PrimTS is imported lazily and requires
   CUTLASS DSL 4.7 or newer on SM100/SM103. The initial adapter admits
   unquantized FP16/BF16 HND paged full attention and BF16 MLA generation;
   cyclic/sliding-window caches, speculative decoding, and MLA context fall
   through to the next library.
-  The complete `prims_ts` Python source tree is managed as the
-  `flashinfer-prims-ts` vendor. Its lock selects
-  [`flashinfer/attention/prims_ts` source](https://github.com/flashinfer-ai/flashinfer/tree/ad8bb37b26281de4d3dd52447edc952924e6562a/flashinfer/attention/prims_ts)
-  from the `main` branch of
-  [`flashinfer-ai/flashinfer`](https://github.com/flashinfer-ai/flashinfer) at
-  commit `ad8bb37b26281de4d3dd52447edc952924e6562a`, including the reusable
-  block-sparse APIs added by FlashInfer PR #4474. The vendor excludes upstream
-  README files and applies the recorded TRT-LLM compatibility patch. That patch
-  retains the reusable live-metadata and caller-workspace wrapper interfaces
-  from FlashInfer commit `ca9b08ae1fe894545300db42cbeff6151f2204b9` and
-  disables trace templates unavailable in TRT-LLM's pinned FlashInfer package.
+  The complete `prims_ts` Python source tree is derived from
+  [`flashinfer-ai/flashinfer`](https://github.com/flashinfer-ai/flashinfer) and
+  managed as the `flashinfer-prims-ts` vendor. The vendor lock records the
+  authoritative source URL and immutable commit.
+  Its paged block-sparse plan records capacity and static kernel choices only;
+  every run supplies the live page table, KV sequence lengths, BSR routes, and
+  optional token-validity bits. This keeps one compatible plan reusable across
+  layers and decode steps without snapshotting request metadata. The vendor
+  excludes upstream README files and applies a recorded TRT-LLM compatibility
+  patch for facilities unavailable in TRT-LLM's pinned FlashInfer package.
   Exact upstream files retain FlashInfer's headers. Before editing this tree,
   read the [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Use a
   persistent patch for TRT-LLM-only adaptations, export an upstream-worthy
@@ -392,7 +430,8 @@ Working rules:
 | `tensorrt_llm/_torch/attention_backend/fmha/` | Internal TRTLLM FMHA libraries |
 | `tensorrt_llm/_torch/attention_backend/vanilla.py` | Torch fallback backend and metadata |
 | `tensorrt_llm/_torch/attention_backend/flashinfer.py` | FlashInfer backend and metadata |
-| `tensorrt_llm/_torch/attention_backend/sparse/` | DSA, Rocket sparse backends, metadata, cache managers |
+| `tensorrt_llm/_torch/attention_backend/sparse/` | Generic sparse contracts plus LLM sparse algorithms, backends, metadata, and cache managers |
+| `tensorrt_llm/_torch/visual_gen/attention_backend/sparse/` | VisualGen-owned sparse algorithms and their thin backend-specific adapters |
 
 ## 6. Testing Notes
 

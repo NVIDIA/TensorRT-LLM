@@ -329,5 +329,56 @@ class TestWanAsyncUlysses:
         run_test_in_distributed(2, _logic_async_vs_sync_parity, backend)
 
 
+def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output():
+    from tensorrt_llm._torch.visual_gen.modules.attention import Attention
+
+    class _CaptureAsyncAttention(torch.nn.Module):
+        def forward_async(self, compute_q, compute_k, compute_v, **kwargs):
+            self.q = compute_q()
+            self.k = compute_k()
+            self.v = compute_v()
+            self.kwargs = kwargs
+            return self.q
+
+    class _CaptureOutputProjection(torch.nn.Module):
+        def forward(self, hidden_states):
+            self.input = hidden_states
+            return hidden_states
+
+    attention = Attention.__new__(Attention)
+    torch.nn.Module.__init__(attention)
+    attention.num_attention_heads = 4
+    attention.num_key_value_heads = 4
+    attention.local_num_attention_heads = 2
+    attention.local_num_key_value_heads = 2
+    attention.head_dim = 4
+    attention.fuse_qk_norm_rope = False
+    attention.qk_norm = False
+    attention._maybe_share_qkv_quantize = False
+    attention.to_q = torch.nn.Linear(12, 8, bias=False)
+    attention.to_k = torch.nn.Linear(12, 8, bias=False)
+    attention.to_v = torch.nn.Linear(12, 8, bias=False)
+    attention.attn = _CaptureAsyncAttention()
+    output_projection = _CaptureOutputProjection()
+    attention.to_out = torch.nn.ModuleList([output_projection])
+    gate_compress = torch.randn(1, 3, 8)
+    gate_fine = torch.randn_like(gate_compress)
+
+    output = attention.forward_async(
+        torch.randn(1, 3, 12),
+        gate_compress=gate_compress,
+        gate_fine=gate_fine,
+    )
+
+    expected_shape = (1, 3, 2, 4)
+    assert attention.attn.q.shape == expected_shape
+    assert attention.attn.k.shape == expected_shape
+    assert attention.attn.v.shape == expected_shape
+    assert attention.attn.kwargs["gate_compress"].shape == expected_shape
+    assert attention.attn.kwargs["gate_fine"].shape == expected_shape
+    assert output_projection.input.shape == (1, 3, 8)
+    assert output.shape == (1, 3, 8)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
