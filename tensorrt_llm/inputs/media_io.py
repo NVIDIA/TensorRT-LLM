@@ -394,6 +394,18 @@ _ISOBMFF_IMAGE_BRANDS = frozenset(
     }
 )
 
+# ISO-BMFF audio: an `.m4a` is an MP4 whose brand says audio-only. Without
+# these it falls through to the video default, which is how an audio file ends
+# up classified as video.
+_ISOBMFF_AUDIO_BRANDS = frozenset(
+    {
+        b"M4A ",
+        b"M4B ",  # iTunes audio / audiobook
+        b"F4A ",
+        b"F4B ",  # Flash audio / audiobook
+    }
+)
+
 # Work bound, not a format rule. The declared box size is client-controlled,
 # so without a ceiling the scan below costs O(payload): 1.6 s of interpreter
 # time for a 64 MB buffer, on the serving event loop. This admits 1020
@@ -478,10 +490,31 @@ def sniff_media_kind(data) -> Optional[str]:
         # major brand alone is not sufficient to identify still images.
         if brands & _ISOBMFF_IMAGE_BRANDS:
             return "image"
+        if brands & _ISOBMFF_AUDIO_BRANDS:
+            return "audio"
         return "video"
-    if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
-        return "video"
+    if header.startswith(b"RIFF"):
+        # RIFF carries both; the form type at [8:12] is what separates them.
+        if header[8:12] == b"AVI ":
+            return "video"
+        if header[8:12] == b"WAVE":
+            return "audio"
+        return None
+    if header.startswith(b"OggS") or header.startswith(b"fLaC") or header.startswith(b"ID3"):
+        return "audio"
+    if _is_mpeg_audio_sync(header):
+        return "audio"
     return None
+
+
+def _is_mpeg_audio_sync(header: bytes) -> bool:
+    """True for a bare MPEG audio / ADTS AAC frame — an MP3 with no ID3 tag.
+
+    The sync word is eleven set bits, so the second byte carries three bits of
+    version/layer alongside it; matching the mask rather than a byte list keeps
+    every MPEG-1/2/2.5 layer and ADTS variant in scope.
+    """
+    return len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0
 
 
 def _select_cv2_stream_buffered_backend() -> Optional[int]:
