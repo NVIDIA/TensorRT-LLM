@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 from tensorrt_llm.inputs.media_io import (
+    _MAX_RESPONSE_BYTES,
     _normalize_file_uri,
     _safe_request_get,
     is_isobmff_image_bytes,
@@ -60,9 +62,39 @@ def _read_reference_payload(reference: str) -> bytes:
         raise ValueError("reference is not valid base64 data.") from exc
 
 
-def _local_path(reference: str) -> Path:
-    """Normalize a ``path`` reference (bare or ``file://``) to a ``Path``."""
-    return Path(_normalize_file_uri(reference))
+def _safe_read_local_file(reference: str) -> bytes:
+    """Read a ``path`` reference, bounding what an unlucky path can cost.
+
+    The counterpart of :func:`_safe_request_get` for the local branch. A
+    remote caller naming the path is the case worth defending: ``read_bytes``
+    on a character device or a FIFO never returns, so an unbounded read is a
+    denial of service rather than a bad request. Requiring a regular file
+    within the same size cap the remote fetch uses keeps both branches to one
+    rule.
+
+    This bounds cost, not reach: any regular file the server process can read
+    is still readable. Restricting *which* files a remote caller may name is a
+    deployment-policy question, and belongs with the deployment.
+    """
+    path = Path(_normalize_file_uri(reference))
+    try:
+        stat = path.stat()  # follows symlinks, so a link to a device is caught
+    except OSError as exc:
+        raise ValueError(f"reference file could not be read: {exc}") from exc
+
+    if not S_ISREG(stat.st_mode):
+        raise ValueError(
+            f"reference path is not a regular file: {reference!r}. Character "
+            "devices, FIFOs and directories cannot be read as media."
+        )
+    if stat.st_size > _MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"reference file is {stat.st_size} bytes, over the {_MAX_RESPONSE_BYTES}-byte limit."
+        )
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"reference file could not be read: {exc}") from exc
 
 
 def _resolve_reference(content: Any, content_format: str) -> bytes:
@@ -90,10 +122,7 @@ def _resolve_reference(content: Any, content_format: str) -> bytes:
         except Exception as exc:
             raise ValueError(f"reference URL could not be fetched: {exc}") from exc
     if content_format == "path":
-        try:
-            return _local_path(content).read_bytes()
-        except OSError as exc:
-            raise ValueError(f"reference file could not be read: {exc}") from exc
+        return _safe_read_local_file(content)
     if content_format == "base64":
         return _read_reference_payload(content)
     raise ValueError(f"unsupported reference format: {content_format!r}")
