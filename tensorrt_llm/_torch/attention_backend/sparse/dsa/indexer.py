@@ -712,10 +712,15 @@ class Indexer(nn.Module):
             and compress_ratio in (1, 4)
         )
         self._selfsampling_run_varlen = None
+        self._selfsampling_max_rows = 0
         if self._use_self_sampling_topk:
-            from ....cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
+            from ....cute_dsl_kernels.blackwell.top_k import (
+                SELFSAMPLING_TOPK_MAX_ROWS,
+                selfsampling_topk_run_varlen,
+            )
 
             self._selfsampling_run_varlen = selfsampling_topk_run_varlen
+            self._selfsampling_max_rows = SELFSAMPLING_TOPK_MAX_ROWS
         self.mtp_index_share = sparse_params.mtp_index_share
 
         if self._enable_heuristic_topk and layer_idx == 0:
@@ -1843,6 +1848,22 @@ class Indexer(nn.Module):
                     and self._enable_heuristic_topk
                     and pre_idx is not None
                 )
+                if _ss_ready and num_gen_tokens > self._selfsampling_max_rows:
+                    # batch-rows admission envelope: the varlen engine splits
+                    # a row across CTAs only for small batches; beyond
+                    # MAX_VARLEN_ROWS it runs one CTA per row and loses ~5x
+                    # per call to the in-tree per-row-split kernels at long
+                    # rows (DSv4 Pro 1M-ISL MTP7, rows=304: 2.63 ms vs
+                    # 0.49 ms). Large batches take the in-tree path until a
+                    # throughput tier lands.
+                    logger.info_once(
+                        "self-sampling GVR top-K: decode batch rows exceed "
+                        f"the validated envelope ({num_gen_tokens} > "
+                        f"{self._selfsampling_max_rows}); large batches take "
+                        "the in-tree top-K path.",
+                        key="selfsampling_topk_rows_fallthrough",
+                    )
+                    _ss_ready = False
                 if _ss_ready and not (
                     # engine hardware-format gate (falls through otherwise):
                     # fp32 row-major logits with a float4-aligned row stride

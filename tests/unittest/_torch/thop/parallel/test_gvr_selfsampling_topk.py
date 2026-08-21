@@ -658,3 +658,40 @@ def test_selfsampling_warmup_row_stride_matches_arena():
     ref = torch.topk(arena[:, :msl], k, dim=1).values.sort(dim=1).values
     got = arena.gather(1, out.long().clamp_min(0)).sort(dim=1).values
     assert torch.equal(ref, got)
+
+
+def test_selfsampling_rows_envelope_constant():
+    """The rows admission envelope is one shared constant, and it matches
+    route_streaming's multi-CTA region: inside the envelope a long row is
+    split across CTAs (R > 1); far outside it the split collapses to one
+    CTA per row — the regression measured at rows=304, n=262144 (5.4x vs
+    the in-tree per-row-split kernel)."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import SELFSAMPLING_TOPK_MAX_ROWS
+
+    assert SELFSAMPLING_TOPK_MAX_ROWS == ss_host.MAX_VARLEN_ROWS == 32
+    n = 262144
+    plan_in = ss_host.route_streaming(ss_host.MAX_VARLEN_ROWS, n, n, 1024, force_main=True)
+    assert int(plan_in["grid"][0]) > 1, "inside the envelope long rows must split"
+    plan_out = ss_host.route_streaming(304, n, n, 1024, force_main=True)
+    assert int(plan_out["grid"][0]) == 1, "rows=304 collapses to one CTA per row"
+
+
+def test_selfsampling_warmup_drops_rows_beyond_envelope():
+    """warmup_varlen must not compile engines for row counts the dispatch
+    envelope never admits (rows > MAX_VARLEN_ROWS): a CUDA-graph batch-size
+    list with large batches warms only the admitted prefix."""
+    k, msl, nn = 512, 8192, 4
+    stride = (msl + 255) // 256 * 256
+    before = set(ss_host._VARLEN_CACHE.keys())
+    ss_host.warmup_varlen(
+        k,
+        msl,
+        compress_ratio=1,
+        next_n=nn,
+        num_rows_list=(nn, 8 * nn, 76 * nn),  # rows 4, 32, 304
+        row_stride=stride,
+    )
+    new_rows = {key[0] for key in ss_host._VARLEN_CACHE if key not in before}
+    assert not any(r > ss_host.MAX_VARLEN_ROWS for r in new_rows), new_rows
+    have_rows = {key[0] for key in ss_host._VARLEN_CACHE}
+    assert {nn, 8 * nn} <= have_rows, "in-envelope rows must still be warmed"

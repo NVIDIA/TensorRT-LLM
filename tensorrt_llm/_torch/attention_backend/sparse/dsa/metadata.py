@@ -292,8 +292,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         DeepGEMM is exact-width) so the warmed keys are the ones dispatch
         actually looks up. Captured geometries are also compiled by the
         pre-capture warmup forwards; eager batches outside ``batch_sizes``
-        still compile lazily on first touch. No-op unless the opt-in gate
-        (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        still compile lazily on first touch. Row counts above the engine's
+        admission envelope (``MAX_VARLEN_ROWS``) are dropped by the helper —
+        those batches dispatch to the in-tree path instead. No-op unless the
+        opt-in gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
         """
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
             return
