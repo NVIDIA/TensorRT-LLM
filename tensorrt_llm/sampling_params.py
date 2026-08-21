@@ -593,6 +593,46 @@ class SamplingParams:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id
 
+            # Fall back to the model config's eos_token_id. Checkpoints with
+            # multi-part chat formats have no single terminator, so they list
+            # their control tokens under `extra_special_tokens` /
+            # `additional_special_tokens` and leave `tokenizer.eos_token_id`
+            # empty; they also tend to ship no generation_config.json. Without
+            # this fallback nothing terminates a request and every generation
+            # runs to `max_tokens`.
+            if self.end_id is None:
+                config_eos = getattr(hf_model_config, "eos_token_id", None)
+                if isinstance(config_eos, (list, tuple)):
+                    # Mirror the generation_config handling: first entry becomes
+                    # end_id, any remaining ones become additional stop tokens.
+                    config_eos = list(config_eos)
+                    if config_eos:
+                        self.end_id = config_eos[0]
+                        for stop_token in config_eos[1:]:
+                            # Skip the primary EOS: a config that lists it twice
+                            # would otherwise put it in both end_id and
+                            # stop_token_ids. Same condition as the
+                            # generation_config path below.
+                            if stop_token == self.end_id:
+                                continue
+                            if self.stop_token_ids is None:
+                                self.stop_token_ids = []
+                            if stop_token not in self.stop_token_ids:
+                                self.stop_token_ids.append(stop_token)
+                elif config_eos is not None:
+                    self.end_id = config_eos
+
+            if self.end_id is None:
+                # Not fatal (an explicit stop or max_tokens may still bound the
+                # request), but worth surfacing rather than silently generating
+                # to the token limit every time.
+                logger.warning(
+                    "Could not resolve an end-of-generation token: the tokenizer has no "
+                    "eos_token_id and the model config has no eos_token_id. Generation will "
+                    "not stop on EOS; requests will run until max_tokens or an explicit stop "
+                    "condition. Pass SamplingParams(end_id=...) to set one explicitly."
+                )
+
             if self.pad_id is None:
                 self.pad_id = self.end_id
 

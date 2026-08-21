@@ -377,7 +377,7 @@ commands:
         flags:
         - "--post_processor_hook"
       reasoning_parser:
-        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
+        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'inkling', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
         default: null
         status: prototype
         required: false

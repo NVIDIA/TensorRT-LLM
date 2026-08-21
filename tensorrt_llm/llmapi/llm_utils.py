@@ -95,6 +95,13 @@ class ModelLoader:
 
         hf_kv_cache_quant_algo = hf_quant_config.pop("kv_cache_quant_algo",
                                                      None)
+        # modelopt hf_quant_config.json may spell "no KV-cache quantization" as
+        # JSON null or as the string "none"/"null"; both must map to None, since
+        # QuantAlgo("none") is not a member. Mirrors the normalization in
+        # ModelConfig.load_modelopt_quant_config.
+        if isinstance(hf_kv_cache_quant_algo, str) and \
+                hf_kv_cache_quant_algo.strip().lower() in ("none", "null", ""):
+            hf_kv_cache_quant_algo = None
         if hf_kv_cache_quant_algo is not None:
             hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
             if explicit_kv_cache_quant_algo is not None:

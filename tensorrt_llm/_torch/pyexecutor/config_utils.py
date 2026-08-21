@@ -149,6 +149,79 @@ def get_kimi_linear_num_attention_layers(config):
     return sum(full_mask)
 
 
+def is_inkling(config):
+    """True for the Inkling checkpoint (top-level multimodal or text sub-config).
+
+    Inkling is a RoPE-free hybrid-attention decoder whose local (sliding-window)
+    layers carry 16 KV heads and global layers 8, so the paged KV cache needs the
+    per-layer ``num_kv_heads`` geometry that only ``KVCacheManagerV2`` allocates.
+    Accepts either the top-level ``inkling_mm_model`` config (runtime model
+    registration) or the ``inkling_text`` sub-config (the text tower the KV cache
+    is actually sized from).
+    """
+    model_type = getattr(config, "model_type", None)
+    if model_type in ("inkling_mm_model", "inkling_text"):
+        return True
+    text_config = getattr(config, "text_config", None)
+    return getattr(text_config, "model_type", None) == "inkling_text"
+
+
+def reject_unsupported_inkling_kv_cache_features(
+        config,
+        *,
+        enable_block_reuse: bool,
+        enable_chunked_prefill: bool,
+        enable_cache_transceiver: bool = False):
+    """Refuse the features Inkling's context path cannot serve correctly.
+
+    Block reuse and chunked prefill both leave a context request with cached
+    history, and Inkling drops it twice over: ``inkling_prefill_attention`` takes
+    no paged-KV argument and attends only to the tokens of its own call, and the
+    four short-conv windows per layer are per-request state outside the KV cache
+    that no context request declares. Disaggregated serving fails a third way --
+    it moves a request without its conv windows at all.
+
+    None of the three raises on its own; they emit wrong logits silently, which
+    is why they are refused here. Supporting them is a feature, not a fix: it
+    needs a chunked-context prefill path carrying ``rel_logits`` and the sliding
+    window across the boundary, and only then the conv-state plumbing.
+    """
+    if not is_inkling(config):
+        return
+    if enable_block_reuse:
+        raise NotImplementedError(
+            "Inkling does not support KV cache block reuse. A reused prefix "
+            "leaves a context request with cached history, and Inkling ignores "
+            "it twice over: the prefill attention "
+            "(inkling_prefill_attention) has no paged-KV path and attends only "
+            "to the new tokens, and the four short-conv windows per layer are "
+            "per-request state outside the KV cache, absent from the reuse key "
+            "and never restored. The result is silently wrong output, not a "
+            "cache miss. Set kv_cache_config.enable_block_reuse=False (the "
+            "Inkling model default) to run Inkling.")
+    if enable_chunked_prefill:
+        raise NotImplementedError(
+            "Inkling does not support chunked prefill. The second and later "
+            "chunks of a prompt drop all preceding context: the prefill "
+            "attention (inkling_prefill_attention) has no paged-KV path, so it "
+            "attends only to the chunk's own tokens, and the short-conv window "
+            "carried from the preceding chunk is never declared via "
+            "has_initial_state and so never consumed. Supporting it needs a "
+            "chunked-context attention path, not just the conv fix. Set "
+            "enable_chunked_prefill=False to run Inkling.")
+    if enable_cache_transceiver:
+        # The C++ route is already refused in _util.py for every V2 manager, but
+        # KvCacheTransceiverV2 is not: it would move the paged KV and leave the
+        # conv windows behind, so the decode instance convolves against zeros.
+        raise NotImplementedError(
+            "Inkling does not support disaggregated serving. The four "
+            "short-conv windows per layer are per-request state outside the "
+            "paged KV cache (InklingConvStateCache), so they are not part of "
+            "any cache transfer; the generation instance would resume from a "
+            "zeroed window and silently emit wrong output. Unset "
+            "cache_transceiver_config to run Inkling.")
+
+
 def _coerce_torch_dtype(dtype):
     """Normalize dtype values from HF configs into torch dtype objects.
 
@@ -614,6 +687,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
     laguna="LagunaConfig",
+    inkling_mm_model="InklingConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 
