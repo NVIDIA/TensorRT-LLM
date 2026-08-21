@@ -5515,9 +5515,18 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "In large language model inference, the key-value cache stores the "
             "attention keys and values computed for each token so they are not "
             "recomputed on later decoding steps. ")
+        # One distinct needle per prompt, planted at the very start of the
+        # context -- i.e. in the first KV pages, exactly the ones that go
+        # LOCKED->HELD on suspend and are reconnected on resume. Recalling it
+        # after a round trip is the KV-integrity signal (assertion (3) below).
+        # The needles also keep the four prompts genuinely distinct: a bare
+        # "Alpha:"/"Beta:" prefix is ignored by the model, which made two
+        # contended completions come back byte-identical.
+        needles = ("BANANA", "TRUMPET", "GLACIER", "VIOLIN")
         prompts = [
-            f"{name}: {base * 8}Answer in one word."
-            for name in ("Alpha", "Beta", "Gamma", "Delta")
+            f"Remember this code word: {n}. {base * 8}"
+            f"Question: what was the code word? Answer in one word."
+            for n in needles
         ]
         # Long generation so each suspend/resume round trip spans many decode
         # steps and the suspended requests are held across a long active run of
@@ -5543,6 +5552,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             return suspended, resumed, offload, onboard
 
         def _common_prefix_len(a: list[int], b: list[int]) -> int:
+            # Diagnostic only -- do NOT turn this into an assertion. Contended
+            # and uncontended runs use different batch compositions, which is
+            # enough to change MoE routing and GEMM tiling, so greedy decoding
+            # may legitimately diverge at any index including 0. See (3) below.
             n = 0
             for x, y in zip(a, b):
                 if x != y:
@@ -5581,7 +5594,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
               f"offload_bytes={offload} onboard_bytes={onboard} "
               f"common_prefix_tokens={prefixes}")
         for i in range(len(prompts)):
-            print(f"[I-10 out {i}] ref={ref_txt[i]!r} con={con_txt[i]!r}")
+            print(f"[I-10 out {i}] needle={needles[i]} "
+                  f"ref_recall={needles[i] in ref_txt[i].upper()} "
+                  f"con_recall={needles[i] in con_txt[i].upper()} "
+                  f"ref={ref_txt[i]!r} con={con_txt[i]!r}")
 
         # (1) No crash / no deadlock: every request completed within the bounded
         # wait above and produced a non-empty completion (a KV-corrupting bad
@@ -5610,13 +5626,33 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # against the counter regressing to admission-counting is the model-free
         # unit test test_admission_is_not_counted_as_a_resume; the ratio is only
         # printed above.
-        # (3) KV integrity: each preempted request shares a deterministic multi-
-        # token prefix with its uncontended reference. Corruption diverges at
-        # token 0; benign batch-composition FP drift diverges only later.
-        assert all(p >= 3 for p in prefixes), (
-            "a preempted request diverged from its uncontended reference at the "
-            "very start -- possible KV corruption; "
-            f"common_prefix_tokens={prefixes}")
+        # (3) KV integrity: the needle planted in each prompt's first KV pages
+        # survives the suspend/resume round trip. A bad page-index reconnect
+        # loses the prompt content and the recall fails; benign numerical drift
+        # does not touch it.
+        #
+        # Token-level equality against the uncontended reference is deliberately
+        # NOT asserted: batch composition changes MoE routing and GEMM tiling,
+        # so greedy decoding is not required to match a batch-of-1 reference at
+        # any index -- not even index 0. `prefixes` is a diagnostic only.
+        #
+        # The contended check is gated on the reference recalling the needle
+        # first, so a model-capability miss fails loudly as a workload
+        # precondition instead of masquerading as KV corruption.
+        missing_ref = [
+            n for n, t in zip(needles, ref_txt) if n not in t.upper()
+        ]
+        assert not missing_ref, (
+            "workload precondition failed: the uncontended reference run did "
+            f"not recall {missing_ref} -- retune the prompt; this is not a "
+            "KV-path failure")
+        missing_con = [
+            n for n, t in zip(needles, con_txt) if n not in t.upper()
+        ]
+        assert not missing_con, (
+            "a preempted request lost prompt content that it recalls "
+            f"uncontended: {missing_con} -- possible KV corruption across "
+            f"suspend/resume; common_prefix_tokens={prefixes}")
 
     def test_dummy_load_format(self):
         llm = LLM(
