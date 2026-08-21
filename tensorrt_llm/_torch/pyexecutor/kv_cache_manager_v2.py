@@ -1754,6 +1754,12 @@ class KVCacheManagerV2(BaseResourceManager):
         layers_per_lc: Dict[int, int] = defaultdict(int)
         window_per_lc: Dict[int, Optional[int]] = {}
         for layer in self.kv_cache_manager_py_config.layers:
+            # A hybrid model's layer list also holds SsmLayerConfig, which has
+            # no sliding_window_size to read. An SSM layer never joins an
+            # attention lifecycle, so skipping it leaves every count reported
+            # below unchanged -- same guard as _stats_life_cycle_metadata.
+            if not isinstance(layer, AttentionLayerConfig):
+                continue
             lc_id = int(self.impl.get_layer_group_id(layer.layer_id))
             layers_per_lc[lc_id] += 1
             window_per_lc[lc_id] = layer.sliding_window_size
@@ -1793,8 +1799,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 if no_s > 0 and yes_s != no_s:
                     pct = (yes_s - no_s) * 100 // no_s
                     delta = f"   ({pct}%)"
-                    any_saving = True
-                    best_saving_pct = min(best_saving_pct, pct)
+                    # Only a drop in slots is a saving. Counting a rise would
+                    # leave best_saving_pct at 0, so the warning below would
+                    # report "up to 0%", and it would also suppress the
+                    # inert-configuration branch that should fire instead.
+                    if yes_s < no_s:
+                        any_saving = True
+                        best_saving_pct = min(best_saving_pct, pct)
                 logger.info(
                     f"    pool_group={pg_idx}  slots without scratch: {no_s}    "
                     f"with scratch: {yes_s}{delta}"

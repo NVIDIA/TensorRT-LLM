@@ -21,7 +21,11 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -30,12 +34,16 @@ from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
+    AttentionLayerConfig,
     BatchDesc,
+    BufferConfig,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
+    LayerId,
+    SsmLayerConfig,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
@@ -150,6 +158,7 @@ def _make_manager_for_cache_tier_test(
         patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
         patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+        patch.object(KVCacheManagerV2, "_log_swa_scratch_summary"),
     ):
         manager = KVCacheManagerV2(
             kv_cache_config,
@@ -394,6 +403,106 @@ def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
         GpuCacheTierConfig,
         DiskCacheTierConfig,
     ]
+
+
+def _attention_layer(layer_id: int, window: int | None) -> AttentionLayerConfig:
+    return AttentionLayerConfig(
+        layer_id=LayerId(layer_id),
+        buffers=[BufferConfig(role=Role.KEY, size=256)],
+        sliding_window_size=window,
+    )
+
+
+def _ssm_layer(layer_id: int) -> SsmLayerConfig:
+    return SsmLayerConfig(
+        layer_id=LayerId(layer_id),
+        buffers=[BufferConfig(role="ssm_state", size=64)],
+    )
+
+
+def _run_swa_scratch_summary(
+    layers: list[object],
+    *,
+    slots_without: list[int],
+    slots_with: list[int],
+    enabled: bool,
+) -> tuple[list[str], list[str]]:
+    """Drive ``_log_swa_scratch_summary`` and return its warning/debug lines.
+
+    The method is diagnostics-only, but it runs unconditionally at the end of
+    ``__init__``, so anything it cannot read aborts engine construction. Calling
+    it unbound keeps the check on the layer walk and the saving arithmetic
+    themselves, with no GPU and no real manager needed.
+    """
+    manager = Mock()
+    manager.impl.get_layer_group_id.side_effect = lambda _: 0
+    manager.kv_cache_manager_py_config = SimpleNamespace(
+        layers=layers,
+        constraints=[BatchDesc([KVCacheDesc(capacity=TOKENS_PER_BLOCK, history_length=0)])],
+    )
+    manager.enable_swa_scratch_reuse = enabled
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    manager.max_num_tokens = TOKENS_PER_BLOCK
+
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    with (
+        patch(f"{module}._introspection") as introspection,
+        patch(f"{module}.logger") as logger,
+    ):
+        introspection.swa_life_cycle_ids.return_value = [0]
+        introspection.pool_group_index.return_value = 0
+        introspection.compute_slots_for_batch.side_effect = [slots_without, slots_with]
+        KVCacheManagerV2._log_swa_scratch_summary(manager)
+
+    return (
+        [str(call.args[0]) for call in logger.warning.call_args_list],
+        [str(call.args[0]) for call in logger.debug.call_args_list],
+    )
+
+
+def test_swa_scratch_summary_skips_ssm_layers() -> None:
+    """A hybrid SSM + SWA engine must survive the startup summary.
+
+    ``SsmLayerConfig`` carries no ``sliding_window_size``. Reading it unguarded
+    raised ``AttributeError`` out of ``__init__`` for any Mamba-hybrid model
+    that also had a real attention window.
+    """
+    warnings, _ = _run_swa_scratch_summary(
+        [_attention_layer(0, window=TOKENS_PER_BLOCK), _ssm_layer(1)],
+        slots_without=[8],
+        slots_with=[4],
+        enabled=True,
+    )
+
+    assert warnings == []
+
+
+def test_swa_scratch_summary_warns_when_a_real_saving_is_declined() -> None:
+    warnings, _ = _run_swa_scratch_summary(
+        [_attention_layer(0, window=TOKENS_PER_BLOCK)],
+        slots_without=[8],
+        slots_with=[4],
+        enabled=False,
+    )
+
+    assert any("would cut windowed slots by up to 50%" in message for message in warnings)
+
+
+def test_swa_scratch_summary_treats_a_slot_increase_as_no_saving() -> None:
+    """A rise in slot count is not a saving and must not be reported as one.
+
+    Counting it left ``best_saving_pct`` at 0, so the declined-saving warning
+    advertised "up to 0%" while the inert-configuration branch never fired.
+    """
+    warnings, debugs = _run_swa_scratch_summary(
+        [_attention_layer(0, window=TOKENS_PER_BLOCK)],
+        slots_without=[4],
+        slots_with=[8],
+        enabled=False,
+    )
+
+    assert not any("would cut windowed slots" in message for message in warnings)
+    assert any("scratch reuse is inert" in message for message in debugs)
 
 
 def test_extra_tokens_are_in_context_capacity() -> None:
