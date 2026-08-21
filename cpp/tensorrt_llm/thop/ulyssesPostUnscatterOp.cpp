@@ -36,14 +36,14 @@ void checkInt32Dim(char const* name, int64_t value)
 
 void checkInt32Product(char const* name, int64_t lhs, int64_t rhs)
 {
-    TORCH_CHECK(lhs == 0 || rhs <= std::numeric_limits<int>::max() / lhs, name, " must fit in int32, got ", lhs, "*",
-        rhs);
+    TORCH_CHECK(
+        lhs == 0 || rhs <= std::numeric_limits<int>::max() / lhs, name, " must fit in int32, got ", lhs, "*", rhs);
 }
 
 void checkInt32SumProduct(char const* name, int64_t lhs, int64_t a, int64_t b, int64_t c)
 {
-    TORCH_CHECK(a <= std::numeric_limits<int64_t>::max() - b && a + b <= std::numeric_limits<int64_t>::max() - c,
-        name, " sum overflows int64");
+    TORCH_CHECK(a <= std::numeric_limits<int64_t>::max() - b && a + b <= std::numeric_limits<int64_t>::max() - c, name,
+        " sum overflows int64");
     checkInt32Product(name, lhs, a + b + c);
 }
 
@@ -140,8 +140,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_packed_qkv_post_
     torch::Tensor& qkv_in, int64_t layout)
 {
     TORCH_CHECK(qkv_in.dim() == 6, "ulysses_packed_qkv_post_unscatter expects [P, B, Sp, 3, H, D]");
-    TORCH_CHECK(qkv_in.size(3) == 3, "ulysses_packed_qkv_post_unscatter expects qkv dim size 3, got ",
-        qkv_in.size(3));
+    TORCH_CHECK(qkv_in.size(3) == 3, "ulysses_packed_qkv_post_unscatter expects qkv dim size 3, got ", qkv_in.size(3));
     TORCH_CHECK(layout == 0 || layout == 1, "layout must be 0 (HND) or 1 (NHD), got ", layout);
 
     CHECK_INPUT(qkv_in, torch::kBFloat16);
