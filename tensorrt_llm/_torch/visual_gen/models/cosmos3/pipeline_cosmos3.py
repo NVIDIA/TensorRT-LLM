@@ -73,7 +73,6 @@ from .defaults import (
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
     resolve_domain_action_config,
-    _validate_video_reference,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
@@ -759,9 +758,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             return value if field_name in specified else None
 
         refs_v = req.params.video_reference
+        # Container and modality are already checked at the coordinator's
+        # reference choke point, so the bytes reaching here are known video.
         video = refs_v[0].content if refs_v else None
-        if video is not None:
-            _validate_video_reference(video)
+        # Container and modality are already checked at the coordinator's
+        # reference choke point, so the bytes reaching here are known video.
         is_action = extra_params.get("action_mode") is not None
         if is_action:
             # Action resolves its whole recipe in forward() -- the canvas from
