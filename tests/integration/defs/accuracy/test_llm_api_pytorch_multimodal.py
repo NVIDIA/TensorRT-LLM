@@ -610,11 +610,6 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     )
     def test_auto_dtype(self, max_num_tokens):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
-        # Keep max_num_tokens low to force LLM chunked prefill, but raise the
-        # encoder budget separately. When unset, encoder_max_num_tokens falls
-        # back to max_num_tokens and is only clamped up to the largest atomic
-        # Pixtral item (~12100), which is too small for some MMMU samples
-        # (resident encoder output ~36MB vs ~31MB budget).
         with LLM(
             self.MODEL_PATH,
             kv_cache_config=kv_cache_config,
