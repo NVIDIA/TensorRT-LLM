@@ -70,6 +70,10 @@ def get_vanilla_sparse_attn_attention_backend(
 
     if sparse_params.algorithm == "rocket":
         return RocketVanillaAttention
+    elif sparse_params.algorithm == "deepseek_v4":
+        from .deepseek_v4 import DeepseekV4VanillaAttention
+
+        return DeepseekV4VanillaAttention
     elif sparse_params.algorithm == "minimax_m3":
         return _resolve_minimax_m3_backend_cls(sparse_params)
     else:

@@ -38,6 +38,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
+    DeepseekV4VanillaAttention,
 )
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseBackendForwardArgs
@@ -320,84 +321,6 @@ def _softmax_with_sink(
     return (num / denom).to(out_dtype)
 
 
-def calculate_deepseek_v4_ref_ctx_sparse(
-    fused_q_rot: torch.Tensor,
-    latent_cache_ref: torch.Tensor,
-    compressed_ref_data: Optional[List[torch.Tensor]],
-    swa_window_size: int,
-    compressed_topk_indices: Optional[torch.Tensor],
-    seq_lens: List[int],
-    num_heads: int,
-    kv_lora_rank: int,
-    v_head_dim: int,
-    qk_nope_head_dim: int,
-    qk_rope_head_dim: int,
-    q_scaling: float,
-    compress_ratio: int,
-    attn_sink: Optional[torch.Tensor] = None,
-):
-    """Per-token reference attention for DeepSeek-V4 context phase.
-
-    For compress_ratio==1: only SWA tokens (causal window).
-    For compress_ratio==4: SWA tokens + indexer topk compressed tokens.
-    For compress_ratio==128: SWA tokens + all compressed tokens.
-    """
-    fused_head_dim = kv_lora_rank + qk_rope_head_dim
-    bmm1_scale = 1 / (math.sqrt(qk_nope_head_dim + qk_rope_head_dim) * q_scaling)
-
-    ref_results = []
-    token_offset = 0
-    for batch_idx, seq_len in enumerate(seq_lens):
-        per_token_outputs = []
-        for token_idx in range(seq_len):
-            global_token_idx = token_offset + token_idx
-            pos = token_idx
-
-            # Gather SWA KV
-            swa_start = max(0, pos - swa_window_size + 1)
-            swa_end = pos + 1
-            swa_kv = latent_cache_ref[token_offset + swa_start : token_offset + swa_end]
-
-            # Gather compressed KV
-            if compress_ratio > 1 and compressed_ref_data is not None:
-                if compress_ratio == 4 and compressed_topk_indices is not None:
-                    indices_row = compressed_topk_indices[global_token_idx]
-                    valid = indices_row[indices_row >= 0]
-                    comp_kv = compressed_ref_data[batch_idx][valid.long()]
-                elif compress_ratio == 128:
-                    num_comp = (pos + 1) // compress_ratio
-                    comp_kv = compressed_ref_data[batch_idx][:num_comp]
-                else:
-                    comp_kv = torch.empty(
-                        0,
-                        swa_kv.shape[-1],
-                        device=swa_kv.device,
-                        dtype=swa_kv.dtype,
-                    )
-
-                if comp_kv.numel() > 0:
-                    all_kv = torch.cat([swa_kv, comp_kv], dim=0)
-                else:
-                    all_kv = swa_kv
-            else:
-                all_kv = swa_kv
-
-            # Compute attention
-            q_tok = fused_q_rot[global_token_idx].view(num_heads, fused_head_dim)
-            k_sel = all_kv.unsqueeze(0).expand(num_heads, -1, -1)
-            v_sel = all_kv[:, :v_head_dim].unsqueeze(0).expand(num_heads, -1, -1)
-
-            attn_w = torch.matmul(q_tok.unsqueeze(1), k_sel.transpose(1, 2)) * bmm1_scale
-            attn_w = _softmax_with_sink(attn_w, attn_sink, fused_q_rot.dtype)
-            out = torch.matmul(attn_w, v_sel).squeeze(1)
-            per_token_outputs.append(out.reshape(1, num_heads * v_head_dim))
-
-        ref_results.append(torch.cat(per_token_outputs, dim=0))
-        token_offset += seq_len
-
-    return torch.cat(ref_results, dim=0)
-
-
 def _rotate_gen_inputs(
     fused_q: torch.Tensor,
     q_pe: torch.Tensor,
@@ -604,6 +527,31 @@ def _create_pos_embd_params(scenario: Scenario) -> PositionalEmbeddingParams:
     )
 
 
+def _create_vanilla_layers(
+    layer_indices: List[int],
+    num_heads: int,
+    head_dim: int,
+    q_scaling: float,
+    pos_embd_params: PositionalEmbeddingParams,
+    mla_params: MLAParams,
+    sparse_config: DeepSeekV4SparseAttentionConfig,
+) -> Dict[int, DeepseekV4VanillaAttention]:
+    return {
+        layer_idx: DeepseekV4VanillaAttention(
+            layer_idx=layer_idx,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=1,
+            q_scaling=q_scaling,
+            pos_embd_params=pos_embd_params,
+            mla_params=mla_params,
+            sparse_attention_config=sparse_config,
+            skip_create_weights_in_init=True,
+        )
+        for layer_idx in layer_indices
+    }
+
+
 @skip_pre_blackwell
 def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
     """Reproduce the tp=4 Flash warmup sparse-MLA kernel shape.
@@ -669,6 +617,15 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
         skip_create_weights_in_init=True,
     )
     layer.update_quant_config(None)
+    vanilla_layer = _create_vanilla_layers(
+        [layer_idx],
+        local_num_heads,
+        head_dim,
+        q_scaling,
+        pos_embd_params,
+        mla_params,
+        sparse_config,
+    )[layer_idx]
     attn_sink = torch.randn(local_num_heads, dtype=torch.float32, device=device).mul_(0.5)
     if not os.environ.get("DSV4_REPRO_NO_SINK"):
         layer.attn_sink = torch.nn.Parameter(attn_sink, requires_grad=False)
@@ -794,25 +751,220 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
         kv_lora_rank,
         qk_rope_head_dim,
     )
-    ref_result = calculate_deepseek_v4_ref_ctx_sparse(
+    golden_sink = None if os.environ.get("DSV4_REPRO_NO_SINK") else attn_sink
+    ref_result = vanilla_layer.forward(
         fused_q_rot,
-        latent_cache_ref,
         None,
-        scenario.window_size,
         None,
-        context_lengths,
-        local_num_heads,
-        kv_lora_rank,
-        v_head_dim,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        q_scaling,
-        ratio,
-        attn_sink=attn_sink,
+        attn_metadata,
+        attention_input_type=AttentionInputType.context_only,
+        latent_cache=latent_cache_ref,
+        attention_sinks=golden_sink,
     )
 
     torch.testing.assert_close(result, ref_result, atol=0.2, rtol=0.02)
     cache_manager.shutdown()
+
+
+@skip_pre_blackwell
+def test_deepseek_v4_sparse_mla_vanilla_golden():
+    """Validate TRTLLM sparse MLA against the Vanilla golden backend."""
+    scenario = Scenario()
+    context_lengths = [14, 140]
+    device = torch.device("cuda")
+    dtype = scenario.dtype
+    num_heads = 16
+    qk_rope_head_dim = scenario.qk_rope_head_dim
+    kv_lora_rank = scenario.kv_lora_rank - qk_rope_head_dim
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    total_tokens = sum(context_lengths)
+    request_ids = list(range(len(context_lengths)))
+    torch.manual_seed(43)
+
+    # The TRTLLM sparse kernel requires its padded top-k width to be a multiple
+    # of four. Ratio-128 metadata rounds the compressed width to a power of two,
+    # so use a max sequence length that gives at least four compressed slots.
+    max_seq_len = scenario.window_size * 3
+    cache_manager, sparse_config = _create_cache_manager(
+        scenario, context_lengths, max_seq_len=max_seq_len
+    )
+    requests = [
+        LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=list(range(context_length)),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        for request_id, context_length in zip(request_ids, context_lengths, strict=True)
+    ]
+    for request in requests:
+        cache_manager.prepare_context(request)
+        cache_manager.resize_context(request, request.context_chunk_size)
+
+    mla_params = MLAParams(
+        q_lora_rank=scenario.q_lora_rank,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=scenario.qk_nope_head_dim,
+        v_head_dim=scenario.v_head_dim,
+        rope_append=False,
+        predicted_tokens_per_seq=1,
+        hidden_size=scenario.hidden_size,
+    )
+    pos_embd_params = _create_pos_embd_params(scenario)
+    mscale = 0.1 * pos_embd_params.rope.mscale_all_dim * math.log(pos_embd_params.rope.scale) + 1.0
+    q_scaling = 1.0 / (mscale * mscale)
+
+    trtllm_layers = {
+        layer_idx: DeepseekV4TrtllmAttention(
+            layer_idx=layer_idx,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=1,
+            q_scaling=q_scaling,
+            pos_embd_params=pos_embd_params,
+            mla_params=mla_params,
+            sparse_attention_config=sparse_config,
+            skip_create_weights_in_init=True,
+        )
+        for layer_idx in TEST_LAYERS
+    }
+    for layer in trtllm_layers.values():
+        layer.update_quant_config(None)
+
+    vanilla_layers = _create_vanilla_layers(
+        TEST_LAYERS,
+        num_heads,
+        head_dim,
+        q_scaling,
+        pos_embd_params,
+        mla_params,
+        sparse_config,
+    )
+
+    for layer_idx in TEST_LAYERS:
+        if scenario.compress_ratios[layer_idx] <= 1:
+            continue
+        _prefill_compress_buffer(
+            cache_manager,
+            layer_idx,
+            context_lengths,
+            request_ids,
+            head_dim,
+            device,
+        )
+
+    metadata = DeepseekV4TrtllmAttentionMetadata(
+        seq_lens=torch.tensor(context_lengths, dtype=torch.int),
+        request_ids=request_ids,
+        max_num_requests=len(request_ids),
+        num_contexts=len(request_ids),
+        prompt_lens=context_lengths,
+        max_num_tokens=total_tokens,
+        kv_cache_manager=cache_manager,
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=[0] * len(request_ids),
+        ),
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        sparse_attention_config=sparse_config,
+    )
+
+    try:
+        metadata.prepare()
+        rope_cos_sin = _create_rope_cos_sin(scenario, device)
+        token_positions = [
+            position for context_length in context_lengths for position in range(context_length)
+        ]
+        for layer_idx in TEST_LAYERS:
+            ratio = scenario.compress_ratios[layer_idx]
+            fused_q = torch.randn(
+                total_tokens,
+                num_heads * head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            q_pe = fused_q.view(total_tokens, num_heads, head_dim)[..., -qk_rope_head_dim:].clone()
+            compressed_kv = torch.randn(
+                total_tokens,
+                kv_lora_rank,
+                dtype=dtype,
+                device=device,
+            )
+            k_pe = torch.randn(
+                total_tokens,
+                qk_rope_head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+            attention_sink = torch.randn(
+                num_heads,
+                dtype=torch.float32,
+                device=device,
+            )
+            topk_indices = (
+                _build_compressed_topk_indices(
+                    token_positions,
+                    ratio,
+                    scenario.index_topk,
+                    device,
+                )
+                if ratio == 4
+                else None
+            )
+            trtllm_output = torch.empty(
+                total_tokens,
+                num_heads * head_dim,
+                dtype=dtype,
+                device=device,
+            )
+
+            result = trtllm_layers[layer_idx].forward(
+                fused_q.clone(),
+                None,
+                None,
+                metadata,
+                forward_args=AttentionForwardArgs(
+                    output=trtllm_output,
+                    latent_cache=latent_cache.clone(),
+                    q_pe=q_pe,
+                    attention_sinks=attention_sink,
+                    attention_input_type=AttentionInputType.context_only,
+                    sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
+                ),
+            )
+            fused_q_rot = _rotate_fused_q_for_ctx(
+                fused_q,
+                rope_cos_sin,
+                context_lengths,
+                num_heads,
+                kv_lora_rank,
+                qk_rope_head_dim,
+            )
+            k_pe_rot = _rotate_k_pe_for_ctx(k_pe, rope_cos_sin, context_lengths)
+            latent_cache_rot = torch.cat([compressed_kv, k_pe_rot], dim=-1)
+            vanilla_output = torch.empty_like(trtllm_output)
+            golden = vanilla_layers[layer_idx].forward(
+                fused_q_rot,
+                None,
+                None,
+                metadata,
+                forward_args=AttentionForwardArgs(
+                    output=vanilla_output,
+                    latent_cache=latent_cache_rot,
+                    attention_sinks=attention_sink,
+                    attention_input_type=AttentionInputType.context_only,
+                    sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
+                ),
+            )
+
+            assert result.data_ptr() == trtllm_output.data_ptr()
+            assert golden.data_ptr() == vanilla_output.data_ptr()
+            torch.testing.assert_close(result, golden, atol=0.2, rtol=2e-2)
+    finally:
+        cache_manager.shutdown()
 
 
 @skip_pre_blackwell
@@ -908,6 +1060,15 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
         )
         layer.update_quant_config(None)
         layers[layer_idx] = layer
+    vanilla_layers = _create_vanilla_layers(
+        TEST_LAYERS,
+        num_heads,
+        head_dim,
+        q_scaling,
+        pos_embd_params,
+        mla_params,
+        sparse_config,
+    )
 
     # Install a per-layer attention sink
     attn_sinks: Dict[int, torch.Tensor] = {}
@@ -1088,7 +1249,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
             sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
         )
 
-        # Reference computation
+        # Vanilla golden computation
         k_pe_ref = _rotate_k_pe_for_ctx(k_pe, rope_cos_sin, context_lengths)
         latent_cache_ref = torch.cat([compressed_kv, k_pe_ref], dim=-1)
         fused_q_rot = _rotate_fused_q_for_ctx(
@@ -1099,21 +1260,15 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
             kv_lora_rank,
             qk_rope_head_dim,
         )
-        ref_result = calculate_deepseek_v4_ref_ctx_sparse(
+        ref_result = vanilla_layers[layer_idx].forward(
             fused_q_rot,
-            latent_cache_ref,
-            compress_ref_data.get(layer_idx),
-            scenario.window_size,
-            topk_indices,
-            context_lengths,
-            num_heads,
-            kv_lora_rank,
-            v_head_dim,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            q_scaling,
-            ratio,
-            attn_sink=attn_sinks[layer_idx],
+            None,
+            None,
+            attn_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=latent_cache_ref,
+            attention_sinks=attn_sinks[layer_idx],
+            sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
         )
 
         latent_cache_ref_all[layer_idx] = latent_cache_ref
@@ -1373,6 +1528,15 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
         )
         layer.update_quant_config(None)
         layers[li] = layer
+    vanilla_layers = _create_vanilla_layers(
+        TEST_LAYERS,
+        num_heads,
+        head_dim,
+        q_scaling,
+        pos_embd_params,
+        mla_params,
+        sparse_config,
+    )
 
     attn_sinks: Dict[int, torch.Tensor] = {}
     for li in TEST_LAYERS:
@@ -1558,6 +1722,27 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
             sparse_backend_args=SparseBackendForwardArgs(topk_indices=ctx_topk),
         )
 
+        ctx_k_pe_ref = _rotate_k_pe_for_ctx(ctx_k_pe, rope_cos_sin, [context_lengths[0]])
+        ctx_latent_ref = torch.cat([ctx_compressed_kv, ctx_k_pe_ref], dim=-1)
+        ctx_q_rot = _rotate_fused_q_for_ctx(
+            ctx_fused_q,
+            rope_cos_sin,
+            [context_lengths[0]],
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+        )
+        ctx_ref = vanilla_layers[li].forward(
+            ctx_q_rot,
+            None,
+            None,
+            mixed_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=ctx_latent_ref,
+            attention_sinks=attn_sinks[li],
+            sparse_backend_args=SparseBackendForwardArgs(topk_indices=ctx_topk),
+        )
+
         # Generation forward → output[total_ctx_tokens:]
         num_seqs = mixed_metadata.kv_lens_cuda_runtime.size(0)
         cu_q = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
@@ -1588,34 +1773,6 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
             cu_kv_seqlens=cu_kv,
             fmha_scheduler_counter=counter,
             sparse_backend_args=SparseBackendForwardArgs(topk_indices=gen_topk),
-        )
-
-        # Context reference
-        ctx_k_pe_ref = _rotate_k_pe_for_ctx(ctx_k_pe, rope_cos_sin, [context_lengths[0]])
-        ctx_latent_ref = torch.cat([ctx_compressed_kv, ctx_k_pe_ref], dim=-1)
-        ctx_q_rot = _rotate_fused_q_for_ctx(
-            ctx_fused_q,
-            rope_cos_sin,
-            [context_lengths[0]],
-            num_heads,
-            kv_lora_rank,
-            qk_rope_head_dim,
-        )
-        ctx_ref = calculate_deepseek_v4_ref_ctx_sparse(
-            ctx_q_rot,
-            ctx_latent_ref,
-            None,
-            scenario.window_size,
-            ctx_topk,
-            [context_lengths[0]],
-            num_heads,
-            kv_lora_rank,
-            v_head_dim,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            q_scaling,
-            ratio,
-            attn_sink=attn_sinks[li],
         )
 
         # Generation reference
