@@ -1080,6 +1080,7 @@ class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
         assert MultimodalConfig().encoder_cuda_graph is None
+        assert MultimodalConfig().encoder_data_parallel_size == 1
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
         assert MultimodalConfig().encoder_scheduling_policy == "DEFAULT"
@@ -1089,6 +1090,7 @@ class TestMultimodalConfig:
         args = TorchLlmArgs(model=llama_model_path)
         assert isinstance(args.multimodal_config, MultimodalConfig)
         assert args.multimodal_config.encoder_cuda_graph is None
+        assert args.multimodal_config.encoder_data_parallel_size == 1
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
@@ -1127,6 +1129,28 @@ class TestMultimodalConfig:
                             multimodal_config=MultimodalConfig(
                                 encoder_scheduling_policy="EAGER"))
         assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
+
+    @pytest.mark.parametrize(
+        "incompatible_config",
+        [
+            {
+                "encoder_side_stream_max_ahead": 1
+            },
+            {
+                "encoder_cuda_graph": {
+                    "vision":
+                    MultimodalEncoderCudaGraphConfig(buckets=[(1035, 1)])
+                }
+            },
+        ],
+    )
+    def test_encoder_data_parallel_rejects_incompatible_optimizations(
+            self, incompatible_config):
+        with pytest.raises(ValidationError):
+            MultimodalConfig(
+                encoder_data_parallel_size=2,
+                **incompatible_config,
+            )
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -2651,6 +2675,17 @@ class TestStrictBaseModelArbitraryArgs:
                 model=llama_model_path,
                 encode_only=True,
                 mm_encoder_only=True,
+            )
+
+    def test_encoder_data_parallel_rejects_mm_encoder_only(self):
+        with pytest.raises(
+                ValueError,
+                match="does not support mm_encoder_only execution yet"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                mm_encoder_only=True,
+                multimodal_config=MultimodalConfig(
+                    encoder_data_parallel_size=2),
             )
 
     def test_multimodal_encoder_rejects_encode_only(self):
