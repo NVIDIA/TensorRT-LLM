@@ -324,7 +324,30 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 self._ctx_router.num_prepared_servers,
                 self._gen_router.num_prepared_servers,
             )
-        return True
+        # Without a cluster manager this used to be an unconditional `True`,
+        # which made /health a standing promise rather than a statement about
+        # the workers: once startup had completed, a ctx or gen worker could
+        # die and the coordinator would keep answering 200 for it. A client
+        # polling /health then has no way to learn the group is unusable, and
+        # waits out its whole timeout on a server that can never respond.
+        #
+        # When a metadata server is configured, the routers already discover
+        # this: `_monitor_servers()` polls, `check_servers_health()` filters,
+        # and a dead worker is dropped from `servers`. Nothing consulted that.
+        # An empty list is unambiguous -- disaggregated serving needs at least
+        # one context AND one generation server, so zero of either cannot be
+        # served, whatever the cause.
+        #
+        # Deliberately NOT sticky. A metadata-driven deployment legitimately
+        # adds and removes workers, so latching "dead" on the first removal
+        # would turn a routine topology change into a permanently unhealthy
+        # coordinator. This reports the current fact and lets recovery show up
+        # as recovery.
+        #
+        # With a static server list and no metadata server there is no monitor
+        # to consult, so the lists never shrink and this stays `True` exactly
+        # as before -- no behaviour change for that deployment shape.
+        return bool(self._ctx_router.servers) and bool(self._gen_router.servers)
 
     async def cluster_info(self) -> Dict[str, Any]:
         info = {
