@@ -28,6 +28,14 @@ hold disjoint request sets, so all per-rank files are merged). The
 recorder syncs a few scalars per step: keep it OFF (--no-accept-stats)
 for the TPOT-reference legs of an A/B.
 
+The recorder accumulates every eager DFlash step, including the warmup
+batch, and can't be reset across the launcher process boundary; the
+harness instead snapshots the post-warmup counts and subtracts them from
+the final totals so the reported figures cover only the timed run. That
+subtraction needs the warmup steps flushed to disk before timing, so the
+stats leg forces TLLM_DFLASH_ACCEPT_STATS_FLUSH_EVERY=1 (export it before
+trtllm-llmapi-launch for TP>1, as run_dspark_acceptance.sbatch does).
+
 Example (inside the container, see run_dspark_acceptance.sbatch). The
 recorder dir MUST be exported before trtllm-llmapi-launch: it pre-spawns the
 MPI worker ranks (where DFlashWorker lives), so setting os.environ inside this
@@ -175,6 +183,26 @@ def build_llm(args: argparse.Namespace) -> tuple[LLM, bool]:
     return LLM(**llm_kwargs), spec_on
 
 
+def _remove_warmup(merged: dict, warmup: dict) -> None:
+    """Subtract warmup-phase counts from the merged accept-stats, in place.
+
+    ``merged`` and ``warmup`` are both outputs of ``merge_snapshots``; after
+    this the reported histogram, AL/AR, and calibration reflect only the timed
+    generation. Only the fields the harness reports (the accepted-draft
+    histogram and the confidence-calibration counts) are adjusted. Counts are
+    monotonic, so the differences are non-negative.
+    """
+    hist = merged["accepted_draft_hist"]
+    for i, n in enumerate(warmup["accepted_draft_hist"]):
+        hist[i] -= n
+    merged["num_steps"] -= warmup["num_steps"]
+    mcc, wcc = merged["confidence_calibration"], warmup["confidence_calibration"]
+    for field in ("attempts", "accepted"):
+        for k, row in enumerate(wcc[field]):
+            for b, n in enumerate(row):
+                mcc[field][k][b] -= n
+
+
 def main() -> None:
     args = parse_arguments()
 
@@ -186,6 +214,16 @@ def main() -> None:
         )
         # Must be set before the LLM (and its worker processes) is built.
         os.environ["TLLM_DFLASH_ACCEPT_STATS_DIR"] = stats_dir
+        # Flush after every verify step so the short warmup batch (a handful
+        # of steps, well under the default flush period) is on disk before the
+        # timed run starts — the harness reads it back as a baseline and
+        # subtracts it below. This env, like the stats dir, only reaches
+        # pre-spawned MPI workers when exported before trtllm-llmapi-launch
+        # (run_dspark_acceptance.sbatch does this for the TP>1 dspark leg);
+        # the in-script set covers the single-process case. The per-step flush
+        # writes a tiny JSON and only runs on the stats leg, which is a
+        # measurement run, not a TPOT reference (--no-accept-stats).
+        os.environ.setdefault("TLLM_DFLASH_ACCEPT_STATS_FLUSH_EVERY", "1")
 
     prompts = load_prompts(args)
     llm, spec_on = build_llm(args)
@@ -209,6 +247,31 @@ def main() -> None:
         # Warmup (excluded from timing): one short batch to pay JIT and
         # allocator costs so the timed section measures steady state.
         llm.generate(prompts[: min(2, len(prompts))], SamplingParams(max_tokens=8, temperature=0.0))
+
+        # The accept-stats recorder lives in the worker ranks and accumulates
+        # every eager DFlash step, warmup included — so the warmup batch would
+        # otherwise bias the aggregate AL/AR, histogram, and calibration. We
+        # can't reset the recorder across the launcher process boundary, so
+        # snapshot its post-warmup counts here and subtract them from the final
+        # totals below (see _remove_warmup). Relies on the per-step flush set
+        # above so warmup is already on disk.
+        warmup_stats = None
+        if stats_dir and os.path.isdir(stats_dir):
+            from tensorrt_llm._torch.speculative.accept_stats import (
+                load_rank_snapshots,
+                merge_snapshots,
+            )
+
+            base_snaps = load_rank_snapshots(stats_dir)
+            if base_snaps:
+                warmup_stats = merge_snapshots(base_snaps)
+            else:
+                print(
+                    "WARNING: could not snapshot warmup accept-stats "
+                    "(no rank files yet); aggregate AL/AR will include the "
+                    "warmup batch. Export TLLM_DFLASH_ACCEPT_STATS_FLUSH_EVERY=1 "
+                    "before trtllm-llmapi-launch for multi-rank runs."
+                )
 
         t0 = time.monotonic()
         outputs = llm.generate(prompts, sampling_params)
@@ -264,6 +327,8 @@ def main() -> None:
             )
         else:
             merged = merge_snapshots(snaps)
+            if warmup_stats is not None:
+                _remove_warmup(merged, warmup_stats)
             summary = summarize_hist(merged["accepted_draft_hist"])
             cc = merged["confidence_calibration"]
             has_calib = any(any(row) for row in cc["attempts"])
