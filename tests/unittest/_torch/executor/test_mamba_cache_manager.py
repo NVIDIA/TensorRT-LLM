@@ -3,8 +3,9 @@
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
 import os
+from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -12,6 +13,8 @@ import torch
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -80,7 +83,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
 
+if IS_FLASHINFER_AVAILABLE:
+    from tensorrt_llm._torch.attention_backend import FlashInferAttentionMetadata
+
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+skip_no_flashinfer = pytest.mark.skipif(not IS_FLASHINFER_AVAILABLE, reason="requires FlashInfer")
 
 
 def test_advance_replay_state_uses_checkpoint_predicate_and_skips_dummies():
@@ -2179,6 +2186,139 @@ def _build_v2_hybrid_with_mamba_layer(
         dtype=dtype,
         conv_state_layout=conv_state_layout,
     )
+
+
+@pytest.mark.parametrize(
+    "manager_factory",
+    [_build_hybrid_with_mamba_layer, _build_v2_hybrid_with_mamba_layer],
+)
+@skip_no_cuda
+@skip_no_flashinfer
+def test_flashinfer_hybrid_page_tables_use_attention_layer(
+    manager_factory: Callable[..., CppMambaHybridCacheManager | MambaHybridCacheManagerV2],
+) -> None:
+    manager = manager_factory(max_batch_size=1)
+    try:
+        request_ids = [123]
+        manager.add_dummy_requests(request_ids, token_nums=[8], is_gen=False)
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            max_num_requests=1,
+            max_num_tokens=8,
+            kv_cache_manager=manager,
+            request_ids=request_ids,
+        )
+
+        with patch.object(
+            manager,
+            "get_batch_cache_indices_flat",
+            wraps=manager.get_batch_cache_indices_flat,
+        ) as get_indices:
+            metadata.prepare()
+
+        assert metadata._get_pp_attention_layer_ids() == [1]
+        assert metadata._default_kv_layer_idx == 1
+        assert get_indices.call_count >= 1
+        assert all(call.kwargs.get("layer_idx") == 1 for call in get_indices.call_args_list)
+        assert torch.all(metadata.paged_kv_indices >= 0)
+
+        with (
+            patch.object(
+                manager,
+                "get_batch_cache_indices_flat",
+                wraps=manager.get_batch_cache_indices_flat,
+            ) as get_indices,
+            patch.object(
+                manager,
+                "get_batch_cache_indices",
+                wraps=manager.get_batch_cache_indices,
+            ) as get_block_ids,
+        ):
+            metadata._prepare_full_draft_page_table()
+
+        assert get_indices.call_count >= 1
+        assert get_block_ids.call_count >= 1
+        assert all(call.kwargs.get("layer_idx") == 1 for call in get_indices.call_args_list)
+        assert all(call.kwargs.get("layer_idx") == 1 for call in get_block_ids.call_args_list)
+    finally:
+        manager.shutdown()
+
+
+@skip_no_cuda
+@skip_no_flashinfer
+def test_flashinfer_metadata_falls_back_to_primary_pool_sizing() -> None:
+    manager = _build_v2_hybrid_with_mamba_layer(max_batch_size=1)
+    try:
+        with patch.object(manager, "get_buffers", None):
+            metadata = FlashInferAttentionMetadata(
+                seq_lens=torch.tensor([1], dtype=torch.int32),
+                num_contexts=1,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=[0],
+                ),
+                max_num_requests=1,
+                max_num_tokens=1,
+                kv_cache_manager=manager,
+                request_ids=[123],
+            )
+
+        assert metadata._paged_kv_indices.numel() == manager.blocks_in_primary_pool
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("manager_factory", "manager_kwargs"),
+    [
+        (
+            _build_hybrid_with_mamba_layer,
+            {
+                "mamba_layer_mask": [True],
+                "attention_layer_mask": [False],
+            },
+        ),
+        (_build_v2_hybrid_with_mamba_layer, {"num_attention_layers": 0}),
+    ],
+)
+@skip_no_cuda
+@skip_no_flashinfer
+def test_flashinfer_metadata_skips_paged_kv_on_recurrent_only_rank(
+    manager_factory: Callable[..., CppMambaHybridCacheManager | MambaHybridCacheManagerV2],
+    manager_kwargs: dict[str, object],
+) -> None:
+    manager = manager_factory(max_batch_size=1, **manager_kwargs)
+    try:
+        request_ids = [123]
+        # Isolate FlashInfer's no-attention path from recurrent-state setup.
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            max_num_requests=1,
+            max_num_tokens=8,
+            kv_cache_manager=manager,
+            request_ids=request_ids,
+            mamba_metadata=False,
+        )
+
+        metadata.prepare()
+
+        assert metadata._default_kv_layer_idx is None
+        assert metadata.paged_kv_indices.numel() == 0
+        assert metadata.num_blocks == [0]
+        assert torch.count_nonzero(metadata.paged_kv_indptr) == 0
+        assert torch.count_nonzero(metadata.paged_kv_last_page_len) == 0
+    finally:
+        manager.shutdown()
 
 
 def _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5):

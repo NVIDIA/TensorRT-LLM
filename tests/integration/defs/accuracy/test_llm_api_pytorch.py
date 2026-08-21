@@ -6480,6 +6480,20 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         assert breakable_results == eager_results
 
     @skip_pre_hopper
+    def test_bf16_flashinfer(self) -> None:
+        model_path = f"{llm_models_root()}/Qwen3.5-4B"
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 max_seq_len=4096,
+                 max_batch_size=32,
+                 kv_cache_config=self.kv_cache_config,
+                 cuda_graph_config=self.cuda_graph_config,
+                 attn_backend="FLASHINFER") as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
     def test_fp8(self):
         model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         with LLM(model_path,
