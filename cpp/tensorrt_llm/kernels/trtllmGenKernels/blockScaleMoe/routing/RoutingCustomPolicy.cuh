@@ -391,6 +391,17 @@ static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * Num
 static constexpr int BlockKernelMaxNumTokens = 4;
 static constexpr int DynBlockKernelMaxNumTokens = 16;
 static constexpr int DynBlockKernelMaxNumExperts = 256;
+// For the Renormalize policy (None + Softmax) the classic block kernel is faster through
+// the 512-expert tier, so the cooperative kernel is only preferred from this tier up.
+// Every other policy is excluded from this bound; see prefersCoopBlockKernel().
+// TLLM_ROUTING_COOP_BLOCK_MIN_EXPERTS overrides both bounds below at runtime.
+static constexpr int CoopBlockKernelMinNumExperts = 576;
+// At a single token the classic kernel gives up its advantage one tier earlier. The
+// cooperative kernel runs one thread per expert, so it scales with the expert count even
+// when there is only one token to route, while the classic kernel has one warp of work in
+// total. Both measured parts agree the cooperative kernel wins the 576 tier at one token,
+// and they disagree at 512, so 512 stays cooperative there. See prefersCoopBlockKernel().
+static constexpr int CoopBlockKernelSingleTokenMinNumExperts = 512;
 // Cooperative block kernel: one thread per expert, so at most 1024 experts (1 CUDA block).
 static constexpr int CoopBlockKernelMaxNumExperts = 1024;
 

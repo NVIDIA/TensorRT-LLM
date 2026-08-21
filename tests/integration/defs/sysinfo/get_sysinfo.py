@@ -108,37 +108,33 @@ def is_power():
     return platform.processor() == "ppc64le"
 
 
-def get_linux_distribution() -> tuple[str, str, str]:
-    """Return Linux distribution metadata.
-
-    The ``distro`` package is preferred when available, with ``os-release`` as
-    a dependency-free fallback.
-
-    Returns:
-        The distribution ID, version ID, and version codename, in that order.
-        Missing ``os-release`` fields are returned as ``"na"``; if the file
-        cannot be read, all three values are ``"na"``.
-    """
+def get_linux_distribution():
     try:
         import distro
-    except ImportError:
-        pass
-    else:
         return (distro.id(), distro.version(), distro.codename())
-
+    except ImportError:
+        # distro is not a direct test dependency historically; it used to arrive
+        # transitively (e.g. via openai<3.3.1) and silently disappeared when that
+        # dependency was dropped. Fall back to the stdlib rather than to 'na'.
+        distro_reason = "distro module not installed"
+    except Exception as e:
+        # Best-effort probe: distro imported but id()/version()/codename() raised.
+        # Any failure here should degrade to os-release, not crash the render, so
+        # the broad catch is deliberate; the reason is preserved for the log below.
+        distro_reason = f"distro probe raised {type(e).__name__}: {e}"
+        logger.warning(f"{distro_reason}; falling back to os-release")
     try:
+        # Python 3.10+; reads /etc/os-release, same source distro uses.
         os_release = platform.freedesktop_os_release()
-    except OSError as error:
-        logger.warning(
-            "Unable to read OS release information, defaulting operating system "
-            "to ('na', 'na', 'na'): %s", error)
+        return (os_release.get("ID", "na"), os_release.get("VERSION_ID", "na"),
+                os_release.get("VERSION_CODENAME", "na"))
+    except OSError:
+        logger.error(
+            f"Cannot determine the Linux distribution ({distro_reason}; "
+            "/etc/os-release also unreadable); reporting ('na', 'na', 'na'). "
+            "Test-db conditions matching linux_distribution_name (e.g. ubuntu*) "
+            "will select ZERO tests and the rendered test list will be empty.")
         return ("na", "na", "na")
-
-    return (
-        os_release.get("ID", "na"),
-        os_release.get("VERSION_ID", "na"),
-        os_release.get("VERSION_CODENAME", "na"),
-    )
 
 
 def is_windows():
