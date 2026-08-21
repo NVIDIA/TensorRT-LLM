@@ -574,7 +574,11 @@ def _scatter_runs(entries) -> np.ndarray:
 
 
 def _expand_runs_python(region_base: int, runs: np.ndarray):
-    """Reference expansion (the reactor's Python-fallback semantics)."""
+    """Local CPU reference expansion of the wire runs.
+
+    Test-only: production has no Python expansion path (the C++ sink is
+    required).
+    """
     srcs, dsts, sizes = [], [], []
     for r in runs:
         for p in range(int(r["count"])):

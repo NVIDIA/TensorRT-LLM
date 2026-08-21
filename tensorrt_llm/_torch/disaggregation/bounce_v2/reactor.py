@@ -33,7 +33,7 @@ THREADING CONTRACT (every cross-thread interaction):
     state), request creation under ``_req_mu`` (BEFORE the WANT goes out, so
     a fast GRANT always finds the request), WANT send under the channel
     lock, then the eager pump. ``CreditScheduler`` is internally locked;
-    ``BatchedCopyPool.submit_copy``/``launch_chunk`` are thread-safe;
+    ``BatchedCopyPool.launch_chunk`` is thread-safe;
     ``NixlTransferAgent.post_transfer_1to1`` (and ``launch_chunk_chained``)
     runs on the reactor thread AND on submit threads.
   - NO C++ BINDING CALL EVER RUNS WHILE ``_req_mu`` IS HELD (anti-convoy
@@ -264,8 +264,8 @@ class _Request:
     acked: int = 0
     last_progress: float = 0.0
     abandon_reason: str = ""
-    #: C++ per-request plan handle (BatchedCopyPool.register_plan), or -1 on
-    #: the pure-Python fallback. Released exactly once on the request's
+    #: C++ per-request plan handle (BatchedCopyPool.register_plan); latched
+    #: to -1 once released. Released exactly once on the request's
     #: terminal paths (complete / fail / fail_all); the handle holds NO arena
     #: addresses (offsets are region-relative), so its release is independent
     #: of region recycling — a launch racing the release fails
@@ -283,11 +283,8 @@ class _Request:
 class _ScatterJob:
     """Receiver-side scatter of one DATA chunk.
 
-    Two flavors, by mechanism capability: with the compiled pool's
-    ``submit_scatter_runs`` the job carries the RAW wire runs (``runs`` set;
-    validation + run expansion + plan fill happen in ONE C++ call); the
-    pure-Python fallback carries the pre-expanded per-piece copy arrays
-    (``srcs``/``dsts``/``sizes`` set).
+    Carries the RAW wire runs: the compiled pool's ``submit_scatter_runs``
+    does validation + run expansion + plan fill in ONE C++ call.
     """
 
     key: str
@@ -295,12 +292,22 @@ class _ScatterJob:
     rid: int
     chunk_idx: int
     offset: int  # arena region offset (the DATA region handle)
-    srcs: Optional[np.ndarray] = None  # [n] u64 absolute source addrs in the region
-    dsts: Optional[np.ndarray] = None  # [n] u64 final KV destination addresses
-    sizes: Optional[np.ndarray] = None  # [n] u32
-    runs: Optional[np.ndarray] = None  # [m] SCATTER_RUN_DTYPE raw wire runs
-    region_base: int = 0  # absolute device address of the granted region
-    region_bytes: int = 0  # granted (buddy-block) region length
+    runs: np.ndarray  # [m] SCATTER_RUN_DTYPE raw wire runs
+    region_base: int  # absolute device address of the granted region
+    region_bytes: int  # granted (buddy-block) region length
+
+
+def _require_binding(obj, name: str):
+    """Fetch a REQUIRED compiled-binding method; raise at construction time
+    (not at first use) when it is missing. The bindings and this Python code
+    ship in one wheel, so absence can only mean a stale/partial build."""
+    fn = getattr(obj, name, None)
+    if fn is None:
+        raise RuntimeError(
+            f"bounce_v2 requires the compiled BatchedCopyPool plan-handle bindings "
+            f"({type(obj).__name__}.{name} is missing); rebuild the wheel"
+        )
+    return fn
 
 
 def _resolve(future: "Future[BounceResult]", result: BounceResult) -> None:
@@ -349,44 +356,30 @@ class BounceReactor:
         self._poller = poller
         self._set_device = set_device_fn
         self._max_chunk = config.max_chunk_size_bytes
-        # Receiver-side C++ scatter sink (per-instance capability detection,
-        # like register_plan): one bound call validates the raw wire
-        # runs, expands them and launches the scatter — replacing the
+        # REQUIRED compiled-binding surface (validated HERE, at construction,
+        # so a stale build fails the engine/reactor bring-up loudly instead of
+        # the first transfer). The bindings and this Python code ship in ONE
+        # wheel, so a missing method can only mean a stale/partial build.
+        #
+        # Receiver-side C++ scatter sink: one bound call validates the raw
+        # wire runs, expands them and launches the scatter — replacing the
         # per-chunk numpy expansion that dominated the Python _on_data cost.
-        # Absent (old binding / fake pool) -> the pure-Python path below.
-        self._submit_scatter_fn = getattr(copy_pool, "submit_scatter_runs", None)
+        self._submit_scatter_fn = _require_binding(copy_pool, "submit_scatter_runs")
         self._pool_rejected = int(getattr(copy_pool, "SCATTER_REJECTED", _SCATTER_REJECTED))
         self._max_descs_per_chunk = min(
             self._max_plan_entries, max(1024, config.max_chunk_size_bytes // 256)
         )
-        # Sender-side per-request C++ plan handle (per-instance capability
-        # detection, like submit_scatter_runs): submit() marshals the whole
+        # Sender-side per-request C++ plan handle: submit() marshals the whole
         # request's gather plan into C++-owned memory ONCE (register_plan)
         # and every chunk launch becomes one scalar-args, GIL-released C++
         # call — launch_chunk for eager (uncredited) chunks, and the agent's
         # launch_chunk_chained for credited chunks (gather + auto-RDMA-post
         # when the gather completes; no Python hop between them, and Python
-        # sees ONE completion per chained chunk). Absent (old binding / fake
-        # pool) -> the classic numpy submit_copy / post_transfer_1to1 path.
-        register_plan_fn = getattr(copy_pool, "register_plan", None)
-        release_plan_fn = getattr(copy_pool, "release_plan", None)
-        launch_chunk_fn = getattr(copy_pool, "launch_chunk", None)
-        if (
-            register_plan_fn is not None
-            and release_plan_fn is not None
-            and launch_chunk_fn is not None
-        ):
-            self._register_plan_fn = register_plan_fn
-            self._release_plan_fn = release_plan_fn
-            self._launch_chunk_fn = launch_chunk_fn
-            self._launch_chained_fn = getattr(raw_agent, "launch_chunk_chained", None)
-            chained = ", chained credited launches" if self._launch_chained_fn else ""
-            logger.info(f"bounce_v2({self_name}): C++ per-request plan handle enabled{chained}")
-        else:
-            self._register_plan_fn = None
-            self._release_plan_fn = None
-            self._launch_chunk_fn = None
-            self._launch_chained_fn = None
+        # sees ONE completion per chained chunk).
+        self._register_plan_fn = _require_binding(copy_pool, "register_plan")
+        self._release_plan_fn = _require_binding(copy_pool, "release_plan")
+        self._launch_chunk_fn = _require_binding(copy_pool, "launch_chunk")
+        self._launch_chained_fn = _require_binding(raw_agent, "launch_chunk_chained")
 
         # --- control channel ---
         self._zmq = zmq.Context(io_threads=1)
@@ -596,13 +589,11 @@ class BounceReactor:
         self._bump("tx_chunks", plan.num_chunks)
 
         chunk_bytes = [c.packed_bytes for c in plan.chunks]
-        plan_handle = -1
-        if self._register_plan_fn is not None:
-            # ONE marshalling call per request: the whole gather plan moves
-            # into C++-owned memory here, so every later chunk launch is a
-            # scalar-args, GIL-released call (see _exec_launch).
-            g_srcs, g_offsets, g_sizes, g_starts = plan.flat_gather()
-            plan_handle = int(self._register_plan_fn(g_srcs, g_offsets, g_sizes, g_starts))
+        # ONE marshalling call per request: the whole gather plan moves into
+        # C++-owned memory here, so every later chunk launch is a scalar-args,
+        # GIL-released call (see _exec_launch).
+        g_srcs, g_offsets, g_sizes, g_starts = plan.flat_gather()
+        plan_handle = int(self._register_plan_fn(g_srcs, g_offsets, g_sizes, g_starts))
         with self._req_mu:
             rid = self._next_rid
             self._next_rid += 1
@@ -1018,10 +1009,10 @@ class BounceReactor:
         local_off = self._sched.acquire_local(chunk.packed_bytes, eager=not have_credit)
         if local_off is None:
             return None
-        # A credited launch through the compiled plan handle CHAINS (the C++
-        # poll thread auto-posts the RDMA write): its distinct busy_op tells
-        # the failure path this in-flight call may already be a write.
-        chained = have_credit and req.plan_handle >= 0 and self._launch_chained_fn is not None
+        # A credited launch CHAINS through the plan handle (the C++ poll
+        # thread auto-posts the RDMA write): its distinct busy_op tells the
+        # failure path this in-flight call may already be a write.
+        chained = have_credit
         posted = _Posted(
             chunk_idx=chunk_idx,
             local_offset=local_off,
@@ -1038,14 +1029,14 @@ class BounceReactor:
             posted.remote_dev = credit.dev_id
         req.posted.append(posted)
         req.next_post += 1
-        return ("launch", posted, chunk, credit)
+        return ("launch", posted, credit)
 
     def _execute_action(self, rid: int, req: _Request, action: tuple) -> int:
         """Run one decided transition (C++ outside ``_req_mu``) and record
         it. Returns a ``_PUMP_*`` code (STOP_IDLE only for a BUSY pool)."""
         kind = action[0]
         if kind == "launch":
-            return self._exec_launch(rid, req, action[1], action[2], action[3])
+            return self._exec_launch(rid, req, action[1], action[2])
         return self._exec_post(rid, req, action[1])
 
     def _register_route_locked(self, cid: int, route: tuple) -> list[tuple]:
@@ -1086,15 +1077,14 @@ class BounceReactor:
             req.pending_credits.appendleft(credit)
             req.next_credit -= 1
 
-    def _exec_launch(self, rid: int, req: _Request, posted: _Posted, chunk, credit) -> int:
-        """EXECUTE+RECORD of a gather launch. With the compiled plan handle
-        the launch is ONE scalar-args, GIL-released C++ call over the
-        pre-marshalled plan: ``launch_chunk`` for an uncredited (eager)
-        chunk, ``launch_chunk_chained`` for a credited one (gather + C++
-        auto-RDMA-post; the chunk goes straight to WRITING and its ONE
-        completion row publishes under the reserved ``xfer_id`` — see the
-        _Posted docstring for the row contract). The numpy ``submit_copy``
-        path remains the fallback. The C++ call runs WITHOUT _req_mu."""
+    def _exec_launch(self, rid: int, req: _Request, posted: _Posted, credit) -> int:
+        """EXECUTE+RECORD of a gather launch: ONE scalar-args, GIL-released
+        C++ call over the pre-marshalled plan — ``launch_chunk`` for an
+        uncredited (eager) chunk, ``launch_chunk_chained`` for a credited one
+        (gather + C++ auto-RDMA-post; the chunk goes straight to WRITING and
+        its ONE completion row publishes under the reserved ``xfer_id`` — see
+        the _Posted docstring for the row contract). The C++ call runs
+        WITHOUT _req_mu."""
         region_base = self._arena_base + posted.local_offset
         chained = posted.busy_op == "launch_chained"
         copy_id = self._pool_busy
@@ -1102,32 +1092,28 @@ class BounceReactor:
         err: Optional[BaseException] = None
         # SNAPSHOT the handle exactly once: _fail_request latches
         # req.plan_handle to -1 under _req_mu at any moment, and this phase
-        # runs unlocked. Reading it twice could pass a torn -1 into the
-        # unsigned binding parameter (TypeError escaping mid-launch); a
-        # single snapshot of an already-released handle instead takes the
-        # deterministic ValueError path below.
+        # runs unlocked. Reading it twice could tear; a single snapshot of an
+        # already-released handle instead takes the deterministic error path
+        # below (ValueError from the binding's unknown-handle validation, or
+        # TypeError from -1 reaching a nanobind unsigned parameter).
         plan_handle = req.plan_handle
         try:
-            if plan_handle >= 0:
-                if chained:
-                    copy_id, reserved = self._launch_chained_fn(
-                        self._pool,
-                        plan_handle,
-                        posted.chunk_idx,
-                        region_base,
-                        posted.remote_addr,
-                        posted.write_bytes,
-                        self._device_id,
-                        posted.remote_dev,
-                        req.peer,
-                        self._poller,
-                    )
-                    copy_id, reserved = int(copy_id), int(reserved)
-                else:
-                    copy_id = int(self._launch_chunk_fn(plan_handle, posted.chunk_idx, region_base))
+            if chained:
+                copy_id, reserved = self._launch_chained_fn(
+                    self._pool,
+                    plan_handle,
+                    posted.chunk_idx,
+                    region_base,
+                    posted.remote_addr,
+                    posted.write_bytes,
+                    self._device_id,
+                    posted.remote_dev,
+                    req.peer,
+                    self._poller,
+                )
+                copy_id, reserved = int(copy_id), int(reserved)
             else:
-                bounce_dsts = (np.uint64(region_base) + chunk.bounce_offsets).astype(np.uint64)
-                copy_id = int(self._pool.submit_copy(chunk.src_ptrs, bounce_dsts, chunk.sizes))
+                copy_id = int(self._launch_chunk_fn(plan_handle, posted.chunk_idx, region_base))
         except (RuntimeError, ValueError, TypeError) as e:
             # RuntimeError: CUDA error / plan overflow from the pool.
             # ValueError: the binding's argument validation (nanobind maps
@@ -1615,9 +1601,9 @@ class BounceReactor:
             self._send_to(peer, encode_cancel(rid, self._endpoint))
 
     def _release_plan(self, handle: int) -> None:
-        """Free a C++ plan handle (no-op for -1 / missing binding). Call
-        WITHOUT ``_req_mu`` (bound call, anti-convoy rule)."""
-        if handle >= 0 and self._release_plan_fn is not None:
+        """Free a C++ plan handle (no-op for the -1 already-released latch).
+        Call WITHOUT ``_req_mu`` (bound call, anti-convoy rule)."""
+        if handle >= 0:
             self._release_plan_fn(handle)
 
     def _fail_all(self, reason: str) -> None:
@@ -1716,9 +1702,10 @@ class BounceReactor:
         region_bytes = self._sched.region_bytes(offset)
         region_base = self._arena_base + offset
         # Scatter validation check (1) — the granted region itself must lie
-        # inside the registered arena. Shared by BOTH scatter paths (the C++
-        # submit_scatter_runs sink validates checks (2)/(3); this one stays
-        # in Python, which owns the arena bounds).
+        # inside the registered arena. Per the C++ contract this check stays
+        # in Python, which owns the arena bounds; the submit_scatter_runs
+        # sink validates checks (2)/(3) (run/piece counts, per-run region
+        # bounds — see BatchedCopyPool::submitScatterRuns).
         if region_bytes <= 0 or region_base + region_bytes > self._arena_base + self._arena_bytes:
             logger.warning(
                 f"bounce_v2({self._self_name}): DATA region out of arena bounds peer={peer} "
@@ -1727,124 +1714,39 @@ class BounceReactor:
             self._flow_chunk_done(key)
             self._send_grants(self._sched.on_scatter_done(key, offset))
             return
-        if self._submit_scatter_fn is None:
-            # Pure-Python fallback: validate + expand the runs here.
-            job = self._validate_and_expand_runs(
-                key, peer, header, runs, offset, region_base, region_bytes
-            )
-            if job is None:
-                # Bounds/size violation: no scatter, NO ACK (a false ACK
-                # would claim the data landed), but the region is released so
-                # it cannot leak — the sender times out. Still chunk-terminal
-                # for the flow accounting, or the _rx_flows entry would leak
-                # forever.
-                self._flow_chunk_done(key)
-                self._send_grants(self._sched.on_scatter_done(key, offset))
-                return
-            empty = job.srcs.shape[0] == 0
-        else:
-            # C++ scatter sink: hand the RAW wire runs to submit_scatter_runs
-            # (validation checks (2)/(3) + run expansion + plan fill + launch
-            # in ONE bound call). A validation failure surfaces as
-            # SCATTER_REJECTED from the launch below and takes the same
-            # no-ACK / release-region path (via _finish_scatter(ok=False)).
-            job = _ScatterJob(
-                key=key,
-                peer=peer,
-                rid=header.request_id,
-                chunk_idx=header.chunk_idx,
-                offset=offset,
-                runs=runs,
-                region_base=region_base,
-                region_bytes=region_bytes,
-            )
-            empty = runs.shape[0] == 0
-        self._scattering[offset] = False
-        if empty:
-            self._bump("rx_data")
-            self._finish_scatter(job, ok=True)  # empty plan: vacuous success
-            return
-        if self._launch_scatter(job):
-            # Launched / backlogged / launch-failed — but NOT validation-
-            # rejected, which must not count as accepted DATA (parity with
-            # the Python fallback, whose validation failure returns above).
-            self._bump("rx_data")
-
-    def _validate_and_expand_runs(
-        self,
-        key: str,
-        peer: str,
-        header: BounceMsgHeader,
-        runs: np.ndarray,
-        offset: int,
-        region_base: int,
-        region_bytes: int,
-    ) -> Optional[_ScatterJob]:
-        """Bounds-check every scatter run against THIS flow's granted region
-        (per-run: exact Python-int arithmetic — hostile u64 strides cannot
-        wrap), then expand runs to per-piece (src, dst, size) arrays for the
-        copy op. Returns None on any violation (logged). These are checks
-        (2) (run/piece counts vs the plan capacity) and (3) (per-run region
-        bounds) — check (1) (region vs arena) runs in _on_data. The compiled
-        pool's submit_scatter_runs replicates (2)/(3) in C++ (see
-        BatchedCopyPool::submitScatterRuns for the mapping); this Python
-        version remains the fallback for bindings without it."""
-        n_runs = int(runs.shape[0])
-        total_pieces = int(runs["count"].astype(np.uint64).sum())
-        if n_runs > self._max_plan_entries or total_pieces > self._max_plan_entries:
-            logger.warning(
-                f"bounce_v2({self._self_name}): rejected scatter with {n_runs} runs / "
-                f"{total_pieces} pieces (max {self._max_plan_entries}) peer={peer} "
-                f"rid={header.request_id} chunk={header.chunk_idx}"
-            )
-            return None
-        srcs = np.empty(total_pieces, dtype=np.uint64)
-        dsts = np.empty(total_pieces, dtype=np.uint64)
-        sizes = np.empty(total_pieces, dtype=np.uint32)
-        pos = 0
-        for r in runs:
-            count = int(r["count"])
-            b_off = int(r["bounce_offset"])
-            b_stride = int(r["bounce_stride"])
-            d_addr = int(r["dst_addr"])
-            d_stride = int(r["dst_stride"])
-            piece = int(r["piece_size"])
-            span = (count - 1) * b_stride + piece
-            if count < 1 or b_off > region_bytes or span > region_bytes - b_off:
-                logger.warning(
-                    f"bounce_v2({self._self_name}): scatter run out of region bounds peer={peer} "
-                    f"rid={header.request_id} chunk={header.chunk_idx} "
-                    f"(off={b_off} span={span} region={region_bytes})"
-                )
-                return None
-            idx = np.arange(count, dtype=np.uint64)
-            srcs[pos : pos + count] = np.uint64(region_base + b_off) + idx * np.uint64(b_stride)
-            dsts[pos : pos + count] = np.uint64(d_addr) + idx * np.uint64(d_stride)
-            sizes[pos : pos + count] = piece
-            pos += count
-        return _ScatterJob(
+        # C++ scatter sink: hand the RAW wire runs to submit_scatter_runs
+        # (validation checks (2)/(3) + run expansion + plan fill + launch in
+        # ONE bound call). A validation failure surfaces as SCATTER_REJECTED
+        # from the launch below and takes the no-ACK / release-region path
+        # (via _finish_scatter(ok=False)).
+        job = _ScatterJob(
             key=key,
             peer=peer,
             rid=header.request_id,
             chunk_idx=header.chunk_idx,
             offset=offset,
-            srcs=srcs,
-            dsts=dsts,
-            sizes=sizes,
+            runs=runs,
+            region_base=region_base,
+            region_bytes=region_bytes,
         )
+        self._scattering[offset] = False
+        if runs.shape[0] == 0:
+            self._bump("rx_data")
+            self._finish_scatter(job, ok=True)  # empty plan: vacuous success
+            return
+        if self._launch_scatter(job):
+            # Launched / backlogged / launch-failed — but NOT validation-
+            # rejected, which must not count as accepted DATA.
+            self._bump("rx_data")
 
     def _submit_scatter(self, job: _ScatterJob) -> int:
-        """Submit one scatter job to the copy pool: the C++ raw-runs sink
-        when the job carries wire runs, the classic expanded-arrays call
-        otherwise. Returns the completion id, BUSY, or (raw-runs path only)
-        SCATTER_REJECTED."""
-        if job.runs is not None:
-            # A 1-D contiguous structured array views as one flat u8 blob of
-            # n*36 bytes — exactly the wire payload the binding expects.
-            return int(
-                self._submit_scatter_fn(job.region_base, job.region_bytes, job.runs.view(np.uint8))
-            )
-        return int(self._pool.submit_copy(job.srcs, job.dsts, job.sizes))
+        """Submit one scatter job to the copy pool's raw-runs sink. Returns
+        the completion id, BUSY, or SCATTER_REJECTED."""
+        # A 1-D contiguous structured array views as one flat u8 blob of
+        # n*36 bytes — exactly the wire payload the binding expects.
+        return int(
+            self._submit_scatter_fn(job.region_base, job.region_bytes, job.runs.view(np.uint8))
+        )
 
     def _launch_scatter(self, job: _ScatterJob) -> bool:
         """Launch (or backlog) one scatter job. Returns False only when the

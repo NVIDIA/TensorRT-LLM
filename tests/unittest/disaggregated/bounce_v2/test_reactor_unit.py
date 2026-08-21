@@ -127,37 +127,94 @@ class FakeClock:
 
 
 class FakeCopyPool:
-    """BatchedCopyPool stand-in: records every submit, no GPU behind it.
+    """BatchedCopyPool stand-in with the full REQUIRED binding surface.
 
     Completion ids are handed out here but reported through the FakePoller by
-    the test. ``busy=True`` makes every submit return ``BUSY`` (all copy
-    streams occupied), which parks receiver scatters in the reactor backlog.
+    the test. ``busy=True`` makes every launch/sink call return ``BUSY`` (all
+    copy streams occupied), which parks receiver scatters in the reactor
+    backlog and rolls sender launches back.
+
+    Sender surface (per-request plan handle): ``register_plan`` /
+    ``release_plan`` / ``launch_chunk``. ``release_plan`` records EVERY call
+    (the exactly-once spy) and is idempotent; a launch on a released handle
+    raises ValueError, exactly like the binding's deterministic
+    launch-racing-release terminal.
+
+    Receiver surface (raw-runs scatter sink): ``submit_scatter_runs``.
+    ``sink_mode`` selects its behavior — "ok" hands out a completion id,
+    "reject" returns SCATTER_REJECTED (validation failure), "raise" throws
+    like a launch error. Every sink call records a copy of the raw runs blob.
     """
 
     BUSY = -1
+    SCATTER_REJECTED = -2
     max_plan_entries = 1 << 16
 
     def __init__(self) -> None:
         self._mu = threading.Lock()
         self.busy = False
-        #: Every submit attempt: (srcs, dsts, sizes, returned id or BUSY).
-        self.calls: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
+        self.sink_mode = "ok"
+        self.plans: dict[int, tuple] = {}
+        self.releases: list[int] = []
+        #: Every accepted gather launch: (handle, chunk_idx, staging_base, cid).
+        self.launches: list[tuple[int, int, int, int]] = []
+        #: Every sink call: (region_base, region_bytes, raw runs bytes, rc).
+        self.sink_calls: list[tuple[int, int, bytes, int | None]] = []
         self._next_cid = 1  # disjoint from FakeXferAgent ids (shared poller space)
+        self._next_handle = 7_000
 
-    def submit_copy(self, srcs, dsts, sizes) -> int:
+    def register_plan(self, srcs, offsets, sizes, starts) -> int:
         with self._mu:
+            handle = self._next_handle
+            self._next_handle += 1
+            self.plans[handle] = (
+                np.array(srcs),
+                np.array(offsets),
+                np.array(sizes),
+                np.array(starts),
+            )
+            return handle
+
+    def release_plan(self, handle) -> None:
+        with self._mu:
+            self.releases.append(int(handle))
+            self.plans.pop(int(handle), None)  # idempotent
+
+    def launch_chunk(self, handle, chunk_idx, staging_base) -> int:
+        with self._mu:
+            if int(handle) not in self.plans:
+                raise ValueError("launch_chunk: unknown plan handle")
             if self.busy:
-                cid = self.BUSY
-            else:
-                cid = self._next_cid
-                self._next_cid += 1
-            self.calls.append((np.array(srcs), np.array(dsts), np.array(sizes), cid))
+                return self.BUSY
+            cid = self._next_cid
+            self._next_cid += 1
+            self.launches.append((int(handle), int(chunk_idx), int(staging_base), cid))
             return cid
 
-    def accepted(self) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
-        """Only the submits that actually launched (non-BUSY)."""
+    def submit_scatter_runs(self, region_base, region_bytes, runs_u8) -> int:
         with self._mu:
-            return [c for c in self.calls if c[3] != self.BUSY]
+            if self.sink_mode == "raise":
+                self.sink_calls.append((int(region_base), int(region_bytes), bytes(runs_u8), None))
+                raise RuntimeError("injected sink launch failure")
+            if self.sink_mode == "reject":
+                rc = self.SCATTER_REJECTED
+            elif self.busy:
+                rc = self.BUSY
+            else:
+                rc = self._next_cid
+                self._next_cid += 1
+            self.sink_calls.append((int(region_base), int(region_bytes), bytes(runs_u8), rc))
+            return rc
+
+    def accepted(self) -> list[tuple[int, int, int, int]]:
+        """Only the gather launches that actually launched (id handed out)."""
+        with self._mu:
+            return list(self.launches)
+
+    def sink_accepted(self) -> list[tuple[int, int, bytes, int | None]]:
+        """Only the sink calls that actually launched (id handed out)."""
+        with self._mu:
+            return [c for c in self.sink_calls if c[3] is not None and c[3] >= 0]
 
 
 class FakePoller:
@@ -194,12 +251,23 @@ class FakePoller:
 
 
 class FakeXferAgent:
-    """NixlTransferAgent stand-in: records posts, ids resolve via FakePoller."""
+    """NixlTransferAgent stand-in: records posts, ids resolve via FakePoller.
+
+    ``launch_chunk_chained`` mirrors the binding's snapshot semantics:
+    allocates the copy id from the pool fake and reserves cid +
+    ``RESERVED_DELTA``. One terminal row per chained chunk, under the
+    reserved id.
+    """
+
+    RESERVED_DELTA = 50_000
 
     def __init__(self) -> None:
         self._mu = threading.Lock()
         #: Every post: (src_addr, dst_addr, nbytes, peer, returned xfer id).
         self.posts: list[tuple[int, int, int, str, int]] = []
+        #: Every chained launch: (handle, chunk_idx, staging_base, dst_ptr,
+        #: nbytes, cid, reserved_id).
+        self.chained: list[tuple] = []
         self._next_xid = 10_000  # disjoint from FakeCopyPool ids
 
     def post_transfer_1to1(self, src, dst, nbytes, _src_dev, _dst_dev, peer, _poller) -> int:
@@ -208,6 +276,31 @@ class FakeXferAgent:
             self._next_xid += 1
             self.posts.append((int(src), int(dst), int(nbytes), peer, xid))
             return xid
+
+    def launch_chunk_chained(
+        self, pool, handle, chunk_idx, staging_base, dst_ptr, nbytes, _sd, _dd, _peer, _poller
+    ):
+        with pool._mu:
+            if int(handle) not in pool.plans:
+                raise ValueError("launch_chunk_chained: unknown plan handle")
+            if pool.busy:
+                return (pool.BUSY, -1)
+            cid = pool._next_cid
+            pool._next_cid += 1
+            reserved = cid + self.RESERVED_DELTA
+            with self._mu:
+                self.chained.append(
+                    (
+                        int(handle),
+                        int(chunk_idx),
+                        int(staging_base),
+                        int(dst_ptr),
+                        int(nbytes),
+                        cid,
+                        reserved,
+                    )
+                )
+        return (cid, reserved)
 
 
 class RawPeer:
@@ -553,7 +646,7 @@ class TestScatterBacklogPurge:
 
         box.pool.busy = False
         time.sleep(0.3)  # generous grace: a leaked job would submit within a tick
-        assert box.pool.accepted() == [], "purged scatter job was still submitted"
+        assert box.pool.sink_accepted() == [], "purged scatter job was still submitted"
         assert box.reactor.alive()
 
     def test_lease_expiry_purges_queued_scatter_and_quarantines_once(self, make_reactor, raw_peers):
@@ -582,7 +675,7 @@ class TestScatterBacklogPurge:
 
         box.pool.busy = False
         time.sleep(0.3)
-        assert box.pool.accepted() == [], "purged scatter job was still submitted"
+        assert box.pool.sink_accepted() == [], "purged scatter job was still submitted"
 
         clock.advance(1.0)  # past the 200 ms quarantine
         _wait_until(lambda: box.sched.free_bytes() == cap0, 10.0, "the quarantine reap")
@@ -607,9 +700,10 @@ class TestScatterBacklogPurge:
         assert box.reactor._scatter_backlog[0].rid == 32
 
         box.pool.busy = False
-        _wait_until(lambda: len(box.pool.accepted()) == 1, 10.0, "the survivor to submit")
-        srcs, dsts, _sizes, cid = box.pool.accepted()[0]
-        assert int(dsts[0]) == 0x6000_0000, "the WRONG flow's job was submitted"
+        _wait_until(lambda: len(box.pool.sink_accepted()) == 1, 10.0, "the survivor to submit")
+        _rbase, _rbytes, blob, cid = box.pool.sink_accepted()[0]
+        run = np.frombuffer(blob, dtype=SCATTER_RUN_DTYPE)[0]
+        assert int(run["dst_addr"]) == 0x6000_0000, "the WRONG flow's job was submitted"
 
         box.poller.complete(cid, ok=True)
         got = peer.recv(10.0)
@@ -620,7 +714,7 @@ class TestScatterBacklogPurge:
         _wait_until(lambda: box.sched.free_bytes() == cap0, 10.0, "both regions to reclaim")
         assert box.sched.tracked_flows() == 0
         time.sleep(0.2)
-        assert len(box.pool.accepted()) == 1, "the cancelled flow's job was also submitted"
+        assert len(box.pool.sink_accepted()) == 1, "the cancelled flow's job was also submitted"
         assert box.reactor.alive()
 
 

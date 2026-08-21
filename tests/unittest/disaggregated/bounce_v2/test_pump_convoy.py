@@ -28,15 +28,13 @@ Pins the new machinery introduced by the no-C++-under-``_req_mu`` rewrite:
   - FAIL x IN-FLIGHT EXEC (T3): a request failing while a pump's C++ call is
     mid-execution outside the lock (``busy_op`` marked) releases each staging
     region exactly once, resolves the future with the right reason, and
-    leaves the reactor alive;
-  - PYTHON SCATTER FALLBACK (T5): a copy pool WITHOUT ``submit_scatter_runs``
-    keeps the classic validate+expand path — ``submit_copy`` receives the
-    exactly-expanded per-piece arrays.
+    leaves the reactor alive.
 
 The deterministic windows are held open by a gated fake pool whose
-``submit_copy`` blocks on an event (the pump's unlocked EXECUTE phase), plus
-a randomized stress run as the broad regression net for the fixed handoff
-race. Reuses the fakes/helpers of test_reactor_unit.py (sibling import).
+``launch_chunk`` blocks on an event (the pump's unlocked EXECUTE phase),
+plus a randomized stress run as the broad regression net for the fixed
+handoff race. Reuses the fakes/helpers of test_reactor_unit.py (sibling
+import).
 """
 
 from __future__ import annotations
@@ -87,7 +85,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 class GatedCopyPool(FakeCopyPool):
-    """FakeCopyPool whose submit_copy BLOCKS on a gate.
+    """FakeCopyPool whose launch_chunk BLOCKS on a gate.
 
     Holds the pump's unlocked C++ EXECUTE window open deterministically:
     the completion id is decided (and recorded) BEFORE blocking, so the test
@@ -100,58 +98,22 @@ class GatedCopyPool(FakeCopyPool):
         self.entered = threading.Event()
         self.hold = threading.Event()
 
-    def submit_copy(self, srcs, dsts, sizes) -> int:
-        cid = super().submit_copy(srcs, dsts, sizes)
+    def launch_chunk(self, handle, chunk_idx, staging_base) -> int:
+        cid = super().launch_chunk(handle, chunk_idx, staging_base)
         self.last_cid = cid
         self.entered.set()
         assert self.hold.wait(timeout=30), "test bug: the pool gate was never released"
         return cid
 
 
-class SinkFakeCopyPool(FakeCopyPool):
-    """FakeCopyPool + ``submit_scatter_runs``: engages the reactor's C++ sink.
-
-    The reactor detects the capability per instance at construction, so this
-    fake pins the sink BRANCH of the receiver path without a GPU. ``mode``
-    selects the sink's behavior: "ok" hands out a completion id,
-    "busy"/"reject" return the binding's sentinels, "raise" throws like a
-    launch error. Every call records a copy of the raw runs blob.
-    """
-
-    SCATTER_REJECTED = -2
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.mode = "ok"
-        #: Every sink call: (region_base, region_bytes, raw runs bytes, rc).
-        self.sink_calls: list[tuple[int, int, bytes, int | None]] = []
-
-    def submit_scatter_runs(self, region_base, region_bytes, runs_u8) -> int:
-        with self._mu:
-            if self.mode == "raise":
-                self.sink_calls.append((int(region_base), int(region_bytes), bytes(runs_u8), None))
-                raise RuntimeError("injected sink launch failure")
-            if self.mode == "reject":
-                rc = self.SCATTER_REJECTED
-            elif self.mode == "busy":
-                rc = self.BUSY
-            else:
-                rc = self._next_cid
-                self._next_cid += 1
-            self.sink_calls.append((int(region_base), int(region_bytes), bytes(runs_u8), rc))
-            return rc
-
-    def sink_accepted(self) -> list[tuple[int, int, bytes, int | None]]:
-        """Only the sink calls that actually launched (id handed out)."""
-        with self._mu:
-            return [c for c in self.sink_calls if c[3] is not None and c[3] >= 0]
-
-
 class GatedOpAgent(FakeXferAgent):
-    """FakeXferAgent gating the classic post entry point.
+    """FakeXferAgent gating one agent entry point ("post" or "chained").
 
-    ``post_transfer_1to1`` blocks on ``hold`` after setting ``entered``: the
-    deterministic mid-EXECUTE window for the busy_op failure tests.
+    The gated call blocks on ``hold`` after setting ``entered``: the
+    deterministic mid-EXECUTE window for the busy_op failure tests. The
+    chained gate holds the call open AFTER the ids are decided (the C++
+    contract's "pinned plan snapshot": a release_plan during the call does
+    not fail it).
     """
 
     def __init__(self, gate: str = "post") -> None:
@@ -169,59 +131,19 @@ class GatedOpAgent(FakeXferAgent):
             self._wait_gate()
         return super().post_transfer_1to1(*args)
 
-
-class PlanFakeCopyPool(FakeCopyPool):
-    """FakeCopyPool + register_plan/launch_chunk/release_plan.
-
-    Engages the reactor's per-request plan-handle path without a GPU.
-    ``release_plan`` records EVERY call (the exactly-once spy) and is
-    idempotent; a launch on a released handle raises ValueError, exactly
-    like the binding's deterministic launch-racing-release terminal.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.plans: dict[int, tuple] = {}
-        self.releases: list[int] = []
-        #: Every accepted plain launch: (handle, chunk_idx, staging_base, cid).
-        self.launches: list[tuple[int, int, int, int]] = []
-        self._next_handle = 7_000
-
-    def register_plan(self, srcs, offsets, sizes, starts) -> int:
-        with self._mu:
-            handle = self._next_handle
-            self._next_handle += 1
-            self.plans[handle] = (
-                np.array(srcs),
-                np.array(offsets),
-                np.array(sizes),
-                np.array(starts),
-            )
-            return handle
-
-    def release_plan(self, handle) -> None:
-        with self._mu:
-            self.releases.append(int(handle))
-            self.plans.pop(int(handle), None)  # idempotent
-
-    def launch_chunk(self, handle, chunk_idx, staging_base) -> int:
-        with self._mu:
-            if int(handle) not in self.plans:
-                raise ValueError("launch_chunk: unknown plan handle")
-            if self.busy:
-                return self.BUSY
-            cid = self._next_cid
-            self._next_cid += 1
-            self.launches.append((int(handle), int(chunk_idx), int(staging_base), cid))
-            return cid
+    def launch_chunk_chained(self, *args):
+        out = super().launch_chunk_chained(*args)
+        if self.gate == "chained":
+            self._wait_gate()
+        return out
 
 
-class GatedPlanPool(PlanFakeCopyPool):
-    """PlanFakeCopyPool whose launch_chunk BLOCKS on a gate.
+class GatedPlanPool(FakeCopyPool):
+    """FakeCopyPool whose launch_chunk BLOCKS on a gate BEFORE the handle check.
 
-    The gate sits BEFORE the handle check, so a release_plan during the gate
-    makes the resumed launch raise ValueError — the binding's deterministic
-    terminal for a launch racing the failure-side release.
+    A release_plan during the gate makes the resumed launch raise ValueError
+    — the binding's deterministic terminal for a launch racing the
+    failure-side release.
     """
 
     def __init__(self) -> None:
@@ -233,54 +155,6 @@ class GatedPlanPool(PlanFakeCopyPool):
         self.entered.set()
         assert self.hold.wait(timeout=30), "test bug: the plan-pool gate was never released"
         return super().launch_chunk(handle, chunk_idx, staging_base)
-
-
-class PlanChainAgent(FakeXferAgent):
-    """FakeXferAgent + launch_chunk_chained (snapshot semantics).
-
-    Allocates the copy id from the pool fake and reserves cid + 50_000; the
-    optional gate holds the call open AFTER the ids are decided (the C++
-    contract's "pinned plan snapshot": a release_plan during the call does
-    not fail it). One terminal row per chained chunk, under the reserved id.
-    """
-
-    RESERVED_DELTA = 50_000
-
-    def __init__(self, gated: bool = False) -> None:
-        super().__init__()
-        self.gated = gated
-        self.entered = threading.Event()
-        self.hold = threading.Event()
-        #: Every chained launch: (handle, chunk_idx, staging_base, dst_ptr,
-        #: nbytes, cid, reserved_id).
-        self.chained: list[tuple] = []
-
-    def launch_chunk_chained(
-        self, pool, handle, chunk_idx, staging_base, dst_ptr, nbytes, _sd, _dd, _peer, _poller
-    ):
-        with pool._mu:
-            if int(handle) not in pool.plans:
-                raise ValueError("launch_chunk_chained: unknown plan handle")
-            if pool.busy:
-                return (pool.BUSY, -1)
-            cid = pool._next_cid
-            pool._next_cid += 1
-            reserved = cid + self.RESERVED_DELTA
-            self.chained.append(
-                (
-                    int(handle),
-                    int(chunk_idx),
-                    int(staging_base),
-                    int(dst_ptr),
-                    int(nbytes),
-                    cid,
-                    reserved,
-                )
-            )
-        if self.gated:
-            self.entered.set()
-            assert self.hold.wait(timeout=30), "test bug: the chained gate was never released"
-        return (cid, reserved)
 
 
 @pytest.fixture
@@ -482,12 +356,17 @@ class TestPumpHandoff:
                     _ack(peer, header.request_id, header.chunk_idx, header.region_handle)
 
         def completer():
-            """Complete every accepted gather / posted write, jittered."""
+            """Complete every accepted gather/chained launch/write, jittered.
+
+            A chained chunk's ONE row publishes under the reserved xfer id
+            (KIND_XFER).
+            """
             done: set[int] = set()
             rng = random.Random(41)
             while not stop.is_set():
                 rows = [(c[3], False) for c in box.pool.accepted()]
                 rows += [(p[4], True) for p in box.agent.posts]
+                rows += [(c[6], True) for c in list(box.agent.chained)]
                 pending = [(i, x) for i, x in rows if i not in done]
                 rng.shuffle(pending)
                 for cid, is_xfer in pending:
@@ -703,55 +582,7 @@ class TestFailDuringBusyExec:
 
 
 # --------------------------------------------------------------------------------------------
-# T5: receiver scatter — Python fallback when the pool lacks submit_scatter_runs
-# --------------------------------------------------------------------------------------------
-class TestScatterPythonFallback:
-    def test_fallback_expands_runs_exactly_and_acks(self, make_reactor, raw_peers):
-        """T5: no ``submit_scatter_runs`` -> classic validate+expand path.
-
-        The fake pool lacks the C++ sink, so the reactor must expand the wire
-        runs itself and call ``submit_copy`` with the exact per-piece arrays;
-        the chunk then ACKs and the region recycles.
-        """
-        box = make_reactor("pyscatter")
-        assert box.reactor._submit_scatter_fn is None  # fallback engaged
-        peer = raw_peers(box.reactor.endpoint, "tx")
-        cap0 = box.sched.free_bytes()
-
-        rid = 5
-        peer.send(codec.encode_want(rid, [CHUNK], peer.endpoint))
-        got = peer.recv(10.0)
-        assert got is not None and got[1].msg_type == codec.BounceMsgType.GRANT
-        credit = codec.decode_credits(got[2], got[1])[0]
-        region_base = BASE + credit.region_handle
-
-        runs = np.zeros(2, dtype=SCATTER_RUN_DTYPE)
-        # (bounce_offset, dst_addr, dst_stride, bounce_stride, piece_size, count)
-        runs[0] = (0, 0x5000_0000, 8 * KIB, 4 * KIB, 4 * KIB, 3)
-        runs[1] = (32 * KIB, 0x6000_0000, 2 * KIB, 2 * KIB, 2 * KIB, 2)
-        peer.send(codec.encode_data(rid, 0, 1, credit.region_handle, runs))
-
-        _wait_until(lambda: len(box.pool.accepted()) == 1, 10.0, "the expanded scatter submit")
-        srcs, dsts, sizes, cid = box.pool.accepted()[0]
-        exp_srcs = [region_base + i * 4 * KIB for i in range(3)]
-        exp_srcs += [region_base + 32 * KIB + i * 2 * KIB for i in range(2)]
-        exp_dsts = [0x5000_0000 + i * 8 * KIB for i in range(3)]
-        exp_dsts += [0x6000_0000 + i * 2 * KIB for i in range(2)]
-        assert srcs.tolist() == exp_srcs, "fallback expanded wrong source addresses"
-        assert dsts.tolist() == exp_dsts, "fallback expanded wrong destination addresses"
-        assert sizes.tolist() == [4 * KIB] * 3 + [2 * KIB] * 2
-
-        box.poller.complete(cid, ok=True)
-        got = peer.recv(10.0)
-        assert got is not None and got[1].msg_type == codec.BounceMsgType.ACK
-        assert got[1].request_id == rid
-        _wait_until(lambda: box.sched.free_bytes() == cap0, 10.0, "the region to recycle")
-        assert box.sched.tracked_flows() == 0
-        assert box.reactor.alive()
-
-
-# --------------------------------------------------------------------------------------------
-# T6: receiver scatter — the C++-sink BRANCH, driven by a sink-capable fake
+# T6: receiver scatter — the C++-sink path, driven by the sink fake
 # --------------------------------------------------------------------------------------------
 def _two_run_data(peer: RawPeer, rid: int, region_handle: int) -> np.ndarray:
     """Send a 2-run DATA (5 pieces) for the granted region; returns the runs."""
@@ -773,15 +604,13 @@ def _grant_one(peer: RawPeer, rid: int):
 
 class TestScatterSinkFake:
     def test_sink_path_taken_raw_runs_and_acks(self, make_reactor, raw_peers):
-        """T6a: a sink-capable pool routes DATA through submit_scatter_runs.
+        """T6a: DATA routes through submit_scatter_runs.
 
         The sink receives the granted region's base/bytes and the EXACT raw
-        wire blob; the Python expansion path is NOT taken (submit_copy never
-        called); the scatter completes, ACKs, and the region recycles.
+        wire blob; the scatter completes, ACKs, and the region recycles.
         """
-        pool = SinkFakeCopyPool()
-        box = make_reactor("sinkok", pool=pool)
-        assert box.reactor._submit_scatter_fn is not None  # capability detected
+        box = make_reactor("sinkok")
+        pool = box.pool
         peer = raw_peers(box.reactor.endpoint, "tx")
         cap0 = box.sched.free_bytes()
 
@@ -792,7 +621,6 @@ class TestScatterSinkFake:
         assert region_base == BASE + credit.region_handle
         assert region_bytes == box.sched.region_bytes(credit.region_handle) == CHUNK
         assert blob == runs.tobytes(), "the sink did not receive the exact raw wire runs"
-        assert pool.calls == [], "the Python expansion path ran despite the sink"
         assert box.reactor.stats().get("rx_data", 0) == 1
 
         box.poller.complete(rc, ok=True)
@@ -810,9 +638,9 @@ class TestScatterSinkFake:
         data landed), the flow accounting is decremented, rx_data is NOT
         bumped, and the reactor stays alive.
         """
-        pool = SinkFakeCopyPool()
-        pool.mode = "reject"
-        box = make_reactor("sinkrej", pool=pool)
+        box = make_reactor("sinkrej")
+        pool = box.pool
+        pool.sink_mode = "reject"
         peer = raw_peers(box.reactor.endpoint, "tx")
         cap0 = box.sched.free_bytes()
 
@@ -823,7 +651,6 @@ class TestScatterSinkFake:
         assert not box.reactor._rx_flows, "flow accounting leaked for the rejected chunk"
         assert box.reactor.stats().get("rx_data", 0) == 0, "rejected DATA counted as accepted"
         assert peer.recv(NEGATIVE_WAIT_S) is None, "a validation-rejected scatter was ACKed"
-        assert pool.calls == []
         assert box.reactor.alive()
 
     def test_sink_busy_backlogs_raw_runs_then_retries(self, make_reactor, raw_peers):
@@ -832,9 +659,9 @@ class TestScatterSinkFake:
         The retry resubmits the IDENTICAL blob once a context frees, then
         the scatter completes and ACKs.
         """
-        pool = SinkFakeCopyPool()
-        pool.mode = "busy"
-        box = make_reactor("sinkbusy", pool=pool)
+        box = make_reactor("sinkbusy")
+        pool = box.pool
+        pool.busy = True
         peer = raw_peers(box.reactor.endpoint, "tx")
         cap0 = box.sched.free_bytes()
 
@@ -843,7 +670,7 @@ class TestScatterSinkFake:
         _wait_until(lambda: len(box.reactor._scatter_backlog) == 1, 10.0, "the BUSY backlog")
         assert box.reactor._scatter_backlog[0].runs is not None, "backlog job lost its raw runs"
 
-        pool.mode = "ok"
+        pool.busy = False
         _wait_until(lambda: len(pool.sink_accepted()) == 1, 10.0, "the backlog retry submit")
         _region_base, _region_bytes, blob, rc = pool.sink_accepted()[0]
         assert blob == runs.tobytes(), "the retry did not carry the identical raw runs"
@@ -860,9 +687,8 @@ class TestScatterSinkFake:
 
         No ACK, region released, flow accounting settled, reactor alive.
         """
-        pool = SinkFakeCopyPool()
-        pool.mode = "raise"
-        box = make_reactor("sinkraise", pool=pool)
+        box = make_reactor("sinkraise")
+        box.pool.sink_mode = "raise"
         peer = raw_peers(box.reactor.endpoint, "tx")
         cap0 = box.sched.free_bytes()
 
@@ -871,7 +697,6 @@ class TestScatterSinkFake:
         _wait_until(lambda: box.sched.free_bytes() == cap0, 10.0, "the failed-launch release")
         assert not box.reactor._rx_flows
         assert peer.recv(NEGATIVE_WAIT_S) is None, "a failed scatter launch was ACKed"
-        assert pool.calls == []
         assert box.reactor.alive()
 
 
@@ -1045,42 +870,9 @@ class TestPumpOwnershipBackstop:
 
 
 # --------------------------------------------------------------------------------------------
-# Per-request plan handle — fallback, chained rows, release
+# Per-request plan handle — chained rows, release
 # --------------------------------------------------------------------------------------------
 class TestPlanHandleFakes:
-    def test_fallback_without_register_plan_uses_numpy_gather(self, make_reactor, raw_peers):
-        """P4: a pool WITHOUT register_plan keeps the numpy gather path.
-
-        The reactor detects the missing capability per instance: the request
-        carries the -1 plan-handle sentinel and ``submit_copy`` receives the
-        exact per-desc gather expansion (srcs, region_base + bounce_offsets,
-        sizes); the transfer then completes normally.
-        """
-        box = make_reactor("planless")  # plain FakeCopyPool: no register_plan
-        assert box.reactor._register_plan_fn is None
-        peer = raw_peers(box.reactor.endpoint, "rx")
-        assert box.reactor.add_peer(peer.name, peer.endpoint)
-
-        fut = _submit(box, peer.name, n_desc=16)  # eager launch on this thread
-        rid, chunk_sizes = _recv_want(peer)
-        req = box.reactor._requests[rid]
-        assert req.plan_handle == -1, "plan handle taken despite the missing binding"
-        chunk = req.plan.chunks[0]
-        srcs, dsts, sizes, cid = box.pool.calls[0]
-        region_base = BASE + req.posted[0].local_offset
-        assert np.array_equal(srcs, chunk.src_ptrs), "fallback gather srcs differ from the plan"
-        assert np.array_equal(dsts, np.uint64(region_base) + chunk.bounce_offsets)
-        assert np.array_equal(sizes, chunk.sizes)
-
-        box.poller.complete(cid, ok=True)
-        credits = _grant_all(peer, rid, chunk_sizes)
-        _wait_until(lambda: len(box.agent.posts) == 1, 10.0, "the RDMA write to be posted")
-        box.poller.complete_xfer(box.agent.posts[0][4], ok=True)
-        got = peer.recv(10.0)
-        assert got is not None and got[1].msg_type == codec.BounceMsgType.DATA
-        _ack(peer, rid, 0, credits[0].region_handle)
-        assert fut.result(timeout=10).ok is True
-
     def test_chained_launch_one_row_and_release_on_completion(self, make_reactor, raw_peers):
         """P5-happy: a credited launch chains and releases the plan on ACK.
 
@@ -1089,8 +881,8 @@ class TestPlanHandleFakes:
         bumps); the chunk's ONE row is the reserved xfer id; completing the
         request releases the plan handle exactly once.
         """
-        pool, agent = PlanFakeCopyPool(), PlanChainAgent()
-        box = make_reactor("planok", pool=pool, agent=agent, enable_eager_gather=False)
+        box = make_reactor("planok", enable_eager_gather=False)
+        pool, agent = box.pool, box.agent
         peer = raw_peers(box.reactor.endpoint, "rx")
         assert box.reactor.add_peer(peer.name, peer.endpoint)
         capacity = box.sched.arena_capacity
@@ -1130,8 +922,8 @@ class TestPlanHandleFakes:
         fully conserved, the plan handle is released exactly once, and the
         reactor stays alive.
         """
-        pool, agent = PlanFakeCopyPool(), PlanChainAgent()
-        box = make_reactor("plangfail", pool=pool, agent=agent, enable_eager_gather=False)
+        box = make_reactor("plangfail", enable_eager_gather=False)
+        pool, agent = box.pool, box.agent
         peer = raw_peers(box.reactor.endpoint, "rx")
         assert box.reactor.add_peer(peer.name, peer.endpoint)
         capacity = box.sched.arena_capacity
@@ -1161,8 +953,8 @@ class TestPlanHandleFakes:
         handle exactly once, the orphaned gather rows recycle both regions,
         and the shutdown failAll must NOT release the handle again.
         """
-        pool = PlanFakeCopyPool()
-        box = make_reactor("planfail", pool=pool)  # plain agent: no chaining
+        box = make_reactor("planfail")  # eager launches: no credit, no chaining
+        pool = box.pool
         peer = raw_peers(box.reactor.endpoint, "rx")
         assert box.reactor.add_peer(peer.name, peer.endpoint)
         capacity = box.sched.arena_capacity
@@ -1195,8 +987,9 @@ class TestPlanHandleFakes:
         routes the reserved id as the orphan write, and its terminal row
         recycles the region and lets the cancel out.
         """
-        pool, agent = PlanFakeCopyPool(), PlanChainAgent(gated=True)
-        box = make_reactor("planchainbusy", pool=pool, agent=agent, enable_eager_gather=False)
+        agent = GatedOpAgent("chained")
+        box = make_reactor("planchainbusy", agent=agent, enable_eager_gather=False)
+        pool = box.pool
         peer = raw_peers(box.reactor.endpoint, "rx")
         assert box.reactor.add_peer(peer.name, peer.endpoint)
         capacity = box.sched.arena_capacity
