@@ -6366,7 +6366,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // pod-launch attempt; isFinalAttempt suppresses synthetic stage-fail XML
         // and junit() on intermediate retryable infra failures.
         stage("[${key}] Run") {
-            cacheErrorAndUploadResult("${key}", values[1], {}, !isInfraDryRun(), attemptTag, isFinalAttempt, retryContext)
+            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
         }
     }]]}
 
