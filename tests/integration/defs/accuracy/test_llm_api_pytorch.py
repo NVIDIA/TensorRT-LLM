@@ -7795,22 +7795,32 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["default", "nvfp4"])
     @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("use_msa", [False, True])
-    def test_nvfp4(self, use_msa, eval_mode):
+    def test_nvfp4(self, use_msa, eval_mode, kv_dtype):
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
-        # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
-        # Triton path keeps the KV cache in BF16.
+        # (MIXED_PRECISION checkpoint). At the default KV dtype the MSA path
+        # runs an FP8 KV cache and the Triton path keeps it in BF16.
         # eval_mode selects the accuracy protocol: "default" = completion-format
         # MMLU + GSM8K; "inferencemax" = chat-format GSM8K matching the public
         # InferenceMAX benchmark (needs a 16k context for thinking output).
+        # kv_dtype="nvfp4" is the hybrid cache: the sparse layers' main K/V are
+        # NVFP4 and the dense layers stay FP8. Only the MSA kernels read it.
+        nvfp4_kv = kv_dtype == "nvfp4"
+        if nvfp4_kv and not use_msa:
+            pytest.skip("The NVFP4 KV cache is only read by the MSA kernels")
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         inferencemax = eval_mode == "inferencemax"
+        if use_msa:
+            cache_dtype = "nvfp4" if nvfp4_kv else "fp8"
+        else:
+            cache_dtype = "auto"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
-                                        dtype="fp8" if use_msa else "auto",
+                                        dtype=cache_dtype,
                                         use_kv_cache_manager_v2=use_msa)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton",
@@ -7841,6 +7851,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  max_batch_size=max_batch_size,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            if nvfp4_kv:
+                assert (llm.args.quant_config.kv_cache_quant_algo ==
+                        QuantAlgo.NVFP4)
             if inferencemax:
                 task = GSM8KInferenceMax(model_name)
                 task.evaluate(llm)
@@ -8110,6 +8123,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["default", "nvfp4"])
     @parametrize_with_ids("disagg", [False, True])
     @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("cuda_graph", [True])
@@ -8119,7 +8133,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
                           overlap_scheduler, use_msa, cuda_graph, eval_mode,
-                          disagg):
+                          disagg, kv_dtype):
+        # kv_dtype="nvfp4" is the hybrid cache: the sparse layers' main K/V are
+        # NVFP4 while the dense targets and the shared Eagle draft layer stay
+        # FP8 on their own physical pages. That combination is what gives the
+        # subpaged shared-draft-layer geometry accuracy coverage; the default
+        # arm never selects it, since is_fp8_dense_layer gates on an NVFP4
+        # cache dtype.
+        nvfp4_kv = kv_dtype == "nvfp4"
         if use_msa:
             from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
                 msa_package_available
@@ -8130,6 +8151,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         inferencemax = eval_mode == "inferencemax"
         max_draft_len = 3
         if disagg:
+            if nvfp4_kv:
+                pytest.skip(
+                    "the disagg transceiver moves the FP8 cache; NVFP4 main "
+                    "K/V would also have to ship its block-scale pool")
             self._run_nvfp4_eagle3_disagg(model_name, model_path, max_draft_len,
                                           inferencemax, attention_dp,
                                           overlap_scheduler, use_msa,
@@ -8143,6 +8168,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # reference).
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
+        if nvfp4_kv:
+            # Left off the default arm so its established references still
+            # describe the same engine.
+            kv_cache_config.dtype = "nvfp4"
         # The fmha_sm100 decode planner caps total_q x num_qo_heads at 65536;
         # with 1 + draft_len = 4 verify tokens per row that bounds the batch
         # at 1024 / TP-sharded heads (256 unsharded under attention DP). The
@@ -8240,6 +8269,88 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 f"from {ref_source})"
             print(f"Eagle3 acceptance references: rate {ref_rate}, length "
                   f"{ref_length} — from {ref_source}.")
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_nvfp4_kv_eagle3_smoke(self):
+        """Generate through MSA with a true NVFP4 KV cache and linear Eagle3."""
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
+            msa_package_available
+
+        if not msa_package_available():
+            pytest.skip("MSA kernels (fmha_sm100) not available")
+
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
+        )
+        kv_cache_config = KvCacheConfig(
+            dtype="nvfp4",
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.6,
+            tokens_per_block=128,
+            use_kv_cache_manager_v2=True,
+        )
+        with LLM(model_path,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                     implementation="msa",
+                     indexer_kv_dtype="fp8",
+                     fuse_qkv_index_projection=True,
+                 ),
+                 moe_config=MoeConfig(backend="CUTLASS"),
+                 speculative_config=spec_config,
+                 cuda_graph_config=CudaGraphConfig(
+                     enable_padding=True,
+                     batch_sizes=[1, 2, 4],
+                 ),
+                 max_seq_len=4096,
+                 max_batch_size=4,
+                 max_num_tokens=1024,
+                 enable_iter_perf_stats=True,
+                 trust_remote_code=True) as llm:
+            prompts = [
+                llm.tokenizer.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": question
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) for question in (
+                    "What is 17 multiplied by 19? Explain briefly.",
+                    "If a train travels 60 miles per hour for 2.5 hours, how far does it go?",
+                    "Write a Python function that returns the sum of a list of integers.",
+                    "Name the capital of Japan and one landmark there.",
+                )
+            ]
+            # Drain startup counters so the assertion below describes this
+            # true-NVFP4 request batch rather than engine warmup.
+            list(llm.get_stats(timeout=2))
+            outputs = llm.generate(
+                prompts,
+                SamplingParams(max_tokens=128, temperature=0),
+            )
+            assert len(outputs) == len(prompts)
+            assert all(output.outputs and output.outputs[0].text
+                       for output in outputs)
+
+            drafted = accepted = steps = 0
+            for stats in llm.get_stats(timeout=2):
+                stats = json.loads(stats) if isinstance(stats, str) else stats
+                spec_stats = stats.get("specDecodingStats") or {}
+                drafted += spec_stats.get("numDraftTokens", 0)
+                accepted += spec_stats.get("numAcceptedTokens", 0)
+                steps += spec_stats.get("numRequestsWithDraftTokens", 0)
+            assert drafted > 0, "linear Eagle3 produced no draft tokens"
+            assert accepted > 0, "linear Eagle3 accepted no draft tokens"
+            assert steps > 0, "linear Eagle3 recorded no speculative iterations"
+            print(f"MiniMax-M3 true-NVFP4 Eagle3 smoke: acceptance rate="
+                  f"{accepted / drafted:.3f}, mean acceptance length="
+                  f"{1 + accepted / steps:.3f} ({steps} spec iterations)")
 
 
 @skip_pre_blackwell
