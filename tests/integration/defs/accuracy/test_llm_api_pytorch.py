@@ -7121,6 +7121,61 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @parametrize_with_ids("enable_branch_snapshot", [False, True])
+    def test_bf16_branch_snapshot(self, enable_branch_snapshot, mocker):
+        """Branch-point snapshots must not change what the model generates.
+
+        A branch snapshot lets a request restore recurrent state at a depth it
+        did not itself prefill through, so a wrong snapshot position would show
+        up as subtly wrong output rather than a failure -- and would look like a
+        larger win, because more prefill is skipped. Both arms therefore run the
+        same task and must reach the same threshold.
+
+        Few-shot GSM8K does fork: every prompt shares the few-shot prefix and
+        diverges at the question, so a request snapshots at that fork and later
+        ones restore from it. But it is one shallow fork at a fixed prefix, so
+        this guards against gross state corruption only -- it is not evidence
+        about agentic traffic, where forks are deep, uneven, and far into a long
+        shared prefix. Both arms keep the end-of-prompt snapshot so hybrid reuse
+        is live either way and the flag is the only difference.
+
+        An aggregate score, rather than a token-for-token comparison against a
+        no-reuse run, is deliberate: on a concurrent server the same prompt does
+        not reproduce its own output. Two byte-identical AgentX runs disagreed on
+        73% of responses, diverging at the first generated content token, because
+        batch composition changes float reduction order and greedy decoding
+        amplifies one flipped logit into different text. A threshold over many
+        samples is insensitive to that; an exact diff is pure noise.
+        """
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            enable_block_reuse=True,
+            avg_seq_len=2048,
+            mamba_state_config=MambaStateConfig(
+                additional_snapshot_offsets_from_end=[0],
+                enable_branch_snapshot=enable_branch_snapshot),
+        )
+        # Mirrors test_bf16: TRTLLM MoE is SM100/103 only, so use CUTLASS, which
+        # is supported everywhere this test can run.
+        moe_config = MoeConfig(backend="CUTLASS")
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=32)
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 tensor_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=4096,
+                 max_batch_size=32,
+                 cuda_graph_config=cuda_graph_config,
+                 enable_chunked_prefill=True,
+                 kv_cache_config=kv_cache_config,
+                 moe_config=moe_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
     @skip_pre_hopper
     def test_fp8_moe_dflash(self, mocker):
         # Covers DFlash speculative decoding on the Qwen3.5 FP8 MoE variant,

@@ -197,15 +197,24 @@ class ReuseScope(NamedTuple):
 
 
 class ReuseMatch(NamedTuple):
-    """Volatile result of a KV cache prefix match."""
+    """Volatile result of a KV cache prefix match.
+
+    ``num_tokens_before_hybrid_pruning`` is retained for internal diagnostics.
+    It is the prefix the attention pages alone would support, before recurrent
+    snapshot availability shortens it.
+
+    ``num_tokens_before_pruning`` is the raw token-path walk depth, before any
+    pruning at all. It locates where this request's content diverges from the
+    tree, independent of which pages happen to still be resident, so
+    ``num_tokens_before_pruning == num_lookup_tokens`` means the whole lookup
+    range matched and there is no fork here.
+    """
 
     blocks: list["Block"]
     num_tokens: int
     num_lookup_tokens: int
-    # Internal diagnostic: the prefix the attention pages alone would support,
-    # i.e. before recurrent-state (SSM) snapshot availability shortened it.
-    # Equal to num_tokens when the model has no SSM life cycle.
-    num_tokens_before_hybrid_pruning: int = 0
+    num_tokens_before_hybrid_pruning: int
+    num_tokens_before_pruning: int
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -789,6 +798,7 @@ class BlockRadixTree:
         acquire ownership of the pages before depending on them.
         """
         raw_matched = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        num_tokens_before_pruning = self._num_matched_tokens(raw_matched)
         ssm_lc_id = self._life_cycles.ssm_life_cycle_id
         # Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
         # the prefix the attention pages alone support. Only hybrid models pay for
@@ -805,6 +815,7 @@ class BlockRadixTree:
             num_tokens,
             len(tokens),
             num_tokens if attn_only_tokens is None else attn_only_tokens,
+            num_tokens_before_pruning,
         )
 
     def _check_sanity(self) -> bool:

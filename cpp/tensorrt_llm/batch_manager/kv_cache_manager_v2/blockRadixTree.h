@@ -374,6 +374,10 @@ public:
         // cycle. Separates "attention prefix matched N tokens" from
         // "recurrent-snapshot pruning cut it to M".
         int numTokensBeforeHybridPruning;
+        // Raw token-path walk depth, before any pruning. Locates where this
+        // request's content diverges from the tree, independent of page
+        // residency. Equal to numLookupTokens when there is no fork.
+        int numTokensBeforePruning;
     };
 
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).

@@ -916,6 +916,8 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
+    // Content-divergence depth is measured before page or recurrent-snapshot pruning.
+    int const numTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
     auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
     // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
     // the prefix the attention pages alone support. Only hybrid models pay for
@@ -930,6 +932,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
     result.numTokensBeforeHybridPruning = attnOnlyTokens.value_or(result.numTokens);
+    result.numTokensBeforePruning = numTokensBeforePruning;
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

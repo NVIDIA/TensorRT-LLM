@@ -2719,6 +2719,144 @@ class TestSSMSupport(unittest.TestCase):
         kv.resume(stream)
         kv.close()
 
+    def test_reuse_match_reports_content_divergence_depth(self) -> None:
+        """The raw walk depth locates the fork, even where pruning shortens reuse."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(96)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 32
+        kv1.commit(prompt[:32])
+        kv1.capacity = 64
+        kv1.commit(prompt[32:64])
+        kv1.close()
+
+        # Duplicate lookup: the whole range matched, so there is no fork and the
+        # divergence depth saturates at the lookup length.
+        duplicate = self.manager.create_kv_cache(input_tokens=prompt[:64])
+        self.assertEqual(duplicate._get_num_tokens_before_pruning(), 64)
+        self.assertEqual(duplicate._get_num_tokens_before_hybrid_pruning(), 64)
+        duplicate.resume(stream)
+        duplicate.close()
+
+        # Diverging lookup: content splits after the committed prefix, so the
+        # divergence depth stays below the lookup length.
+        sibling = prompt[:64] + [self.next_token() for _ in range(32)]
+        forked = self.manager.create_kv_cache(input_tokens=sibling)
+        self.assertEqual(forked._get_num_tokens_before_pruning(), 64)
+        self.assertLess(forked._get_num_tokens_before_pruning(), len(sibling))
+        forked.resume(stream)
+        forked.close()
+
+        # Snapshot pruning shortens reuse to the last usable SSM snapshot, but
+        # leaves the divergence depth untouched: attention matched all 48.
+        partial = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        self.assertEqual(partial._get_num_tokens_before_pruning(), 48)
+        self.assertEqual(partial._get_num_tokens_before_hybrid_pruning(), 48)
+        self.assertEqual(partial.num_committed_tokens, 32)
+        partial.resume(stream)
+        partial.close()
+
+    def test_reuse_match_depths_are_monotonically_ordered(self) -> None:
+        """Pruning only ever shortens: reuse <= hybrid depth <= divergence depth."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(128)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        for i in range(3):
+            kv1.capacity = 32 * (i + 1)
+            kv1.commit(prompt[32 * i : 32 * (i + 1)])
+        kv1.close()
+
+        for lookup_len in (16, 32, 48, 64, 80, 96, 112, 128):
+            kv = self.manager.create_kv_cache(input_tokens=prompt[:lookup_len])
+            divergence = kv._get_num_tokens_before_pruning()
+            hybrid = kv._get_num_tokens_before_hybrid_pruning()
+            self.assertLessEqual(kv.num_committed_tokens, hybrid, msg=f"len={lookup_len}")
+            self.assertLessEqual(hybrid, divergence, msg=f"len={lookup_len}")
+            self.assertLessEqual(divergence, lookup_len, msg=f"len={lookup_len}")
+            kv.resume(stream)
+            kv.close()
+
+    def test_branch_snapshot_at_divergence_unlocks_sibling_reuse(self) -> None:
+        """A snapshot at the fork lets later siblings reuse the shared prefix.
+
+        This is the R1-R3 sequence the branch-snapshot feature targets: R1
+        snapshots only at its own prompt end, which is past the fork and so
+        useless to siblings. R2 snapshots at the divergence depth instead, and
+        R3 then reuses the whole shared prefix.
+        """
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        shared = [self.next_token() for _ in range(64)]
+        r1_prompt = shared + [self.next_token() for _ in range(32)]
+        r2_prompt = shared + [self.next_token() for _ in range(32)]
+        r3_prompt = shared + [self.next_token() for _ in range(32)]
+
+        # R1 commits once, so its only snapshot sits at its prompt end.
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = len(r1_prompt)
+        kv1.commit(r1_prompt)
+        kv1.close()
+
+        # A sibling locates the fork at 64 but reuses nothing: the sole snapshot
+        # is at 96, past the point where the content diverges.
+        probe = self.manager.create_kv_cache(input_tokens=r3_prompt)
+        self.assertEqual(probe._get_num_tokens_before_pruning(), 64)
+        self.assertEqual(probe._get_num_tokens_before_hybrid_pruning(), 64)
+        self.assertEqual(probe.num_committed_tokens, 0)
+        probe.resume(stream)
+        probe.close()
+
+        # R2 diverges at the same depth and snapshots there before continuing.
+        kv2 = self.manager.create_kv_cache(input_tokens=r2_prompt)
+        self.assertEqual(kv2._get_num_tokens_before_pruning(), 64)
+        kv2.resume(stream)
+        kv2.capacity = 64
+        kv2.commit(r2_prompt[:64])
+        kv2.capacity = len(r2_prompt)
+        kv2.commit(r2_prompt[64:])
+        kv2.close()
+
+        # R3 now reuses the full shared prefix instead of re-prefilling it.
+        kv3 = self.manager.create_kv_cache(input_tokens=r3_prompt)
+        self.assertEqual(kv3.num_committed_tokens, 64)
+        kv3.resume(stream)
+        kv3.close()
+
+    def test_reuse_match_divergence_is_zero_without_a_shared_prefix(self) -> None:
+        """A lookup that shares nothing reports a zero divergence depth."""
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(64)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 32
+        kv1.commit(prompt[:32])
+        kv1.close()
+
+        unrelated = [self.next_token() for _ in range(64)]
+        kv2 = self.manager.create_kv_cache(input_tokens=unrelated)
+        self.assertEqual(kv2._get_num_tokens_before_pruning(), 0)
+        self.assertEqual(kv2.num_committed_tokens, 0)
+        kv2.resume(stream)
+        kv2.close()
+
     def test_ssm_planned_drop_targets_latest_snapshot_with_shared_plans(self) -> None:
         """Shared plans drop only their conversation endpoint snapshot."""
         cfg = self._make_ssm_config(tokens_per_block=32)

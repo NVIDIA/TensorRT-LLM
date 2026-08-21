@@ -289,6 +289,11 @@ public:
         return mNumTokensBeforeHybridPruning;
     }
 
+    int numTokensBeforePruning() const noexcept
+    {
+        return mNumTokensBeforePruning;
+    }
+
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
@@ -599,6 +604,7 @@ private:
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
     int mNumTokensBeforeHybridPruning;
+    int mNumTokensBeforePruning;
     bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;

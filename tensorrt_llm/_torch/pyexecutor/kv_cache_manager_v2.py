@@ -2530,11 +2530,19 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return self._prepare_context_impl(req)
 
+    def _record_branch_snapshot_point(
+        self, req: LlmRequest, kv_cache: _KVCache, num_lookup_tokens: Optional[int]
+    ) -> None:
+        """Hook for recurrent-state managers; attention-only caches have no snapshots."""
+
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
+            # Stays None when the cache was resumed rather than freshly
+            # matched, which is also the case where no branch point applies.
+            num_lookup_tokens = None
             if kv_cache is None:
                 all_tokens = self._reuse_token_source(req)
                 # Last token cannot be recovered, so we don't include it in
@@ -2545,6 +2553,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 else:
                     tokens = None
+                # Taken from the augmented sequence rather than derived as
+                # prompt_len - 1, because augmentation can change the length
+                # for multimodal requests.
+                num_lookup_tokens = len(tokens) if tokens is not None else None
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -2568,6 +2580,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.set_prepopulated_prompt_len(
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
+                self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
