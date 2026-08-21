@@ -964,7 +964,7 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
 
     if expected is None:
         assert (
-            creator._fallback_if_unsupported_kv_cache_manager_v2(
+            creator._validate_or_fallback_kv_cache_manager_v2(
                 MambaHybridCacheManagerV2, model_config, KvCacheConfig()
             )
             is MambaHybridCacheManagerV2
