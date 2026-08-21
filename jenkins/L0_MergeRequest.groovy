@@ -672,8 +672,7 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
 // Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
 // both label existence and that the labeler is an active team member.
 // Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
-// recordBlock=false performs the same check without changing the build description.
-def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch, boolean recordBlock = true) {
+def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
     if (!globalVars[GITHUB_PR_API_URL]) {
         echo "[requireMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
         return false
@@ -700,23 +699,19 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch, boolean reco
         return false
     }
 
-    // Label missing or unauthorized — return the block reason and optionally
-    // write the marker that the wrapper surfaces in the PR comment.
-    if (recordBlock) {
-        def existingDesc = currentBuild.description ?: ""
-        currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
-            "<span data-multi-gpu-label-required='true'>" +
-            "Multi-GPU tests require label 'ci: full pre-merge approved'" +
-            "</span>"
-    }
+    // Label missing or unauthorized — write description marker for wrapper
+    // to surface in PR comment, and return the block reason string.
+    def existingDesc = currentBuild.description ?: ""
+    currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
+        "<span data-multi-gpu-label-required='true'>" +
+        "Multi-GPU tests require label 'ci: full pre-merge approved'" +
+        "</span>"
     def reason = !result.labelExists
         ? "label 'ci: full pre-merge approved' is not present on this PR"
         : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
     def blockMsg = "${arch} Multi-GPU tests blocked: ${reason}. " +
          "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
-    if (recordBlock) {
-        echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
-    }
+    echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
     return blockMsg
 }
 
@@ -937,7 +932,7 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 {
     try {
         def blockReason = requireMultiGpuApprovalLabel(
-            pipeline, globalVars, "CBTS telemetry", false)
+            pipeline, globalVars, "CBTS telemetry")
         return !blockReason
     } catch (InterruptedException e) {
         throw e
