@@ -150,6 +150,7 @@ def savePipelineScripts() {
     trtllm_utils.setupGitMirror()
     checkout scm
     sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
+    sh "cp scripts/generate_lock_file.py /tmp/generate_lock_file.py"
 }
 
 def checkoutSource ()
@@ -207,7 +208,7 @@ def generateLockFiles(llmRepo, ref)
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
         sh "git config --global user.email \"90828364+tensorrt-cicd@users.noreply.github.com\""
         sh "git config --global user.name \"TensorRT LLM\""
-        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
+        sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 /tmp/generate_lock_file.py"
         def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
