@@ -78,6 +78,11 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
+# MPI session reuse cannot safely reset Userbuffers between Engines. Tests
+# using this helper must keep ``torch_compile=True`` in their node id; tests
+# with unconditional compile configs must keep ``piecewise_cuda_graph`` in
+# their node id. Keep this contract in sync with
+# test_common.session_reuse_hooks._PRIVATE_NODEID_PATTERNS.
 def _get_default_torch_compile_config(torch_compile):
     return TorchCompileConfig(enable_fullgraph=True,
                               enable_piecewise_cuda_graph=True,
