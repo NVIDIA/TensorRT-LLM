@@ -698,8 +698,24 @@ class ModelConfig(Generic[TConfig]):
 
         # NOTE: This is for llm-compressor's quantized checkpoints.
         elif hf_quant_config.get("quant_method") == "compressed-tensors":
-            update_quant_config_from_compressed_tensors(quant_config,
-                                                        hf_quant_config)
+            # Multi-group ("mixed-precision") checkpoints resolve to
+            # MIXED_PRECISION plus one QuantConfig per quantized module, which
+            # needs the checkpoint's module names. Single-group checkpoints do
+            # not, so the tensor index is only read when there is more than one
+            # group.
+            module_names = None
+            if len(hf_quant_config.get("config_groups") or {}) > 1:
+                module_names = ModelConfig._read_checkpoint_module_names(
+                    checkpoint_dir)
+            layer_quant_config = update_quant_config_from_compressed_tensors(
+                quant_config, hf_quant_config, module_names)
+            if (quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+                    and layer_quant_config is None):
+                raise ValueError(
+                    "compressed-tensors checkpoint quantizes modules "
+                    "differently per config group, but its per-layer quant "
+                    "config could not be resolved because no safetensors "
+                    f"tensor index was found under {checkpoint_dir}.")
         elif hf_quant_config.get("quant_method") == "nvfp4":
             quant_config.quant_algo = QuantAlgo.NVFP4
             group_size = hf_quant_config.get("group_size", 16)
@@ -720,6 +736,62 @@ class ModelConfig(Generic[TConfig]):
         with open(path, "rb") as f:
             header_size = struct.unpack("<Q", f.read(8))[0]
             return json.loads(f.read(header_size))
+
+    @staticmethod
+    def _read_checkpoint_module_names(
+            checkpoint_dir: Optional[str]) -> Optional[List[str]]:
+        """Read checkpoint-namespace module names for every stored tensor.
+
+        compressed-tensors ``config_groups`` select modules with regexes, so
+        resolving a multi-group (mixed-precision) checkpoint into per-layer
+        quant configs needs the checkpoint's module list.
+
+        Args:
+            checkpoint_dir: Local checkpoint directory, may be None.
+
+        Returns:
+            Deduplicated module names, or None when no safetensors tensor
+            index could be read.
+        """
+        if checkpoint_dir is None:
+            return None
+
+        tensor_names = []
+        checkpoint_path = Path(checkpoint_dir)
+        if checkpoint_path.is_dir():
+            index_path = checkpoint_path / "model.safetensors.index.json"
+            shard_paths = sorted(checkpoint_path.glob("*.safetensors"))
+        else:
+            try:
+                cached_index = transformers.utils.hub.cached_file(
+                    checkpoint_dir, "model.safetensors.index.json")
+            except OSError:
+                cached_index = None
+            index_path = Path(
+                cached_index) if cached_index is not None else None
+            shard_paths = []
+            if index_path is None:
+                try:
+                    cached_shard = transformers.utils.hub.cached_file(
+                        checkpoint_dir, "model.safetensors")
+                except OSError:
+                    cached_shard = None
+                if cached_shard is not None:
+                    shard_paths.append(Path(cached_shard))
+
+        if index_path is not None and index_path.exists():
+            with open(index_path) as f:
+                tensor_names = list(json.load(f).get("weight_map", {}))
+        else:
+            for shard in shard_paths:
+                tensor_names.extend(ModelConfig._read_safetensors_header(shard))
+
+        # Drop the parameter name ("weight", "weight_packed", ...) and the
+        # "__metadata__" header entry, neither of which is a module.
+        module_names = [
+            name.rsplit('.', 1)[0] for name in tensor_names if '.' in name
+        ]
+        return list(dict.fromkeys(module_names)) or None
 
     @staticmethod
     def _get_safetensors_header_for_tensor(checkpoint_dir: str,
