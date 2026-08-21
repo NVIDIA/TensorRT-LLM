@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for the KV connector prefix phases on KVCacheManagerV2.
 
 KVCacheManagerV2's scheduling pass is speculative: a request can be prepared
@@ -354,6 +356,11 @@ class TestOfferEndIsAbsolute:
         assert req.py_connector_prefix_end == PROMPT_LEN - 1
         assert req.context_current_position == PROMPT_LEN - 1
         assert connector.commits == [(0, PROMPT_LEN - 1, False)]
+        # The clamp is the one place an offer shrinks without passing through
+        # phase 3 or the release path, both of which read the clamped end. So
+        # it has to hand the remainder back itself or the connector keeps
+        # ownership of it for the life of the process.
+        assert connector.cancels == [(0, PROMPT_LEN - 1, PROMPT_LEN)]
 
 
 class TestWriteRangeAtDelivery:
@@ -584,6 +591,9 @@ class TestAsyncLoad:
 
         assert req.py_connector_prefix_end == PROMPT_LEN - 1
         assert connector.commits == [(0, 0, True)]
+        # Lossy for an async load -- the transfer began inside the query -- but
+        # still the only signal the connector gets that the tail is dead.
+        assert connector.cancels == [(0, PROMPT_LEN - 1, PROMPT_LEN)]
 
 
 class TestPhasesMustAgree:

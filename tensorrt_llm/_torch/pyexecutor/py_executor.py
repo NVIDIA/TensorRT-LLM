@@ -1269,7 +1269,8 @@ class PyExecutor:
                 f"cache tiers below GPU (found: {names}). Pages evicted to "
                 "another tier have their GPU slot reassigned, which would "
                 "invalidate the addresses registered with the connector. Set "
-                "KvCacheConfig.host_cache_size=0 to disable the host tier.")
+                "KvCacheConfig.host_cache_size=0 and "
+                "KvCacheConfig.disk_cache_size=0 to run GPU-only.")
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
