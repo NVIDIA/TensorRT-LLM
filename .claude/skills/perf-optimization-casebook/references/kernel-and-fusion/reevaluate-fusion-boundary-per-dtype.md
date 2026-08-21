@@ -80,7 +80,7 @@ measured: []
   `tensorrt_llm/_torch/models/modeling_deepseekv3.py` (`DeepseekV32Attention`,
   `fuse_a_indexer_k_weight`, `post_load_weights`),
   `tensorrt_llm/_torch/attention/attention.py`,
-  `tensorrt_llm/_torch/attention/backends/sparse/dsa.py`. Owning specialists:
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/indexer.py`. Owning specialists:
   **kernel-cuda-specialist**, **trtllm-moe-develop**. Related: the
   [ranking-only TF32 case](ranking-only-precision-tf32.md) (same indexer GEMM, the
   precision lever) and the many "fuse the chain" cases in this family — this is the

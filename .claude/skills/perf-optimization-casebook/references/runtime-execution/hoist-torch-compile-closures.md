@@ -54,7 +54,7 @@ measured: []
   (`prepare_position_ids_and_last_tokens` hoisted from a `forward()` closure to a
   method; `update_kv_lens` decorator dropped and inlined as
   `kv_lens_cuda[:batch_size] += 1`), and
-  `tensorrt_llm/_torch/attention/backends/sparse/dsa.py` (`_get_dense_topk_indices`
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/metadata.py` (`_get_dense_topk_indices`
   hoisted out of `prepare_dense_topk_indices` into a `@maybe_compile` method).
 - **Expected effect:** fewer `torch.compile` recompilations and lower Dynamo/host
   time per call → smaller GPU-idle gaps and higher throughput when host-bound;
