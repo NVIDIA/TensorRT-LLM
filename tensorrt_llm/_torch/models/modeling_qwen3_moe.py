@@ -13,14 +13,14 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                                 RenormalizeMoeRoutingMethod,
-                                 RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe, resolve_moe_cls)
-from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
+                             RenormalizeMoeRoutingMethod,
+                             RenormalizeNaiveMoeRoutingMethod,
+                             RoutingMethodType, TRTLLMGenFusedMoE, create_moe,
+                             resolve_moe_cls)
+from ..moe.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention

@@ -111,14 +111,14 @@ from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy
 from ..model_config import ModelConfig
-from ..modules.fused_moe import ConfigurableMoE, create_moe
-from ..modules.fused_moe.interface import _compute_ep_partition
-from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
+from ..moe.fused_moe import ConfigurableMoE, create_moe
+from ..moe.fused_moe.interface import _compute_ep_partition
+from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..utils import ActivationType, ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -1140,7 +1140,7 @@ class KimiK3MoERuntime(nn.Module):
                 "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
             )
         if routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
-            from ..modules.fused_moe.mega_moe import MegaMoEDeepGemm
+            from ..moe.fused_moe.mega_moe import MegaMoEDeepGemm
 
             if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
                 raise RuntimeError(
@@ -1148,7 +1148,7 @@ class KimiK3MoERuntime(nn.Module):
                     f"MoE factory selected {type(self.routed_experts.backend).__name__}."
                 )
         if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
-            from ..modules.fused_moe.mega_moe import MegaMoECuteDsl
+            from ..moe.fused_moe.mega_moe import MegaMoECuteDsl
 
             # Same guard as MEGAMOE_DEEPGEMM above, and for the same reason:
             # create_moe silently falls back when a backend declines the

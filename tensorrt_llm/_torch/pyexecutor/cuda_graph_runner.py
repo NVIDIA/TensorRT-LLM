@@ -15,9 +15,9 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
-from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
+from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec

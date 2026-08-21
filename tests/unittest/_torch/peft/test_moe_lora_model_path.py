@@ -23,10 +23,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_qwen_moe import QwenMoE
-from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.moe_scheduler import ExternalCommMoEScheduler
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
 pytestmark = pytest.mark.cpu_only

@@ -65,7 +65,13 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.engram import Engram, EngramConfig, EngramHashProvider
-from ..modules.fused_moe import (
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
+from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
+from ..modules.mla import MLA
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (
     CutlassFusedMoE,
     DeepSeekV4MoeRoutingMethod,
     MoEWeightLoadingMode,
@@ -75,13 +81,7 @@ from ..modules.fused_moe import (
     is_moe_weight_owner,
     resolve_moe_cls,
 )
-from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
-from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
-from ..modules.mla import MLA
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
-from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata, get_num_extra_kv_tokens
 from ..utils import (

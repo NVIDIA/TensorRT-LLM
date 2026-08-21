@@ -424,8 +424,8 @@ Future directions include:
 
 ## References
 
-- Source code: [`tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py)
-- Backend selection: [`tensorrt_llm/_torch/modules/fused_moe/create_moe.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/fused_moe/create_moe.py)
+- Source code: [`tensorrt_llm/_torch/moe/fused_moe/fused_moe_densegemm.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/fused_moe_densegemm.py)
+- Backend selection: [`tensorrt_llm/_torch/moe/fused_moe/create_moe.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/create_moe.py)
 - FC1 kernel: [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc1.py)
 - FC2 kernel: [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm/fc2.py)
 - Custom op registration: [`tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py)

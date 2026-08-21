@@ -52,11 +52,11 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
 
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..expert_statistic import ExpertStatistic
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
+from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate

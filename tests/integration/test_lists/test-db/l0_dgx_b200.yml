@@ -81,26 +81,26 @@ l0_dgx_b200:
   tests:
   # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
   # --- CUTLASS ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_FP8"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and NVFP4"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_MXFP8"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and MXFP8 and not W4A8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_FP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and NVFP4"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_MXFP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and MXFP8 and not W4A8"
   # --- TRTLLM ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
   # --- CUTEDSL (NVFP4 only) ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
   # --- DEEPGEMM (FP8_BLOCK_SCALES only) ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
   # --- MEGAMOE_DEEPGEMM (W4A8_MXFP4_MXFP8 only) ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_DEEPGEMM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_CUTEDSL"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MEGAMOE_CUTEDSL"
   # ------------- MoE: test_multi_gpu_eplb ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "not None"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "not None"
 - condition:
     ranges:
       system_gpu_count:
@@ -363,7 +363,7 @@ l0_dgx_b200:
   - disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_attn_multi_gpus TIMEOUT (60)
   # ---- FP8 per-tensor (QDQ) moved to post-merge; block-scale/W4A8 stay in pre ----
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES and not W4A8 and not MXFP8"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES and not W4A8 and not MXFP8"
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

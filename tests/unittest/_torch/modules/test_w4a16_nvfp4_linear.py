@@ -287,7 +287,7 @@ def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize(
 
     with (
         patch(
-            "tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4.dequant_nvfp4_2d_triton",
+            "tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4.dequant_nvfp4_2d_triton",
             side_effect=fake_dequant,
         ),
         patch("torch.ops.trtllm.fp4_quantize", side_effect=fail_fp4_quantize, create=True),

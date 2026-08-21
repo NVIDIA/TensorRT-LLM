@@ -20,8 +20,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_laguna import LagunaHfWeightMapper
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoEEligibility
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoEEligibility
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE
 
 pytestmark = pytest.mark.cpu_only
 
