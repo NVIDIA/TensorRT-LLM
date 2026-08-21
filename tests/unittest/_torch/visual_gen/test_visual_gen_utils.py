@@ -1252,3 +1252,57 @@ class TestSafeLocalFileRead:
 
         with pytest.raises(ValueError, match="could not be read"):
             _safe_read_local_file(str(tmp_path / "nope.png"))
+
+
+class TestReferencePathCanBeDisabled:
+    """``format='path'`` reads server-side files, so a deployment can refuse it.
+
+    Enabled by default: a co-located client naming a shared path is a real
+    setup, and the code cannot tell that deployment from an untrusted one.
+    """
+
+    @staticmethod
+    def _request(fmt="path", content="/tmp/ref.png"):
+        return VideoGenerationRequest(
+            prompt="x", image_reference={"content": content, "format": fmt}
+        )
+
+    def test_path_is_accepted_by_default(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", raising=False)
+        params = parse_visual_gen_params(self._request(), _StubVisualGen())
+
+        assert params.image_reference[0].format == "path"
+
+    def test_path_is_refused_when_disabled(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "1")
+
+        with pytest.raises(ValueError, match="is disabled on this server"):
+            parse_visual_gen_params(self._request(), _StubVisualGen())
+
+    def test_disabling_path_leaves_the_other_formats_alone(self, monkeypatch):
+        """The gate is about reading server-side files, not about references."""
+        monkeypatch.setenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "1")
+
+        params = parse_visual_gen_params(
+            self._request(fmt="base64", content="aGk="), _StubVisualGen()
+        )
+
+        assert params.image_reference[0].format == "base64"
+
+    def test_an_unrecognized_value_warns_and_stays_enabled(self, monkeypatch, caplog):
+        """Treating a typo as "on" would silently break working deployments;
+        treating it as "off" silently is worse, hence the warning."""
+        monkeypatch.setenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "true")
+
+        params = parse_visual_gen_params(self._request(), _StubVisualGen())
+
+        assert params.image_reference[0].format == "path"
+
+    def test_the_deprecated_field_is_gated_too(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "1")
+        request = VideoGenerationRequest(
+            prompt="x", input_reference="/tmp/ref.png", input_reference_format="path"
+        )
+
+        with pytest.raises(ValueError, match="is disabled on this server"):
+            parse_visual_gen_params(request, _StubVisualGen())

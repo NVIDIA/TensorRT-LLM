@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from tensorrt_llm.inputs.media_io import sniff_media_kind
@@ -90,6 +91,26 @@ def _merge_extra_params(
         params.extra_params = None
 
 
+def _reference_path_is_disabled() -> bool:
+    """Whether ``format='path'`` is turned off for HTTP requests.
+
+    A ``path`` reference asks the server to read its own disk, which is what a
+    co-located client wants and what a remote one has no business doing. Which
+    of the two a deployment has is not something the code can know, so it is
+    enabled by default and disabled with
+    ``TRTLLM_DISABLE_REFERENCE_FORMAT_PATH=1``. The local Python API is
+    unaffected either way: this gate is the HTTP boundary's.
+    """
+    raw = os.environ.get("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "0")
+    if raw not in ("0", "1"):
+        logger.warning(
+            "Unrecognized value for TRTLLM_DISABLE_REFERENCE_FORMAT_PATH: "
+            f"{raw!r}. Expected '0' or '1'. Treating as '0' "
+            "(reference format='path' enabled)."
+        )
+    return raw == "1"
+
+
 def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
     """Extract ``(content, format, role)`` from one raw HTTP reference.
 
@@ -104,6 +125,13 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
     content = getattr(ref, "content", None)
     if not isinstance(content, str):
         raise ValueError("reference item must carry a 'content' string.")
+    if ref.format == "path" and _reference_path_is_disabled():
+        raise ValueError(
+            "reference format='path' is disabled on this server "
+            "(TRTLLM_DISABLE_REFERENCE_FORMAT_PATH=1); it reads server-side "
+            "files and is only meaningful for co-located clients. Send the "
+            "file as base64 or upload it via multipart/form-data."
+        )
     return content, ref.format, getattr(ref, "role", None)
 
 
@@ -153,6 +181,13 @@ def _apply_deprecated_input_reference(
     if hasattr(input_reference, "file"):  # multipart upload — form implied
         payload = input_reference.file.read()
     else:
+        if input_reference_format == "path" and _reference_path_is_disabled():
+            raise ValueError(
+                "reference format='path' is disabled on this server "
+                "(TRTLLM_DISABLE_REFERENCE_FORMAT_PATH=1); it reads server-side "
+                "files and is only meaningful for co-located clients. Send the "
+                "file as base64 or upload it via multipart/form-data."
+            )
         # Imported here, not at module scope: the resolver reaches into
         # VisualGen, and a plain LLM deployment must not pull a vertical in
         # behind its request schema.
