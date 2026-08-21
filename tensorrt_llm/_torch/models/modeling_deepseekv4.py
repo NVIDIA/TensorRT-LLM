@@ -82,7 +82,6 @@ from ..moe.fused_moe import (
     resolve_moe_cls,
 )
 from ..moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from ..moe.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..peft.lora.layer import LoraLayer
 from ..speculative import SpecMetadata, get_num_extra_kv_tokens
 from ..utils import (
@@ -1697,7 +1696,6 @@ class DeepseekV4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({"alltoall_result_do_sum": False} if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output

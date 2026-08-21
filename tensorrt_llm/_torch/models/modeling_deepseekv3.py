@@ -63,7 +63,6 @@ from ..modules.embedding import Embedding
 from ..modules.mla import MLA
 from ..moe.fused_moe import (DeepSeekV3MoeRoutingMethod, MoEWeightLoadingMode,
                              create_moe, is_moe_weight_owner)
-from ..moe.fused_moe.fused_moe_wide_ep import WideEPMoE
 
 # isort: off
 from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
@@ -1150,9 +1149,6 @@ class Deepseekv3MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({
-                "alltoall_result_do_sum": False
-            } if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output
