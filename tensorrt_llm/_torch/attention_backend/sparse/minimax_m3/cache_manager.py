@@ -885,12 +885,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         return pool, slot_stride, pages_per_role
 
-    def get_dense_kv_scale_subpage_pool(self, layer_idx: int) -> Tuple[torch.Tensor, int, int]:
-        """Dense/Eagle layers are FP8 in the hybrid cache and have no scales."""
-        raise RuntimeError(
-            f"hybrid FP8 dense/Eagle layer {layer_idx} has no NVFP4 block-scale pool"
-        )
-
     def get_kv_subpage_pool(
         self, layer_idx: int, kv_layout: str = "HND"
     ) -> Tuple[torch.Tensor, int]:

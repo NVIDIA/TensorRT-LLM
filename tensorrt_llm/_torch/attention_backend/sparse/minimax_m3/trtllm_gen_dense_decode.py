@@ -28,7 +28,6 @@ from typing import Collection, Mapping, Optional, Protocol
 import torch
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
-from tensorrt_llm.bindings import DataType
 
 from .msa_utils import check_decode_span_shape
 
@@ -36,24 +35,12 @@ from .msa_utils import check_decode_span_shape
 class _MiniMaxM3DenseKVCacheManager(Protocol):
     """Cache-pool surface consumed by the dense TRTLLM-gen helpers."""
 
-    dtype: DataType
     layer_offsets: Mapping[int, int]
     sparse_layer_ids: Collection[int]
-
-    def is_nvfp4_layer(self, layer_idx: int) -> bool: ...
 
     def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str) -> tuple[torch.Tensor, int]: ...
 
     def get_dense_kv_subpage_pool(self, layer_idx: int) -> tuple[torch.Tensor, int, int]: ...
-
-    def get_dense_kv_scale_subpage_pool(self, layer_idx: int) -> tuple[torch.Tensor, int, int]: ...
-
-
-def _layer_uses_nvfp4(kv_cache_manager: _MiniMaxM3DenseKVCacheManager, layer_idx: int) -> bool:
-    predicate = getattr(kv_cache_manager, "is_nvfp4_layer", None)
-    if predicate is not None:
-        return bool(predicate(layer_idx))
-    return getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4
 
 
 @functools.lru_cache(maxsize=None)
@@ -140,62 +127,23 @@ def _dense_kv_inputs(
     q: torch.Tensor,
     kv_cache_manager: _MiniMaxM3DenseKVCacheManager,
     layer_idx: int,
-    *,
-    sm_scale: float,
-    kv_scale_quant_orig: Optional[torch.Tensor],
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-    int,
-    int,
-    float | torch.Tensor,
-    float | torch.Tensor,
-]:
-    """Resolve direct TRTLLM-gen inputs for one M3 dense layer."""
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Resolve direct TRTLLM-gen inputs for one M3 dense layer.
+
+    Dense layers are FP8 in every M3 config, including the hybrid NVFP4 cache
+    where only the sparse layers hold packed E2M1 data; see is_fp8_dense_layer.
+    """
     get_dense_pool = getattr(kv_cache_manager, "get_dense_kv_subpage_pool", None)
     if get_dense_pool is None:
         kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
         pages_per_role = 1
     else:
         kv_pool, subpages_per_slot, pages_per_role = get_dense_pool(layer_idx)
-    kv_scale_pool = None
-    bmm1_scale: float | torch.Tensor = sm_scale
-    bmm2_scale: float | torch.Tensor = 1.0
 
-    if _layer_uses_nvfp4(kv_cache_manager, layer_idx):
-        if kv_scale_quant_orig is None:
-            raise RuntimeError("MiniMax-M3 dense NVFP4 attention requires [Q, K, V] scales")
-        if kv_scale_quant_orig.dtype != torch.float32 or kv_scale_quant_orig.numel() < 3:
-            raise ValueError("MiniMax-M3 dense NVFP4 scales must be FP32 [Q, K, V]")
-        kv_scale_pool, scale_factor, scale_pages = kv_cache_manager.get_dense_kv_scale_subpage_pool(
-            layer_idx
-        )
-        if (int(scale_factor), int(scale_pages)) != (
-            int(subpages_per_slot),
-            int(pages_per_role),
-        ):
-            raise RuntimeError(
-                "MiniMax-M3 NVFP4 data/scale pools have different block-table geometry"
-            )
-        q = q.to(torch.float8_e4m3fn)
-        kv_pool = kv_pool.view(torch.uint8)
-        kv_scale_pool = kv_scale_pool.view(torch.float8_e4m3fn)
-        raw_bmm1 = kv_scale_quant_orig[1:2] * float(sm_scale)
-        bmm1_scale = torch.cat((raw_bmm1, raw_bmm1 * 1.4426950408889634))
-        bmm2_scale = kv_scale_quant_orig[2:3]
-    elif kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
+    if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
         q = q.to(torch.float8_e4m3fn)
 
-    return (
-        q,
-        kv_pool,
-        kv_scale_pool,
-        int(subpages_per_slot),
-        int(pages_per_role),
-        bmm1_scale,
-        bmm2_scale,
-    )
+    return q, kv_pool, int(subpages_per_slot), int(pages_per_role)
 
 
 def subpage_block_table(
@@ -305,7 +253,6 @@ def minimax_m3_trtllm_gen_dense_decode(
     max_num_requests: int,
     staged_subpage_table: Optional[torch.Tensor] = None,
     staged_subpages_per_slot: int = 0,
-    kv_scale_quant_orig: Optional[torch.Tensor] = None,
     enable_pdl: bool = True,
 ) -> None:
     """Full-context decode attention through trtllm-gen, in place into output.
@@ -327,21 +274,7 @@ def minimax_m3_trtllm_gen_dense_decode(
         decode_query_len,
     )
 
-    (
-        q,
-        kv_pool,
-        kv_scale_pool,
-        subpages_per_slot,
-        pages_per_role,
-        bmm1_scale,
-        bmm2_scale,
-    ) = _dense_kv_inputs(
-        q,
-        kv_cache_manager,
-        layer_idx,
-        sm_scale=sm_scale,
-        kv_scale_quant_orig=kv_scale_quant_orig,
-    )
+    q, kv_pool, subpages_per_slot, pages_per_role = _dense_kv_inputs(q, kv_cache_manager, layer_idx)
     num_heads = int(q.shape[1])
 
     reserve = torch.cuda.is_current_stream_capturing()
@@ -366,8 +299,8 @@ def minimax_m3_trtllm_gen_dense_decode(
         staged_subpage_table,  # block_tables
         seq_lens,  # seq_lens
         max_seq_len,  # max_seq_len
-        bmm1_scale,  # bmm1_scale
-        bmm2_scale,  # bmm2_scale
+        sm_scale,  # bmm1_scale
+        1.0,  # bmm2_scale
         -1,  # window_left: M3 dense layers are fully causal
         output,  # out
         None,  # sinks
@@ -375,7 +308,7 @@ def minimax_m3_trtllm_gen_dense_decode(
         decode_query_len,  # q_len_per_req
         None,  # max_q_len
         None,  # cum_seq_lens_q
-        kv_scale_pool,  # NVFP4 E4M3 block scales, otherwise None
+        None,  # block scales: FP8 dense layers have none
         False,  # uses_shared_paged_kv_idx
     )
 
@@ -394,31 +327,16 @@ def minimax_m3_trtllm_gen_dense_context(
     max_q_len: int,
     max_kv_len: int,
     max_num_requests: int,
-    kv_scale_quant_orig: Optional[torch.Tensor] = None,
     staged_subpage_table: Optional[torch.Tensor] = None,
     staged_subpages_per_slot: int = 0,
     enable_pdl: bool = True,
 ) -> None:
-    """Full-context attention for M3 dense layers, including NVFP4 KV."""
+    """Full-context attention for M3 dense layers."""
     from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
         _trtllm_gen_batch_context_with_kv_cache,
     )
 
-    (
-        q,
-        kv_pool,
-        kv_scale_pool,
-        subpages_per_slot,
-        pages_per_role,
-        bmm1_scale,
-        bmm2_scale,
-    ) = _dense_kv_inputs(
-        q,
-        kv_cache_manager,
-        layer_idx,
-        sm_scale=sm_scale,
-        kv_scale_quant_orig=kv_scale_quant_orig,
-    )
+    q, kv_pool, subpages_per_slot, pages_per_role = _dense_kv_inputs(q, kv_cache_manager, layer_idx)
     batch_size = int(seq_lens.shape[0])
     num_heads = int(q.shape[1])
     reserve = torch.cuda.is_current_stream_capturing()
@@ -446,8 +364,8 @@ def minimax_m3_trtllm_gen_dense_context(
         seq_lens,
         max_q_len,
         max_kv_len,
-        bmm1_scale,
-        bmm2_scale,
+        sm_scale,
+        1.0,
         batch_size,
         cu_q_lens,
         cu_kv_lens,
@@ -455,7 +373,7 @@ def minimax_m3_trtllm_gen_dense_context(
         output,
         None,
         enable_pdl,
-        kv_scale_pool,
+        None,
         False,
         True,
     )
@@ -469,7 +387,6 @@ def minimax_m3_trtllm_gen_dense_attention(
     *,
     sm_scale: float,
     output: torch.Tensor,
-    kv_scale_quant_orig: Optional[torch.Tensor] = None,
 ) -> None:
     """Dispatch the packed M3 dense batch by context/generation phase."""
     qo_lens = metadata.msa_qo_lens_cpu
@@ -498,7 +415,6 @@ def minimax_m3_trtllm_gen_dense_attention(
             max_q_len=int(qo_lens[:num_contexts].max().item()),
             max_kv_len=int(kv_lens[:num_contexts].max().item()),
             max_num_requests=int(metadata.max_num_requests),
-            kv_scale_quant_orig=kv_scale_quant_orig,
             staged_subpage_table=staged_table,
             staged_subpages_per_slot=staged_factor,
         )
@@ -525,7 +441,6 @@ def minimax_m3_trtllm_gen_dense_attention(
         max_num_requests=int(metadata.max_num_requests),
         staged_subpage_table=staged_table,
         staged_subpages_per_slot=staged_factor,
-        kv_scale_quant_orig=kv_scale_quant_orig,
     )
 
 
@@ -555,23 +470,6 @@ def dense_decode_unsupported_reason(
         return "the KV cache manager does not expose a flat sub-page pool."
     if int(head_dim) != 128:
         return f"head_dim {int(head_dim)}; only 128 has trtllm-gen H128 cubins."
-    dense_layers = [
-        layer_idx
-        for layer_idx in getattr(kv_cache_manager, "layer_offsets", {})
-        if layer_idx not in getattr(kv_cache_manager, "sparse_layer_ids", ())
-    ]
-    probe_layer = dense_layers[0] if dense_layers else 0
-    if _layer_uses_nvfp4(kv_cache_manager, probe_layer):
-        if not hasattr(kv_cache_manager, "get_dense_kv_scale_subpage_pool"):
-            return "the NVFP4 manager does not expose a dense block-scale pool."
-        if not dense_layers:
-            return "the NVFP4 manager has no dense attention layer."
-        dense_pool, _stride, _pages = kv_cache_manager.get_dense_kv_subpage_pool(dense_layers[0])
-        if int(dense_pool.shape[2]) != 32:
-            return (
-                f"the NVFP4 dense pool uses P{int(dense_pool.shape[2])}; "
-                "the shipped trtllm-gen cubins require P32."
-            )
     if not _flashinfer_available():
         return "flashinfer is not installed."
     return None

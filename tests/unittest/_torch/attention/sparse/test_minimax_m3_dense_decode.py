@@ -165,9 +165,6 @@ def test_hybrid_target_dense_pool_stays_fp8_p128_while_sparse_is_nvfp4_p128():
         for slot in (0, int(k.shape[0]) - 1):
             assert data_pool[slot * slot_stride].data_ptr() == k[slot].data_ptr()
             assert data_pool[slot * slot_stride + 1].data_ptr() == v[slot].data_ptr()
-        with pytest.raises(RuntimeError, match="has no NVFP4 block-scale pool"):
-            manager.get_dense_kv_scale_subpage_pool(0)
-
         dense_buffers = manager.kv_cache_manager_py_config.layers[0].buffers
         assert {buffer.role for buffer in dense_buffers} == {
             manager._get_pool_roles(0)[0],

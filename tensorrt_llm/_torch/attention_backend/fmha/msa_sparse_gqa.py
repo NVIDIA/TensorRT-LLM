@@ -245,7 +245,6 @@ def run_msa_paged_gqa(
             metadata,
             sm_scale=sm_scale,
             output=out_view,
-            kv_scale_quant_orig=kv_scale_quant_orig,
         )
         return
 

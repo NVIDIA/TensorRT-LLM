@@ -9,7 +9,6 @@ Numerical parity against the Triton reference is covered by the SM100
 integration accuracy test.
 """
 
-from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -1317,63 +1316,6 @@ def test_nvfp4_mixed_step_splits_triton_suffix_from_csr_prefix(monkeypatch):
     assert csr_kwargs["indexes"].shape[0] == 4
     assert csr_kwargs["num_rows"] == 2
     assert csr_kwargs["scales"] is ctx.scales
-
-
-def test_fp8_subpaged_dispatch_forwards_dequant_scale(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The shared Eagle cache path must preserve its FP8 dequant scale."""
-    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
-    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils as msa_utils
-    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode as dense_decode
-
-    monkeypatch.setattr(
-        msa_utils, "msa_decode_span_bounds", lambda metadata, num_tokens: (0, 0, 0, 0, 0)
-    )
-    parameter = signature(dense_decode.minimax_m3_trtllm_gen_dense_attention).parameters[
-        "kv_scale_quant_orig"
-    ]
-    assert parameter.default is None
-    captured: dict[str, object] = {}
-
-    def fake_dense_attention(*_args: object, **kwargs: object) -> None:
-        captured.update(kwargs)
-
-    monkeypatch.setattr(
-        dense_decode,
-        "minimax_m3_trtllm_gen_dense_attention",
-        fake_dense_attention,
-    )
-
-    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
-    attention.layer_idx = 3
-    attention.head_dim = 128
-    attention.num_heads = 8
-    attention.q_scaling = 1.0
-    metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            is_nvfp4_layer=lambda layer_idx: False,
-            is_fp8_subpaged_layer=lambda layer_idx: layer_idx == 3,
-        ),
-        _msa_prewritten_layer=3,
-    )
-    q = torch.zeros(2, attention.num_heads * attention.head_dim)
-    output = torch.empty_like(q)
-    dequant_scale = torch.ones(3, dtype=torch.float32)
-
-    msa_gqa.run_msa_paged_gqa(
-        attention,
-        q,
-        None,
-        None,
-        metadata,
-        output,
-        kv_block_indexes=None,
-        plan=None,
-        kv_scale_quant_orig=dequant_scale,
-    )
-
-    assert captured["kv_scale_quant_orig"] is dequant_scale
 
 
 def test_nvfp4_pure_prefill_dispatches_to_csr(monkeypatch):
