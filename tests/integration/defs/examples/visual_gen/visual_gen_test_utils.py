@@ -26,7 +26,7 @@ import sys
 import traceback
 import zipfile
 from dataclasses import dataclass
-from typing import Collection, Literal
+from typing import Collection, Iterator, Literal
 
 import pytest
 import torch
@@ -407,6 +407,38 @@ def _cleanup_cuda():
     # torch.compile and unconditional @torch.compile helpers can lazily spawn
     # an Inductor worker pool whose daemon threads otherwise outlive the test.
     shutdown_compile_workers()
+
+
+@contextlib.contextmanager
+def _lpips_pinned_fp32_matmul_precision() -> Iterator[None]:
+    """Pin fp32-matmul arithmetic so LPIPS goldens are portable across hosts.
+
+    NGC PyTorch containers default matmul TF32 on (``float32_matmul_precision
+    == "high"``); PyPI torch defaults it off (``"highest"``). A model with fp32
+    GEMMs inside its denoising loop (Cosmos3: the RoPE frequency matmul, the
+    fp32 timestep embedder, and the fp32 autocast block in
+    ``transformer_cosmos3.py``) therefore produces a different trajectory under
+    each default, and a golden cut under one fails under the other -- measured
+    LPIPS-to-golden moved 0.132 -> 0.054 from this single flag. Pin "highest"
+    (IEEE fp32, measured bit-stable across torch 2.11/2.12 and B200/B300), and
+    pin cuDNN TF32 to its universal default so the second knob cannot drift.
+    bf16 compute -- all of the heavy kernels -- is unaffected by either knob.
+
+    Applied per generation path rather than from
+    ``_lpips_deterministic_algorithms``: that helper also wraps generation for
+    LTX-2, HunyuanVideo, FLUX, QwenImage and WAN, whose goldens were cut
+    without the pin and are not re-baselined here. Keep the blast radius equal
+    to the goldens a change actually re-cuts.
+    """
+    previous_precision = torch.get_float32_matmul_precision()
+    previous_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cudnn.allow_tf32 = True
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+        torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
 
 
 @contextlib.contextmanager
