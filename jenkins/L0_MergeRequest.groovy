@@ -639,7 +639,8 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
             def rawDataJson = pipeline.sh(
                 script: """
                     curl --silent --fail \
-                         --retry 3 --retry-delay 5 --retry-all-errors \
+                         --connect-timeout 10 --max-time 60 \
+                         --retry 3 --retry-delay 5 --retry-all-errors --retry-max-time 120 \
                          --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
                          --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
                 """,
@@ -1100,6 +1101,10 @@ def getOssComplianceFileChanged(pipeline, globalVars)
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
+        if (globalVars[CHANGED_FILE_LIST_FETCH_FAILED]) {
+            pipeline.echo("Changed-file retrieval failed. Conservatively enabling OSS compliance check.")
+            return true
+        }
         return false
     }
 
@@ -1256,7 +1261,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
         if (globalVars[CHANGED_FILE_LIST_FETCH_FAILED]) {
-            pipeline.echo("GitHub API failed. Conservatively enabling multi-GPU tests.")
+            pipeline.echo("Changed-file retrieval failed. Conservatively enabling multi-GPU tests.")
             return true
         }
         return false
