@@ -1153,6 +1153,7 @@ def forward_sparse_attn(
         if self.apply_rotary_emb:
             assert ctx_position_ids is not None
             k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
+            latent_cache_ctx = torch.cat([compressed_kv_ctx, k_pe_ctx], dim=-1)
 
         context_o_lora_bmm_input = forward_context_sparse_attn(
             self,
@@ -1181,6 +1182,7 @@ def forward_sparse_attn(
         if self.apply_rotary_emb:
             assert gen_position_ids is not None
             k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
+            latent_cache_gen = torch.cat([compressed_kv_gen, k_pe_gen], dim=-1)
 
         generation_o_lora_bmm_input = forward_generation_sparse_attn(
             self,
