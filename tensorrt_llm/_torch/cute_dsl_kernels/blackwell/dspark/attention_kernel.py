@@ -50,14 +50,6 @@ except ImportError:
     cutlass_memory = utils
 
 
-from .scheduler_helpers import (
-    LOG2_E,
-    DSparkPersistentTileScheduler,
-    DSparkPersistentTileSchedulerParams,
-    create_dspark_persistent_tile_scheduler,
-    create_dspark_persistent_tile_scheduler_params,
-)
-
 """DSpark rolling-window MQA attention for NVIDIA Blackwell-family GPUs.
 
 A TMA + tcgen05 tensor-core warp-specialized persistent kernel that fuses the
@@ -72,6 +64,8 @@ The split-KV/LSE/variable-sequence machinery of the generic attention kernel and
 standalone harness have been removed, and the inverse-RoPE epilogue fusion was
 added here.
 """
+
+LOG2_E = 1.4426950408889634074
 
 
 class DSparkAttentionKernel:
@@ -609,7 +603,7 @@ class DSparkAttentionKernel:
         vc_smem_layout_for_tma_win: cute.ComposedLayout,
         vc_smem_layout_for_tma_draft: cute.ComposedLayout,
         cta_layout_vmnk: cute.Layout,
-        tile_sched_params: DSparkPersistentTileSchedulerParams,
+        tile_sched_params,
         SharedStorage: cutlass.Constexpr,
     ):
         """Run the persistent, warp-specialized DSpark device pipeline.
@@ -729,7 +723,7 @@ class DSparkAttentionKernel:
             load_pt_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_pt_stage
             )
-            tile_sched = create_dspark_persistent_tile_scheduler(
+            tile_sched = self._create_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -762,7 +756,7 @@ class DSparkAttentionKernel:
             load_pt_release_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.load_pt_stage
             )
-            tile_sched = create_dspark_persistent_tile_scheduler(
+            tile_sched = self._create_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -844,7 +838,7 @@ class DSparkAttentionKernel:
             mma_o_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_o_stage
             )
-            tile_sched = create_dspark_persistent_tile_scheduler(
+            tile_sched = self._create_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -920,7 +914,7 @@ class DSparkAttentionKernel:
 
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-            tile_sched = create_dspark_persistent_tile_scheduler(
+            tile_sched = self._create_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -973,7 +967,7 @@ class DSparkAttentionKernel:
 
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-            tile_sched = create_dspark_persistent_tile_scheduler(
+            tile_sched = self._create_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -2416,18 +2410,15 @@ class DSparkAttentionKernel:
         )
 
     @staticmethod
+    def _create_tile_scheduler(tile_sched_params, blk_coord: cute.Coord, grid_shape: cute.Shape):
+        """Create a device scheduler supplied by the concrete attention specialization."""
+        raise NotImplementedError
+
+    @staticmethod
     def _compute_grid(
         o: cute.Tensor,
         cluster_shape_mnk: Tuple[int, int, int],
         max_active_clusters: int,
-    ) -> Tuple[DSparkPersistentTileSchedulerParams, Tuple[int, int, int]]:
-        """Build persistent scheduler parameters and cap the active grid."""
-        o_shape = o.shape
-        tile_sched_params = create_dspark_persistent_tile_scheduler_params(
-            cute.size(o_shape[3]),
-            cute.size(o_shape[2]),
-            cluster_shape_mnk,
-        )
-        grid = DSparkPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
-
-        return tile_sched_params, grid
+    ):
+        """Build scheduler state supplied by the concrete attention specialization."""
+        raise NotImplementedError
