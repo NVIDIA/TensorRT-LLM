@@ -15,7 +15,10 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py
+  # Own entry (and ignored above): rebinds mpi4py's serializer process-wide at
+  # import time, so it must not share a pytest process with the attention suite.
+  - unittest/_torch/attention/test_mla_helix.py
   - unittest/_torch/thop/parallel
   - unittest/_torch/attention/kernels/parallel
   - unittest/_torch/thop/serial

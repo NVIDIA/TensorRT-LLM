@@ -76,7 +76,10 @@ l0_b200:
   - test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py
+  # Own entry (and ignored above): rebinds mpi4py's serializer process-wide at
+  # import time, so it must not share a pytest process with the attention suite.
+  - unittest/_torch/attention/test_mla_helix.py
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - unittest/_torch/kv_cache_compression
