@@ -543,22 +543,36 @@ public:
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_alpha must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
         if (swiglu_beta.has_value())
         {
             CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_beta must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
         if (swiglu_limit.has_value())
         {
             CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_limit must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
+        TORCH_CHECK(
+            base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
+            "SiTu requires both swiglu_alpha and swiglu_beta.");
+        TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
+            "SiTu does not support swiglu_limit.");
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
@@ -797,22 +811,36 @@ public:
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_alpha must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
         if (swiglu_beta.has_value())
         {
             CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_beta must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
         if (swiglu_limit.has_value())
         {
             CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_limit must have num_experts_on_rank elements.");
-            base_activation_type = ActivationType::SwigluBias;
+            if (base_activation_type != ActivationType::SiTu)
+            {
+                base_activation_type = ActivationType::SwigluBias;
+            }
         }
+        TORCH_CHECK(
+            base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
+            "SiTu requires both swiglu_alpha and swiglu_beta.");
+        TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
+            "SiTu does not support swiglu_limit.");
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
