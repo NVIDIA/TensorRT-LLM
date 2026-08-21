@@ -231,7 +231,7 @@ BF16.</em></sub></p>
 The table condenses the 18 marked points into six family rows. Each cell reports
 `speedup / mean LPIPS`; the star and triangle use the same Skip Softmax settings as Figure 4.
 
-| GEMM/attention quantization | Not enabled | ★ Skip Softmax | ▲ Skip Softmax |
+| GEMM/attention quantization | Not enabled | ★ Conservative Skip Softmax | ▲ Aggressive Skip Softmax |
 | :--- | :--- | :--- | :--- |
 | BF16 | 1.000× / 0.1181 | 1.108× / 0.1701 | 1.179× / 0.4844 |
 | BF16 + SAGE | 1.080× / 0.2562 | 1.167× / 0.2681 | 1.221× / 0.4883 |
