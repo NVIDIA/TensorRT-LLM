@@ -47,6 +47,13 @@ def _is_multi_gpu_stage(name: str) -> bool:
     return bool(_MULTI_GPU_RE.search(name))
 
 
+def _multi_gpu_scheduled(
+    status: str, multi_gpu_required: bool, multi_gpu_label_gate_open: bool
+) -> bool:
+    """Whether multi-GPU belongs to the non-CBTS baseline at decision time."""
+    return status == "post_merge" or (multi_gpu_required and multi_gpu_label_gate_open)
+
+
 def _stage_group(name: str) -> str:
     """Strip the trailing pytest-split shard id from a stage name."""
     return _STAGE_SHARD_SUFFIX_RE.sub("", name)
@@ -78,11 +85,12 @@ def _case_counts(
 ) -> tuple[int, int]:
     r"""(cbts_cases, total_cases): cases CBTS runs vs all cases in the mode.
 
-    cbts = sum over the stages that Layer 2 will schedule, using the Layer-3
-    kept count for narrowed stages and the full count for force-kept stages.
+    cbts = sum over the stages expected to pass Layer 2 at decision time,
+    using the Layer-3 kept count for narrowed stages and the full count for
+    force-kept stages.
     total = the full case count over the same trigger-mode universe. OnDemand
     stages are never in that universe. Multi-GPU stages are included only
-    when the baseline multi-GPU gate is open.
+    when normal CI requires them and the approval-label gate is open.
 
     A trailing stage number is a pytest-split shard, not another copy of the
     test list. Counts are therefore aggregated once per stage family; summing
@@ -183,11 +191,14 @@ def build_document(
     pr_number: str,
     cbts_cases: int,
     total_cases: int,
-    multi_gpu_scheduled: bool = False,
+    multi_gpu_required: bool = False,
+    multi_gpu_label_gate_open: bool = False,
 ) -> dict:
     """Build the typed OpenSearch doc (field prefixes: s_=str, l_=int, d_=float, flat_=dict)."""
     scope = decision.get("scope")
-    multi_gpu_scheduled = status == "post_merge" or multi_gpu_scheduled
+    multi_gpu_scheduled = _multi_gpu_scheduled(
+        status, multi_gpu_required, multi_gpu_label_gate_open
+    )
     affected = _scheduled_affected_stages(decision, status, multi_gpu_scheduled)
     # deferred has no decision; fall back to --reason.
     if not reason:
@@ -229,7 +240,8 @@ def build_document(
         # This field is consumed directly by the CBTS OpenSearch dashboard.
         "d_case_skip_rate": round(case_skip_rate, 4),
         "b_case_skip_rate_valid": case_skip_rate_valid,
-        "b_multi_gpu_scheduled": multi_gpu_scheduled,
+        "b_non_cbts_multi_gpu_required": multi_gpu_required,
+        "b_multi_gpu_label_gate_open": multi_gpu_label_gate_open,
         "flat_detail": {
             "hit_stages": affected,
             "scopes": list(decision.get("scopes") or []),
@@ -252,11 +264,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pr-number", default="", help="PR / MR number for s_pr_number.")
     parser.add_argument("--repo-root", default=".", help="Repo root (for the case-rate counts).")
     parser.add_argument(
-        "--multi-gpu-scheduled",
+        "--multi-gpu-required",
         action="store_true",
         default=False,
-        help="Pass when multi-GPU pre-merge stages will actually run (multi_gpu_file_changed=true). "
-        "Omit to exclude those stages from the skip-rate denominator.",
+        help="Pass when normal non-CBTS policy requires multi-GPU pre-merge stages.",
+    )
+    parser.add_argument(
+        "--multi-gpu-label-gate-open",
+        action="store_true",
+        default=False,
+        help="Pass when the multi-GPU approval-label gate is open at CBTS decision time.",
     )
     args = parser.parse_args(argv)
 
@@ -267,11 +284,16 @@ def main(argv: list[str] | None = None) -> int:
     from open_search_db import CBTS_PROJECT_NAME, OpenSearchDB
 
     decision = json.loads(Path(args.decision).read_text()) if args.decision else {}
+    multi_gpu_scheduled = _multi_gpu_scheduled(
+        args.status,
+        args.multi_gpu_required,
+        args.multi_gpu_label_gate_open,
+    )
     cbts_cases, total_cases = _case_counts(
         decision,
         args.status,
         args.repo_root,
-        multi_gpu_scheduled=args.multi_gpu_scheduled,
+        multi_gpu_scheduled=multi_gpu_scheduled,
     )
     doc = build_document(
         decision,
@@ -280,7 +302,8 @@ def main(argv: list[str] | None = None) -> int:
         args.pr_number,
         cbts_cases,
         total_cases,
-        multi_gpu_scheduled=args.multi_gpu_scheduled,
+        multi_gpu_required=args.multi_gpu_required,
+        multi_gpu_label_gate_open=args.multi_gpu_label_gate_open,
     )
     OpenSearchDB.add_id_of_json(doc)
     ok = OpenSearchDB.postToOpenSearchDB(doc, CBTS_PROJECT_NAME)

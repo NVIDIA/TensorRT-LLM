@@ -672,20 +672,20 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
 // Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
 // both label existence and that the labeler is an active team member.
 // Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
-def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
+def getMultiGpuApprovalLabelGate(pipeline, globalVars) {
     if (!globalVars[GITHUB_PR_API_URL]) {
         echo "[requireMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
-        return false
+        return [gateOpen: true, status: "not_applicable", reason: ""]
     }
     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
         echo "[requireMultiGpuApprovalLabel] Skipping label check: PostMerge pipeline is exempt"
-        return false
+        return [gateOpen: true, status: "not_applicable", reason: ""]
     }
 
     def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
     if (!prMatch) {
         echo "[requireMultiGpuApprovalLabel] Could not extract PR number from ${globalVars[GITHUB_PR_API_URL]}. Failing open."
-        return false
+        return [gateOpen: true, status: "unknown", reason: ""]
     }
     def prNumber = prMatch[0][1]
 
@@ -693,9 +693,22 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
     if (!result.checkCompleted) {
         // API error — fail-open: do not block CI if the label check itself fails
         echo "[requireMultiGpuApprovalLabel] Label validation incomplete (${result.error}). Failing open."
-        return false
+        return [gateOpen: true, status: "unknown", reason: ""]
     }
     if (result.labelExists && result.authorized) {
+        return [gateOpen: true, status: "approved", reason: ""]
+    }
+
+    def reason = !result.labelExists
+        ? "label 'ci: full pre-merge approved' is not present on this PR"
+        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
+    def status = result.labelExists ? "unauthorized" : "missing"
+    return [gateOpen: false, status: status, reason: reason]
+}
+
+def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
+    def gate = getMultiGpuApprovalLabelGate(pipeline, globalVars)
+    if (gate.gateOpen) {
         return false
     }
 
@@ -706,10 +719,7 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
         "<span data-multi-gpu-label-required='true'>" +
         "Multi-GPU tests require label 'ci: full pre-merge approved'" +
         "</span>"
-    def reason = !result.labelExists
-        ? "label 'ci: full pre-merge approved' is not present on this PR"
-        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
-    def blockMsg = "${arch} Multi-GPU tests blocked: ${reason}. " +
+    def blockMsg = "${arch} Multi-GPU tests blocked: ${gate.reason}. " +
          "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
     echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
     return blockMsg
@@ -911,14 +921,45 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
         def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
-        def multiGpuScheduled = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
-        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output, multiGpuScheduled)
+        def multiGpuRequired = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
+        // The label gate is irrelevant when normal CI does not require
+        // multi-GPU. Treat it as effectively open and avoid an unnecessary
+        // GitHub API request on the common single-GPU-only path.
+        def multiGpuLabelGateOpen = !multiGpuRequired ||
+            _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+        _cbtsReportDecision(
+            pipeline,
+            globalVars,
+            runStatus,
+            "",
+            output,
+            multiGpuRequired,
+            multiGpuLabelGateOpen,
+        )
         return result
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
         return null
+    }
+}
+
+// Observe the multi-GPU approval gate at CBTS decision time. This is telemetry
+// only: a later dispatch re-checks the label so this snapshot cannot change CI
+// behavior. Match the dispatch policy and fail open on non-interruption errors.
+def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+{
+    try {
+        def gate = getMultiGpuApprovalLabelGate(pipeline, globalVars)
+        pipeline.echo("CBTS: multi-GPU label gate at decision time: " +
+                      "status=${gate.status}, open=${gate.gateOpen}")
+        return gate.gateOpen as boolean
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS: multi-GPU label telemetry check failed (${e.message}); failing open")
+        return true
     }
 }
 
@@ -967,14 +1008,18 @@ def _cbtsCoverageAudit(pipeline)
 
 // Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
 // decisionJson null for deferred; reason used only then. Context/creds via env.
-// multiGpuScheduled: true when multi-GPU pre-merge stages will actually run,
-// so they are included in the skip-rate denominator.
-def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson, boolean multiGpuScheduled = false)
+// Multi-GPU enters the pre-merge denominator only when normal CI requires it
+// and the approval-label gate is open at CBTS decision time.
+def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson,
+                        boolean multiGpuRequired = false, boolean multiGpuLabelGateOpen = false)
 {
     try {
         def args = "--status ${status}"
-        if (multiGpuScheduled) {
-            args += " --multi-gpu-scheduled"
+        if (multiGpuRequired) {
+            args += " --multi-gpu-required"
+        }
+        if (multiGpuLabelGateOpen) {
+            args += " --multi-gpu-label-gate-open"
         }
         if (decisionJson != null) {
             pipeline.writeFile(file: "${LLM_ROOT}/cbts_decision.json", text: decisionJson)
