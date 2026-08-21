@@ -23,7 +23,7 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 # serving protocol can name them without pulling VisualGen in, but
 # ``tensorrt_llm.visual_gen`` stays their public home. The redundant aliases
 # mark these as intentional re-exports rather than unused imports.
-from tensorrt_llm.media.reference import ContentFormat as ContentFormat
+from tensorrt_llm.media.reference import MediaContentFormat as MediaContentFormat
 from tensorrt_llm.media.reference import MediaRef as MediaRef
 from tensorrt_llm.media.reference import MediaRole as MediaRole
 from tensorrt_llm.media.reference import reject_bare_refs as _reject_bare_refs
