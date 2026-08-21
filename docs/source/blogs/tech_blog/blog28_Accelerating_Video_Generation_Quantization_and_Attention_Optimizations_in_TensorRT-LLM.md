@@ -249,7 +249,8 @@ python "$EXAMPLE_DIR/apply_calibration.py" --model-dir "$MODEL_DIR"
 ```
 
 The helper adds only calibrated Skip Softmax metadata to the checkpoint; it does not quantize GEMM
-weights. Runtime choices are centralized in `visual_gen.yaml`.
+weights. Runtime choices are centralized in the packaged
+[`visual_gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b/visual_gen.yaml).
 
 ### VisualGen configuration
 
