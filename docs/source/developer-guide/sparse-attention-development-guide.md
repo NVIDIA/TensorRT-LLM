@@ -317,7 +317,7 @@ framework wiring is:
 - A lowered `SparseParams` object that carries the resolved kernel
   settings.
 - A switch inside the attention backend (e.g.,
-  `_torch/attention/backends/trtllm_gen.py`) that reads the lowered params
+  `_torch/attention/backends/fmha/flashinfer_trtllm_gen.py`) that reads the lowered params
   and enables the kernel-side fast path.
 
 Skip Softmax Attention follows this pattern — see the

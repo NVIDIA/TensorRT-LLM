@@ -54,7 +54,7 @@ measured: []
   `cpp/tensorrt_llm/thop/{IndexerKCacheGatherOp.cpp, convertReqIndexToGlobalOp.cpp}`
   (+ `CMakeLists.txt`), the `register_fake` meta impls in
   `tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py`, and the call sites in
-  `tensorrt_llm/_torch/attention/backends/sparse/dsa.py`
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/indexer.py`
   (`torch.ops.trtllm.indexer_k_cache_gather_op`,
   `torch.ops.trtllm.convert_req_index_to_global`).
 - **Expected effect:** lower host launch overhead and fewer recompiles → smaller
