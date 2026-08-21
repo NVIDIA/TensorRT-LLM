@@ -16,11 +16,14 @@
 import asyncio
 import os
 import sys
+from typing import Any, Generator
 
 import pytest
 from llmapi.apps.openai_server import RemoteOpenAIServer
 
-from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,
+from tensorrt_llm.executor import RequestError
+from tensorrt_llm.scaffolding import (ChatTask, GenerationTask,
+                                      StreamGenerationTask, TaskStatus,
                                       TRTLLMWorker, TRTOpenaiWorker,
                                       UserMessage)
 
@@ -76,6 +79,144 @@ def create_trtoai_worker(model_name, async_client):
         async_client=async_client,
         model=model_name,
     )
+
+
+class _AwaitableResult:
+
+    def __init__(self, result: object) -> None:
+        self.result = result
+
+    def __await__(self) -> Generator[Any, None, object]:
+
+        async def _result() -> object:
+            return self.result
+
+        return _result().__await__()
+
+
+class _Completion:
+
+    text = "ok"
+    token_ids = [1]
+    finish_reason = "stop"
+    logprobs = None
+
+
+class _GenerationResult:
+
+    outputs = [_Completion()]
+    context_logits = None
+
+
+class _SuccessfulLLM:
+
+    def generate_async(self, *args: object,
+                       **kwargs: object) -> _AwaitableResult:
+        return _AwaitableResult(_GenerationResult())
+
+
+class _FailingLLM:
+
+    def __init__(self, error: RequestError) -> None:
+        self.error = error
+
+    def generate_async(self, *args: object,
+                       **kwargs: object) -> _AwaitableResult:
+        raise self.error
+
+
+class _StreamingFailingResult:
+
+    def __init__(self, error: RequestError) -> None:
+        self._done = False
+        self.error = error
+        self.outputs = [_Completion()]
+        self.context_logits = None
+
+    async def _aresult_step(self) -> None:
+        raise self.error
+
+
+class _StreamingFailingLLM:
+
+    def __init__(self, error: RequestError) -> None:
+        self.error = error
+
+    def generate_async(self, *args: object,
+                       **kwargs: object) -> _StreamingFailingResult:
+        return _StreamingFailingResult(self.error)
+
+
+def test_trtllm_worker_copies_finish_reason_from_result() -> None:
+    worker = TRTLLMWorker(_SuccessfulLLM(), tokenizer=None)
+    task = GenerationTask.create_from_prompt("hello")
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.output_str == "ok"
+    assert task.output_tokens == [1]
+    assert task.finish_reason == "stop"
+
+
+def test_trtllm_worker_returns_length_for_max_num_tokens_error() -> None:
+    error = RequestError(
+        "The sum of prompt length (4), query length (1) should not exceed "
+        "max_num_tokens (4)")
+    worker = TRTLLMWorker(_FailingLLM(error), tokenizer=None)
+    task = GenerationTask.create_from_prompt("hello")
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.output_str == ""
+    assert task.output_tokens == []
+    assert task.finish_reason == "length"
+
+
+def test_trtllm_worker_preserves_unrelated_request_errors() -> None:
+    worker = TRTLLMWorker(_FailingLLM(RequestError("bad request")),
+                          tokenizer=None)
+    task = GenerationTask.create_from_prompt("hello")
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.WORKER_EXECEPTION
+    assert task.finish_reason is None
+
+
+def test_trtllm_worker_returns_length_for_streaming_step_error() -> None:
+    error = RequestError(
+        "The sum of prompt length (4), query length (1) should not exceed "
+        "max_num_tokens (4)")
+    worker = TRTLLMWorker(_StreamingFailingLLM(error), tokenizer=None)
+    task = StreamGenerationTask.create_from_generation_task(
+        GenerationTask.create_from_prompt("hello"), streaming_step=1)
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.end_flag
+    assert task.output_str == ""
+    assert task.output_tokens == []
+    assert task.finish_reason == "length"
+
+
+def test_trtllm_worker_returns_length_for_streaming_start_error() -> None:
+    error = RequestError(
+        "The sum of prompt length (4), query length (1) should not exceed "
+        "max_num_tokens (4)")
+    worker = TRTLLMWorker(_FailingLLM(error), tokenizer=None)
+    task = StreamGenerationTask.create_from_generation_task(
+        GenerationTask.create_from_prompt("hello"), streaming_step=1)
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.end_flag
+    assert task.output_str == ""
+    assert task.output_tokens == []
+    assert task.finish_reason == "length"
 
 
 def test_trtllm_worker_generation(default_prompt, trtllm_model_path):

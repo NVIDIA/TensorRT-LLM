@@ -30,7 +30,8 @@ from mcp.client.sse import sse_client
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
-from tensorrt_llm.executor import GenerationExecutor, GenerationResult
+from tensorrt_llm.executor import (GenerationExecutor, GenerationResult,
+                                   RequestError)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -614,24 +615,43 @@ class TRTLLMWorker(Worker):
                         copy.deepcopy(generate_result.outputs[0].token_ids)))
 
     def fill_task_with_result(self, task: GenerationTask,
-                              result: GenerationResult):
+                              result: GenerationResult) -> None:
         task.output_str = result.outputs[0].text
         task.output_tokens = result.outputs[0].token_ids
+        task.finish_reason = result.outputs[0].finish_reason
         task.context_logits = result.context_logits
         task.logprobs = result.outputs[0].logprobs
+
+    @staticmethod
+    def _finish_task_by_length(task: GenerationTask) -> TaskStatus:
+        task.output_str = ""
+        task.output_tokens = []
+        task.finish_reason = "length"
+        return TaskStatus.SUCCESS
+
+    @staticmethod
+    def _is_max_num_tokens_request_error(error: RequestError) -> bool:
+        return "should not exceed max_num_tokens" in str(error)
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         sampling_params = self.convert_task_params(task)
 
-        if task.streaming_output_flag:
-            result = self.llm.generate_async(task.input_str,
-                                             sampling_params=sampling_params,
-                                             streaming=True)
-            await self.streaming_generate_helper(result, None,
-                                                 task.streaming_output_list)
-        else:
-            result = await self.llm.generate_async(
-                task.input_str, sampling_params=sampling_params)
+        try:
+            if task.streaming_output_flag:
+                result = self.llm.generate_async(
+                    task.input_str,
+                    sampling_params=sampling_params,
+                    streaming=True)
+                await self.streaming_generate_helper(result, None,
+                                                     task.streaming_output_list)
+            else:
+                result = await self.llm.generate_async(
+                    task.input_str, sampling_params=sampling_params)
+        except RequestError as error:
+            if self._is_max_num_tokens_request_error(error):
+                return self._finish_task_by_length(task)
+            print('TRTLLM worker get exception: ' + str(error))
+            return TaskStatus.WORKER_EXECEPTION
 
         self.fill_task_with_result(task, result)
 
@@ -642,17 +662,34 @@ class TRTLLMWorker(Worker):
             self, task: StreamGenerationTask) -> TaskStatus:
         sampling_params = self.convert_task_params(task)
         if task.request_handle is None:
-            task.request_handle = self.llm.generate_async(
-                task.input_str, sampling_params=sampling_params, streaming=True)
+            try:
+                task.request_handle = self.llm.generate_async(
+                    task.input_str,
+                    sampling_params=sampling_params,
+                    streaming=True)
+            except RequestError as error:
+                task.end_flag = True
+                if self._is_max_num_tokens_request_error(error):
+                    return self._finish_task_by_length(task)
+                print('TRTLLM worker get exception: ' + str(error))
+                return TaskStatus.WORKER_EXECEPTION
 
         if task.cancel_flag:
             task.end_flag = True
             task.request_handle.abort()
             return TaskStatus.SUCCESS
 
-        await self.streaming_generate_helper(
-            task.request_handle, task.streaming_step,
-            task.streaming_output_queue if task.streaming_output_flag else None)
+        try:
+            await self.streaming_generate_helper(
+                task.request_handle, task.streaming_step,
+                task.streaming_output_queue
+                if task.streaming_output_flag else None)
+        except RequestError as error:
+            task.end_flag = True
+            if self._is_max_num_tokens_request_error(error):
+                return self._finish_task_by_length(task)
+            print('TRTLLM worker get exception: ' + str(error))
+            return TaskStatus.WORKER_EXECEPTION
 
         self.fill_task_with_result(task, task.request_handle)
 
