@@ -504,8 +504,11 @@ def _stub_agents(
         data[progress_module._STAGE_BY_AGENT[agent]].append(entry)
         progress_module.write_progress(workflow.progress_path, data)
 
-    def plan_drafter(iteration: int, mode: str):
-        trace.append((iteration, f"plan_drafter:{mode}"))
+    def plan_drafter(iteration: int, mode: str, feedback_triggered: bool = False):
+        # Feedback-forced replan turns are tagged ``+feedback`` so tests
+        # can assert the flag threaded through the sub-cycle.
+        suffix = "+feedback" if feedback_triggered else ""
+        trace.append((iteration, f"plan_drafter:{mode}{suffix}"))
         if mode not in drafter_iters:
             raise AssertionError(
                 f"plan_drafter stub was invoked with mode={mode!r} but "
@@ -523,11 +526,12 @@ def _stub_agents(
             },
         )
 
-    def plan_reviewer(iteration: int, phase: str = "initial"):
+    def plan_reviewer(iteration: int, phase: str = "initial", feedback_triggered: bool = False):
         # Tag the trace entry so replan-review calls are distinguishable
         # from initial plan-phase reviews, but keep the initial-mode tag
         # bare so the existing tests' trace assertions still match.
-        label = "plan_reviewer" if phase == "initial" else f"plan_reviewer:{phase}"
+        suffix = "+feedback" if feedback_triggered else ""
+        label = "plan_reviewer" if phase == "initial" else f"plan_reviewer:{phase}{suffix}"
         trace.append((iteration, label))
         decision = next(plan_reviewer_iter, "APPROVE")
         _append(
@@ -3077,10 +3081,13 @@ def test_trigger_replan_with_feedback_enters_replan_subcycle_on_resume(tmp_path)
         workflow.close()
 
     # The first (and only) build-phase agent is the replan PlanDrafter at
-    # the upcoming iteration — the coder was skipped entirely.
-    assert trace == [(2, "plan_drafter:replan")]
+    # the upcoming iteration — the coder was skipped entirely — and the
+    # turn is marked feedback-triggered.
+    assert trace == [(2, "plan_drafter:replan+feedback")]
     state = module.load_state(tmp_path / module.STATE_FILENAME)
     assert state.done is True
+    # The feedback-replan flag is cleared once the sub-cycle terminates.
+    assert state.feedback_replan is False
 
 
 def test_trigger_replan_with_feedback_is_noop_without_feedback(tmp_path):
@@ -3130,4 +3137,134 @@ def test_trigger_replan_with_feedback_replans_after_completed_run(tmp_path):
     finally:
         workflow.close()
 
-    assert trace[0] == (2, "plan_drafter:replan")
+    assert trace[0] == (2, "plan_drafter:replan+feedback")
+
+
+def test_feedback_replan_flag_roundtrips_and_defaults_false(tmp_path):
+    """``feedback_replan`` round-trips through save/load, defaulting to False.
+
+    Checkpoints written before the field existed load with it defaulting to
+    False.
+    """
+    module = _load_module()
+    path = tmp_path / module.STATE_FILENAME
+
+    state = module.WorkflowState(
+        task_path="t", num_iterations=3, stage=module.STAGE_REPLAN, feedback_replan=True
+    )
+    module.save_state(path, state)
+    assert module.load_state(path).feedback_replan is True
+
+    # A pre-existing checkpoint without the key loads as False.
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["feedback_replan"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert module.load_state(path).feedback_replan is False
+
+
+def test_feedback_replan_flag_survives_replan_reviewer_reject_loop(tmp_path):
+    """The feedback-triggered framing survives a reviewer REJECT loop.
+
+    A feedback-forced replan that goes DRAFT_READY → reviewer REJECT →
+    replan retry keeps the framing on the retried drafter turn, and clears
+    it once the reviewer APPROVEs back to the coder.
+    """
+    module = _load_module()
+    _seed_replan_feedback_resume(module, tmp_path, stage=module.STAGE_CODER)
+
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=3,
+        replan_on_qa=True,
+        trigger_replan_with_feedback=True,
+        feedback="rebuild the extension in the target container",
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DRAFT_READY", "DRAFT_READY", "DONE"]},
+        plan_reviewer_decisions=["REJECT", "APPROVE"],
+        qa_decisions=["APPROVE"],
+    )
+    workflow._run_plan_phase = lambda *_a, **_kw: None  # defense
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # Feedback framing persists across the in-sub-cycle REJECT retry …
+    assert trace[:4] == [
+        (2, "plan_drafter:replan+feedback"),
+        (2, "plan_reviewer:replan+feedback"),
+        (2, "plan_drafter:replan+feedback"),
+        (2, "plan_reviewer:replan+feedback"),
+    ]
+    # … and is dropped once the sub-cycle hands back to the coder: the
+    # post-QA replan of the next iteration is an ordinary one.
+    assert (3, "coder") in trace
+    assert (3, "plan_drafter:replan") in trace
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.feedback_replan is False
+
+
+def test_replan_drafter_prompt_flags_feedback_trigger(tmp_path):
+    """The drafter replan prompt surfaces the feedback-triggered framing.
+
+    ``_run_plan_drafter(mode="replan", feedback_triggered=True)`` must
+    surface the framing in the user prompt; an ordinary post-QA replan
+    prompt must not carry it.
+    """
+    module = _load_module()
+
+    for flag, expected in ((True, True), (False, False)):
+        captured: list[str] = []
+        workflow = module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            clean=True,
+            replan_on_qa=True,
+        )
+        real_drafter = workflow.plan_drafter
+        try:
+            workflow.plan_drafter = lambda prompt: captured.append(prompt) or ""
+            workflow._run_plan_drafter(iteration=1, mode="replan", feedback_triggered=flag)
+        finally:
+            workflow.plan_drafter = real_drafter
+            workflow.close()
+
+        assert len(captured) == 1
+        present = "Feedback-triggered replan" in captured[0]
+        assert present is expected, (
+            f"feedback_triggered={flag}: expected marker presence "
+            f"{expected}, prompt head: {captured[0][:200]!r}"
+        )
+
+
+def test_replan_reviewer_prompt_flags_feedback_trigger(tmp_path):
+    """The reviewer replan prompt flags a feedback-forced revision.
+
+    ``_run_plan_reviewer(phase="replan", feedback_triggered=True)`` must
+    tell the reviewer the revision came from a feedback-forced turn; the
+    ordinary replan review must not.
+    """
+    module = _load_module()
+
+    for flag, expected in ((True, True), (False, False)):
+        captured: list[str] = []
+        workflow = module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            clean=True,
+            replan_on_qa=True,
+        )
+        real_reviewer = workflow.plan_reviewer
+        try:
+            workflow.plan_reviewer = lambda prompt: captured.append(prompt) or ""
+            workflow._run_plan_reviewer(iteration=1, phase="replan", feedback_triggered=flag)
+        finally:
+            workflow.plan_reviewer = real_reviewer
+            workflow.close()
+
+        assert len(captured) == 1
+        present = "feedback-triggered" in captured[0]
+        assert present is expected, (
+            f"feedback_triggered={flag}: expected marker presence "
+            f"{expected}, prompt head: {captured[0][:200]!r}"
+        )

@@ -732,9 +732,16 @@ def build_progress_tools(
         append_plan_drafter_progress,
         _make_read_tool("plan_drafter"),
     ]
+    plan_reviewer_tools = [
+        append_plan_reviewer_progress,
+        _make_read_tool("plan_reviewer"),
+    ]
     if plan_drafter_replan_on_qa:
         plan_drafter_tools.append(_make_build_read_tool("plan_drafter"))
         plan_drafter_tools.append(_make_human_feedback_tool("plan_drafter"))
+        # The replan PlanReviewer audits feedback-triggered replans, so it
+        # needs the user's direct voice too — same rationale as QA below.
+        plan_reviewer_tools.append(_make_human_feedback_tool("plan_reviewer"))
 
     # QA intentionally does not get `read_latest_progress`: its verdict
     # must be grounded in ``task.yaml`` and the actual code it builds, not
@@ -745,10 +752,7 @@ def build_progress_tools(
     # stays out of reach.
     return {
         "plan_drafter": plan_drafter_tools,
-        "plan_reviewer": [
-            append_plan_reviewer_progress,
-            _make_read_tool("plan_reviewer"),
-        ],
+        "plan_reviewer": plan_reviewer_tools,
         "coder": [
             append_coder_progress,
             _make_read_tool("coder"),

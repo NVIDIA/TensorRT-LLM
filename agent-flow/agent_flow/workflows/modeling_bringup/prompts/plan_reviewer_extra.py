@@ -269,6 +269,38 @@ acceptance-criteria edit in its `summary` — REJECT a `DRAFT_READY`
 turn that changed criteria without a justification line in the
 PlanDrafter's progress entry.
 
+### Feedback-triggered replan — interrupt audit
+
+When the orchestrator's replan-review prompt declares the turn
+**feedback-triggered**, the PlanDrafter holds a one-turn override: it
+may interrupt the `— IN_PROGRESS` Stage. Call `read_human_feedback` to
+see the feedback the revision must serve, then audit the interrupt
+against the override's exact shape instead of auto-REJECTing it:
+
+- Legal interrupt edits: the active Stage's header flipped to
+  `— INTERRUPTED (superseded by feedback iter <n>)`; its `[Doing]` and
+  remaining `[Undo]` Goals marked `[Skipped] — superseded by feedback
+  iter <n>`; a new feedback Stage inserted immediately after it (with
+  downstream PENDING Stages renumbered, same mechanics as a gap-fix
+  insert) and marked `— IN_PROGRESS` with its first Goal
+  `[Doing] (iterations=0)`; the interrupted Stage's
+  `acceptance-criteria.md` subsection header annotated
+  `(INTERRUPTED iter <n> — superseded by feedback)` with its items
+  otherwise untouched.
+- Auto-REJECT if: the turn was NOT declared feedback-triggered but the
+  revision interrupts a Stage or marks Goals `[Skipped]` anyway; a
+  `— CLOSED` Stage or a `[Done]` / `[Failed]` row was touched; a
+  `[Skipped]` Goal is not dispatched in the PlanDrafter's `summary`
+  (either re-planned into the feedback Stage / a downstream PENDING
+  Stage with its unmet acceptance items carried forward, or explicitly
+  dropped with a justification naming the superseding feedback); the
+  feedback Stage does not actually address the newest human-feedback
+  entry; an interrupted Stage's locked checklist items were edited or
+  removed; or the interrupt was gratuitous — the feedback could have
+  been served through the ordinary lock-matrix paths (a future-Stage
+  edit or the current `[Doing]` Goal's scope) yet in-progress work was
+  discarded anyway.
+
 In non-replan workflows you never enter the replan-review phase; these
 rules apply only when the orchestrator routes you with `phase="replan"`.
 """
