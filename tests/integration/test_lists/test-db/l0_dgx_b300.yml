@@ -20,6 +20,7 @@ l0_dgx_b300:
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
   - unittest/_torch/executor
+  - unittest/_torch/disaggregation
   # ------------- modules (multi-GPU) ---------------
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modeling -k "modeling_llama"

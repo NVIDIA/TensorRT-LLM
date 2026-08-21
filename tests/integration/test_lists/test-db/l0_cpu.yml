@@ -28,6 +28,7 @@ l0_cpu:
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   - unittest/_torch/distributed
   - unittest/_torch/executor
+  - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling

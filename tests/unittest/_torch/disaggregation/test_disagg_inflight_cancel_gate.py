@@ -522,9 +522,7 @@ def test_flag_unset_preserves_python_transceiver(monkeypatch):
     expected = object()
     constructor = Mock(return_value=expected)
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
-    monkeypatch.setitem(
-        sys.modules, "tensorrt_llm._torch.disaggregation.transceiver_v2", fake_module
-    )
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
 
     result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
 
@@ -537,9 +535,7 @@ def test_python_nixl_transceiver_accepts_v2_mamba_manager(monkeypatch):
     expected = object()
     constructor = Mock(return_value=expected)
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
-    monkeypatch.setitem(
-        sys.modules, "tensorrt_llm._torch.disaggregation.transceiver_v2", fake_module
-    )
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
     manager = object.__new__(MambaHybridCacheManagerV2)
 
     result = transceiver_module.create_kv_cache_transceiver(
@@ -677,7 +673,7 @@ def test_cpp_capability_is_config_scoped(monkeypatch, backend, runtime, nixl_bac
 
 
 def test_python_transceiver_capability_defaults_to_unsupported():
-    from tensorrt_llm._torch.disaggregation.transceiver_v2 import KvCacheTransceiverV2
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
 

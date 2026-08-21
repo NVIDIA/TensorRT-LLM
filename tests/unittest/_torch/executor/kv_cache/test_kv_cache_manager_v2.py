@@ -144,7 +144,7 @@ def _make_manager_for_cache_tier_test(
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
-    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     with (
         patch(f"{module}.CuError", _CacheTierInitError),
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
