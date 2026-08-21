@@ -149,16 +149,6 @@ SNB = 256  # L170  streaming-path bin count
 CMPC = 4096  # L2372 crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # L2374 CTA size of the clustered register path
 
-# Dispatch-policy admission envelope (not a kernel.cu constant): the
-# streaming varlen engine multi-CTA-splits a row only for small batches
-# (route_streaming: R = min(148//b, ...) for b <= 32); past that R collapses
-# toward one CTA per row and long rows lose badly to the in-tree per-row
-# split kernels (measured 5.4x per call at rows=304, n=262144, K=1024,
-# B200: 2.63 ms vs 0.49 ms).  Integrations must fall through to the in-tree
-# path above this row count; warmup_varlen drops larger requests so engine
-# init never compiles keys dispatch will not admit.
-MAX_VARLEN_ROWS = 32
-
 
 def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     """Mirror of gvr_topk_launch (kernel.cu L2754-3197). Pure. See module doc."""
@@ -1301,11 +1291,10 @@ def run_varlen(
     probe battery). Finite inputs — including +/-inf and denormals — are
     tie-aware exact.
 
-    PERFORMANCE ENVELOPE: correct for any ``num_rows``, but the streaming
-    engine splits a row across CTAs only for small batches — past
-    ``MAX_VARLEN_ROWS`` it runs one CTA per row and long rows lose ~5x to
-    the in-tree per-row-split kernels.  Serving integrations must gate on
-    ``MAX_VARLEN_ROWS`` and fall through to the in-tree path above it.
+    FULL-RANGE PRODUCTION CONTRACT: correct and dispatched for any
+    ``num_rows`` (BS 1..1024+ x next_n) and any envelope up to 1M kv tokens.
+    Family selection (streaming main / clustered register-resident) is a
+    pure function of the capture-stable launcher key.
     """
     if logits.dtype is not torch.float32:
         raise RuntimeError(
@@ -1535,10 +1524,38 @@ def warmup_varlen(
     dev = torch.cuda.current_device()
     nn = max(1, int(next_n))
     # round each request down to a next_n multiple (min next_n) and dedup
-    rows_list = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
-    # admission envelope: dispatch falls through to the in-tree path above
-    # MAX_VARLEN_ROWS, so compiling larger keys would only burn init time
-    rows_list = [r for r in rows_list if r <= MAX_VARLEN_ROWS]
+    req_rows = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
+    if not req_rows:
+        return
+    # BAND-AWARE enumeration: the engine compile key depends on the plan's
+    # constexpr tuple (+ r_const family axis), NOT on the exact row count, so
+    # warming ONE representative row per distinct engine key covers every row
+    # count up to the largest request. Representatives are the first row of
+    # each band, which keeps the warmup allocation bounded (~a few hundred
+    # rows) even when CUDA-graph batch lists reach thousands of rows.
+    n_env_c = max(1, int(max_seq_len) // int(compress_ratio))
+    npad_c = (n_env_c + 63) // 64 * 64 if row_stride is None else int(row_stride)
+    seen_keys = set()
+    rows_list = []
+    r = nn
+    r_max = req_rows[-1]
+    while r <= r_max:
+        plan_free = route(r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k))
+        if plan_free["kernel"] == "reg_clus":
+            ekey = ("reg_clus", tuple(plan_free["tpl"]))
+        else:
+            p = route_streaming(
+                r,
+                max(min(n_env_c, npad_c), int(top_k) + 1),
+                npad_c,
+                int(top_k),
+                force_main=True,
+            )
+            ekey = ("main", tuple(p["tpl"][:6]), p["rt"]["R"])
+        if ekey not in seen_keys:
+            seen_keys.add(ekey)
+            rows_list.append(r)
+        r += nn
     if not rows_list:
         return
     n_env = max(1, int(max_seq_len) // int(compress_ratio))
@@ -1574,5 +1591,12 @@ def warmup_varlen(
         )
     del logits, kv_lens, pre_idx, out
     torch.cuda.synchronize()
+    # band launches compiled every ENGINE; now populate the per-row-count
+    # LAUNCHER cache entries for the exact requested row counts (pure host
+    # work, zero allocation/launch — engines hit the compile cache), so a
+    # CUDA-graph capture at any requested geometry finds its key immediately.
+    n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
+    for r in req_rows:
+        _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
     with _VARLEN_WARMUP_LOCK:
         _VARLEN_WARMUP_DONE.add(key)

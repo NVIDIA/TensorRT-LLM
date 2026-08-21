@@ -20,7 +20,6 @@ from .gvr_topk_decode import GvrParams, GvrTopKKernel
 from .gvr_topk_decode_direct import DirectTopKKernel
 from .gvr_topk_decode_dispatch import is_tiered_topk_supported, tiered_topk
 from .gvr_topk_decode_reg import GvrRegKernel
-from .gvr_topk_decode_self_sampling_host import MAX_VARLEN_ROWS as SELFSAMPLING_TOPK_MAX_ROWS
 from .gvr_topk_decode_self_sampling_host import run_varlen as selfsampling_topk_run_varlen
 from .gvr_topk_decode_tp import GvrTpKernel
 from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel
@@ -37,5 +36,4 @@ __all__ = [
     "tiered_topk",
     "is_tiered_topk_supported",
     "selfsampling_topk_run_varlen",
-    "SELFSAMPLING_TOPK_MAX_ROWS",
 ]

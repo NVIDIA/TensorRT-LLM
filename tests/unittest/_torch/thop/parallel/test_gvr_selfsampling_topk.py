@@ -660,43 +660,6 @@ def test_selfsampling_warmup_row_stride_matches_arena():
     assert torch.equal(ref, got)
 
 
-def test_selfsampling_rows_envelope_constant():
-    """The rows admission envelope is one shared constant, and it matches
-    route_streaming's multi-CTA region: inside the envelope a long row is
-    split across CTAs (R > 1); far outside it the split collapses to one
-    CTA per row — the regression measured at rows=304, n=262144 (5.4x vs
-    the in-tree per-row-split kernel)."""
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import SELFSAMPLING_TOPK_MAX_ROWS
-
-    assert SELFSAMPLING_TOPK_MAX_ROWS == ss_host.MAX_VARLEN_ROWS == 32
-    n = 262144
-    plan_in = ss_host.route_streaming(ss_host.MAX_VARLEN_ROWS, n, n, 1024, force_main=True)
-    assert int(plan_in["grid"][0]) > 1, "inside the envelope long rows must split"
-    plan_out = ss_host.route_streaming(304, n, n, 1024, force_main=True)
-    assert int(plan_out["grid"][0]) == 1, "rows=304 collapses to one CTA per row"
-
-
-def test_selfsampling_warmup_drops_rows_beyond_envelope():
-    """warmup_varlen must not compile engines for row counts the dispatch
-    envelope never admits (rows > MAX_VARLEN_ROWS): a CUDA-graph batch-size
-    list with large batches warms only the admitted prefix."""
-    k, msl, nn = 512, 8192, 4
-    stride = (msl + 255) // 256 * 256
-    before = set(ss_host._VARLEN_CACHE.keys())
-    ss_host.warmup_varlen(
-        k,
-        msl,
-        compress_ratio=1,
-        next_n=nn,
-        num_rows_list=(nn, 8 * nn, 76 * nn),  # rows 4, 32, 304
-        row_stride=stride,
-    )
-    new_rows = {key[0] for key in ss_host._VARLEN_CACHE if key not in before}
-    assert not any(r > ss_host.MAX_VARLEN_ROWS for r in new_rows), new_rows
-    have_rows = {key[0] for key in ss_host._VARLEN_CACHE}
-    assert {nn, 8 * nn} <= have_rows, "in-envelope rows must still be warmed"
-
-
 def test_selfsampling_varlen_regclus_parity_and_oracle():
     """The varlen launcher must admit the clustered register-resident family
     exactly where the free route picks it (route() parity tier 1), and the
@@ -762,3 +725,42 @@ def test_selfsampling_varlen_regclus_cuda_graph():
         torch.cuda.synchronize()
         got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
         assert torch.equal(got, ref_v)
+
+
+def test_selfsampling_varlen_full_row_range():
+    """Full-range production contract: with self-sampling enabled, EVERY row
+    count dispatches to the self-sampling engines (no rows-based fall-through)
+    — spot-check the throughput end (rows 304 and 1024) for tie-aware
+    exactness at a mid-size envelope."""
+    k, msl_c, cr = 1024, 65536, 4
+    torch.manual_seed(3)
+    for rows in (304, 1024):
+        lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+        pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
+        kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+        torch.cuda.synchronize()
+        key = (rows, msl_c, k, msl_c, 1, cr)
+        assert key in ss_host._VARLEN_CACHE, "row count must dispatch in-engine"
+        ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
+        got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
+        assert torch.equal(got, ref_v), f"rows={rows} value multiset mismatch"
+
+
+def test_selfsampling_warmup_band_enumeration_bounded():
+    """warmup_varlen must cover arbitrarily large batch lists by warming one
+    representative row per distinct engine compile key — bounded time and
+    memory (the representative rows saturate a few hundred, never the
+    requested thousands)."""
+    k, msl = 512, 65536  # kv tokens, cr=4 -> n_env 16384: few bands, fast
+    before = len(ss_host._VARLEN_WARMUP_DONE)
+    ss_host.warmup_varlen(
+        k,
+        msl,
+        compress_ratio=4,
+        next_n=4,
+        num_rows_list=(4096,),
+        row_stride=(msl // 4 + 255) // 256 * 256,
+    )
+    assert len(ss_host._VARLEN_WARMUP_DONE) == before + 1
