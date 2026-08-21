@@ -781,6 +781,85 @@ def test_selfsampling_varlen_reg_parity_and_oracle():
                 assert torch.equal(out[r], ref[r]), f"k={k} row {r} expected all -1"
 
 
+def test_selfsampling_varlen_clus_parity_and_oracle():
+    """The varlen launcher must admit the cluster-split family exactly where
+    the free route picks it (route() parity tier 3), and the per-row varlen
+    port must match the reference oracle on a heterogeneous batch: full rows,
+    mid rows BELOW the family's standalone admission floor (n <= SCAP,
+    exercising the always-on per-row QUAD schedule), a short row (n <= k,
+    in-kernel identity + -1 tail from cluster rank 0) and a zero-window row,
+    under MTP row windows (next_n=4). Covers CS=2 and CS=4 clusters."""
+    torch.manual_seed(23)
+    nn = 4
+    # (rows, msl_c, k, expected cluster size)
+    cases = [(64, 131072, 1024, 2), (32, 131072, 1024, 4)]
+    cr = 4
+    for rows, msl_c, k, want_cs in cases:
+        npad = msl_c
+        plan = ss_host.route(rows, msl_c, npad, k)
+        assert plan["kernel"] == "clus" and plan["cluster"] == want_cs, plan
+        batch = rows // nn
+        lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
+        pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
+        lens = [msl_c * cr, 900, nn - 1, 20000, 40000, 300000, msl_c * cr // 2, 5000]
+        kv = torch.tensor(
+            [lens[i % len(lens)] for i in range(batch)], dtype=torch.int32, device=_DEV
+        )
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+        key = (rows, npad, k, msl_c, nn, cr)
+        assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
+        ss_host.run_varlen(
+            lg,
+            pre,
+            kv,
+            ref,
+            next_n=nn,
+            compress_ratio=cr,
+            max_seq_len=msl_c * cr,
+            engine="reference",
+        )
+        torch.cuda.synchronize()
+        for r in range(rows):
+            if (ref[r] >= 0).any():
+                row = lg[r].float()
+                got = row[out[r].long().clamp_min(0)].sort().values
+                want = row[ref[r].long().clamp_min(0)].sort().values
+                assert torch.equal(got, want), f"cs={want_cs} row {r} value multiset mismatch"
+                assert torch.equal(out[r] < 0, ref[r] < 0), f"cs={want_cs} row {r} pad mask"
+            else:
+                assert torch.equal(out[r], ref[r]), f"cs={want_cs} row {r} expected all -1"
+
+
+def test_selfsampling_varlen_clus_cuda_graph():
+    """Cluster-split-family varlen engine must be CUDA-graph capturable:
+    warmed engine, capture one launch, replay twice, tie-aware exact each
+    time."""
+    k, msl_c, cr = 1024, 131072, 4
+    rows = 32
+    torch.manual_seed(29)
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    key = (rows, msl_c, k, msl_c, 1, cr)
+    assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
+    g = torch.cuda.CUDAGraph()
+    out.fill_(-7)
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
+    for _ in range(2):
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
+        assert torch.equal(got, ref_v)
+
+
 def test_selfsampling_varlen_reg_cuda_graph():
     """Register-family varlen engine must be CUDA-graph capturable: warmed
     engine, capture one launch, replay twice, tie-aware exact each time."""

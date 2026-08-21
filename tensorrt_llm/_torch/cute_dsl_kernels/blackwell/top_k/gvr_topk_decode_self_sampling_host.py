@@ -732,7 +732,7 @@ _VARLEN_CACHE = {}
 
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     """Capture-time varlen plan + compiled launcher (v1 = the gvr_main port,
-    universally correct across the envelope; the clus port follows).  Every
+    universally correct across the envelope; specialist tiers below).  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
     key = (num_rows, npad, k, n_env, next_n, cr)
@@ -773,6 +773,30 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
             "reg",
             fn,
             (rt_f["n"], rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+        )
+        _VARLEN_CACHE[key] = lc
+        return lc
+    # ---- route() parity, family tier 3: cluster split (clus) ---------------
+    # Same admission rule: exactly where the free route picks clus (the
+    # large-N mid-rows band). SCAP/CMP are launch-stable (pure functions of
+    # rows/CS/k — never of n) so the envelope values are the per-row values;
+    # the sampling-ladder scalars (SMP/TGT/Q/SS2/TGT2) are dead launch slots,
+    # re-derived per row in-kernel by the route_dynamic clus mirror
+    # (GvrMainKernel discipline). Per-row n / short-row handling in-kernel.
+    if plan_free["kernel"] == "clus":
+        rt_f = plan_free["rt"]
+        fn = dev.get_compiled__clus(
+            tuple(plan_free["tpl"]),
+            scap=rt_f["SCAP"],
+            cmp_=rt_f["CMP"],
+            varlen=True,
+            next_n=next_n,
+            cr_shift=cr_shift,
+        )
+        lc = (
+            "clus",
+            fn,
+            (n_eff, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0),
         )
         _VARLEN_CACHE[key] = lc
         return lc
@@ -1079,8 +1103,9 @@ def _build_launcher(b, n, npad, k):
     if fam == "clus":
         dev = _device()
         # compile key carries the smem-extent scalars (scap/cmp_); compiled
-        # ABI: (logits, pre_idx, out, n, npad, k, SCAP, CMP, SMP, TGT, Q,
-        #       SS2, TGT2) -- NO workspace (spec §4c)
+        # ABI: (logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP,
+        #       TGT, Q, SS2, TGT2) -- NO workspace (spec §4c); kv_lens is the
+        # dead varlen slot in batch-uniform mode (dummy, reg_clus precedent)
         fn = dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"])
         args = (
             rt["n"],
@@ -1094,7 +1119,11 @@ def _build_launcher(b, n, npad, k):
             rt["SS2"],
             rt["TGT2"],
         )
-        return (fn, args, False)
+
+        def _call(lg, pi, idx, _fn=fn, _args=args):
+            _fn(lg, pi, _dummy_kv(lg.get_device(), lg.device), idx, *_args)
+
+        return (_call, (), False)
     if fam == "reg_clus":
         dev = _device()
         # compiled ABI: (logits, pre_idx, kv_lens, out, n) -- kv_lens is the
@@ -1451,6 +1480,10 @@ def run_varlen(
             lc[1](lg, pre_idx, kv_lens, idx, lc[2])
         elif lc[0] == "reg":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, CMP, QC, smem)
+            lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
+        elif lc[0] == "clus":
+            # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
+            #                SCAP, CMP, dead DYN x5)
             lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
         else:
             _, fn, pre, tail = lc
