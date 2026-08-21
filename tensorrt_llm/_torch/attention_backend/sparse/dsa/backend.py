@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import math
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -26,29 +24,6 @@ from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
-
-_NVFP4_MAX_BLOCK_SCALE = 448.0
-_NVFP4_MAX_VALUE = 6.0
-_NVFP4_MLA_KV_CACHE_AMAX_ENV = "TRTLLM_NVFP4_MLA_KV_CACHE_AMAX"
-_NVFP4_MLA_KV_CACHE_DEFAULT_AMAX = 100.0
-
-
-def _get_nvfp4_mla_kv_cache_amax() -> float:
-    value = os.environ.get(
-        _NVFP4_MLA_KV_CACHE_AMAX_ENV,
-        str(_NVFP4_MLA_KV_CACHE_DEFAULT_AMAX),
-    )
-    try:
-        amax = float(value)
-    except ValueError as error:
-        raise ValueError(
-            f"{_NVFP4_MLA_KV_CACHE_AMAX_ENV} must be a positive finite float, got {value!r}"
-        ) from error
-    if not math.isfinite(amax) or amax <= 0:
-        raise ValueError(
-            f"{_NVFP4_MLA_KV_CACHE_AMAX_ENV} must be a positive finite float, got {value!r}"
-        )
-    return amax
 
 
 class DSATrtllmAttention(TrtllmAttention):
@@ -99,15 +74,6 @@ class DSATrtllmAttention(TrtllmAttention):
             attention_chunk_size=attention_chunk_size,
             **kwargs,
         )
-
-        if quant_config is not None and quant_config.layer_quant_mode.has_fp4_kv_cache():
-            kv_cache_amax = _get_nvfp4_mla_kv_cache_amax()
-            dequant_scale = kv_cache_amax / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE)
-            self.kv_cache_scaling_factor.fill_(dequant_scale)
-            self.kv_scale_quant_orig = self.kv_cache_scaling_factor
-            self.kv_scale_orig_quant = torch.full_like(
-                self.kv_cache_scaling_factor, 1.0 / dequant_scale
-            )
 
         # Cross-layer indexer sharing: only "full" layers own an indexer;
         # "shared" layers reuse the previous full layer's top-k (see
@@ -172,10 +138,16 @@ class DSATrtllmAttention(TrtllmAttention):
             if total_kv_tokens <= 0:
                 raise RuntimeError("NVFP4 DSA context has no active KV tokens")
             head_dim = metadata.kv_cache_manager.head_dim
+            # Static sparse FMHA may prefetch up to TopK rows even when a
+            # short context has fewer valid KV tokens.
+            scratch_capacity = max(total_kv_tokens, topk_indices.shape[1])
             scratch = torch.empty(
-                (total_kv_tokens, 1, head_dim),
+                (scratch_capacity, 1, head_dim),
                 dtype=torch.float8_e4m3fn,
                 device=topk_indices.device,
+            )
+            gather_scratch = (
+                scratch if scratch_capacity == total_kv_tokens else scratch[:total_kv_tokens]
             )
             compact_indices = torch.empty_like(topk_indices)
             torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather(
@@ -185,7 +157,7 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata._cached_req_idx_ctx,
                 metadata._cached_block_table_ctx,
                 metadata.ctx_kv_indptr[: metadata.num_contexts + 1],
-                scratch,
+                gather_scratch,
                 compact_indices,
                 self.kv_scale_quant_orig,
                 local_layer_idx,
