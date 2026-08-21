@@ -13,19 +13,19 @@ from transformers import LlamaConfig, PretrainedConfig
 from tensorrt_llm.logger import logger
 
 from ...functional import PositionEmbeddingType, RotaryScalingType
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.mla import MLA
+from ..attention.rotary_embedding import RotaryEmbedding
 from ..model_config import ModelConfig, TConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
-from ..modules.mla import MLA
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 
 try:
     from ..custom_ops import \

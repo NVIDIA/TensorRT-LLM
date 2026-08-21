@@ -108,7 +108,7 @@ from ..._utils import is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe

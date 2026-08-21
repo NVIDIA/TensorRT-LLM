@@ -552,7 +552,7 @@ public:
     // a plugin field or a constructor parameter
     int32_t mNbMultiBlockSemaphores = 0;
 
-    // See [Chunked Attention] in _torch/modules/attention.py
+    // See [Chunked Attention] in _torch/attention/attention.py
     std::optional<int64_t> mAttentionChunkSize = std::nullopt;
 
     // Skip softmax threshold scale factor.

@@ -13,7 +13,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend.trtllm import TrtllmAttentionMetadata
+from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import Buffers, get_memory_buffers

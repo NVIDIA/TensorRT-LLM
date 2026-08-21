@@ -28,14 +28,14 @@ import torch
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     MLAParams,
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSABackendForwardArgs, DSACacheManager
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSABackendForwardArgs, DSACacheManager
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str

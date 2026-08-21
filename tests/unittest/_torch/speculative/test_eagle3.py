@@ -31,9 +31,10 @@ from utils.util import (skip_blackwell, skip_num_gpus_less_than,
                         skip_pre_blackwell)
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSACacheManagerV2, DSAtrtllmAttentionMetadata)
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import \
+    TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor._util import \

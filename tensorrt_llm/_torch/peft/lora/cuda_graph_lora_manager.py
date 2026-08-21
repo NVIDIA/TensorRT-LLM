@@ -19,7 +19,7 @@ import torch
 
 from ...._utils import nvtx_range
 from ....logger import logger
-from ...attention_backend.interface import AttentionMetadata
+from ...attention.backends.interface import AttentionMetadata
 from ...pyexecutor.resource_manager import PeftCacheManager
 from ...pyexecutor.scheduler import ScheduledRequests
 from .adapter_slot_manager import AdapterSlotManager

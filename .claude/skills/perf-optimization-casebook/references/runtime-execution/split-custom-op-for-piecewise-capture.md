@@ -84,7 +84,7 @@ measured: []
   or fall back to the single-op eager path. Trigger: capture errors, an accuracy
   mismatch, or the split adding net overhead.
 - **Prior art:** PRs #12503, #12186. Files:
-  `tensorrt_llm/_torch/modules/attention.py` (`trtllm::mla_dsa_proj` + `register_fake`,
+  `tensorrt_llm/_torch/attention/attention.py` (`trtllm::mla_dsa_proj` + `register_fake`,
   `trtllm::mla_dsa_attn_inplace`, `forward_dsa_proj` / `forward_dsa_attn`,
   `_should_use_short_mha`), `tensorrt_llm/_torch/compilation/piecewise_optimizer.py`,
   `tensorrt_llm/_torch/compilation/utils.py` (`inplace_info`). Owning specialist:

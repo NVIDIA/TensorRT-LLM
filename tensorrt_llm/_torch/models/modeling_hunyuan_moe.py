@@ -10,11 +10,11 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
 from tensorrt_llm.functional import PositionEmbeddingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (CutlassFusedMoE, RenormalizeMoeRoutingMethod,

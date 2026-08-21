@@ -108,8 +108,8 @@ measured: []
   `cpp/tensorrt_llm/kernels/fmhaDispatcher.cpp` (`useSparseMLA()`, `mSparseMla`),
   `cpp/tensorrt_llm/kernels/.../fmhaReduction.cu`,
   `cpp/tensorrt_llm/common/attentionOp.cpp` (`mFP8ContextMLA`, K/V buffer sizing),
-  `tensorrt_llm/_torch/modules/attention.py` (`forward_absorption`,
-  `forward_generation_dsa`), `tensorrt_llm/_torch/attention_backend/sparse/dsa.py`
+  `tensorrt_llm/_torch/attention/attention.py` (`forward_absorption`,
+  `forward_generation_dsa`), `tensorrt_llm/_torch/attention/backends/sparse/dsa/metadata.py`
   (`sparse_mla_topk`). Owning specialist: **kernel-cuda-specialist**. Related: the
   [top-k selection kernel](specialize-topk-selection-kernel.md) (the producer of
   the indices), [split MLA reduction](split-mla-reduction-kernel.md) (the same

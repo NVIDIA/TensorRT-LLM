@@ -78,9 +78,10 @@ measured: []
   `q_split_threshold` to disable. Trigger: any boundary-length mismatch, an eager fallback
   regressing captured batches, or no benefit at the target lengths.
 - **Prior art:** PRs #9524, #11677, #11871. Files:
-  `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` (`prepare_dense_topk_indices`,
-  `skip_indexer_for_short_seqs`, `q_split_threshold`),
-  `tensorrt_llm/_torch/modules/attention.py` (`_should_use_short_mha`,
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/metadata.py` (`prepare_dense_topk_indices`),
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/params.py`
+  (`skip_indexer_for_short_seqs`, `q_split_threshold`),
+  `tensorrt_llm/_torch/attention/attention.py` (`_should_use_short_mha`,
   `forward_context_dsa`), `tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py`
   (`short_seq_len_mode`). Owning skills: **trtllm-serve-config-guide**,
   **perf-torch-cuda-graph-specialist**. Related: the

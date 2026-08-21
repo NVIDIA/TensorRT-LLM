@@ -25,7 +25,7 @@ import triton
 import triton.language as tl
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (

@@ -55,7 +55,7 @@ Sparse attention has two configuration layers.
   VisualGen. They are the Python/YAML surface and may also merge data
   from checkpoint `config.json`.
 - **Lowered sparse params** live under
-  `tensorrt_llm/_torch/attention_backend/sparse/`. They are backend-owned
+  `tensorrt_llm/_torch/attention/backends/sparse/`. They are backend-owned
   runtime objects consumed by attention implementations and metadata
   builders.
 
@@ -151,7 +151,7 @@ Different KV heads are allowed to emit different sparse index sets; Q
 heads that map to the same KV head share the KV head's sparse pattern.
 
 Algorithm implementations live under
-`tensorrt_llm/_torch/attention_backend/sparse/`:
+`tensorrt_llm/_torch/attention/backends/sparse/`:
 
 - `rocket/` — RocketKV backend, metadata, cache manager, parameters, and kernels.
 - `dsa/` — DSA backend, indexer, metadata, cache manager, parameters, custom ops, and kernels.
@@ -239,7 +239,7 @@ the bottom of the file.
 
 Create a new backend class inheriting from `TrtllmAttention` (or
 `VanillaAttention` if appropriate) in
-`tensorrt_llm/_torch/attention_backend/sparse/`. Override one or both
+`tensorrt_llm/_torch/attention/backends/sparse/`. Override one or both
 prediction methods.
 
 **`sparse_kv_predict(self, q, k, metadata, forward_args)`**
@@ -296,7 +296,7 @@ If the algorithm needs extra tensors beyond the main KV cache:
 ### 4. Registration and dispatch
 
 - Register the new config + backend in
-  `tensorrt_llm/_torch/attention_backend/sparse/registry.py` and
+  `tensorrt_llm/_torch/attention/backends/sparse/registry.py` and
   `tensorrt_llm/_torch/pyexecutor/_util.py` so the runtime routes
   requests to your backend when the config is present.
 - If the algorithm customizes module-layer behavior, implement and register a
@@ -317,7 +317,7 @@ framework wiring is:
 - A lowered `SparseParams` object that carries the resolved kernel
   settings.
 - A switch inside the attention backend (e.g.,
-  `_torch/attention_backend/trtllm_gen.py`) that reads the lowered params
+  `_torch/attention/backends/fmha/flashinfer_trtllm_gen.py`) that reads the lowered params
   and enables the kernel-side fast path.
 
 Skip Softmax Attention follows this pattern — see the

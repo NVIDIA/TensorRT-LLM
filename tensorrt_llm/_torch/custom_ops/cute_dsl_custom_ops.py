@@ -9030,7 +9030,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # =========================================================================
     # MLA decode (Blackwell) - wraps the CuTe DSL kernels that live at
     # tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/.
-    # Used by the cute_dsl_mla FMHA library (see attention_backend/fmha/cute_dsl_mla.py).
+    # Used by the cute_dsl_mla FMHA library (see attention/backends/fmha/cute_dsl_mla.py).
     # =========================================================================
 
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import \
