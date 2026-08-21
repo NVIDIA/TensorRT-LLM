@@ -27,6 +27,7 @@ Override checkpoint:
 import gc
 import json
 import os
+from collections.abc import Generator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,6 +57,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
+from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
@@ -655,19 +658,30 @@ class TestDefaultNegativePrompt:
 
 
 @pytest.fixture(scope="class")
-def cosmos3_pipeline():
-    checkpoint = _require_checkpoint()
-    pipeline = _load_pipeline(checkpoint)
-    yield pipeline
-    del pipeline
-    gc.collect()
-    torch.cuda.empty_cache()
+def cosmos3_pipeline() -> Generator[Cosmos3OmniMoTPipeline, None, None]:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
+        checkpoint = _require_checkpoint()
+        pipeline = _load_pipeline(checkpoint)
+        yield pipeline
+        del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.integration
 @pytest.mark.cosmos3_t2v
 @pytest.mark.high_cuda_memory
 class TestCosmos3T2V:
+    def test_native_wan_vae_is_default(self, cosmos3_pipeline: Cosmos3OmniMoTPipeline) -> None:
+        assert isinstance(cosmos3_pipeline.vae, WanVAE)
+
+        config = cosmos3_pipeline.vae.config
+        assert len(config.latents_mean) == config.z_dim
+        assert len(config.latents_std) == config.z_dim
+        assert config.scale_factor_spatial == cosmos3_pipeline.vae_scale_factor_spatial
+        assert config.scale_factor_temporal == cosmos3_pipeline.vae_scale_factor_temporal
+
     def test_t2v_smoke(self, cosmos3_pipeline):
         result = _run_forward(cosmos3_pipeline, image=None, num_frames=NUM_FRAMES)
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
