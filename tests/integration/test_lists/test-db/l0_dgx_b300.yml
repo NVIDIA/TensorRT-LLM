@@ -15,7 +15,10 @@ l0_dgx_b300:
       stage: post_merge
       backend: pytorch
   tests:
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py --ignore=unittest/_torch/attention/test_rotary_embedding.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py --ignore=unittest/_torch/attention/test_rotary_embedding.py
+  # Own entry (and ignored above): rebinds mpi4py's serializer process-wide at
+  # import time, so it must not share a pytest process with the attention suite.
+  - unittest/_torch/attention/test_mla_helix.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
