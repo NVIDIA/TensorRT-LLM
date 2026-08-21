@@ -337,6 +337,36 @@ def test_load_collectable_entries_missing_returns_none(mod, tmp_path):
     assert mod.load_collectable_entries(str(tmp_path)) is None
 
 
+def test_verify_qa_test_lists_clears_stale_file(mod, tmp_path, monkeypatch):
+    """A pre-existing qa_test.txt must not leak stale IDs into parity.
+
+    verify_qa_test_lists opens qa_test.txt in append mode, so without the
+    up-front removal a stale entry left by an earlier checkout or a retried run
+    would survive and be treated as collectable by compute_parity -- letting a
+    now-invalid static acceptance falsely pass the parity gate. Stub the runtime
+    pytest --co / shell calls, keep the file I/O real, and assert the stale line
+    is gone and only the current QA def list's entries remain.
+    """
+    llm_src = tmp_path
+    qa_dir = llm_src / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    qa_def = qa_dir / "l0_a10.txt"
+    qa_def.write_text("accuracy/test_new.py::test_current[a] TIMEOUT 90\n", encoding="utf-8")
+    # Stale artifact from an earlier run, in the append target.
+    (llm_src / "qa_test.txt").write_text("accuracy/test_old.py::test_stale[b]\n", encoding="utf-8")
+
+    # Stub the runtime pytest --co and the rm/ls shell-outs; the real removal
+    # and append file I/O is what we exercise.
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(mod.subprocess, "check_output", lambda *a, **k: f"{qa_def}\n".encode())
+
+    mod.verify_qa_test_lists(str(llm_src))
+
+    result = (llm_src / "qa_test.txt").read_text().splitlines()
+    assert "accuracy/test_old.py::test_stale[b]" not in result
+    assert result == ["accuracy/test_new.py::test_current[a]"]
+
+
 # --------------------------------------------------------------------------
 # module-const soundness against in-place mutation / rebinding
 # --------------------------------------------------------------------------
