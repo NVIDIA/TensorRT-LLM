@@ -15,7 +15,7 @@ l0_h100:
       orchestrator: mpi
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/attention
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - unittest/_torch/executor
@@ -23,13 +23,11 @@ l0_h100:
   - unittest/others/test_lora_manager.py
   - unittest/_torch/misc
   # ------------- modules (non-MoE) ---------------
-  - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
-  - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   - unittest/_torch/modules/test_w4a16_nvfp4_linear.py
@@ -61,10 +59,13 @@ l0_h100:
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/speculative/test_capture_sampling_params.py
   - unittest/_torch/thop/parallel
+  - unittest/_torch/attention/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/parallel_hw_agnostic
+  - unittest/_torch/attention/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/kernels/parallel_hw_agnostic
   - unittest/_torch/thop/serial
+  - unittest/_torch/attention/kernels/serial
   # Only key models in H100: llama/gemma/gpt-oss
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gemma3"

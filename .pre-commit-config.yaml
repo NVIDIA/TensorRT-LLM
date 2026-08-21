@@ -555,6 +555,7 @@ common-files: &common_files |
         tests/unittest/_torch/attention/test_attention_mla.py |
         tests/unittest/_torch/attention/test_attention_no_cache.py |
         tests/unittest/_torch/attention/test_flashinfer_attention.py |
+        tests/unittest/_torch/attention/test_rotary_embedding.py |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
@@ -587,7 +588,6 @@ common-files: &common_files |
         tests/unittest/_torch/modeling/test_modeling_siglip.py |
         tests/unittest/_torch/modeling/test_modeling_vila.py |
         tests/unittest/_torch/modules/test_group_rmn_norm.py |
-        tests/unittest/_torch/modules/test_rotary_embedding.py |
         tests/unittest/_torch/modules/test_triton_linear.py |
         tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py |
         tests/unittest/_torch/moe/test_fused_moe.py |
@@ -1318,6 +1318,7 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/attention/test_attention_mla.py |
         tests/unittest/_torch/attention/test_attention_no_cache.py |
         tests/unittest/_torch/attention/test_flashinfer_attention.py |
+        tests/unittest/_torch/attention/test_rotary_embedding.py |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
@@ -1350,7 +1351,6 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/modeling/test_modeling_siglip.py |
         tests/unittest/_torch/modeling/test_modeling_vila.py |
         tests/unittest/_torch/modules/test_group_rmn_norm.py |
-        tests/unittest/_torch/modules/test_rotary_embedding.py |
         tests/unittest/_torch/modules/test_triton_linear.py |
         tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py |
         tests/unittest/_torch/moe/test_fused_moe.py |

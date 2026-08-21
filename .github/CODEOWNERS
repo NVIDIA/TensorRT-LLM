@@ -133,7 +133,6 @@
 /tensorrt_llm/usage @NVIDIA/trt-llm-runtime-devs
 /tests/torch @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/compilation @NVIDIA/trt-llm-runtime-devs
-/tests/unittest/_torch/custom_ops @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/distributed @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/executor @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/peft @NVIDIA/trt-llm-runtime-devs
@@ -324,16 +323,12 @@
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
 /tests/scripts/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/custom_ops/test_fused_inv_rope_fp8_quant.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/modules/helix_test_utils.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/modules/test_mha_helix.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/modules/test_mla_helix.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/modules/test_rotary_embedding.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/thop/parallel/test_indexer_topk.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fused_qk_norm_rope.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/thop/parallel_hw_agnostic/test_helix_postprocess.py @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/thop/serial/test_fused_cat_fp8.py @NVIDIA/trt-llm-torch-attention-devs
+# The two files below moved in from directories owned by the Runtime team, which
+# stays on as a co-owner so that no reviewer loses sight of a file they had.
+/tests/unittest/_torch/attention/test_mla_registry.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-runtime-devs
+# Also exercises the sliding-block-table op that the sparse cache manager owns,
+# so a change to either side routes to that team as well.
+/tests/unittest/_torch/attention/kernels/test_deepseek_v4_block_table.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-runtime-devs
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
