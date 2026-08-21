@@ -22,7 +22,7 @@ The helpers are shared by the LLM and VisualGen pipelines.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, ClassVar, Dict, Literal, Optional, Union
 
 import numexpr
 import torch
@@ -417,5 +417,6 @@ class SkipSoftmaxScheduler:
 class SkipSoftmaxParams(SparseParams):
     """Skip-softmax backend parameters."""
 
+    uses_framework_prediction: ClassVar[bool] = False
     algorithm: Literal["skip_softmax"] = field(init=False, default="skip_softmax")
     scheduler: SkipSoftmaxScheduler = field(default_factory=SkipSoftmaxScheduler)

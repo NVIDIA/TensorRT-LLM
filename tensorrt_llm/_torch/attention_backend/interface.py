@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import weakref
 from collections import namedtuple
@@ -27,6 +42,7 @@ from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
+from .sparse.block_sparse import BlockSparseForwardInputs
 from .sparse.params import SkipSoftmaxKernelParams, SparseMetadataParams
 
 try:
@@ -969,6 +985,7 @@ class AttentionForwardArgs:
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
+    block_sparse_inputs: Optional[BlockSparseForwardInputs] = None
 
     sparse_prediction: SparsePrediction = field(
         default_factory=SparsePrediction)

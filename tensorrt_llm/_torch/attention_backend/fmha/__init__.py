@@ -20,6 +20,7 @@ from .interface import Fmha
 from .msa_sparse_gqa import MsaSparseGqaFmha
 from .phased import FmhaParams, PhasedFmha
 from .prims_ts import PrimsTSFmha
+from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
 from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_lib_classes
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "FmhaParams",
     "MsaSparseGqaFmha",
     "PhasedFmha",
+    "PrimsTSBlockSparseFmha",
     "PrimsTSFmha",
     "get_enabled_fmha_lib_classes",
 ]

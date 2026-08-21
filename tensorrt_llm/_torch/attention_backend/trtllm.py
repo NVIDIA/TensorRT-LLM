@@ -17,6 +17,7 @@ import functools
 import math
 import os
 import weakref
+from collections.abc import MutableMapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -41,6 +42,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .sparse.block_sparse import BlockSparseParams
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 
@@ -1216,6 +1218,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
+        attention_metadata_state: Optional[MutableMapping[str, object]] = None,
         **kwargs,
     ):
         """
@@ -1235,6 +1238,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        # Callers may supply one state per serialized execution component. FMHA
+        # implementations may use it for plans and graph-stable workspaces that
+        # span its attention layers. Core TRTLLM does not otherwise interpret
+        # the state or its backend-specific keys.
+        self.attention_metadata_state = attention_metadata_state
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
@@ -1510,6 +1518,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata,
             TrtllmAttentionMetadata,
         )
+        has_block_sparse_params = isinstance(self.sparse_params,
+                                             BlockSparseParams)
+        has_block_sparse_inputs = forward_args.block_sparse_inputs is not None
+        if has_block_sparse_params != has_block_sparse_inputs:
+            raise ValueError(
+                "BlockSparseParams and block_sparse_inputs must be provided together."
+            )
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
@@ -1608,11 +1623,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 seq_start=num_ctx,
             )
 
-        # RocketKV and DSA predict which blocks to keep, so build their sparse
-        # index tensors here. Skip-softmax needs no prediction.
+        # Framework-predicted sparse algorithms build their index tensors here.
+        # Kernel-routed algorithms carry their own per-forward inputs instead.
         sparse_params = self.sparse_params
-        if (sparse_params is not None
-                and not isinstance(sparse_params, SkipSoftmaxParams)):
+        if sparse_params is not None and sparse_params.uses_framework_prediction:
             kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
                                                     forward_args)
             at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
@@ -1677,7 +1691,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     assert k.shape[1] == kv_hidden_size
                     assert v.shape[1] == kv_hidden_size
             num_tokens = q.shape[0]
-            if k is not None and not metadata.is_cross:
+            # Generic block-sparse routes explicitly describe independent Q
+            # and KV geometries. Other separate-QKV self-attention paths keep
+            # the historical equal-token contract.
+            if (k is not None and not metadata.is_cross
+                    and not isinstance(self.sparse_params, BlockSparseParams)):
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:

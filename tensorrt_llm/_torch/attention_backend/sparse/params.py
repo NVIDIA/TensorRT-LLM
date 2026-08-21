@@ -24,6 +24,7 @@ attention-forward contract.
 """
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 
 class SparseParams:
@@ -36,6 +37,8 @@ class SparseParams:
     """
 
     algorithm: str
+    uses_framework_prediction: ClassVar[bool] = True
+    allows_fallback_fmha: ClassVar[bool] = True
 
 
 class SparseMetadataParams:

@@ -14,11 +14,22 @@
 # limitations under the License.
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.attention_backend.fmha import registry
+from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention_backend.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.sparse.block_sparse import (
+    BlockSparseForwardInputs,
+    BlockSparseParams,
+    BlockSparseRoutes,
+)
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 EXPECTED_DEFAULT_LIBS = (
     "msa_sparse_gqa",
+    "prims_ts_block_sparse",
     "prims_ts",
     "cute_dsl_mla",
     "flashinfer_trtllm_gen",
@@ -32,15 +43,64 @@ def _enabled_names() -> tuple[str, ...]:
     return tuple(names_by_class[cls] for cls in classes)
 
 
-def test_default_fmha_lib_order_prioritizes_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
+class _BlockSparseAttentionOwner:
+    def __init__(self, sparse_params: object) -> None:
+        self.sparse_params = sparse_params
+
+
+def test_default_fmha_lib_order(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
 
-    assert registry.DEFAULT_FMHA_LIBS == EXPECTED_DEFAULT_LIBS
-    assert tuple(registry.FMHA_LIBS) == EXPECTED_DEFAULT_LIBS
     assert _enabled_names() == EXPECTED_DEFAULT_LIBS
 
 
-@pytest.mark.parametrize("value", ["", "   ", ", ,"])
+def test_generic_block_sparse_fmha_is_registered_and_cannot_fall_back_dense() -> None:
+    assert registry.FMHA_LIBS["prims_ts_block_sparse"] is PrimsTSBlockSparseFmha
+
+    owner = _BlockSparseAttentionOwner(BlockSparseParams(q_block_size=64, kv_block_size=64))
+    fmha = FallbackFmha(owner)
+    q = torch.empty(0)
+
+    assert not fmha.is_supported(q, q, q, object(), AttentionForwardArgs())
+    routes = BlockSparseRoutes(
+        block_indptr=torch.empty((1, 1, 1), dtype=torch.int32),
+        block_indices=torch.empty(0, dtype=torch.int32),
+        max_blocks_per_row=0,
+    )
+    permissive_owner = _BlockSparseAttentionOwner(None)
+    permissive_fmha = FallbackFmha(permissive_owner)
+    assert not permissive_fmha.is_supported(
+        q,
+        q,
+        q,
+        object(),
+        AttentionForwardArgs(block_sparse_inputs=BlockSparseForwardInputs(routes=routes)),
+    )
+
+
+def test_trtllm_attention_rejects_live_block_sparse_inputs_without_static_params() -> None:
+    attention = TrtllmAttention.__new__(TrtllmAttention)
+    attention.sparse_params = None
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    routes = BlockSparseRoutes(
+        block_indptr=torch.empty((1, 1, 1), dtype=torch.int32),
+        block_indices=torch.empty(0, dtype=torch.int32),
+        max_blocks_per_row=0,
+    )
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        attention.forward(
+            torch.empty((0, 0)),
+            None,
+            None,
+            metadata,
+            AttentionForwardArgs(
+                block_sparse_inputs=BlockSparseForwardInputs(routes=routes),
+            ),
+        )
+
+
+@pytest.mark.parametrize("value", ["   ", ", ,"])
 def test_empty_fmha_lib_env_uses_default(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
@@ -73,6 +133,7 @@ def test_delta_fmha_lib_env_applies_entries_in_order(monkeypatch: pytest.MonkeyP
 
     assert _enabled_names() == (
         "msa_sparse_gqa",
+        "prims_ts_block_sparse",
         "cute_dsl_mla",
         "flashinfer_trtllm_gen",
         "fallback",

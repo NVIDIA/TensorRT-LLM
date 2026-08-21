@@ -28,13 +28,15 @@ FmhaCls: TypeAlias = type[Fmha]
 def init_fmha_libs() -> dict[str, "FmhaCls"]:
     """Build the ordered FMHA library registry.
 
-    MSA is imported inside this factory because it imports TRT-LLM attention
-    classes at module scope and would otherwise create an import cycle.
+    Sparse FMHA implementations are imported inside this factory to keep their
+    dependencies from participating in package initialization cycles.
     """
     from .msa_sparse_gqa import MsaSparseGqaFmha
+    from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
 
     return {
         "msa_sparse_gqa": MsaSparseGqaFmha,
+        "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
         "prims_ts": PrimsTSFmha,
         "cute_dsl_mla": CuteDslMlaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,

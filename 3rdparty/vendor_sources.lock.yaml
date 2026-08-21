@@ -1,9 +1,9 @@
 schema_version: 1
 vendors:
   flashinfer-prims-ts:
-    url: ssh://git@gitlab-master.nvidia.com:12051/yuhangh/flashinfer.git
+    url: https://github.com/heyuhhh/flashinfer.git
     branch: user/yuhangh/primts-block-sparse-live
-    commit: c5226139cc158685c96e273478a7f24eb13978c0
+    commit: 49e8f17c90b7aab0b6e109f6642ddb911070ad97
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention_backend/prims_ts
     include:

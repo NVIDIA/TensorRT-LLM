@@ -37,6 +37,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
         "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
         "timestep",  # used to populate skip-softmax params in ``TrtllmAttention.forward``
+        "block_sparse_inputs",  # consumed only by the generic block-sparse FMHA implementation
     }
 )
 
@@ -48,6 +49,22 @@ _THOP_LITERALS: dict = {}
 
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
+
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        """Reject semantic inputs that the dense THOP fallback cannot consume."""
+
+        del q, k, v, metadata
+        sparse_params = self.attn.sparse_params
+        return forward_args.block_sparse_inputs is None and (
+            sparse_params is None or sparse_params.allows_fallback_fmha
+        )
 
     def forward(
         self,
