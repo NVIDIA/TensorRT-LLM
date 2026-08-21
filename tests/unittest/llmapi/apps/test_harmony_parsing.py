@@ -1474,43 +1474,41 @@ class TestStripIncompleteMessagesReporting:
     def test_malformed_non_tool_message_does_not_blame_a_tool_call(self, adapter):
         """A dropped final message must not be reported as a lost tool call.
 
-        The stop-token branch fires for any complete-but-malformed message.
-        Claiming "a tool call for unknown recipient has been dropped" when no
-        recipient existed sends users chasing a call that never happened.
+        The stop-token branch fires for any complete-but-malformed message,
+        but the report used to assert unconditionally that "a tool call for
+        unknown recipient has been dropped". When a final or analysis message
+        is what was lost, that sends users chasing a call that never happened.
+
+        This drives _log_discarded_tokens directly. Routing an equivalent
+        stream through harmony_output_to_openai makes the harmony parser fail
+        outright, so the discard branch is never reached and the assertions
+        below would pass vacuously against the generic parse-failure warning.
         """
         try:
             from openai_harmony import Conversation, Message, Role
         except (ImportError, ModuleNotFoundError):
             pytest.skip("openai_harmony not importable")
 
-        analysis = Message.from_role_and_content(
-            Role.ASSISTANT, "Simple question, answer directly."
-        ).with_channel("analysis")
         final = Message.from_role_and_content(Role.ASSISTANT, "The answer is 42.").with_channel(
             "final"
         )
-        tokens = list(
-            adapter.encoding.render_conversation(Conversation.from_messages([analysis, final]))
-        )[2:]
-
-        message_token = 200008  # <|message|>
-        idx = len(tokens) - 1 - tokens[::-1].index(message_token)
-        # Complete-but-malformed final message, carrying a stop token.
-        malformed = tokens[:idx] + tokens[idx + 1 :] + [adapter.get_stop_tokens()[0]]
+        # Complete but malformed, with no "to=" recipient and a trailing stop
+        # token, so reporting takes the stop-token branch.
+        discarded = list(adapter.encoding.render_conversation(Conversation.from_messages([final])))[
+            2:
+        ] + [adapter.get_stop_tokens()[0]]
+        assert "to=" not in adapter._safe_decode_utf8(discarded), "span must carry no recipient"
 
         with patch("tensorrt_llm.serve.harmony_adapter.logger") as mock_logger:
-            adapter.harmony_output_to_openai(
-                harmony_output_tokens=malformed,
-                available_tools=None,
-                tool_choice=None,
-            )
+            adapter._log_discarded_tokens(discarded)
 
         assert mock_logger.warning.called, "malformed message was dropped silently"
         logged = " ".join(str(c) for c in mock_logger.warning.call_args_list)
         assert "tool call" not in logged, "no tool call was involved"
         assert "unknown recipient" not in logged
 
-    def test_non_functions_recipient_is_named(self, adapter):
+    @pytest.mark.parametrize("recipient", ["browser.search", "python"])
+    def test_non_functions_recipient_is_named(self, adapter, recipient):
         """Recipients outside "functions." are tool calls too, and get named.
 
         The streaming path treats any recipient other than "assistant" as a
@@ -1522,28 +1520,41 @@ class TestStripIncompleteMessagesReporting:
         except (ImportError, ModuleNotFoundError):
             pytest.skip("openai_harmony not importable")
 
+        # The leading analysis message matters: render_conversation()[2:] drops
+        # the first message's <|start|>, so a lone tool message would have no
+        # <|start|> to strip back to and would fail parsing outright instead of
+        # being discarded and reported.
+        analysis = Message.from_role_and_content(
+            Role.ASSISTANT, "Decide which tool to call."
+        ).with_channel("analysis")
         tool = (
             Message.from_role_and_content(Role.ASSISTANT, '{"query": "weather"}')
             .with_channel("commentary")
-            .with_recipient("browser.search")
+            .with_recipient(recipient)
             .with_content_type("<|constrain|>json")
         )
-        tokens = list(adapter.encoding.render_conversation(Conversation.from_messages([tool])))[2:]
+        tokens = list(
+            adapter.encoding.render_conversation(Conversation.from_messages([analysis, tool]))
+        )[2:]
 
         message_token = 200008  # <|message|>
         idx = len(tokens) - 1 - tokens[::-1].index(message_token)
         malformed = tokens[:idx] + tokens[idx + 1 :]
 
         with patch("tensorrt_llm.serve.harmony_adapter.logger") as mock_logger:
-            adapter.harmony_output_to_openai(
+            result = adapter.harmony_output_to_openai(
                 harmony_output_tokens=malformed,
                 available_tools=None,
                 tool_choice=None,
             )
 
-        assert mock_logger.warning.called, "browser tool call was dropped silently"
+        # Guards against a vacuous pass: the surviving prefix must have parsed,
+        # so the warning below is the discard report rather than a parse
+        # failure whose "Raw output:" echo happens to contain the recipient.
+        assert not result.get("_harmony_parsing_failed", False)
+        assert mock_logger.warning.called, f"{recipient} tool call was dropped silently"
         logged = " ".join(str(c) for c in mock_logger.warning.call_args_list)
-        assert "browser.search" in logged
+        assert recipient in logged
         assert "unknown recipient" not in logged
 
 
