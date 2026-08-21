@@ -2,7 +2,7 @@
  * Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d.cpp
  * Copyright (c) 2024, Tri Dao.
  *
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
+#include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -55,6 +56,31 @@ namespace torch_ext
     {                                                                                                                  \
         AT_ERROR(#NAME, " not implemented for input type '", toString(ITYPE), "'");                                    \
     }
+
+namespace
+{
+//! Byte range [begin, end) actually addressed by a (possibly strided) tensor.
+std::pair<char const*, char const*> addressedBytes(at::Tensor const& t)
+{
+    int64_t last = 0;
+    for (int64_t d = 0; d < t.dim(); ++d)
+    {
+        if (t.size(d) > 0)
+        {
+            last += (t.size(d) - 1) * t.stride(d);
+        }
+    }
+    auto const* begin = static_cast<char const*>(t.data_ptr());
+    return {begin, begin + (last + 1) * t.element_size()};
+}
+
+bool tensorsOverlap(at::Tensor const& a, at::Tensor const& b)
+{
+    auto const [a0, a1] = addressedBytes(a);
+    auto const [b0, b1] = addressedBytes(b);
+    return a0 < b1 && b0 < a1;
+}
+} // namespace
 
 void set_conv_params_fwd(tensorrt_llm::kernels::causal_conv1d::ConvParamsBase& params,
     // sizes
@@ -103,7 +129,11 @@ void causalConv1dFwd(at::Tensor const& x, at::Tensor const& weight, std::optiona
     bool silu_activation,
     // used to identify padding entries if cache_indices provided
     // in case of padding, the kernel will return early
-    int64_t pad_slot_id)
+    int64_t pad_slot_id,
+    // optional destination.  Defaults to writing back into x (in-place, the historical
+    // behaviour).  Pass an explicit tensor to control the output layout - in particular to keep
+    // a token-major result and avoid transposing around this op.
+    std::optional<at::Tensor> const& out_)
 {
     auto input_type = x.scalar_type();
     auto weight_type = weight.scalar_type();
@@ -163,7 +193,13 @@ void causalConv1dFwd(at::Tensor const& x, at::Tensor const& weight, std::optiona
         CHECK_SHAPE(cache_indices_, batch_size);
     }
 
-    at::Tensor out = x;
+    at::Tensor out = out_.has_value() ? out_.value() : x;
+    if (out_.has_value())
+    {
+        TORCH_CHECK(out.scalar_type() == input_type, "out must have the same dtype as x");
+        TORCH_CHECK(out.is_cuda());
+        TORCH_CHECK(out.sizes() == x.sizes(), "out must have the same shape as x");
+    }
 
     tensorrt_llm::kernels::causal_conv1d::ConvParamsBase params;
     set_conv_params_fwd(params, batch_size, dim, seqlen, width, x, weight, out, bias_, silu_activation, pad_slot_id,
@@ -184,13 +220,39 @@ void causalConv1dFwd(at::Tensor const& x, at::Tensor const& weight, std::optiona
         params.conv_states_ptr = nullptr;
     }
 
+    // Pick the kernel from the memory layout.  `causal_conv1d_fwd_kernel` walks the token axis
+    // with unit stride (and vectorises across it), so it is only correct for a token-contiguous
+    // x.  A channel-contiguous (token-major) x instead goes to the channel-last kernel, which
+    // saves the caller the pair of transposes it would otherwise need.
+    bool const channel_last = params.x_c_stride == 1 && params.x_l_stride > 1 && dim > 1;
+
     // Otherwise the kernel will be launched from cuda:0 device
     // Static cast to signed char (AKA c10::DeviceIndex - the input to CUDAGuard) to avoid compiler warning about
     // narrowing
     at::cuda::CUDAGuard device_guard{static_cast<signed char>(x.get_device())};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_fwd",
-        [&] { tensorrt_llm::kernels::causal_conv1d::causal_conv1d_fwd_cuda<input_t, weight_t>(params, stream); });
+    if (channel_last)
+    {
+        TORCH_CHECK(params.out_c_stride == 1 && params.out_l_stride > 1,
+            "causal_conv1d_fwd: a channel-last x needs a channel-last out; pass `out` explicitly");
+        // The channel-last kernel chunks each sequence along the token axis and every chunk reads
+        // a (width-1)-token halo written by its predecessor, so overlapping out with x would race
+        // across blocks (the kernel also marks both pointers __restrict__).
+        TORCH_CHECK(!tensorsOverlap(x, out),
+            "causal_conv1d_fwd: the channel-last path cannot run in-place; `out` must not overlap x");
+        DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_channellast_fwd",
+            [&] {
+                tensorrt_llm::kernels::causal_conv1d::causal_conv1d_channellast_fwd_cuda<input_t, weight_t>(
+                    params, stream);
+            });
+    }
+    else
+    {
+        TORCH_CHECK(params.out_l_stride == params.x_l_stride && params.out_c_stride == params.x_c_stride,
+            "causal_conv1d_fwd: out must have the same layout as x for the channel-major kernel");
+        DISPATCH_WTYPE_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_fwd",
+            [&] { tensorrt_llm::kernels::causal_conv1d::causal_conv1d_fwd_cuda<input_t, weight_t>(params, stream); });
+    }
 }
 
 void causalConv1dUpdate(at::Tensor const& x, at::Tensor const& conv_state, at::Tensor const& weight,
@@ -304,7 +366,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? cache_indices,"
         "Tensor? has_initial_state,"
         "bool silu_activation,"
-        "int pad_slot_id) -> ()");
+        "int pad_slot_id,"
+        "Tensor!? out=None) -> ()");
 
     m.def(
         "causal_conv1d_update(Tensor! x,"
