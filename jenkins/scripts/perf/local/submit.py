@@ -879,15 +879,22 @@ def main():
         # with any per-role ctx_worker_env_var / gen_worker_env_var from yaml.
         ctx_worker_env_var = env_config.get("ctx_worker_env_var", "")
         gen_worker_env_var = env_config.get("gen_worker_env_var", "")
+        # FLASHINFER_WORKSPACE_BASE/FLASHINFER_CUBIN_DIR keep FlashInfer's JIT
+        # workspace and cubin cache (including their file locks and mmapped
+        # artifacts) on node-local storage. Without them llmapi.mpi_session
+        # falls back to ~/.cache inside the container, which can sit on a
+        # shared filesystem where flock/mmap are unreliable (ESTALE/SIGBUS).
         ctx_worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{ctx_tllm_profile_start_stop}' "
-            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+            f"FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_ws_\\${{SLURM_LOCALID}} "
+            f"FLASHINFER_CUBIN_DIR=/tmp/flashinfer_cubin_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
             f"{ctx_worker_env_var}"
         )
         gen_worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{gen_tllm_profile_start_stop}' "
-            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+            f"FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_ws_\\${{SLURM_LOCALID}} "
+            f"FLASHINFER_CUBIN_DIR=/tmp/flashinfer_cubin_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
             f"{gen_worker_env_var}"
         )
@@ -980,7 +987,8 @@ def main():
     else:
         worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{tllm_profile_start_stop}' "
-            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+            f"FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_ws_\\${{SLURM_LOCALID}} "
+            f"FLASHINFER_CUBIN_DIR=/tmp/flashinfer_cubin_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
         )
         # Aggregated mode (including ctx_only).
