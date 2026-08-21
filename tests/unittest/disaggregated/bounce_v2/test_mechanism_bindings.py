@@ -39,6 +39,8 @@ tab = pytest.importorskip(
     reason="bounce_v2 mechanism tests require the compiled tensorrt_llm wheel",
 )
 
+from tensorrt_llm._torch.disaggregation.bounce_v2.plan import SCATTER_RUN_DTYPE  # noqa: E402
+
 DEVICE = 0
 KIB = 1 << 10
 MIB = 1 << 20
@@ -554,3 +556,162 @@ class TestRegisterRegion:
         arena = tab.FabricArena(MIB, DEVICE, require_fabric=False)
         # deregisterRegionImpl is warn-only by contract: never registered -> no exception.
         agent.deregister_region(arena.base_ptr, arena.size, DEVICE)
+
+
+# --------------------------------------------------------------------------------------------
+# 8. submit_scatter_runs (receiver DATA sink: validate + expand + launch in C++)
+# --------------------------------------------------------------------------------------------
+def _scatter_runs(entries) -> np.ndarray:
+    """Build a SCATTER_RUN_DTYPE array.
+
+    Entries are (b_off, dst, d_stride, b_stride, piece, count) tuples in
+    the wire field order.
+    """
+    runs = np.zeros(len(entries), dtype=SCATTER_RUN_DTYPE)
+    for i, e in enumerate(entries):
+        runs[i] = e
+    return runs
+
+
+def _expand_runs_python(region_base: int, runs: np.ndarray):
+    """Reference expansion (the reactor's Python-fallback semantics)."""
+    srcs, dsts, sizes = [], [], []
+    for r in runs:
+        for p in range(int(r["count"])):
+            srcs.append(region_base + int(r["bounce_offset"]) + p * int(r["bounce_stride"]))
+            dsts.append(int(r["dst_addr"]) + p * int(r["dst_stride"]))
+            sizes.append(int(r["piece_size"]))
+    return _u64(srcs), _u64(dsts), _u32(sizes)
+
+
+@pytest.mark.skipif(
+    not hasattr(tab.BatchedCopyPool, "submit_scatter_runs"),
+    reason="installed transfer-agent binding predates BatchedCopyPool.submit_scatter_runs",
+)
+class TestSubmitScatterRuns:
+    def test_happy_path_matches_python_expansion_byte_exact(self, pool, poller):
+        """T4a: the C++ sink scatters exactly like the Python expansion.
+
+        Same raw wire runs through submit_scatter_runs (dst A) and through
+        the reference expansion + submit_copy (dst B): both destinations must
+        be byte-identical to each other AND to a CPU-computed reference,
+        including untouched bytes between the pieces.
+        """
+        region_bytes = 64 * KIB
+        region = _rand_bytes(region_bytes, seed=8141)
+        spread = 96 * KIB
+        dst_a = torch.zeros(spread, dtype=torch.uint8, device="cuda")
+        dst_b = torch.zeros(spread, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+
+        def entries_for(dst):
+            # Odd offsets/sizes and unequal strides: nothing may assume
+            # alignment or dst_stride == bounce_stride.
+            return [
+                (3, dst.data_ptr() + 5, 8 * KIB + 7, 4 * KIB + 3, 1000, 5),
+                (40 * KIB + 1, dst.data_ptr() + 60 * KIB, 3 * KIB, 2 * KIB, 2 * KIB, 3),
+                (60 * KIB, dst.data_ptr() + 90 * KIB, 0, 0, 17, 1),  # single piece, strides 0
+            ]
+
+        runs_a = _scatter_runs(entries_for(dst_a))
+        cid = pool.submit_scatter_runs(
+            region.data_ptr(), region_bytes, np.ascontiguousarray(runs_a).view(np.uint8)
+        )
+        assert cid not in (tab.BatchedCopyPool.BUSY, tab.BatchedCopyPool.SCATTER_REJECTED)
+        kind, ok = _drain_ids(poller, [cid])[cid]
+        assert (kind, ok) == (tab.CompletionPoller.KIND_EVENT, 1)
+
+        runs_b = _scatter_runs(entries_for(dst_b))
+        srcs, dsts, sizes = _expand_runs_python(region.data_ptr(), runs_b)
+        _submit_and_wait(pool, poller, srcs, dsts, sizes)
+
+        torch.cuda.synchronize()
+        assert torch.equal(dst_a, dst_b), "C++ sink scattered differently from the Python path"
+        # And against a CPU reference (also proves the gaps stayed untouched).
+        ref = torch.zeros(spread, dtype=torch.uint8)
+        region_cpu = region.cpu()
+        for b_off, dst_ptr, d_stride, b_stride, piece, count in entries_for(dst_a):
+            d_off = dst_ptr - dst_a.data_ptr()
+            for p in range(count):
+                ref[d_off + p * d_stride : d_off + p * d_stride + piece] = region_cpu[
+                    b_off + p * b_stride : b_off + p * b_stride + piece
+                ]
+        assert torch.equal(dst_a.cpu(), ref)
+
+    @pytest.mark.parametrize("bad", ["offset_past_region", "span_overflow", "strided_overflow"])
+    def test_out_of_region_runs_rejected(self, pool, poller, bad):
+        """T4b: validation failures return SCATTER_REJECTED and touch nothing.
+
+        Offset beyond region_bytes / span overflow at the tail / a strided
+        span walking past the region: -2, no completion row is ever
+        published, the destination stays untouched, and no stream context is
+        consumed.
+        """
+        region_bytes = 64 * KIB
+        region = _rand_bytes(region_bytes, seed=8142)
+        dst = torch.zeros(128 * KIB, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        entry = {
+            "offset_past_region": (region_bytes + 1, dst.data_ptr(), 0, 0, 16, 1),
+            "span_overflow": (region_bytes - 8, dst.data_ptr(), 0, 0, 16, 1),
+            "strided_overflow": (0, dst.data_ptr(), 32 * KIB, 32 * KIB, 4 * KIB, 4),
+        }[bad]
+        free0 = pool.free_count()
+        rc = pool.submit_scatter_runs(
+            region.data_ptr(),
+            region_bytes,
+            np.ascontiguousarray(_scatter_runs([entry])).view(np.uint8),
+        )
+        assert rc == tab.BatchedCopyPool.SCATTER_REJECTED == -2
+        assert poller.drain(0).shape == (0, 3), "a rejected scatter still published a row"
+        assert pool.free_count() == free0, "a rejected scatter consumed a stream context"
+        torch.cuda.synchronize()
+        assert not dst.any(), "a rejected scatter still wrote to the destination"
+
+    def test_busy_then_retry_with_same_raw_runs(self):
+        """T4c: BUSY with every context taken; the raw runs retry clean.
+
+        The reactor's backlog contract: the SAME raw runs succeed once a
+        context frees. A slow-sweep poller pins the single context in flight
+        past the BUSY probe (recycling only happens on the poll sweep).
+        """
+        poller = tab.CompletionPoller(poll_interval_us=200_000)
+        try:
+            pool = tab.BatchedCopyPool(
+                num_streams=1, max_plan_entries=4096, device_id=DEVICE, poller=poller
+            )
+            region = _rand_bytes(64 * KIB, seed=8143)
+            buf = torch.zeros(8 * MIB, dtype=torch.uint8, device="cuda")
+            dst = torch.zeros(8 * KIB, dtype=torch.uint8, device="cuda")
+            torch.cuda.synchronize()
+            occupier = pool.submit_copy(
+                _u64([buf.data_ptr()]), _u64([buf.data_ptr() + 4 * MIB]), _u32([4 * MIB])
+            )
+            assert occupier != tab.BatchedCopyPool.BUSY
+
+            raw = np.ascontiguousarray(
+                _scatter_runs([(0, dst.data_ptr(), 4 * KIB, 2 * KIB, 2 * KIB, 2)])
+            ).view(np.uint8)
+            rc = pool.submit_scatter_runs(region.data_ptr(), 64 * KIB, raw)
+            assert rc == tab.BatchedCopyPool.BUSY, "single context was not busy"
+
+            _drain_ids(poller, [occupier])  # sweep recycles the context
+            cid = pool.submit_scatter_runs(region.data_ptr(), 64 * KIB, raw)
+            assert cid not in (tab.BatchedCopyPool.BUSY, tab.BatchedCopyPool.SCATTER_REJECTED)
+            kind, ok = _drain_ids(poller, [cid])[cid]
+            assert (kind, ok) == (tab.CompletionPoller.KIND_EVENT, 1)
+            torch.cuda.synchronize()
+            assert torch.equal(dst[: 2 * KIB], region[: 2 * KIB].to(dst.device))
+            assert torch.equal(dst[4 * KIB : 6 * KIB], region[2 * KIB : 4 * KIB])
+            del pool
+        finally:
+            poller.shutdown()
+
+    def test_malformed_blob_length_raises(self, pool):
+        """T4d: a runs blob that is not a multiple of 36 bytes raises."""
+        region = torch.zeros(4 * KIB, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        with pytest.raises(ValueError):
+            pool.submit_scatter_runs(region.data_ptr(), 4 * KIB, np.zeros(35, dtype=np.uint8))
+        with pytest.raises(ValueError):
+            pool.submit_scatter_runs(region.data_ptr(), 4 * KIB, np.zeros(37, dtype=np.uint8))
