@@ -13,7 +13,6 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..attention_backend.flashinfer import FlashInferAttentionMetadata
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
@@ -838,11 +837,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         batch_size,
     ):
         """Draft with an external Q-only assistant over accepted target KV."""
-        if not isinstance(attn_metadata, FlashInferAttentionMetadata):
-            raise TypeError(
-                "External shared-target-KV MTP requires FlashInfer attention "
-                "metadata.")
-
         (
             draft_input_ids,
             recurrent_hidden_states,
@@ -857,10 +851,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             batch_indices=spec_metadata.batch_indices_cuda[:batch_size],
         )
 
-        draft_metadata = attn_metadata.get_draft_metadata()
-        draft_metadata.update_shared_kv_draft_lengths(attn_metadata,
-                                                      num_accepted_tokens,
-                                                      num_contexts)
+        draft_metadata = attn_metadata.get_shared_kv_draft_metadata(
+            num_accepted_tokens, num_contexts)
         draft_metadata.use_spec_decoding = False
         draft_metadata.padded_num_tokens = None
         draft_metadata.all_rank_num_tokens = (

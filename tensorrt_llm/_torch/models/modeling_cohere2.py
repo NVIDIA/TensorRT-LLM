@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Optional
 
 import torch
@@ -6,7 +21,11 @@ from tqdm import tqdm
 from transformers import Cohere2Config
 from transformers.activations import ACT2FN
 
-from tensorrt_llm._torch.attention_backend import AttentionMetadata, FlashInferAttentionMetadata
+from tensorrt_llm._torch.attention_backend import (
+    AttentionMetadata,
+    FlashInferAttentionMetadata,
+    TrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionMask,
     CustomAttentionMask,
@@ -114,9 +133,10 @@ class Cohere2Attention(Attention):
         **kwargs,
     ):
         if attention_mask_data is not None:
-            assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-                "Only FlashInfer backend supports custom attention mask currently."
-            )
+            assert isinstance(
+                attn_metadata,
+                (FlashInferAttentionMetadata, TrtllmAttentionMetadata),
+            ), "Only FlashInfer and TRTLLM backends support custom attention masks."
             assert attention_mask == CustomAttentionMask.CUSTOM
         return super().forward(
             position_ids=position_ids,

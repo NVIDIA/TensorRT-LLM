@@ -34,7 +34,11 @@ from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
+from ..attention_backend import (
+    AttentionMetadata,
+    FlashInferAttentionMetadata,
+    TrtllmAttentionMetadata,
+)
 from ..attention_backend.interface import (
     AttentionMask,
     CustomAttentionMask,
@@ -283,6 +287,14 @@ class Gemma4Attention(QKNormRoPEAttention):
             dense_bias=False,
             config=model_config,
             q_scaling=q_scaling,
+            # Full-attention layers use proportional RoPE whose active
+            # frequencies are paired across the full head. Apply it at the
+            # module layer because fused preprocessing cannot represent that
+            # pairing with only the logical rotary dimension.
+            # KV-shared layers read a frozen cache prefix, so their explicit
+            # position_ids—not the readable KV length—must select the query's
+            # RoPE position.
+            rope_fusion=is_sliding and not is_kv_shared,
         )
 
         # Restore original config head_dim
@@ -331,10 +343,11 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # trtllm-gen FMHA kernels are available only on datacenter Blackwell.
-        # Use FlashInfer FA2 on other architectures, including SM120/SM121;
-        # multimodal custom masks then use FlashInfer's native mask planning.
-        self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
+        # When FlashInfer is explicitly selected, use trtllm-gen only on
+        # datacenter Blackwell. The default TRTLLM backend selects phased FMHA
+        # directly and does not expose this FlashInfer option.
+        if hasattr(self.attn, "flashinfer_backend"):
+            self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -499,9 +512,10 @@ class Gemma4Attention(QKNormRoPEAttention):
         **kwargs,
     ) -> torch.Tensor:
         if attention_mask_data is not None:
-            assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-                "Only FlashInfer backend supports custom attention mask currently."
-            )
+            assert isinstance(
+                attn_metadata,
+                (FlashInferAttentionMetadata, TrtllmAttentionMetadata),
+            ), "Only FlashInfer and TRTLLM backends support custom attention masks."
             assert attention_mask == CustomAttentionMask.CUSTOM
         # Custom-mask (multimodal) prefill uses the Triton prefill fallback,
         # which consumes BF16 q/k/v — keep the unfused prep for those calls.
@@ -1254,12 +1268,19 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
-        FlashInfer backend is required for hybrid attention (per-layer
-        head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
-        bidirectional attention masks for multimodal tokens.
+        The TRTLLM attention backend uses trtllm-gen for the regular attention
+        phases and a Triton context phase for bidirectional multimodal masks.
+        External shared-KV MTP keeps FlashInfer as its default because the
+        production FP8-KV multimodal path is not yet supported by TRTLLM's
+        custom-mask context implementation.
         """
+        speculative_config = getattr(llm_args, "speculative_config", None)
+        spec_dec_mode = getattr(speculative_config, "spec_dec_mode", None)
+        uses_external_shared_kv = (
+            spec_dec_mode is not None and spec_dec_mode.is_mtp_eagle_one_model()
+        )
         return {
-            "attn_backend": "FLASHINFER",
+            "attn_backend": "FLASHINFER" if uses_external_shared_kv else "TRTLLM",
         }
 
     @classmethod
@@ -1351,16 +1372,13 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
 
         return causal_mask
 
-    def get_flashinfer_attention_mask(
+    def get_attention_mask(
         self,
         mm_token_type_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         effective_sliding_window: Optional[int] = None,
     ) -> torch.Tensor:
-        """Build FlashInfer custom mask for context requests."""
-        assert isinstance(attn_metadata, FlashInferAttentionMetadata), (
-            "Only FlashInfer backend supports custom mask currently."
-        )
+        """Build a custom attention mask for context requests."""
         num_contexts = attn_metadata.num_contexts
         assert num_contexts > 0
 
@@ -1449,7 +1467,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         # full-attention layers retain their normal causal mask.
         use_bidir = getattr(self.config, "use_bidirectional_attention", None)
         if mm_token_type_ids is not None and use_bidir == "vision":
-            local_attention_mask_data = self.get_flashinfer_attention_mask(
+            local_attention_mask_data = self.get_attention_mask(
                 mm_token_type_ids=mm_token_type_ids,
                 attn_metadata=attn_metadata,
                 effective_sliding_window=self.config.sliding_window,
@@ -1608,6 +1626,17 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
             hidden_size=assistant_config.hidden_size,
             vocab_size=assistant_config.vocab_size,
         )
+        # The assistant is invoked with draft-specific attention metadata.
+        # Keep its attention calls eager under torch.compile / breakable CUDA
+        # graphs so they consume that explicit metadata instead of the target
+        # model metadata registered in the custom attention op.
+        for layer in self.model.layers:
+            attention = layer.self_attn
+            if attention.register_to_config:
+                text_model_config.extra_attrs.get("attn_layers", {}).pop(
+                    attention.layer_idx_str, None
+                )
+                attention.register_to_config = False
         self.pre_projection = Linear(
             2 * assistant_config.backbone_hidden_size,
             assistant_config.hidden_size,

@@ -17,10 +17,13 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    CustomAttentionMask,
+)
 from tensorrt_llm.bindings.internal import thop
 
-from .interface import Fmha
+from .interface import Fmha, FmhaPhase
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
@@ -48,6 +51,32 @@ _THOP_LITERALS: dict = {}
 
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
+
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
+    ) -> bool:
+        del q, phase
+        if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
+            return False
+
+        # The fused THOP path cannot read an existing self-attention KV cache
+        # from a Q-only input.  This form is used by external shared-KV draft
+        # layers and must be handled by a phased generation implementation.
+        is_q_only_self_attention = (
+            not metadata.is_cross
+            and k is None
+            and v is None
+            and not forward_args.is_fused_qkv
+            and not forward_args.update_kv_cache
+        )
+        return not is_q_only_self_attention
 
     def forward(
         self,
