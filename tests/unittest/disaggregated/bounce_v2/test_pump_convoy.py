@@ -932,3 +932,77 @@ class TestFailDuringBusyOp:
             return box.agent.posts[0][4]
 
         _fail_mid_op_and_settle(box, peer, fut, rid, req, terminal_id)
+
+
+# --------------------------------------------------------------------------------------------
+# T8: pump ownership survives the finally backstop (ae8fe99bcc1 regression)
+# --------------------------------------------------------------------------------------------
+class TestPumpOwnershipBackstop:
+    def test_busy_chunk_never_reselected_and_posted_exactly_once(self, make_reactor, raw_peers):
+        """ae8fe99bcc1 regression: exactly ONE RDMA post per chunk, ever.
+
+        The pre-fix finally backstop stomped a new legitimate owner's
+        ``pump_busy`` after the atomic idle release, admitting a concurrent
+        second owner that re-selected a mid-classic-post chunk and DUPLICATED
+        the RDMA write (functionally invisible: the extra ACK drops as
+        stale, so only a spy count can pin it). Two assertions, one per half
+        of the fix:
+
+        Assertion A — the ``busy_op`` skip in ``_next_action_locked`` (the
+        reliable pre-fix discriminator): with the one chunk mid-post on the
+        blocked owner (state GATHERED, ``busy_op == "post"``, ``xfer_id``
+        unassigned), the decide sweep must NOT return that chunk. Pre-fix
+        code matched the ``GATHERED and has_credit and xfer_id < 0`` arm and
+        returned ``("post", <busy chunk>)`` — the exact re-selection a
+        second owner performed.
+
+        Assertion B — the single-owner invariant behaviorally: hammering
+        ``_pump`` from several threads while the owner is blocked mid-post
+        must only bounce off ``pump_busy`` / hand over via ``pump_again``;
+        after release, the fake agent's post op was called EXACTLY once for
+        the one chunk and the future resolves OK. (The pre-fix stomp needed
+        the precise finally-after-atomic-release window, which cannot be
+        forced from a test without reaching into private state — hence
+        assertion A carries the pre-fix failure; this half guards the
+        invariant the ``owned`` flag now guarantees.)
+        """
+        agent = GatedOpAgent("post")
+        box = make_reactor("ownstomp", agent=agent)  # chain off: classic post path
+        peer = raw_peers(box.reactor.endpoint, "rx")
+        assert box.reactor.add_peer(peer.name, peer.endpoint)
+
+        fut, rid, req, _cid = _stage_gated_op(box, peer, gathered_first=True)
+        posted = req.posted[0]
+        assert posted.busy_op == "post"
+        assert posted.state.name == "GATHERED" and posted.has_credit and posted.xfer_id < 0
+
+        # --- Assertion A: the decide sweep skips the mid-EXECUTE chunk. ---
+        with box.reactor._req_mu:
+            action = box.reactor._next_action_locked(rid, req)
+        assert action is None, f"_next_action_locked re-selected a mid-post chunk: {action!r}"
+        assert posted.busy_op == "post"  # the probe did not disturb the marker
+
+        # --- Assertion B: concurrent pumpers can only bounce or hand over. --
+        hammers = [
+            threading.Thread(
+                target=lambda: [box.reactor._pump(rid) for _ in range(20)], daemon=True
+            )
+            for _ in range(3)
+        ]
+        for t in hammers:
+            t.start()
+        for t in hammers:
+            t.join(timeout=10)
+            assert not t.is_alive(), "a hammering _pump call wedged"
+        assert len(box.agent.posts) == 0, "a second owner posted while the op was in flight"
+
+        box.agent.hold.set()
+        _wait_until(lambda: len(box.agent.posts) == 1, 10.0, "the gated post to record")
+        box.poller.complete_xfer(box.agent.posts[0][4], ok=True)
+        got = peer.recv(10.0)
+        assert got is not None and got[1].msg_type == codec.BounceMsgType.DATA
+        _ack(peer, rid, 0, posted.remote_handle)
+        assert fut.result(timeout=10).ok is True
+        # THE spy count: exactly one RDMA post for the one chunk, ever.
+        assert len(box.agent.posts) == 1, "duplicate RDMA post for a single chunk"
+        assert box.reactor.alive()
