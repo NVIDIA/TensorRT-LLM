@@ -334,6 +334,14 @@ def test_qwen3_reasoning_parser(text: str, content: str,
     assert result.reasoning_content == reasoning_context
 
 
+def test_qwen3_5_reasoning_parser_enable_thinking_false() -> None:
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "qwen3_5", {"enable_thinking": False})
+    result = reasoning_parser.parse("visible")
+    assert result.content == "visible"
+    assert result.reasoning_content == ""
+
+
 @pytest.mark.parametrize(("delta_texts", "content", "reasoning_context"), [
     (["<think>a", "l</think>r", "b"], ["", "r", "b"], ["a", "l", ""]),
     (["<th", "ink>a</think>b"], ["", "b"], ["", "a"]),
