@@ -4345,25 +4345,61 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver. Mutually exclusive with agent_buffer_enable."
+        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver. Mutually exclusive with agent_buffer_size_mb."
     )
 
-    agent_buffer_enable: Optional[bool] = Field(
+    agent_buffer_size_mb: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Size in MiB of the C++ transfer agent's bounce (staging) arena; 0 "
+        "(default) disables the fast path. A single arena shared by send and "
+        "recv, currently implemented by the NIXL agent. Mutually exclusive "
+        "with kv_cache_bounce_size_mb. Configure the context and generation "
+        "instances consistently.")
+
+    agent_bounce_params: Optional[Dict[str, str]] = Field(
         default=None,
         description=
-        "Enable the transfer agent's staging-buffer (bounce) fast path, which gathers a request's "
-        "scattered KV blocks into a pre-registered arena and transfers them in pipelined chunks. "
-        "Currently implemented by the NIXL agent. Unset (default) falls back to the "
-        "TRTLLM_NIXL_BOUNCE_ENABLE environment variable; an explicit value overrides it. Expert "
-        "tuning knobs stay on the TRTLLM_NIXL_BOUNCE_* environment variables. Mutually exclusive "
-        "with kv_cache_bounce_size_mb.")
+        "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see "
+        "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
+        "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
+        "Precedence: this dict > environment variable > built-in default. "
+        "Requires agent_buffer_size_mb > 0.")
+
+    @field_validator('agent_bounce_params', mode='before')
+    @classmethod
+    def coerce_agent_bounce_params_to_str(cls, v):
+        """Coerce agent_bounce_params values to strings (YAML often yields ints/bools)."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"agent_bounce_params must be a dict of str to str, got "
+                f"{type(v).__name__}")
+        return {str(k): str(val) for k, val in v.items()}
 
     @model_validator(mode='after')
     def validate_bounce_exclusive(self) -> 'CacheTransceiverConfig':
-        if self.agent_buffer_enable and self.kv_cache_bounce_size_mb > 0:
+        if self.agent_buffer_size_mb > 0 and self.kv_cache_bounce_size_mb > 0:
             raise ValueError(
-                "agent_buffer_enable and kv_cache_bounce_size_mb are mutually "
+                "agent_buffer_size_mb and kv_cache_bounce_size_mb are mutually "
                 "exclusive bounce implementations; enable only one.")
+        if self.agent_bounce_params:
+            if self.agent_buffer_size_mb == 0:
+                raise ValueError(
+                    "agent_bounce_params requires agent_buffer_size_mb > 0; "
+                    "the bounce fast path is disabled at size 0, so the params "
+                    "would be ignored.")
+            # Lazy: importing tensorrt_llm._torch at module scope is circular.
+            from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
+                AGENT_BOUNCE_PARAM_KEYS
+            unknown = sorted(
+                set(self.agent_bounce_params) - AGENT_BOUNCE_PARAM_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown agent_bounce_params key(s) {unknown}; valid keys "
+                    f"are {sorted(AGENT_BOUNCE_PARAM_KEYS)}.")
         return self
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
@@ -4388,7 +4424,8 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             kv_transfer_sender_future_timeout_ms=self.
             kv_transfer_sender_future_timeout_ms,
             kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms,
-            agent_buffer_enable=self.agent_buffer_enable)
+            agent_buffer_size_mb=self.agent_buffer_size_mb,
+            agent_bounce_params=self.agent_bounce_params or {})
 
 
 @dataclass

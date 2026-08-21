@@ -23,7 +23,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -2428,7 +2428,11 @@ class RankInfoServer:
 
 
 def _create_nixl_agent(
-    name: str, rank: int, world_size: int, agent_buffer_enable: Optional[bool] = None
+    name: str,
+    rank: int,
+    world_size: int,
+    agent_buffer_size_mb: int = 0,
+    agent_bounce_params: Optional[Dict[str, str]] = None,
 ) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
@@ -2440,7 +2444,8 @@ def _create_nixl_agent(
         num_threads=num_threads,
         rank=rank,
         world_size=world_size,
-        agent_buffer_enable=agent_buffer_enable,
+        agent_buffer_size_mb=agent_buffer_size_mb,
+        agent_bounce_params=agent_bounce_params,
         **kwargs,
     )
 
@@ -2471,9 +2476,14 @@ class TransferWorkerConfig:
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
-    # Transfer-agent staging-buffer (bounce v2) switch; None falls back to
-    # TRTLLM_NIXL_BOUNCE_ENABLE. Mutually exclusive with `bounce` above.
-    agent_buffer_enable: Optional[bool] = None
+    # Transfer-agent staging-buffer (bounce v2) arena size in MiB; 0 disables the
+    # fast path. Mutually exclusive with `bounce` above (enforced upstream by
+    # CacheTransceiverConfig validation).
+    agent_buffer_size_mb: int = 0
+    # Expert bounce knobs (TRTLLM_NIXL_BOUNCE_* names without the prefix and the
+    # trailing _BYTES, lowercased); dict > env > default. Ignored when
+    # agent_buffer_size_mb == 0.
+    agent_bounce_params: Optional[Dict[str, str]] = None
 
 
 class TransferWorker:
@@ -2544,7 +2554,8 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank),
             rank=mapping.rank,
             world_size=mapping.world_size,
-            agent_buffer_enable=self._config.agent_buffer_enable,
+            agent_buffer_size_mb=self._config.agent_buffer_size_mb,
+            agent_bounce_params=self._config.agent_bounce_params,
         )
         self._registered_mem: list = []
         try:

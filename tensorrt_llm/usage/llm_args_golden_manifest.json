@@ -148,10 +148,10 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[bool]",
+      "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
-      "path": "cache_transceiver_config.agent_buffer_enable"
+      "path": "cache_transceiver_config.agent_buffer_size_mb"
     },
     {
       "allowed_values": [

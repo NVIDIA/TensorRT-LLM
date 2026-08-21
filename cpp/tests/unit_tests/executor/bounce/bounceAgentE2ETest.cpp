@@ -16,7 +16,7 @@
  */
 
 // Production-path e2e: bounce engaged transparently through NixlTransferAgent::submitTransferRequests
-// with TRTLLM_NIXL_BOUNCE_ENABLE=1. Real agents (2..N), real RDMA, wired exactly as production disagg
+// with BaseAgentConfig::agentBufferSizeMb > 0. Real agents (2..N), real RDMA, wired exactly as production disagg
 // does (tensorrt_llm/_torch/disaggregation/native/transfer.py): one-directional AgentDesc exchange
 // (senders load the receiver, never the reverse) and the receiver self-bootstraps each sender from
 // its WANT — no manual addPeer, no connection-info path. NOTE: the KV src/dst buffers are
@@ -103,60 +103,54 @@ int runConcurrentFlows(
     return ok.load();
 }
 
-// Enable bounce + tune thresholds so a modest transfer engages it (small regions -> recycling).
-void setBounceEnv(char const* arenaBytes = "2097152", char const* granularityBytes = "256")
+// Bounce-enabled agent config: agentBufferSizeMb switches bounce on, and the expert knobs ride
+// bounceParams (dict > env > default) with thresholds tuned so a modest transfer engages bounce
+// (small regions -> recycling). sizeMb == 0 keeps bounce off (no knobs attached).
+kvc::BaseAgentConfig makeBounceConfig(
+    std::string name, std::size_t arenaSizeMb = 2, char const* granularityBytes = "256")
 {
-    setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", "4", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", "4096", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", arenaBytes, 1);
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", granularityBytes, 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", "2", 1);
-}
-
-void clearBounceEnv()
-{
-    unsetenv("TRTLLM_NIXL_BOUNCE_ENABLE");
-    unsetenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT");
-    unsetenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES");
-    unsetenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES");
-    unsetenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES");
-    unsetenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST");
-    unsetenv("TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES");
+    kvc::BaseAgentConfig cfg{std::move(name), true, false, true};
+    cfg.agentBufferSizeMb = arenaSizeMb;
+    if (arenaSizeMb > 0)
+    {
+        cfg.bounceParams = {
+            {"min_descriptor_count", "4"},
+            {"max_chunk_size", "4096"},
+            {"arena_allocation_granularity", granularityBytes},
+            {"max_inflight_chunks_per_request", "2"},
+        };
+    }
+    return cfg;
 }
 } // namespace
 
-// BaseAgentConfig::agentBufferEnable (from CacheTransceiverConfig's agent_buffer_enable) overrides
-// the TRTLLM_NIXL_BOUNCE_ENABLE environment variable in both directions; unset keeps env behavior.
-TEST(BounceAgentE2E, AgentBufferEnableConfigOverridesEnv)
+// BaseAgentConfig::agentBufferSizeMb (from CacheTransceiverConfig's agent_buffer_size_mb) is the
+// ONLY on/off switch: 0 keeps bounce disabled, >0 enables it. The legacy TRTLLM_NIXL_BOUNCE_ENABLE
+// environment variable must have no effect anymore.
+TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)
 {
     if (!hasCuda())
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    setBounceEnv();
-    auto makeAgent = [](char const* name, std::optional<bool> agentBufferEnable)
-    {
-        kvc::BaseAgentConfig cfg{name, true, false, true};
-        cfg.agentBufferEnable = agentBufferEnable;
-        return std::make_unique<kvc::NixlTransferAgent>(cfg);
-    };
+    setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
     try
     {
-        // Env says on: explicit false wins; unset follows the env.
-        EXPECT_FALSE(makeAgent("cfgOffAgent", false)->isBounceEnabled());
-        EXPECT_TRUE(makeAgent("cfgUnsetAgent", std::nullopt)->isBounceEnabled());
-        // Env says off: explicit true wins.
-        setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "0", 1);
-        EXPECT_TRUE(makeAgent("cfgOnAgent", true)->isBounceEnabled());
-        EXPECT_FALSE(makeAgent("cfgUnsetAgent2", std::nullopt)->isBounceEnabled());
+        EXPECT_FALSE(std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cfgOffAgent", 0))->isBounceEnabled());
+        EXPECT_TRUE(std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cfgOnAgent", 2))->isBounceEnabled());
+        // size 0 + non-empty params: the params must be ignored (warned about, not honored) and
+        // bounce must stay off. (The llm_args validator rejects this combination upfront; this
+        // covers the direct BaseAgentConfig entry point.)
+        auto orphanParams = makeBounceConfig("cfgOrphanAgent", 0);
+        orphanParams.bounceParams = {{"copy_stream_count", "2"}};
+        EXPECT_FALSE(std::make_unique<kvc::NixlTransferAgent>(orphanParams)->isBounceEnabled());
     }
     catch (std::exception const& e)
     {
-        clearBounceEnv();
+        unsetenv("TRTLLM_NIXL_BOUNCE_ENABLE");
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
-    clearBounceEnv();
+    unsetenv("TRTLLM_NIXL_BOUNCE_ENABLE");
 }
 
 TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
@@ -165,20 +159,17 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    setBounceEnv(/*arenaBytes=*/"1048576", /*granularityBytes=*/"4096");
-
     std::unique_ptr<kvc::NixlTransferAgent> a;
     std::unique_ptr<kvc::NixlTransferAgent> b;
     try
     {
-        kvc::BaseAgentConfig ca{"bAgentA", true, false, true};
-        kvc::BaseAgentConfig cb{"bAgentB", true, false, true};
-        a = std::make_unique<kvc::NixlTransferAgent>(ca);
-        b = std::make_unique<kvc::NixlTransferAgent>(cb);
+        a = std::make_unique<kvc::NixlTransferAgent>(
+            makeBounceConfig("bAgentA", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"));
+        b = std::make_unique<kvc::NixlTransferAgent>(
+            makeBounceConfig("bAgentB", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"));
     }
     catch (std::exception const& e)
     {
-        clearBounceEnv();
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
@@ -201,7 +192,6 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     a->shutdown();
     b->shutdown();
     freeXferBufs(bufs);
-    clearBounceEnv();
 }
 
 // A non-power-of-two arena can clamp the effective chunk cap below the configured cap. A descriptor
@@ -212,27 +202,35 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", "1", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", "98304", 1); // configured 96 KiB
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", "98304", 1);     // buddy capacity is 64 KiB
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", "256", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES", "1048576", 1);
+    // 3 MiB arena (non-power-of-two) -> buddy capacity is 2 MiB, below the configured 3 MiB chunk
+    // cap. The descriptor below sits between the two limits.
+    auto makeCapConfig = [](char const* name)
+    {
+        kvc::BaseAgentConfig cfg{name, true, false, true};
+        cfg.agentBufferSizeMb = 3;
+        cfg.bounceParams = {
+            {"min_descriptor_count", "1"},
+            {"max_chunk_size", "3145728"}, // configured 3 MiB
+            {"arena_allocation_granularity", "256"},
+            {"max_average_descriptor_size", "8MB"},
+        };
+        return cfg;
+    };
 
     std::unique_ptr<kvc::NixlTransferAgent> a;
     std::unique_ptr<kvc::NixlTransferAgent> b;
     try
     {
-        a = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{"capAgentA", true, false, true});
-        b = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{"capAgentB", true, false, true});
+        a = std::make_unique<kvc::NixlTransferAgent>(makeCapConfig("capAgentA"));
+        b = std::make_unique<kvc::NixlTransferAgent>(makeCapConfig("capAgentB"));
     }
     catch (std::exception const& e)
     {
-        clearBounceEnv();
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
-    auto bufs = makeXferBufs(/*nDescs=*/1, /*descBytes=*/80 * 1024, /*seed=*/8);
+    // 2.5 MiB: above the effective (buddy) 2 MiB cap, below the configured 3 MiB cap.
+    auto bufs = makeXferBufs(/*nDescs=*/1, /*descBytes=*/2560 * 1024, /*seed=*/8);
     auto req = makeReq(bufs, "capAgentB");
     a->registerMemory(req.getSrcDescs());
     b->registerMemory(req.getDstDescs());
@@ -251,7 +249,6 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     a->shutdown();
     b->shutdown();
     freeXferBufs(bufs);
-    clearBounceEnv();
 }
 
 // Production-path CONCURRENCY: many threads call submitTransferRequests on the SAME sender agent at
@@ -264,20 +261,15 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    setBounceEnv();
-
     std::unique_ptr<kvc::NixlTransferAgent> a;
     std::unique_ptr<kvc::NixlTransferAgent> b;
     try
     {
-        kvc::BaseAgentConfig ca{"cAgentA", true, false, true};
-        kvc::BaseAgentConfig cb{"cAgentB", true, false, true};
-        a = std::make_unique<kvc::NixlTransferAgent>(ca);
-        b = std::make_unique<kvc::NixlTransferAgent>(cb);
+        a = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cAgentA"));
+        b = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cAgentB"));
     }
     catch (std::exception const& e)
     {
-        clearBounceEnv();
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
@@ -309,7 +301,6 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
     {
         freeXferBufs(x);
     }
-    clearBounceEnv();
 }
 
 // Production-path BIDIRECTIONAL concurrency: two bounce-enabled agents each submit to the OTHER at
@@ -324,20 +315,15 @@ TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    setBounceEnv();
-
     std::unique_ptr<kvc::NixlTransferAgent> a;
     std::unique_ptr<kvc::NixlTransferAgent> b;
     try
     {
-        kvc::BaseAgentConfig ca{"biAgentA", true, false, true};
-        kvc::BaseAgentConfig cb{"biAgentB", true, false, true};
-        a = std::make_unique<kvc::NixlTransferAgent>(ca);
-        b = std::make_unique<kvc::NixlTransferAgent>(cb);
+        a = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("biAgentA"));
+        b = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("biAgentB"));
     }
     catch (std::exception const& e)
     {
-        clearBounceEnv();
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
@@ -371,7 +357,6 @@ TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
     {
         freeXferBufs(x);
     }
-    clearBounceEnv();
 }
 
 // Production-path MULTI-AGENT (N>2): 1 receiver + S sender agents, every sender writing to the one
@@ -386,8 +371,6 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    setBounceEnv();
-
     constexpr int kSenders = 3; // total agents = 1 receiver + 3 senders
     std::string const recvName = "mnAgentR";
 
@@ -395,16 +378,15 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     std::vector<std::unique_ptr<kvc::NixlTransferAgent>> senders;
     try
     {
-        recv = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{recvName, true, false, true});
+        recv = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig(recvName));
         for (int i = 1; i <= kSenders; ++i)
         {
-            senders.push_back(std::make_unique<kvc::NixlTransferAgent>(
-                kvc::BaseAgentConfig{"mnAgentS" + std::to_string(i), true, false, true}));
+            senders.push_back(
+                std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("mnAgentS" + std::to_string(i))));
         }
     }
     catch (std::exception const& e)
     {
-        clearBounceEnv();
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
@@ -440,5 +422,4 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     {
         freeXferBufs(x);
     }
-    clearBounceEnv();
 }

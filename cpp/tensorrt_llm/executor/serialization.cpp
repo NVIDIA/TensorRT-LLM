@@ -1466,9 +1466,12 @@ CacheTransceiverConfig Serialization::deserializeCacheTransceiverConfig(std::ist
     auto kvTransferTimeoutMs = su::deserialize<std::optional<int>>(is);
     auto kvTransferSenderFutureTimeoutMs = su::deserialize<std::optional<int>>(is);
     auto kvTransferPollIntervalMs = su::deserialize<std::optional<int>>(is);
-    auto agentBufferEnable = su::deserialize<std::optional<bool>>(is);
+    auto agentBufferSizeMb = su::deserialize<size_t>(is);
+    // serializeUtils has no native map support; the params travel as a sorted vector of pairs.
+    auto agentBounceParamsVec = su::deserialize<std::vector<std::pair<std::string, std::string>>>(is);
+    std::map<std::string, std::string> agentBounceParams(agentBounceParamsVec.begin(), agentBounceParamsVec.end());
     return CacheTransceiverConfig{backendType, maxTokensInBuffer, kvTransferTimeoutMs, kvTransferSenderFutureTimeoutMs,
-        kvTransferPollIntervalMs, agentBufferEnable};
+        kvTransferPollIntervalMs, agentBufferSizeMb, std::move(agentBounceParams)};
 }
 
 void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os)
@@ -1478,7 +1481,11 @@ void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConf
     su::serialize(cacheTransceiverConfig.getKvTransferTimeoutMs(), os);
     su::serialize(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(), os);
     su::serialize(cacheTransceiverConfig.getKvTransferPollIntervalMs(), os);
-    su::serialize(cacheTransceiverConfig.getAgentBufferEnable(), os);
+    su::serialize(cacheTransceiverConfig.getAgentBufferSizeMb(), os);
+    auto const& agentBounceParams = cacheTransceiverConfig.getAgentBounceParams();
+    std::vector<std::pair<std::string, std::string>> const agentBounceParamsVec(
+        agentBounceParams.begin(), agentBounceParams.end());
+    su::serialize(agentBounceParamsVec, os);
 }
 
 size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig)
@@ -1489,7 +1496,11 @@ size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTranscei
     totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferTimeoutMs());
     totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs());
     totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferPollIntervalMs());
-    totalSize += su::serializedSize(cacheTransceiverConfig.getAgentBufferEnable());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getAgentBufferSizeMb());
+    auto const& agentBounceParams = cacheTransceiverConfig.getAgentBounceParams();
+    std::vector<std::pair<std::string, std::string>> const agentBounceParamsVec(
+        agentBounceParams.begin(), agentBounceParams.end());
+    totalSize += su::serializedSize(agentBounceParamsVec);
     return totalSize;
 }
 

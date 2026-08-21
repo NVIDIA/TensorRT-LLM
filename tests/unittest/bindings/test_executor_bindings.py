@@ -1388,11 +1388,36 @@ def test_cache_transceiver_config_pickle():
     config = trtllm.CacheTransceiverConfig(
         backend=trtllm.CacheTransceiverBackendType.UCX,
         max_tokens_in_buffer=1024,
-        kv_transfer_poll_interval_ms=5000)
+        kv_transfer_poll_interval_ms=5000,
+        agent_buffer_size_mb=512,
+        agent_bounce_params={
+            "max_chunk_size": "32MB",
+            "copy_stream_count": "4"
+        })
     config_copy = pickle.loads(pickle.dumps(config))
     assert config_copy.backend == config.backend
     assert config_copy.max_tokens_in_buffer == config.max_tokens_in_buffer
     assert config_copy.kv_transfer_poll_interval_ms == config.kv_transfer_poll_interval_ms
+    assert config_copy.agent_buffer_size_mb == 512
+    assert config_copy.agent_bounce_params == {
+        "max_chunk_size": "32MB",
+        "copy_stream_count": "4"
+    }
+    # Defaults roundtrip too (size 0 = bounce off, empty params).
+    default_copy = pickle.loads(pickle.dumps(trtllm.CacheTransceiverConfig()))
+    assert default_copy.agent_buffer_size_mb == 0
+    assert default_copy.agent_bounce_params == {}
+
+    # Legacy 6-tuple states carried the retired Optional[bool] agent_buffer_enable at index 5;
+    # any such value (True/False/None) must deserialize as "bounce off" (size 0) — in particular
+    # a legacy True must NOT be number-converted into a 1 MiB arena.
+    for legacy_agent_buffer_enable in (True, False, None):
+        legacy = trtllm.CacheTransceiverConfig.__new__(
+            trtllm.CacheTransceiverConfig)
+        legacy.__setstate__((trtllm.CacheTransceiverBackendType.UCX, 1024, 100,
+                             1000, 5000, legacy_agent_buffer_enable))
+        assert legacy.agent_buffer_size_mb == 0, legacy_agent_buffer_enable
+        assert legacy.agent_bounce_params == {}
 
 
 @pytest.mark.cpu_only
