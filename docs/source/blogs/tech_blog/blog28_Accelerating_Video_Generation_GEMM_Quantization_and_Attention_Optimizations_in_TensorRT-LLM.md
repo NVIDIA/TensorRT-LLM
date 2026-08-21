@@ -30,7 +30,7 @@ up more visual quality than the application can tolerate.
 
 ## Table of Contents
 
-- [Quantization](#quantization)
+- [GEMM Quantization](#gemm-quantization)
 - [Attention Optimizations](#attention-optimizations)
 - [Results](#results)
 - [Reproduction](#reproduction)
