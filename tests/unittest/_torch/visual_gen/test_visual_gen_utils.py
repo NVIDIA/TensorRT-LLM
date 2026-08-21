@@ -1176,3 +1176,89 @@ class TestReferenceBroadcastSplit:
         del req
         gc.collect()
         assert not any(b.exists() for b in blocks)
+
+
+class TestSafeLocalFileRead:
+    """A ``path`` reference bounds what an unlucky path can cost.
+
+    A remote caller naming the path is the case worth defending: reading a
+    character device or a FIFO never returns, so an unbounded read is a denial
+    of service rather than a bad request.
+    """
+
+    @staticmethod
+    def _png(tmp_path):
+        buffer = BytesIO()
+        Image.new("RGB", (8, 8)).save(buffer, format="PNG")
+        target = tmp_path / "ref.png"
+        target.write_bytes(buffer.getvalue())
+        return target
+
+    def test_a_regular_file_reads(self, tmp_path):
+        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
+
+        target = self._png(tmp_path)
+
+        assert _safe_read_local_file(str(target)) == target.read_bytes()
+        assert _safe_read_local_file(target.as_uri()) == target.read_bytes()
+
+    def test_a_symlink_to_a_regular_file_reads(self, tmp_path):
+        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
+
+        target = self._png(tmp_path)
+        link = tmp_path / "link.png"
+        link.symlink_to(target)
+
+        assert _safe_read_local_file(str(link)) == target.read_bytes()
+
+    @pytest.mark.parametrize("device", ["/dev/zero", "/dev/null"])
+    def test_a_character_device_is_refused(self, device):
+        """The unbounded read: `/dev/zero` never reaches EOF."""
+        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
+
+        with pytest.raises(ValueError, match="not a regular file"):
+            _safe_read_local_file(device)
+
+    def test_a_symlink_to_a_device_is_refused(self, tmp_path):
+        """``stat`` follows the link, so the check sees what will be read."""
+        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
+
+        link = tmp_path / "innocent.png"
+        link.symlink_to("/dev/zero")
+
+        with pytest.raises(ValueError, match="not a regular file"):
+            _safe_read_local_file(str(link))
+
+    def test_a_fifo_is_refused(self, tmp_path):
+        """Reading a FIFO blocks rather than returning, so size caps cannot help."""
+        import os
+
+        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
+
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+
+        with pytest.raises(ValueError, match="not a regular file"):
+            _safe_read_local_file(str(fifo))
+
+    def test_a_directory_is_refused(self, tmp_path):
+        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
+
+        with pytest.raises(ValueError, match="not a regular file"):
+            _safe_read_local_file(str(tmp_path))
+
+    def test_an_oversized_file_is_refused_before_it_is_read(self, tmp_path, monkeypatch):
+        """The cap is checked against ``stat``, so the bytes never come in."""
+        from tensorrt_llm.visual_gen import media_refs
+
+        target = self._png(tmp_path)
+        monkeypatch.setattr(media_refs, "_MAX_RESPONSE_BYTES", 8)
+
+        with pytest.raises(ValueError, match="over the 8-byte limit"):
+            media_refs._safe_read_local_file(str(target))
+
+    def test_a_missing_file_is_a_client_error(self, tmp_path):
+        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
+
+        with pytest.raises(ValueError, match="could not be read"):
+            _safe_read_local_file(str(tmp_path / "nope.png"))
