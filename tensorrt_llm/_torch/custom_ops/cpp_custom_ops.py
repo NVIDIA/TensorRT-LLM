@@ -310,6 +310,17 @@ def _register_fake():
                                 dtype=scores_with_bias.dtype), scores.new_empty(
                                     shape, dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::kimi_k3_noaux_tc_mxfp8_quant")
+    def _(scores, bias, hidden_states, routed_scaling_factor):
+        num_tokens = scores.shape[0]
+        return (
+            scores.new_empty((num_tokens, 16), dtype=torch.int32),
+            scores.new_empty((num_tokens, 16), dtype=torch.bfloat16),
+            hidden_states.new_empty((num_tokens, 3584),
+                                    dtype=torch.float8_e4m3fn),
+            hidden_states.new_empty((num_tokens, 112), dtype=torch.uint8),
+        )
+
     @torch.library.register_fake("trtllm::inplace_slice_copy")
     def _(dest, src, dim1_start, dim1_end):
         pass

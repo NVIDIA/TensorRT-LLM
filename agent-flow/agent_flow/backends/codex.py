@@ -727,7 +727,7 @@ def _codex_backend_version() -> str:
     return _VERSION_CACHE
 
 
-_REASONING_EFFORT = "xhigh"
+_REASONING_EFFORT = "max"
 
 _SDK_PATCHED = False
 
@@ -874,6 +874,7 @@ class CodexBackend(Backend):
         hooks: dict | None = None,
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        cwd: Path | None = None,
     ) -> AsyncIterator[BackendClient]:
         # ``disallowed_tools`` and ``extra_mcp_servers`` are currently
         # Claude-Code-only concepts (they map onto
@@ -892,6 +893,7 @@ class CodexBackend(Backend):
         SandboxMode = _symbol("openai_codex.generated.v2_all", "SandboxMode")
         ThreadStartParams = _symbol("openai_codex.generated.v2_all", "ThreadStartParams")
 
+        session_cwd = cwd or Path.cwd()
         params = ThreadStartParams(
             model=model,
             developer_instructions=system_prompt or None,
@@ -899,7 +901,7 @@ class CodexBackend(Backend):
                 "model_reasoning_effort": _REASONING_EFFORT,
                 "model_context_window": 1000000,
             },
-            cwd=str(Path.cwd()),
+            cwd=str(session_cwd),
             sandbox=SandboxMode.danger_full_access,
             approval_policy=AskForApproval(root=AskForApprovalValue.never),
         )
@@ -908,7 +910,7 @@ class CodexBackend(Backend):
             start_payload["dynamicTools"] = [_dynamic_tool_spec(t) for t in tools]
 
         await self._codex._ensure_initialized()
-        session_init = await _build_session_init_event(self._codex._client, Path.cwd())
+        session_init = await _build_session_init_event(self._codex._client, session_cwd)
         started = await self._codex._client.thread_start(start_payload)
         thread_id = started.thread.id
 

@@ -275,6 +275,31 @@ def _compute_auto_host_tier_quota(
     return host_quota
 
 
+def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
+    """Reduce the auto-provisioned host cache tier quota to the fleet minimum.
+
+    ``_compute_auto_host_tier_quota`` reads rank-local host state
+    (``SC_AVPHYS_PAGES``, ``RLIMIT_MEMLOCK``), so co-scheduled ranks can arrive
+    at divergent host quotas (observed up to 10x). Divergent host-tier
+    retention makes per-rank MAX_UTILIZATION schedulers disagree about which
+    suspended requests can resume, which wedges collectives on
+    non-attention-DP TP. Reducing to the fleet minimum makes the
+    most-constrained rank set the value for everyone, mirroring the device
+    quota sync. A single-rank job needs no collective and is returned as-is.
+
+    Args:
+        host_quota: This rank's locally-computed host tier quota in bytes.
+        mapping: Parallelism mapping; ``world_size`` selects whether a
+            collective is needed.
+
+    Returns:
+        The globally-agreed host tier quota in bytes (the fleet ``MIN``).
+    """
+    if mapping.world_size > 1:
+        host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
+    return host_quota
+
+
 def _estimate_swa_cache_size(
     layer_sizes: Sequence[int],
     attention_windows: Sequence[Optional[int]],
@@ -995,10 +1020,9 @@ class KVCacheManagerV2(BaseResourceManager):
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
-            # evict and later restore KV cache pages.  Without a host tier,
-            # suspended pages have nowhere to be offloaded and resume()
-            # always fails, causing a scheduling deadlock where no
-            # generation request can ever make progress.
+            # evict and later restore KV cache pages. Without a secondary
+            # tier, suspended held pages cannot migrate out of GPU, so
+            # suspension cannot free capacity and scheduling can deadlock.
             #
             # Automatically provision a host tier matching the GPU quota so
             # suspend/resume works out of the box.  Cap at available host
@@ -1030,13 +1054,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{local_ranks} co-located rank(s) on this node, "
                 f"available host memory {mem_available / (1 << 30):.2f}GiB"
             )
-            # Auto sizing reads rank-local host state, so co-scheduled ranks
-            # can get divergent host quotas (observed up to 10x). Divergent
-            # host-tier retention makes per-rank schedulers disagree, which
-            # wedges collectives on non-attention-DP TP. Sync to the fleet
-            # minimum, like the device quota above.
-            if mapping.world_size > 1:
-                host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
+            # Reduce the rank-local auto quota to the fleet minimum; see
+            # _sync_host_tier_quota for why divergence wedges collectives.
+            host_quota = _sync_host_tier_quota(host_quota, mapping)
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
@@ -1061,31 +1081,36 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
         )
         config = self._build_cache_config(config)
+        has_host_cache_tier = any(
+            isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
+        )
 
         self.kv_cache_manager_py_config = config
 
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
-            if len(cache_tiers) > 1:
+            if has_host_cache_tier:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
                     "tier (cuMemHostRegister may have failed). "
                     "Retrying without host cache tier."
                 )
-                cache_tiers_gpu_only = [t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)]
-                config = replace(config, cache_tiers=cache_tiers_gpu_only)
-                cache_tiers = cache_tiers_gpu_only
+                cache_tiers_without_host = [
+                    tier for tier in config.cache_tiers if not isinstance(tier, HostCacheTierConfig)
+                ]
+                config = replace(config, cache_tiers=cache_tiers_without_host)
                 self.kv_cache_manager_py_config = config
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
                 raise
+        self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()
             )
             self.event_manager.add_created_event(
-                self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
+                self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
             )
 
@@ -2473,7 +2498,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache (move to host tier)."""
+        """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
@@ -3098,6 +3123,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
+        # Materialize the blocks backing the declared history instead of treating it as
+        # already committed. Only meaningful together with is_gen.
+        #
+        # Set when the caller writes the history itself and needs those blocks backed,
+        # instead of letting sliding-window pools keep only the last window_size.
+        materialize_history: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         kv_reserve_draft_tokens: Optional[int] = None,
@@ -3136,7 +3167,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
             # token_num - 1 is the past history length in generation.
-            history_hint = max(0, token_num - 1) if is_gen else None
+            history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
             encoder_input_tokens = (
                 [1] * encoder_output_len if encoder_output_len is not None else None
@@ -3174,7 +3205,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
-                if is_gen:
+                if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.

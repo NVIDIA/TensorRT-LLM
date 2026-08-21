@@ -19,13 +19,13 @@ import torch
 
 from ...._utils import nvtx_range
 from ....logger import logger
-from ....lora_manager import LoraManager, LoraModelConfig
 from ...attention_backend.interface import AttentionMetadata
 from ...pyexecutor.resource_manager import PeftCacheManager
 from ...pyexecutor.scheduler import ScheduledRequests
 from .adapter_slot_manager import AdapterSlotManager
 from .cuda_graph_lora_params import CudaGraphLoraParams
 from .layer import LoraLayer
+from .manager import LoraManager, LoraModelConfig
 
 
 class CudaGraphLoraManager:

@@ -45,7 +45,7 @@ def _is_deepep_feasible(num_ranks: int) -> bool:
 
     Intranode: num_ranks in {2, 4, 8} and num_ranks == local_mpi_size().
     Internode: exactly 8 ranks per node, with 2/4/8/16 RDMA nodes.
-    Mirrors the feasibility check in fused_moe_wide_ep.py::select_alltoall_method_type.
+    Mirrors the feasibility check in communication/deep_ep.py::DeepEP._is_deepep_feasible.
     """
     _INTRANODE_RANKS = {2, 4, 8}
     _REQUIRED_LOCAL_SIZE = 8
