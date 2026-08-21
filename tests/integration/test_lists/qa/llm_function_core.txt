@@ -901,5 +901,5 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grain
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync[True-True-no_autotuner]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4_fine_grained_sync[True-True-autotuner]
 unittest/llmapi/apps/_test_openai_embeddings.py
-unittest/_torch/modeling/test_modeling_deepseekv3.py
+unittest/_torch/modeling/test_modeling_deepseek_r1.py
 unittest/_torch/modules/test_flashinfer_fused_add_add_rmsnorm.py
