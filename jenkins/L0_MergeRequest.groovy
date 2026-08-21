@@ -996,7 +996,7 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 def _cbtsCoverageAudit(pipeline)
 {
     try {
-        // artifact.py resolves, downloads and unpacks; paths come back
+        // artifact.py resolves, downloads and merges the x86/SBSA DBs; paths come back
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
