@@ -407,7 +407,11 @@ class BestOfNController(Controller):
 
         best_task, best_idx = self.select_best(generation_tasks, reward_values,
                                                **select_best_kwargs)
-        task.result = best_task.result
+        # Propagate the winning candidate's output onto the request's task, the same way
+        # MajorityVoteController does. Reading best_task.result raised AttributeError:
+        # no generation task type defines `result`.
+        task.output_str = best_task.output_str
+        task.output_tokens = best_task.output_tokens
 
     def select_best(self, tasks: List[Task], reward_values, **kwargs) -> Task:
         max_index = torch.argmax(torch.tensor(reward_values)).item()
