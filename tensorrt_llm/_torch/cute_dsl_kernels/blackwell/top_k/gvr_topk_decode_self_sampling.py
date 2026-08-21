@@ -4694,7 +4694,10 @@ class GvrClusKernel:
                 sok = cutlass.Int32(1)
         if sok != cutlass.Int32(0):  # L1932-1947 sample hist
             w = (SMAX - SMIN) * cutlass.Float32(1.0 / 256.0)
-            sc_s = cutlass.Float32(1.0) / w
+            # CUDA --use_fast_math lowers `1.0f / w` to a bare MUFU.RCP; the
+            # plain `/` spelling emits the IEEE div.rn rcp+Newton+CALL chain
+            # (fix-4). w > 0 by the sok guard; bucketing is SC-invariant.
+            sc_s = cute.arch.rcp_approx(w)
             if shas != cutlass.Int32(0):
                 for t in cutlass.range_constexpr(4):
                     bq = C.f2s_rz((fsa[t] - SMIN) * sc_s)
@@ -4838,7 +4841,9 @@ class GvrClusKernel:
                 wdok = cutlass.Int32(1)
             if wdok == cutlass.Int32(0):
                 WD = cutlass.Float32(1e-30)
-            SC = cutlass.Float32(1.0) / WD
+            # MUFU.RCP spelling (fix-4): WD >= 1e-30 finite by the wdok
+            # clamp; classify bucketing is SC-invariant for any SC > 0.
+            SC = cute.arch.rcp_approx(WD)
 
             # ---- P3 row pass over OWNED CHUNKS (L2033-2121) ----
             g = rank + cutlass.Int32(0)
@@ -5796,7 +5801,9 @@ class GvrRegClusKernel:
             wsel = cutlass.Float32(1e-30)
             if WD > cutlass.Float32(0.0):
                 wsel = WD
-            SC = cutlass.Float32(1.0) / wsel
+            # MUFU.RCP spelling (fix-4, mirrors the reg family's L3668 site):
+            # wsel >= 1e-30 finite; bucketing is SC-invariant for any SC > 0.
+            SC = cute.arch.rcp_approx(wsel)
             CQ0 = cutlass.Float32(1.0) - Tv * SC
             CQ = CQ0 + cutlass.Float32(1e-6) * (_fabsf__regclus(CQ0) + cutlass.Float32(1.0))
 
