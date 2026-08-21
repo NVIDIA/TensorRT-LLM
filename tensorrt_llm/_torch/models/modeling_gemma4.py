@@ -16,7 +16,7 @@
 
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +29,7 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -62,6 +63,8 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_posit
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
     from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -328,14 +331,10 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # Use trtllm-gen for ALL layers.  trtllm-gen has pre-compiled cubins
-        # for both H256+SWA and H512 across all supported dtypes.
-        # For FP8 KV cache (NVFP4), Q is also cast to FP8 in the FlashInfer
-        # backend so that QkvE4m3OBfloat16 context cubins can be used
-        # (context cubins require same Q/KV dtype; decode cubins support
-        # mixed dtypes natively).  Uniform backend avoids workspace
-        # corruption between different wrapper types under CUDA graphs.
-        self.attn.flashinfer_backend = "trtllm-gen"
+        # trtllm-gen FMHA kernels are available only on datacenter Blackwell.
+        # Use FlashInfer FA2 on other architectures, including SM120/SM121;
+        # multimodal custom masks then use FlashInfer's native mask planning.
+        self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
@@ -1228,6 +1227,8 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    build_mtp_draft_model_from_config = True
+
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -1250,7 +1251,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         super().__init__(Gemma4TextModel(model_config), model_config)
 
     @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults.
 
         FlashInfer backend is required for hybrid attention (per-layer
@@ -1260,6 +1261,23 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         return {
             "attn_backend": "FLASHINFER",
         }
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Gemma4's VSWA layout.
+
+        Hybrid-attention checkpoints (per-layer head_dim) are routed to V2
+        unconditionally regardless of this preference.
+        """
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
+        return "PYTHON"
 
     def _get_token_type_mask(self, mm_token_type_ids: torch.Tensor):
         """Build bidirectional attention mask from mm_token_type_ids.

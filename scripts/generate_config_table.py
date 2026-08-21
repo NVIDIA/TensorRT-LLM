@@ -23,6 +23,8 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import yaml
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
 
@@ -71,6 +73,10 @@ MODEL_INFO = {
     "Qwen/Qwen3-Next-80B-A3B-Thinking": {
         "display_name": "Qwen3-Next-80B",
         "url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking",
+    },
+    "Qwen/Qwen3.8-2.4T-A95B-FP8": {
+        "display_name": "Qwen3.8-2.4T-A95B (FP8)",
+        "url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
     },
     "nvidia/Qwen3.5-397B-A17B-NVFP4": {
         "display_name": "Qwen3.5-397B-A17B (NVFP4)",
@@ -142,6 +148,36 @@ def _model_display_and_url(model: str) -> tuple[str, str]:
     return model, ""
 
 
+def _references_repo_relative_path(config_path: str) -> bool:
+    """Return True if the config points at another repo file through a relative path.
+
+    Such a path (for example ``moe_config.load_balancer``) is opened relative to the
+    working directory, so the serve command has to run from the TensorRT LLM directory.
+    """
+    try:
+        config = yaml.safe_load((REPO_ROOT / config_path).read_text())
+    except (OSError, yaml.YAMLError):
+        return False
+
+    def walk(node) -> bool:
+        if isinstance(node, dict):
+            return any(walk(value) for value in node.values())
+        if isinstance(node, list):
+            return any(walk(item) for item in node)
+        if isinstance(node, str) and not os.path.isabs(node):
+            return (REPO_ROOT / node).is_file()
+        return False
+
+    return walk(config)
+
+
+def _serve_command(model: str, config_path: str) -> str:
+    command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
+    if _references_repo_relative_path(config_path):
+        command = f'cd "${{TRTLLM_DIR}}" && {command}'
+    return command
+
+
 def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
     """Parse curated recipe YAML and return CuratedRow entries for JSON serialization."""
     curated_list = CuratedRecipeList.from_yaml(Path(yaml_path))
@@ -154,7 +190,7 @@ def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
         config_filename = os.path.basename(config_path)
         config_github_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{config_path}"
         config_raw_url = f"https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/{config_path}"
-        command = f"trtllm-serve {entry.model} --config ${{TRTLLM_DIR}}/{config_path}"
+        command = _serve_command(entry.model, config_path)
         rows.append(
             CuratedRow(
                 model=entry.model,
@@ -211,7 +247,7 @@ def build_rows(yaml_path: Path) -> list[RecipeRow]:
                     else assign_profile(len(entries), idx, conc)
                 )
 
-                command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
+                command = _serve_command(model, config_path)
 
                 config_filename = os.path.basename(config_path)
                 config_github_url = (

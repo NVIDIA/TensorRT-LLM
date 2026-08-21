@@ -8,8 +8,8 @@ dependencies = [
     "anyio>=4.0",
     "pyyaml>=6.0",
     "rich>=13.0",
-    "claude-agent-sdk==0.2.110",
-    "openai-codex==0.1.0b3",
+    "claude-agent-sdk==0.2.128",
+    "openai-codex==0.144.4",
 ]
 
 [project.optional-dependencies]

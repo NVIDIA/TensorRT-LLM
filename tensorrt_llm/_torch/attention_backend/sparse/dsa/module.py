@@ -198,7 +198,7 @@ def forward_sparse_attn_custom_op(
         )
     q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
     indexer_intermediates = proj_outputs[4:]
-    torch.ops.trtllm.mla_dsa_attn_inplace(
+    custom_ops.maybe_bcg_mla_dsa_attn_inplace(
         q,
         compressed_kv,
         k_pe,
@@ -386,6 +386,11 @@ def _forward_dsa_attn(
             position_ids=gen_position_ids,
             indexer_intermediates=indexer_intermediates,
         )
+
+    # Join the prev_topk copy forked in sparse_attn_indexer; CUDA graph
+    # capture requires the join within the same layer's forward.
+    if self.mqa.indexer is not None:
+        self.mqa.indexer.maybe_join_prev_topk_copy()
 
 
 def should_use_short_mha(

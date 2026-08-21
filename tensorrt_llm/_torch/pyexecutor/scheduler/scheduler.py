@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Request schedulers used by the PyTorch executor."""
+
 import dataclasses
 import inspect
 from abc import ABC, abstractmethod
@@ -13,7 +18,12 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
-from ..llm_request import LlmRequest, LlmRequestState
+from ..llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    format_multimodal_encoder_output_budget_error,
+    is_multimodal_encoder_ready,
+)
 
 RequestList = list[LlmRequest]
 PrefixReuseSummary: TypeAlias = tb_internal.batch_manager.PrefixReuseSummary
@@ -53,17 +63,52 @@ def _call_with_optional_summary(
     return fn(*args, cached_summary=cached_summary)
 
 
-SchedulerOutput = namedtuple(
-    "SchedulerOutput",
-    [
-        "encoder_requests",
-        "context_requests",
-        "generation_requests",
-        "paused_requests",
-        "fitting_disagg_gen_init_requests",
-        "num_fitting_requests",
-    ],
-)
+class SchedulerOutput(
+    namedtuple(
+        "_SchedulerOutputBase",
+        [
+            "encoder_requests",
+            "context_requests",
+            "generation_requests",
+            "paused_requests",
+            "fitting_disagg_gen_init_requests",
+            "num_fitting_requests",
+            "scheduled_mm_encoder_items",
+            "recompute_paused_requests",
+        ],
+    )
+):
+    """Scheduler result.
+
+    ``scheduled_mm_encoder_items`` defaults to ``None``. The V2-only
+    ``recompute_paused_requests`` defaults to a fresh empty list so existing
+    V1 schedulers can keep constructing the original six-field output.
+    """
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        encoder_requests: RequestList,
+        context_requests: RequestList,
+        generation_requests: RequestList,
+        paused_requests: RequestList,
+        fitting_disagg_gen_init_requests: RequestList,
+        num_fitting_requests: int,
+        scheduled_mm_encoder_items: dict[int, list[int]] | None = None,
+        recompute_paused_requests: RequestList | None = None,
+    ):
+        return super(SchedulerOutput, cls).__new__(
+            cls,
+            encoder_requests,
+            context_requests,
+            generation_requests,
+            paused_requests,
+            fitting_disagg_gen_init_requests,
+            num_fitting_requests,
+            scheduled_mm_encoder_items,
+            [] if recompute_paused_requests is None else recompute_paused_requests,
+        )
 
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
@@ -151,7 +196,9 @@ class ScheduledRequests:
     generation_requests: RequestList
     """Requests that are in the generation phase."""
     paused_requests: RequestList
-    """Requests that are paused."""
+    """Requests whose KV cache was suspended without resetting request state."""
+    recompute_paused_requests: RequestList
+    """Requests that must release resources and restart from context."""
     added_inflight_req_ids: list[int]
     """Request ids this batch inserted into the executor's inflight set.
 
@@ -162,6 +209,10 @@ class ScheduledRequests:
     ``context_requests_last_chunk`` -- so the ids are no longer derivable from
     the request lists at removal time.
     """
+    scheduled_mm_encoder_items: dict[int, list[int]] | None
+    """Maps a request id to the prompt-ordered indices of its multimodal items
+    selected for encoder execution this iteration (only items whose encoder
+    outputs are still missing). ``None`` when no items were scheduled."""
 
     def __init__(self):
         self.encoder_requests: RequestList = []
@@ -169,7 +220,9 @@ class ScheduledRequests:
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
+        self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
 
     @property
     def is_generation_only(self) -> bool:
@@ -227,6 +280,25 @@ class ScheduledRequests:
 
 
 class RequestScheduler(ABC):
+    @property
+    @abstractmethod
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        """Return the half-open state range admitted to a forward batch."""
+        raise NotImplementedError
+
+    def is_request_in_schedulable_state(self, request: LlmRequest) -> bool:
+        """Return whether request state permits admission to a forward batch."""
+        if is_decoder_context_request_waiting_for_encoder_output(request):
+            return False
+        if request.state in (
+            LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        ):
+            return False
+        schedule_from, schedule_to = self.scheduling_state_range
+        return schedule_from.value <= request.state_value < schedule_to.value
+
     @abstractmethod
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -268,6 +340,11 @@ class SerializableSchedulerOutput:
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
     wait_for_disagg_gen_transfer_progress: bool = False
+    # request id -> prompt-ordered indices of its MM items selected for
+    # encoder execution this iteration
+    scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+    recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
+    """Request ids of recompute-paused requests."""
 
     @classmethod
     def from_scheduler_result(
@@ -292,6 +369,10 @@ class SerializableSchedulerOutput:
             ],
             num_fitting_requests=num_fitting_requests,
             wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
+            scheduled_mm_encoder_items=scheduled_requests.scheduled_mm_encoder_items,
+            recompute_paused_requests=[
+                req.request_id for req in scheduled_requests.recompute_paused_requests
+            ],
         )
 
     def to_scheduler_result(
@@ -313,6 +394,10 @@ class SerializableSchedulerOutput:
         ]
         scheduled_requests.paused_requests = [
             id_to_request[req_id] for req_id in self.paused_requests
+        ]
+        scheduled_requests.scheduled_mm_encoder_items = self.scheduled_mm_encoder_items
+        scheduled_requests.recompute_paused_requests = [
+            id_to_request[req_id] for req_id in self.recompute_paused_requests
         ]
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
@@ -403,10 +488,14 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: int = None,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
+        self.no_schedule_until_state = no_schedule_until_state
+        self.no_schedule_after_state = no_schedule_after_state
 
         ctx_chunk_config_cpp = None
         if ctx_chunk_config is not None:
@@ -414,7 +503,12 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
 
-        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config_cpp, max_num_tokens)
+        self.impl = tb_internal.algorithms.MicroBatchScheduler(
+            ctx_chunk_config=ctx_chunk_config_cpp,
+            max_context_length=max_num_tokens,
+            no_schedule_until_state=no_schedule_until_state,
+            no_schedule_after_state=no_schedule_after_state,
+        )
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -437,6 +531,13 @@ class SimpleScheduler(RequestScheduler):
         super(SimpleScheduler, self).__init__()
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return (
+            self.micro_batch_scheduler.no_schedule_until_state,
+            self.micro_batch_scheduler.no_schedule_after_state,
+        )
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -462,6 +563,289 @@ class SimpleScheduler(RequestScheduler):
         requests = drop_decoder_context_requests_waiting_for_encoder_output(requests)
         fitting_requests, _, _ = self.capacity_scheduler.schedule_request(requests)
         return len(fitting_requests) == len(requests)
+
+
+class MultimodalScheduler(RequestScheduler):
+    """Add atomic multimodal item budgeting around the existing scheduler.
+
+    The wrapper is constructed only for ``MultimodalModelMixin`` models. It
+    deliberately reuses the wrapped scheduler's capacity and microbatch
+    schedulers so MM encoder costs never enter the LLM token budget.
+
+    ``max_batch_size`` and ``max_num_tokens`` are shared across requests and
+    modalities. For multimodal encoders, one atomic image or video occupies
+    one encoder batch slot even when it expands into several model-internal
+    attention sequences. Those attention metadata capacities are derived
+    separately from the token budget and model geometry.
+
+    When ``output_budget_bytes`` is configured, selection also enforces the
+    encoder output byte budget (allocate-before-compute): an item is only
+    selected when its embedding bytes fit alongside the outputs already
+    resident on live requests and bytes claimed earlier in the pass.
+    Occupancy is derived from request states each pass rather than tracked
+    by a counter, so a stripped or aborted request self-heals the budget.
+    """
+
+    def __init__(
+        self,
+        scheduler: SimpleScheduler,
+        max_batch_size: int,
+        max_num_tokens: int,
+        *,
+        output_budget_bytes: int | None = None,
+        bytes_per_encoder_embedding: int = 0,
+    ) -> None:
+        self.scheduler = scheduler
+        self.max_batch_size = max_batch_size
+        self.max_num_tokens = max_num_tokens
+        # Optional byte budget for encoder outputs living outside a forward
+        # pass. Item selection performs allocate-before-compute against it:
+        # occupancy is *derived* each pass from live request states (their
+        # recorded, not-yet-consumed outputs) — there is no counter to
+        # release or keep in sync; a stripped or aborted request simply
+        # stops contributing. `bytes_per_encoder_embedding` converts declared
+        # embedding rows to bytes and must be positive alongside a budget.
+        self.output_budget_bytes = output_budget_bytes
+        self.bytes_per_encoder_embedding = bytes_per_encoder_embedding
+        if output_budget_bytes is not None and bytes_per_encoder_embedding <= 0:
+            raise ValueError(
+                "bytes_per_encoder_embedding must be positive when a byte "
+                "budget bounds MM encoder outputs"
+            )
+        self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
+            scheduler, "micro_batch_scheduler"
+        )
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return self.scheduler.scheduling_state_range
+
+    def _total_resident_output_bytes(self, active_requests: RequestList) -> int:
+        """Sum per-request resident encoder-output bytes across live states.
+
+        Summed fresh every pass: a request whose outputs were consumed
+        (stripped post-prefill) or that was aborted no longer contributes,
+        so the accounting self-heals with no release bookkeeping.
+        """
+        return sum(
+            state.resident_output_bytes(self.bytes_per_encoder_embedding)
+            for request in active_requests
+            if (state := request.py_mm_encoder_state) is not None
+        )
+
+    def _select_items(
+        self, requests: RequestList, *, active_requests: RequestList | None = None
+    ) -> tuple[dict[int, list[int]], RequestList]:
+        """Greedily select pending MM items under the encoder budgets.
+
+        Requests are visited in the wrapped capacity scheduler's FCFS order
+        with no explicit `MultimodalEncoderProgress`-based priority: a
+        request left `PARTIAL` by a budget split necessarily sits ahead of
+        anything admitted later, so its remaining items resume before newer
+        work by order alone.
+
+        When a byte budget is configured, selection also performs
+        allocate-before-compute, per request rather than per item: a request
+        starts only if its *whole* embedding fits alongside (a) storage
+        already held by live requests (derived from `active_requests`) and
+        (b) bytes claimed earlier in this pass. That matches how the storage
+        is allocated — the first recorded item sizes the buffer for all of
+        them — and means a started request can always finish, so no
+        head-of-line reservation is needed to keep later requests from
+        squatting the space it still needs.
+
+        Returns the selected item indices per request id, plus the requests
+        eligible for LLM microbatch scheduling this iteration (encoder
+        outputs already ready, or every pending item selected above).
+        """
+        remaining_batch_slots = self.max_batch_size
+        remaining_tokens = self.max_num_tokens
+        budget = self.output_budget_bytes
+        resident_bytes = (
+            self._total_resident_output_bytes(
+                active_requests if active_requests is not None else requests
+            )
+            if budget is not None
+            else 0
+        )
+        reserved_bytes = 0
+        selected: dict[int, list[int]] = {}
+        llm_eligible: RequestList = []
+
+        for request in requests:
+            state = request.py_mm_encoder_state
+            if state is None:
+                llm_eligible.append(request)
+                continue
+            if is_multimodal_encoder_ready(request):
+                llm_eligible.append(request)
+                continue
+
+            # Admission validates user-provided item metadata and stores an
+            # owned copy on the request state. Reading only that state here
+            # keeps malformed-input failures scoped to the affected request
+            # instead of raising from the scheduler loop.
+            token_lengths = state.encoder_token_lengths
+
+            pending = state.pending_item_indices()
+            # The first item scheduled for a request allocates the storage for
+            # *all* of its items, so the byte budget is charged once per
+            # request rather than per item. A request that cannot be charged
+            # yet stays fully pending instead of occupying part of the budget
+            # with work that cannot be prefilled until it completes.
+            if (
+                budget is not None
+                and not state.has_storage
+                and pending
+                and remaining_batch_slots > 0
+                and token_lengths[pending[0]] <= remaining_tokens
+            ):
+                request_bytes = sum(state.embedding_lengths) * self.bytes_per_encoder_embedding
+                if request_bytes > budget:
+                    # Liveness backstop: admission
+                    # (`initialize_multimodal_encoder_request`) already
+                    # rejects requests whose outputs can never coexist
+                    # within the budget, so reaching this means an
+                    # accounting bug rather than a user input.
+                    raise RuntimeError(
+                        format_multimodal_encoder_output_budget_error(
+                            request_bytes,
+                            budget,
+                            self.max_num_tokens,
+                            request_id=request.py_request_id,
+                        )
+                    )
+                if resident_bytes + reserved_bytes + request_bytes > budget:
+                    continue
+                reserved_bytes += request_bytes
+
+            request_items: list[int] = []
+            for item_idx in pending:
+                cost = token_lengths[item_idx]
+                if remaining_batch_slots == 0 or cost > remaining_tokens:
+                    break
+                request_items.append(item_idx)
+                remaining_batch_slots -= 1
+                remaining_tokens -= cost
+
+            if request_items:
+                selected[request.request_id] = request_items
+
+            if pending and len(request_items) == len(pending):
+                llm_eligible.append(request)
+
+        return selected, llm_eligible
+
+    def _schedule_micro_batch(
+        self,
+        fitting_requests: RequestList,
+        fitting_disagg_gen_init_requests: RequestList,
+        paused_requests: RequestList,
+        inflight_request_ids: set[int],
+        *,
+        llm_eligible: RequestList,
+        selected_items: dict[int, list[int]] | None = None,
+    ) -> SchedulerOutput:
+        encoder_requests, context_requests, generation_requests = (
+            self.scheduler.micro_batch_scheduler.schedule(llm_eligible, inflight_request_ids)
+        )
+        return SchedulerOutput(
+            encoder_requests=encoder_requests,
+            context_requests=context_requests,
+            generation_requests=generation_requests,
+            paused_requests=list(paused_requests),
+            fitting_disagg_gen_init_requests=list(fitting_disagg_gen_init_requests),
+            num_fitting_requests=len(fitting_requests),
+            scheduled_mm_encoder_items=selected_items or None,
+        )
+
+    def schedule_request(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> SchedulerOutput:
+        """Apply the default LLM-capacity-coupled MM scheduling policy.
+
+        First use the wrapped scheduler to determine which requests fit
+        LLM/KV capacity, then select their pending atomic MM items under the
+        encoder budgets. The executor's encoder step is the single site that
+        runs MM encoders: an in-budget batch is simply the case where every
+        pending item gets selected. Only requests whose encoder outputs are
+        ready, or become ready this iteration, enter LLM microbatch
+        scheduling.
+        """
+        if not self.has_separate_stages:
+            # Compatibility path for schedulers exposing only a combined API:
+            # schedule the LLM batch first, then enforce MM budgets on its
+            # context requests, withholding contexts that will still lack MM
+            # embeddings after this iteration.
+            scheduler_output = self.scheduler.schedule_request(
+                active_requests, inflight_request_ids
+            )
+            selected_items, llm_eligible = self._select_items(
+                list(scheduler_output.context_requests),
+                active_requests=active_requests,
+            )
+            return scheduler_output._replace(
+                context_requests=llm_eligible,
+                scheduled_mm_encoder_items=selected_items or None,
+            )
+
+        # Only requests admitted by ordinary LLM/KV capacity may consume MM
+        # encoder budget this iteration.
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
+            self.scheduler.capacity_scheduler.schedule_request(active_requests)
+        )
+        selected_items, llm_eligible = self._select_items(
+            list(fitting_requests), active_requests=active_requests
+        )
+        # Preserve the capacity scheduler's decisions while attaching the MM
+        # item plan that the executor must run before the selected LLM
+        # microbatch.
+        return self._schedule_micro_batch(
+            fitting_requests,
+            fitting_disagg_gen_init_requests,
+            paused_requests,
+            inflight_request_ids,
+            llm_eligible=llm_eligible,
+            selected_items=selected_items,
+        )
+
+    def can_schedule(self, requests: RequestList) -> bool:
+        return self.scheduler.can_schedule(requests)
+
+
+class MultimodalEagerEncoderScheduler(MultimodalScheduler):
+    """Eagerly schedule encoder work for already-active MM requests.
+
+    Unlike the default coupled policy, this policy selects encoder items before
+    LLM capacity scheduling. An active request may therefore make encoder
+    progress even when it is not selected for the current LLM batch. It does
+    not admit waiting requests or bypass LLM capacity for decoder execution.
+    """
+
+    def schedule_request(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> SchedulerOutput:
+        selected_items, llm_eligible = self._select_items(active_requests)
+
+        if not self.has_separate_stages:
+            scheduler_output = self.scheduler.schedule_request(llm_eligible, inflight_request_ids)
+            return scheduler_output._replace(scheduled_mm_encoder_items=selected_items or None)
+
+        llm_eligible_ids = {request.request_id for request in llm_eligible}
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
+            self.scheduler.capacity_scheduler.schedule_request(active_requests)
+        )
+        fitting_llm_eligible = [
+            request for request in fitting_requests if request.request_id in llm_eligible_ids
+        ]
+        return self._schedule_micro_batch(
+            fitting_requests,
+            fitting_disagg_gen_init_requests,
+            paused_requests,
+            inflight_request_ids,
+            llm_eligible=fitting_llm_eligible,
+            selected_items=selected_items,
+        )
 
 
 class ChunkingPolicy(Enum):
@@ -1876,6 +2260,13 @@ class SimpleUnifiedScheduler(RequestScheduler):
             max_num_tokens=max_num_tokens,
             ctx_chunk_config=py_chunk_config,
             no_schedule_until_state=no_schedule_until_state,
+        )
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return (
+            self.micro_batch_scheduler.no_schedule_until_state,
+            self.micro_batch_scheduler.no_schedule_after_state,
         )
 
     def schedule_request(
