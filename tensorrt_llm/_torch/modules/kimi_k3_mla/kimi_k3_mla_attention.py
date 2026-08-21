@@ -13,13 +13,12 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-from torch import nn
 
 from ....functional import PositionEmbeddingType
-from ....models.modeling_utils import QuantConfig
 from ...attention_backend import AttentionMetadata, TrtllmAttention
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
+from ..linear import Linear, TensorParallelMode
 from ..mla import MLA
 
 
@@ -158,14 +157,11 @@ class KimiK3MLAAttention(MLA):
         layer_idx: int = 0,
         use_output_gate: bool = True,
         max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantConfig] = None,
+        model_config: ModelConfig,
     ) -> None:
         pos_embd_params = _make_pos_embd_params(
             qk_rope_head_dim=qk_rope_head_dim,
             max_position_embeddings=max_position_embeddings,
-        )
-        model_config = ModelConfig(
-            quant_config=quant_config if quant_config is not None else QuantConfig()
         )
         super().__init__(
             hidden_size=hidden_size,
@@ -196,10 +192,21 @@ class KimiK3MLAAttention(MLA):
         self.use_output_gate = use_output_gate
 
         if use_output_gate:
-            self.g_proj = nn.Linear(
+            # Follow q_b_proj's effective MLA mapping: replicated under
+            # attention-DP and column-sharded by head otherwise.
+            self.g_proj = Linear(
                 hidden_size,
                 num_heads * v_head_dim,
                 bias=False,
+                dtype=dtype,
+                mapping=self.q_b_proj.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                quant_config=model_config.get_quant_config(),
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+                allreduce_strategy=model_config.allreduce_strategy,
+                force_dynamic_quantization=model_config.force_dynamic_quantization,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
 
         # K3 is NoPE. The base MLA backends still require real RoPE tables, so

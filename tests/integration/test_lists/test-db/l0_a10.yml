@@ -67,6 +67,7 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_sa[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
@@ -106,6 +107,7 @@ l0_a10:
   # llmapi
   - unittest/llmapi/test_rlhf_utils.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   # executor
   - unittest/executor/test_spec_dec_stats_pairing.py

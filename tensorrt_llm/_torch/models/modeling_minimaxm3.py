@@ -161,6 +161,25 @@ def get_text_model_config(
     return cfg
 
 
+def _validate_sparse_attention_runtime_config(
+    model_config: "ModelConfig[PretrainedConfig]",
+) -> None:
+    """Require the runtime backend that owns M3's metadata and index cache.
+
+    Both dense and sparse M3 layers use that cache manager, independent of
+    checkpoint precision or GPU architecture. Backend-specific constraints,
+    such as MSA requiring SM100, are validated by the backend itself.
+    """
+    sparse_config = model_config.sparse_attention_config
+    if sparse_config is None or sparse_config.algorithm != "minimax_m3":
+        raise ValueError(
+            "MiniMax-M3 requires sparse_attention_config.algorithm='minimax_m3' "
+            "to create its KV-cache manager and prepare attn_metadata.minimax_m3. "
+            "Set the following in the LLM API configuration:\n"
+            "sparse_attention_config:\n  algorithm: minimax_m3"
+        )
+
+
 def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
     """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
     sparse_cfg = getattr(text_config, "sparse_attention_config", None)
@@ -1860,6 +1879,7 @@ class MiniMaxM3Model(DecoderModel):
     """M3 text decoder model."""
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
+        _validate_sparse_attention_runtime_config(model_config)
         super().__init__(model_config)
         quant_config = model_config.quant_config
         if quant_config is None or (

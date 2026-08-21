@@ -137,10 +137,51 @@ def _test_nodeid(test_line):
         The pytest node ID from the entry.
     """
     return re.split(
-        r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?:\s|$)",
+        r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?=[\s(]|$)",
         test_line,
         maxsplit=1,
     )[0]
+
+
+def _test_marker(test_line):
+    """Return a test-list execution marker, or ``None`` when absent."""
+    line = test_line.partition("#")[0].strip()
+    match = re.search(r"\s+(XFAIL|SKIP|UNSTABLE|TIMEOUT)(?=[\s(]|$)", line)
+    return match.group(1) if match else None
+
+
+def selected_test_is_skip_waived(selected_test_line, waives_file, test_prefix=None):
+    """Whether pytest will skip the selected case before executing its body.
+
+    The CI pipeline merges remote waives into the repository waives file
+    before invoking this launcher. Mirror the exact-nodeid SKIP decision here
+    so a skipped test does not run an otherwise unrelated precheck first.
+    """
+    if _test_marker(selected_test_line) == "SKIP":
+        return True
+
+    selected_nodeid = _test_nodeid(selected_test_line).strip()
+    try:
+        waive_lines = _read_test_list_lines(waives_file)
+    except (FileNotFoundError, ValueError):
+        return False
+
+    for line in waive_lines:
+        if _test_marker(line) != "SKIP":
+            continue
+        waived_nodeid = _test_nodeid(line).strip()
+        if waived_nodeid.startswith("full:"):
+            scope, separator, waived_nodeid = waived_nodeid[5:].partition("/")
+            if not separator or not test_prefix:
+                continue
+            # Match the platform-prefix handling in test_list_parser. SM
+            # waives require runtime GPU discovery and remain pytest-owned.
+            platform_prefix = test_prefix.split("-", 1)[0]
+            if scope.startswith("sm") or platform_prefix not in scope:
+                continue
+        if waived_nodeid == selected_nodeid:
+            return True
+    return False
 
 
 def _load_pytest_split_durations(tokens, llm_src):
@@ -759,6 +800,14 @@ def main():
         script_prefix_lines,
         args.split_group,
     )
+    pytest_tokens = _pytest_command_tokens(script_prefix_lines)
+    selected_test_skipped = selected_test_is_skip_waived(
+        selected_test_line,
+        os.path.join(args.llm_src, "tests", "integration", "test_lists", "waives.txt"),
+        test_prefix=_pytest_option(pytest_tokens, "--test-prefix"),
+    )
+    if selected_test_skipped:
+        print("Selected test is SKIP-waived; cache-transceiver precheck will not run")
     config_yaml, server_name, benchmark_mode, runtime_mode = parse_test_case_name(
         args.llm_src,
         selected_test_line,
@@ -903,9 +952,22 @@ def main():
         # (single owner, shared with the local flow).
         pcfg = _import_precheck_config(args.llm_src)
         precheck_enabled = pcfg.precheck_enabled(config)
-        llm_models_root = (
-            _resolve_llm_models_root(script_prefix_lines) if precheck_enabled else None
-        )
+        precheck_will_run = precheck_enabled and not selected_test_skipped
+        # The model root is only consumed by the precheck (auto KV-cache-manager
+        # resolution needs the model config). Fail fast only when the precheck
+        # will actually run; otherwise degrade to a warning so stages whose
+        # pytestCommand does not carry LLM_MODELS_ROOT inline keep submitting.
+        llm_models_root = None
+        if precheck_enabled:
+            try:
+                llm_models_root = _resolve_llm_models_root(script_prefix_lines)
+            except ValueError as e:
+                if precheck_will_run:
+                    raise
+                print(
+                    f"WARNING: {e}; "
+                    "cache-transceiver precheck is skipped for this config so continuing"
+                )
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,
@@ -918,6 +980,7 @@ def main():
                 ),
                 stage_name=args.stage_name,
                 llm_models_root=llm_models_root,
+                skip_precheck=selected_test_skipped,
             )
         )
         srun_args_lines.extend(

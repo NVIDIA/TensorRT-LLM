@@ -15,6 +15,7 @@
 
 import inspect
 import math
+import os
 import threading
 from abc import ABC, abstractmethod
 from enum import Enum, auto
@@ -231,6 +232,42 @@ class EplbSupportStatus(Enum):
     NOT_VERIFIED = auto()
 
 
+def _host_weight_pageout_mode() -> Optional[str]:
+    """Select how a consumed expert's host weight pages are reclaimed.
+
+    A loaded MoE layer leaves its source weight pages resident on the host,
+    charged to the cgroup the ranks share, so on a large checkpoint they pile
+    up long after the device weights are ready. This picks the ``madvise`` mode
+    applied once an expert's weights have been consumed; it covers only
+    contiguous CPU expert projections and biases, and ``madvise`` is a hint,
+    not a free or an unmap.
+
+    Integrated GPUs share memory with the CPU and always get ``"dontneed"``;
+    ``TLLM_PAGEOUT_HOST_WEIGHTS`` does not affect them. Discrete GPUs default
+    to ``None``, because ranks loading the same shards reuse those cached
+    pages; setting the variable (``True``/``true``/``1``/``yes``/``y``) opts
+    into ``"pageout"``.
+
+    The opt-in path must use ``MADV_PAGEOUT`` rather than ``MADV_DONTNEED``:
+    a mapper can rebuild a weight into anonymous memory, where ``DONTNEED``
+    discards the contents and a later read sees zeros. ``MADV_PAGEOUT`` is
+    non-destructive for file-backed and anonymous pages alike.
+
+    Enable it when ranks share a constrained cgroup and host memory is what
+    runs out. It complements the worker limit rather than replacing it, and
+    does not pay off everywhere: one measured layout saw a large drop in node
+    peak, another saw none and loaded slightly slower. Hence opt-in.
+    """
+    if is_device_integrated():
+        return "dontneed"
+    if os.environ.get("TLLM_PAGEOUT_HOST_WEIGHTS",
+                      "False") in ["True", "true", "1", "yes", "y"]:
+        logger.info_once("Releasing host weight pages after each expert load",
+                         key="moe_host_weight_pageout")
+        return "pageout"
+    return None
+
+
 class FusedMoEMethodBase(ABC):
     """
     Base class for all fused MoE methods.
@@ -346,18 +383,19 @@ class FusedMoEMethodBase(ABC):
             w2_kargs["allow_partial_loading"] = allow_partial_loading
         pass_expert_idx_w3w1 = "expert_idx" in w3_w1_args
 
+        pageout_mode = _host_weight_pageout_mode()
+
         def maybe_pageout_mmapped_cpu_weights(
                 weight_tensors: List[object]) -> None:
-            # Integrated GPU systems share physical memory with CPU. After we
-            # finish copying from mmapped CPU weights, proactively advising the
-            # kernel to drop those pages reduces shared-memory pressure.
-            if not is_device_integrated():
+            # Once an expert's weights have been copied to the device, advise
+            # the kernel to release the host pages backing them.
+            if pageout_mode is None:
                 return
             for weight in weight_tensors:
                 if (isinstance(weight, torch.Tensor)
                         and weight.device.type == "cpu"
                         and weight.is_contiguous()):
-                    advise_tensor_pageout(weight)
+                    advise_tensor_pageout(weight, mode=pageout_mode)
 
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.

@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from ..types import (
@@ -91,5 +92,6 @@ class Backend(ABC):
         hooks: dict | None = None,
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        cwd: Path | None = None,
     ) -> AsyncIterator[BackendClient]:
         yield

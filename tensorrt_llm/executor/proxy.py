@@ -1189,6 +1189,19 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.error(f"Error fetching data transceiver state via RPC: {e}")
             raise
 
+    def get_startup_metrics(self) -> dict | None:
+        """Get rank-0 startup metrics, or ``None`` if the RPC is unavailable."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get startup metrics")
+            return None
+        try:
+            metrics = self.rpc_client.get_startup_metrics().remote()
+            return metrics if isinstance(metrics, dict) else None
+        except RPCError as e:
+            logger.warning(f"Error fetching startup metrics via RPC: {e}")
+            return None
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
 

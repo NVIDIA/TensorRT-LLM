@@ -300,6 +300,17 @@ class HfWeightLoader(BaseWeightLoader):
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
+        """Load model weights keyed by checkpoint tensor name.
+
+        Kimi K3 checkpoint is opened lazily as HF SafeTensors to avoid materializing any part of the checkpoint
+        in CPU memory.
+        Other models' checkpoints may be prefetched in parallel to warm up the OS file cache if
+        the CPU memory is large enough, before their tensors are loaded via mmap.
+        when `_WEIGHT_CACHE_ENV` is on, other models can also use a CPU weight cache to accelerate repeated
+        loading under the same process.
+
+        Returns a `ConsumableWeightsDict` mapping checkpoint tensor names to tensors.
+        """
         if self._is_kimi_k3_checkpoint(checkpoint_dir):
             return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
@@ -386,7 +397,7 @@ class HfWeightLoader(BaseWeightLoader):
         return ConsumableWeightsDict(weights)
 
     @staticmethod
-    def _load_safetensors_file(file):
+    def _load_safetensors_file(file: str) -> dict[str, torch.Tensor]:
         logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 

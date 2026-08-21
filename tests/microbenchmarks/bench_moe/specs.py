@@ -314,6 +314,17 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         n_group=8,
         topk_group=4,
     ),
+    "deepseek_r1": ModelSpec(
+        name="deepseek_r1",
+        num_experts=256,
+        top_k=8,
+        hidden_size=7168,
+        intermediate_size=2048,
+        quant_algo="FP8_BLOCK_SCALES",
+        routing_method="DEEPSEEK_V3",
+        n_group=8,
+        topk_group=4,
+    ),
     "kimi_k2": ModelSpec(
         name="kimi_k2",
         num_experts=384,

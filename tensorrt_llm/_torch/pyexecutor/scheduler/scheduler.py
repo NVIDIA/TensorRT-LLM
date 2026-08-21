@@ -63,21 +63,52 @@ def _call_with_optional_summary(
     return fn(*args, cached_summary=cached_summary)
 
 
-SchedulerOutput = namedtuple(
-    "SchedulerOutput",
-    [
-        "encoder_requests",
-        "context_requests",
-        "generation_requests",
-        "paused_requests",
-        "fitting_disagg_gen_init_requests",
-        "num_fitting_requests",
-        # request id -> prompt-ordered indices of its MM items selected for
-        # encoder execution this iteration
-        "scheduled_mm_encoder_items",
-    ],
-    defaults=[None],
-)
+class SchedulerOutput(
+    namedtuple(
+        "_SchedulerOutputBase",
+        [
+            "encoder_requests",
+            "context_requests",
+            "generation_requests",
+            "paused_requests",
+            "fitting_disagg_gen_init_requests",
+            "num_fitting_requests",
+            "scheduled_mm_encoder_items",
+            "recompute_paused_requests",
+        ],
+    )
+):
+    """Scheduler result.
+
+    ``scheduled_mm_encoder_items`` defaults to ``None``. The V2-only
+    ``recompute_paused_requests`` defaults to a fresh empty list so existing
+    V1 schedulers can keep constructing the original six-field output.
+    """
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        encoder_requests: RequestList,
+        context_requests: RequestList,
+        generation_requests: RequestList,
+        paused_requests: RequestList,
+        fitting_disagg_gen_init_requests: RequestList,
+        num_fitting_requests: int,
+        scheduled_mm_encoder_items: dict[int, list[int]] | None = None,
+        recompute_paused_requests: RequestList | None = None,
+    ):
+        return super(SchedulerOutput, cls).__new__(
+            cls,
+            encoder_requests,
+            context_requests,
+            generation_requests,
+            paused_requests,
+            fitting_disagg_gen_init_requests,
+            num_fitting_requests,
+            scheduled_mm_encoder_items,
+            [] if recompute_paused_requests is None else recompute_paused_requests,
+        )
 
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
@@ -165,7 +196,9 @@ class ScheduledRequests:
     generation_requests: RequestList
     """Requests that are in the generation phase."""
     paused_requests: RequestList
-    """Requests that are paused."""
+    """Requests whose KV cache was suspended without resetting request state."""
+    recompute_paused_requests: RequestList
+    """Requests that must release resources and restart from context."""
     added_inflight_req_ids: list[int]
     """Request ids this batch inserted into the executor's inflight set.
 
@@ -187,6 +220,7 @@ class ScheduledRequests:
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
 
@@ -309,6 +343,8 @@ class SerializableSchedulerOutput:
     # request id -> prompt-ordered indices of its MM items selected for
     # encoder execution this iteration
     scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+    recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
+    """Request ids of recompute-paused requests."""
 
     @classmethod
     def from_scheduler_result(
@@ -334,6 +370,9 @@ class SerializableSchedulerOutput:
             num_fitting_requests=num_fitting_requests,
             wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
             scheduled_mm_encoder_items=scheduled_requests.scheduled_mm_encoder_items,
+            recompute_paused_requests=[
+                req.request_id for req in scheduled_requests.recompute_paused_requests
+            ],
         )
 
     def to_scheduler_result(
@@ -357,6 +396,9 @@ class SerializableSchedulerOutput:
             id_to_request[req_id] for req_id in self.paused_requests
         ]
         scheduled_requests.scheduled_mm_encoder_items = self.scheduled_mm_encoder_items
+        scheduled_requests.recompute_paused_requests = [
+            id_to_request[req_id] for req_id in self.recompute_paused_requests
+        ]
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
         ]

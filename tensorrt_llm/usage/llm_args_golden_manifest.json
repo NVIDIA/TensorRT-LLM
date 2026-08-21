@@ -1064,7 +1064,6 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
-        "WIDEEP",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1074,7 +1073,7 @@
         "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"
@@ -1912,6 +1911,13 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.enable_global_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.enable_penalty"
     },
     {
       "allowed_values": [],

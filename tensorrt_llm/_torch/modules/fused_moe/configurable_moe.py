@@ -487,6 +487,11 @@ class ConfigurableMoE(MoE):
         """
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
+        elif self.enable_dwdp:
+            # DWDP prefetches expert weights instead of dispatching tokens, so a
+            # rank only ever processes its own tokens, never more. Keyed off
+            # ``enable_dwdp`` so no non-DWDP path changes the branch it takes.
+            num_rows = max(all_rank_num_tokens)
         else:
             # non-DP: no cross-rank dispatch. The scheduler fills all_rank_num_tokens
             # from [x.shape[0]] before calling here, so it must be a single-element list.
