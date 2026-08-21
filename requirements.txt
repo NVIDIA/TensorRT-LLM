@@ -52,7 +52,7 @@ aenum
 pyzmq
 fastapi>=0.120.1,<=0.121.3
 starlette>=0.49.1
-uvicorn
+uvicorn>=0.30
 setuptools<80
 # FlashInfer source builds (--no-build-isolation) need packaging>=24.2 for setuptools license-expression validation
 packaging>=24.2
