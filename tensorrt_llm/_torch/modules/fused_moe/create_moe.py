@@ -87,9 +87,9 @@ def create_moe_backend(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
-        activation: Optional MegaMoE DeepGEMM activation name
-        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
-        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
+        activation: Optional MegaMoE activation name (DeepGEMM / CuteDSL)
+        situ_beta: Optional MegaMoE SiTU beta (DeepGEMM / CuteDSL)
+        situ_linear_beta: Optional MegaMoE SiTU linear beta (DeepGEMM / CuteDSL)
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
@@ -185,11 +185,12 @@ def create_moe_backend(
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
         )
 
-    if any(value is not None
-           for value in (activation, situ_beta,
-                         situ_linear_beta)) and moe_cls is not MegaMoEDeepGemm:
-        raise ValueError("MegaMoE DeepGEMM activation options require "
-                         f"MegaMoEDeepGemm, got {moe_cls.__name__}")
+    if (any(value is not None
+            for value in (activation, situ_beta, situ_linear_beta))
+            and moe_cls not in (MegaMoEDeepGemm, MegaMoECuteDsl)):
+        raise ValueError(
+            "MegaMoE activation options require MegaMoEDeepGemm or "
+            f"MegaMoECuteDsl, got {moe_cls.__name__}")
 
     if any(value is not None for value in (trtllm_gen_activation_type,
                                            trtllm_gen_activation_alpha,
@@ -327,6 +328,9 @@ def create_moe_backend(
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         if moe_cls is MegaMoECuteDsl:
             # ``_resolve_gate_up_clamp`` accepts tensor or scalar; fall back
@@ -335,12 +339,7 @@ def create_moe_backend(
                                               if swiglu_limit is not None else
                                               swiglu_limit_scalar)
         else:
-            megamoe_kwargs.update(
-                swiglu_limit_scalar=swiglu_limit_scalar,
-                activation=activation,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
+            megamoe_kwargs["swiglu_limit_scalar"] = swiglu_limit_scalar
         return moe_cls(**megamoe_kwargs)
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
@@ -395,9 +394,9 @@ def create_moe(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
-        activation: Optional MegaMoE DeepGEMM activation name
-        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
-        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
+        activation: Optional MegaMoE activation name (DeepGEMM / CuteDSL)
+        situ_beta: Optional MegaMoE SiTU beta (DeepGEMM / CuteDSL)
+        situ_linear_beta: Optional MegaMoE SiTU linear beta (DeepGEMM / CuteDSL)
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
@@ -449,10 +448,10 @@ def create_moe(
     )
     if (any(value is not None
             for value in (activation, situ_beta, situ_linear_beta))
-            and moe_cls is not MegaMoEDeepGemm):
+            and moe_cls not in (MegaMoEDeepGemm, MegaMoECuteDsl)):
         raise ValueError(
-            "MegaMoE DeepGEMM activation options require "
-            "MegaMoEDeepGemm without backend fallback, but resolved "
+            "MegaMoE activation options require MegaMoEDeepGemm or "
+            "MegaMoECuteDsl without backend fallback, but resolved "
             f"{moe_cls.__name__}.")
     if (any(value is not None for value in (trtllm_gen_activation_type,
                                             trtllm_gen_activation_alpha,

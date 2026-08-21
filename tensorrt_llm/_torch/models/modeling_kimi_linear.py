@@ -1121,19 +1121,14 @@ class KimiK3MoERuntime(nn.Module):
                 trtllm_gen_activation_alpha=situ_beta,
                 trtllm_gen_activation_beta=situ_linear_beta,
             )
-        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+        elif routed_moe_model_config.moe_backend in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"):
+            # Both MegaMoE backends take the same explicit SiTU trio.
+            # CuteDSL can also infer from pretrained ``activation_situ_*``.
             routed_moe_kwargs.update(
                 activation="situ",
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
             )
-        # MEGAMOE_CUTEDSL has no branch on purpose. ``MegaMoECuteDsl`` resolves
-        # SiTU from the pretrained config in ``_resolve_activation_config``
-        # (``activation=None`` -> "situ" when ``activation_situ_beta`` is
-        # present), and ``create_moe`` currently rejects the explicit
-        # ``activation``/``situ_beta``/``situ_linear_beta`` trio for anything
-        # other than ``MegaMoEDeepGemm``, so passing them here would raise.
-        # Unifying that plumbing is tracked in TRTLLM-15649.
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
