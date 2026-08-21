@@ -686,6 +686,12 @@ class CUDAGraphRunner:
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
+        expected_num_tokens = self._get_num_tokens_for_key(key)
+        if seqlen != expected_num_tokens:
+            raise ValueError(
+                f"replay() got {seqlen} tokens for key {key}, but the graph "
+                f"was captured for {expected_num_tokens} tokens. A shorter "
+                "input_ids leaves the tail of the static input buffer stale.")
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
@@ -694,6 +700,13 @@ class CUDAGraphRunner:
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
             if mrope_delta_read_seq_slots is not None:
+                if mrope_delta_read_seq_slots.shape[
+                        0] != key.batch_size * self.max_beam_width:
+                    raise ValueError(
+                        f"replay() got {mrope_delta_read_seq_slots.shape[0]} "
+                        f"mrope_delta_read_seq_slots for key {key}, but the graph "
+                        f"was captured for {key.batch_size * self.max_beam_width} "
+                        "mrope_delta_read_seq_slots.")
                 static_tensors[
                     'mrope_delta_read_seq_slots'][:mrope_delta_read_seq_slots.
                                                   shape[0]].copy_(
