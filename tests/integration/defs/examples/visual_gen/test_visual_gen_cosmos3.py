@@ -49,6 +49,22 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
 # Cosmos3 requires VANILLA attention and guardrails disabled in CI.
 COSMOS3_NANO_MODEL_SUBPATH = "Cosmos3-Nano"
 COSMOS3_LPIPS_PROMPT = "A serene mountain landscape with snow-capped peaks and a flowing river"
+# The T2I/T2V goldens were baked before the Cosmos3 audio-output feature
+# (f50ca53dae) changed two conditioning defaults: the descriptive negative
+# prompt became "" and max_sequence_length went 1024 -> 4096. Pin the original
+# values for those two tests so they stay decoupled from future public-default
+# changes (matching the WAN21/22, LTX2, QwenImage pattern). The V2V golden was
+# baked after that feature landed, so it deliberately keeps the live defaults.
+COSMOS3_LPIPS_NEGATIVE_PROMPT = (
+    "The video captures a series of frames showing ugly scenes, static with no motion, "
+    "motion blur, over-saturation, shaky footage, low resolution, grainy texture, "
+    "pixelated images, poorly lit areas, underexposed and overexposed scenes, poor "
+    "color balance, washed out colors, choppy sequences, jerky movements, low frame "
+    "rate, artifacting, color banding, unnatural transitions, outdated special effects, "
+    "fake elements, unconvincing visuals, poorly edited content, jump cuts, visual "
+    "noise, and flickering. Overall, the video is of poor quality."
+)
+COSMOS3_LPIPS_MAX_SEQUENCE_LENGTH = 1024
 COSMOS3_LPIPS_HEIGHT = 720
 COSMOS3_LPIPS_WIDTH = 1280
 COSMOS3_LPIPS_T2V_NUM_FRAMES = 189
@@ -128,13 +144,22 @@ def _build_cosmos3_accuracy_cases():
 COSMOS3_ACCURACY_CASES = _build_cosmos3_accuracy_cases()
 
 
-def _run_cosmos3_lpips_pipeline(num_frames, video=None):
+def _run_cosmos3_lpips_pipeline(
+    num_frames, video=None, negative_prompt="", max_sequence_length=None
+):
     """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
     or ``None`` if generation produced no video.  ``num_frames=1`` yields the
     single-frame text-to-image path; passing ``video`` (encoded MP4 bytes,
     decoded on the worker's NVDEC) yields the video-to-video path.
+
+    ``negative_prompt`` defaults to ``""`` because the goldens were generated
+    against an empty uncond branch; leaving it unset would inherit the
+    video-mode default instead.  ``max_sequence_length`` defaults to ``None``,
+    which leaves the pipeline's own default in force. Callers whose golden
+    predates the audio-output feature pass the pinned pre-audio values
+    explicitly.
     """
     # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
@@ -163,15 +188,14 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
             with torch.no_grad():
                 result = pipeline.forward(
                     prompt=COSMOS3_LPIPS_PROMPT,
-                    # The goldens were generated against an empty uncond branch,
-                    # so pin it rather than inheriting the video-mode default.
-                    negative_prompt="",
+                    negative_prompt=negative_prompt,
                     seed=COSMOS3_LPIPS_SEED,
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
                     num_frames=num_frames,
                     num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
                     guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
+                    max_sequence_length=max_sequence_length,
                     frame_rate=COSMOS3_LPIPS_FRAME_RATE,
                     use_guardrails=False,
                     video=video,
@@ -191,7 +215,11 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
 
 def _generate_cosmos3_lpips_video(output_path):
     """Generate the Cosmos3-Nano text-to-video LPIPS sample."""
-    video = _run_cosmos3_lpips_pipeline(COSMOS3_LPIPS_T2V_NUM_FRAMES)
+    video = _run_cosmos3_lpips_pipeline(
+        COSMOS3_LPIPS_T2V_NUM_FRAMES,
+        negative_prompt=COSMOS3_LPIPS_NEGATIVE_PROMPT,
+        max_sequence_length=COSMOS3_LPIPS_MAX_SEQUENCE_LENGTH,
+    )
     assert video is not None, "Cosmos3-Nano T2V LPIPS run produced no video"
     _save_lpips_video_mp4(video, output_path, frame_rate=COSMOS3_LPIPS_FRAME_RATE)
 
@@ -228,7 +256,11 @@ def _generate_cosmos3_lpips_image(output_path):
     """Generate the Cosmos3-Nano text-to-image LPIPS sample (single frame)."""
     from tensorrt_llm.media.encoding import save_image
 
-    video = _run_cosmos3_lpips_pipeline(COSMOS3_LPIPS_T2I_NUM_FRAMES)
+    video = _run_cosmos3_lpips_pipeline(
+        COSMOS3_LPIPS_T2I_NUM_FRAMES,
+        negative_prompt=COSMOS3_LPIPS_NEGATIVE_PROMPT,
+        max_sequence_length=COSMOS3_LPIPS_MAX_SEQUENCE_LENGTH,
+    )
     assert video is not None, "Cosmos3-Nano T2I LPIPS run produced no frame"
     # video is (B, T, H, W, C); take the single frame -> (H, W, C) for save_image.
     save_image(video[0, 0], output_path)
@@ -368,7 +400,10 @@ def test_cosmos3_nano_v2v_lpips_against_golden(_visual_gen_deps, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
+def test_cosmos3_nano_t2i_lpips_against_golden(request, tmp_path):
+    # No _visual_gen_deps: this case is single-frame throughout (PIL save_image
+    # plus the eval script's image branch), so it needs none of that fixture's
+    # video codecs -- matching test_cosmos3_feature_accuracy_against_golden.
     generated_path = tmp_path / "cosmos3_nano_t2i_generated.png"
     golden_path = _golden_media_path(
         tmp_path, "cosmos3_nano_t2i_lpips_golden.png", "Cosmos3-Nano T2I LPIPS golden image"
@@ -381,6 +416,13 @@ def test_cosmos3_nano_t2i_lpips_against_golden(_visual_gen_deps, tmp_path):
         COSMOS3_LPIPS_PROMPT,
         golden_path,
         generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        COSMOS3_LPIPS_THRESHOLD,
+        generated_path,
+        "cosmos3_nano_t2i_lpips_golden.png",
     )
     _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
 

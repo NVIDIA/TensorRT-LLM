@@ -3,6 +3,8 @@
   "model": "Cosmos3-Nano",
   "source": "TensorRT-LLM VisualGen",
   "prompt": "A serene mountain landscape with snow-capped peaks and a flowing river",
+  "negative_prompt": "pinned pre-audio descriptive default (COSMOS3_LPIPS_NEGATIVE_PROMPT)",
+  "max_sequence_length": 1024,
   "height": 720,
   "width": 1280,
   "num_frames": 1,
@@ -15,7 +17,18 @@
   "lpips_net": "alex",
   "lpips_threshold": 0.05,
   "diffusers_version": "0.38.0",
-  "tensorrt_llm_version": "1.3.0rc20",
-  "tensorrt_llm_commit": "85665f5fd331d0154a78172954846d843085e83f",
-  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release@sha256:3308a2dc0192a8329ea02eca7b5c44f290f5e894cd8c5921099308d84c3e5691"
+  "tensorrt_llm_version": "1.3.0rc24",
+  "tensorrt_llm_commit": "1745a6e689082e32e113fe06460ee5c3dfecbba9",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-skip-tritondevel-202607271403-16694-handongl",
+  "rebake_reason": [
+    "Refreshed for https://nvbugs/6418815. The prior golden (commit",
+    "85665f5fd331d0154a78172954846d843085e83f) predates the Cosmos3 audio-output",
+    "feature (f50ca53dae) and so encodes the pre-feature cross-attention numerics:",
+    "before that feature, cross-attention padded every CFG sample to the batch-wide",
+    "max text length and attended over the padding. f50ca53dae added per-sample",
+    "text slicing (real_text_lens), which is the correct behavior and which the",
+    "V2V golden (baked after it) depends on, so it must not be reverted. This",
+    "golden was regenerated with real_text_lens in force; the run is bit-exact",
+    "reproducible (verified across two independent runs on the same host)."
+  ]
 }

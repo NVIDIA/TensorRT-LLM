@@ -106,7 +106,6 @@ examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_accep
 examples/test_ad_speculative_decoding.py::test_nemotron_mtp_model_with_weights SKIP (https://nvbugs/6630699)
 examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/6632606)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[nvfp4] SKIP (https://nvbugs/6572800)
-examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden SKIP (https://nvbugs/6418815)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden SKIP (https://nvbugs/6437341)
 examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4] SKIP (https://nvbugs/6572800)
 examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-nvfp4] SKIP (https://nvbugs/6572800)
