@@ -28,7 +28,7 @@ from typing_extensions import Literal
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 
-Role = Literal["reference", "first_frame", "last_frame"]
+MediaRole = Literal["reference", "first_frame", "last_frame"]
 
 # Wire form of a reference's ``content``. Declared explicitly rather than
 # sniffed: a bare string is otherwise ambiguous between a local path and
@@ -58,8 +58,13 @@ class MediaRef(StrictBaseModel):
             "loader), ``base64`` (a ``data:`` URI is also accepted), or ``bytes``."
         )
     )
-    role: Optional[Role] = Field(
-        default=None, description="``reference`` | ``first_frame`` | ``last_frame``."
+    role: Optional[MediaRole] = Field(
+        default=None,
+        description=(
+            "Which conditioning slot this reference fills. Required only when the "
+            "target model accepts this modality in more than one slot; omit it when "
+            "the model leaves no ambiguity."
+        ),
     )
 
     @model_validator(mode="after")
