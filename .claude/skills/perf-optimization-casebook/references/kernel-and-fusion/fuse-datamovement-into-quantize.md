@@ -69,7 +69,8 @@ measured: []
   does not add precision loss.)
 - **Verify:** correctness — fused-op output equals the unfused `cat/gather +
   quantize` reference within tolerance, incl. non-contiguous / edge strides
-  (`test_fused_cat_fp8.py`, `test_triton_gather_k_cache.py`). Perf — kernel/op count
+  (`tests/unittest/_torch/attention/kernels/serial/test_fused_cat_fp8.py`,
+  `test_triton_gather_k_cache.py`). Perf — kernel/op count
   and prep-phase time before vs after; confirm `register_fake` lets `torch.compile`
   trace the op.
 - **Rollback:** swap the call site back to the unfused `cat/split/gather + quantize`

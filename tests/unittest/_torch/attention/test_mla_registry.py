@@ -20,14 +20,14 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.attention.mla import MLA
-from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     _create_dsv4_epilogue_buffers,
     _run_dsv4_o_lora_bmms,
     prepare_sparse_attn_outputs,
     project_sparse_attn_output,
 )
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -137,7 +137,7 @@ def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
     hidden_states = torch.empty(8, 16)
 
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module.is_sm_100f",
+        "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
         return_value=True,
     ):
         outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
@@ -154,7 +154,7 @@ def test_dsv4_fusion_create_output_uses_bucket_token_count() -> None:
     hidden_states = torch.empty(8, 16)
 
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module.is_sm_100f",
+        "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
         return_value=True,
     ):
         output = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)[0]

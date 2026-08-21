@@ -18,11 +18,11 @@ import sys
 import weakref
 from dataclasses import dataclass
 
-import _torch.modules.helix_test_utils as helix_utils
+import _torch.attention.helix_test_utils as helix_utils
 import cloudpickle
 import pytest
 import torch
-from _torch.modules.helix_test_utils import (
+from _torch.attention.helix_test_utils import (
     CACHE_TYPE_SELF,
     activate_all_ranks_for_context,
     compute_mismatch_ratio,
@@ -36,13 +36,13 @@ from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.attention import Attention
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     KVCacheParams,
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import model_extra_attrs

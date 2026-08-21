@@ -20,8 +20,8 @@ import torch
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import KVCacheParams
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str

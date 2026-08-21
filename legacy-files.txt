@@ -551,6 +551,7 @@ tests/unittest/_torch/attention/test_attention.py
 tests/unittest/_torch/attention/test_attention_mla.py
 tests/unittest/_torch/attention/test_attention_no_cache.py
 tests/unittest/_torch/attention/test_flashinfer_attention.py
+tests/unittest/_torch/attention/test_rotary_embedding.py
 tests/unittest/_torch/attention/test_vanilla_attention.py
 tests/unittest/_torch/compilation/test_add_norm.py
 tests/unittest/_torch/debugger/test_debugger_addon.py
@@ -587,7 +588,6 @@ tests/unittest/_torch/modules/test_group_rmn_norm.py
 tests/unittest/_torch/modules/test_moe_host_sharer.py
 tests/unittest/_torch/modules/test_moe_load_balancer.py
 tests/unittest/_torch/modules/test_moe_routing.py
-tests/unittest/_torch/modules/test_rotary_embedding.py
 tests/unittest/_torch/modules/test_triton_linear.py
 tests/unittest/_torch/multi_gpu/test_allreduce.py
 tests/unittest/_torch/multi_gpu/test_alltoall.py
