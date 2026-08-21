@@ -310,6 +310,7 @@ def test_row_linear(hidden_size, mpi_pool_executor):
         assert r is True
 
 
+@pytest.mark.post_merge
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("seq_len", [2, 32], ids=lambda x: f"seqlen:{x}")
