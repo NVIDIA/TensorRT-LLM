@@ -175,28 +175,81 @@ def _build_reference_list(value: Any) -> Optional[list]:
     return refs
 
 
+def _read_image_edit_upload(value: Any) -> bytes:
+    """Read a multipart image-edit upload, capping it while it streams."""
+    total = 0
+    if hasattr(value.file, "seek"):
+        value.file.seek(0)
+    chunks = []
+    while True:
+        chunk = value.file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > IMAGE_EDIT_MAX_IMAGE_BYTES:
+            raise ValueError(
+                "Image edit input exceeds the per-image byte limit "
+                f"({total} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _decode_image_edit_string(value: str) -> bytes:
+    """Decode one base64 image-edit input, refusing paths and URLs.
+
+    OpenAI's ``image`` field is base64 or an upload. A path or URL there would
+    ask the server to fetch on the client's behalf, which this endpoint has
+    never offered.
+    """
+    decoded = _decode_base64_media(value)
+    if decoded is not None:
+        return decoded
+    if urlparse(value).scheme in ("file", "http", "https"):
+        raise ValueError(
+            "Image edit inputs must be uploaded files or base64-encoded images; "
+            "local paths and URLs are not supported."
+        )
+    raise ValueError("String image edit inputs must be base64-encoded image data.")
+
+
 def _build_image_edit_reference_list(value: Any) -> Optional[list]:
     """Build references from an image-edit request's OpenAI-shaped ``image``.
 
     That field follows OpenAI's schema, which has no place to declare a wire
-    form: an entry is a bare base64 string or a multipart upload, so the format
-    is implied by the transport instead of read off the item.
+    form, so each entry is decoded here — the same read a multipart upload
+    already gets — and carried on as ``bytes``. The size and PNG/JPEG checks
+    stay at the boundary because only this endpoint imposes them.
     """
     if value is None:
         return None
     from tensorrt_llm.visual_gen.params import MediaRef
 
     refs = []
+    total_bytes = 0
     for item in value if isinstance(value, list) else [value]:
         if hasattr(item, "file"):  # multipart UploadFile
-            refs.append(MediaRef(content=item.file.read(), format="bytes"))
+            payload = _read_image_edit_upload(item)
         elif isinstance(item, str):
-            refs.append(MediaRef(content=item, format="base64"))
+            payload = _decode_image_edit_string(item)
         else:
             raise ValueError(
-                "image edit inputs must be base64-encoded images or uploaded files, "
+                "Image edit inputs must be base64-encoded images or uploaded files, "
                 f"got {type(item).__name__}."
             )
+        if len(payload) > IMAGE_EDIT_MAX_IMAGE_BYTES:
+            raise ValueError(
+                "Image edit input exceeds the per-image byte limit "
+                f"({len(payload)} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+            )
+        _validate_png_jpeg_image(payload)
+        total_bytes += len(payload)
+        if total_bytes > IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES:
+            raise ValueError(
+                "Image edit inputs exceed the total byte limit "
+                f"({total_bytes} > {IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES})."
+            )
+        refs.append(MediaRef(content=payload, format="bytes"))
     return refs
 
 
@@ -250,19 +303,6 @@ def _decode_base64_media(value: str) -> Optional[bytes]:
         return None
 
 
-def _write_bytes_with_limit(value: bytes, path: str) -> int:
-    size = len(value)
-    if size > IMAGE_EDIT_MAX_IMAGE_BYTES:
-        raise ValueError(
-            "Image edit input exceeds the per-image byte limit "
-            f"({size} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
-        )
-    _validate_png_jpeg_image(value)
-    with open(path, "wb") as f:
-        f.write(value)
-    return size
-
-
 def _validate_png_jpeg_image(value: bytes) -> None:
     try:
         with Image.open(BytesIO(value)) as image:
@@ -272,58 +312,6 @@ def _validate_png_jpeg_image(value: bytes) -> None:
         raise ValueError(_INVALID_IMAGE_EDIT_INPUT_MESSAGE) from exc
     if image_format not in _IMAGE_EDIT_INPUT_FORMATS:
         raise ValueError(_INVALID_IMAGE_EDIT_INPUT_MESSAGE)
-
-
-def _copy_upload_with_limit(value: Any, path: str) -> int:
-    total = 0
-    if hasattr(value.file, "seek"):
-        value.file.seek(0)
-    chunks = []
-    while True:
-        chunk = value.file.read(1024 * 1024)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > IMAGE_EDIT_MAX_IMAGE_BYTES:
-            raise ValueError(
-                "Image edit input exceeds the per-image byte limit "
-                f"({total} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
-            )
-        chunks.append(chunk)
-    return _write_bytes_with_limit(b"".join(chunks), path)
-
-
-def _materialize_conditioning_input(
-    value: Any,
-    path: str,
-) -> tuple[str, int]:
-    """Return a server-owned file path for upload or base64 inputs."""
-    try:
-        if isinstance(value, str):
-            decoded = _decode_base64_media(value)
-            if decoded is None:
-                parsed = urlparse(value)
-                if parsed.scheme in ("file", "http", "https"):
-                    raise ValueError(
-                        "Image edit inputs must be uploaded files or base64-encoded images; "
-                        "local paths and URLs are not supported."
-                    )
-                raise ValueError("String image edit inputs must be base64-encoded image data.")
-            return path, _write_bytes_with_limit(decoded, path)
-
-        if isinstance(value, bytes):
-            return path, _write_bytes_with_limit(value, path)
-
-        if hasattr(value, "file"):
-            return path, _copy_upload_with_limit(value, path)
-    except Exception:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        raise
-
-    raise ValueError(f"Unsupported conditioning input type: {type(value)}")
 
 
 def _resolve_image_edit_layer_multiplier(
@@ -371,47 +359,6 @@ def _validate_image_edit_request_limits(
         )
     return image_count
 
-
-def _materialize_conditioning_inputs(
-    value: Any,
-    *,
-    id: str,
-    field_name: str,
-    media_storage_path: str,
-) -> str | List[str]:
-    values = value if isinstance(value, list) else [value]
-    paths = []
-    total_bytes = 0
-    try:
-        for i, item in enumerate(values):
-            path, size = _materialize_conditioning_input(
-                item,
-                os.path.join(media_storage_path, f"{id}_{field_name}_{i}.png"),
-            )
-            paths.append(path)
-            total_bytes += size
-            if total_bytes > IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES:
-                raise ValueError(
-                    "Image edit inputs exceed the total byte limit "
-                    f"({total_bytes} > {IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES})."
-                )
-    except Exception:
-        cleanup_materialized_conditioning_inputs(paths)
-        raise
-    return paths if isinstance(value, list) else paths[0]
-
-
-def cleanup_materialized_conditioning_inputs(value: Any) -> None:
-    paths = value if isinstance(value, list) else [value]
-    for path in paths:
-        if not isinstance(path, str):
-            continue
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            logger.warning("Failed to remove temporary image edit input %r: %s", path, exc)
 
 def _apply_deprecated_input_reference(
     input_reference: str | UploadFile | None,

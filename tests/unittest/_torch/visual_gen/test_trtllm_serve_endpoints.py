@@ -189,6 +189,7 @@ class MockVisualGen:
         extra_param_specs: Optional[dict] = None,
         model: str = "test-model",
         supports_image_edit: bool = False,
+        ref_slot_specs: Optional[dict] = None,
     ):
         from types import SimpleNamespace
 
@@ -236,7 +237,9 @@ class MockVisualGen:
             extra_param_specs=extra_param_specs
             or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
             supports_image_edit=supports_image_edit,
-            ref_slot_specs={
+            ref_slot_specs=ref_slot_specs
+            if ref_slot_specs is not None
+            else {
                 "image_reference": RefSlotSpec(
                     modality="image", roles=[RoleSpec(role="first_frame", min=0, max=1)]
                 ),
@@ -994,12 +997,21 @@ class TestImageEdit:
         should_fail: bool = False,
         supports_image_edit: bool = True,
     ):
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+
         gen = MockVisualGen(
             image_output=image_output if image_output is not None else _make_dummy_image_tensor(),
             extra_param_specs=extra_param_specs,
             model=model,
             should_fail=should_fail,
             supports_image_edit=supports_image_edit,
+            # Edit pipelines take joint conditioning images, not a first frame;
+            # mirrors Qwen-Image-Edit's own slot declaration.
+            ref_slot_specs={
+                "image_reference": RefSlotSpec(
+                    modality="image", roles=[RoleSpec(role="reference", min=1, max=None)]
+                ),
+            },
         )
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
         return _create_server(gen, model_name=model), gen
@@ -1057,8 +1069,8 @@ class TestImageEdit:
         )
 
         assert resp.status_code == 200
-        assert str(gen.last_params.image).startswith(str(tmp_path))
-        assert not os.path.exists(gen.last_params.image)
+        assert gen.last_params.image_reference[0].format == "bytes"
+        assert isinstance(gen.last_params.image_reference[0].content, bytes)
         assert gen.last_params.num_images_per_prompt == 2
         body = resp.json()
         assert body["output_format"] == "webp"
@@ -1107,8 +1119,8 @@ class TestImageEdit:
         body = resp.json()
         url = body["data"][0]["url"]
         assert "/v1/images/" in url and "/content" in url
-        assert str(gen.last_params.image).startswith(str(tmp_path))
-        assert not os.path.exists(gen.last_params.image)
+        assert gen.last_params.image_reference[0].format == "bytes"
+        assert isinstance(gen.last_params.image_reference[0].content, bytes)
 
         path = url.split("//", 1)[-1].split("/", 1)[1]
         content = client.get("/" + path)
@@ -1329,7 +1341,7 @@ class TestImageEdit:
         )
 
         assert resp.status_code == 200
-        assert len(gen.last_params.image) == 16
+        assert len(gen.last_params.image_reference) == 16
         assert len(resp.json()["data"]) == 1
         assert list(tmp_path.iterdir()) == []
 
