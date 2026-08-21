@@ -122,8 +122,12 @@ def _validate_reference_payload(payload: bytes, *, modality: str) -> None:
                 "video_reference is not a recognized media container; supported "
                 "inputs are MP4/AVI video."
             )
-    # audio: no signature sniffing (sniff_media_kind detects only image/video);
-    # the consuming pipeline validates the audio codec in its worker.
+    elif modality == "audio":
+        if sniff_media_kind(payload) != "audio":
+            raise ValueError(
+                "audio_reference is not a recognized audio container; supported "
+                "inputs are WAV/MP3/FLAC/OGG/M4A/AAC."
+            )
 
 
 def prepare_reference_slots(params: Any) -> None:

@@ -618,6 +618,32 @@ class TestInputReferenceResolution:
 class TestMediaBytesProbes:
     """The in-memory signature probes the serve boundary routes on."""
 
+    def test_sniff_recognizes_audio_containers(self):
+        """Audio has to classify as itself, not fall through to ``None``.
+
+        ``None`` means "not media", which is what a caller rejects on, so an
+        audio reference that sniffs to ``None`` is indistinguishable from a
+        text file. Headers are the real ones ffmpeg emits.
+        """
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        assert sniff_media_kind(b"RIFF\x2e\x45\x00\x00WAVEfmt ") == "audio"
+        assert sniff_media_kind(b"fLaC\x00\x00\x00\x22") == "audio"
+        assert sniff_media_kind(b"OggS\x00\x02\x00\x00\x00\x00\x00\x00") == "audio"
+        assert sniff_media_kind(b"ID3\x04\x00\x00\x00\x00\x00\x00") == "audio"
+        # bare MPEG/ADTS frame sync — an MP3 or AAC with no leading tag
+        assert sniff_media_kind(b"\xff\xf1\x50\x40\x21\x3f\xfc\xde") == "audio"
+        assert sniff_media_kind(b"\xff\xfb\x90\x00\x00\x00\x00\x00") == "audio"
+
+    def test_sniff_separates_m4a_from_mp4(self):
+        """An ``.m4a`` is an MP4 whose brand says audio-only; without the brand
+        check it takes the video default."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        assert sniff_media_kind(self._ftyp(b"M4A ", (b"isom", b"mp42"))) == "audio"
+        assert sniff_media_kind(self._ftyp(b"M4B ")) == "audio"
+        assert sniff_media_kind(self._ftyp(b"isom", (b"iso2", b"avc1"))) == "video"
+
     def test_sniff_media_kind(self):
         from tensorrt_llm.inputs.media_io import sniff_media_kind
 
@@ -631,8 +657,9 @@ class TestMediaBytesProbes:
         assert sniff_media_kind(TestInputReferenceResolution._avi_bytes()) == "video"
         assert sniff_media_kind(b"plain text, not media") is None
         assert sniff_media_kind(b"") is None
-        # RIFF alone is not AVI (e.g. WAV audio is RIFF too).
-        assert sniff_media_kind(b"RIFF\x00\x00\x00\x00WAVEfmt ") is None
+        # RIFF carries both: the form type at [8:12] is what separates them.
+        assert sniff_media_kind(b"RIFF\x00\x00\x00\x00WAVEfmt ") == "audio"
+        assert sniff_media_kind(b"RIFF\x00\x00\x00\x00WEBP") is None
 
     @staticmethod
     def _ftyp(major: bytes, compatible: tuple = (), *, size: int = None) -> bytes:
