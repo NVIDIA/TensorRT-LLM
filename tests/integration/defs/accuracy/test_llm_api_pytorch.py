@@ -8123,6 +8123,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["default", "nvfp4"])
     @parametrize_with_ids("disagg", [False, True])
     @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("cuda_graph", [True])
@@ -8132,7 +8133,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
                           overlap_scheduler, use_msa, cuda_graph, eval_mode,
-                          disagg):
+                          disagg, kv_dtype):
+        # kv_dtype="nvfp4" is the hybrid cache: the sparse layers' main K/V are
+        # NVFP4 while the dense targets and the shared Eagle draft layer stay
+        # FP8 on their own physical pages. That combination is what gives the
+        # subpaged shared-draft-layer geometry accuracy coverage; the default
+        # arm never selects it, since is_fp8_dense_layer gates on an NVFP4
+        # cache dtype.
+        nvfp4_kv = kv_dtype == "nvfp4"
         if use_msa:
             from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
                 msa_package_available
@@ -8143,6 +8151,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         inferencemax = eval_mode == "inferencemax"
         max_draft_len = 3
         if disagg:
+            if nvfp4_kv:
+                pytest.skip(
+                    "the disagg transceiver moves the FP8 cache; NVFP4 main "
+                    "K/V would also have to ship its block-scale pool")
             self._run_nvfp4_eagle3_disagg(model_name, model_path, max_draft_len,
                                           inferencemax, attention_dp,
                                           overlap_scheduler, use_msa,
@@ -8156,6 +8168,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # reference).
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
+        if nvfp4_kv:
+            # Left off the default arm so its established references still
+            # describe the same engine.
+            kv_cache_config.dtype = "nvfp4"
         # The fmha_sm100 decode planner caps total_q x num_qo_heads at 65536;
         # with 1 + draft_len = 4 verify tokens per row that bounds the batch
         # at 1024 / TP-sharded heads (256 unsharded under attention DP). The
