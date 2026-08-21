@@ -40,8 +40,9 @@ import os
 import pickle
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Iterable, List, Optional, Sequence
 
 import torch
 import yaml
@@ -55,7 +56,10 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    create_kv_cache_transceiver,
+    maybe_enable_fabric_memory_for_python_transceiver,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig
@@ -69,6 +73,8 @@ DataType = tensorrt_llm.bindings.DataType
 # Must match report.py.
 RID_COMBINATION_STRIDE = 1_000_000
 RID_REQLEN_STRIDE = 10_000
+TRANSFER_TIMEOUT_GRACE_SECONDS = 5
+ABORT_COORDINATION_TIMEOUT_SECONDS = 2
 
 DTYPE_MAP = {"FP8": DataType.FP8, "HALF": DataType.HALF, "BF16": DataType.BF16}
 
@@ -287,36 +293,203 @@ class _TransferError(Exception):
     pass
 
 
-def _wait_ctx_complete(xcvr, rid, runtime):
-    """Block until this ctx request's send finishes (or errors).
+class _FatalTransferError(_TransferError):
+    """A transfer may still own KV pages, so this process must not reuse them."""
 
-    * C++ transceiver: check_context_transfer_status(None) is a true block-all;
-      a single call suffices (see the comment at the call site).
-    * PYTHON (V2) transceiver: even under block_all, each TxSession wait is
-      bounded by kv_transfer_sender_future_timeout_ms (default 1000 ms). A
-      slower peer handshake makes the call log "TxSession ... timed out" and
-      return with the request still DISAGG_CONTEXT_TRANS_IN_PROGRESS -- in the
-      real executor that is benign (the session stays open and is re-polled
-      every iteration), but returning here would free and refill the KV blocks
-      mid-flight, so the receiver reads the NEXT request's pattern (verify FAIL
-      on every request except the last). So poll until
-      this rid lands in the completed/failed lists. Collectively safe: every
-      ctx rank loops on the same rid and the per-call consensus makes all
-      ranks observe completion on the same iteration. The per-cell
-      signal.alarm and the hang detector bound the loop.
-    """
-    if runtime != "PYTHON":
-        xcvr.check_context_transfer_status(None)
+
+def _request_ids(values: Iterable[Any]) -> set[int]:
+    return {value.py_request_id if hasattr(value, "py_request_id") else value for value in values}
+
+
+def _context_completion_error(
+    rid: int,
+    completed: Iterable[Any],
+    failed: Iterable[Any],
+    state: Any,
+    error_state: Any,
+) -> Optional[str]:
+    completed_rids = _request_ids(completed)
+    failed_rids = _request_ids(failed)
+    if rid in failed_rids:
+        return f"ctx transfer failed for rid={rid}"
+    if state == error_state:
+        return f"ctx transfer reported DISAGG_TRANS_ERROR for rid={rid}"
+    if rid not in completed_rids:
+        return (
+            f"ctx block-all returned without completing rid={rid}: "
+            f"completed={sorted(completed_rids)} failed={sorted(failed_rids)}"
+        )
+    return None
+
+
+def _gen_completion_error(
+    rid: int,
+    completed: Iterable[Any],
+    failed: Iterable[Any],
+    cancelled: Iterable[Any],
+    state: Any,
+    complete_state: Any,
+    error_state: Any,
+) -> Optional[str]:
+    completed_rids = _request_ids(completed)
+    failed_rids = _request_ids(failed)
+    cancelled_rids = _request_ids(cancelled)
+    if rid in failed_rids:
+        return f"gen transfer failed for rid={rid}"
+    if rid in cancelled_rids:
+        return f"gen transfer cancelled for rid={rid}"
+    if state == error_state:
+        return f"gen transfer reported DISAGG_TRANS_ERROR for rid={rid}"
+    if rid not in completed_rids:
+        return (
+            f"gen block-all returned without completing rid={rid}: "
+            f"completed={sorted(completed_rids)} failed={sorted(failed_rids)} "
+            f"cancelled={sorted(cancelled_rids)}"
+        )
+    if state != complete_state:
+        return f"gen transfer returned rid={rid} as complete with nonterminal state={state}"
+    return None
+
+
+def _can_release_sequence(transfer_may_have_started: bool, transfer_completed: bool) -> bool:
+    """Return whether the transceiver has relinquished its ownership of the pages."""
+    return not transfer_may_have_started or transfer_completed
+
+
+def _release_sequence_if_safe(
+    mgr: Any,
+    req: Any,
+    kv_handle: Any,
+    use_v2: bool,
+    *,
+    transfer_may_have_started: bool,
+    transfer_completed: bool,
+) -> bool:
+    if req is None or not _can_release_sequence(transfer_may_have_started, transfer_completed):
+        return False
+    free_sequence(mgr, req, kv_handle, use_v2)
+    return True
+
+
+def _validate_context_completion(req: Any, status: Optional[Sequence[Any]]) -> None:
+    if status is None or len(status) != 2:
+        raise _FatalTransferError(
+            f"ctx block-all returned invalid status for rid={req.py_request_id}"
+        )
+    completed, failed = status
+    error = _context_completion_error(
+        req.py_request_id,
+        completed,
+        failed,
+        req.state,
+        LlmRequestState.DISAGG_TRANS_ERROR,
+    )
+    if error is not None:
+        raise _FatalTransferError(error)
+
+
+def _validate_python_gen_completion(req: Any, status: Optional[Sequence[Any]]) -> None:
+    if status is None or len(status) != 3:
+        raise _FatalTransferError(
+            f"gen block-all returned invalid status for rid={req.py_request_id}"
+        )
+    completed, failed, cancelled = status
+    error = _gen_completion_error(
+        req.py_request_id,
+        completed,
+        failed,
+        cancelled,
+        req.state,
+        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+        LlmRequestState.DISAGG_TRANS_ERROR,
+    )
+    if error is not None:
+        raise _FatalTransferError(error)
+
+
+def _first_reason(reasons: Iterable[Optional[str]], fallback: str) -> str:
+    return next((reason for reason in reasons if reason), fallback)
+
+
+def _exchange_release_decision(
+    role: str,
+    comm: Any,
+    is_leader: bool,
+    zmq_sock: Any,
+    local_safe: bool,
+    local_reason: str = "",
+) -> tuple[bool, str]:
+    """Agree across both MPI roles before either side releases KV pages."""
+    role_safe = bool(comm.allreduce(1 if local_safe else 0, op=MPI.MIN))
+    gathered_reasons = comm.gather(local_reason or None, root=0)
+    decision = None
+    if is_leader:
+        role_reason = (
+            ""
+            if role_safe
+            else _first_reason(
+                gathered_reasons,
+                f"{role} peer rank did not prove transfer completion",
+            )
+        )
+        local_status = "COMPLETE" if role_safe else "FATAL"
+        try:
+            if role == "gen":
+                zmq_sock.send(pickle.dumps((local_status, role_reason)))
+            peer_status, peer_reason = pickle.loads(zmq_sock.recv())
+            peer_role = "ctx" if role == "gen" else "gen"
+            if peer_status not in ("COMPLETE", "FATAL"):
+                combined_safe = False
+                combined_reason = f"invalid {peer_role} peer release status: {peer_status!r}"
+            elif role == "gen":
+                combined_safe = role_safe and peer_status == "COMPLETE"
+                combined_reason = "" if combined_safe else str(peer_reason or role_reason)
+            else:
+                combined_safe = role_safe and peer_status == "COMPLETE"
+                combined_reason = (
+                    ""
+                    if combined_safe
+                    else role_reason
+                    if not role_safe
+                    else str(peer_reason or "gen did not prove transfer completion")
+                )
+            if role != "gen":
+                zmq_sock.send(
+                    pickle.dumps(("COMPLETE" if combined_safe else "FATAL", combined_reason))
+                )
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - converted to process-fatal ownership outcome
+            combined_safe = False
+            combined_reason = f"final release handshake failed: {e!r}"
+        decision = (combined_safe, combined_reason)
+    return comm.bcast(decision, root=0)
+
+
+def _hard_abort_process(comm: Any) -> None:
+    """Terminate without running transceiver/KV-manager finalizers."""
+    try:
+        comm.Abort(137)
+    except Exception:  # noqa: BLE001 - SIGKILL is the mandatory fallback
+        pass
+    os.kill(os.getpid(), signal.SIGKILL)
+    raise RuntimeError("SIGKILL unexpectedly returned")
+
+
+def _coordinate_abort_after_leader_flush(comm: Any) -> None:
+    """Best-effort bounded rendezvous after the leader persists diagnostics."""
+    try:
+        request = comm.Ibarrier()
+        deadline = time.monotonic() + ABORT_COORDINATION_TIMEOUT_SECONDS
+        while not request.Test():
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+    except Exception:  # noqa: BLE001 - abort must remain the fallback
         return
-    while True:
-        completed, failed = xcvr.check_context_transfer_status(None)
-        if rid in failed:
-            raise _TransferError(f"ctx transfer failed for rid={rid}")
-        if rid in completed:
-            return
 
 
-def _wait_gen_complete(xcvr, req, runtime):
+def _wait_gen_complete(xcvr: Any, req: LlmRequest, runtime: str) -> None:
     """Block until this gen request's receive finishes (or errors).
 
     Block-all is the only safe wait here: returning while the receive is still
@@ -333,7 +506,8 @@ def _wait_gen_complete(xcvr, req, runtime):
       detector bound this loop, so a genuinely stuck transfer is still caught.
     """
     if runtime == "PYTHON":
-        xcvr.check_gen_transfer_status(None)  # block_all
+        status = xcvr.check_gen_transfer_status(None)  # block_all
+        _validate_python_gen_completion(req, status)
         return
     import time
 
@@ -346,6 +520,10 @@ def _wait_gen_complete(xcvr, req, runtime):
         if req.state in terminal:
             break
         time.sleep(0.001)
+    if req.state == LlmRequestState.DISAGG_TRANS_ERROR:
+        raise _FatalTransferError(
+            f"gen transfer reported DISAGG_TRANS_ERROR for rid={req.py_request_id}"
+        )
 
 
 def run_one_request(
@@ -353,11 +531,10 @@ def run_one_request(
 ):
     """Transfer one request and verify it (gen side).
 
-    The per-request ZMQ handshake is lockstep-safe: the ctx leader ALWAYS sends
-    exactly one reply ("OK"+context_phase_params, or "ABORT"+reason) for each
-    gen "go", so a ctx-side error never leaves the gen side blocked or the
-    sockets out of sync. Errors (local exceptions or a transceiver-reported
-    DISAGG_TRANS_ERROR) are raised so the caller records TRANSFER_ERROR.
+    The leaders exchange setup and final ownership decisions over ZMQ. Neither
+    role releases its sequence until every local rank and the peer role report
+    successful completion. A result without quiescence proof raises
+    _FatalTransferError so the caller hard-aborts without running finalizers.
     Returns the gen-side verification result (True/False), or None on ctx.
     """
     is_ctx = role == "ctx"
@@ -366,6 +543,7 @@ def run_one_request(
     if is_ctx:
         local_err = None
         req = kv_handle = None
+        transfer_may_have_started = False
         try:
             req = make_request(True, rid, req_len, runtime)
             kv_handle = add_sequence(kvm, req, req_len, use_v2)
@@ -373,53 +551,100 @@ def run_one_request(
             tensorrt_llm.logger.info(
                 f"[ctx r{rank}] rid={rid} len={req_len}: transfer START (send)"
             )
+            # The call can dispatch KV work before raising, so ownership becomes
+            # uncertain as soon as we enter it.
+            transfer_may_have_started = True
             xcvr.respond_and_send_async(req)
-        except Exception as e:  # noqa: BLE001 - relay failure to gen, then raise
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - relayed to gen, then classified
             local_err = e
-        # Instance-wide consensus: every ctx rank must take the same branch at the
-        # collective check below, even if only some ranks failed (e.g. a UCX
-        # device error on a subset of GPUs). allreduce doubles as a barrier.
+
         any_failed = comm.allreduce(1 if local_err is not None else 0, op=MPI.MAX)
+        any_started = comm.allreduce(1 if transfer_may_have_started else 0, op=MPI.MAX)
+        handshake_error = None
         if is_leader:
-            zmq_sock.recv()  # gen leader's "go"
-            if not any_failed:
-                # context_phase_params is picklable and carries everything gen
-                # needs (endpoint, ctx_dp_rank, first_gen/draft tokens).
-                zmq_sock.send(pickle.dumps(("OK", req.context_phase_params)))
-            else:
-                reason = repr(local_err) if local_err is not None else "peer ctx rank failed"
-                zmq_sock.send(pickle.dumps(("ABORT", reason)))
+            try:
+                message = zmq_sock.recv()  # gen leader's "go"
+                if message != b"go":
+                    raise _TransferError(f"unexpected gen handshake message: {message!r}")
+                if not any_failed:
+                    # context_phase_params carries the endpoint and generation metadata.
+                    zmq_sock.send(pickle.dumps(("OK", req.context_phase_params)))
+                else:
+                    reason = repr(local_err) if local_err is not None else "peer ctx rank failed"
+                    status = "FATAL" if any_started else "ABORT"
+                    zmq_sock.send(pickle.dumps((status, reason)))
+            except _Timeout:
+                raise
+            except Exception as e:  # noqa: BLE001 - broadcast before raising
+                handshake_error = repr(e)
+        handshake_error = comm.bcast(handshake_error, root=0)
+        if handshake_error is not None:
+            raise _FatalTransferError(f"initial ctx/gen handshake failed: {handshake_error}")
         if any_failed:
-            if req is not None:
-                try:
-                    free_sequence(kvm, req, kv_handle, use_v2)
-                except Exception:  # noqa: BLE001
-                    pass
-            raise local_err if local_err is not None else _TransferError("peer ctx rank failed")
-        # Always block_all (None): with a request count, C++ only waits up to
-        # kv_transfer_sender_future_timeout_ms (1000ms) and returns even if the
-        # transfer is still in progress. NIXL/UCX cold-start connection setup can
-        # exceed that, so the harness would free the request mid-transfer, leaving
-        # the gen side hung and the ctx sender thread asserting on a freed session.
-        # The PYTHON runtime additionally needs a poll loop on top of block_all;
-        # see _wait_ctx_complete.
-        _wait_ctx_complete(xcvr, rid, runtime)
+            reason = repr(local_err) if local_err is not None else "peer ctx rank failed"
+            if any_started:
+                raise _FatalTransferError(reason)
+            _release_sequence_if_safe(
+                kvm,
+                req,
+                kv_handle,
+                use_v2,
+                transfer_may_have_started=False,
+                transfer_completed=False,
+            )
+            raise _TransferError(reason)
+
+        transfer_error = None
+        try:
+            # block_all retries short polling slices until completion or the
+            # request-level KV-transfer deadline. Only the exact completed ID
+            # proves that the sender has stopped reading this request's pages.
+            status = xcvr.check_context_transfer_status(None)
+            _validate_context_completion(req, status)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - becomes a cross-role fatal decision
+            transfer_error = e
+
+        safe_to_release, reason = _exchange_release_decision(
+            role,
+            comm,
+            is_leader,
+            zmq_sock,
+            local_safe=transfer_error is None,
+            local_reason=repr(transfer_error) if transfer_error is not None else "",
+        )
+        if not safe_to_release:
+            raise _FatalTransferError(reason)
         state = req.state
         tensorrt_llm.logger.info(f"[ctx r{rank}] rid={rid}: transfer DONE (send), state={state}")
         free_sequence(kvm, req, kv_handle, use_v2)
-        if state == LlmRequestState.DISAGG_TRANS_ERROR:
-            raise _TransferError("ctx transfer reported DISAGG_TRANS_ERROR")
         return None
 
     # gen side
+    initial_error = None
     if is_leader:
-        zmq_sock.send(b"go")
-        status, payload = pickle.loads(zmq_sock.recv())
+        try:
+            zmq_sock.send(b"go")
+            status, payload = pickle.loads(zmq_sock.recv())
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - ctx may already own in-flight pages
+            status, payload = "FATAL", f"initial ctx/gen handshake failed: {e!r}"
+            initial_error = repr(e)
     else:
         status, payload = None, None
-    status, payload = comm.bcast((status, payload), root=0)  # syncs gen ranks
+    status, payload, initial_error = comm.bcast(
+        (status, payload, initial_error), root=0
+    )  # syncs gen ranks
+    if initial_error is not None or status == "FATAL":
+        raise _FatalTransferError(str(payload))
     if status == "ABORT":
         raise _TransferError(f"ctx aborted: {payload}")
+    if status != "OK":
+        raise _FatalTransferError(f"unexpected ctx handshake status: {status!r}")
     ctx_params = payload
 
     local_err = None
@@ -428,36 +653,67 @@ def run_one_request(
         req = make_request(False, rid, req_len, runtime, ctx_params=ctx_params)
         kv_handle = add_sequence(kvm, req, req_len, use_v2)
         tensorrt_llm.logger.info(f"[gen r{rank}] rid={rid} len={req_len}: transfer START (recv)")
+        # The context sender is already live, and this call may partially
+        # dispatch before raising. Any setup error from here is process-fatal.
         xcvr.request_and_receive_async(req)
+    except _Timeout:
+        raise
     except Exception as e:  # noqa: BLE001
         local_err = e
-    # Instance-wide consensus so all gen ranks take the same branch at check_gen.
-    any_failed = comm.allreduce(1 if local_err is not None else 0, op=MPI.MAX)
-    if any_failed:
-        if req is not None:
-            try:
-                free_sequence(kvm, req, kv_handle, use_v2)
-            except Exception:  # noqa: BLE001
-                pass
-        raise local_err if local_err is not None else _TransferError("peer gen rank failed")
-    # Block until the receive actually completes (mirrors the ctx side) instead
-    # of returning on the sender timeout. See _wait_gen_complete for why the C++
-    # path polls an int rather than passing None.
-    _wait_gen_complete(xcvr, req, runtime)
-    # The receive may land on a side CUDA stream; sync before reading.
-    torch.cuda.synchronize()
 
-    state = req.state
-    ok = state != LlmRequestState.DISAGG_TRANS_ERROR and verify_request(
-        kvm, req.py_request_id, rank, n_local_layers
+    any_failed = comm.allreduce(1 if local_err is not None else 0, op=MPI.MAX)
+    transfer_error = local_err
+    if not any_failed:
+        try:
+            # See _wait_gen_complete for why the C++ path polls an int rather
+            # than passing None. Python validates the exact returned request ID.
+            _wait_gen_complete(xcvr, req, runtime)
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - becomes a cross-role fatal decision
+            transfer_error = e
+    elif transfer_error is None:
+        transfer_error = _FatalTransferError("peer gen rank failed during receive setup")
+
+    if transfer_error is None:
+        try:
+            # A terminal transceiver result is not sufficient ownership proof:
+            # wait for any side-stream work touching the received pages before
+            # either role is allowed to release its sequence.
+            torch.cuda.synchronize()
+        except _Timeout:
+            raise
+        except Exception as e:  # noqa: BLE001 - quiescence remains unproven
+            transfer_error = e
+
+    safe_to_release, reason = _exchange_release_decision(
+        role,
+        comm,
+        is_leader,
+        zmq_sock,
+        local_safe=transfer_error is None,
+        local_reason=repr(transfer_error) if transfer_error is not None else "",
     )
+    if not safe_to_release:
+        raise _FatalTransferError(reason)
+
+    # Transfer completion and CUDA synchronization have released transport
+    # ownership. Verification errors are now safe mismatches: retain lockstep,
+    # free the sequence, and keep testing.
+    try:
+        local_ok = verify_request(kvm, req.py_request_id, rank, n_local_layers)
+    except _Timeout:
+        raise
+    except Exception as e:  # noqa: BLE001 - transfer is already proven quiescent
+        tensorrt_llm.logger.error(f"[gen r{rank}] rid={rid}: verification error: {e!r}")
+        local_ok = False
+    ok = bool(comm.allreduce(1 if local_ok else 0, op=MPI.MIN))
+    state = req.state
     tensorrt_llm.logger.info(
         f"[gen r{rank}] rid={rid}: transfer DONE (recv), state={state}, "
         f"verify={'PASS' if ok else 'FAIL'}"
     )
     free_sequence(kvm, req, kv_handle, use_v2)
-    if state == LlmRequestState.DISAGG_TRANS_ERROR:
-        raise _TransferError("gen transfer reported DISAGG_TRANS_ERROR")
     return ok
 
 
@@ -530,13 +786,18 @@ def main():
     os.makedirs(status_dir, exist_ok=True)
     status_path = os.path.join(status_dir, f"sweep{sweep}_{role}.jsonl")
     status_f = open(status_path, "a") if is_leader else None
+    timeout_s = int(cfg["run"]["timeout_per_cell_s"])
+    if timeout_s <= TRANSFER_TIMEOUT_GRACE_SECONDS:
+        raise ValueError(
+            "run.timeout_per_cell_s must be greater than "
+            f"{TRANSFER_TIMEOUT_GRACE_SECONDS}s to leave ownership-handshake headroom"
+        )
 
-    # ZMQ leader channel. A REQ/REP handshake interrupted by a timeout leaves the
-    # socket unusable, so we reset it after any error to isolate the blast radius
-    # to a single (combination, request_length) cell.
+    # ZMQ leader channel. Transfer-ownership failures hard-abort this sweep, so
+    # an interrupted REQ/REP exchange is never reused in-process.
     zmq_ctx = None
     zmq_sock = None
-    rcv_timeout_ms = cfg["run"]["timeout_per_cell_s"] * 1000
+    rcv_timeout_ms = timeout_s * 1000
 
     def open_sock():
         if not is_leader:
@@ -569,19 +830,31 @@ def main():
             s.connect(f"tcp://{ctx_node}:{zmq_port}")
         return s
 
-    def reset_sock():
-        nonlocal zmq_sock
-        if not is_leader:
-            return
-        try:
-            zmq_sock.close(linger=0)
-        except Exception:  # noqa: BLE001
-            pass
-        zmq_sock = open_sock()
-
     zmq_sock = open_sock()
 
     cases = build_cases(cfg)
+    # The C++ fabric-memory env getter is cached on its first KV pool
+    # allocation. Enable the default before any matrix case builds a pool, even
+    # when a C++ transceiver case appears before Python+V1 in the matrix.
+    python_v1_case = next(
+        (case for case in cases if case["runtime"] == "PYTHON" and case["cache_manager"] == "V1"),
+        None,
+    )
+    if python_v1_case is not None:
+        maybe_enable_fabric_memory_for_python_transceiver(
+            CacheTransceiverConfig(
+                backend=python_v1_case["backend"],
+                transceiver_runtime="PYTHON",
+            ),
+            KVCacheManager,
+        )
+        print(
+            f"[{role} rank={rank}] PYTHON+V1 case in matrix: "
+            "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY="
+            f"{os.environ.get('TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY')} "
+            "applies to every case in this run, including C++ transceiver ones",
+            flush=True,
+        )
     req_lens = cfg["test_matrix"]["request_lengths"]
     warmup = cfg["test_matrix"]["warmup_requests"]
     num_req = cfg["test_matrix"]["num_requests_per_length"]
@@ -611,7 +884,72 @@ def main():
         )
         status_f.flush()
 
-    timeout_s = cfg["run"]["timeout_per_cell_s"]
+    def record_remaining(
+        combination_idx: int,
+        reqlen_idx: Optional[int],
+        status: str,
+        reason: str,
+    ) -> None:
+        """Record every unrun cell before a fatal sweep abort."""
+        for remaining_ci in range(combination_idx, len(cases)):
+            start_li = reqlen_idx if remaining_ci == combination_idx else 0
+            if start_li is None:
+                start_li = 0
+            for remaining_li in range(start_li, len(req_lens)):
+                cell_reason = (
+                    reason
+                    if remaining_ci == combination_idx
+                    and (reqlen_idx is None or remaining_li == reqlen_idx)
+                    else f"skipped after fatal transfer outcome: {reason}"
+                )
+                record(remaining_ci, remaining_li, status, cell_reason)
+
+    def flush_status() -> None:
+        if status_f is None or status_f.closed:
+            return
+        status_f.flush()
+        try:
+            os.fsync(status_f.fileno())
+        except OSError:
+            pass
+        status_f.close()
+
+    def hard_abort_sweep(
+        combination_idx: int,
+        reqlen_idx: Optional[int],
+        status: str,
+        reason: str,
+        *,
+        coordinated: bool = False,
+    ) -> None:
+        """Record the failure and exit without deregistering live transfer memory."""
+        try:
+            signal.alarm(0)
+            cancel_watchdog()
+        except Exception:  # noqa: BLE001 - abort must still happen
+            pass
+        if is_leader:
+            try:
+                record_remaining(combination_idx, reqlen_idx, status, reason)
+                flush_status()
+            except Exception:  # noqa: BLE001 - abort must still happen
+                pass
+        if coordinated:
+            # All ranks reach this path after an intra-role consensus/broadcast.
+            # The bounded collective prevents a nonleader from aborting before
+            # the leader's status file is durable, without trusting consensus
+            # in rank-local timeout/unknown-exception paths.
+            _coordinate_abort_after_leader_flush(comm)
+        elif not is_leader:
+            # Rank-local alarms/exceptions cannot safely enter a collective.
+            # Give the leader's independently armed deadline a short chance to
+            # persist the role verdict before this rank aborts the srun step.
+            time.sleep(ABORT_COORDINATION_TIMEOUT_SECONDS)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            _hard_abort_process(comm)
 
     # In-process hang detector (TensorRT-LLM's HangDetector): a side thread runs
     # an asyncio timer reset per cell; on expiry it dumps all thread stacks
@@ -639,19 +977,27 @@ def main():
 
     def _on_hang():
         ci = hang_cell["ci"]
-        targets = range(len(req_lens)) if hang_cell["li"] is None else [hang_cell["li"]]
-        for li in targets:
-            record(
-                ci,
-                li,
-                "TIMEOUT",
-                f"hang detected during {hang_cell['what']} (>{watchdog_deadline}s)",
+        reason = f"hang detected during {hang_cell['what']} (>{watchdog_deadline}s)"
+        if is_leader:
+            try:
+                record_remaining(ci, hang_cell["li"], "TIMEOUT", reason)
+                flush_status()
+            except Exception:  # noqa: BLE001 - SIGKILL must still happen
+                pass
+        else:
+            # All ranks arm the same cell deadline. Give the leader's watchdog
+            # a bounded opportunity to persist the role status before this
+            # rank's bad exit causes srun to terminate the whole step.
+            time.sleep(ABORT_COORDINATION_TIMEOUT_SECONDS)
+        try:
+            sys.stderr.write(
+                f"[{role} rank={rank}] WATCHDOG_KILL {hang_cell['what']} "
+                f"ci={ci} li={hang_cell['li']}\n"
             )
-        sys.stderr.write(
-            f"[{role} rank={rank}] WATCHDOG_KILL {hang_cell['what']} ci={ci} li={hang_cell['li']}\n"
-        )
-        sys.stderr.flush()
-        os.kill(os.getpid(), signal.SIGKILL)
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os.kill(os.getpid(), signal.SIGKILL)
 
     hang_detector = HangDetector(timeout=watchdog_deadline, on_detected=_on_hang)
     hang_detector.start()
@@ -686,6 +1032,10 @@ def main():
             # much slower host-staged tcp, so enable bounce for cross-node
             # transfers inside an NVLink domain.
             kv_cache_bounce_size_mb=int(cfg["kv_cache"].get("bounce_size_mb", 0)),
+            # For the Python sender, leave deterministic headroom for the
+            # signal handler and final CTX/GEN ownership handshake after its
+            # request deadline. The cell alarm remains the C++ path's bound.
+            kv_transfer_timeout_ms=(timeout_s - TRANSFER_TIMEOUT_GRACE_SECONDS) * 1000,
         )
 
         # Build the cache manager + transceiver ONCE per case (the manager is
@@ -701,6 +1051,17 @@ def main():
             )
             signal.alarm(0)
             cancel_watchdog()
+        except _Timeout:
+            reason = f"setup exceeded {timeout_s}s with ownership state unknown"
+            try:
+                print(
+                    f"[{role} rank={rank}] SETUP TIMEOUT {case['label']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:  # noqa: BLE001 - abort must still happen
+                pass
+            hard_abort_sweep(ci, None, "TIMEOUT", reason)
         except Exception as e:  # noqa: BLE001 - setup failed for the whole case
             signal.alarm(0)
             cancel_watchdog()
@@ -732,7 +1093,6 @@ def main():
             torch.cuda.empty_cache()
             continue
 
-        case_timed_out = False
         for li, req_len in enumerate(req_lens):
             try:
                 signal.alarm(timeout_s)
@@ -758,20 +1118,34 @@ def main():
                 signal.alarm(0)
                 cancel_watchdog()
                 record(ci, li, "PASS" if (role != "gen" or all_ok) else "MISMATCH")
-            except _Timeout:
-                signal.alarm(0)
-                cancel_watchdog()
-                record(ci, li, "TIMEOUT", f"exceeded {timeout_s}s")
-                for remaining_li in range(li + 1, len(req_lens)):
-                    record(ci, remaining_li, "TIMEOUT", "skipped after timeout in earlier req_len")
-                print(
-                    f"[{role} rank={rank}] TIMEOUT {case['label']} req_len={req_len}",
-                    file=sys.stderr,
-                    flush=True,
+            except _FatalTransferError as e:
+                try:
+                    print(
+                        f"[{role} rank={rank}] FATAL {case['label']} req_len={req_len}: {e!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:  # noqa: BLE001 - abort must still happen
+                    pass
+                hard_abort_sweep(
+                    ci,
+                    li,
+                    "TRANSFER_ERROR",
+                    repr(e),
+                    coordinated=True,
                 )
-                reset_sock()
-                case_timed_out = True
-            except Exception as e:  # noqa: BLE001 - report any transceiver error
+            except _Timeout:
+                reason = f"exceeded {timeout_s}s with transfer quiescence unproven"
+                try:
+                    print(
+                        f"[{role} rank={rank}] TIMEOUT {case['label']} req_len={req_len}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:  # noqa: BLE001 - abort must still happen
+                    pass
+                hard_abort_sweep(ci, li, "TIMEOUT", reason)
+            except _TransferError as e:
                 signal.alarm(0)
                 cancel_watchdog()
                 record(ci, li, "TRANSFER_ERROR", repr(e))
@@ -780,9 +1154,16 @@ def main():
                     file=sys.stderr,
                     flush=True,
                 )
-            any_timed_out = comm.allreduce(1 if case_timed_out else 0, op=MPI.MAX)
-            if any_timed_out:
-                break
+            except Exception as e:  # noqa: BLE001 - unknown ownership state is fatal
+                try:
+                    print(
+                        f"[{role} rank={rank}] UNEXPECTED {case['label']} req_len={req_len}: {e!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:  # noqa: BLE001 - abort must still happen
+                    pass
+                hard_abort_sweep(ci, li, "TRANSFER_ERROR", repr(e))
 
         # Tear down the case's transceiver and preserve its C++ CSVs.
         if hasattr(xcvr, "shutdown"):

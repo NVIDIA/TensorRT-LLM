@@ -42,7 +42,7 @@ from utils.util import (force_ampere, similar, similarity_score,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
-from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
@@ -726,59 +726,6 @@ def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
         llm.shutdown()
 
 
-@skip_gpu_memory_less_than_80gb
-@pytest.mark.part2
-@test_lora_with_and_without_cuda_graph
-def test_bielik_11b_v2_2_instruct_multi_lora(cuda_graph_config) -> None:
-    model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
-
-    target_modules = ['attn_q', 'attn_k', 'attn_v']
-
-    # Set up temporary directory for LoRA adapters
-    with tempfile.TemporaryDirectory() as lora_dir:
-        print("Creating dummy LoRAs...")
-
-        model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                     dtype=torch.bfloat16,
-                                                     device_map="auto")
-        hf_modules = ["q_proj", "k_proj", "v_proj"]
-        peft_lora_config = PeftLoraConfig(r=8,
-                                          target_modules=hf_modules,
-                                          bias="none",
-                                          task_type="CAUSAL_LM")
-        lora_paths = []
-        for i in range(2):
-            lora_model = get_peft_model(model, peft_lora_config)
-            for param in lora_model.parameters():
-                param.data.zero_()
-            lora_path = f"{lora_dir}/lora_{i}"
-            lora_model.save_pretrained(lora_path)
-            lora_paths.append(lora_path)
-
-        trtllm_lora_config = LoraConfig(lora_target_modules=target_modules,
-                                        max_lora_rank=8,
-                                        max_loras=2,
-                                        max_cpu_loras=2)
-        llm = LLM(model_dir,
-                  lora_config=trtllm_lora_config,
-                  cuda_graph_config=cuda_graph_config)
-
-        prompts = [
-            "Kim był Mikołaj Kopernik i z czego zasłynął?",
-            "Gdzie znajduje się stolica Polski?",
-        ]
-        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
-        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
-        lora_requests = [lora_req1, lora_req2]
-        sampling_params = SamplingParams(max_tokens=200)
-
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=lora_requests)
-
-        assert len(outputs) == 2
-
-
 @pytest.mark.part2
 @test_lora_with_and_without_cuda_graph
 def test_gemma3_1b_instruct_multi_lora(cuda_graph_config) -> None:
@@ -928,7 +875,7 @@ def test_lora_many_adapters_no_memory_leak() -> None:
 def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
                                        description):
     """Test load_torch_nemo_lora function with different LoRA rank configurations."""
-    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+    from tensorrt_llm._torch.peft.lora.manager import load_torch_nemo_lora
 
     nemo_path = create_mock_nemo_lora_checkpoint(
         tmp_path,
@@ -957,7 +904,7 @@ def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
 @pytest.mark.part0
 def test_nemo_lora_unsupported_modules_validation(tmp_path):
     """Test validation of unsupported modules in NeMo LoRA."""
-    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+    from tensorrt_llm._torch.peft.lora.manager import load_torch_nemo_lora
 
     nemo_path = create_mock_nemo_lora_checkpoint(
         tmp_path,

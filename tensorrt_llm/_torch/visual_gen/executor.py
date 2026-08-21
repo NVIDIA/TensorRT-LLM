@@ -369,6 +369,7 @@ class DiffusionExecutor:
                         "status": "READY",
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
+                        "supports_image_edit": self.pipeline.supports_image_edit,
                     },
                 )
             )
@@ -418,6 +419,12 @@ class DiffusionExecutor:
                 ):
                     continue
                 setattr(params, field_name, default_value)
+                # Marks it as a pipeline default rather than caller intent, so
+                # request-dependent defaults stay re-resolvable; assigning the
+                # field re-marks it.
+                # Assumes model_fields_set is the live __pydantic_fields_set__, not a
+                # copy; TestDefaultMarksThroughRealPath fails loudly if that changes.
+                params.model_fields_set.discard(field_name)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
         specs = self.pipeline.extra_param_specs
@@ -673,6 +680,7 @@ class DiffusionRemoteClient:
         # Pipeline metadata — populated by _wait_ready from the READY signal.
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
+        self.supports_image_edit: bool = False
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1028,6 +1036,7 @@ class DiffusionRemoteClient:
                             "default_generation_params", {}
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
+                        self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return
