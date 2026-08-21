@@ -147,31 +147,23 @@ BF16.</em></sub></p>
 
 ### Frontier analysis
 
-The table below extracts the three marked operating points from each GEMM/attention family. The
-conservative and aggressive configurations both use `target_sparsity=0.75`; they differ in
-`disabled_until_timestep`, which is 0.86 and 1.00, respectively. Latency is mean pipeline-forward
-time across the seven prompts, and LPIPS is measured against the eager BF16 outputs.
+The table below isolates the points used in the analysis. The six runs without Skip Softmax show
+how GEMM and attention quantization move the operating point. The final three runs hold NVFP4 +
+SAGE fixed and expose the two Skip Softmax controls. Skip Softmax values are shown as
+`target_sparsity / disabled_until_timestep`. Latency is mean pipeline-forward time across the
+seven prompts, and LPIPS is measured against the eager BF16 outputs.
 
-| GEMM/attention quantization | Skip Softmax configuration | Latency (s) | Speedup | Mean LPIPS |
+| GEMM/attention quantization | Skip Softmax (`target_sparsity / disabled_until_timestep`) | Latency (s) | Speedup | Mean LPIPS |
 | :--- | :--- | ---: | ---: | ---: |
 | BF16 | Not enabled | 525.0 | 1.000× | 0.1181 |
-| BF16 | Conservative | 473.9 | 1.108× | 0.1701 |
-| BF16 | Aggressive | 445.5 | 1.179× | 0.4844 |
 | BF16 + SAGE | Not enabled | 486.2 | 1.080× | 0.2562 |
-| BF16 + SAGE | Conservative | 450.0 | 1.167× | 0.2681 |
-| BF16 + SAGE | Aggressive | 429.9 | 1.221× | 0.4883 |
 | FP8 block | Not enabled | 489.2 | 1.073× | 0.4249 |
-| FP8 block | Conservative | 429.5 | 1.223× | 0.4237 |
-| FP8 block | Aggressive | 410.9 | 1.278× | 0.4835 |
 | FP8 block + SAGE | Not enabled | 449.3 | 1.169× | 0.3971 |
-| FP8 block + SAGE | Conservative | 409.3 | 1.283× | 0.3961 |
-| FP8 block + SAGE | Aggressive | 389.3 | 1.349× | 0.4697 |
 | NVFP4 | Not enabled | 471.6 | 1.113× | 0.5042 |
-| NVFP4 | Conservative | 416.0 | 1.262× | 0.5071 |
-| NVFP4 | Aggressive | 389.1 | 1.349× | 0.5319 |
 | NVFP4 + SAGE | Not enabled | 409.7 | 1.281× | 0.5057 |
-| NVFP4 + SAGE | Conservative | 369.5 | 1.421× | 0.5076 |
-| NVFP4 + SAGE | Aggressive | 348.0 | 1.509× | 0.5234 |
+| NVFP4 + SAGE | 0.65 / 0.86 | 374.9 | 1.401× | 0.5043 |
+| NVFP4 + SAGE | 0.75 / 0.86 | 369.5 | 1.421× | 0.5076 |
+| NVFP4 + SAGE | 0.75 / 1.00 | 348.0 | 1.509× | 0.5234 |
 
 The first large quality shift comes from dynamic GEMM quantization. BF16, FP8 block scaling, and
 NVFP4 form distinct LPIPS bands, with lower-precision GEMMs moving progressively higher in the
@@ -195,16 +187,40 @@ quantization chooses the broad quality band; SAGE and Skip Softmax then recover 
 band.
 
 Figure 3 adds a visual check across all seven prompts. For each GEMM/attention family, the top row
-uses the conservative Skip Softmax configuration and the bottom row uses the aggressive one. The
-eager BF16 output at the left provides a common reference.
+uses the conservative Skip Softmax configuration and the bottom row uses the aggressive Skip
+Softmax configuration. The eager BF16 output at the left provides a common reference.
 
 <p align="center">
-  <img src="../media/tech_blog28_visual_comparison.jpg" alt="First-frame comparison across seven prompts, with an eager BF16 reference followed by conservative and aggressive Skip Softmax results for BF16, BF16 plus SAGE, FP8 block, FP8 block plus SAGE, NVFP4, and NVFP4 plus SAGE" width="1080">
+  <img src="../media/tech_blog28_visual_comparison_p01_cat_garden.jpg" alt="First-frame comparison for a cat in a sunlit garden, with an eager BF16 reference and conservative and aggressive Skip Softmax results across six GEMM and attention configurations" width="1080">
+</p>
+
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p03_park_kids.jpg" alt="First-frame comparison for children in a park, with an eager BF16 reference and conservative and aggressive Skip Softmax results across six GEMM and attention configurations" width="1080">
+</p>
+
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p04_drone_coast.jpg" alt="First-frame comparison for a coastal drone shot, with an eager BF16 reference and conservative and aggressive Skip Softmax results across six GEMM and attention configurations" width="1080">
+</p>
+
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p05_neon_sign.jpg" alt="First-frame comparison for a neon OPEN sign, with an eager BF16 reference and conservative and aggressive Skip Softmax results across six GEMM and attention configurations" width="1080">
+</p>
+
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p06_woman_smile.jpg" alt="First-frame comparison for a studio portrait, with an eager BF16 reference and conservative and aggressive Skip Softmax results across six GEMM and attention configurations" width="1080">
+</p>
+
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p07_horse_gallop.jpg" alt="First-frame comparison for a galloping racehorse, with an eager BF16 reference and conservative and aggressive Skip Softmax results across six GEMM and attention configurations" width="1080">
+</p>
+
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p10_market.jpg" alt="First-frame comparison for a street market, with an eager BF16 reference and conservative and aggressive Skip Softmax results across six GEMM and attention configurations" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 3. First-frame comparison across all seven prompts. Conservative
-uses `target_sparsity=0.75` and `disabled_until_timestep=0.86`; aggressive uses the same target
-sparsity and `disabled_until_timestep=1.00`.</em></sub></p>
+Skip Softmax uses `target_sparsity=0.75` and `disabled_until_timestep=0.86`; aggressive Skip
+Softmax uses the same target sparsity and `disabled_until_timestep=1.00`.</em></sub></p>
 
 ## Reproduction
 
