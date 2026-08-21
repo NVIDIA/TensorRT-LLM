@@ -62,7 +62,6 @@ TEST(ZmqControlChannel, BidirectionalMessagesOverTcp)
     ASSERT_TRUE(b::decodeHeader(blob, h));
     EXPECT_EQ(h.msgType, static_cast<std::uint16_t>(b::BounceMsgType::kWANT));
     EXPECT_EQ(h.requestId, 42u);
-    EXPECT_EQ(h.aux, 3u); // numChunks
     std::vector<std::uint32_t> sizes;
     std::string ep;
     ASSERT_TRUE(b::decodeWant(blob, h, sizes, ep));

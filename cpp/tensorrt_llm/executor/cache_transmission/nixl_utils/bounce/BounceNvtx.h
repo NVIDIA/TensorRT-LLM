@@ -36,7 +36,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // -DNVTX_DISABLE=OFF to profile).
 //
 // Two kinds of spans:
-//   - BounceNvtxScope: same-thread RAII push/pop, for synchronous sections (buildPlan, the
+//   - BounceNvtxScope: same-thread RAII start/end span, for synchronous sections (buildPlan, the
 //     gather launch, the scatter kernel + sync in a worker).
 //   - bounceRangeStart()/bounceRangeEnd(): process-wide start/end ranges for the ASYNC legs —
 //     started on one thread and ended on another (gather in flight: IO-thread launch -> IO-thread
@@ -134,8 +134,9 @@ inline std::uint64_t bounceRangeStart(std::uint32_t /*argb*/, char const* /*fmt*
 #endif
 
 /// Label the calling thread in profiler timelines (e.g. "bounceIO", "bounceScatter"), so the
-/// bounce threads are identifiable rows in nsys-ui — PushPop ranges (like the scatter span)
-/// appear under the thread that pushed them, which is otherwise an anonymous worker.
+/// bounce threads are identifiable rows in nsys-ui instead of anonymous worker threads (the
+/// names label the bounceIO/bounceScatter thread rows even though the spans themselves land in
+/// the process-scoped domain row).
 inline void bounceNameThread(char const* name)
 {
 #ifndef NVTX_DISABLE

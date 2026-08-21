@@ -57,7 +57,14 @@ find_package(PkgConfig)
 if(PKG_CONFIG_FOUND)
   pkg_check_modules(ZMQ libzmq)
 endif()
+# Both zmq tiers need libzmq AND the fetched cppzmq header: without the latter
+# the sources compile-fail on zmq.hpp even though libzmq itself was found.
 if(ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+  set(BOUNCE_CPPZMQ_AVAILABLE TRUE)
+else()
+  set(BOUNCE_CPPZMQ_AVAILABLE FALSE)
+endif()
+if(BOUNCE_CPPZMQ_AVAILABLE)
   add_gtest(zmqControlChannelTest zmqControlChannelTest.cpp)
   target_sources(
     zmqControlChannelTest PRIVATE ${BOUNCE_DIR}/ZmqControlChannel.cpp
@@ -75,9 +82,8 @@ endif()
 if(NIXL_ROOT)
   # The reactor tests also need zmq for the control plane (cppzmq is fetched
   # when NIXL is on); all of them share this source set + include/link sets.
-  # Same gate as the zmq-only tier above: without the fetched cppzmq header the
-  # sources compile-fail on zmq.hpp even though libzmq itself was found.
-  if(ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+  # Same gate as the zmq-only tier above.
+  if(BOUNCE_CPPZMQ_AVAILABLE)
     set(BOUNCE_REACTOR_SRCS
         ${BOUNCE_DIR}/BounceTransport.cpp
         ${BOUNCE_DIR}/BounceTransferPlan.cpp
@@ -93,20 +99,22 @@ if(NIXL_ROOT)
     set(BOUNCE_TEST_LIBS tensorrt_llm_nixl_wrapper NIXL::nixl
                          ${NIXL_BUILD_LIBRARY} ${ZMQ_LIBRARIES})
 
+    # One reactor test target: the bounce sources compiled in, plus the shared
+    # include/link sets.
+    function(add_bounce_reactor_test name src)
+      add_gtest(${name} ${src})
+      target_sources(${name} PRIVATE ${BOUNCE_REACTOR_SRCS})
+      target_include_directories(${name} PRIVATE ${BOUNCE_TEST_INCS})
+      target_link_libraries(${name} PRIVATE ${BOUNCE_TEST_LIBS})
+    endfunction()
+
     # End-to-end transport over real RDMA (gather -> RDMA write -> scatter +
     # credit recycling), byte-exact.
-    add_gtest(bounceTransportTest bounceTransportTest.cpp)
-    target_sources(bounceTransportTest PRIVATE ${BOUNCE_REACTOR_SRCS})
-    target_include_directories(bounceTransportTest PRIVATE ${BOUNCE_TEST_INCS})
-    target_link_libraries(bounceTransportTest PRIVATE ${BOUNCE_TEST_LIBS})
+    add_bounce_reactor_test(bounceTransportTest bounceTransportTest.cpp)
 
     # Boundary, failure-path, and concurrency tests.
-    add_gtest(bounceTransportFailureTest bounceTransportFailureTest.cpp)
-    target_sources(bounceTransportFailureTest PRIVATE ${BOUNCE_REACTOR_SRCS})
-    target_include_directories(bounceTransportFailureTest
-                               PRIVATE ${BOUNCE_TEST_INCS})
-    target_link_libraries(bounceTransportFailureTest
-                          PRIVATE ${BOUNCE_TEST_LIBS})
+    add_bounce_reactor_test(bounceTransportFailureTest
+                            bounceTransportFailureTest.cpp)
 
     # Optional ThreadSanitizer variant of the reactor concurrency test. The
     # bounce sources + the test are instrumented; the shared libtensorrt_llm
@@ -116,11 +124,8 @@ if(NIXL_ROOT)
     option(BOUNCE_TSAN
            "Build a ThreadSanitizer variant of the bounce reactor test" OFF)
     if(BOUNCE_TSAN)
-      add_gtest(bounceTransportTsanTest bounceTransportFailureTest.cpp)
-      target_sources(bounceTransportTsanTest PRIVATE ${BOUNCE_REACTOR_SRCS})
-      target_include_directories(bounceTransportTsanTest
-                                 PRIVATE ${BOUNCE_TEST_INCS})
-      target_link_libraries(bounceTransportTsanTest PRIVATE ${BOUNCE_TEST_LIBS})
+      add_bounce_reactor_test(bounceTransportTsanTest
+                              bounceTransportFailureTest.cpp)
       target_compile_options(
         bounceTransportTsanTest
         PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=thread -g>

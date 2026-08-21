@@ -27,7 +27,6 @@ namespace
 {
 b::BounceMsgHeader decodeOk(std::string const& blob, b::BounceMsgType expectType)
 {
-    EXPECT_TRUE(b::hasBounceMagic(blob));
     b::BounceMsgHeader h{};
     EXPECT_TRUE(b::decodeHeader(blob, h));
     EXPECT_EQ(h.msgType, static_cast<std::uint16_t>(expectType));
@@ -43,7 +42,6 @@ TEST(BounceMessageCodec, WantCarriesChunkSizesAndEndpoint)
     auto h = decodeOk(blob, b::BounceMsgType::kWANT);
     EXPECT_EQ(h.requestId, 42u);
     EXPECT_EQ(h.count, 3u);
-    EXPECT_EQ(h.aux, 3u); // numChunks
     std::vector<std::uint32_t> out;
     std::string outEp;
     ASSERT_TRUE(b::decodeWant(blob, h, out, outEp));
@@ -57,7 +55,6 @@ TEST(BounceMessageCodec, CancelIsEmptyWantThatStillCarriesEndpoint)
     auto blob = b::encodeCancel(42, ep); // same wire form as an empty-chunk WANT
     auto h = decodeOk(blob, b::BounceMsgType::kWANT);
     EXPECT_EQ(h.count, 0u);              // no chunks -> cancel
-    EXPECT_EQ(h.aux, 0u);
     std::vector<std::uint32_t> out;
     std::string outEp;
     ASSERT_TRUE(b::decodeWant(blob, h, out, outEp));
@@ -192,7 +189,6 @@ TEST(BounceMessageCodec, ShortBlobRejected)
     std::string tiny(8, '\0');
     b::BounceMsgHeader h{};
     EXPECT_FALSE(b::decodeHeader(tiny, h));
-    EXPECT_FALSE(b::hasBounceMagic(std::string(2, '\0')));
 }
 
 TEST(BounceMessageCodec, BadMagicRejected)

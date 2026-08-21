@@ -29,7 +29,7 @@ namespace
 {
 
 BounceMsgHeader makeHeader(BounceMsgType type, std::uint64_t requestId, std::uint32_t chunkIdx, std::uint32_t numChunks,
-    std::uint64_t regionHandle, std::uint32_t count, std::uint32_t payloadBytes, std::uint32_t aux)
+    std::uint64_t regionHandle, std::uint32_t count, std::uint32_t payloadBytes)
 {
     BounceMsgHeader header{};
     header.magic = kBounceMagic;
@@ -41,7 +41,6 @@ BounceMsgHeader makeHeader(BounceMsgType type, std::uint64_t requestId, std::uin
     header.regionHandle = regionHandle;
     header.count = count;
     header.payloadBytes = payloadBytes;
-    header.aux = aux;
     return header;
 }
 
@@ -95,7 +94,7 @@ std::string encodeWant(
     auto const sizesBytes = static_cast<std::uint32_t>(chunkBytes.size() * sizeof(std::uint32_t));
     auto const epLen = static_cast<std::uint32_t>(endpoint.size());
     auto const payloadBytes = sizesBytes + static_cast<std::uint32_t>(sizeof(std::uint32_t)) + epLen;
-    auto h = makeHeader(BounceMsgType::kWANT, requestId, 0, 0, 0, n, payloadBytes, n);
+    auto h = makeHeader(BounceMsgType::kWANT, requestId, 0, 0, 0, n, payloadBytes);
     std::string blob;
     blob.resize(sizeof(BounceMsgHeader) + payloadBytes);
     std::memcpy(blob.data(), &h, sizeof(BounceMsgHeader));
@@ -122,8 +121,7 @@ std::string encodeCancel(std::uint64_t requestId, std::string const& endpoint)
 std::string encodeGrant(std::uint64_t requestId, std::vector<BounceCreditEntry> const& credits)
 {
     auto const bytes = static_cast<std::uint32_t>(credits.size() * sizeof(BounceCreditEntry));
-    auto h
-        = makeHeader(BounceMsgType::kGRANT, requestId, 0, 0, 0, static_cast<std::uint32_t>(credits.size()), bytes, 0);
+    auto h = makeHeader(BounceMsgType::kGRANT, requestId, 0, 0, 0, static_cast<std::uint32_t>(credits.size()), bytes);
     return encodeWithEntries(h, credits);
 }
 
@@ -132,24 +130,13 @@ std::string encodeData(std::uint64_t requestId, std::uint32_t chunkIdx, std::uin
 {
     auto const bytes = static_cast<std::uint32_t>(entries.size() * sizeof(BounceScatterRun));
     auto h = makeHeader(BounceMsgType::kDATA, requestId, chunkIdx, numChunks, regionHandle,
-        static_cast<std::uint32_t>(entries.size()), bytes, 0);
+        static_cast<std::uint32_t>(entries.size()), bytes);
     return encodeWithEntries(h, entries);
 }
 
 std::string encodeAck(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle)
 {
-    return encodeHeaderOnly(makeHeader(BounceMsgType::kACK, requestId, chunkIdx, 0, regionHandle, 0, 0, 0));
-}
-
-bool hasBounceMagic(std::string const& blob)
-{
-    if (blob.size() < sizeof(std::uint32_t))
-    {
-        return false;
-    }
-    std::uint32_t magic = 0;
-    std::memcpy(&magic, blob.data(), sizeof(magic));
-    return magic == kBounceMagic;
+    return encodeHeaderOnly(makeHeader(BounceMsgType::kACK, requestId, chunkIdx, 0, regionHandle, 0, 0));
 }
 
 bool decodeHeader(std::string const& blob, BounceMsgHeader& outHeader)

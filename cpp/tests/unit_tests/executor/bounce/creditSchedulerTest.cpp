@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -198,6 +199,16 @@ struct Mirror
     {
         owner.erase(offset);
     }
+
+    // Free every region whose owning flow satisfies `pred` (mirrors a whole-flow/whole-peer reclaim).
+    template <typename Pred>
+    void freeOwnedBy(Pred&& pred)
+    {
+        for (auto it = owner.begin(); it != owner.end();)
+        {
+            it = pred(it->second) ? owner.erase(it) : std::next(it);
+        }
+    }
 };
 
 } // namespace
@@ -325,18 +336,7 @@ TEST(CreditScheduler, PeerGoneMidRecycleHandsRegionsToWaiter)
     m.grant(s.onWant("B", want(100))); // B wants 4 but nothing free yet
     EXPECT_EQ(s.heldCount("B"), 0u);
 
-    std::vector<std::uint64_t> aOffsets;
-    for (auto const& [off, owner] : m.owner)
-    {
-        if (owner == "A")
-        {
-            aOffsets.push_back(off);
-        }
-    }
-    for (auto off : aOffsets)
-    {
-        m.free(off); // mirror: A no longer owns these
-    }
+    m.freeOwnedBy([](std::string const& owner) { return owner == "A"; }); // mirror: A no longer owns these
     std::vector<std::uint64_t> deferred;
     auto re = s.reclaimFlow("A", {}, deferred);
     m.grant(re);
@@ -362,18 +362,7 @@ TEST(CreditScheduler, ReclaimByPrefixDropsAllFlowsOfPeer)
     EXPECT_EQ(s.heldCount(p1a) + s.heldCount(p1b), 4u);
     EXPECT_EQ(s.heldCount(p2), 0u);
 
-    std::vector<std::uint64_t> p1Offsets;
-    for (auto const& [off, owner] : m.owner)
-    {
-        if (owner == p1a || owner == p1b)
-        {
-            p1Offsets.push_back(off);
-        }
-    }
-    for (auto off : p1Offsets)
-    {
-        m.free(off);
-    }
+    m.freeOwnedBy([&](std::string const& owner) { return owner == p1a || owner == p1b; });
     std::vector<std::uint64_t> deferred;
     auto re = s.reclaimByPrefix(std::string("p1") + sep, {}, deferred);
     m.grant(re);
