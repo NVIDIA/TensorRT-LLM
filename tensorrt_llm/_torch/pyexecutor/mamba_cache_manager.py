@@ -2003,7 +2003,6 @@ def _estimate_mamba_hybrid_cache_cost(
     tokens_per_block: int,
     max_seq_len: Optional[int],
     num_reserved_dummy_slots: int,
-    num_guaranteed_resident_sequences: Optional[int],
     include_explicit_snapshots: bool,
     cap_partial_attention_snapshots: bool,
     is_draft: bool = False,
@@ -2027,9 +2026,12 @@ def _estimate_mamba_hybrid_cache_cost(
     ) if local_attention_layers > 0 else 0)
     state_bytes_per_rank = (local_mamba_layers *
                             params.get_states_bytes_per_layer(mapping))
-    resident_sequences = (max_batch_size *
-                          mapping.pp_size if num_guaranteed_resident_sequences
-                          is None else num_guaranteed_resident_sequences)
+    # The V2 estimator includes explicit snapshot capacity and can offload
+    # suspended recurrent state. The legacy estimator cannot, so it retains
+    # the full batch-sized recurrent-state floor.
+    resident_sequences = (_get_v2_guaranteed_resident_sequences(
+        max_batch_size, mapping) if include_explicit_snapshots else
+                          max_batch_size * mapping.pp_size)
     if local_mamba_layers == 0:
         resident_sequences = 0
 
@@ -2423,7 +2425,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             num_reserved_dummy_slots=1,
-            num_guaranteed_resident_sequences=None,
             include_explicit_snapshots=False,
             cap_partial_attention_snapshots=False,
             **kwargs,
@@ -3176,12 +3177,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             num_reserved_dummy_slots=num_reserved_dummy_slots,
-            # PP scheduling is decided by the first rank, which may not own a
-            # recurrent layer. Preserve the full PP working-set floor until a
-            # per-sequence admission limit is synchronized across ranks. A
-            # single-stage manager only needs one request for progress.
-            num_guaranteed_resident_sequences=(
-                _get_v2_guaranteed_resident_sequences(max_batch_size, mapping)),
             include_explicit_snapshots=True,
             cap_partial_attention_snapshots=True,
             **kwargs,

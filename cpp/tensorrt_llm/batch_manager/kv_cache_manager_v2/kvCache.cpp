@@ -312,15 +312,20 @@ bool KvCache::resume(std::optional<CUstream> stream)
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
         numSlotsNeeded[lc] += std::max(0, scratchDeltaCounts[lc]);
 
-    // Admission is based on the pages this cache will make unavailable,
-    // rather than the current utilization of an unrelated pool group.
-    TypedVec<PoolGroupIndex, SlotCount> additionalUnavailable(storageMgr.numPoolGroups(), 0);
+    // This projected per-pool requirement replaces the old gate on current
+    // utilization. A request with no cost in a pressured pool must not be
+    // rejected because another pool happens to be full.
+    TypedVec<PoolGroupIndex, SlotCount> additionalRequiredSlots(storageMgr.numPoolGroups(), 0);
+    TypedVec<PoolGroupIndex, SlotCount> freeSlotRequirements(storageMgr.numPoolGroups(), 0);
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
-        additionalUnavailable[storageMgr.getPoolGroupIndex(lc)] += numSlotsNeeded[lc];
+        auto const pgIdx = storageMgr.getPoolGroupIndex(lc);
+        additionalRequiredSlots[pgIdx] += numSlotsNeeded[lc];
+        freeSlotRequirements[pgIdx] += numSlotsNeeded[lc];
     }
 
     std::unordered_set<Page*> countedPages;
+    std::vector<SharedPtr<Page>> gpuPagesToProtect;
     for (auto const& activePage : _activePages())
     {
         auto const page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
@@ -331,61 +336,75 @@ bool KvCache::resume(std::optional<CUstream> stream)
         // A held GPU page that is not on the eviction queue is already
         // included in stats.unavailable(). Only migration from a colder tier
         // or locking a currently evictable GPU page increases that count.
-        if (page->cacheLevel != kGpuLevel || page->scheduledForEviction())
+        auto const pgIdx = storageMgr.getPoolGroupIndex(activePage.lcId);
+        if (page->cacheLevel != kGpuLevel)
         {
-            additionalUnavailable[storageMgr.getPoolGroupIndex(activePage.lcId)] += 1;
+            additionalRequiredSlots[pgIdx] += 1;
+            freeSlotRequirements[pgIdx] += 1;
+        }
+        else if (page->scheduledForEviction())
+        {
+            additionalRequiredSlots[pgIdx] += 1;
+            gpuPagesToProtect.push_back(page);
         }
     }
 
-    // The resume headroom protects pools whose working set can grow after
-    // admission. A live SSM state occupies one fixed slot for the whole
-    // request, so applying the threshold to an SSM-only pool strands part of
-    // its request capacity. Keep the threshold when an SSM lifecycle shares
-    // a pool group with an attention lifecycle.
-    TypedVec<PoolGroupIndex, int> needsResumeHeadroom(storageMgr.numPoolGroups(), false);
+    // SSM state has a fixed one-slot working set and needs no decode-growth
+    // headroom. Attention keeps the configured limit, including any pool
+    // group it shares with SSM.
+    TypedVec<PoolGroupIndex, float> maxUtilForResume(storageMgr.numPoolGroups(), 1.0F);
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
     {
         bool const isSsm = ssmLcId.has_value() && lc == *ssmLcId;
         if (!isSsm)
         {
-            needsResumeHeadroom[storageMgr.getPoolGroupIndex(lc)] = true;
+            maxUtilForResume[storageMgr.getPoolGroupIndex(lc)] = mManager->config().maxUtilForResume;
         }
     }
 
     for (PoolGroupIndex pgIdx{0}; pgIdx < storageMgr.numPoolGroups(); ++pgIdx)
     {
         auto const stats = storageMgr.getStatistics(kGpuLevel, pgIdx);
-        auto const projectedUnavailable = stats.unavailable() + additionalUnavailable[pgIdx];
-        auto const limit = static_cast<double>(stats.total) * mManager->config().maxUtilForResume;
-        if (needsResumeHeadroom[pgIdx] && additionalUnavailable[pgIdx] > 0
-            && static_cast<double>(projectedUnavailable) > limit)
+        auto const projectedUnavailable = stats.unavailable() + additionalRequiredSlots[pgIdx];
+        auto const limit = static_cast<double>(stats.total) * maxUtilForResume[pgIdx];
+        if (additionalRequiredSlots[pgIdx] > 0 && static_cast<double>(projectedUnavailable) > limit)
         {
             return false;
         }
+    }
+
+    MigrationRecorder const migrationRecorder
+        = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+              CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+    DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+    { _recordDroppedPages(pages, cacheLevel); };
+
+    // Keep this cache's GPU pages out of the eviction candidates while
+    // reserving every slot needed for allocation and lower-tier migration.
+    // Manager access is serialized, so the prepared slots remain available
+    // until newGpuSlots() and activate() consume them below.
+    for (auto const& page : gpuPagesToProtect)
+    {
+        storageMgr.excludeFromEviction(*page);
+    }
+    try
+    {
+        storageMgr.prepareFreeSlots(kGpuLevel, freeSlotRequirements, migrationRecorder, dropRecorder);
+    }
+    catch (OutOfPagesError const&)
+    {
+        for (auto it = gpuPagesToProtect.rbegin(); it != gpuPagesToProtect.rend(); ++it)
+        {
+            storageMgr.scheduleForEviction(**it);
+        }
+        return false;
     }
 
     // Only allocate if any slots are needed.
     bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
     if (anyNeeded)
     {
-        TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots;
-        try
-        {
-            MigrationRecorder const migrationRecorder
-                = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
-                      CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
-            DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
-            { _recordDroppedPages(pages, cacheLevel); };
-            tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
-        }
-        catch (OutOfPagesError const&)
-        {
-            return false;
-        }
-        catch (OutOfMemoryError const&)
-        {
-            return false;
-        }
+        auto tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
 
         // Separate deferred vs scratch slots, and collect scratch ready events.
         std::vector<CachedCudaEvent const*> scratchReadyEvents;
@@ -417,42 +436,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), scratchReadyEvents);
     }
 
-    auto releaseDeferredSlots = [&]()
-    {
-        for (LifeCycleId lc{0}; lc < numLc; ++lc)
-        {
-            if (deferredSlots[lc].has_value())
-            {
-                storageMgr.releaseSlot(lc, kGpuLevel, std::move(*deferredSlots[lc]));
-                deferredSlots[lc].reset();
-            }
-        }
-    };
-    auto rollbackPreallocatedSlots = [&]()
-    {
-        {
-            auto scope = recordEventScope();
-            _freeScratchSlots();
-        }
-        releaseDeferredSlots();
-    };
-
-    try
-    {
-        activate();
-    }
-    catch (OutOfPagesError const&)
-    {
-        rollbackPreallocatedSlots();
-        TLLM_CHECK_DEBUG(_checkSanity());
-        return false;
-    }
-    catch (OutOfMemoryError const&)
-    {
-        rollbackPreallocatedSlots();
-        TLLM_CHECK_DEBUG(_checkSanity());
-        return false;
-    }
+    activate();
 
     // Deferred copy: for partial blocks and SSM, copy from now-locked source pages
     // to pre-allocated GPU slots, then unlock sources and replace with new pages.
@@ -462,103 +446,59 @@ bool KvCache::resume(std::optional<CUstream> stream)
         auto const lastOrdinal = BlockOrdinal{mBlocks.empty() ? 0 : (numCommittedTokens() - 1) / mTokensPerBlock};
         CUstream cudaStr = cudaStream();
 
+        // Wait for all new slots to be ready (deduplicated).
+        {
+            std::vector<CachedCudaEvent const*> slotEvents;
+            for (auto& optSlot : deferredSlots)
+            {
+                if (optSlot.has_value())
+                    slotEvents.push_back(&optSlot->readyEvent);
+            }
+            streamWaitEvents(reinterpret_cast<CudaStream>(cudaStr), slotEvents);
+        }
+
         // Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
         std::vector<SharedPageLock*> srcLocks;
-        std::vector<std::pair<LifeCycleId, bool>> copyStats;
-        bool deferredSlotsReady = false;
-        auto rollbackDeferredCopy = [&]()
+        for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
         {
-            auto scope = recordEventScope();
-            _releaseActivePageLocks();
-            _freeScratchSlots();
-            if (deferredSlotsReady)
+            if (!deferredSlots[lcIdx].has_value())
+                continue;
+            auto& newSlot = *deferredSlots[lcIdx];
+
+            BlockPage* sourcePage = nullptr;
+            if (ssmLcId.has_value() && lcIdx == *ssmLcId)
             {
-                for (auto& deferredSlot : deferredSlots)
+                if (numCommittedTokens() == 0)
+                    continue; // fresh SSM — no source to copy from
+                sourcePage = &mSsmBlocks[beamIdx][lcIdx];
+            }
+            else
+            {
+                sourcePage = &mBlocks[lastOrdinal].pages[beamIdx][lcIdx];
+            }
+            auto* lock = std::get_if<SharedPageLock>(sourcePage);
+            TLLM_CHECK_DEBUG(lock && lock->isValid());
+            bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
+            srcLocks.push_back(lock);
+
+            PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
+            copySlotData(storageMgr, kGpuLevel, kGpuLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && _shouldRecordStats())
+            {
+                bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
+                    /*beamWidth=*/1, /*countAsMissed=*/!hasPartialReuseSource);
+                if (changed)
                 {
-                    if (deferredSlot.has_value())
-                        deferredSlot->readyEvent = finishEvent();
+                    mManager->markStatsDirty(id);
                 }
             }
-            releaseDeferredSlots();
-        };
-        try
-        {
+            KVCacheIterationStatsDelta iterationStats;
+            iterationStats.iterIntraDeviceCopyBlocks = 1;
+            for (size_t const size : storageMgr.slotSize(pgIdx))
             {
-                // Wait before overwriting any recycled slot. Once this
-                // returns, one event on this stream can safely cover every
-                // deferred slot if a later copy fails.
-                std::vector<CachedCudaEvent const*> slotEvents;
-                for (auto& optSlot : deferredSlots)
-                {
-                    if (optSlot.has_value())
-                        slotEvents.push_back(&optSlot->readyEvent);
-                }
-                streamWaitEvents(reinterpret_cast<CudaStream>(cudaStr), slotEvents);
-                deferredSlotsReady = true;
+                iterationStats.iterIntraDeviceCopyBytes += static_cast<int64_t>(size);
             }
-
-            for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
-            {
-                if (!deferredSlots[lcIdx].has_value())
-                    continue;
-                auto& newSlot = *deferredSlots[lcIdx];
-
-                BlockPage* sourcePage = nullptr;
-                if (ssmLcId.has_value() && lcIdx == *ssmLcId)
-                {
-                    if (numCommittedTokens() == 0)
-                        continue; // fresh SSM — no source to copy from
-                    sourcePage = &mSsmBlocks[beamIdx][lcIdx];
-                }
-                else
-                {
-                    sourcePage = &mBlocks[lastOrdinal].pages[beamIdx][lcIdx];
-                }
-                auto* lock = std::get_if<SharedPageLock>(sourcePage);
-                TLLM_CHECK_DEBUG(lock && lock->isValid());
-                bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
-                srcLocks.push_back(lock);
-
-                PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
-                copySlotData(
-                    storageMgr, kGpuLevel, kGpuLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
-                copyStats.emplace_back(lcIdx, hasPartialReuseSource);
-            }
-
-            // Do not expose successful allocation/copy telemetry until every
-            // deferred copy has been queued successfully.
-            for (auto const& [lcIdx, hasPartialReuseSource] : copyStats)
-            {
-                if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && _shouldRecordStats())
-                {
-                    bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
-                        /*beamWidth=*/1, /*countAsMissed=*/!hasPartialReuseSource);
-                    if (changed)
-                    {
-                        mManager->markStatsDirty(id);
-                    }
-                }
-                PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
-                KVCacheIterationStatsDelta iterationStats;
-                iterationStats.iterIntraDeviceCopyBlocks = 1;
-                for (size_t const size : storageMgr.slotSize(pgIdx))
-                {
-                    iterationStats.iterIntraDeviceCopyBytes += static_cast<int64_t>(size);
-                }
-                _recordDirectIterationStats(lcIdx, iterationStats);
-            }
-        }
-        catch (OutOfPagesError const&)
-        {
-            rollbackDeferredCopy();
-            TLLM_CHECK_DEBUG(_checkSanity());
-            return false;
-        }
-        catch (OutOfMemoryError const&)
-        {
-            rollbackDeferredCopy();
-            TLLM_CHECK_DEBUG(_checkSanity());
-            return false;
+            _recordDirectIterationStats(lcIdx, iterationStats);
         }
 
         // Unlock source pages — recordEventScope captures all prior CUDA work
@@ -1195,12 +1135,6 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 newSlots = mManager->storage().newGpuSlots(allocCounts, migrationRecorder, dropRecorder);
             }
             catch (OutOfPagesError const&)
-            {
-                _recoverExcessScratchSlots(excessScratchSlots);
-                _lockHeldBlocks(backupHolders);
-                return false;
-            }
-            catch (OutOfMemoryError const&)
             {
                 _recoverExcessScratchSlots(excessScratchSlots);
                 _lockHeldBlocks(backupHolders);

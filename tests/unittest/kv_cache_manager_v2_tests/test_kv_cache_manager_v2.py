@@ -19,7 +19,6 @@ import hashlib
 import itertools
 import os
 import random
-import sys
 import time
 import unittest
 from contextlib import contextmanager
@@ -28,7 +27,6 @@ from importlib.util import find_spec
 from random import randbytes
 from statistics import median
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Sequence, cast, get_type_hints
-from unittest import mock
 
 import pytest
 
@@ -170,6 +168,9 @@ requires_python_backend = unittest.skipIf(
 
 
 class TestExceptionHierarchy(unittest.TestCase):
+    def test_out_of_memory_derives_from_out_of_pages(self) -> None:
+        self.assertTrue(issubclass(OutOfMemoryError, OutOfPagesError))
+
     @unittest.skipUnless(
         KV_CACHE_MANAGER_V2_BACKEND == "cpp",
         "C++ binding exception hierarchy",
@@ -2369,6 +2370,17 @@ class TestSSMSupport(unittest.TestCase):
             self.assertEqual(host_before.free, 0)
             self.assertGreater(gpu_before.evictable, 0)
 
+            # Resuming a state that is already on GPU needs no free slot. It
+            # must still work when both tiers are full; the preflight protects
+            # that page from becoming its own eviction victim.
+            gpu_resident = next(
+                cache
+                for cache in caches
+                if _introspection.active_page_stats(cache)[0][GPU_LEVEL] > 0
+            )
+            self.assertTrue(gpu_resident.resume(stream))
+            gpu_resident.suspend()
+
             blocked = self.manager.create_kv_cache()
             caches.append(blocked)
             self.assertFalse(blocked.resume(stream))
@@ -2516,68 +2528,6 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(stats[ssm_life_cycle_id].iter_intra_device_copy_blocks, 1)
         self.assertGreater(stats[ssm_life_cycle_id].iter_intra_device_copy_bytes, 0)
         reused.close()
-
-    @requires_python_backend
-    def test_deferred_copy_oom_restores_suspended_state(self) -> None:
-        """A partial first-resume copy failure must be fully retryable."""
-        cfg = self._make_ssm_config(
-            tokens_per_block=32,
-            num_attn_layers=1,
-            num_ssm_layers=1,
-            enable_partial_reuse=True,
-            max_util_for_resume=1.0,
-        )
-        self.manager = KVCacheManager(cfg)
-        stream_holder = CachedCudaStream()
-        stream = cast(CudaStream, stream_holder.handle)
-        prompt = [self.next_token() for _ in range(64)]
-
-        seed = self.manager.create_kv_cache()
-        self.assertTrue(seed.resume(stream))
-        self.assertTrue(seed.resize(48, 48))
-        seed.commit(prompt[:48], is_end=True)
-        seed.close()
-
-        reused = self.manager.create_kv_cache(input_tokens=prompt, id=101)
-        try:
-            self.assertEqual(reused.num_committed_tokens, 48)
-            reused.discard_pending_stats()
-            self.manager.get_and_reset_ssm_snapshot_iteration_stats()
-            self.manager.get_and_reset_iteration_stats()
-
-            def storage_state() -> list[tuple[int, int, int, int]]:
-                return [
-                    (stat.total, stat.free, stat.evictable, stat.unavailable)
-                    for stat in _introspection.storage_statistics(self.manager, GPU_LEVEL)
-                ]
-
-            before = storage_state()
-            kv_cache_module = sys.modules[_KVCache.__module__]
-            original_batched_copy = kv_cache_module.batched_copy
-            copy_count = 0
-
-            def fail_second_copy(*args, **kwargs):
-                nonlocal copy_count
-                copy_count += 1
-                if copy_count == 2:
-                    raise OutOfMemoryError("injected deferred-copy OOM")
-                return original_batched_copy(*args, **kwargs)
-
-            with mock.patch.object(kv_cache_module, "batched_copy", side_effect=fail_second_copy):
-                self.assertFalse(reused.resume(stream))
-
-            self.assertEqual(copy_count, 2)
-            self.assertEqual(reused.status, _KVCache.Status.SUSPENDED)
-            self.assertTrue(reused._never_resumed)
-            self.assertTrue(reused._pending_stats.empty)
-            self.assertTrue(reused._check_sanity())
-            self.assertEqual(storage_state(), before)
-            self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), set())
-            self.assertEqual(self.manager.get_and_reset_iteration_stats(), {})
-
-            self.assertTrue(reused.resume(stream))
-        finally:
-            reused.close()
 
     def test_ssm(self) -> None:
         """Inference with SSM layer: prefill 63 tokens, decode 52 tokens."""

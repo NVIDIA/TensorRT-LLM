@@ -30,11 +30,24 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Exception hierarchy (mirrors _exceptions.py)
 // ---------------------------------------------------------------------------
 
-class OutOfMemoryError : public std::runtime_error
+// Not enough cache capacity to satisfy an allocation request.
+class OutOfPagesError : public std::runtime_error
+{
+public:
+    explicit OutOfPagesError(std::string const& msg = "Out of pages")
+        : std::runtime_error(msg)
+    {
+    }
+};
+
+// A cache-capacity failure caused by an underlying memory tier. Keeping this
+// under OutOfPagesError lets admission callers handle every retryable capacity
+// failure through the same path while preserving the more specific OOM type.
+class OutOfMemoryError : public OutOfPagesError
 {
 public:
     explicit OutOfMemoryError(std::string const& msg = "Out of memory")
-        : std::runtime_error(msg)
+        : OutOfPagesError(msg)
     {
     }
 };
@@ -116,16 +129,6 @@ class ResourceBusyError : public std::runtime_error
 {
 public:
     explicit ResourceBusyError(std::string const& msg = "Resource is busy")
-        : std::runtime_error(msg)
-    {
-    }
-};
-
-// Not enough free pages to satisfy an allocation request.
-class OutOfPagesError : public std::runtime_error
-{
-public:
-    explicit OutOfPagesError(std::string const& msg = "Out of pages")
         : std::runtime_error(msg)
     {
     }

@@ -760,10 +760,7 @@ class MultimodalScheduler(RequestScheduler):
         )
 
     def schedule_request(
-        self,
-        active_requests: RequestList,
-        inflight_request_ids: set[int],
-        eviction_protected_request_ids: Optional[set[int]] = None,
+        self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         """Apply the default LLM-capacity-coupled MM scheduling policy.
 
@@ -781,9 +778,7 @@ class MultimodalScheduler(RequestScheduler):
             # context requests, withholding contexts that will still lack MM
             # embeddings after this iteration.
             scheduler_output = self.scheduler.schedule_request(
-                active_requests,
-                inflight_request_ids,
-                eviction_protected_request_ids=eviction_protected_request_ids,
+                active_requests, inflight_request_ids
             )
             selected_items, llm_eligible = self._select_items(
                 list(scheduler_output.context_requests),
@@ -828,19 +823,12 @@ class MultimodalEagerEncoderScheduler(MultimodalScheduler):
     """
 
     def schedule_request(
-        self,
-        active_requests: RequestList,
-        inflight_request_ids: set[int],
-        eviction_protected_request_ids: Optional[set[int]] = None,
+        self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         selected_items, llm_eligible = self._select_items(active_requests)
 
         if not self.has_separate_stages:
-            scheduler_output = self.scheduler.schedule_request(
-                llm_eligible,
-                inflight_request_ids,
-                eviction_protected_request_ids=eviction_protected_request_ids,
-            )
+            scheduler_output = self.scheduler.schedule_request(llm_eligible, inflight_request_ids)
             return scheduler_output._replace(scheduled_mm_encoder_items=selected_items or None)
 
         llm_eligible_ids = {request.request_id for request in llm_eligible}

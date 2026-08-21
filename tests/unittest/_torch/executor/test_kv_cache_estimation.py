@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for KV cache capacity profiling and token estimation.
+"""Tests for KV cache token estimation in KvCacheCreator._get_token_num_for_estimation.
 
 Guards the ADP (Attention Data Parallelism) cache-block reduction: when
 enable_attention_dp is True and tp_size > 1, _create_dummy_context_requests
@@ -18,15 +18,9 @@ import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.pyexecutor._util import (
-    CacheCost,
-    KvCacheCreator,
-    _await_profile_batch,
-    _needs_gdn_sequence_count_profile,
-)
+from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
 
@@ -36,56 +30,6 @@ pytestmark = pytest.mark.cpu_only
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def test_gdn_sequence_count_profile_is_limited_to_flashinfer_qwen(monkeypatch) -> None:
-    monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
-    qwen = SimpleNamespace(pretrained_config=SimpleNamespace(architectures=["Qwen3_5ForCausalLM"]))
-    nemotron = SimpleNamespace(
-        pretrained_config=SimpleNamespace(architectures=["NemotronHForCausalLM"])
-    )
-
-    assert _needs_gdn_sequence_count_profile(qwen, sm_version=90)
-    assert not _needs_gdn_sequence_count_profile(qwen, sm_version=80)
-    assert not _needs_gdn_sequence_count_profile(nemotron, sm_version=90)
-
-    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "0")
-    assert not _needs_gdn_sequence_count_profile(qwen, sm_version=90)
-
-
-def test_profile_batch_waits_for_local_final_responses() -> None:
-    final_result = SimpleNamespace(is_final=True)
-    partial_result = SimpleNamespace(is_final=False)
-    executor = SimpleNamespace(
-        is_shutdown=False,
-        await_responses=Mock(
-            side_effect=[
-                [
-                    SimpleNamespace(
-                        request_id=1,
-                        result=partial_result,
-                        has_error=lambda: False,
-                    )
-                ],
-                [
-                    SimpleNamespace(
-                        request_id=1,
-                        result=final_result,
-                        has_error=lambda: False,
-                    ),
-                    SimpleNamespace(
-                        request_id=2,
-                        result=final_result,
-                        has_error=lambda: False,
-                    ),
-                ],
-            ]
-        ),
-    )
-
-    _await_profile_batch(executor, expected_request_count=2)
-
-    assert executor.await_responses.call_count == 2
 
 
 def _make_mock_request(num_input_tokens, beam_width=1):
@@ -181,87 +125,6 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
     assert model.forwarded_item_counts == [2]
     assert retained_output.data_ptr() != model.last_output.data_ptr()
     assert creator._dummy_encoder_inputs == []
-
-
-def test_sequence_max_dummy_requests_preserve_token_budget() -> None:
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = SimpleNamespace(
-        model=SimpleNamespace(
-            model_config=SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
-        ),
-        max_seq_len=32,
-        use_mrope=False,
-    )
-    creator._mapping = SimpleNamespace(enable_attention_dp=False, tp_size=1)
-    creator._max_num_tokens = 10
-    creator._max_beam_width = 1
-
-    requests = creator._create_dummy_context_requests(
-        input_seq_len=10,
-        num_requests=4,
-    )
-
-    assert [len(request.input_token_ids) for request in requests] == [3, 3, 2, 2]
-
-    requests = creator._create_dummy_context_requests(
-        input_seq_len=2,
-        num_requests=4,
-    )
-    assert [len(request.input_token_ids) for request in requests] == [2, 2, 2, 2]
-
-
-def test_hybrid_v2_prepares_measured_sequence_count_estimation(monkeypatch) -> None:
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = SimpleNamespace(
-        model=SimpleNamespace(
-            model_config=SimpleNamespace(
-                pretrained_config=SimpleNamespace(
-                    vocab_size=128,
-                    architectures=["Qwen3_5ForCausalLM"],
-                )
-            )
-        ),
-        max_seq_len=32,
-        use_mrope=False,
-    )
-    creator._mapping = SimpleNamespace(enable_attention_dp=False, tp_size=1)
-    creator._kv_cache_manager_cls = MambaHybridCacheManagerV2
-    creator._max_batch_size = 4
-    creator._max_num_tokens = 10
-    creator._net_max_seq_len = 32
-    creator._max_beam_width = 1
-    creator._pool_ratio_in = [0.25, 0.75]
-    creator._avg_seq_len_in = 16
-    creator._kv_cache_config = KvCacheConfig(
-        max_tokens=64,
-        max_gpu_total_bytes=1234,
-        pool_ratio=[0.5, 0.5],
-        avg_seq_len=8,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor._util.is_flashinfer_gdn_supported_arch",
-        lambda sm_version=None: True,
-    )
-
-    assert creator.try_prepare_sequence_count_estimation()
-    # Simulate the preliminary quota clamping the second-pass cache shape.
-    creator._max_seq_len = 4
-    creator.prepare_sequence_count_profile_requests()
-
-    wide_requests, long_requests = creator._dummy_req_batches
-    assert [len(request.input_token_ids) for request in long_requests] == [3, 3, 3, 1]
-    assert [len(request.input_token_ids) for request in wide_requests] == [3, 3, 2, 2]
-    assert creator._sequence_profile_memory_cap == 1234
-    assert creator._kv_cache_config.max_tokens == 64
-    assert creator._kv_cache_config.pool_ratio == [0.25, 0.75]
-    assert creator._kv_cache_config.avg_seq_len == 16
-
-
-def test_non_hybrid_v2_skips_sequence_count_estimation() -> None:
-    creator = object.__new__(KvCacheCreator)
-    creator._kv_cache_manager_cls = KVCacheManagerV2
-
-    assert not creator.try_prepare_sequence_count_estimation()
 
 
 def _make_creator(

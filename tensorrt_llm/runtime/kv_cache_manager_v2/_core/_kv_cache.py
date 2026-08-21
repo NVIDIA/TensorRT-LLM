@@ -42,7 +42,7 @@ from .._common import (
     TokenIdExt,
 )
 from .._copy_engine import CopyTask, batched_copy
-from .._exceptions import LogicError, OutOfMemoryError, OutOfPagesError
+from .._exceptions import LogicError, OutOfPagesError
 from .._life_cycle_registry import (
     AttnLifeCycle,
     LayerGroupId,
@@ -856,7 +856,7 @@ class _KVCache:
                         self._record_migrated_slots,
                         self._record_dropped_pages,
                     )
-                except (OutOfMemoryError, OutOfPagesError):
+                except OutOfPagesError:
                     self._recover_excess_scratch_slots(excess_scratch_slots)
                     self._lock_held_blocks(backup_holders)
                     return False
@@ -1180,15 +1180,6 @@ class _KVCache:
             lock.unlock()
             beam_block[lc_idx] = holder
 
-    def _release_deferred_slots(
-        self, deferred_slots: TypedIndexList[LifeCycleId, Slot | None]
-    ) -> None:
-        storage = self._storage
-        for lc_idx, slot in typed_enumerate(deferred_slots):
-            if slot is not None:
-                storage.release_slot(lc_idx, GPU_LEVEL, slot)
-                deferred_slots[lc_idx] = None
-
     # Suspend, allow the KV cache manager to evict buffers from GPU, but don't drop them.
     # suspend+resume allows us to implement dynamic batch size. May also be used to support HSTU model.
     def suspend(self) -> None:
@@ -1243,15 +1234,18 @@ class _KVCache:
         for lc_idx in typed_range(num_life_cycles):
             num_slots[lc_idx] += delta_scratch_slots[lc_idx]
 
-        # Admission is based on the pages this cache will make unavailable,
-        # rather than the current utilization of an unrelated pool group.
-        # A suspended GPU page is evictable today but becomes unavailable once
-        # locked; an offloaded page has the same final cost after migration.
-        additional_unavailable = filled_list(0, storage.num_pool_groups)
+        # This projected per-pool requirement replaces the old gate on current
+        # utilization. A request with no cost in a pressured pool must not be
+        # rejected because another pool happens to be full.
+        additional_required_slots = filled_list(0, storage.num_pool_groups)
+        free_slot_requirements = filled_list(0, storage.num_pool_groups)
         for lc_idx, count in typed_enumerate(num_slots):
-            additional_unavailable[storage.get_pool_group_index(lc_idx)] += count
+            pg_idx = storage.get_pool_group_index(lc_idx)
+            additional_required_slots[pg_idx] += count
+            free_slot_requirements[pg_idx] += count
 
         counted_pages: set[int] = set()
+        gpu_pages_to_protect: list[Page] = []
         for ordinal, beam_idx, lc_idx in self._active_pages():
             holder = self._page(ordinal, beam_idx, lc_idx)
             if holder is None:
@@ -1264,35 +1258,54 @@ class _KVCache:
             # A held GPU page that is not on the eviction queue is already
             # included in stat.unavailable. Only migration from a colder tier
             # or locking an evictable GPU page increases that count.
-            if page.cache_level != GPU_LEVEL or page.scheduled_for_eviction:
-                additional_unavailable[storage.get_pool_group_index(lc_idx)] += 1
+            pg_idx = storage.get_pool_group_index(lc_idx)
+            if page.cache_level != GPU_LEVEL:
+                additional_required_slots[pg_idx] += 1
+                free_slot_requirements[pg_idx] += 1
+            elif page.scheduled_for_eviction:
+                additional_required_slots[pg_idx] += 1
+                gpu_pages_to_protect.append(page)
 
-        max_utilization = self.manager._init_config.max_util_for_resume
         gpu_stats = storage.get_statistics(GPU_LEVEL)
-        # The resume headroom protects pools whose working set can grow after
-        # admission. A live SSM state occupies one fixed slot for the whole
-        # request, so applying the threshold to an SSM-only pool strands
-        # (1 - max_utilization) of its request slots. Keep the threshold when
-        # an SSM lifecycle shares a pool group with an attention lifecycle.
-        needs_resume_headroom = filled_list(False, storage.num_pool_groups)
+        # SSM state has a fixed one-slot working set and needs no decode-growth
+        # headroom. Attention keeps the configured limit, including any pool
+        # group it shares with SSM.
+        max_util_for_resume = filled_list(1.0, storage.num_pool_groups)
         for lc_idx, lc in life_cycles.items():
             if not isinstance(lc, SsmLifeCycle):
-                needs_resume_headroom[storage.get_pool_group_index(lc_idx)] = True
+                max_util_for_resume[storage.get_pool_group_index(lc_idx)] = (
+                    self.manager._init_config.max_util_for_resume
+                )
         if any(
-            needs_resume_headroom[pg_idx]
-            and additional_unavailable[pg_idx] > 0
-            and stat.unavailable + additional_unavailable[pg_idx] > stat.total * max_utilization
+            additional_required_slots[pg_idx] > 0
+            and stat.unavailable + additional_required_slots[pg_idx]
+            > stat.total * max_util_for_resume[pg_idx]
             for pg_idx, stat in typed_enumerate(gpu_stats)
         ):
             return False
 
+        # Keep this cache's GPU pages out of the eviction candidates while
+        # reserving every slot needed for allocation and lower-tier migration.
+        # Manager access is serialized, so these free slots remain available
+        # until new_gpu_slots() and batched_lock_to_gpu() consume them below.
+        for page in gpu_pages_to_protect:
+            storage.exclude_from_eviction(page)
+        try:
+            storage.prepare_free_slots(
+                GPU_LEVEL,
+                free_slot_requirements,
+                self._record_migrated_slots,
+                self._record_dropped_pages,
+            )
+        except OutOfPagesError:
+            for page in reversed(gpu_pages_to_protect):
+                storage.schedule_for_eviction(page)
+            return False
+
         if any(c > 0 for c in num_slots):
-            try:
-                tmp_slots = storage.new_gpu_slots(
-                    num_slots, self._record_migrated_slots, self._record_dropped_pages
-                )
-            except (OutOfMemoryError, OutOfPagesError):
-                return False
+            tmp_slots = storage.new_gpu_slots(
+                num_slots, self._record_migrated_slots, self._record_dropped_pages
+            )
 
             # Wait for scratch slots to be ready
             scratch_slots_to_add = make_typed(lambda _: list[Slot](), num_life_cycles)
@@ -1322,16 +1335,9 @@ class _KVCache:
             )
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
             tasks.append(BatchedLockTarget(page, beam_idx, ordinal, lc_idx))
-        try:
-            locks = batched_lock_to_gpu(
-                self, tasks, self._record_migrated_slots, self._record_dropped_pages
-            )
-        except (OutOfMemoryError, OutOfPagesError):
-            with self._record_event():
-                self._free_scratch_slots()
-            self._release_deferred_slots(deferred_slots)
-            assert NDEBUG or self._check_sanity()
-            return False
+        locks = batched_lock_to_gpu(
+            self, tasks, self._record_migrated_slots, self._record_dropped_pages
+        )
 
         # Replace all holders with locks.
         for (ordinal, beam_idx, lc_idx), lock in zip(self._active_pages(), locks):
@@ -1353,85 +1359,59 @@ class _KVCache:
             )
             # Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
             src_locks: list[_SharedPageLock] = []
-            copy_stats: list[tuple[LifeCycleId, bool]] = []
             gpu_tier = storage.cache_tiers[GPU_LEVEL]
-            deferred_slots_ready = False
-            try:
-                # Wait before overwriting any recycled slot. Once this returns,
-                # one event on this stream can safely cover every deferred slot.
-                stream_wait_events(
-                    self.cuda_stream,
-                    (slot.ready_event for slot in deferred_slots if slot is not None),
-                )
-                deferred_slots_ready = True
-                for lc_idx, new_slot in typed_enumerate(deferred_slots):
-                    if new_slot is None:
-                        continue
-                    if lc_idx == ssm_lc_id:
-                        if self.num_committed_tokens == 0:
-                            continue  # fresh SSM — no source to copy from
-                        lock = self._ssm_blocks[beam_idx][lc_idx]
-                    else:
-                        lock = self._block(last_ordinal, beam_idx)[lc_idx]
-                    assert type(lock) is _SharedPageLock
-                    # V2 still copies a partial reuse into a private slot before writing to it.
-                    # The copy allocates a block, but it is a miss only without a reusable source.
-                    has_partial_reuse_source = self._has_reuse_source(lock)
-                    src_locks.append(lock)
-                    pg_idx = storage._life_cycle_grouping[lc_idx]
-                    slot_size = storage.slot_size(pg_idx)
-                    for p in typed_range(storage.num_pools(pg_idx)):
-                        dst = storage.slot_address(GPU_LEVEL, pg_idx, new_slot.slot_id, p)
-                        src = storage.slot_address(GPU_LEVEL, pg_idx, lock.page.slot_id, p)
-                        # todo: add another batched copy supporting non-uniform size.
-                        batched_copy(
-                            gpu_tier,
-                            gpu_tier,
-                            slot_size[p],
-                            [CopyTask(dst, src)],
-                            self.cuda_stream,
-                        )
-                    copy_stats.append((lc_idx, has_partial_reuse_source))
-
-                # Do not expose a successful allocation/copy in telemetry until
-                # every deferred copy has been queued successfully.
-                for lc_idx, has_partial_reuse_source in copy_stats:
-                    if lc_idx != ssm_lc_id:
-                        life_cycle_key = self._stats_life_cycle_key(lc_idx)
-                        if life_cycle_key is not None and self._should_record_stats():
-                            changed = self._pending_stats.record_allocation_range(
-                                life_cycle_key,
-                                last_ordinal,
-                                BlockOrdinal(last_ordinal + 1),
-                                beam_width=1,
-                                count_as_missed=not has_partial_reuse_source,
-                            )
-                            if changed:
-                                self.manager.mark_stats_dirty(self.id)
-                    pg_idx = storage._life_cycle_grouping[lc_idx]
-                    # Block-reuse accounting above is attention-only, but the
-                    # copy is reported for every life cycle, SSM included.
-                    self._record_direct_iteration_stats(
-                        lc_idx,
-                        KVCacheIterationStatsDelta(
-                            iter_intra_device_copy_blocks=1,
-                            iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
-                        ),
+            stream_wait_events(
+                self.cuda_stream,
+                (slot.ready_event for slot in deferred_slots if slot is not None),
+            )
+            for lc_idx, new_slot in typed_enumerate(deferred_slots):
+                if new_slot is None:
+                    continue
+                if lc_idx == ssm_lc_id:
+                    if self.num_committed_tokens == 0:
+                        continue  # fresh SSM — no source to copy from
+                    lock = self._ssm_blocks[beam_idx][lc_idx]
+                else:
+                    lock = self._block(last_ordinal, beam_idx)[lc_idx]
+                assert type(lock) is _SharedPageLock
+                # V2 still copies a partial reuse into a private slot before writing to it.
+                # The copy allocates a block, but it is a miss only without a reusable source.
+                has_partial_reuse_source = self._has_reuse_source(lock)
+                src_locks.append(lock)
+                pg_idx = storage._life_cycle_grouping[lc_idx]
+                slot_size = storage.slot_size(pg_idx)
+                for p in typed_range(storage.num_pools(pg_idx)):
+                    dst = storage.slot_address(GPU_LEVEL, pg_idx, new_slot.slot_id, p)
+                    src = storage.slot_address(GPU_LEVEL, pg_idx, lock.page.slot_id, p)
+                    # todo: add another batched copy supporting non-uniform size.
+                    batched_copy(
+                        gpu_tier,
+                        gpu_tier,
+                        slot_size[p],
+                        [CopyTask(dst, src)],
+                        self.cuda_stream,
                     )
-            except (OutOfMemoryError, OutOfPagesError):
-                # Activation locked all source pages. Restore the suspended
-                # state atomically and return every preallocated slot so a
-                # later resume can retry from a valid ownership graph.
-                with self._record_event():
-                    self._release_active_page_locks()
-                    self._free_scratch_slots()
-                    if deferred_slots_ready:
-                        for slot in deferred_slots:
-                            if slot is not None:
-                                slot.ready_event = self.finish_event
-                    self._release_deferred_slots(deferred_slots)
-                assert NDEBUG or self._check_sanity()
-                return False
+                if lc_idx != ssm_lc_id:
+                    life_cycle_key = self._stats_life_cycle_key(lc_idx)
+                    if life_cycle_key is not None and self._should_record_stats():
+                        changed = self._pending_stats.record_allocation_range(
+                            life_cycle_key,
+                            last_ordinal,
+                            BlockOrdinal(last_ordinal + 1),
+                            beam_width=1,
+                            count_as_missed=not has_partial_reuse_source,
+                        )
+                        if changed:
+                            self.manager.mark_stats_dirty(self.id)
+                # Block-reuse accounting above is attention-only, but the
+                # copy is reported for every life cycle, SSM included.
+                self._record_direct_iteration_stats(
+                    lc_idx,
+                    KVCacheIterationStatsDelta(
+                        iter_intra_device_copy_blocks=1,
+                        iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
+                    ),
+                )
             # Unlock source pages — _record_event captures all prior cuda work
             # so the original pages know when we're done reading from them.
             if src_locks:

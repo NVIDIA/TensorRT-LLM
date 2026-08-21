@@ -239,13 +239,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         return self.no_schedule_until_state, self.no_schedule_after_state
 
     def schedule_request(
-        self,
-        active_requests: RequestList,
-        inflight_request_ids: set[int],
-        eviction_protected_request_ids: Optional[set[int]] = None,
+        self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
-        eviction_protected_request_ids = eviction_protected_request_ids or set()
         # Main scheduling loop
         (
             scheduled_encoder,
@@ -255,11 +251,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused,
             disagg_candidates,
             has_chunking,
-        ) = self._schedule_loop(
-            active_requests,
-            inflight_request_ids,
-            eviction_protected_request_ids,
-        )
+        ) = self._schedule_loop(active_requests, inflight_request_ids)
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -277,12 +269,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Main scheduling loop ----
 
-    def _schedule_loop(
-        self,
-        active_requests,
-        inflight_request_ids,
-        eviction_protected_request_ids,
-    ):
+    def _schedule_loop(self, active_requests, inflight_request_ids):
         scheduled_ctx: RequestList = []
         scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
@@ -312,13 +299,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
-        protected_cache_owner_ids = {
-            req.request_id
-            for req in requests_list
-            if req.request_id in inflight_request_ids
-            or req.request_id in eviction_protected_request_ids
-        }
-
         # Opt-in: prioritize disagg-gen first-token requests (see __init__).
         # py_decoding_iter == 0 covers DISAGG_GENERATION_INIT /
         # TRANS_IN_PROGRESS / TRANS_COMPLETE. A stable sort keeps FIFO arrival
@@ -445,7 +425,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     recompute_pause_state,
                     evicted,
                     recompute_paused,
-                    protected_cache_owner_ids,
+                    inflight_request_ids,
                     scheduled_beam_width,
                     has_pending_completions,
                 )
@@ -1004,7 +984,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_pause_state: _RecomputePauseState,
         evicted: RequestList,
         recompute_paused: RequestList,
-        protected_cache_owner_ids: set[int],
+        inflight_request_ids: set[int],
         scheduled_beam_width: int,
         has_pending_completions: bool,
     ) -> tuple[ScheduleAction, int, int, int, bool]:
@@ -1042,7 +1022,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req_it,
                 req_it_end,
                 evicted,
-                protected_cache_owner_ids,
+                inflight_request_ids,
             )
 
         if not success:
@@ -1054,7 +1034,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 recompute_pause_state,
                 evicted,
                 recompute_paused,
-                protected_cache_owner_ids,
+                inflight_request_ids,
             )
 
         if success:
@@ -1066,13 +1046,6 @@ class KVCacheV2Scheduler(RequestScheduler):
                 False,
             )
 
-        if req.request_id in protected_cache_owner_ids:
-            # The overlap executor still needs the previous batch's cache
-            # until its sampled token has been consumed. It may schedule the
-            # same request again, so this protection is deliberately separate
-            # from the scheduler's ordinary inflight filter.
-            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end, False
-
         if self.kv_cache_manager.is_request_active(req.py_request_id):
             logger.debug(
                 f"[V2Scheduler] Evicting blocked request {req.py_request_id} "
@@ -1081,7 +1054,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._evict_request(req)
             evicted.append(req)
         elif self.enable_recompute_pause and self._is_recompute_pause_candidate(
-            req, protected_cache_owner_ids
+            req, inflight_request_ids
         ):
             # The request was evicted in an earlier scheduling pass. Its cache
             # has therefore already had a chance to remain on GPU or migrate
@@ -1133,7 +1106,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
 
-    def _is_evictable(self, req: LlmRequest, protected_request_ids: set[int]) -> bool:
+    def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
         """Return whether a started request can be safely evicted.
 
         An already-suspended cache is not useful in the preserve-first phase:
@@ -1141,14 +1114,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         if not self._is_started_request(req):
             return False
-        if req.request_id in protected_request_ids:
+        if req.request_id in inflight_request_ids:
             return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
     def _is_recompute_pause_candidate(
-        self, req: LlmRequest, protected_request_ids: set[int]
+        self, req: LlmRequest, inflight_request_ids: set[int]
     ) -> bool:
-        if req.request_id in protected_request_ids:
+        if req.request_id in inflight_request_ids:
             return False
         # is_generation_in_progress_state also includes GENERATION_TO_COMPLETE,
         # which is outside the schedulable range and may still be finalizing.
@@ -1176,7 +1149,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it: int,
         req_it_end: int,
         evicted: RequestList,
-        protected_request_ids: set[int],
+        inflight_request_ids: set[int],
     ) -> tuple[int, bool]:
         """Evict tail requests until generation admission can make progress.
 
@@ -1195,7 +1168,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         while req_it_end > req_it:
             victim_idx = None
             for i in range(req_it_end - 1, req_it, -1):
-                if self._is_evictable(requests_list[i], protected_request_ids):
+                if self._is_evictable(requests_list[i], inflight_request_ids):
                     victim_idx = i
                     break
 
@@ -1226,7 +1199,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_pause_state: _RecomputePauseState,
         evicted: RequestList,
         recompute_paused: RequestList,
-        protected_request_ids: set[int],
+        inflight_request_ids: set[int],
     ) -> tuple[int, bool]:
         """Use main's recompute-pause fallback after preserved eviction fails.
 
@@ -1243,7 +1216,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if i in recompute_pause_state.victim_indices:
                     continue
                 candidate = requests_list[i]
-                if self._is_recompute_pause_candidate(candidate, protected_request_ids):
+                if self._is_recompute_pause_candidate(candidate, inflight_request_ids):
                     victim_idx = i
                     break
 
@@ -1252,7 +1225,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     (
                         candidate
                         for candidate in evicted
-                        if self._is_recompute_pause_candidate(candidate, protected_request_ids)
+                        if self._is_recompute_pause_candidate(candidate, inflight_request_ids)
                     ),
                     None,
                 )
@@ -1289,7 +1262,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it,
                     req_it_end,
                     evicted,
-                    protected_request_ids,
+                    inflight_request_ids,
                 )
             if success:
                 return req_it_end, True

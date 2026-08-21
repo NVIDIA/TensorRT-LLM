@@ -5152,6 +5152,10 @@ class PyExecutor:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
+                    # Closing a V2 cache records the previous forward stream's
+                    # completion event on every released slot. A new owner
+                    # waits on that event, matching V1's overlap ordering
+                    # without exposing physical cache ownership to scheduler.
                     self._terminate_recompute_paused_requests(scheduled_batch)
                 else:
                     self._terminate_requests(scheduled_batch.paused_requests)
@@ -6298,24 +6302,8 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        if getattr(self, "_is_kv_manager_v2", False):
-            # Overlap schedules the next batch before consuming the previous
-            # batch's sampled tokens. Those requests must remain schedulable,
-            # but their cache cannot be evicted or released until the sample
-            # update reaches its safe boundary.
-            previous_batch = getattr(self, "previous_batch", None)
-            eviction_protected_request_ids = ({
-                request.request_id
-                for request in previous_batch.scheduled_requests.all_requests()
-            } if previous_batch is not None else set())
-            scheduler_output = self.scheduler.schedule_request(
-                self.active_requests,
-                self.inflight_req_ids,
-                eviction_protected_request_ids=eviction_protected_request_ids,
-            )
-        else:
-            scheduler_output = self.scheduler.schedule_request(
-                self.active_requests, self.inflight_req_ids)
+        scheduler_output = self.scheduler.schedule_request(
+            self.active_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder

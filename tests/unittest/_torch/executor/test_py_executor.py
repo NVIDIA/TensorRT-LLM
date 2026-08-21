@@ -1331,43 +1331,6 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     ]
 
 
-def test_v2_schedule_protects_overlap_previous_batch_from_eviction():
-    class StopSchedule(RuntimeError):
-        pass
-
-    executor = object.__new__(PyExecutor)
-    active_request = Mock(request_id=1)
-    previous_request = Mock(request_id=7)
-    previous_requests = Mock()
-    previous_requests.all_requests.return_value = [previous_request]
-    executor.previous_batch = types.SimpleNamespace(scheduled_requests=previous_requests)
-    executor._is_kv_manager_v2 = True
-    executor.active_requests = [active_request, previous_request]
-    executor.inflight_req_ids = set()
-    executor.kv_cache_manager = Mock()
-    executor.scheduler = Mock()
-
-    def stop_after_schedule(
-        requests,
-        inflight_req_ids,
-        *,
-        eviction_protected_request_ids,
-    ):
-        assert requests == executor.active_requests
-        assert inflight_req_ids == executor.inflight_req_ids
-        assert eviction_protected_request_ids == {previous_request.request_id}
-        raise StopSchedule
-
-    executor.scheduler.schedule_request.side_effect = stop_after_schedule
-
-    with pytest.raises(StopSchedule):
-        PyExecutor._schedule(executor)
-
-    executor.kv_cache_manager.prepare_expect_snapshot_points.assert_called_once_with(
-        executor.active_requests
-    )
-
-
 class TestComputeScheduledTokens:
     """Tests for PyExecutor._compute_scheduled_tokens.
 
@@ -2841,20 +2804,11 @@ class TestPendingTransferResponseFlush:
         # Once for the retry pass and once for the following clean exit.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
-    @pytest.mark.parametrize("is_kv_manager_v2", [False, True])
-    def test_idle_pass_processes_eviction_release_and_has_one_flush(
-        self, monkeypatch, is_kv_manager_v2
-    ):
-        """Only destructive eviction uses the executor pause lifecycle in V2."""
+    def test_idle_pass_has_one_flush(self, monkeypatch):
+        """An idle pass must not pay an additional response gather."""
         executor = self._make_executor_loop_stub()
-        executor._is_kv_manager_v2 = is_kv_manager_v2
-        executor._can_pause_for_rebalance = Mock(return_value=False)
-        paused_request = Mock()
         scheduled_batch = types.SimpleNamespace(
-            encoder_requests=[],
-            paused_requests=[] if is_kv_manager_v2 else [paused_request],
-            recompute_paused_requests=[paused_request] if is_kv_manager_v2 else [],
-            generation_requests=[],
+            encoder_requests=[], paused_requests=[], generation_requests=[]
         )
         executor._prepare_and_schedule_batch = Mock(
             side_effect=[(scheduled_batch, None), (None, None)]
@@ -2862,8 +2816,6 @@ class TestPendingTransferResponseFlush:
         executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
         executor._terminate_requests = Mock()
         executor._pause_requests = Mock()
-        executor._terminate_recompute_paused_requests = Mock()
-        executor._pause_recompute_paused_requests = Mock()
         executor._can_queue = Mock(return_value=(False, None))
         executor.kv_connector_manager = None
         executor._revert_gen_alloc = Mock()
@@ -2877,27 +2829,16 @@ class TestPendingTransferResponseFlush:
 
         PyExecutor._executor_loop(executor)
 
-        if is_kv_manager_v2:
-            executor._terminate_requests.assert_not_called()
-            executor._pause_requests.assert_not_called()
-            executor._terminate_recompute_paused_requests.assert_called_once_with(scheduled_batch)
-            executor._pause_recompute_paused_requests.assert_called_once_with(scheduled_batch)
-        else:
-            executor._terminate_requests.assert_called_once_with([paused_request])
-            executor._pause_requests.assert_called_once_with([paused_request])
-            executor._terminate_recompute_paused_requests.assert_not_called()
-            executor._pause_recompute_paused_requests.assert_not_called()
         # One completed idle pass plus the clean-exit drain, not two flushes
         # during the idle pass itself.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
-    def test_overlap_v2_recompute_pause_waits_for_sample_update(self, monkeypatch):
-        """Consume prior samples before resetting a distinct eviction victim."""
+    def test_overlap_v2_recompute_pause_orders_release_and_reset(self, monkeypatch):
+        """Release through an event before reuse, then reset after sampling."""
         executor = self._make_executor_loop_stub()
         executor._is_kv_manager_v2 = True
         executor._can_pause_for_rebalance = Mock(return_value=False)
         executor._wait_for_model_engine_input_copy = Mock()
-        paused_request = Mock(py_request_id=7)
         previous_request = Mock(py_request_id=8)
         previous_requests = Mock()
         previous_requests.all_requests.return_value = [previous_request]
@@ -2906,11 +2847,11 @@ class TestPendingTransferResponseFlush:
             sample_state=previous_sample_state,
             scheduled_requests=previous_requests,
         )
-        executor.active_requests = [previous_request, paused_request]
+        executor.active_requests = [previous_request]
         scheduled_batch = types.SimpleNamespace(
             encoder_requests=[],
             paused_requests=[],
-            recompute_paused_requests=[paused_request],
+            recompute_paused_requests=[previous_request],
             generation_requests=[],
         )
         executor._prepare_and_schedule_batch = Mock(

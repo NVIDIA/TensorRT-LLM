@@ -695,7 +695,7 @@ class TestKVCacheFailuresGen:
             recompute_pause_state=recompute_pause_state,
             evicted=evicted,
             recompute_paused=recompute_paused,
-            protected_request_ids=set(),
+            inflight_request_ids=set(),
         )
 
         assert success
@@ -853,102 +853,6 @@ class TestKVCacheFailuresGen:
         assert out.recompute_paused_requests == []
         mgr.suspend_request.assert_called_once_with(waiting)
         mgr.free_resources.assert_not_called()
-
-    def test_overlap_previous_batch_request_is_not_evicted_or_released(self):
-        """Sampling owners stay schedulable but cannot be pressure victims."""
-        mgr = make_kv_cache_manager(
-            try_allocate_generation_fn=lambda req: False,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=100)
-        protected = make_gen_request(0)
-
-        out = sched.schedule_request(
-            [protected],
-            set(),
-            eviction_protected_request_ids={protected.request_id},
-        )
-
-        assert out.generation_requests == []
-        assert out.paused_requests == []
-        assert out.recompute_paused_requests == []
-        mgr.suspend_request.assert_not_called()
-        mgr.free_resources.assert_not_called()
-
-    def test_overlap_previous_batch_tail_does_not_block_safe_self_eviction(self):
-        """Protection is victim-specific rather than a global eviction gate."""
-        mgr = make_kv_cache_manager(
-            try_allocate_generation_fn=lambda req: False,
-        )
-        sched = make_scheduler(mgr, max_num_tokens=100)
-        waiting = make_gen_request(0)
-        protected_tail = make_gen_request(1)
-
-        out = sched.schedule_request(
-            [waiting, protected_tail],
-            set(),
-            eviction_protected_request_ids={protected_tail.request_id},
-        )
-
-        assert out.generation_requests == []
-        assert ids(out.paused_requests) == [waiting.request_id]
-        assert out.recompute_paused_requests == []
-        mgr.suspend_request.assert_called_once_with(waiting)
-        mgr.free_resources.assert_not_called()
-
-    def test_overlap_previous_batch_only_protects_actual_owner(self):
-        """An unrelated safe cache can still provide V1-style progress."""
-        freed_request_ids = set()
-
-        def allocate_after_release(req):
-            return 1 in freed_request_ids
-
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=allocate_after_release)
-        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
-        sched = make_scheduler(mgr, max_num_tokens=100)
-        waiting = make_gen_request(0)
-        preserved = make_gen_request(1)
-        protected_tail = make_gen_request(2)
-        mgr.kv_cache_map[waiting.py_request_id].is_active = False
-        mgr.kv_cache_map[preserved.py_request_id].is_active = False
-
-        out = sched.schedule_request(
-            [waiting, preserved, protected_tail],
-            set(),
-            eviction_protected_request_ids={protected_tail.request_id},
-        )
-
-        assert ids(out.generation_requests) == [waiting.request_id, protected_tail.request_id]
-        assert out.paused_requests == []
-        assert ids(out.recompute_paused_requests) == [preserved.request_id]
-        mgr.suspend_request.assert_not_called()
-        mgr.free_resources.assert_called_once_with(preserved)
-
-    def test_overlap_eviction_protection_expires_after_sample_update(self):
-        """A former overlap owner follows offload then release once safe."""
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
-        sched = make_scheduler(mgr, max_num_tokens=100)
-        protected = make_gen_request(0)
-
-        first = sched.schedule_request(
-            [protected],
-            set(),
-            eviction_protected_request_ids={protected.request_id},
-        )
-        assert first.generation_requests == []
-        assert first.paused_requests == []
-        assert first.recompute_paused_requests == []
-
-        second = sched.schedule_request([protected], set())
-        assert second.generation_requests == []
-        assert ids(second.paused_requests) == [protected.request_id]
-        assert second.recompute_paused_requests == []
-
-        third = sched.schedule_request([protected], set())
-        assert third.generation_requests == []
-        assert third.paused_requests == []
-        assert ids(third.recompute_paused_requests) == [protected.request_id]
-        mgr.suspend_request.assert_called_once_with(protected)
-        mgr.free_resources.assert_called_once_with(protected)
 
     def test_pending_completion_prevents_false_deadlock(self):
         """A completing request releases its cache without eviction churn."""
