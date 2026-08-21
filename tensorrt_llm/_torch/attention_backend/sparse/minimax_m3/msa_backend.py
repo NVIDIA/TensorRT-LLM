@@ -33,7 +33,6 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._utils import maybe_pin_memory
-from tensorrt_llm.bindings import DataType
 
 from .common import (
     MiniMaxM3SparseConfig,
@@ -598,10 +597,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         except Exception:
             return False
 
-    def _msa_main_kv_is_nvfp4(self) -> bool:
-        """Whether the main paged K/V cache uses packed NVFP4 storage."""
-        return getattr(self.kv_cache_manager, "dtype", None) == DataType.NVFP4
-
     def _create_msa_buffers(self) -> None:
         """Allocate the CUDA-graph-stable MSA device buffers.
 
@@ -1001,16 +996,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"{resolution} now. It must hold for every replay; see "
                 "_resolve_decode_kernels."
             )
-
-    def _msa_runs_no_fmha(self) -> bool:
-        """Whether nothing at all this step reaches fmha_sm100.
-
-        Sparse GQA now runs through a preplanned fmha_sm100 call on pure decode,
-        while prefill and mixed steps already use it for their context rows.
-        Hence every prepared M3 step needs the flattened page table and at
-        least the sparse GQA plan.
-        """
-        return False
 
     def _msa_uses_fixed_stride_page_table(self) -> bool:
         """Whether sparse fmha_sm100 can consume ``msa_block_table`` directly.
@@ -1452,10 +1437,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         The page table and per-new-token cache slots are derived via the
         build_paged_kv_slot_mapping helper, then copied into the persistent
         buffers. The transient builder tensors are discarded.
-
-        Two of those buffers exist only for fmha_sm100 and are skipped when
-        _resolve_decode_kernels left it with nothing to run this step; see
-        _msa_runs_no_fmha.
         """
         self._msa_fields_ready = False
         # Drop any prewritten marker a failed prior step left unconsumed, so
@@ -1621,9 +1602,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # side, so on_update_kv_lens can slice a sub-plan's token range without
         # a device read. Only the plan-mirror patching reads it, so a step with
         # no plan to mirror does not pay for the transfer off the device.
-        self._msa_q_token_starts = (
-            (0,) if self._msa_runs_no_fmha() else (0, *torch.cumsum(qo_long, 0).tolist())
-        )
+        self._msa_q_token_starts = (0, *torch.cumsum(qo_long, 0).tolist())
         self._msa_live_batch = batch_size
         self._msa_live_total_q = total_new_tokens
         self._msa_page_size = page_size

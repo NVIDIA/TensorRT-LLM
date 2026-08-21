@@ -747,7 +747,6 @@ def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
     metadata._resolve_decode_kernels()
 
     assert msa_ported_decode_active(metadata) is True
-    assert metadata._msa_runs_no_fmha() is False
     assert metadata._msa_uses_fixed_stride_page_table() is True
     assert metadata.msa_decode_query_len == 1
     assert metadata.msa_max_kv_len == 11
@@ -778,7 +777,6 @@ def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monk
     assert span.is_mixed is True
     assert msa_ported_decode_active(metadata) is True
     # fmha_sm100 still runs the context prefix, so its page table stays live.
-    assert metadata._msa_runs_no_fmha() is False
     assert metadata._msa_uses_fixed_stride_page_table() is False
     # The trtllm-gen scheduling bound must come from the span's own rows: the
     # 4096-token context row here would inflate a whole-batch maximum by 100x.
@@ -796,7 +794,6 @@ def test_resolve_decode_kernels_resolves_no_span_for_a_pure_prefill(monkeypatch)
     assert metadata.msa_decode_span is None
     assert metadata.msa_decode_query_len is None
     assert msa_ported_decode_active(metadata) is False
-    assert metadata._msa_runs_no_fmha() is False
     assert metadata._msa_uses_fixed_stride_page_table() is False
 
 
@@ -1039,7 +1036,6 @@ def _nvfp4_dispatch_fixture(
     metadata = SimpleNamespace(
         kv_cache_manager=manager,
         _msa_prewritten_layer=3,
-        _msa_main_kv_is_nvfp4=lambda: True,
         msa_decode_query_len=decode_query_len,
         msa_decode_span=span,
         msa_block_table=torch.zeros(batch, 4, dtype=torch.int32),
