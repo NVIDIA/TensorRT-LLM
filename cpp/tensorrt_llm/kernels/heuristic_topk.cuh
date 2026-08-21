@@ -692,8 +692,14 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         // Phase 1 produced no usable bracket. This used to emit the first K
         // elements of the row verbatim, which is not a top-K at all — it is
         // simply the head of the row. Fall through instead with the widest
-        // trusted bracket and let Phase 2 / the Phase-3 repair locate the
-        // threshold; the hint only ever affects speed, never the answer.
+        // trusted bracket and let the Phase-3 repair locate the threshold;
+        // the hint only ever affects speed, never the answer. done = 2 stops
+        // Phase 2 after its single seed probe (which can still promote to the
+        // done = 1 fast path): the secant interpolates on the LINEAR float
+        // scale, so across a (-FLT_MAX, FLT_MAX) bracket it cannot converge
+        // within MAX_REFINE_ITERS and would burn 15 full-N counting passes
+        // before the repair fixes the row anyway. The Phase-3 bisection on
+        // the ordered-key image collapses any bracket in <= 32 steps.
         if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
         {
             if (tid == 0)
@@ -704,7 +710,7 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
                 smem->cnt_lo = N;
                 smem->cnt_hi = 0;
                 smem->threshold = seed;
-                smem->done = 0;
+                smem->done = 2;
             }
             __syncthreads();
         }
@@ -1380,8 +1386,14 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         // Phase 1 produced no usable bracket. This used to emit the first K
         // elements of the row verbatim, which is not a top-K at all — it is
         // simply the head of the row. Fall through instead with the widest
-        // trusted bracket and let Phase 2 / the Phase-3 repair locate the
-        // threshold; the hint only ever affects speed, never the answer.
+        // trusted bracket and let the Phase-3 repair locate the threshold;
+        // the hint only ever affects speed, never the answer. done = 2 stops
+        // Phase 2 after its single seed probe (which can still promote to the
+        // done = 1 fast path): the secant interpolates on the LINEAR float
+        // scale, so across a (-FLT_MAX, FLT_MAX) bracket it cannot converge
+        // within MAX_REFINE_ITERS and would burn 15 full-N counting passes
+        // before the repair fixes the row anyway. The Phase-3 bisection on
+        // the ordered-key image collapses any bracket in <= 32 steps.
         if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
         {
             if (tid == 0)
@@ -1392,7 +1404,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
                 smem->cnt_lo = N;
                 smem->cnt_hi = 0;
                 smem->threshold = seed;
-                smem->done = 0;
+                smem->done = 2;
             }
             __syncthreads();
         }
