@@ -13,10 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
-import json
 import sys
-import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -24,7 +21,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.linear as linear_module
-from tensorrt_llm._torch.autotuner import AutoTuner, AutoTunerProfilingCache
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     MXFP8GemmRunner,
     _get_mxfp8_large_m_tuning_buckets,
@@ -307,102 +304,91 @@ def test_mxfp8_native_autotuner_dispatch(monkeypatch):
     assert native_gemm.call_count == 2
 
 
-def test_mxfp8_native_autotuner_syncs_profiles():
-    initial_cache_count = len(MXFP8GemmRunner.synced_cache_keys)
-    runner = object.__new__(MXFP8GemmRunner)
-    runner.output_dtype = torch.bfloat16
-    runner.sm_version = 100
-    runner.mxfp8_gemm_runner = Mock()
-    profile = (
+def test_mxfp8_native_autotuner_syncs_all_profiles(monkeypatch):
+    bf16_runner = Mock()
+    fp16_runner = Mock()
+    monkeypatch.setattr(
+        MXFP8GemmRunner,
+        "runner_dict",
+        {
+            (torch.bfloat16, 100): bf16_runner,
+            (torch.float16, 100): fp16_runner,
+        },
+    )
+    bf16_profile = (
         (8192, 6144),
         (-1,),
         (9216, 6144),
         (1769472,),
         (1,),
     )
+    fp16_profile = (
+        (16384, 6144),
+        (-1,),
+        (9216, 6144),
+        (3538944,),
+        (1,),
+    )
+    cache = {
+        (
+            "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+            "MXFP8GemmRunner",
+            str((torch.bfloat16, 100)),
+            bf16_profile,
+        ): (0, 17, 0.25),
+        (
+            "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+            "MXFP8GemmRunner",
+            str((torch.float16, 100)),
+            fp16_profile,
+        ): (0, 23, 0.20),
+        (
+            "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+            "OtherRunner",
+            str((torch.bfloat16, 100)),
+            bf16_profile,
+        ): (0, 29, 0.15),
+        (
+            "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
+            "MXFP8GemmRunner",
+            str((torch.float32, 100)),
+            bf16_profile,
+        ): (0, 31, 0.10),
+    }
+    profiling_cache = Mock()
+    profiling_cache.get_specific_custom_op.return_value = cache
+    tuner = Mock(profiling_cache=profiling_cache)
+
+    MXFP8GemmRunner.sync_all_tactic_caches(tuner)
+
+    bf16_runner.register_tactic.assert_called_once_with(8192, 9216, 6144, 17)
+    fp16_runner.register_tactic.assert_called_once_with(16384, 9216, 6144, 23)
+
+
+def test_mxfp8_native_autotuner_rejects_mismatched_k(monkeypatch):
+    native_runner = Mock()
+    monkeypatch.setattr(
+        MXFP8GemmRunner,
+        "runner_dict",
+        {(torch.bfloat16, 100): native_runner},
+    )
     cache_key = (
         "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
         "MXFP8GemmRunner",
-        str(runner.unique_id()),
-        profile,
+        str((torch.bfloat16, 100)),
+        (
+            (8192, 6144),
+            (-1,),
+            (9216, 4096),
+            (1769472,),
+            (1,),
+        ),
     )
-    profiling_cache = Mock(generation=0)
+    profiling_cache = Mock()
     profiling_cache.get_specific_custom_op.return_value = {cache_key: (0, 17, 0.25)}
-
     tuner = Mock(profiling_cache=profiling_cache)
-    runner.sync_tactic_cache(tuner)
-    runner.sync_tactic_cache(tuner)
-
-    runner.mxfp8_gemm_runner.register_tactic.assert_called_once_with(8192, 9216, 6144, 17)
-    profiling_cache.generation = 1
-    runner.sync_tactic_cache(tuner)
-    assert runner.mxfp8_gemm_runner.register_tactic.call_count == 2
-
-    replacement_cache = Mock(generation=0)
-    replacement_cache.get_specific_custom_op.return_value = {cache_key: (0, 17, 0.25)}
-    tuner.profiling_cache = replacement_cache
-    runner.sync_tactic_cache(tuner)
-    assert runner.mxfp8_gemm_runner.register_tactic.call_count == 3
-
-    cache_ref = weakref.ref(profiling_cache)
-    del profiling_cache
-    gc.collect()
-    assert cache_ref() is None
-    assert len(MXFP8GemmRunner.synced_cache_keys) == initial_cache_count + 1
-
-
-def test_mxfp8_native_autotuner_resyncs_loaded_tactic(tmp_path):
-    runner = object.__new__(MXFP8GemmRunner)
-    runner.output_dtype = torch.bfloat16
-    runner.sm_version = 100
-    runner.mxfp8_gemm_runner = Mock()
-    profile = (
-        (8192, 6144),
-        (-1,),
-        (9216, 6144),
-        (1769472,),
-        (1,),
-    )
-    cache_key = (
-        "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm",
-        "MXFP8GemmRunner",
-        str(runner.unique_id()),
-        profile,
-    )
-    profiling_cache = object.__new__(AutoTunerProfilingCache)
-    profiling_cache.cache = {cache_key: (0, 17, 0.25)}
-    profiling_cache.independent_op = set()
-    profiling_cache.excluded_op = set()
-    profiling_cache._generation = 0
-    tuner = Mock(profiling_cache=profiling_cache)
-
-    runner.sync_tactic_cache(tuner)
-    runner.mxfp8_gemm_runner.register_tactic.assert_called_once_with(8192, 9216, 6144, 17)
-
-    cache_path = tmp_path / "mxfp8-cache.json"
-    cache_path.write_text(
-        json.dumps(
-            {
-                "metadata": {
-                    "lib_version": "test",
-                    "creation_timestamp": 0,
-                    "device_name": "test",
-                    "device_capability": [10, 0],
-                },
-                "rank_0": profiling_cache._serialize_cache_data({cache_key: (0, 23, 0.20)}),
-            }
-        )
-    )
-    profiling_cache.load_cache(cache_path, rank=0)
-    runner.sync_tactic_cache(tuner)
-
-    assert profiling_cache.generation == 1
-    assert runner.mxfp8_gemm_runner.register_tactic.call_args_list[-1].args == (
-        8192,
-        9216,
-        6144,
-        23,
-    )
+    with pytest.raises(ValueError, match="mismatched K dimensions"):
+        MXFP8GemmRunner.sync_all_tactic_caches(tuner)
 
 
 def test_mxfp8_rejects_unknown_backend(monkeypatch):

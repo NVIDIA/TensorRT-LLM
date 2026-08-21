@@ -19,7 +19,6 @@ import threading
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
-from weakref import WeakKeyDictionary
 
 import torch
 import triton  # type: ignore[import]
@@ -33,9 +32,9 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (AutoTuner, AutoTunerProfilingCache, ConstraintSpec,
-                         DistributedTuningStrategy, DynamicTensorSpec,
-                         OptimizationProfile, TunableRunner, TuningConfig)
+from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
+                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
+                         TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -594,9 +593,6 @@ class MXFP8GemmRunner(TunableRunner):
     _LARGE_M_BANDS = ((6553, 8192), (13106, 16384), (19659, 32768))
 
     runner_dict = dict()
-    synced_cache_keys: ClassVar[WeakKeyDictionary[AutoTunerProfilingCache, dict[
-        tuple[torch.dtype, int], tuple[int,
-                                       set[tuple]]]]] = WeakKeyDictionary()
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, _get_mxfp8_large_m_tuning_buckets,
         _map_to_mxfp8_large_m_bucket), ),
@@ -623,29 +619,18 @@ class MXFP8GemmRunner(TunableRunner):
         """Return the generic fallback followed by every compiled tactic."""
         return [-1, *range(self.mxfp8_gemm_runner.get_num_configs())]
 
-    def sync_tactic_cache(self, tuner: AutoTuner) -> None:
-        """Register newly profiled tactics in the native serving cache."""
-        runner_name = self.__class__.__name__
-        unique_id = str(self.unique_id())
-        profiling_cache = tuner.profiling_cache
-        cache = profiling_cache.get_specific_custom_op(_MXFP8_AUTOTUNED_OP)
-        runner_sync_state = self.synced_cache_keys.setdefault(
-            profiling_cache, {})
-        generation, synced_cache_keys = runner_sync_state.get(
-            self.unique_id(), (-1, set()))
-        if generation != profiling_cache.generation:
-            generation, synced_cache_keys = profiling_cache.generation, set()
-            runner_sync_state[self.unique_id()] = (generation,
-                                                   synced_cache_keys)
+    @classmethod
+    def sync_all_tactic_caches(cls, tuner: AutoTuner) -> None:
+        """Register every profiled MXFP8 tactic in the native serving cache."""
+        cache = tuner.profiling_cache.get_specific_custom_op(
+            _MXFP8_AUTOTUNED_OP)
+        runners = {str(key): runner for key, runner in cls.runner_dict.items()}
         for cache_key, (_runner_id, tactic, _min_time) in cache.items():
-            if cache_key in synced_cache_keys:
-                continue
-            # Each cache entry is immutable once profiled, so remember both
-            # matching and non-matching entries to avoid rescanning the full
-            # shared custom-op cache on every synchronization.
-            synced_cache_keys.add(cache_key)
             _, cached_runner_name, cached_unique_id, profile = cache_key
-            if cached_runner_name != runner_name or cached_unique_id != unique_id:
+            if cached_runner_name != cls.__name__:
+                continue
+            native_runner = runners.get(cached_unique_id)
+            if native_runner is None:
                 continue
             m, k = profile[0]
             n, weight_k = profile[2]
@@ -653,7 +638,7 @@ class MXFP8GemmRunner(TunableRunner):
                 raise ValueError(
                     f"MXFP8 autotuner cache has mismatched K dimensions: "
                     f"activation K={k}, weight K={weight_k}")
-            self.mxfp8_gemm_runner.register_tactic(m, n, k, tactic)
+            native_runner.register_tactic(m, n, k, tactic)
 
     def forward(
         self,
@@ -704,8 +689,6 @@ def mxfp8_mxfp8_gemm_autotuned(
         MXFP8GemmRunner.tuning_config,
         inputs,
     )
-    if tuner.is_tuning_mode:
-        runner.sync_tactic_cache(tuner)
     return runner(inputs=inputs, tactic=best_tactic)
 
 

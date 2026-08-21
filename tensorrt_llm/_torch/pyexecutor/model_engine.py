@@ -1890,6 +1890,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs forward passes to populate the autotuner cache."""
+        from ..custom_ops.torch_custom_ops import MXFP8GemmRunner
         from ..modules.linear import (MXFP8LinearMethod,
                                       flashinfer_mxfp8_autotune)
 
@@ -2043,6 +2044,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if enable_native_mxfp8_autotuner:
             if ran_native_forward:
+                MXFP8GemmRunner.sync_all_tactic_caches(AutoTuner.get())
                 for method in native_mxfp8_methods:
                     method.mark_native_autotuned()
             else:

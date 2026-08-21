@@ -441,7 +441,6 @@ class AutoTunerProfilingCache:
 
     def __init__(self):
         self.cache: Dict[Tuple, Tuple] = dict()
-        self._generation = 0
 
         # Track which ops use which distributed strategy
         # Maps custom_op name -> DistributedTuningStrategy
@@ -472,12 +471,6 @@ class AutoTunerProfilingCache:
         self.cache.clear()
         self.independent_op.clear()
         self.excluded_op.clear()
-        self._generation += 1
-
-    @property
-    def generation(self) -> int:
-        """Return a counter that changes whenever this cache is cleared."""
-        return self._generation
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -750,8 +743,6 @@ class AutoTunerProfilingCache:
                 logger.debug(
                     f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
                 )
-
-            self._generation += 1
 
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"

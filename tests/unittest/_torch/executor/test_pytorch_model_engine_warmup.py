@@ -21,6 +21,7 @@ from unittest.mock import Mock, patch
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
@@ -402,6 +403,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     "tensorrt_llm._torch.pyexecutor.model_engine.autotune",
                     side_effect=trtllm_autotune,
                 ),
+                patch.object(MXFP8GemmRunner, "sync_all_tactic_caches") as sync_tactics,
                 patch("torch.cuda.synchronize"),
                 patch("torch.cuda.empty_cache"),
                 patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
@@ -425,6 +427,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method.needs_native_autotune)
         self.assertEqual(method.backend, "auto")
         self.assertTrue(method._flashinfer_autotuned)
+        sync_tactics.assert_called_once_with(tuner)
         self.assertEqual(tuner.setup_distributed_state.call_count, 1)
         tuner.setup_distributed_state.assert_called_with(engine.mapping, engine.dist)
 
@@ -512,6 +515,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     "tensorrt_llm._torch.pyexecutor.model_engine.autotune",
                     side_effect=trtllm_autotune,
                 ),
+                patch.object(MXFP8GemmRunner, "sync_all_tactic_caches") as sync_tactics,
                 patch("torch.cuda.empty_cache"),
                 patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
             ):
@@ -531,6 +535,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method.needs_native_autotune)
         self.assertEqual(method.backend, "trtllm")
         self.assertFalse(method._flashinfer_autotuned)
+        sync_tactics.assert_not_called()
         engine.forward.assert_not_called()
 
     def test_flashinfer_mxfp8_rank_mismatch_falls_back_before_warmup(self):
@@ -601,6 +606,7 @@ class TestWarmupCleanup(unittest.TestCase):
                     "tensorrt_llm._torch.pyexecutor.model_engine.autotune",
                     return_value=contextlib.nullcontext(),
                 ),
+                patch.object(MXFP8GemmRunner, "sync_all_tactic_caches") as sync_tactics,
                 patch("torch.cuda.synchronize"),
                 patch("torch.cuda.empty_cache"),
                 patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
@@ -612,6 +618,7 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertEqual(method.backend, "trtllm")
         self.assertTrue(method._native_autotuned)
         self.assertFalse(method._flashinfer_autotuned)
+        sync_tactics.assert_called_once_with(tuner)
         flashinfer_module.autotune.assert_not_called()
         self.assertEqual(engine.forward.call_count, 2)
 
