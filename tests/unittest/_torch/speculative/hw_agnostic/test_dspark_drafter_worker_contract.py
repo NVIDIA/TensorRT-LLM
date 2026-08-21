@@ -20,7 +20,7 @@ using stubs. That cannot catch a worker handed a draft model whose attributes it
 does not have: the two agree on paper and diverge on first contact. The routing
 bug this file pins surfaced only as
 
-    AttributeError: 'Qwen3DSparkForCausalLM' object has no attribute 'num_stages'
+    AttributeError: 'GQADSparkForCausalLM' object has no attribute 'num_stages'
 
 five minutes into a 16-GPU run, after the weights had loaded -- because nothing
 below the factory was ever exercised.
@@ -172,12 +172,12 @@ def _drafter_config_top_level_spelling():
 
 @pytest.fixture(scope="module")
 def standalone_drafter():
-    """The real ``Qwen3DSparkForCausalLM``, weights loaded, on the device."""
+    """The real ``GQADSparkForCausalLM``, weights loaded, on the device."""
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_dspark import Qwen3DSparkForCausalLM
+    from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 
     model_config = ModelConfig(pretrained_config=_drafter_config(), attn_backend="TRTLLM")
-    drafter = Qwen3DSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
+    drafter = GQADSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
     drafter.load_weights(_drafter_weights())
     return drafter
 
@@ -189,12 +189,12 @@ def test_top_level_head_spelling_activates_the_heads():
     # on the floor and falls back to the DFlash slot convention -- correct
     # output, lower acceptance, nothing raised.
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_dspark import Qwen3DSparkForCausalLM
+    from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 
     model_config = ModelConfig(
         pretrained_config=_drafter_config_top_level_spelling(), attn_backend="TRTLLM"
     )
-    drafter = Qwen3DSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
+    drafter = GQADSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
     drafter.load_weights(_drafter_weights())
 
     assert drafter._dspark_markov_rank == RANK
@@ -213,13 +213,13 @@ def test_published_head_weight_names_load():
     # to DFlash, which drops them -- or, once the rank resolves, raises
     # "missing markov_w1.weight" on a checkpoint that plainly ships it.
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_dspark import Qwen3DSparkForCausalLM
+    from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 
     for legacy in (False, True):
         model_config = ModelConfig(
             pretrained_config=_drafter_config_top_level_spelling(), attn_backend="TRTLLM"
         )
-        drafter = Qwen3DSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
+        drafter = GQADSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
         drafter.load_weights(_drafter_weights(legacy_head_keys=legacy))
         assert drafter.has_markov_head, f"legacy_head_keys={legacy}"
         assert drafter.confidence_proj_weight is not None, f"legacy_head_keys={legacy}"
@@ -232,12 +232,12 @@ def test_markov_weights_without_a_resolvable_rank_raise():
     from transformers import Qwen3Config
 
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_dspark import Qwen3DSparkForCausalLM
+    from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 
     cfg = dict(TINY)
     cfg["dflash_config"] = {"mask_token_id": VOCAB - 2, "target_layer_ids": [0, 1]}
     model_config = ModelConfig(pretrained_config=Qwen3Config.from_dict(cfg), attn_backend="TRTLLM")
-    drafter = Qwen3DSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
+    drafter = GQADSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
 
     with pytest.raises(ValueError, match="markov_rank resolved to 0"):
         drafter.load_weights(_drafter_weights())

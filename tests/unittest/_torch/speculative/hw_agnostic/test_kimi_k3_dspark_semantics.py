@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM, dspark_layer_window_size
-from tensorrt_llm._torch.models.modeling_dspark import Qwen3DSparkForCausalLM
+from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     dspark_markov_chain_logits,
     dspark_markov_step_bias,
@@ -265,7 +265,7 @@ def _build_drafter(dspark: bool, weights):
 
     model_config = ModelConfig(pretrained_config=_tiny_config(dspark), attn_backend="TRTLLM")
     # The DSpark head set lives in the DSpark drafter, not in the DFlash base.
-    drafter_cls = Qwen3DSparkForCausalLM if dspark else DFlashForCausalLM
+    drafter_cls = GQADSparkForCausalLM if dspark else DFlashForCausalLM
     drafter = drafter_cls(model_config).to("cuda")
     # Drop dspark head tensors for the plain drafter (schema without them).
     if not dspark:
@@ -414,7 +414,7 @@ def test_dspark_causal_config_rejected():
     cfg = _tiny_config(True)
     cfg.dflash_config = dict(cfg.dflash_config, causal=True)
     with pytest.raises(ValueError, match="non-causal DSpark convention"):
-        Qwen3DSparkForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
+        GQADSparkForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
 
 
 @needs_gpu
@@ -426,7 +426,7 @@ def test_dspark_projector_type_alone_rejects_causal():
     cfg = _tiny_config(False)
     cfg.dflash_config = dict(cfg.dflash_config, projector_type="dspark", causal=True)
     with pytest.raises(ValueError, match="non-causal DSpark convention"):
-        Qwen3DSparkForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
+        GQADSparkForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
 
 
 def _run_block_decode(drafter, weights, captured, noise_embed):

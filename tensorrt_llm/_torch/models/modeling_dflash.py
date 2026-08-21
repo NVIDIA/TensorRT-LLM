@@ -179,7 +179,44 @@ class DFlashForCausalLM(nn.Module):
         # non-causal block attention). Subclasses opt in.
         self._context_input_layernorm = False
         self._sliding_layers_causal = False
+        self._validate_gqa_shape()
         self._warn_inferred_attention_windows()
+
+    def _validate_gqa_shape(self):
+        """Reject a backbone the block decode cannot express.
+
+        The hand-written block decode is GQA-shaped throughout: it splits a
+        fused ``qkv_proj`` by (num_heads, num_kv_heads, head_dim), fuses K/V
+        across layers on one uniform head dim, and shares a single RoPE cache.
+        The registry will happily build a backbone that violates any of that --
+        an MLA drafter has no per-head K/V at all -- and without this the
+        failure surfaces much later inside ``_build_fused_kv_buffers`` or, worse,
+        as silently mis-sliced weights. Raise at construction instead.
+        """
+        layers = getattr(self.model, "layers", None)
+        if not layers:
+            return
+        for idx, layer in enumerate(layers):
+            attn = getattr(layer, "self_attn", None)
+            if attn is None or not hasattr(attn, "qkv_proj"):
+                raise ValueError(
+                    f"DFlash block decode requires a fused self_attn.qkv_proj on "
+                    f"every draft layer, but layer {idx} of draft backbone "
+                    f"{type(self.config).__name__} has none. Backbones that do not "
+                    "project per-head Q/K/V (e.g. MLA) need their own block decode."
+                )
+        num_kv_heads = layers[0].self_attn.num_key_value_heads
+        mismatched = [
+            idx
+            for idx, layer in enumerate(layers[1:], start=1)
+            if layer.self_attn.num_key_value_heads != num_kv_heads
+        ]
+        if mismatched:
+            raise ValueError(
+                "DFlash fuses draft K/V across layers and needs one uniform "
+                f"num_key_value_heads, but layers {mismatched} differ from layer 0 "
+                f"({num_kv_heads})."
+            )
 
     @staticmethod
     def _rope_signature(attn):

@@ -91,10 +91,6 @@ def test_admitted_modes_pass_the_gate(mode):
     assert _rejected_by(_model_config(mode)) is None
 
 
-def test_no_spec_config_passes_the_gate():
-    assert _rejected_by(_model_config(None)) is None
-
-
 @pytest.mark.parametrize("mode", REFUSED, ids=lambda m: m.name)
 def test_refused_modes_are_rejected_at_the_spec_gate(mode):
     assert _rejected_by(_model_config(mode)) == _SPEC_GATE

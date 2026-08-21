@@ -716,7 +716,7 @@ class DSparkWorker(DFlashWorker):
     head-driven policies are overridden here: the block-output slot
     convention (``shift_label``) and the Markov intra-block logit bias.
 
-    Mirrors the model side, where ``DSparkDrafterForCausalLM`` extends
+    Mirrors the model side, where ``GQADSparkForCausalLM`` extends
     ``DFlashForCausalLM`` with the same two heads.
 
     Naming: this is the unqualified DSpark worker because a separately

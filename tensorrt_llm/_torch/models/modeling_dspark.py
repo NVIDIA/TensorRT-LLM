@@ -38,7 +38,7 @@ here, in one of two flavours that differ only in how the draft is delivered:
   Most of this module is this flavour.
 * **standalone** — the drafter ships as its own checkpoint and shares nothing
   with the target but the vocabulary and the captured hidden states. Its block
-  decode is DFlash's, so :class:`DSparkDrafterForCausalLM` subclasses
+  decode is DFlash's, so :class:`GQADSparkForCausalLM` subclasses
   ``DFlashForCausalLM`` and adds the Markov head, the confidence head and the
   shift_label convention. See "Standalone DSpark drafters" near the bottom.
 
@@ -67,9 +67,9 @@ Four parts live here:
    ``[bonus_token, noise, ...]`` block input) and ``dspark_propose`` (Markov
    refinement + static confidence truncation).
 
-4. **Standalone DSpark drafters** — :class:`DSparkDrafterForCausalLM` and its
-   per-backbone subclasses, plus the two-level ``_build_dspark_draft`` dispatch
-   that picks between the two flavours.
+4. **Standalone DSpark drafters** — :class:`GQADSparkForCausalLM`, plus the
+   ``_build_dspark_draft`` dispatch that picks between the two flavours on
+   deployment form alone.
 
 The per-stage *backbone* forward (block attention whose K/V derive from
 ``main_x``, + MoE + mHC) is brought up and numerically validated against the real
@@ -1931,12 +1931,12 @@ _DSPARK_HEAD_WEIGHT_ALIASES = {
 }
 
 
-class DSparkDrafterForCausalLM(DFlashForCausalLM):
-    """DSpark drafter built from a standalone draft checkpoint.
+class GQADSparkForCausalLM(DFlashForCausalLM):
+    """DSpark drafter on a GQA-shaped backbone, from a standalone checkpoint.
 
-    Adds the DSpark head set on top of the generic DFlash block decode:
+    Adds the DSpark head set on top of the DFlash block decode:
 
-      - the vanilla Markov intra-block logit bias, applied by ``DFlashWorker``
+      - the vanilla Markov intra-block logit bias, applied by ``DSparkWorker``
         through :meth:`apply_markov_chain_logits`;
       - the ``shift_label`` output convention (the hidden state at block slot j
         predicts draft token j+1, so slot 0 holds the anchor token);
@@ -1945,9 +1945,14 @@ class DSparkDrafterForCausalLM(DFlashForCausalLM):
     Confidence-scheduled verification is not implemented yet: ``confidence_proj``
     is loaded but unused, and drafting always proposes the full K tokens.
 
-    The draft backbone itself is whatever the drafter config resolves to through
-    the model registry, so this class is backbone-agnostic; per-backbone
-    subclasses exist to carry backbone-specific block-decode overrides.
+    Named for the attention shape, not for a model: the backbone is whatever
+    the drafter config resolves to through the model registry, and the
+    inherited block decode works for every GQA family the DFlash drafters
+    already cover (qwen3, llama, gpt_oss, ...). A per-model subclass would be
+    empty. The GQA precondition is inherited, not introduced here -- see
+    ``DFlashForCausalLM._validate_gqa_shape``. An MLA-backboned drafter needs
+    its own block decode and becomes a sibling, ``MLADSparkForCausalLM``, not a
+    subclass of this.
 
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
@@ -2082,31 +2087,6 @@ class DSparkDrafterForCausalLM(DFlashForCausalLM):
         return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
 
 
-class Qwen3DSparkForCausalLM(DSparkDrafterForCausalLM):
-    """DSpark drafter on a Qwen3-style GQA draft backbone.
-
-    Overrides nothing today: the backbone is built from the drafter config
-    through the model registry, and the DSpark head set is backbone-independent,
-    so ``DSparkDrafterForCausalLM`` already covers this combination end to end.
-
-    It exists as the explicit dispatch target for ``model_type: qwen3``, which
-    keeps the supported matrix visible in class names rather than buried in a
-    builder, and as the seat for backbone-specific overrides when they arrive.
-    They will: an MLA-backboned drafter cannot reuse this block decode, which
-    assumes a fused ``qkv_proj`` and one uniform head dim across Q/K/V.
-    """
-
-
-# Standalone DSpark drafters by the draft checkpoint's ``model_type``. The key
-# is the backbone family, not the target model: the same drafter class serves
-# any target, and a target-specific one would have nothing to hold -- the
-# target-side half of DSpark is the hidden-state capture, which lives in each
-# target's own modeling file.
-_DSPARK_DRAFTERS_BY_MODEL_TYPE = {
-    "qwen3": Qwen3DSparkForCausalLM,
-}
-
-
 def draft_is_embedded_in_target(model_config) -> bool:
     """True when the DSpark draft weights live inside the target checkpoint.
 
@@ -2154,19 +2134,15 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
             block_size=model_config.spec_config.block_size,
         )
 
-    model_type = getattr(draft_config.pretrained_config, "model_type", None)
-    drafter_cls = _DSPARK_DRAFTERS_BY_MODEL_TYPE.get(model_type)
-    if drafter_cls is None:
-        supported = ", ".join(sorted(_DSPARK_DRAFTERS_BY_MODEL_TYPE))
-        raise NotImplementedError(
-            f"No standalone DSpark drafter for draft model_type {model_type!r}. "
-            f"Supported draft model_type values: {supported}. The dispatch keys "
-            "on the draft backbone, so a drafter is supported once its backbone "
-            "has a block-decode implementation here; MLA-backboned drafters "
-            "(e.g. Inferact/Kimi-K3-DSpark, model_type 'k3_dspark') need one and "
-            "are a follow-up."
-        )
-    return drafter_cls(
+    # No per-model_type table here. ``DFlashForCausalLM.__init__`` already
+    # resolves the backbone from the drafter config through the model registry,
+    # so keying on model_type a second time would only duplicate that dispatch
+    # and force a new entry for every GQA family that already works. What the
+    # table really guarded was the block decode's GQA precondition, which is now
+    # checked where it belongs, in the DFlash base. An MLA-backboned drafter
+    # (e.g. Inferact/Kimi-K3-DSpark) fails that check with a clear message until
+    # ``MLADSparkForCausalLM`` lands as a sibling.
+    return GQADSparkForCausalLM(
         draft_config,
         dflash_attention_backend=model_config.spec_config.attention_backend,
     )
@@ -2178,8 +2154,7 @@ __all__ = [
     "DSv4DSparkDraftModel",
     "DSv4DSparkForCausalLM",
     # Standalone flavour.
-    "DSparkDrafterForCausalLM",
-    "Qwen3DSparkForCausalLM",
+    "GQADSparkForCausalLM",
     "draft_is_embedded_in_target",
     "validate_dspark_eplb_layer_base",
     "validate_dspark_eplb_stage_layers",
