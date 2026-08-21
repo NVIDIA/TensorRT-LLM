@@ -35,8 +35,7 @@ BounceArena::BounceArena(std::size_t bytes, int deviceId, bool allowFabric)
     // On MNNVL parts (GH200/GB200) the arena (RDMA src/dst, NIXL-registered) must be fabric memory
     // to be reachable over the NVLink fabric + GPUDirect-RDMA capable. Elsewhere (and CI, or when
     // fabric is force-disabled) fall back to cudaMalloc.
-    mIsFabric = allowFabric && tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory::supportFabricMemory();
-    if (mIsFabric)
+    if (allowFabric && tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory::supportFabricMemory())
     {
         mFabric = std::make_unique<tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory>(bytes);
         mBase = mFabric->getPtr();
@@ -50,7 +49,7 @@ BounceArena::BounceArena(std::size_t bytes, int deviceId, bool allowFabric)
 
 BounceArena::~BounceArena()
 {
-    if (!mIsFabric && mBase != nullptr)
+    if (!mFabric && mBase != nullptr)
     {
         // Select the owning device before freeing (multi-GPU: cudaFree otherwise targets the thread's
         // current device). Fabric-backed arena is freed by ~FabricMemory (mFabric). A dtor can't

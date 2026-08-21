@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "bounceTestUtils.h"
+
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
 
 #include <gtest/gtest.h>
@@ -27,14 +29,7 @@
 
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
 
-namespace
-{
-bool hasCuda()
-{
-    int n = 0;
-    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
-}
-} // namespace
+using bounce_test::hasCuda;
 
 TEST(ExecPool, AcquireReleaseExhaustion)
 {

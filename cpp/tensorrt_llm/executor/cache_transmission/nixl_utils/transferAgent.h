@@ -30,9 +30,10 @@ namespace tensorrt_llm::executor::kv_cache
 
 namespace bounce
 {
-// Pimpl holding the bounce v2 transport + its pools/engine/channel. Defined only in the .cpp
-// (and only when built with TLLM_BOUNCE_V2 / ENABLE_UCX); the member below is always present so
-// the NixlTransferAgent layout is identical across all translation units.
+// Pimpl holding the bounce v2 transport + its arena/exec pool/control channel. The full definition
+// lives in the .cpp: the real one under TLLM_BOUNCE_V2 (set when libzmq is found, independent of
+// ENABLE_UCX), an empty struct otherwise; the member below is always present so the
+// NixlTransferAgent layout is identical across all translation units.
 struct NixlBounceState;
 } // namespace bounce
 
@@ -175,7 +176,8 @@ private:
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
 
     /// Bounce v2 transport (opt-in via CacheTransceiverConfig.agent_buffer_size_mb). Null unless
-    /// enabled & built; when null the agent behaves exactly as before. See bounce/DESIGN.md.
+    /// enabled & built; when null the agent behaves exactly as before. See the design overview at
+    /// the top of bounce/BounceTransport.h.
     std::unique_ptr<bounce::NixlBounceState> mBounce;
 
     /// Lazily create the bounce transport (ctor, before any metadata exchange) when enabled.

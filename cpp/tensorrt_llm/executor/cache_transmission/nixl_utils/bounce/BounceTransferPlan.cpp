@@ -45,7 +45,7 @@ constexpr std::uint64_t alignUp(std::uint64_t value, std::uint64_t align) noexce
 //       Captures a uniformly-strided dst (e.g. a head slice into a wider pool -> ONE run).
 // Irregular layouts simply break runs (worst case: one count==1 run per desc == the old per-desc
 // plan). Correctness never depends on merging.
-void buildScatterRuns(BounceChunk& chunk, bool merge)
+void buildScatterRuns(BounceChunk& chunk)
 {
     auto const n = chunk.dstPtrs.size();
     chunk.scatterRuns.clear();
@@ -54,7 +54,7 @@ void buildScatterRuns(BounceChunk& chunk, bool merge)
         std::uint64_t const dst = chunk.dstPtrs[i];
         std::uint64_t const bounce = chunk.bounceOffsets[i];
         std::uint32_t const size = chunk.sizes[i];
-        if (merge && !chunk.scatterRuns.empty())
+        if (!chunk.scatterRuns.empty())
         {
             auto& r = chunk.scatterRuns.back();
             if (r.count == 1)
@@ -91,7 +91,7 @@ void buildScatterRuns(BounceChunk& chunk, bool merge)
 } // namespace
 
 BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
-    std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk, bool mergeScatterRuns)
+    std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk)
 {
     BounceTransferPlan plan;
 
@@ -123,7 +123,7 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
     {
         if (!current.srcPtrs.empty())
         {
-            buildScatterRuns(current, mergeScatterRuns);
+            buildScatterRuns(current);
             plan.mChunks.emplace_back(std::move(current));
             current = BounceChunk{};
             cursor = 0;

@@ -128,6 +128,19 @@ void CreditScheduler::maybeActivateDrain()
     }
 }
 
+void CreditScheduler::issueGrant(
+    std::string const& flow, FlowState& st, std::size_t ringIdx, std::uint64_t offset, std::vector<Grant>& grants)
+{
+    std::uint32_t const want = st.pending.front();
+    st.pending.pop_front();
+    st.held.insert(offset);
+    st.blockedAtGrantSequence.reset();
+    st.lastProgress = mClock();             // issuing a grant renews the flow's lease
+    grants.push_back(Grant{flow, offset, mBaseAddr + offset, want});
+    mCursor = (ringIdx + 1) % mRing.size(); // next sweep starts AFTER this flow -> round-robin
+    ++mGrantSequence;
+}
+
 // Hand out as many region grants as possible RIGHT NOW, fairly and bounded. Called whenever space
 // frees up or new demand arrives (onWant / onScatterDone / releaseLocal / reclaim*). Three rules:
 //   1. Fair: rotate over flows round-robin (mRing + mCursor). A head chunk that repeatedly fails to
@@ -174,13 +187,7 @@ std::vector<Grant> CreditScheduler::schedule()
             auto const ringIt = std::find(mRing.begin(), mRing.end(), *mDrainFlow);
             TLLM_CHECK_DEBUG(ringIt != mRing.end());
             std::size_t const idx = static_cast<std::size_t>(ringIt - mRing.begin());
-            st.pending.pop_front();
-            st.held.insert(*off);
-            st.blockedAtGrantSequence.reset();
-            st.lastProgress = mClock(); // issuing a grant renews the flow's lease
-            grants.push_back(Grant{*mDrainFlow, *off, mBaseAddr + *off, want});
-            mCursor = (idx + 1) % mRing.size();
-            ++mGrantSequence;
+            issueGrant(*mDrainFlow, st, idx, *off, grants);
             mDrainFlow.reset();
             continue;
         }
@@ -214,13 +221,7 @@ std::vector<Grant> CreditScheduler::schedule()
                 }
                 continue; // arena can't fit this chunk now -> try another flow (smaller may fit)
             }
-            st.pending.pop_front();
-            st.held.insert(*off);
-            st.blockedAtGrantSequence.reset();
-            st.lastProgress = mClock();         // issuing a grant renews the flow's lease
-            grants.push_back(Grant{mRing[idx], *off, mBaseAddr + *off, want});
-            mCursor = (idx + 1) % mRing.size(); // next sweep starts AFTER this flow -> round-robin
-            ++mGrantSequence;
+            issueGrant(mRing[idx], st, idx, *off, grants);
             progress = true;
             // One grant per sweep: break out and let the outer loop re-sweep from the advanced cursor,
             // so grants alternate across flows (strict rotation) rather than filling one flow first.
