@@ -4,7 +4,7 @@
 """Torch custom op for fused DSpark rolling-window attention.
 
 The op runs the tcgen05 MMA kernel
-(:class:`DSparkAttentionForward`) on the supported DSpark
+(:class:`DSparkAttention`) on the supported DSpark
 geometry: 128 heads, head_dim 512, draft block 5 or 6, and a 128-row rolling
 window. Other shapes fall back to the pure-PyTorch reference path in
 ``models/dspark/attention.py``.
@@ -25,7 +25,7 @@ except ImportError:
 
 from ..._utils import get_sm_version
 from ...logger import logger
-from ..cute_dsl_kernels.blackwell.dspark.page8_specialization import DSparkAttentionForward
+from ..cute_dsl_kernels.blackwell.dspark.attention import DSparkAttention
 from .dspark_rmsnorm_rope_custom_op import (
     _get_dspark_arch_str,
     precompile_dspark_attention_preparation,
@@ -34,7 +34,7 @@ from .dspark_rmsnorm_rope_custom_op import (
 _DSPARK_NUM_HEADS = 128
 _DSPARK_HEAD_DIM = 512
 _DSPARK_WINDOW_SIZE = 128
-_DSPARK_PAGE_SIZE = 8
+_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
 _DSPARK_BLOCK_SIZES = (5, 6)
 _DSPARK_ROPE_DIM = 64
 
@@ -328,7 +328,9 @@ def _compile_dspark_attention(
     )
     block_spec = _as_dynamic_data(
         torch.empty(
-            (specimen_batch, _DSPARK_PAGE_SIZE, head_dim), dtype=torch.bfloat16, device=device
+            (specimen_batch, _DSPARK_DRAFT_BLOCK_STORAGE_SIZE, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
         ).permute(1, 2, 0),
         (2, 0, 1),
     )
@@ -357,30 +359,24 @@ def _compile_dspark_attention(
 
     hardware_info = cutlass_utils.HardwareInfo()
     max_active_clusters = hardware_info.get_max_active_clusters(2)
-    kernel = DSparkAttentionForward(
+    kernel = DSparkAttention(
         cutlass.Float32,
         (128, 128),
         (128, 256),
         max_active_clusters,
-        _DSPARK_PAGE_SIZE,
+        _DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
         _DSPARK_WINDOW_SIZE,
         0.0,
-        True,
-        False,
-        False,
         seq_len_q=block_size,
         mma_qk_tiler_k=128,
         inverse_rope_dim=_DSPARK_ROPE_DIM,
         arch_str=arch_str,
     )
-    # The compressed page table is implicit in the DSpark specialization; its
-    # ABI slot intentionally reuses the window table placeholder.
     compiled = cute.compile(
         kernel,
         q_spec,
         window_spec,
         block_spec,
-        page_table_spec,
         page_table_spec,
         output_spec,
         cache_seqs_spec,
@@ -401,7 +397,7 @@ def _compile_dspark_attention(
 
 def _run_dspark_attention(
     q: torch.Tensor,
-    block_page: torch.Tensor,
+    draft_block: torch.Tensor,
     kv_cache: torch.Tensor,
     slots_i32: torch.Tensor,
     cache_seqs: torch.Tensor,
@@ -413,17 +409,14 @@ def _run_dspark_attention(
     block_size = q.shape[1]
     compiled = _compile_dspark_attention(block_size, softmax_scale)
     page_table_win = _as_dynamic_lead0(slots_i32.unsqueeze(1).permute(1, 0))
-    # The compressed page table is implicit; reuse the window-table ABI value.
-    page_table_cmp = page_table_win
     output = torch.empty_like(q)
 
     stream_arg = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled(
         _as_dynamic_data(q.permute(2, 3, 1, 0), (3, 2, 0, 1)),
         _as_dynamic_data(kv_cache.permute(1, 2, 0), None, compact=False),
-        _as_dynamic_data(block_page.permute(1, 2, 0), (2, 0, 1)),
+        _as_dynamic_data(draft_block.permute(1, 2, 0), (2, 0, 1)),
         page_table_win,
-        page_table_cmp,
         _as_dynamic_data(output.permute(2, 3, 1, 0), (3, 2, 0, 1)),
         _as_dynamic_1d(cache_seqs),
         _as_dynamic_1d(valid_len),
@@ -483,12 +476,12 @@ def cute_dsl_dspark_attention(
     # kernels.
     _compile_dspark_attention(block_size, softmax_scale)
     kv_cache[slots, start_pos % _DSPARK_WINDOW_SIZE] = main_kv
-    block_page = F.pad(block_kv, (0, 0, 0, _DSPARK_PAGE_SIZE - block_size))
+    draft_block = F.pad(block_kv, (0, 0, 0, _DSPARK_DRAFT_BLOCK_STORAGE_SIZE - block_size))
     slots_i32 = slots.to(torch.int32)
     cache_seqs = start_pos.to(torch.int32)
     return _run_dspark_attention(
         q,
-        block_page,
+        draft_block,
         kv_cache,
         slots_i32,
         cache_seqs,
@@ -522,7 +515,7 @@ def _(
 )
 def cute_dsl_dspark_attention_prepared(
     q: torch.Tensor,
-    block_page: torch.Tensor,
+    draft_block: torch.Tensor,
     kv_cache: torch.Tensor,
     slots_i32: torch.Tensor,
     cache_seqs: torch.Tensor,
@@ -535,7 +528,7 @@ def cute_dsl_dspark_attention_prepared(
 
     return _run_dspark_attention(
         q,
-        block_page,
+        draft_block,
         kv_cache,
         slots_i32,
         cache_seqs,
@@ -549,7 +542,7 @@ def cute_dsl_dspark_attention_prepared(
 @torch.library.register_fake("trtllm::cute_dsl_dspark_attention_prepared")
 def _(
     q: torch.Tensor,
-    block_page: torch.Tensor,
+    draft_block: torch.Tensor,
     kv_cache: torch.Tensor,
     slots_i32: torch.Tensor,
     cache_seqs: torch.Tensor,
@@ -558,6 +551,6 @@ def _(
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    del block_page, kv_cache, slots_i32, cache_seqs, valid_len, attn_sink, inverse_rope_freqs
+    del draft_block, kv_cache, slots_i32, cache_seqs, valid_len, attn_sink, inverse_rope_freqs
     del softmax_scale
     return torch.empty_like(q)

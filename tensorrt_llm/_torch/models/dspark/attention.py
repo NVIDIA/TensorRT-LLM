@@ -48,8 +48,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     )
     from ...custom_ops.dspark_rmsnorm_rope_custom_op import (
         cute_dsl_dspark_rmsnorm_rope,
-        cute_dsl_dspark_rmsnorm_rope_block_page,
         cute_dsl_dspark_rmsnorm_rope_cache_write,
+        cute_dsl_dspark_rmsnorm_rope_draft_block,
         is_fused_dspark_attention_preparation_supported,
         is_fused_dspark_rmsnorm_rope_supported,
     )
@@ -553,7 +553,7 @@ def dspark_attention_forward_batched(
             start_pos,
             eps,
         )
-        block_page = cute_dsl_dspark_rmsnorm_rope_block_page(
+        draft_block = cute_dsl_dspark_rmsnorm_rope_draft_block(
             block_kv_input,
             kv_norm_w,
             block_rope_freqs,
@@ -561,7 +561,7 @@ def dspark_attention_forward_batched(
         )
         o = cute_dsl_dspark_attention_prepared(
             q,
-            block_page,
+            draft_block,
             write_target,
             slots_i32,
             cache_seqs,

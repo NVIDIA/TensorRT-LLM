@@ -11,15 +11,15 @@ import torch
 
 from ..._utils import get_sm_version
 from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
-    DSparkRMSNormRoPEBlockPageKernel,
     DSparkRMSNormRoPECacheWriteKernel,
+    DSparkRMSNormRoPEDraftBlockKernel,
     DSparkRMSNormRoPEKernel,
 )
 
 _DSPARK_HEAD_DIM = 512
 _DSPARK_ROPE_DIM = 64
 _DSPARK_WINDOW_SIZE = 128
-_DSPARK_PAGE_SIZE = 8
+_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
 _DSPARK_BLOCK_SIZES = (5, 6)
 _DSPARK_ARCH_BY_SM = {
     100: "sm_100",
@@ -106,7 +106,7 @@ def _is_dspark_cache_write_supported(
     )
 
 
-def _is_dspark_block_page_supported(
+def _is_dspark_draft_block_supported(
     x: torch.Tensor,
     weight: torch.Tensor,
     freqs: torch.Tensor,
@@ -135,7 +135,7 @@ def is_fused_dspark_attention_preparation_supported(
     return (
         main_x.shape[0] == block_x.shape[0]
         and _is_dspark_cache_write_supported(main_x, weight, main_freqs, kv_cache, slots, start_pos)
-        and _is_dspark_block_page_supported(block_x, weight, block_freqs)
+        and _is_dspark_draft_block_supported(block_x, weight, block_freqs)
     )
 
 
@@ -197,7 +197,7 @@ def precompile_dspark_attention_preparation(block_size: int, eps: float) -> None
     _dspark_preparation_compile_allowed = True
     try:
         _compile_dspark_rmsnorm_rope_cache_write(eps)
-        _compile_dspark_rmsnorm_rope_block_page(block_size, eps)
+        _compile_dspark_rmsnorm_rope_draft_block(block_size, eps)
     finally:
         _dspark_preparation_compile_allowed = False
 
@@ -261,10 +261,10 @@ def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
 
 
 @functools.cache
-def _compile_dspark_rmsnorm_rope_block_page(block_size: int, eps: float):
+def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float):
     if not _dspark_preparation_compile_allowed:
         raise RuntimeError(
-            "DSpark RMSNorm/RoPE block-page kernel was not precompiled during worker initialization"
+            "DSpark RMSNorm/RoPE draft-block kernel was not precompiled during worker initialization"
         )
 
     rows = cute.sym_int()
@@ -282,16 +282,16 @@ def _compile_dspark_rmsnorm_rope_block_page(block_size: int, eps: float):
     )
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16,
-        (batch, _DSPARK_PAGE_SIZE, _DSPARK_HEAD_DIM),
+        (batch, _DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSPARK_HEAD_DIM),
         stride_order=(2, 1, 0),
     )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    kernel = DSparkRMSNormRoPEBlockPageKernel(
+    kernel = DSparkRMSNormRoPEDraftBlockKernel(
         _DSPARK_HEAD_DIM,
         _DSPARK_ROPE_DIM,
         eps,
         block_size,
-        _DSPARK_PAGE_SIZE,
+        _DSPARK_DRAFT_BLOCK_STORAGE_SIZE,
     )
     return cute.compile(
         kernel,
@@ -408,20 +408,20 @@ def _(
 
 
 @torch.library.custom_op(
-    "trtllm::cute_dsl_dspark_rmsnorm_rope_block_page",
+    "trtllm::cute_dsl_dspark_rmsnorm_rope_draft_block",
     mutates_args=(),
     device_types="cuda",
 )
-def cute_dsl_dspark_rmsnorm_rope_block_page(
+def cute_dsl_dspark_rmsnorm_rope_draft_block(
     x: torch.Tensor,
     weight: torch.Tensor,
     freqs: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Prepare an eight-row page after the caller validates the fused contract."""
+    """Prepare a zero-padded draft block after validating the fused contract."""
     block_size = x.shape[1]
-    compiled = _compile_dspark_rmsnorm_rope_block_page(block_size, eps)
-    output = x.new_empty((x.shape[0], _DSPARK_PAGE_SIZE, _DSPARK_HEAD_DIM))
+    compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps)
+    output = x.new_empty((x.shape[0], _DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSPARK_HEAD_DIM))
     compiled(
         x.view(-1, _DSPARK_HEAD_DIM),
         weight,
@@ -431,7 +431,7 @@ def cute_dsl_dspark_rmsnorm_rope_block_page(
     return output
 
 
-@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_rope_block_page")
+@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_rope_draft_block")
 def _(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -439,4 +439,4 @@ def _(
     eps: float,
 ) -> torch.Tensor:
     del weight, freqs, eps
-    return x.new_empty((x.shape[0], _DSPARK_PAGE_SIZE, _DSPARK_HEAD_DIM))
+    return x.new_empty((x.shape[0], _DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSPARK_HEAD_DIM))

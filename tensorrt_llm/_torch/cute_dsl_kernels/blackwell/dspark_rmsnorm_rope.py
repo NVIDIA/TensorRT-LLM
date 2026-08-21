@@ -207,8 +207,8 @@ class DSparkRMSNormRoPECacheWriteKernel(DSparkRMSNormRoPEKernel):
             )
 
 
-class DSparkRMSNormRoPEBlockPageKernel(DSparkRMSNormRoPEKernel):
-    """Apply RMSNorm/RoPE and materialize a zero-padded physical KV page."""
+class DSparkRMSNormRoPEDraftBlockKernel(DSparkRMSNormRoPEKernel):
+    """Apply RMSNorm/RoPE and materialize a fixed-size zero-padded draft block."""
 
     def __init__(
         self,
@@ -216,11 +216,11 @@ class DSparkRMSNormRoPEBlockPageKernel(DSparkRMSNormRoPEKernel):
         rope_dim: int,
         eps: float,
         block_size: int,
-        page_size: int,
+        storage_size: int,
     ):
         super().__init__(hidden_dim, rope_dim, 1, eps, True, True, False)
         self.block_size = block_size
-        self.page_size = page_size
+        self.storage_size = storage_size
 
     @cute.jit
     def __call__(
@@ -232,7 +232,7 @@ class DSparkRMSNormRoPEBlockPageKernel(DSparkRMSNormRoPEKernel):
         stream: cuda.CUstream,
     ):
         self.kernel(x, weight, freqs, output).launch(
-            grid=[output.shape[0], self.page_size, 1],
+            grid=[output.shape[0], self.storage_size, 1],
             block=[self.num_threads, 1, 1],
             stream=stream,
         )

@@ -31,45 +31,24 @@ import cutlass
 import cutlass.cute as cute
 
 
-class HCAStaticTileSchedulerParams:
+class DSparkPersistentTileSchedulerParams:
     def __init__(
         self,
-        is_persistent: bool,
         problem_shape_b: cute.Int32,
         problem_shape_s: cute.Int32,
         cluster_shape_mnk: cute.Shape,
-        split_kv: cutlass.Int32,
-        split_pv: int = 1,
         *,
         problem_shape_b_fdd: cute.FastDivmodDivisor = None,
         problem_shape_s_fdd: cute.FastDivmodDivisor = None,
-        split_kv_fdd: cute.FastDivmodDivisor = None,
         loc=None,
         ip=None,
     ):
-        """The static tile scheduler parameters prepared for HCA static tile scheduler.
-
-        :param is_persistent: Whether to use persistent kernel mode
-        :type is_persistent: bool
-        :param problem_shape_b: The shape of the problem
-        :type problem_shape_b: cute.Int32
-        :param problem_shape_s: The shape of the problem in sequence length Q dimension
-        :type problem_shape_s: cute.Int32
-        :param cluster_shape_mnk: The shape of the cluster
-        :type cluster_shape_mnk: cute.Shape
-        :param split_kv: The scalar factor for split KV
-        :param split_pv: The number of splits along PV N dimension (compile-time constant)
-        :type split_pv: int
-        """
-        self.is_persistent = is_persistent
+        """Parameters for the persistent DSpark attention tile scheduler."""
         self.problem_shape_b = problem_shape_b
         self.problem_shape_s = problem_shape_s
         self.problem_shape_b_fdd = problem_shape_b_fdd
         self.problem_shape_s_fdd = problem_shape_s_fdd
         self.cluster_shape_mnk = cluster_shape_mnk
-        self.split_kv = split_kv
-        self.split_kv_fdd = split_kv_fdd
-        self.split_pv = split_pv
         if cutlass.const_expr(problem_shape_b_fdd is None):
             self.problem_shape_b_fdd = cute.fast_divmod_create_divisor(
                 problem_shape_b, loc=loc, ip=ip
@@ -78,8 +57,6 @@ class HCAStaticTileSchedulerParams:
             self.problem_shape_s_fdd = cute.fast_divmod_create_divisor(
                 problem_shape_s, loc=loc, ip=ip
             )
-        if cutlass.const_expr(split_kv_fdd is None):
-            self.split_kv_fdd = cute.fast_divmod_create_divisor(split_kv, loc=loc, ip=ip)
         self.loc = loc
         self.ip = ip
 
@@ -87,10 +64,8 @@ class HCAStaticTileSchedulerParams:
         return (
             self.problem_shape_b,
             self.problem_shape_s,
-            self.split_kv,
             self.problem_shape_b_fdd,
             self.problem_shape_s_fdd,
-            self.split_kv_fdd,
         )
 
     def __extract_mlir_values__(self):
@@ -110,36 +85,26 @@ class HCAStaticTileSchedulerParams:
             count = len(cutlass.extract_mlir_values(field))
             rebuilt.append(cutlass.new_from_mlir_values(field, tuple(values[:count])))
             values = values[count:]
-        problem_shape_b, problem_shape_s, split_kv, b_fdd, s_fdd, kv_fdd = rebuilt
-        return HCAStaticTileSchedulerParams(
-            self.is_persistent,
+        problem_shape_b, problem_shape_s, b_fdd, s_fdd = rebuilt
+        return DSparkPersistentTileSchedulerParams(
             problem_shape_b,
             problem_shape_s,
             self.cluster_shape_mnk,
-            split_kv,
-            self.split_pv,
             problem_shape_b_fdd=b_fdd,
             problem_shape_s_fdd=s_fdd,
-            split_kv_fdd=kv_fdd,
             loc=self.loc,
         )
 
 
-def create_hca_static_tile_scheduler_params(
-    is_persistent: bool,
+def create_dspark_persistent_tile_scheduler_params(
     problem_shape_b: cute.Int32,
     problem_shape_s: cute.Int32,
     cluster_shape_mnk: cute.Shape,
-    split_kv: cutlass.Int32,
-    split_pv: int = 1,
-) -> HCAStaticTileSchedulerParams:
-    return HCAStaticTileSchedulerParams(
-        is_persistent,
+) -> DSparkPersistentTileSchedulerParams:
+    return DSparkPersistentTileSchedulerParams(
         problem_shape_b,
         problem_shape_s,
         cluster_shape_mnk,
-        split_kv,
-        split_pv,
     )
 
 
@@ -167,118 +132,74 @@ class WorkTileInfo:
         return self.blk_coord
 
 
-class HCAStaticTileScheduler:
+class DSparkPersistentTileScheduler:
     def __init__(
         self,
-        params: HCAStaticTileSchedulerParams,
+        params: DSparkPersistentTileSchedulerParams,
         current_work_linear_idx: cutlass.Int32,
         blk_coord: cute.Coord,
         grid_shape: cute.Shape,
         *,
-        is_valid: bool = True,
         loc=None,
         ip=None,
     ):
-        """The static tile scheduler for HCA split kv kernel.
-        Based on `is_persistent`, it provides 2 modes for use:
-        - Persistent mode: Launch fixed blocks and reschedule the data blocks.
-        - Non-persistent mode: Launch dynamic blocks and exit when the current work is done.
-
-        :param params: The static tile scheduler parameters
-        :type params: HCAStaticTileSchedulerParams
-        :param current_work_linear_idx: The linear index of the current work
-        :type current_work_linear_idx: cutlass.Int32
-        :param blk_coord: The coordinate of the current work
-        :type blk_coord: cute.Coord
-        :param grid_shape: The shape of the grid
-        :type grid_shape: cute.Shape
-        :param is_valid: Whether the current work is valid
-        :type is_valid: bool
-        """
+        """Persistent scheduler for the fixed, unsplit DSpark attention work tiles."""
         self.params = params
         self.blk_coord = blk_coord
         self.grid_shape = grid_shape
         self.current_work_linear_idx = current_work_linear_idx
-        if params.is_persistent:
-            self.persistent_blk_layout = cute.make_layout(
-                (
-                    params.cluster_shape_mnk[0],
-                    params.problem_shape_s,
-                    params.problem_shape_b,
-                    params.split_kv,
-                ),
-                loc=loc,
-                ip=ip,
-            )
-            self.num_blocks = cute.size(self.persistent_blk_layout, loc=loc, ip=ip)
-            # Used for persistent scheduling
-            self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
-        else:
-            self.is_valid = is_valid
+        self.persistent_blk_layout = cute.make_layout(
+            (
+                params.cluster_shape_mnk[0],
+                params.problem_shape_s,
+                params.problem_shape_b,
+            ),
+            loc=loc,
+            ip=ip,
+        )
+        self.num_blocks = cute.size(self.persistent_blk_layout, loc=loc, ip=ip)
+        self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
         self.loc = loc
         self.ip = ip
 
     @staticmethod
     def get_grid_shape(
-        params: HCAStaticTileSchedulerParams,
+        params: DSparkPersistentTileSchedulerParams,
         max_active_clusters: int,
         *,
         loc=None,
         ip=None,
     ) -> cute.Shape:
         # called by host
-        grid_shape = (
-            params.cluster_shape_mnk[0],
-            params.problem_shape_b * params.problem_shape_s,
-            params.split_kv,
+        total_blocks = params.cluster_shape_mnk[0] * params.problem_shape_b * params.problem_shape_s
+        return (
+            cutlass.min(
+                max_active_clusters * cute.size(params.cluster_shape_mnk),
+                total_blocks,
+            ),
+            1,
+            1,
         )
-        if params.is_persistent:
-            return (
-                cutlass.min(
-                    max_active_clusters * cute.size(params.cluster_shape_mnk),
-                    cute.size(grid_shape, loc=loc, ip=ip),
-                ),
-                1,
-                1,
-            )
-        else:
-            return grid_shape
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        is_valid = (
-            self.current_work_linear_idx < self.num_blocks
-            if self.params.is_persistent
-            else self.is_valid
+        is_valid = self.current_work_linear_idx < self.num_blocks
+        current_work_cluster_batch, cluster_idx = (
+            self.current_work_linear_idx // self.params.cluster_shape_mnk[0],
+            self.current_work_linear_idx % self.params.cluster_shape_mnk[0],
         )
+        current_work_s_batch, s_idx = divmod(
+            current_work_cluster_batch, self.params.problem_shape_s_fdd
+        )
+        _, b_idx = divmod(current_work_s_batch, self.params.problem_shape_b_fdd)
 
-        if self.params.is_persistent:
-            current_work_cluster_batch, cluster_idx = (
-                self.current_work_linear_idx // self.params.cluster_shape_mnk[0],
-                self.current_work_linear_idx % self.params.cluster_shape_mnk[0],
-            )
-            current_work_s_batch, s_idx = divmod(
-                current_work_cluster_batch, self.params.problem_shape_s_fdd
-            )
-            current_work_b_batch, b_idx = divmod(
-                current_work_s_batch, self.params.problem_shape_b_fdd
-            )
-            _, split_kv_idx = divmod(current_work_b_batch, self.params.split_kv_fdd)
-
-            blk_coord = (cluster_idx, s_idx, b_idx, split_kv_idx)
-        else:
-            b_idx, s_idx = divmod(self.blk_coord[1], self.params.problem_shape_s_fdd)
-            blk_coord = (self.blk_coord[0], s_idx, b_idx, self.blk_coord[2])
-
-        return WorkTileInfo(blk_coord, is_valid)
+        # Keep a zero split coordinate for the kernel's existing tensor slicing.
+        return WorkTileInfo((cluster_idx, s_idx, b_idx, 0), is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
 
     def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
-        if self.params.is_persistent:
-            self.current_work_linear_idx += advance_count * self.num_persistent_sm
-        else:
-            self.is_valid = False
+        self.current_work_linear_idx += advance_count * self.num_persistent_sm
 
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.params)
@@ -288,10 +209,8 @@ class HCAStaticTileScheduler:
         return values
 
     def __new_from_mlir_values__(self, values):
-        # Slice per component by its own value count so compile-time-constant
-        # scheduler params (e.g. a static split_kv) round-trip correctly; the
-        # original fixed values[0:6]/[6]/[7:10]/[10:] slicing assumed every
-        # params field was dynamic.
+        # Slice per component by its own value count so static and dynamic
+        # scheduler fields round-trip correctly.
         values = list(values)
         rebuilt = []
         for component in (self.params, self.current_work_linear_idx, self.blk_coord):
@@ -300,23 +219,17 @@ class HCAStaticTileScheduler:
             values = values[count:]
         new_params, new_current_work_linear_idx, new_blk_coord = rebuilt
         new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values)
-        return HCAStaticTileScheduler(
+        return DSparkPersistentTileScheduler(
             new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
         )
 
 
-def create_hca_static_tile_scheduler(
-    params: HCAStaticTileSchedulerParams,
+def create_dspark_persistent_tile_scheduler(
+    params: DSparkPersistentTileSchedulerParams,
     blk_coord: cute.Coord,
     grid_shape: cute.Shape,
-) -> HCAStaticTileScheduler:
-    return HCAStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
+) -> DSparkPersistentTileScheduler:
+    return DSparkPersistentTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
 
 
 LOG2_E = 1.4426950408889634074
-# avoid register indexing on array.
-MAX_SPLITS = 256
-
-
-def ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b

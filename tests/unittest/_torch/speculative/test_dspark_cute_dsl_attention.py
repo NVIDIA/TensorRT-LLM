@@ -194,8 +194,8 @@ def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
     )
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         cute_dsl_dspark_rmsnorm_rope,
-        cute_dsl_dspark_rmsnorm_rope_block_page,
         cute_dsl_dspark_rmsnorm_rope_cache_write,
+        cute_dsl_dspark_rmsnorm_rope_draft_block,
     )
 
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, blk_freqs, inverse_rope_freqs = (
@@ -221,10 +221,10 @@ def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
         slots_i32, cache_seqs = cute_dsl_dspark_rmsnorm_rope_cache_write(
             main_x, weight, main_freqs, kv_cache, slots, start_pos, 1e-6
         )
-        block_page = cute_dsl_dspark_rmsnorm_rope_block_page(block_x, weight, block_freqs, 1e-6)
+        draft_block = cute_dsl_dspark_rmsnorm_rope_draft_block(block_x, weight, block_freqs, 1e-6)
         captured = cute_dsl_dspark_attention_prepared(
             q,
-            block_page,
+            draft_block,
             kv_cache,
             slots_i32,
             cache_seqs,
@@ -258,9 +258,9 @@ def test_cute_dsl_dspark_attention_prepared_cuda_graph_replay():
 
     torch.testing.assert_close(captured, expected, rtol=5e-2, atol=3e-2)
     torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
-    torch.testing.assert_close(block_page[:, :block], expected_block, rtol=0, atol=0)
+    torch.testing.assert_close(draft_block[:, :block], expected_block, rtol=0, atol=0)
     torch.testing.assert_close(
-        block_page[:, block:], torch.zeros_like(block_page[:, block:]), rtol=0, atol=0
+        draft_block[:, block:], torch.zeros_like(draft_block[:, block:]), rtol=0, atol=0
     )
 
 
@@ -351,12 +351,12 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
     calls = {
         "attention_prepared": 0,
         "cache_write": 0,
-        "block_page": 0,
+        "draft_block": 0,
         "rmsnorm_rope": 0,
     }
     op_attention = dspark_attention.cute_dsl_dspark_attention_prepared
     op_cache_write = dspark_attention.cute_dsl_dspark_rmsnorm_rope_cache_write
-    op_block_page = dspark_attention.cute_dsl_dspark_rmsnorm_rope_block_page
+    op_draft_block = dspark_attention.cute_dsl_dspark_rmsnorm_rope_draft_block
     op_rmsnorm_rope = dspark_attention.cute_dsl_dspark_rmsnorm_rope
 
     def counted_attention(*args):
@@ -367,9 +367,9 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
         calls["cache_write"] += 1
         return op_cache_write(*args)
 
-    def counted_block_page(*args):
-        calls["block_page"] += 1
-        return op_block_page(*args)
+    def counted_draft_block(*args):
+        calls["draft_block"] += 1
+        return op_draft_block(*args)
 
     def counted_rmsnorm_rope(*args):
         calls["rmsnorm_rope"] += 1
@@ -384,8 +384,8 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
         )
         patch.setattr(
             dspark_attention,
-            "cute_dsl_dspark_rmsnorm_rope_block_page",
-            counted_block_page,
+            "cute_dsl_dspark_rmsnorm_rope_draft_block",
+            counted_draft_block,
         )
         patch.setattr(dspark_attention, "cute_dsl_dspark_rmsnorm_rope", counted_rmsnorm_rope)
         actual = dspark_attention.dspark_attention_forward_batched(
@@ -397,7 +397,7 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist)
     assert calls == {
         "attention_prepared": 1,
         "cache_write": 1,
-        "block_page": 1,
+        "draft_block": 1,
         "rmsnorm_rope": 2,
     }
 
@@ -521,14 +521,14 @@ def test_preparation_precompile_covers_dynamic_batches_without_runtime_jit():
         precompile_dspark_attention,
     )
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
-        _compile_dspark_rmsnorm_rope_block_page,
         _compile_dspark_rmsnorm_rope_cache_write,
-        cute_dsl_dspark_rmsnorm_rope_block_page,
+        _compile_dspark_rmsnorm_rope_draft_block,
         cute_dsl_dspark_rmsnorm_rope_cache_write,
+        cute_dsl_dspark_rmsnorm_rope_draft_block,
     )
 
     _compile_dspark_rmsnorm_rope_cache_write.cache_clear()
-    _compile_dspark_rmsnorm_rope_block_page.cache_clear()
+    _compile_dspark_rmsnorm_rope_draft_block.cache_clear()
     q, main_kv, block_kv, kv_cache, slots, start_pos, _, _, _ = _make_inputs(
         23, start_pos_values=[300, 4, 250], cache_pages=40
     )
@@ -550,11 +550,11 @@ def test_preparation_precompile_covers_dynamic_batches_without_runtime_jit():
             1e-6,
         )
     with pytest.raises(RuntimeError, match="not precompiled"):
-        cute_dsl_dspark_rmsnorm_rope_block_page(block_kv, weight, block_freqs, 1e-6)
+        cute_dsl_dspark_rmsnorm_rope_draft_block(block_kv, weight, block_freqs, 1e-6)
     torch.testing.assert_close(kv_cache, cache_before, rtol=0, atol=0)
 
     _compile_dspark_rmsnorm_rope_cache_write.cache_clear()
-    _compile_dspark_rmsnorm_rope_block_page.cache_clear()
+    _compile_dspark_rmsnorm_rope_draft_block.cache_clear()
     precompile_dspark_attention(q.shape[1], q.shape[2], kv_cache, q.shape[-1] ** -0.5)
 
     for batch in (1, 3, 8, 32):
@@ -573,11 +573,11 @@ def test_preparation_precompile_covers_dynamic_batches_without_runtime_jit():
             pos_b.long(),
             1e-6,
         )
-        block_page = cute_dsl_dspark_rmsnorm_rope_block_page(block_b, weight, block_freqs_b, 1e-6)
+        draft_block = cute_dsl_dspark_rmsnorm_rope_draft_block(block_b, weight, block_freqs_b, 1e-6)
         torch.testing.assert_close(slots_i32, slots_b, rtol=0, atol=0)
         torch.testing.assert_close(cache_seqs, pos_b, rtol=0, atol=0)
-        assert block_page.shape == (batch, 8, 512)
-        assert torch.count_nonzero(block_page[:, q_b.shape[1] :]) == 0
+        assert draft_block.shape == (batch, 8, 512)
+        assert torch.count_nonzero(draft_block[:, q_b.shape[1] :]) == 0
 
     assert _compile_dspark_rmsnorm_rope_cache_write.cache_info().misses == 1
-    assert _compile_dspark_rmsnorm_rope_block_page.cache_info().misses == 1
+    assert _compile_dspark_rmsnorm_rope_draft_block.cache_info().misses == 1

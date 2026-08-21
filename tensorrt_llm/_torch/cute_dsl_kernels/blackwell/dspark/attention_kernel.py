@@ -52,11 +52,10 @@ except ImportError:
 
 from .scheduler_helpers import (
     LOG2_E,
-    HCAStaticTileScheduler,
-    HCAStaticTileSchedulerParams,
-    ceil_div,
-    create_hca_static_tile_scheduler,
-    create_hca_static_tile_scheduler_params,
+    DSparkPersistentTileScheduler,
+    DSparkPersistentTileSchedulerParams,
+    create_dspark_persistent_tile_scheduler,
+    create_dspark_persistent_tile_scheduler_params,
 )
 
 """DSpark rolling-window MQA attention for NVIDIA Blackwell-family GPUs.
@@ -65,7 +64,7 @@ A TMA + tcgen05 tensor-core warp-specialized persistent kernel that fuses the
 Q*K^T matmul, attention-sink online softmax, P*V matmul, and the inverse-RoPE
 epilogue into a single launch. KV arrives as two paged streams (the 128-row
 rolling window and the draft block's own rows); see
-``page8_specialization.py`` for the supported DSpark contract and
+``attention.py`` for the supported DSpark contract and
 ``tests/unittest/_torch/speculative/test_dspark_cute_dsl_attention.py`` for
 validation coverage.
 
@@ -86,47 +85,15 @@ class DSparkAttentionKernel:
         mma_qk_tiler_mn: Tuple[int, int],
         mma_pv_tiler_mn: Tuple[int, int],
         max_active_clusters: int,
-        page_size_cmp: int,
+        page_size_draft: int,
         page_size_win: int,
         skip_correction_threshold: float,
-        is_persistent: bool,
-        is_var_seq: bool,
-        is_var_split_kv: bool,
         *,
         arch_str: str,
         seq_len_q: int = 1,
         mma_qk_tiler_k: int = 128,
     ):
-        """Initialize the DSpark attention kernel configuration.
-
-        :param acc_dtype: Data type for accumulation S and O
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param mma_s_tiler: The (H, K) tile shape of the MMA instruction for S
-        :type mma_s_tiler: Tuple[int, int]
-        :param mma_p_tiler: The (H, D) tile shape of the MMA instruction for P
-        :type mma_p_tiler: Tuple[int, int]
-        :param max_active_clusters: Maximum number of active clusters
-        :type max_active_clusters: int
-        :param page_size_cmp: Page size of the compressed-KV page table
-        :type page_size_cmp: int
-        :param page_size_win: Page size of the sliding-window page table
-            (must be a power-of-two multiple of page_size_cmp)
-        :type page_size_win: int
-        :param skip_correction_threshold: Threshold to skip correction
-        :type skip_correction_threshold: float
-        :param is_persistent: Whether to use persistent kernel mode
-        :type is_persistent: bool
-        :param is_var_seq: Whether to use variable sequence length
-        :type is_var_seq: bool
-        :param is_var_split_kv: Whether to use variable split KV
-        :type is_var_split_kv: bool
-        :param arch_str: CuTe allocator architecture for the target GPU
-        :type arch_str: str
-        :param seq_len_q: Query sequence length used to specialize tiling
-        :type seq_len_q: int
-        :param mma_qk_tiler_k: QK MMA reduction tile; must be 128.
-        :type mma_qk_tiler_k: int
-        """
+        """Initialize the fixed DSpark attention geometry and pipeline stages."""
 
         if mma_qk_tiler_k != 128:
             raise ValueError(f"mma_qk_tiler_k must be 128, got {mma_qk_tiler_k}")
@@ -139,7 +106,7 @@ class DSparkAttentionKernel:
                 f"DSpark needs {self.tmem_alloc_cols} TMEM columns, but "
                 f"{self.arch_name} provides {max_tmem_alloc_cols}"
             )
-        # latent_dim is the FULL per-head depth for HCA (head_dim).
+        # latent_dim is the FULL per-head depth for DSpark attention (head_dim).
         # The last `qk_rope_head_dim` of these are assumed to be already
         # RoPE-rotated by the caller; the kernel does not see rope as a
         # separate path.
@@ -149,28 +116,24 @@ class DSparkAttentionKernel:
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
         self.skip_correction_threshold = skip_correction_threshold
-        self.is_persistent = is_persistent
-        self.page_size_cmp = page_size_cmp
+        self.page_size_draft = page_size_draft
         self.page_size_win = page_size_win
         # Physical page sizes define the page-table/cache ABI. TMA page spans
         # normally match them, but a specialization may use a wider logical
         # span so one OOB-zero-filling TMA replaces many tiny page copies.
-        self.tma_page_size_cmp = page_size_cmp
+        self.tma_page_size_draft = page_size_draft
         self.tma_page_size_win = page_size_win
         self.fixed_cache_seq_len = None
-        self.implicit_cmp_page_table = False
-        self.attn_sink_is_scaled = False
+        self.attn_sink_is_scaled = True
         # Fixed two-stream specializations can receive the initialized-row
         # count separately from the absolute decode position, masking unwritten
-        # rows in the first window tile while keeping the compressed tile fixed.
-        self.window_valid_len_from_tensor = False
+        # rows in the first window tile while keeping the draft-block tile fixed.
+        self.window_valid_len_from_tensor = True
         # Fixed-shape specializations may fuse the inverse-RoPE epilogue: the
         # last ``inverse_rope_dim`` output lanes are de-rotated in registers
         # right before the store, preserving the former kernel boundary's BF16
-        # rounding. 0 keeps the generic HCA output path unchanged.
+        # rounding. 0 keeps the generic DSpark attention output path unchanged.
         self.inverse_rope_dim = 0
-        self.is_var_seq = is_var_seq
-        self.is_var_split_kv = is_var_split_kv
         self.seq_len_q = seq_len_q
         self.mma_qk_tiler_k = mma_qk_tiler_k
         self.cluster_shape_mnk = (2, 1, 1)
@@ -234,10 +197,10 @@ class DSparkAttentionKernel:
         )
 
     def _setup_attributes(self):
-        """Set up configurations and parameters for the HCA kernel operation.
+        """Set up configurations and parameters for the DSpark attention kernel operation.
 
         This method initializes and configures various attributes required for the
-        execution of the heavily compressed attention kernel, mainly about the pipeline stages:
+        execution of the DSpark attention kernel, mainly about the pipeline stages:
 
         - Sets up staging parameters for Q, K, V inputs and accumulator data
         - Configures pipeline stages for softmax, correction, and epilogue operations
@@ -263,9 +226,8 @@ class DSparkAttentionKernel:
         self,
         q_latent: cute.Tensor,
         c_latent_win: cute.Tensor,
-        c_latent_cmp: cute.Tensor,
+        c_latent_draft: cute.Tensor,
         page_table_win: cute.Tensor,
-        page_table_cmp: cute.Tensor,
         o: cute.Tensor,
         cache_seqs: Optional[cute.Tensor],
         window_valid_lens: Optional[cute.Tensor],
@@ -275,62 +237,19 @@ class DSparkAttentionKernel:
         inverse_rope_freqs: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
-        """Execute the Heavily Compressed Attention (HCA) operation on the provided tensors.
+        """Build and launch DSpark attention for the supplied runtime tensors.
 
         KV is split into two streams concatenated along the seq_len_k dimension:
           - Sliding-window: first `mma_qk_tiler[1]` rows (default 128).
-          - Compressed:     remaining rows.
-        Each stream has its own page table and page size; the kernel feeds them
-        into a single MMA stream (k_tile_idx == 0 is window, idx >= 1 is
-        compressed with offset of one tile).
-
-        :param q_latent: The query tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
-            (last `qk_rope_head_dim` lanes pre-rotated by caller).
-        :type q_latent: cute.Tensor
-        :param c_latent_win: Sliding-window key tensor with shape
-            [mma_qk_tiler[1], latent_dim, batch_size] (last `qk_rope_head_dim`
-            lanes pre-rotated by caller).
-        :type c_latent_win: cute.Tensor
-        :param c_latent_cmp: Compressed key tensor with shape
-            [seq_len_k_cmp, latent_dim, batch_size] (last `qk_rope_head_dim`
-            lanes pre-rotated by caller).
-        :type c_latent_cmp: cute.Tensor
-        :param page_table_win: Page table for the sliding-window stream
-            with shape [page_count_win, batch_size]
-        :type page_table_win: cute.Tensor
-        :param page_table_cmp: Page table for the compressed stream
-            with shape [page_count_cmp, batch_size]
-        :type page_table_cmp: cute.Tensor
-        :param o: The output tensor with shape [num_head, latent_dim, seq_len_q, batch_size]
-        :type o: cute.Tensor
-        :param cache_seqs: The absolute decode positions with shape [batch_size]
-        :type cache_seqs: cute.Tensor
-        :param window_valid_lens: The initialized rolling-window row counts with
-            shape [batch_size].
-        :type window_valid_lens: cute.Tensor
-        :param softmax_scale: The scale factor for softmax
-        :type softmax_scale: cutlass.Float32
-        :param output_scale: The scale factor for the output
-        :type output_scale: cutlass.Float32
-        :param attn_sink_unscaled: Per-head attention-sink logit divided
-            by `softmax_scale` (i.e., expressed in the "unscaled S" space the
-            kernel uses). Shape [num_heads]. Acts as a virtual extra softmax
-            logit with V=0; per-row row_max is initialised from this tensor.
-        :type attn_sink_unscaled: cute.Tensor
-        :param inverse_rope_freqs: Flat FP32 ``[batch * seq_len_q *
-            inverse_rope_dim]`` cos/sin pairs for the fused inverse-RoPE
-            epilogue (``None`` when ``inverse_rope_dim == 0``).
-        :type inverse_rope_freqs: Optional[cute.Tensor]
-        :param stream: The CUDA stream to execute the kernel on
-        :type stream: cuda.CUstream
-
-        :raises TypeError: If tensor data types don't match or aren't supported
+          - Draft-block:     remaining rows.
+        The rolling-window stream uses a runtime page-table slot. The draft
+        block is stored contiguously, one physical block per request.
         """
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_latent.element_type
-        self.k_dtype = c_latent_cmp.element_type
-        self.v_dtype = c_latent_cmp.element_type
+        self.k_dtype = c_latent_draft.element_type
+        self.v_dtype = c_latent_draft.element_type
         self.o_dtype = o.element_type
 
         # check type consistency
@@ -339,29 +258,20 @@ class DSparkAttentionKernel:
             or self.q_dtype != self.v_dtype
             or c_latent_win.element_type != self.k_dtype
         ):
-            raise TypeError("Type mismatch among q/c_win/c_cmp")
+            raise TypeError("Type mismatch among q/c_win/c_draft")
         # check leading dimensions of input/output
         if cutlass.const_expr(q_latent.stride[1] != 1):
             raise ValueError("q_latent must have leading dimension 1")
-        if cutlass.const_expr(c_latent_cmp.stride[1] != 1):
-            raise ValueError("c_latent_cmp must have leading dimension 1")
+        if cutlass.const_expr(c_latent_draft.stride[1] != 1):
+            raise ValueError("c_latent_draft must have leading dimension 1")
         if cutlass.const_expr(c_latent_win.stride[1] != 1):
             raise ValueError("c_latent_win must have leading dimension 1")
         if cutlass.const_expr(o.stride[1] != 1):
             raise ValueError("o must have leading dimension 1")
 
-        # DSpark always runs a single split with the final-output epilogue; the
-        # intermediate-accumulator, LSE, and reduction machinery of the
-        # original HCA kernel are compiled out.
-        lse = None
-        acc_o = None
-        acc_lse = None
-        split_kv = 1
-        block_split_kvs = None
-
-        c_latent_cmp_transpose_layout = cute.select(c_latent_cmp.layout, mode=[1, 0, 2])
-        c_latent_cmp_transpose = cute.make_tensor(
-            c_latent_cmp.iterator, c_latent_cmp_transpose_layout
+        c_latent_draft_transpose_layout = cute.select(c_latent_draft.layout, mode=[1, 0, 2])
+        c_latent_draft_transpose = cute.make_tensor(
+            c_latent_draft.iterator, c_latent_draft_transpose_layout
         )
         c_latent_win_transpose_layout = cute.select(c_latent_win.layout, mode=[1, 0, 2])
         c_latent_win_transpose = cute.make_tensor(
@@ -420,7 +330,7 @@ class DSparkAttentionKernel:
             self.load_kv_stage,
         )
         cta_kv_m = qk_tiled_mma.op.shape_mnk[0] // qk_tiled_mma.thr_id.shape
-        kc_page_tile_size_cmp = min(self.tma_page_size_cmp, cta_kv_m)
+        kc_page_tile_size_draft = min(self.tma_page_size_draft, cta_kv_m)
         kc_page_tile_size_win = min(self.tma_page_size_win, cta_kv_m)
 
         kc_smem_layout_for_tma_base = sm100_utils.make_smem_layout(
@@ -429,8 +339,8 @@ class DSparkAttentionKernel:
             self.k_dtype,
             self.load_kv_stage,
         )
-        kc_smem_layout_for_tma_cmp = cute.tiled_divide(
-            kc_smem_layout_for_tma_base, (kc_page_tile_size_cmp, self.mma_qk_tiler[2])
+        kc_smem_layout_for_tma_draft = cute.tiled_divide(
+            kc_smem_layout_for_tma_base, (kc_page_tile_size_draft, self.mma_qk_tiler[2])
         )
         kc_smem_layout_for_tma_win = cute.tiled_divide(
             kc_smem_layout_for_tma_base, (kc_page_tile_size_win, self.mma_qk_tiler[2])
@@ -452,7 +362,7 @@ class DSparkAttentionKernel:
             self.v_dtype,
             self.load_kv_stage,
         )
-        vc_page_tile_size_cmp = min(self.tma_page_size_cmp, self.mma_pv_tiler[2])
+        vc_page_tile_size_draft = min(self.tma_page_size_draft, self.mma_pv_tiler[2])
         vc_page_tile_size_win = min(self.tma_page_size_win, self.mma_pv_tiler[2])
         vc_smem_layout_for_tma_base = sm100_utils.make_smem_layout(
             OperandMajorMode.MN,
@@ -461,9 +371,9 @@ class DSparkAttentionKernel:
             self.load_kv_stage,
         )
         vc_pv_n = pv_tiled_mma.op.shape_mnk[1] // pv_tiled_mma.thr_id.shape
-        vc_smem_layout_for_tma_cmp = cute.tiled_divide(
+        vc_smem_layout_for_tma_draft = cute.tiled_divide(
             vc_smem_layout_for_tma_base,
-            (vc_pv_n, vc_page_tile_size_cmp),
+            (vc_pv_n, vc_page_tile_size_draft),
         )
         vc_smem_layout_for_tma_win = cute.tiled_divide(
             vc_smem_layout_for_tma_base,
@@ -481,16 +391,16 @@ class DSparkAttentionKernel:
             qk_tiled_mma,
             cta_layout_vmnk.shape,
         )
-        # TMA load for c latent (cmp + win)
-        kc_smem_layout_cmp = cute.select(kc_smem_layout_for_tma_cmp, mode=[0])
-        tma_atom_c_latent_cmp, tma_tensor_c_latent_cmp = self.make_paged_tiled_tma_atom(
+        # TMA load for window and draft-block K
+        kc_smem_layout_draft = cute.select(kc_smem_layout_for_tma_draft, mode=[0])
+        tma_atom_c_latent_draft, tma_tensor_c_latent_draft = self.make_paged_tiled_tma_atom(
             tma_load_op,
-            c_latent_cmp,
-            kc_smem_layout_cmp,
+            c_latent_draft,
+            kc_smem_layout_draft,
             (self.mma_qk_tiler[1], self.mma_qk_tiler[2]),
             qk_tiled_mma,
             is_k_load=True,
-            page_size=self.tma_page_size_cmp,
+            page_size=self.tma_page_size_draft,
         )
         kc_smem_layout_win = cute.select(kc_smem_layout_for_tma_win, mode=[0])
         tma_atom_c_latent_win, tma_tensor_c_latent_win = self.make_paged_tiled_tma_atom(
@@ -502,17 +412,17 @@ class DSparkAttentionKernel:
             is_k_load=True,
             page_size=self.tma_page_size_win,
         )
-        # TMA load for c latent transpose (cmp + win)
-        vc_smem_layout_cmp = cute.select(vc_smem_layout_for_tma_cmp, mode=[0])
-        tma_atom_c_latent_transpose_cmp, tma_tensor_c_latent_transpose_cmp = (
+        # TMA load for window and draft-block V
+        vc_smem_layout_draft = cute.select(vc_smem_layout_for_tma_draft, mode=[0])
+        tma_atom_c_latent_transpose_draft, tma_tensor_c_latent_transpose_draft = (
             self.make_paged_tiled_tma_atom(
                 tma_load_op,
-                c_latent_cmp_transpose,
-                vc_smem_layout_cmp,
+                c_latent_draft_transpose,
+                vc_smem_layout_draft,
                 (self.mma_pv_tiler[1], self.mma_pv_tiler[2]),
                 pv_tiled_mma,
                 is_k_load=False,
-                page_size=self.tma_page_size_cmp,
+                page_size=self.tma_page_size_draft,
             )
         )
         vc_smem_layout_win = cute.select(vc_smem_layout_for_tma_win, mode=[0])
@@ -546,15 +456,11 @@ class DSparkAttentionKernel:
         self.tma_copy_kc_bytes = kc_copy_size
 
         tile_sched_params, grid = self._compute_grid(
-            o,
-            split_kv,
-            self.cluster_shape_mnk,
-            self.max_active_clusters,
-            self.is_persistent,
+            o, self.cluster_shape_mnk, self.max_active_clusters
         )
 
         @cute.struct
-        class SplitKVKernelSharedStorage:
+        class AttentionKernelSharedStorage:
             # Pipeline barriers
             load_q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_q_stage * 2]
             load_kv_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_kv_stage * 2]
@@ -587,42 +493,34 @@ class DSparkAttentionKernel:
                 cute.struct.MemRange[self.q_dtype, cute.cosize(p_smem_layout_staged)],
                 1024,
             ]
-            smem_page_table: cute.struct.MemRange[
-                cutlass.Int32, self.load_pt_stage * self.mma_qk_tiler[1] // 2
-            ]
+            smem_page_table: cute.struct.MemRange[cutlass.Int32, self.load_pt_stage]
 
-        required_smem_bytes = SplitKVKernelSharedStorage.__sizeof__()
+        required_smem_bytes = AttentionKernelSharedStorage.__sizeof__()
         available_smem_bytes = cutlass_memory.get_smem_capacity_in_bytes(self.arch_str)
         if cutlass.const_expr(required_smem_bytes > available_smem_bytes):
             raise ValueError(
-                f"HCA SharedStorage needs {required_smem_bytes} bytes, but "
+                f"DSpark attention SharedStorage needs {required_smem_bytes} bytes, but "
                 f"{self.arch_name} provides {available_smem_bytes} bytes"
             )
 
         softmax_scale_log2 = softmax_scale * LOG2_E
-        self.split_kv_kernel(
+        self.kernel(
             qk_tiled_mma,
             pv_tiled_mma,
             tma_atom_q_latent,
             tma_tensor_q_latent,
             tma_atom_c_latent_win,
             tma_tensor_c_latent_win,
-            tma_atom_c_latent_cmp,
-            tma_tensor_c_latent_cmp,
+            tma_atom_c_latent_draft,
+            tma_tensor_c_latent_draft,
             tma_atom_c_latent_transpose_win,
             tma_tensor_c_latent_transpose_win,
-            tma_atom_c_latent_transpose_cmp,
-            tma_tensor_c_latent_transpose_cmp,
+            tma_atom_c_latent_transpose_draft,
+            tma_tensor_c_latent_transpose_draft,
             page_table_win,
-            page_table_cmp,
             o,
-            lse,
-            acc_o,
-            acc_lse,
-            split_kv,
             cache_seqs,
             window_valid_lens,
-            block_split_kvs,
             softmax_scale_log2,
             output_scale,
             attn_sink_unscaled,
@@ -632,12 +530,12 @@ class DSparkAttentionKernel:
             p_smem_layout_staged,
             vc_smem_layout_staged,
             kc_smem_layout_for_tma_win,
-            kc_smem_layout_for_tma_cmp,
+            kc_smem_layout_for_tma_draft,
             vc_smem_layout_for_tma_win,
-            vc_smem_layout_for_tma_cmp,
+            vc_smem_layout_for_tma_draft,
             cta_layout_vmnk,
             tile_sched_params,
-            SplitKVKernelSharedStorage,
+            AttentionKernelSharedStorage,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -680,7 +578,7 @@ class DSparkAttentionKernel:
         return cute.CopyAtom(tma_load_op, cpasync.CopyBulkTensorTileG2SNonExecTrait(res[0])), res[1]
 
     @cute.kernel
-    def split_kv_kernel(
+    def kernel(
         self,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
@@ -688,22 +586,16 @@ class DSparkAttentionKernel:
         mQL: cute.Tensor,
         tma_atom_c_latent_win: Optional[cute.CopyAtom],
         mCL_win: cute.Tensor,
-        tma_atom_c_latent_cmp: Optional[cute.CopyAtom],
-        mCL_cmp: cute.Tensor,
+        tma_atom_c_latent_draft: Optional[cute.CopyAtom],
+        mCL_draft: cute.Tensor,
         tma_atom_c_latent_transpose_win: Optional[cute.CopyAtom],
         mCLT_win: cute.Tensor,
-        tma_atom_c_latent_transpose_cmp: Optional[cute.CopyAtom],
-        mCLT_cmp: cute.Tensor,
+        tma_atom_c_latent_transpose_draft: Optional[cute.CopyAtom],
+        mCLT_draft: cute.Tensor,
         mPT_win: cute.Tensor,
-        mPT_cmp: cute.Tensor,
         mO: Optional[cute.Tensor],
-        mLSE: Optional[cute.Tensor],
-        mAccO: Optional[cute.Tensor],
-        mAccLSE: Optional[cute.Tensor],
-        split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         window_valid_lens: cute.Tensor,
-        block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         attn_sink_unscaled: cute.Tensor,
@@ -713,103 +605,19 @@ class DSparkAttentionKernel:
         p_smem_layout_staged: cute.ComposedLayout,
         vc_smem_layout_staged: cute.ComposedLayout,
         kc_smem_layout_for_tma_win: cute.ComposedLayout,
-        kc_smem_layout_for_tma_cmp: cute.ComposedLayout,
+        kc_smem_layout_for_tma_draft: cute.ComposedLayout,
         vc_smem_layout_for_tma_win: cute.ComposedLayout,
-        vc_smem_layout_for_tma_cmp: cute.ComposedLayout,
+        vc_smem_layout_for_tma_draft: cute.ComposedLayout,
         cta_layout_vmnk: cute.Layout,
-        tile_sched_params: HCAStaticTileSchedulerParams,
+        tile_sched_params: DSparkPersistentTileSchedulerParams,
         SharedStorage: cutlass.Constexpr,
     ):
-        """The device split_kv kernel implementation of the Heavily Compressed Attention (HCA).
+        """Run the persistent, warp-specialized DSpark device pipeline.
 
-        This kernel coordinates multiple specialized warps to perform different phases of the HCA computation:
-        1. Load warp: Loads Q/C latent data from global memory to shared memory using TMA
-        2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
-        3. Compute warps: Compute softmax and do rescaling on accumulators, and store the intermediate/final results
-        to global memory
-
-        The kernel produces either intermediate or final results of the HCA computation based on the split_kv parameter.
-        When split_kv is 1, the kernel generates the final results directly. Otherwise, it produces intermediate results
-        that will later be combined by a reduction kernel.
-
-        The kernel implements a complex pipeline with overlapping computation and memory operations,
-        using tensor memory access (TMA) for efficient data loading, warp specialization for different
-        computation phases.
-
-        :param tiled_mma_qk: Tiled MMA for Q*K^T
-        :type tiled_mma_qk: cute.TiledMma
-        :param tiled_mma_pv: Tiled MMA for P*V
-        :type tiled_mma_pv: cute.TiledMma
-        :param tma_atom_q_latent: TMA copy atom for query latent tensor
-        :type tma_atom_q_latent: cute.CopyAtom
-        :param mQL: query latent tensor
-        :type mQL: cute.Tensor
-        :param tma_atom_c_latent_win: TMA copy atom for window-stream K
-        :type tma_atom_c_latent_win: cute.CopyAtom
-        :param mCL_win: Window-stream key tensor
-        :type mCL_win: cute.Tensor
-        :param tma_atom_c_latent_cmp: TMA copy atom for compressed-stream K
-        :type tma_atom_c_latent_cmp: cute.CopyAtom
-        :param mCL_cmp: Compressed-stream key tensor
-        :type mCL_cmp: cute.Tensor
-        :param mCLT_win: Window-stream V transpose tensor
-        :type mCLT_win: cute.Tensor
-        :param mCLT_cmp: Compressed-stream V transpose tensor
-        :type mCLT_cmp: cute.Tensor
-        :param mPT_win: Window-stream page table tensor
-        :type mPT_win: cute.Tensor
-        :param mPT_cmp: Compressed-stream page table tensor
-        :type mPT_cmp: cute.Tensor
-        :param mO: Output tensor
-        :type mO: cute.Tensor
-        :param mLSE: Log-sum-exp tensor
-        :type mLSE: cute.Tensor
-        :param mAccO: Intermediate accumulator output tensor
-        :type mAccO: cute.Tensor
-        :param mAccLSE: Intermediate accumulator log-sum-exp tensor
-        :type mAccLSE: cute.Tensor
-        :param split_kv: The split_kv parameter
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: The absolute decode positions tensor
-        :type cache_seqs: cute.Tensor
-        :param window_valid_lens: The initialized rolling-window row counts
-        :type window_valid_lens: cute.Tensor
-        :param block_split_kvs: The per-block split_kv values tensor
-        :type block_split_kvs: cute.Tensor
-        :param softmax_scale_log2: The log2 scale factor for softmax
-        :type softmax_scale_log2: cutlass.Float32
-        :param output_scale: The scale factor for the output
-        :type output_scale: cutlass.Float32
-        :param attn_sink_unscaled: Per-head attention-sink logit
-            (unscaled-S space). Shape [num_heads]. Each thread looks up the
-            sink for its M-row only on the first split block.
-        :type attn_sink_unscaled: cute.Tensor
-        :param q_latent_smem_layout_staged: Shared memory layout for query latent tensor
-        :type q_latent_smem_layout_staged: cute.ComposedLayout
-        :param kc_smem_layout_staged: Shared memory layout for key/value latent tensor
-        :type kc_smem_layout_staged: cute.ComposedLayout
-        :param p_smem_layout_staged: Shared memory layout for probability matrix
-        :type p_smem_layout_staged: cute.ComposedLayout
-        :param vc_smem_layout_staged: Shared memory layout for value tensor
-        :type vc_smem_layout_staged: cute.ComposedLayout
-        :param kc_smem_layout_for_tma_win: Shared memory layout for window K
-            tensor for TMA
-        :type kc_smem_layout_for_tma_win: cute.ComposedLayout
-        :param kc_smem_layout_for_tma_cmp: Shared memory layout for compressed
-            K tensor for TMA
-        :type kc_smem_layout_for_tma_cmp: cute.ComposedLayout
-        :param vc_smem_layout_for_tma_win: Shared memory layout for window V
-            tensor for TMA
-        :type vc_smem_layout_for_tma_win: cute.ComposedLayout
-        :param vc_smem_layout_for_tma_cmp: Shared memory layout for compressed
-            V tensor for TMA
-        :type vc_smem_layout_for_tma_cmp: cute.ComposedLayout
-        :param cta_layout_vmnk: Layout for compute threads
-        :type cta_layout_vmnk: cute.Layout
-        :param tile_sched_params: Scheduling parameters for work distribution
-        :type tile_sched_params: HCAStaticTileSchedulerParams
-        :param SharedStorage: Shared storage for the kernel
-        :type SharedStorage: cutlass.Constexpr
+        One warp stages page indices, one warp issues TMA, one warp drives
+        tcgen05 MMA, and the compute/correction warps run online softmax and the
+        output epilogue. The explicit pipeline objects below define their
+        resource hand-offs.
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -823,9 +631,9 @@ class DSparkAttentionKernel:
         if warp_idx == self.mma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_q_latent)
             cpasync.prefetch_descriptor(tma_atom_c_latent_win)
-            cpasync.prefetch_descriptor(tma_atom_c_latent_cmp)
+            cpasync.prefetch_descriptor(tma_atom_c_latent_draft)
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose_win)
-            cpasync.prefetch_descriptor(tma_atom_c_latent_transpose_cmp)
+            cpasync.prefetch_descriptor(tma_atom_c_latent_transpose_draft)
 
         # Alloc
         smem = cutlass_memory.SmemAllocator()
@@ -882,23 +690,21 @@ class DSparkAttentionKernel:
             kc_smem_layout_for_tma_win.outer,
             swizzle=kc_smem_layout_for_tma_win.inner,
         )
-        sKC_for_tma_cmp = storage.smem_kc.get_tensor(
-            kc_smem_layout_for_tma_cmp.outer,
-            swizzle=kc_smem_layout_for_tma_cmp.inner,
+        sKC_for_tma_draft = storage.smem_kc.get_tensor(
+            kc_smem_layout_for_tma_draft.outer,
+            swizzle=kc_smem_layout_for_tma_draft.inner,
         )
         # (MMA, MMA_D, MMA_K, PIPE)
         # reuse smem
         sVC_ptr = cute.recast_ptr(sKC.iterator, vc_smem_layout_staged.inner)
         sVC = cute.make_tensor(sVC_ptr, vc_smem_layout_staged.outer)
         sVC_for_tma_win = cute.make_tensor(sVC_ptr, vc_smem_layout_for_tma_win.outer)
-        sVC_for_tma_cmp = cute.make_tensor(sVC_ptr, vc_smem_layout_for_tma_cmp.outer)
+        sVC_for_tma_draft = cute.make_tensor(sVC_ptr, vc_smem_layout_for_tma_draft.outer)
         # (MMA, MMA_H, MMA_K)
         sP = storage.smem_p.get_tensor(
             p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
         )
-        sPT = storage.smem_page_table.get_tensor(
-            cute.make_layout((self.mma_qk_tiler[1] // 2, self.load_pt_stage))
-        )
+        sPT = storage.smem_page_table.get_tensor(cute.make_layout((1, self.load_pt_stage)))
         # (compute_threads,)
         softmax_smem_exchange = storage.softmax_smem_exchange.get_tensor(
             cute.make_layout(self.num_compute_warps * self.threads_per_warp)
@@ -923,33 +729,22 @@ class DSparkAttentionKernel:
             load_pt_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_pt_stage
             )
-            tile_sched = create_hca_static_tile_scheduler(
+            tile_sched = create_dspark_persistent_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv,
-                    cache_seqs,
-                    block_split_kvs,
-                    blk_coord,
+                load_pt_common_params = SimpleNamespace(
+                    blk_coord=blk_coord,
+                    load_pt_pipeline=load_pt_pipeline,
+                    mPT_win=mPT_win,
+                    sPT=sPT,
+                    tidx=tidx,
                 )
-                if k_tile_count > 0:
-                    load_pt_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        load_pt_pipeline=load_pt_pipeline,
-                        mPT_win=mPT_win,
-                        mPT_cmp=mPT_cmp,
-                        sPT=sPT,
-                        tidx=tidx,
-                    )
-                    load_pt_producer_state = self.load_page_table(
-                        load_pt_common_params,
-                        k_index,
-                        k_tile_count,
-                        load_pt_producer_state,
-                    )
+                load_pt_producer_state = self.load_page_table(
+                    load_pt_common_params, load_pt_producer_state
+                )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             load_pt_pipeline.producer_tail(load_pt_producer_state)
@@ -967,70 +762,57 @@ class DSparkAttentionKernel:
             load_pt_release_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.load_pt_stage
             )
-            tile_sched = create_hca_static_tile_scheduler(
+            tile_sched = create_dspark_persistent_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv,
-                    cache_seqs,
-                    block_split_kvs,
-                    blk_coord,
+                # Construct fixed common/tma_qk/tma_pv params for load_tma
+                tma_common_params = SimpleNamespace(
+                    blk_coord=blk_coord,
+                    load_q_pipeline=load_q_pipeline,
+                    load_kv_pipeline=load_kv_pipeline,
+                    sPT=sPT,
+                    load_pt_pipeline=load_pt_pipeline,
                 )
-                if k_tile_count > 0:
-                    # Construct fixed common/tma_qk/tma_pv params for load_tma
-                    tma_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        local_split_kv=local_split_kv,
-                        load_q_pipeline=load_q_pipeline,
-                        load_kv_pipeline=load_kv_pipeline,
-                        mPT_win=mPT_win,
-                        mPT_cmp=mPT_cmp,
-                        sPT=sPT,
-                        load_pt_pipeline=load_pt_pipeline,
-                    )
-                    tma_qk_params = SimpleNamespace(
-                        tiled_mma_qk=tiled_mma_qk,
-                        tma_atom_q_latent=tma_atom_q_latent,
-                        tma_atom_c_latent_win=tma_atom_c_latent_win,
-                        tma_atom_c_latent_cmp=tma_atom_c_latent_cmp,
-                        mQL=mQL,
-                        mCL_win=mCL_win,
-                        mCL_cmp=mCL_cmp,
-                        sQ=sQ,
-                        sKC_win=sKC_for_tma_win,
-                        sKC_cmp=sKC_for_tma_cmp,
-                    )
-                    tma_pv_params = SimpleNamespace(
-                        tiled_mma_pv=tiled_mma_pv,
-                        tma_atom_c_latent_transpose_win=tma_atom_c_latent_transpose_win,
-                        tma_atom_c_latent_transpose_cmp=tma_atom_c_latent_transpose_cmp,
-                        mCL_win=mCL_win,
-                        mCL_cmp=mCL_cmp,
-                        mCLT_win=mCLT_win,
-                        mCLT_cmp=mCLT_cmp,
-                        sVC_win=sVC_for_tma_win,
-                        sVC_cmp=sVC_for_tma_cmp,
-                    )
-                    # Load tma
-                    (
-                        load_q_producer_state,
-                        load_kv_producer_state,
-                        load_pt_consumer_state,
-                        load_pt_release_state,
-                    ) = self.load_tma(
-                        tma_common_params,
-                        tma_qk_params,
-                        tma_pv_params,
-                        k_index,
-                        k_tile_count,
-                        load_q_producer_state,
-                        load_kv_producer_state,
-                        load_pt_consumer_state,
-                        load_pt_release_state,
-                    )
+                tma_qk_params = SimpleNamespace(
+                    tiled_mma_qk=tiled_mma_qk,
+                    tma_atom_q_latent=tma_atom_q_latent,
+                    tma_atom_c_latent_win=tma_atom_c_latent_win,
+                    tma_atom_c_latent_draft=tma_atom_c_latent_draft,
+                    mQL=mQL,
+                    mCL_win=mCL_win,
+                    mCL_draft=mCL_draft,
+                    sQ=sQ,
+                    sKC_win=sKC_for_tma_win,
+                    sKC_draft=sKC_for_tma_draft,
+                )
+                tma_pv_params = SimpleNamespace(
+                    tiled_mma_pv=tiled_mma_pv,
+                    tma_atom_c_latent_transpose_win=tma_atom_c_latent_transpose_win,
+                    tma_atom_c_latent_transpose_draft=tma_atom_c_latent_transpose_draft,
+                    mCL_win=mCL_win,
+                    mCL_draft=mCL_draft,
+                    mCLT_win=mCLT_win,
+                    mCLT_draft=mCLT_draft,
+                    sVC_win=sVC_for_tma_win,
+                    sVC_draft=sVC_for_tma_draft,
+                )
+                (
+                    load_q_producer_state,
+                    load_kv_producer_state,
+                    load_pt_consumer_state,
+                    load_pt_release_state,
+                ) = self.load_tma(
+                    tma_common_params,
+                    tma_qk_params,
+                    tma_pv_params,
+                    load_q_producer_state,
+                    load_kv_producer_state,
+                    load_pt_consumer_state,
+                    load_pt_release_state,
+                )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -1062,57 +844,51 @@ class DSparkAttentionKernel:
             mma_o_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_o_stage
             )
-            tile_sched = create_hca_static_tile_scheduler(
+            tile_sched = create_dspark_persistent_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord
+                mma_common_params = SimpleNamespace(
+                    blk_coord=blk_coord,
+                    load_q_pipeline=load_q_pipeline,
+                    load_kv_pipeline=load_kv_pipeline,
+                    tmem_ptr=tmem_ptr,
+                    is_leader_cta=is_leader_cta,
+                    L=mCL_draft.shape[1],
                 )
-                if k_tile_count > 0:
-                    mma_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        local_split_kv=local_split_kv,
-                        load_q_pipeline=load_q_pipeline,
-                        load_kv_pipeline=load_kv_pipeline,
-                        tmem_ptr=tmem_ptr,
-                        is_leader_cta=is_leader_cta,
-                        L=mCL_cmp.shape[1],
-                    )
-                    mma_qk_params = SimpleNamespace(
-                        mma_s_pipeline=mma_s_pipeline,
-                        sQ=sQ,
-                        sKC=sKC,
-                    )
-                    mma_pv_params = SimpleNamespace(
-                        p_mma_pipeline=p_mma_pipeline,
-                        mma_o_pipeline=mma_o_pipeline,
-                        sP=sP,
-                        sVC=sVC,
-                    )
-                    (
-                        tiled_mma_qk,
-                        tiled_mma_pv,
-                        load_q_consumer_state,
-                        load_kv_consumer_state,
-                        mma_s_producer_state,
-                        p_mma_consumer_state,
-                        mma_o_producer_state,
-                    ) = self.mma(
-                        mma_common_params,
-                        mma_qk_params,
-                        mma_pv_params,
-                        k_tile_count,
-                        tiled_mma_qk,
-                        tiled_mma_pv,
-                        load_q_consumer_state,
-                        load_kv_consumer_state,
-                        mma_s_producer_state,
-                        p_mma_consumer_state,
-                        mma_o_producer_state,
-                    )
+                mma_qk_params = SimpleNamespace(
+                    mma_s_pipeline=mma_s_pipeline,
+                    sQ=sQ,
+                    sKC=sKC,
+                )
+                mma_pv_params = SimpleNamespace(
+                    p_mma_pipeline=p_mma_pipeline,
+                    mma_o_pipeline=mma_o_pipeline,
+                    sP=sP,
+                    sVC=sVC,
+                )
+                (
+                    tiled_mma_qk,
+                    tiled_mma_pv,
+                    load_q_consumer_state,
+                    load_kv_consumer_state,
+                    mma_s_producer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                ) = self.mma(
+                    mma_common_params,
+                    mma_qk_params,
+                    mma_pv_params,
+                    tiled_mma_qk,
+                    tiled_mma_pv,
+                    load_q_consumer_state,
+                    load_kv_consumer_state,
+                    mma_s_producer_state,
+                    p_mma_consumer_state,
+                    mma_o_producer_state,
+                )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -1144,48 +920,39 @@ class DSparkAttentionKernel:
 
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-            tile_sched = create_hca_static_tile_scheduler(
+            tile_sched = create_dspark_persistent_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord
+                compute_common_params = SimpleNamespace(
+                    blk_coord=blk_coord,
+                    smem_exchange=softmax_smem_exchange,
+                    mO=mO,
+                    K=self.get_cache_seq_len(cache_seqs, blk_coord[2]),
+                    window_valid_len=self.get_window_valid_len(window_valid_lens, blk_coord[2]),
+                    window_end_pos=self.get_window_end_pos(cache_seqs, blk_coord[2]),
+                    L=mCL_draft.shape[1],
+                    tmem_ptr=tmem_ptr,
+                    tidx=tidx,
+                    p_cor_pipeline=p_cor_pipeline,
+                    attn_sink_unscaled=attn_sink_unscaled,
                 )
-                if k_tile_count > 0:
-                    compute_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        split_kv=split_kv,
-                        local_split_kv=local_split_kv,
-                        smem_exchange=softmax_smem_exchange,
-                        mAccO=mAccO,
-                        mO=mO,
-                        K=self.get_cache_seq_len(cache_seqs, blk_coord[2]),
-                        window_valid_len=self.get_window_valid_len(window_valid_lens, blk_coord[2]),
-                        window_end_pos=self.get_window_end_pos(cache_seqs, blk_coord[2]),
-                        L=mCL_cmp.shape[1],
-                        tmem_ptr=tmem_ptr,
-                        tidx=tidx,
-                        p_cor_pipeline=p_cor_pipeline,
-                        attn_sink_unscaled=attn_sink_unscaled,
-                    )
-                    compute_softmax_params = SimpleNamespace(
-                        tiled_mma_qk=tiled_mma_qk,
-                        sP=sP,
-                        mma_s_pipeline=mma_s_pipeline,
-                        p_mma_pipeline=p_mma_pipeline,
-                        softmax_scale_log2=softmax_scale_log2,
-                    )
-                    mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state = self.compute(
-                        compute_common_params,
-                        compute_softmax_params,
-                        k_index=k_index,
-                        k_tile_count=k_tile_count,
-                        mma_s_consumer_state=mma_s_consumer_state,
-                        p_mma_producer_state=p_mma_producer_state,
-                        p_cor_producer_state=p_cor_producer_state,
-                    )
+                compute_softmax_params = SimpleNamespace(
+                    tiled_mma_qk=tiled_mma_qk,
+                    sP=sP,
+                    mma_s_pipeline=mma_s_pipeline,
+                    p_mma_pipeline=p_mma_pipeline,
+                    softmax_scale_log2=softmax_scale_log2,
+                )
+                mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state = self.compute(
+                    compute_common_params,
+                    compute_softmax_params,
+                    mma_s_consumer_state=mma_s_consumer_state,
+                    p_mma_producer_state=p_mma_producer_state,
+                    p_cor_producer_state=p_cor_producer_state,
+                )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             p_cor_pipeline.producer_tail(p_cor_producer_state)
@@ -1206,46 +973,36 @@ class DSparkAttentionKernel:
 
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-            tile_sched = create_hca_static_tile_scheduler(
+            tile_sched = create_dspark_persistent_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord
+                compute_common_params = SimpleNamespace(
+                    blk_coord=blk_coord,
+                    smem_exchange=epilogue_smem_exchange,
+                    mO=mO,
+                    K=self.get_cache_seq_len(cache_seqs, blk_coord[2]),
+                    L=mCL_draft.shape[1],
+                    H=mQL.shape[0],
+                    tmem_ptr=tmem_ptr,
+                    tidx=tidx,
+                    tiled_mma_pv=tiled_mma_pv,
+                    p_cor_pipeline=p_cor_pipeline,
+                    mma_o_pipeline=mma_o_pipeline,
                 )
-                if k_tile_count > 0:
-                    compute_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        split_kv=split_kv,
-                        local_split_kv=local_split_kv,
-                        smem_exchange=epilogue_smem_exchange,
-                        mAccO=mAccO,
-                        mO=mO,
-                        K=self.get_cache_seq_len(cache_seqs, blk_coord[2]),
-                        L=mCL_cmp.shape[1],
-                        H=mQL.shape[0],
-                        tmem_ptr=tmem_ptr,
-                        tidx=tidx,
-                        tiled_mma_pv=tiled_mma_pv,
-                        p_cor_pipeline=p_cor_pipeline,
-                        mma_o_pipeline=mma_o_pipeline,
-                    )
-                    compute_epilogue_params = SimpleNamespace(
-                        output_scale=output_scale,
-                        softmax_scale_log2=softmax_scale_log2,
-                        mAccLSE=mAccLSE,
-                        mLSE=mLSE,
-                        mFreqs=inverse_rope_freqs,
-                    )
-                    p_cor_consumer_state, mma_o_consumer_state = self.correction(
-                        compute_common_params,
-                        compute_epilogue_params,
-                        k_tile_count=k_tile_count,
-                        p_cor_consumer_state=p_cor_consumer_state,
-                        mma_o_consumer_state=mma_o_consumer_state,
-                    )
+                compute_epilogue_params = SimpleNamespace(
+                    output_scale=output_scale,
+                    softmax_scale_log2=softmax_scale_log2,
+                    mFreqs=inverse_rope_freqs,
+                )
+                p_cor_consumer_state, mma_o_consumer_state = self.correction(
+                    compute_common_params,
+                    compute_epilogue_params,
+                    p_cor_consumer_state=p_cor_consumer_state,
+                    mma_o_consumer_state=mma_o_consumer_state,
+                )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -1303,69 +1060,14 @@ class DSparkAttentionKernel:
         return valid
 
     @cute.jit
-    def get_k_tile_count(
-        self,
-        split_kv: cutlass.Int32,
-        cache_seqs: cute.Tensor,
-        block_split_kvs: cute.Tensor,
-        blk_coord: cute.Coord,
-    ) -> tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]:
-        """Get the current k_index, k_tile_count, and local split_kv value for the HCA kernel.
-
-        :param split_kv: Split_kv value
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: Cache sequence lengths tensor
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: Per-block split_kv values tensor
-        :type block_split_kvs: cute.Tensor
-        :param blk_coord: Block coordinate
-        :type blk_coord: cute.Coord
-        :return: k_index, k_tile_count, split_kv
-        :rtype: tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32]
-        """
-        K = self.get_cache_seq_len(cache_seqs, blk_coord[2])
-        if cutlass.const_expr(self.is_var_split_kv):
-            split_kv = block_split_kvs[blk_coord[2]]
-
-        k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
-        k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
-        k_index = blk_coord[3] * k_tile_per_cta
-        k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
-        return k_index, k_tile_count, split_kv
-
-    @cute.jit
     def load_page_table(
         self,
         common_params: SimpleNamespace,
-        k_index: cutlass.Int32,
-        k_tile_count: cutlass.Int32,
         load_pt_producer_state: pipeline.PipelineState,
     ) -> pipeline.PipelineState:
-        """Load warp to load page table. Updates the load pt producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_pt_producer_state: The load pt producer state
-        :type load_pt_producer_state: pipeline.PipelineState
-
-        :return: The load pt producer state
-        :rtype: pipeline.PipelineState
-        """
-        # k_index == 0 → window stream (one tile worth of indices from mPT_win)
-        # k_index >= 1 → compressed stream (offset k_index-1 into mPT_cmp)
+        """Stage the rolling-window slot followed by the implicit draft-block slot."""
         mPT_win = common_params.mPT_win[None, common_params.blk_coord[2]]
-        mPT_cmp = common_params.mPT_cmp[None, common_params.blk_coord[2]]
-        page_per_tile_win = self.mma_qk_tiler[1] // self.tma_page_size_win
-        page_per_tile_cmp = self.mma_qk_tiler[1] // self.tma_page_size_cmp
-        # Loop bound covers whichever stream needs more indices per K-tile
-        # so that sPT is fully populated under either page-size ordering.
-        page_per_tile_max = max(page_per_tile_win, page_per_tile_cmp)
         tidx = common_params.tidx % self.threads_per_warp
-
         load_pt_pipeline = common_params.load_pt_pipeline
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS),
@@ -1373,50 +1075,23 @@ class DSparkAttentionKernel:
             num_bits_per_copy=cutlass.Int32.width,
         )
         mPT_win_for_copy = cute.flat_divide(mPT_win, (1,))
-        mPT_cmp_for_copy = cute.flat_divide(mPT_cmp, (1,))
         sPT_for_copy = cute.flat_divide(common_params.sPT, (1,))
-        elem_per_thread = cute.ceil_div(page_per_tile_max, self.threads_per_warp)
 
-        while k_tile_count > 0:
-            load_pt_pipeline.producer_acquire(load_pt_producer_state)
-            is_win = k_index == 0
-            cmp_offset = k_index - 1
-            for i in range(elem_per_thread):
-                idx = i * self.threads_per_warp + tidx
-                if is_win:
-                    if cute.elem_less(idx, mPT_win.shape[0]) and cute.elem_less(
-                        idx, page_per_tile_win
-                    ):
-                        cute.copy(
-                            atom_async_copy,
-                            mPT_win_for_copy[None, idx],
-                            sPT_for_copy[None, idx, load_pt_producer_state.index],
-                        )
-                    else:
-                        sPT_for_copy[None, idx, load_pt_producer_state.index].fill(0)
-                else:
-                    if cutlass.const_expr(self.implicit_cmp_page_table):
-                        if cute.elem_less(idx, page_per_tile_cmp):
-                            sPT_for_copy[None, idx, load_pt_producer_state.index].fill(
-                                common_params.blk_coord[2]
-                            )
-                        else:
-                            sPT_for_copy[None, idx, load_pt_producer_state.index].fill(0)
-                    else:
-                        if cute.elem_less(
-                            cmp_offset * page_per_tile_cmp + idx, mPT_cmp.shape[0]
-                        ) and cute.elem_less(idx, page_per_tile_cmp):
-                            cute.copy(
-                                atom_async_copy,
-                                mPT_cmp_for_copy[None, cmp_offset * page_per_tile_cmp + idx],
-                                sPT_for_copy[None, idx, load_pt_producer_state.index],
-                            )
-                        else:
-                            sPT_for_copy[None, idx, load_pt_producer_state.index].fill(0)
-            load_pt_pipeline.producer_commit(load_pt_producer_state)
-            load_pt_producer_state.advance()
-            k_index += 1
-            k_tile_count -= 1
+        load_pt_pipeline.producer_acquire(load_pt_producer_state)
+        if tidx == 0:
+            cute.copy(
+                atom_async_copy,
+                mPT_win_for_copy[None, 0],
+                sPT_for_copy[None, 0, load_pt_producer_state.index],
+            )
+        load_pt_pipeline.producer_commit(load_pt_producer_state)
+        load_pt_producer_state.advance()
+
+        load_pt_pipeline.producer_acquire(load_pt_producer_state)
+        if tidx == 0:
+            sPT_for_copy[None, 0, load_pt_producer_state.index].fill(common_params.blk_coord[2])
+        load_pt_pipeline.producer_commit(load_pt_producer_state)
+        load_pt_producer_state.advance()
 
         return load_pt_producer_state
 
@@ -1426,8 +1101,6 @@ class DSparkAttentionKernel:
         common_params: SimpleNamespace,
         qk_params: SimpleNamespace,
         v_params: SimpleNamespace,
-        k_index: cutlass.Int32,
-        k_tile_count: cutlass.Int32,
         load_q_producer_state: pipeline.PipelineState,
         load_kv_producer_state: pipeline.PipelineState,
         load_pt_consumer_state: pipeline.PipelineState,
@@ -1438,30 +1111,7 @@ class DSparkAttentionKernel:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Load wrap to load Q/C latent tensors. Updates the load qkv producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param v_params: The v parameters
-        :type v_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_q_producer_state: The load q producer state
-        :type load_q_producer_state: pipeline.PipelineState
-        :param load_kv_producer_state: The load kv producer state
-        :type load_kv_producer_state: pipeline.PipelineState
-        :param load_pt_consumer_state: The load pt consumer state
-        :type load_pt_consumer_state: pipeline.PipelineState
-        :param load_pt_release_state: The load pt release state
-        :type load_pt_release_state: pipeline.PipelineState
-
-        :return: The load q producer state, load kv producer state, load pt consumer state, and load pt release state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Partition Q/K/V tensors and issue the fixed window/draft TMA sequence."""
         # === Q partition (single Q stream) ===
         mma_qk_tiler_mk = cute.select(self.mma_qk_tiler, mode=[0, 2])
         gQL = cute.flat_divide(qk_params.mQL, mma_qk_tiler_mk)
@@ -1488,19 +1138,21 @@ class DSparkAttentionKernel:
             else gCL_win[None, 0, None, None]
         )
 
-        # === K partition for compressed stream ===
-        cta_m_cmp = min(cta_kv_m, self.tma_page_size_cmp)
-        page_tile_size_k_cmp = min(self.tma_page_size_cmp, cta_m_cmp)
-        gCL_cmp = cute.tiled_divide(qk_params.mCL_cmp, (page_tile_size_k_cmp, self.mma_qk_tiler[2]))
-        tSgCL_cmp = (
-            gCL_cmp[
+        # === K partition for draft-block stream ===
+        cta_m_draft = min(cta_kv_m, self.tma_page_size_draft)
+        page_tile_size_k_draft = min(self.tma_page_size_draft, cta_m_draft)
+        gCL_draft = cute.tiled_divide(
+            qk_params.mCL_draft, (page_tile_size_k_draft, self.mma_qk_tiler[2])
+        )
+        tSgCL_draft = (
+            gCL_draft[
                 None,
                 common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
                 None,
                 None,
             ]
-            if cta_m_cmp < self.tma_page_size_cmp
-            else gCL_cmp[None, 0, None, None]
+            if cta_m_draft < self.tma_page_size_draft
+            else gCL_draft[None, 0, None, None]
         )
 
         # tma partition for q (one stream) and k (two streams sharing SMEM)
@@ -1519,12 +1171,12 @@ class DSparkAttentionKernel:
             qk_params.sKC_win,
             tSgCL_win,
         )
-        tKCsKC_cmp, tCLgCL_cmp = cpasync.tma_partition(
-            qk_params.tma_atom_c_latent_cmp,
+        tKCsKC_draft, tCLgCL_draft = cpasync.tma_partition(
+            qk_params.tma_atom_c_latent_draft,
             0,
             cute.make_layout(1),
-            qk_params.sKC_cmp,
-            tSgCL_cmp,
+            qk_params.sKC_draft,
+            tSgCL_draft,
         )
 
         tQLgQL = tQLgQL_mkl[
@@ -1541,14 +1193,16 @@ class DSparkAttentionKernel:
         tOgCLT_win = cute.tiled_divide(gCLT_win, (cta_n, page_tile_size_v_win))
         tOgCLT_win = tOgCLT_win[None, 0, 0, None, None, None]
 
-        # === V partition for compressed stream ===
-        page_tile_size_v_cmp = min(self.tma_page_size_cmp, self.mma_pv_tiler[2])
-        gCLT_cmp = cute.flat_divide(v_params.mCLT_cmp, (self.mma_pv_tiler[1], page_tile_size_v_cmp))
-        gCLT_cmp = cute.logical_divide(gCLT_cmp, (cta_n,))[
+        # === V partition for draft-block stream ===
+        page_tile_size_v_draft = min(self.tma_page_size_draft, self.mma_pv_tiler[2])
+        gCLT_draft = cute.flat_divide(
+            v_params.mCLT_draft, (self.mma_pv_tiler[1], page_tile_size_v_draft)
+        )
+        gCLT_draft = cute.logical_divide(gCLT_draft, (cta_n,))[
             (None, common_params.blk_coord[0]), None, None, None, None
         ]
-        tOgCLT_cmp = cute.tiled_divide(gCLT_cmp, (cta_n, page_tile_size_v_cmp))
-        tOgCLT_cmp = tOgCLT_cmp[None, 0, 0, None, None, None]
+        tOgCLT_draft = cute.tiled_divide(gCLT_draft, (cta_n, page_tile_size_v_draft))
+        tOgCLT_draft = tOgCLT_draft[None, 0, 0, None, None, None]
 
         tVCsVC_win, tCLTgCLT_win = cpasync.tma_partition(
             v_params.tma_atom_c_latent_transpose_win,
@@ -1557,70 +1211,62 @@ class DSparkAttentionKernel:
             v_params.sVC_win,
             tOgCLT_win,
         )
-        tVCsVC_cmp, tCLTgCLT_cmp = cpasync.tma_partition(
-            v_params.tma_atom_c_latent_transpose_cmp,
+        tVCsVC_draft, tCLTgCLT_draft = cpasync.tma_partition(
+            v_params.tma_atom_c_latent_transpose_draft,
             0,
             cute.make_layout(1),
-            v_params.sVC_cmp,
-            tOgCLT_cmp,
+            v_params.sVC_draft,
+            tOgCLT_draft,
         )
 
         # set extra params (both streams threaded through)
         qk_params.tQLgQL = tQLgQL
         qk_params.tCLgCL_win = tCLgCL_win
-        qk_params.tCLgCL_cmp = tCLgCL_cmp
+        qk_params.tCLgCL_draft = tCLgCL_draft
         qk_params.tQsQ = tQsQ
         qk_params.tKCsKC_win = tKCsKC_win
-        qk_params.tKCsKC_cmp = tKCsKC_cmp
+        qk_params.tKCsKC_draft = tKCsKC_draft
         v_params.tCLTgCLT_win = tCLTgCLT_win
-        v_params.tCLTgCLT_cmp = tCLTgCLT_cmp
+        v_params.tCLTgCLT_draft = tCLTgCLT_draft
         v_params.tVCsVC_win = tVCsVC_win
-        v_params.tVCsVC_cmp = tVCsVC_cmp
+        v_params.tVCsVC_draft = tVCsVC_draft
 
         load_q_producer_state, load_kv_producer_state, load_pt_consumer_state = (
             self.load_tma_qk_one_k_tile(
                 common_params,
                 qk_params,
-                k_index,
-                k_tile_count,
                 load_q_producer_state,
                 load_kv_producer_state,
                 load_pt_consumer_state,
+                is_window=True,
                 load_q=True,
             )
         )
-        k_index += 1
-        k_tile_count -= 1
-        while k_tile_count > 0:
-            load_q_producer_state, load_kv_producer_state, load_pt_consumer_state = (
-                self.load_tma_qk_one_k_tile(
-                    common_params,
-                    qk_params,
-                    k_index,
-                    k_tile_count,
-                    load_q_producer_state,
-                    load_kv_producer_state,
-                    load_pt_consumer_state,
-                    load_q=False,
-                )
-            )
-            load_kv_producer_state, load_pt_release_state = self.load_tma_v_one_k_tile(
+        load_q_producer_state, load_kv_producer_state, load_pt_consumer_state = (
+            self.load_tma_qk_one_k_tile(
                 common_params,
-                v_params,
-                k_index - 1,
+                qk_params,
+                load_q_producer_state,
                 load_kv_producer_state,
-                load_pt_release_state,
+                load_pt_consumer_state,
+                is_window=False,
+                load_q=False,
             )
-            k_index += 1
-            k_tile_count -= 1
-
-        # load last v tile
+        )
         load_kv_producer_state, load_pt_release_state = self.load_tma_v_one_k_tile(
             common_params,
             v_params,
-            k_index - 1,
             load_kv_producer_state,
             load_pt_release_state,
+            is_window=True,
+        )
+
+        load_kv_producer_state, load_pt_release_state = self.load_tma_v_one_k_tile(
+            common_params,
+            v_params,
+            load_kv_producer_state,
+            load_pt_release_state,
+            is_window=False,
         )
         return (
             load_q_producer_state,
@@ -1634,77 +1280,17 @@ class DSparkAttentionKernel:
         self,
         common_params: SimpleNamespace,
         qk_params: SimpleNamespace,
-        k_index: cutlass.Int32,
-        k_tile_count: cutlass.Int32,
         load_q_producer_state: pipeline.PipelineState,
         load_kv_producer_state: pipeline.PipelineState,
         load_pt_consumer_state: pipeline.PipelineState,
+        is_window: bool,
         load_q: bool,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Load one k-tile of Q/C latent tensors. Updates the load qkv producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param load_q_producer_state: The load q producer state
-        :type load_q_producer_state: pipeline.PipelineState
-        :param load_kv_producer_state: The load kv producer state
-        :type load_kv_producer_state: pipeline.PipelineState
-        :param load_pt_consumer_state: The load pt consumer state
-        :type load_pt_consumer_state: pipeline.PipelineState
-        :param load_q: Whether to load q
-        :type load_q: bool
-
-        :return: The load q producer state, load kv producer state, and load pt consumer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
-        page_per_tile_win = ceil_div(
-            self.mma_qk_tiler[1] // self.tma_page_size_win,
-            qk_params.tiled_mma_qk.thr_id.shape,
-        )
-        page_per_tile_cmp = ceil_div(
-            self.mma_qk_tiler[1] // self.tma_page_size_cmp,
-            qk_params.tiled_mma_qk.thr_id.shape,
-        )
-        # Either stream may have the larger per-CTA page count; size the
-        # rmem buffer to accommodate both.
-        page_per_tile_max = max(page_per_tile_win, page_per_tile_cmp)
-
+        """Issue Q and K TMA copies for one compile-time-selected stream."""
         common_params.load_pt_pipeline.consumer_wait(load_pt_consumer_state)
         page_table_stage = load_pt_consumer_state.index
         load_pt_consumer_state.advance()
-        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile_max), cutlass.Int32)
-        # Win and cmp may have different page_size, so the "all-CTAs share one
-        # page" vs "each CTA reads its own page" choice must be made per
-        # stream. (When page_size == mma_qk_tiler[1] there is exactly one
-        # page covering one K-tile shared across CTAs; otherwise pages are
-        # distributed.)
-        is_win_for_idx = k_index == 0
-        if is_win_for_idx:
-            if cutlass.const_expr(self.mma_qk_tiler[1] // self.tma_page_size_win == 1):
-                for i in cutlass.range_constexpr(page_per_tile_max):
-                    k_idx[i] = common_params.sPT[0, page_table_stage]
-            else:
-                for i in cutlass.range_constexpr(page_per_tile_max):
-                    k_idx[i] = common_params.sPT[
-                        i + common_params.blk_coord[0] * page_per_tile_max,
-                        page_table_stage,
-                    ]
-        else:
-            if cutlass.const_expr(self.mma_qk_tiler[1] // self.tma_page_size_cmp == 1):
-                for i in cutlass.range_constexpr(page_per_tile_max):
-                    k_idx[i] = common_params.sPT[0, page_table_stage]
-            else:
-                for i in cutlass.range_constexpr(page_per_tile_max):
-                    k_idx[i] = common_params.sPT[
-                        i + common_params.blk_coord[0] * page_per_tile_max,
-                        page_table_stage,
-                    ]
+        k_idx = common_params.sPT[0, page_table_stage]
         # load q once at first iteration (single Q stream)
         if cutlass.const_expr(load_q):
             common_params.load_q_pipeline.producer_acquire(load_q_producer_state)
@@ -1718,8 +1304,7 @@ class DSparkAttentionKernel:
                 )
             load_q_producer_state.advance()
 
-        # K load: branch on stream (k_index == 0 → window, else compressed)
-        is_win = k_index == 0
+        # K load: branch on stream (k_index == 0 → window, else draft-block)
         load_kv_pipeline = common_params.load_kv_pipeline
         # Pre-init tma_bar_ptr so its type is established before the loop
         # (cute.range doesn't allow type changes inside the body).
@@ -1727,22 +1312,20 @@ class DSparkAttentionKernel:
         for i in cutlass.range(self.iterations_qk_latent):
             tma_bar_ptr = load_kv_pipeline.producer_get_barrier(load_kv_producer_state)
             load_kv_pipeline.producer_acquire(load_kv_producer_state)
-            if is_win:
-                for k in cutlass.range(page_per_tile_win):
-                    cute.copy(
-                        qk_params.tma_atom_c_latent_win,
-                        qk_params.tCLgCL_win[None, i, k_idx[k]],
-                        qk_params.tKCsKC_win[None, k, 0, load_kv_producer_state.index],
-                        tma_bar_ptr=tma_bar_ptr,
-                    )
+            if cutlass.const_expr(is_window):
+                cute.copy(
+                    qk_params.tma_atom_c_latent_win,
+                    qk_params.tCLgCL_win[None, i, k_idx],
+                    qk_params.tKCsKC_win[None, 0, 0, load_kv_producer_state.index],
+                    tma_bar_ptr=tma_bar_ptr,
+                )
             else:
-                for k in cutlass.range(page_per_tile_cmp):
-                    cute.copy(
-                        qk_params.tma_atom_c_latent_cmp,
-                        qk_params.tCLgCL_cmp[None, i, k_idx[k]],
-                        qk_params.tKCsKC_cmp[None, k, 0, load_kv_producer_state.index],
-                        tma_bar_ptr=tma_bar_ptr,
-                    )
+                cute.copy(
+                    qk_params.tma_atom_c_latent_draft,
+                    qk_params.tCLgCL_draft[None, i, k_idx],
+                    qk_params.tKCsKC_draft[None, 0, 0, load_kv_producer_state.index],
+                    tma_bar_ptr=tma_bar_ptr,
+                )
             load_kv_producer_state.advance()
 
         return load_q_producer_state, load_kv_producer_state, load_pt_consumer_state
@@ -1752,44 +1335,16 @@ class DSparkAttentionKernel:
         self,
         common_params: SimpleNamespace,
         v_params: SimpleNamespace,
-        k_index: cutlass.Int32,
         load_kv_producer_state: pipeline.PipelineState,
         load_pt_release_state: pipeline.PipelineState,
+        is_window: bool,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Load one k-tile of compressed latent transpose tensor(v). Updates the load qkv producer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param v_params: The load tma v parameters
-        :type v_params: SimpleNamespace
-        :param k_index: The k index
-        :type k_index: cutlass.Int32
-        :param load_kv_producer_state: The load qkv producer state
-        :type load_kv_producer_state: pipeline.PipelineState
-        :param load_pt_release_state: The load pt release state
-        :type load_pt_release_state: pipeline.PipelineState
-
-        :return: The load kv producer state and load pt release state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
-        """
-        page_per_tile_win = self.mma_pv_tiler[2] * self.iterations_pv_k // self.tma_page_size_win
-        page_per_tile_cmp = self.mma_pv_tiler[2] * self.iterations_pv_k // self.tma_page_size_cmp
-        page_per_subtile_win = ceil_div(page_per_tile_win, self.iterations_pv_k)
-        page_per_subtile_cmp = ceil_div(page_per_tile_cmp, self.iterations_pv_k)
-        # Either stream may have the larger page count.
-        page_per_tile_max = max(page_per_tile_win, page_per_tile_cmp)
-        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile_max), cutlass.Int32)
+        """Issue V TMA copies for one compile-time-selected stream."""
         page_table_stage = load_pt_release_state.index
-        for i in cutlass.range(page_per_tile_max):
-            k_idx[i] = (
-                common_params.sPT[0, page_table_stage]
-                if page_per_tile_max == 1
-                else common_params.sPT[i, page_table_stage]
-            )
+        k_idx = common_params.sPT[0, page_table_stage]
         common_params.load_pt_pipeline.consumer_release(load_pt_release_state)
         load_pt_release_state.advance()
 
-        is_win = k_index == 0
         load_kv_pipeline = common_params.load_kv_pipeline
         # Pre-init tma_bar_ptr so its type is established before the loop
         # (cute.range doesn't allow type changes inside the body).
@@ -1798,44 +1353,20 @@ class DSparkAttentionKernel:
             for j in cutlass.range(self.iterations_pv_n):
                 tma_bar_ptr = load_kv_pipeline.producer_get_barrier(load_kv_producer_state)
                 load_kv_pipeline.producer_acquire(load_kv_producer_state)
-                if is_win:
-                    for k in cutlass.range(page_per_subtile_win):
-                        k_idx_i = k_idx[
-                            k
-                            + i
-                            // ceil_div(self.iterations_pv_k, page_per_tile_win)
-                            * page_per_subtile_win
-                        ]
-                        cute.copy(
-                            v_params.tma_atom_c_latent_transpose_win,
-                            v_params.tCLTgCLT_win[
-                                None,
-                                j,
-                                i % ceil_div(self.iterations_pv_k, page_per_tile_win),
-                                k_idx_i,
-                            ],
-                            v_params.tVCsVC_win[None, 0, k, load_kv_producer_state.index],
-                            tma_bar_ptr=tma_bar_ptr,
-                        )
+                if cutlass.const_expr(is_window):
+                    cute.copy(
+                        v_params.tma_atom_c_latent_transpose_win,
+                        v_params.tCLTgCLT_win[None, j, i, k_idx],
+                        v_params.tVCsVC_win[None, 0, 0, load_kv_producer_state.index],
+                        tma_bar_ptr=tma_bar_ptr,
+                    )
                 else:
-                    for k in cutlass.range(page_per_subtile_cmp):
-                        k_idx_i = k_idx[
-                            k
-                            + i
-                            // ceil_div(self.iterations_pv_k, page_per_tile_cmp)
-                            * page_per_subtile_cmp
-                        ]
-                        cute.copy(
-                            v_params.tma_atom_c_latent_transpose_cmp,
-                            v_params.tCLTgCLT_cmp[
-                                None,
-                                j,
-                                i % ceil_div(self.iterations_pv_k, page_per_tile_cmp),
-                                k_idx_i,
-                            ],
-                            v_params.tVCsVC_cmp[None, 0, k, load_kv_producer_state.index],
-                            tma_bar_ptr=tma_bar_ptr,
-                        )
+                    cute.copy(
+                        v_params.tma_atom_c_latent_transpose_draft,
+                        v_params.tCLTgCLT_draft[None, j, i, k_idx],
+                        v_params.tVCsVC_draft[None, 0, 0, load_kv_producer_state.index],
+                        tma_bar_ptr=tma_bar_ptr,
+                    )
 
                 load_kv_producer_state.advance()
         return load_kv_producer_state, load_pt_release_state
@@ -1846,7 +1377,6 @@ class DSparkAttentionKernel:
         common_params: SimpleNamespace,
         qk_params: SimpleNamespace,
         pv_params: SimpleNamespace,
-        k_tile_count: cutlass.Int32,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         load_q_consumer_state: pipeline.PipelineState,
@@ -1862,38 +1392,7 @@ class DSparkAttentionKernel:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """MMA warp to compute the result of Q*K^T and P*V. Updates the tiled mma and pipeline states.
-
-        :param common_params: The common parameters for mma qk and pv
-        :type common_params: SimpleNamespace
-        :param qk_params: The mma qk parameters
-        :type qk_params: SimpleNamespace
-        :param pv_params: The mma pv parameters
-        :type pv_params: SimpleNamespace
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param tiled_mma_qk: The tiled mma qk
-        :type tiled_mma_qk: cute.TiledMma
-        :param tiled_mma_pv: The tiled mma pv
-        :type tiled_mma_pv: cute.TiledMma
-        :param load_q_consumer_state: The load q consumer state
-        :type load_q_consumer_state: pipeline.PipelineState
-        :param load_kv_consumer_state: The load kv consumer state
-        :type load_kv_consumer_state: pipeline.PipelineState
-        :param mma_s_producer_state: The mma s producer state
-        :type mma_s_producer_state: pipeline.PipelineState
-        :param p_mma_consumer_state: The p mma consumer state
-        :type p_mma_consumer_state: pipeline.PipelineState
-        :param mma_o_producer_state: The mma o producer state
-        :type mma_o_producer_state: pipeline.PipelineState
-
-        :return: The tiled mma qk, the tiled mma pv, the load q consumer state,
-            the load kv consumer state, the mma s producer state, the p mma
-            consumer state, and the mma o producer state
-        :rtype: tuple[cute.TiledMma, cute.TiledMma, pipeline.PipelineState,
-            pipeline.PipelineState, pipeline.PipelineState,
-            pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Run two QK tiles and two PV tiles on the leader CTA."""
 
         tSrQ = tiled_mma_qk.make_fragment_A(qk_params.sQ)
         tSrKC = tiled_mma_qk.make_fragment_B(qk_params.sKC)
@@ -1944,36 +1443,33 @@ class DSparkAttentionKernel:
                 mma_s_producer_state,
                 wait_q=True,
             )
-            k_tile_count -= 1
-            while k_tile_count > 0:
-                (
-                    tiled_mma_qk,
-                    load_q_consumer_state,
-                    load_kv_consumer_state,
-                    mma_s_producer_state,
-                ) = self.mma_qk(
-                    common_params,
-                    qk_params,
-                    tiled_mma_qk,
-                    load_q_consumer_state,
-                    load_kv_consumer_state,
-                    mma_s_producer_state,
-                    wait_q=False,
-                )
-                (
-                    tiled_mma_pv,
-                    load_kv_consumer_state,
-                    p_mma_consumer_state,
-                    mma_o_producer_state,
-                ) = self.mma_pv(
-                    common_params,
-                    pv_params,
-                    tiled_mma_pv,
-                    load_kv_consumer_state,
-                    p_mma_consumer_state,
-                    mma_o_producer_state,
-                )
-                k_tile_count -= 1
+            (
+                tiled_mma_qk,
+                load_q_consumer_state,
+                load_kv_consumer_state,
+                mma_s_producer_state,
+            ) = self.mma_qk(
+                common_params,
+                qk_params,
+                tiled_mma_qk,
+                load_q_consumer_state,
+                load_kv_consumer_state,
+                mma_s_producer_state,
+                wait_q=False,
+            )
+            (
+                tiled_mma_pv,
+                load_kv_consumer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            ) = self.mma_pv(
+                common_params,
+                pv_params,
+                tiled_mma_pv,
+                load_kv_consumer_state,
+                p_mma_consumer_state,
+                mma_o_producer_state,
+            )
 
             # release q consumer states
             load_q_pipeline.consumer_release(load_q_release_state)
@@ -2018,22 +1514,7 @@ class DSparkAttentionKernel:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Compute one k-tile of mma for Q*K^T. Updates the tiled MMA QK and pipeline states.
-
-        :param qk_params: The qk parameters
-        :type qk_params: SimpleNamespace
-        :param tiled_mma_qk: The tiled mma qk
-        :type tiled_mma_qk: cute.TiledMma
-        :param load_q_consumer_state: The load q consumer state
-        :type load_q_consumer_state: pipeline.PipelineState
-        :param load_kv_consumer_state: The load kv consumer state
-        :type load_kv_consumer_state: pipeline.PipelineState
-        :param mma_s_producer_state: The mma s producer state
-        :type mma_s_producer_state: pipeline.PipelineState
-
-        :return: The tiled mma qk, the load q consumer state, the load kv consumer state, and the mma s producer state
-        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Consume one staged K tile and produce one QK score tile."""
         tStS = qk_params.tStS_staged[None, None, None, mma_s_producer_state.index]
 
         qk_params.mma_s_pipeline.producer_acquire(mma_s_producer_state)
@@ -2082,24 +1563,7 @@ class DSparkAttentionKernel:
         pipeline.PipelineState,
         pipeline.PipelineState,
     ]:
-        """Compute one k-tile of mma for P*V. Updates the tiled mma pv and pipeline states.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param pv_params: The pv parameters
-        :type pv_params: SimpleNamespace
-        :param tiled_mma_pv: The tiled mma pv
-        :type tiled_mma_pv: cute.TiledMma
-        :param load_kv_consumer_state: The load kv consumer state
-        :type load_kv_consumer_state: pipeline.PipelineState
-        :param p_mma_consumer_state: The P MMA consumer state
-        :type p_mma_consumer_state: pipeline.PipelineState
-        :param mma_o_producer_state: The MMA o producer state
-        :type mma_o_producer_state: pipeline.PipelineState
-
-        :return: The tiled mma pv, the load qkv consumer state, the P MMA consumer state, and the MMA o producer state
-        :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
+        """Consume one staged P/V tile and accumulate one PV output tile."""
 
         pv_params.mma_o_pipeline.producer_acquire(mma_o_producer_state)
         pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
@@ -2144,34 +1608,11 @@ class DSparkAttentionKernel:
         self,
         common_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
-        k_index: cutlass.Int32,
-        k_tile_count: cutlass.Int32,
         mma_s_consumer_state: pipeline.PipelineState,
         p_mma_producer_state: pipeline.PipelineState,
         p_cor_producer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]:
-        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param softmax_params: The softmax parameters
-        :type softmax_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The number of k-tiles
-        :type k_tile_count: cutlass.Int32
-        :param mma_s_consumer_state: The MMA s consumer state
-        :type mma_s_consumer_state: pipeline.PipelineState
-        :param p_mma_producer_state: The P MMA producer state
-        :type p_mma_producer_state: pipeline.PipelineState
-        :param p_cor_producer_state: The P correction producer state
-        :type p_cor_producer_state: pipeline.PipelineState
-
-        :return: The MMA s consumer state, the P MMA producer state, and the P correction producer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
-        """
-
-        k_tile_total = cute.ceil_div(common_params.K, self.mma_qk_tiler[1])
+        """Run online softmax for the window tile and final draft tile."""
 
         # Pre-compute this thread's per-head attention-sink, sized in the
         # unscaled-S space. We replicate softmax's tStS partition mechanics
@@ -2206,89 +1647,61 @@ class DSparkAttentionKernel:
         if cutlass.const_expr(self.attn_sink_is_scaled):
             my_sink = my_sink * LOG2_E / softmax_params.softmax_scale_log2
 
-        # Online-softmax state. The very first split block (blk_coord[3] == 0)
-        # absorbs the per-head attention-sink as a virtual extra logit (V=0):
+        # Online-softmax starts from the per-head attention sink as a virtual
+        # extra logit (V=0):
         #   row_max := my_sink, row_sum := 1 / warps_in_n, O := 0.
         # The epilogue sums row_sum across N-partitioned warps, so distributing
         # the virtual sink's unit mass prevents it from being counted once per
         # warp (a visible normalization error for short windows).
-        # Other split blocks start cold; the reduction kernel merges them.
-        row_max = -self.acc_dtype.inf
-        row_sum = self.acc_dtype(0)
-        if common_params.blk_coord[3] == 0:
-            row_max = my_sink
-            row_sum = self.acc_dtype(1.0 / self.warps_in_n)
+        row_max = my_sink
+        row_sum = self.acc_dtype(1.0 / self.warps_in_n)
         correction_factor = self.acc_dtype(1)
         common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
 
-        # no mask applied
-        while k_tile_count > 1:
-            (
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-            ) = self.softmax(
-                common_params,
-                softmax_params,
-                k_index,
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-                False,
-                False,
-            )
-            k_index = k_index + 1
-            k_tile_count = k_tile_count - 1
+        # Rolling-window tile: all physical columns are present; the softmax
+        # helper applies the runtime initialized-row mask when needed.
+        (
+            mma_s_consumer_state,
+            p_mma_producer_state,
+            p_cor_producer_state,
+            row_max,
+            row_sum,
+            correction_factor,
+        ) = self.softmax(
+            common_params,
+            softmax_params,
+            cutlass.Int32(0),
+            mma_s_consumer_state,
+            p_mma_producer_state,
+            p_cor_producer_state,
+            row_max,
+            row_sum,
+            correction_factor,
+            False,
+            False,
+        )
 
-        # mask applied
-        if cutlass.const_expr(common_params.mAccO is not None):
-            (
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-            ) = self.softmax(
-                common_params,
-                softmax_params,
-                k_index,
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-                k_index == k_tile_total - 1,
-                True,
-            )
-        else:
-            (
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-            ) = self.softmax(
-                common_params,
-                softmax_params,
-                k_index,
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-                True,
-                True,
-            )
+        # The draft-block tile is always the final, masked tile.
+        (
+            mma_s_consumer_state,
+            p_mma_producer_state,
+            p_cor_producer_state,
+            row_max,
+            row_sum,
+            correction_factor,
+        ) = self.softmax(
+            common_params,
+            softmax_params,
+            cutlass.Int32(1),
+            mma_s_consumer_state,
+            p_mma_producer_state,
+            p_cor_producer_state,
+            row_max,
+            row_sum,
+            correction_factor,
+            True,
+            True,
+        )
 
         return mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state
 
@@ -2297,50 +1710,33 @@ class DSparkAttentionKernel:
         self,
         common_params: SimpleNamespace,
         epilogue_params: SimpleNamespace,
-        k_tile_count: cutlass.Int32,
         p_cor_consumer_state: pipeline.PipelineState,
         mma_o_consumer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
-        """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
+        """Consume two correction records, rescale, and run the epilogue."""
 
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param epilogue_params: The epilogue parameters
-        :type epilogue_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param k_tile_count: The number of k-tiles
-        :type k_tile_count: cutlass.Int32
-        :param p_cor_consumer_state: The P correction consumer state
-        :type p_cor_consumer_state: pipeline.PipelineState
-        :param mma_o_consumer_state: The MMA o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
-
-        :return: The P correction consumer state, and the MMA o consumer state
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
-        """
-
-        k_tile_count_init = k_tile_count
-        while k_tile_count > 0:
-            p_cor_consumer_state, row_sum, row_max, correction_factor, no_correction = (
-                self.get_correction_factor(common_params, p_cor_consumer_state)
-            )
-            if k_tile_count_init != k_tile_count:
-                mma_o_consumer_state = self.rescale(
-                    common_params,
-                    mma_o_consumer_state,
-                    correction_factor,
-                    no_correction,
-                )
-            k_tile_count = k_tile_count - 1
-            if k_tile_count == 0:
-                mma_o_consumer_state = self.epilogue(
-                    common_params,
-                    epilogue_params,
-                    mma_o_consumer_state,
-                    row_sum,
-                    row_max,
-                )
+        # First-tile metadata establishes the online-softmax state. The second
+        # tile may require rescaling the first PV accumulation before the final
+        # PV result is consumed by the epilogue.
+        p_cor_consumer_state, _, _, _, _ = self.get_correction_factor(
+            common_params, p_cor_consumer_state
+        )
+        p_cor_consumer_state, row_sum, row_max, correction_factor, no_correction = (
+            self.get_correction_factor(common_params, p_cor_consumer_state)
+        )
+        mma_o_consumer_state = self.rescale(
+            common_params,
+            mma_o_consumer_state,
+            correction_factor,
+            no_correction,
+        )
+        mma_o_consumer_state = self.epilogue(
+            common_params,
+            epilogue_params,
+            mma_o_consumer_state,
+            row_sum,
+            row_max,
+        )
 
         return p_cor_consumer_state, mma_o_consumer_state
 
@@ -2424,38 +1820,7 @@ class DSparkAttentionKernel:
         cutlass.Float32,
         cutlass.Float32,
     ]:
-        """Softmax for one k-tile. Updates the related pipeline states and returns the computed results.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param softmax_params: The softmax parameters
-        :type softmax_params: SimpleNamespace
-        :param k_index: The index of the k-tile
-        :type k_index: cutlass.Int32
-        :param mma_s_consumer_state: The MMA s consumer state
-        :type mma_s_consumer_state: pipeline.PipelineState
-        :param p_mma_producer_state: The P MMA producer state
-        :type p_mma_producer_state: pipeline.PipelineState
-        :param p_cor_producer_state: The P correction producer state
-        :type p_cor_producer_state: pipeline.PipelineState
-        :param row_max: The row max
-        :type row_max: cutlass.Float32
-        :param row_sum: The row sum
-        :type row_sum: cutlass.Float32
-        :param correction_factor: The correction factor
-        :type correction_factor: cutlass.Float32
-        :param is_last_tile: Whether the last tile
-        :type is_last_tile: bool
-        :param is_local_last_tile: Whether the last tile is local
-        :type is_local_last_tile: cutlass.Boolean
-
-        :return: The MMA s consumer state, the P MMA producer state, the P
-            correction producer state, the row max, the row sum, and the
-            correction factor
-        :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState,
-            pipeline.PipelineState, cutlass.Float32, cutlass.Float32,
-            cutlass.Float32]
-        """
+        """Update online softmax and stage P plus correction metadata for one tile."""
 
         softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
         softmax_params.mma_s_pipeline.consumer_wait(mma_s_consumer_state)
@@ -2727,51 +2092,26 @@ class DSparkAttentionKernel:
         # Flatten divide and partition global tensors for O
         cta_pv_tiler_mn = cute.select(cta_pv_tiler, mode=[0, 1])
 
-        gO = None
-        if cutlass.const_expr(common_params.mAccO is not None):
-            gO = cute.local_tile(
-                common_params.mAccO[None, common_params.blk_coord[3], None, None, None],
-                cta_pv_tiler_mn,
-                (
-                    common_params.blk_coord[0],
-                    iter_n,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ),
-            )
-            cO = cute.local_tile(
-                cute.make_identity_tensor(
-                    common_params.mAccO[None, common_params.blk_coord[3], None, None, None].shape
-                ),
-                cta_pv_tiler_mn,
-                (
-                    common_params.blk_coord[0],
-                    iter_n,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ),
-            )
-        else:
-            gO = cute.local_tile(
-                common_params.mO,
-                cta_pv_tiler_mn,
-                (
-                    common_params.blk_coord[0],
-                    iter_n,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ),
-            )
-            cO = cute.local_tile(
-                cute.make_identity_tensor(common_params.mO.shape),
-                cta_pv_tiler_mn,
-                (
-                    common_params.blk_coord[0],
-                    iter_n,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ),
-            )
+        gO = cute.local_tile(
+            common_params.mO,
+            cta_pv_tiler_mn,
+            (
+                common_params.blk_coord[0],
+                iter_n,
+                common_params.blk_coord[1],
+                common_params.blk_coord[2],
+            ),
+        )
+        cO = cute.local_tile(
+            cute.make_identity_tensor(common_params.mO.shape),
+            cta_pv_tiler_mn,
+            (
+                common_params.blk_coord[0],
+                iter_n,
+                common_params.blk_coord[1],
+                common_params.blk_coord[2],
+            ),
+        )
         tTR_tAcc = tmem_load_thr_copy.partition_S(tAcc)
         tTR_gO = tmem_load_thr_copy.partition_D(gO)
         tTR_cO = tmem_load_thr_copy.partition_D(cO)
@@ -2789,16 +2129,7 @@ class DSparkAttentionKernel:
         cutlass.Float32,
         cutlass.Int32,
     ]:
-        """Get the correction factor from the P correction consumer state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param p_cor_consumer_state: The P correction consumer state
-        :type p_cor_consumer_state: pipeline.PipelineState
-
-        :return: The P correction consumer state, the row_sum, the row_max, and the correction factor
-        :rtype: tuple[pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Int32]
-        """
+        """Load one correction record from TMEM and release its stage."""
         common_params.p_cor_pipeline.consumer_wait(p_cor_consumer_state)
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         # load correction factor
@@ -2845,20 +2176,7 @@ class DSparkAttentionKernel:
         correction_factor: cutlass.Float32,
         no_correction: cutlass.Int32,
     ) -> pipeline.PipelineState:
-        """Rescale for one k-tile. Updates the related pipeline state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param mma_o_consumer_state: The mma o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
-        :param correction_factor: The correction factor
-        :type correction_factor: cutlass.Float32
-        :param no_correction: Whether to apply correction factor
-        :type no_correction: cutlass.Int32
-
-        :return: The MMA o consumer state
-        :rtype: pipeline.PipelineState
-        """
+        """Apply the second-tile correction factor to the first PV result."""
         skip_correction = cute.arch.vote_all_sync(no_correction == 1)
         common_params.mma_o_pipeline.consumer_wait(mma_o_consumer_state)
         if not skip_correction:
@@ -2898,22 +2216,7 @@ class DSparkAttentionKernel:
         row_sum: cutlass.Float32,
         row_max: cutlass.Float32,
     ) -> pipeline.PipelineState:
-        """Epilogue for one k-tile. Updates the related pipeline state.
-
-        :param common_params: The common parameters
-        :type common_params: SimpleNamespace
-        :param epilogue_params: The epilogue parameters
-        :type epilogue_params: SimpleNamespace
-        :param mma_o_consumer_state: The mma o consumer state
-        :type mma_o_consumer_state: pipeline.PipelineState
-        :param row_sum: The row sum
-        :type row_sum: cutlass.Float32
-        :param row_max: The row max
-        :type row_max: cutlass.Float32
-
-        :return: The MMA o consumer state
-        :rtype: pipeline.PipelineState
-        """
+        """Normalize PV, apply inverse RoPE, and store the final output."""
 
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
 
@@ -2949,36 +2252,25 @@ class DSparkAttentionKernel:
                 )
 
             # store o to global memory
-            tR2G_rO_src = None
+            tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
             tR2G_rO_dst = tTR_gO
-            if cutlass.const_expr(common_params.mAccO is None):
-                tR2G_rO_src = cute.make_fragment_like(tTR_gO, self.o_dtype)
-                # using final output dtype for o
-                tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
-                if cutlass.const_expr(self.inverse_rope_dim > 0):
-                    # Fused inverse-RoPE epilogue on the last inverse_rope_dim
-                    # output lanes. The value is rounded to the output dtype
-                    # BEFORE the rotation, preserving the removed standalone
-                    # kernel boundary bit-for-bit; the tmem-load fragment holds
-                    # 32 contiguous columns per thread, so each (re, im) pair
-                    # is register-local.
-                    nope_dim = self.latent_dim - self.inverse_rope_dim
-                    freqs_base = (
-                        common_params.blk_coord[2] * self.seq_len_q + common_params.blk_coord[1]
-                    ) * self.inverse_rope_dim
-                    for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                        d = tTR_cO[i][1]
-                        if d >= nope_dim:
-                            pair_base = freqs_base + (d - nope_dim)
-                            cos = epilogue_params.mFreqs[pair_base]
-                            sin = epilogue_params.mFreqs[pair_base + 1]
-                            re = cutlass.Float32(tR2G_rO_src[i])
-                            im = cutlass.Float32(tR2G_rO_src[i + 1])
-                            tR2G_rO_src[i] = (re * cos + im * sin).to(self.o_dtype)
-                            tR2G_rO_src[i + 1] = (im * cos - re * sin).to(self.o_dtype)
-            else:
-                # using accumulate dtype for o
-                tR2G_rO_src = tTR_rAcc
+            # Round to the final output dtype before optional inverse RoPE.
+            tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
+            if cutlass.const_expr(self.inverse_rope_dim > 0):
+                nope_dim = self.latent_dim - self.inverse_rope_dim
+                freqs_base = (
+                    common_params.blk_coord[2] * self.seq_len_q + common_params.blk_coord[1]
+                ) * self.inverse_rope_dim
+                for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                    d = tTR_cO[i][1]
+                    if d >= nope_dim:
+                        pair_base = freqs_base + (d - nope_dim)
+                        cos = epilogue_params.mFreqs[pair_base]
+                        sin = epilogue_params.mFreqs[pair_base + 1]
+                        re = cutlass.Float32(tR2G_rO_src[i])
+                        im = cutlass.Float32(tR2G_rO_src[i + 1])
+                        tR2G_rO_src[i] = (re * cos + im * sin).to(self.o_dtype)
+                        tR2G_rO_src[i + 1] = (im * cos - re * sin).to(self.o_dtype)
 
             if cute.elem_less(tTR_cO[0][0], common_params.H):
                 cute.autovec_copy(
@@ -2994,14 +2286,7 @@ class DSparkAttentionKernel:
         return mma_o_consumer_state
 
     def make_and_init_load_pt_pipeline(self, load_pt_mbar_ptr):
-        """Create and initialize the load page table pipeline.
-
-        :param load_pt_mbar_ptr: The load page table mbar pointer
-        :type load_pt_mbar_ptr: cute.Tensor
-
-        :return: The load page table pipeline
-        :rtype: pipeline.PipelineAsync
-        """
+        """Create the page-index producer/consumer pipeline."""
         load_pt_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
             self.threads_per_warp * len([self.load_pt_warp_id]),
@@ -3021,20 +2306,7 @@ class DSparkAttentionKernel:
     def make_and_init_load_qkv_pipeline(
         self, load_qkv_mbar_ptr, cta_layout_vmnk, load_stages, tx_count
     ) -> pipeline.PipelineTmaUmma:
-        """Create and initialize the tma load qkv pipeline.
-
-        :param load_qkv_mbar_ptr: The load qkv mbar pointer
-        :type load_qkv_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-        :param load_stages: The load stages
-        :type load_stages: list[int]
-        :param tx_count: The tx count
-        :type tx_count: int
-
-        :return: The tma load qkv pipeline
-        :rtype: pipeline.PipelineTmaUmma
-        """
+        """Create a TMA-to-UMMA pipeline with byte transaction tracking."""
         load_qkv_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.load_tma_warp_id])
         )
@@ -3054,16 +2326,7 @@ class DSparkAttentionKernel:
     def make_and_init_mma_s_pipeline(
         self, mma_s_mbar_ptr, cta_layout_vmnk
     ) -> pipeline.PipelineUmmaAsync:
-        """Create and initialize the mma s pipeline.
-
-        :param mma_s_mbar_ptr: The mma s mbar pointer
-        :type mma_s_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-
-        :return: The mma s pipeline
-        :rtype: pipeline.PipelineUmmaAsync
-        """
+        """Create the QK-MMA-to-softmax pipeline."""
 
         mma_s_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_warp_id])
@@ -3087,16 +2350,7 @@ class DSparkAttentionKernel:
     def make_and_init_p_mma_pipeline(
         self, p_mma_mbar_ptr, cta_layout_vmnk
     ) -> pipeline.PipelineAsyncUmma:
-        """Create and initialize the p mma pipeline.
-
-        :param p_mma_mbar_ptr: The p mma mbar pointer
-        :type p_mma_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-
-        :return: The p mma pipeline
-        :rtype: pipeline.PipelineAsyncUmma
-        """
+        """Create the softmax-to-PV-MMA pipeline."""
 
         producer_thread_size = (
             self.threads_per_warp * len(self.compute_warp_ids) * self.cluster_shape_mnk[0]
@@ -3118,14 +2372,7 @@ class DSparkAttentionKernel:
         )
 
     def make_and_init_p_cor_pipeline(self, p_cor_mbar_ptr) -> pipeline.PipelineAsyncUmma:
-        """Create and initialize the p correction pipeline.
-
-        :param p_cor_mbar_ptr: The p correction mbar pointer
-        :type p_cor_mbar_ptr: cute.Tensor
-
-        :return: The p correction pipeline
-        :rtype: pipeline.PipelineAsyncUmma
-        """
+        """Create the online-softmax correction metadata pipeline."""
 
         producer_thread_size = self.threads_per_warp * len(self.compute_warp_ids)
         p_cor_producer_group = pipeline.CooperativeGroup(
@@ -3147,16 +2394,7 @@ class DSparkAttentionKernel:
     def make_and_init_mma_o_pipeline(
         self, mma_o_mbar_ptr, cta_layout_vmnk
     ) -> pipeline.PipelineUmmaAsync:
-        """Create and initialize the mma o pipeline.
-
-        :param mma_o_mbar_ptr: The mma o mbar pointer
-        :type mma_o_mbar_ptr: cute.Tensor
-        :param cta_layout_vmnk: The cta layout vmnk
-        :type cta_layout_vmnk: tuple[int, int, int]
-
-        :return: The mma o pipeline
-        :rtype: pipeline.PipelineUmmaAsync
-        """
+        """Create the PV-MMA-to-correction/epilogue pipeline."""
 
         mma_o_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_warp_id])
@@ -3180,31 +2418,16 @@ class DSparkAttentionKernel:
     @staticmethod
     def _compute_grid(
         o: cute.Tensor,
-        split_kv: cutlass.Int32,
         cluster_shape_mnk: Tuple[int, int, int],
         max_active_clusters: int,
-        is_persistent: bool,
-    ) -> Tuple[HCAStaticTileSchedulerParams, Tuple[int, int, int]]:
-        """Compute grid shape for the output tensor C.
-
-        :param c: The output tensor C
-        :type c: cute.Tensor
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
-        :type cluster_shape_mn: tuple[int, int]
-
-        :return: Tile scheduler parameters and grid shape.
-        :rtype: tuple[HCAStaticTileSchedulerParams, tuple[int, int, int]]
-        """
+    ) -> Tuple[DSparkPersistentTileSchedulerParams, Tuple[int, int, int]]:
+        """Build persistent scheduler parameters and cap the active grid."""
         o_shape = o.shape
-        tile_sched_params = create_hca_static_tile_scheduler_params(
-            is_persistent,
+        tile_sched_params = create_dspark_persistent_tile_scheduler_params(
             cute.size(o_shape[3]),
             cute.size(o_shape[2]),
             cluster_shape_mnk,
-            split_kv,
         )
-        grid = HCAStaticTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+        grid = DSparkPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
         return tile_sched_params, grid
