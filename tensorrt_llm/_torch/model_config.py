@@ -234,6 +234,11 @@ class ModelConfig(Generic[TConfig]):
     max_seq_len: Optional[int] = None
 
     moe_max_num_tokens: Optional[int] = None
+    # Set in __post_init__; a normal field, not init=False, so that
+    # dataclasses.replace() and copy.copy() carry it.
+    _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
+                                                           repr=False,
+                                                           compare=False)
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
 
     attn_backend: str = 'TRTLLM'
@@ -336,8 +341,23 @@ class ModelConfig(Generic[TConfig]):
 
         # Set default moe_max_num_tokens if not specified
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        # Record the provenance first: once filled in, a derived size is
+        # indistinguishable from one a deployment configured to the same number.
+        if self._moe_max_num_tokens_is_default is None:
+            self._moe_max_num_tokens_is_default = self.moe_max_num_tokens is None
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
+    def is_moe_max_num_tokens_default(self) -> bool:
+        """Whether ``moe_max_num_tokens`` was derived rather than configured.
+
+        A MoE backend with a conservative workspace cap uses this to clamp only
+        the derived size. A config rebuilt from another one's
+        ``moe_max_num_tokens`` -- the draft configs in
+        ``modeling_speculative.py`` -- reads as configured, which is safe: the
+        target's first MoE layer has already capped the forwarded size.
+        """
+        return bool(self._moe_max_num_tokens_is_default)
 
     @property
     def torch_dtype(self) -> torch.dtype:
