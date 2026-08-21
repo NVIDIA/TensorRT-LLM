@@ -332,20 +332,23 @@ and timestep. `disabled_until_timestep` controls when skipping begins as denoisi
 near 1 to 0: a lower value keeps more early steps dense. Calibration also supplies an `ignore`
 list for layers that should stay dense.
 
-Without Skip Softmax calibration metadata, the runtime cannot resolve `target_sparsity`. Skip
-Softmax can still be enabled directly in YAML by providing `threshold_scale_factor` instead:
+The packaged YAML configures Skip Softmax as follows:
 
 ```yaml
 attention_config:
   backend: TRTLLM
   sparse_attention_config:
     algorithm: skip_softmax
-    threshold_scale_factor: <model-specific threshold>
+    target_sparsity: 0.65
+    disabled_until_timestep: 0.86
 ```
 
-See the
+This `target_sparsity` form requires checkpoint calibration metadata. Without calibration, Skip
+Softmax can instead be enabled by configuring `threshold_scale_factor` directly. See the
 [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#skip-softmax-attention)
 for direct-threshold configuration.
+
+### Run with trtllm-serve
 
 Start `trtllm-serve` with the packaged configuration:
 
