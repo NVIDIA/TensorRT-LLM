@@ -392,7 +392,6 @@
 /tests/integration/defs/examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/integration/defs/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/scripts/perf-sanity/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fused_dit* @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/unittest/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 
