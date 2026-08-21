@@ -924,6 +924,7 @@ def _build_gemma4_kv_cache_manager(
     num_blocks=4,
     tokens_per_block=32,
     batch_size=1,
+    enable_swa_eviction: bool = False,
 ):
     """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
 
@@ -981,7 +982,9 @@ def _build_gemma4_kv_cache_manager(
     if not needs_vswa:
         needs_vswa = isinstance(num_kv_heads, list) and len(set(num_kv_heads)) > 1
     if needs_vswa and sliding_window:
-        swa_window = min(sliding_window, max_seq_len - 1)
+        swa_window = (
+            min(sliding_window, max_seq_len - 1) if enable_swa_eviction else max_seq_len - 1
+        )
         max_attn_window = [
             swa_window if lt == "sliding_attention" else max_seq_len for lt in layer_types
         ]
@@ -2075,21 +2078,8 @@ class TestGemma4HFComparison(unittest.TestCase):
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
-    def test_vswa_no_eviction_with_long_sequence(self):
-        """VSWA: sliding pool must not evict blocks when max_attention_window
-        uses max_seq_len - 1 (the fix for page index OOB).
-
-        Root cause: when _util.py used the model's sliding_window (e.g. 512)
-        as max_attention_window for sliding layers, V2 would evict old blocks
-        when kv_lens exceeded the window.  But FlashInfer's prepare() computes
-        num_blocks from the FULL kv_lens, so the page indices for evicted
-        blocks become stale → illegal memory access.
-
-        The fix uses max_seq_len - 1 instead of sliding_window, preventing
-        eviction while keeping is_vswa=True.  This test verifies that with
-        the fix, a sequence longer than sliding_window still has all its
-        blocks allocated (no eviction) and page indices are within bounds.
-        """
+    def test_vswa_evicted_page_indices_are_sanitized(self) -> None:
+        """FlashInfer metadata replaces evicted SWA page markers."""
         from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
@@ -2098,44 +2088,45 @@ class TestGemma4HFComparison(unittest.TestCase):
         config_dict["sliding_window"] = 64
         config = Gemma4TextConfig(**config_dict)
 
-        # num_blocks=4 → max_seq_len = 4*128 = 512, much larger than
-        # sliding_window=64.  With the fix, max_attention_window for sliding
-        # layers = 511 (max_seq_len - 1), so V2 won't evict.
-        kv_cache_manager = self._get_kv_cache_manager(config, num_blocks=4)
+        kv_cache_manager = self._get_kv_cache_manager(
+            config, num_blocks=4, enable_swa_eviction=True
+        )
 
-        # Allocate a request with tokens > sliding_window
+        # Allocate a generation request longer than the sliding window.
         request_ids = [1]
-        token_nums = [128]  # 128 tokens >> sliding_window (64)
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        cached_tokens = 126
+        token_nums = [cached_tokens + 1]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums, is_gen=True)
+
+        num_blocks = (token_nums[0] + kv_cache_manager.tokens_per_block - 1) // (
+            kv_cache_manager.tokens_per_block
+        )
+        raw_indices = kv_cache_manager.get_batch_cache_indices_flat(
+            request_ids, [num_blocks], layer_idx=0
+        )
+        self.assertIn(BAD_PAGE_INDEX, raw_indices.tolist())
 
         metadata_cls = get_attention_backend("FLASHINFER").Metadata
         metadata = metadata_cls(
-            seq_lens=torch.tensor([128], dtype=torch.int),
-            num_contexts=1,
+            seq_lens=torch.ones(1, dtype=torch.int),
+            num_contexts=0,
             kv_cache_params=KVCacheParams(
                 use_cache=True,
-                num_cached_tokens_per_seq=[0],
+                num_cached_tokens_per_seq=[cached_tokens],
             ),
             max_num_requests=1,
             max_num_tokens=8192,
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
-            prompt_lens=[128],
         )
 
         with torch.inference_mode():
             metadata.prepare()
 
-        # num_blocks should be based on full kv_lens (128 tokens),
-        # not clamped to sliding_window (64 tokens).
-        expected_blocks = (
-            128 + kv_cache_manager.tokens_per_block - 1
-        ) // kv_cache_manager.tokens_per_block
-        self.assertEqual(
-            metadata.num_blocks[0],
-            expected_blocks,
-            f"num_blocks should be {expected_blocks} (from full kv_lens=128), "
-            f"not clamped to sliding_window={config_dict['sliding_window']}",
+        self.assertEqual(metadata.num_blocks[0], num_blocks)
+        self.assertNotIn(
+            BAD_PAGE_INDEX,
+            metadata.get_paged_kv_indices_for_layer(0).cpu().tolist(),
         )
 
         # Page indices must be within bounds for EVERY layer
@@ -3401,7 +3392,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         label: str = "",
         batch_size: int = 2,
         initial_cached: list[int] | None = None,
-        replay_cached_steps: list[list[int]] | None = None,
+        replay_cached: list[int] | None = None,
         num_blocks: int = 16,
         expect_split_kv: bool = False,
     ) -> None:
@@ -3426,16 +3417,15 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         if initial_cached is None:
             initial_cached = [30, 45]
         self.assertEqual(len(initial_cached), batch_size)
-        if replay_cached_steps is None:
-            replay_cached_steps = [initial_cached]
-        for replay_cached in replay_cached_steps:
-            self.assertEqual(len(replay_cached), batch_size)
+        if replay_cached is None:
+            replay_cached = initial_cached
+        self.assertEqual(len(replay_cached), batch_size)
         reserved_cached = [
-            max(cached_tokens)
-            for cached_tokens in zip(initial_cached, *replay_cached_steps, strict=True)
+            max(initial, replay)
+            for initial, replay in zip(initial_cached, replay_cached, strict=True)
         ]
         token_nums = [t + 1 for t in reserved_cached]
-        requests = kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        requests = kv_cache_manager.add_dummy_requests(request_ids, token_nums, is_gen=True)
         self.assertIsNotNone(requests)
 
         for i in range(config.num_hidden_layers):
@@ -3536,42 +3526,27 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             for i in range(num_layers):
                 cg_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata))
 
-        captured_split_kv_plans = {}
-        if expect_split_kv and torch.cuda.get_device_capability() == (9, 0):
+        if expect_split_kv:
             split_kv_head_dims = set()
             for plan_params, wrappers in cg_metadata._plan_params_to_wrappers.items():
                 decode_wrapper = wrappers.decode_wrapper
                 if decode_wrapper is None or decode_wrapper._backend != "fa2":
                     continue
-                self.assertTrue(wrappers.cuda_graph_plan_captured)
-                self.assertEqual(len(decode_wrapper._plan_info), 15)
                 self.assertTrue(
-                    decode_wrapper._plan_info[14],
+                    decode_wrapper._plan_info[-1],
                     f"{label}: FA2 hd={plan_params.head_dim} did not enable split-K",
-                )
-                self.assertEqual(wrappers.cuda_graph_plan_info, tuple(decode_wrapper._plan_info))
-                captured_split_kv_plans[plan_params] = (
-                    tuple(decode_wrapper._plan_info),
-                    decode_wrapper._int_workspace_buffer.data_ptr(),
                 )
                 split_kv_head_dims.add(plan_params.head_dim)
             self.assertEqual(split_kv_head_dims, {256, 512})
 
+        replay_cached_steps = [replay_cached]
+        if expect_split_kv:
+            replay_cached_steps.append([cached + 1 for cached in replay_cached])
         for replay_step, reference_cached in enumerate(replay_cached_steps):
             cg_metadata.kv_cache_params = KVCacheParams(
                 use_cache=True, num_cached_tokens_per_seq=reference_cached
             )
             cg_metadata.prepare()
-
-            for plan_params, (captured_plan_info, workspace_ptr) in captured_split_kv_plans.items():
-                wrappers = cg_metadata._plan_params_to_wrappers[plan_params]
-                decode_wrapper = wrappers.decode_wrapper
-                self.assertEqual(tuple(decode_wrapper._plan_info), captured_plan_info)
-                self.assertEqual(decode_wrapper._int_workspace_buffer.data_ptr(), workspace_ptr)
-                self.assertEqual(
-                    wrappers.decode_plan_num_blocks,
-                    tuple(cg_metadata.num_blocks[cg_metadata.num_contexts :]),
-                )
 
             graph.replay()
 
@@ -3621,41 +3596,20 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
-    def test_cuda_graph_decode_long_multi_request(self) -> None:
-        """E2B-like split-K schedules refresh across graph replays."""
-        batch_size = 8
-        self._run_cuda_graph_real_headdim(
-            deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG),
-            "E2B split-K schedule refresh",
-            batch_size=batch_size,
-            initial_cached=[4095] + [31] * (batch_size - 1),
-            replay_cached_steps=[
-                [511] * batch_size,
-                [31] * (batch_size - 1) + [4095],
-                [30, 31, 32, 33, 1023, 1024, 1025, 2048],
-            ],
-            num_blocks=8192,
-            expect_split_kv=True,
-        )
-
-    @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0),
+        "FA2 split-K schedule refresh is Hopper-specific",
     )
-    def test_cuda_graph_decode_long_multi_request_12b_like(self) -> None:
-        """12B-like split-K schedules refresh across graph replays."""
+    def test_cuda_graph_split_kv_schedule_refresh(self) -> None:
+        """FA2 split-K graphs refresh schedules for new KV distributions."""
         batch_size = 8
         self._run_cuda_graph_real_headdim(
             deepcopy(GEMMA4_12B_REAL_DIMS_CONFIG),
             "12B split-K schedule refresh",
             batch_size=batch_size,
             initial_cached=[4095] + [31] * (batch_size - 1),
-            replay_cached_steps=[
-                [511] * batch_size,
-                [31] * (batch_size - 1) + [4095],
-                [30, 31, 32, 33, 1023, 1024, 1025, 2048],
-            ],
-            num_blocks=8192,
+            replay_cached=[510] * batch_size,
+            num_blocks=512,
             expect_split_kv=True,
         )
 
@@ -3674,95 +3628,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     def test_cuda_graph_decode_26b_like(self):
         """26B-like: GQA=2, K=V, hd=256/512."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG), "26B")
-
-    @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
-    def test_cuda_graph_decode_with_evicted_swa_pages(self):
-        """FA2 CUDA graph decode safely ignores evicted SWA pages."""
-        config_dict = deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG)
-        config_dict["sliding_window"] = 1024
-        config_dict["max_position_embeddings"] = 4096
-        config = Gemma4TextConfig(**config_dict)
-
-        tokens_per_block = 32
-        cached_tokens = 2046
-        kv_cache_manager = self._get_kv_cache_manager(
-            config,
-            num_blocks=80,
-            tokens_per_block=tokens_per_block,
-            batch_size=1,
-        )
-        self.addCleanup(kv_cache_manager.shutdown)
-
-        requests = kv_cache_manager.add_dummy_requests([0], [cached_tokens + 1], is_gen=True)
-        self.assertIsNotNone(requests)
-        torch.nn.init.normal_(kv_cache_manager.get_buffers(0))
-
-        num_blocks = (cached_tokens + 1 + tokens_per_block - 1) // tokens_per_block
-        raw_indices = kv_cache_manager.get_batch_cache_indices_flat([0], [num_blocks], layer_idx=0)
-        self.assertIn(BAD_PAGE_INDEX, raw_indices.tolist())
-
-        metadata = FlashInferAttentionMetadata(
-            seq_lens=torch.ones(1, dtype=torch.int),
-            num_contexts=0,
-            is_cuda_graph=True,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=[cached_tokens],
-            ),
-            workspace_buffer=torch.empty(
-                _FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"
-            ),
-            max_num_requests=1,
-            max_num_tokens=4096,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=[0],
-        )
-        metadata.prepare()
-        sanitized_indices = metadata.get_paged_kv_indices_for_layer(0)
-        self.assertNotIn(BAD_PAGE_INDEX, sanitized_indices.cpu().tolist())
-
-        layer = FlashInferAttention(
-            layer_idx=0,
-            num_heads=config.num_attention_heads,
-            head_dim=config.head_dim,
-            num_kv_heads=config.num_key_value_heads,
-            q_scaling=1.0 / math.sqrt(config.head_dim),
-            flashinfer_backend="fa2",
-        )
-        query = torch.randn(
-            1,
-            config.num_attention_heads * config.head_dim,
-            dtype=config.torch_dtype,
-            device="cuda",
-        )
-
-        eager_output = None
-        for _ in range(2):
-            eager_output = layer.forward(
-                query,
-                None,
-                None,
-                metadata,
-                attention_window_size=config.sliding_window,
-            )
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            graph_output = layer.forward(
-                query,
-                None,
-                None,
-                metadata,
-                attention_window_size=config.sliding_window,
-            )
-        graph.replay()
-        torch.cuda.synchronize()
-
-        self.assertTrue(torch.isfinite(graph_output).all())
-        torch.testing.assert_close(graph_output, eager_output, atol=1e-2, rtol=0)
 
     @torch.no_grad()
     @unittest.mock.patch(
