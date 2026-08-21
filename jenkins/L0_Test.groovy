@@ -104,9 +104,6 @@ def LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
 def INFRA_DRY_RUN_TEST_CONTEXT = "infra_dry_run"
-// Source-level dry-run invariants are covered by
-// tests/unittest/tools/test_infra_dry_run_pipeline.py. Keep those checks scoped
-// to behavior owned by this mode when refactoring the surrounding pipeline.
 
 @Field
 def BUILD_CONFIGS = [
@@ -577,10 +574,8 @@ def getInfraDryRunPytestTargets(testListPath) {
         return []
     }
 
-    // --test-list filters items only after pytest has imported every file under
-    // the current directory. The CPU-only dry runners intentionally do not
-    // install the product test environment, so limit collection to the rendered
-    // synthetic nodeids as positional arguments as well.
+    // --test-list filters after collection, so also pass the exact rendered
+    // nodeid positionally to avoid importing unrelated product tests.
     def targets = readFile(file: testListPath).readLines()
         .collect { it.trim().split(/\s+/, 2)[0] }
         .findAll { it.contains("::") }
@@ -1729,10 +1724,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
     def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
     def infraDryRun = isInfraDryRun()
-    def effectiveTestList = infraDryRun ? INFRA_DRY_RUN_TEST_CONTEXT : testList
-    def effectiveSplitId = infraDryRun ? 1 : splitId
-    def effectiveSplits = infraDryRun ? 1 : splits
-    def effectivePerfMode = infraDryRun ? false : perfMode
+    if (infraDryRun) {
+        testList = INFRA_DRY_RUN_TEST_CONTEXT
+        splitId = 1
+        splits = 1
+        perfMode = false
+    }
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
@@ -1761,7 +1758,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
             def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
-            def testListPathNode = "${jobWorkspace}/${effectiveTestList}.txt"
+            def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def waivesListPathLocal = infraDryRun
                 ? "${llmPath}/infra_dry_run_waives.txt"
@@ -1823,7 +1820,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 String clusterNameForDurations = useClusterDurations ? partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_') : null
-                def testListPathLocal = renderTestDB(pipeline, effectiveTestList, llmSrcLocal, stageName, makoOptsJson, clusterNameForDurations)
+                def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson, clusterNameForDurations)
                 // Copy the test list atomically. A retry that reuses a still-active job
                 // re-copies over ${testListPathNode} while that job may be reading it via
                 // --test-list; scp truncates-then-streams, so a concurrent read could see a
@@ -1940,8 +1937,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def extraArgs = [
                     "--test-list=$testListPathNode",
                     "--splitting-algorithm least_duration",
-                    "--splits $effectiveSplits",
-                    "--group $effectiveSplitId",
+                    "--splits $splits",
+                    "--group $splitId",
                     *clusterDurationsArgsNode,
                 ]
                 if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
@@ -1955,7 +1952,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     llmSrcNode,
                     stageName,
                     waivesListPathNode,
-                    effectivePerfMode,
+                    perfMode,
                     jobWorkspace,
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
@@ -2135,7 +2132,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export llmTarfile=$llmTarfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
-                    export perfMode=$effectivePerfMode
+                    export perfMode=$perfMode
                     ${infraDryRun ? "export infraDryRun=true" : ""}
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
@@ -3754,71 +3751,6 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def runInfraDryRunInPreparedWorkspace(pipeline, String llmSrc, String stageName)
-{
-    def outputPath = "${WORKSPACE}/${stageName}"
-    def waivesFile = "${llmSrc}/infra_dry_run_waives.txt"
-    def coverageConfigFile = "${llmSrc}/infra_dry_run.coveragerc"
-
-    sh "rm -rf ${outputPath} && mkdir -p ${outputPath} && : > ${waivesFile} && : > ${coverageConfigFile}"
-    // Test-list preprocessing performs a pytest --collect-only pass before the
-    // final pytest invocation. Both passes load defs/conftest.py, so keep the
-    // dry-run import guard active for the entire prepared-workspace flow.
-    withEnv(["stageName=${stageName}", "TRTLLM_INFRA_DRY_RUN=true"]) {
-        def testDBList = renderTestDB(
-            pipeline,
-            INFRA_DRY_RUN_TEST_CONTEXT,
-            llmSrc,
-            stageName,
-        )
-        def preprocessedLists = processShardTestList(
-            llmSrc,
-            testDBList,
-            1,
-            1,
-            false,
-        )
-        if (preprocessedLists.regularCount < 1) {
-            error "No infrastructure dry-run benchmark was selected for ${stageName}"
-        }
-
-        def extraArgs = []
-        if (ENABLE_UPLOAD_TEST_RESULTS) {
-            def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
-            extraArgs += [
-                "--capture=fd",
-                "--s3-upload-path=${uploadPath}/${stageName}",
-                "--s3-upload-mode=deferred",
-            ]
-        }
-        def pytestCommand = getPytestBaseCommandLine(
-            llmSrc,
-            stageName,
-            waivesFile,
-            false,
-            outputPath,
-            coverageConfigFile,
-            "",
-            extraArgs,
-        )
-        pytestCommand += [
-            "--test-list=${preprocessedLists.regular}",
-        ]
-        pytestCommand += getInfraDryRunPytestTargets(preprocessedLists.regular)
-
-        withCredentials([
-            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
-            string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
-            string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
-        ]) {
-            sh """
-                cd ${llmSrc}/tests/integration/defs && \
-                ${pytestCommand.join(" ")}
-            """
-        }
-    }
-}
-
 def runLLMDocBuild(pipeline, config)
 {
     // Step 1: cloning source code
@@ -3843,11 +3775,6 @@ def runLLMDocBuild(pipeline, config)
     }
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
-
-    if (isInfraDryRun()) {
-        runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, "CPU-Build_Docs")
-        return
-    }
 
     // Step 3: build doc
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y doxygen python3-pip graphviz")
@@ -3894,28 +3821,24 @@ def runLLMAgentFlowTest(pipeline, stageName)
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
 
-    // Dry acceptance validates the shared benchmark/JUnit/upload path for every
-    // selected stage; it must not install or execute this product test suite.
-    if (isInfraDryRun()) {
-        def llmSrc = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
-        // The build pod used by AgentFlow does not run the normal TRT-LLM test
-        // environment setup, so install only the pytest, test-list, and upload
-        // tooling consumed by the shared dry-run adapter. Keep the AgentFlow
-        // package and its product dependencies out of this path.
-        trtllm_utils.llmExecStepWithRetry(
-            pipeline,
-            script: "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout pytest-unused-fixtures mako boto3"
-        )
-        runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)
-        return
-    }
-
     def agentFlowRoot = "${LLM_ROOT}/agent-flow"
 
     // Install agent-flow with its test extras (pytest, pytest-asyncio) and the
     // runtime deps from pyproject.toml (claude-agent-sdk, openai-codex, ...).
     // These resolve from the container's default PyPI mirror.
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${agentFlowRoot} && pip3 install -e \".[test]\"")
+
+    if (isInfraDryRun()) {
+        // Keep the normal environment and reporting path, but replace product tests.
+        sh """
+            rm -rf "${agentFlowRoot}/tests" && \
+            mkdir -p "${agentFlowRoot}/tests" && \
+            printf '%s\\n' \
+                'def test_infra_dry_run_placeholder():' \
+                '    pass' \
+                > "${agentFlowRoot}/tests/test_infra_dry_run_placeholder.py"
+        """
+    }
 
     sh "mkdir -p ${WORKSPACE}/${stageName}"
 
@@ -4953,10 +4876,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noIsolateTests = false
         def rerunFailed = false
         def infraDryRun = isInfraDryRun()
-        def effectiveTestList = infraDryRun ? INFRA_DRY_RUN_TEST_CONTEXT : testList
-        def effectiveSplitId = infraDryRun ? 1 : splitId
-        def effectiveSplits = infraDryRun ? 1 : splits
-        def effectivePerfMode = infraDryRun ? false : perfMode
+        if (infraDryRun) {
+            testList = INFRA_DRY_RUN_TEST_CONTEXT
+            splitId = 1
+            splits = 1
+            perfMode = false
+        }
 
         // When useClusterDurations is set, use a per-cluster durations file keyed on
         // partition.clusterName (e.g. "oci-hsg", "dlcluster").  This lets each cluster
@@ -4973,7 +4898,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
         }
 
-        def testDBList = renderTestDB(pipeline, effectiveTestList, llmSrc, stageName, null, clusterNameForDurations)
+        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
         def waivesFilePath = infraDryRun
             ? "${llmSrc}/infra_dry_run_waives.txt"
             : "${llmSrc}/tests/integration/test_lists/waives.txt"
@@ -4991,14 +4916,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(
-            llmSrc,
-            testDBList,
-            effectiveSplitId,
-            effectiveSplits,
-            effectivePerfMode,
-            clusterDurationsPath,
-        )
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode, clusterDurationsPath)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -5043,7 +4961,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             llmSrc,
             stageName,
             waivesFilePath,
-            effectivePerfMode,
+            perfMode,
             "${WORKSPACE}/${stageName}",
             coverageConfigFile,
             "",  // pytestUtil
@@ -5165,7 +5083,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
-        if (effectivePerfMode) {
+        if (perfMode) {
             // Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
             basePerfFilename = "base_perf_pytorch.csv"
             basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"

@@ -34,6 +34,32 @@ with mock.patch.dict(sys.modules, {"torch": _TORCH_IMPORT_STUB}):
     BENCHMARK = importlib.util.module_from_spec(_SPEC)
     _SPEC.loader.exec_module(BENCHMARK)
 
+_FAKE_TORCH_SOURCE = textwrap.dedent(
+    """
+    float32 = "float32"
+    class Device:
+        def __init__(self, kind, index=None):
+            self.type, self.index = kind, index
+    class Scalar:
+        def item(self): return True
+    class Tensor:
+        def __init__(self, value, dtype, device):
+            self.value, self.dtype, self.device = value, dtype, device
+        def all(self): return Scalar()
+    def device(kind, index=None): return Device(kind, index)
+    def full(_shape, value, *, dtype, device): return Tensor(value, dtype, device)
+    def matmul(left, _right): return Tensor(4.0, left.dtype, left.device)
+    def full_like(tensor, value): return Tensor(value, tensor.dtype, tensor.device)
+    def isfinite(tensor): return tensor
+    def equal(left, right): return left.value == right.value
+    """
+)
+
+
+def _write_benchmark_sandbox(root: Path) -> None:
+    (root / BENCHMARK_PATH.name).write_text(BENCHMARK_PATH.read_text())
+    (root / "torch.py").write_text(_FAKE_TORCH_SOURCE)
+
 
 class _Scalar:
     def __init__(self, value):
@@ -128,30 +154,8 @@ class InfraDryRunBenchmarkTest(unittest.TestCase):
     def test_standard_pytest_collection_selects_only_the_requested_context(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / BENCHMARK_PATH.name).write_text(BENCHMARK_PATH.read_text())
+            _write_benchmark_sandbox(root)
             (root / "test_product.py").write_text("def test_product(): pass\n")
-            (root / "torch.py").write_text(
-                textwrap.dedent(
-                    """
-                    float32 = "float32"
-                    class Device:
-                        def __init__(self, kind, index=None):
-                            self.type, self.index = kind, index
-                    class Scalar:
-                        def item(self): return True
-                    class Tensor:
-                        def __init__(self, value, dtype, device):
-                            self.value, self.dtype, self.device = value, dtype, device
-                        def all(self): return Scalar()
-                    def device(kind, index=None): return Device(kind, index)
-                    def full(_shape, value, *, dtype, device): return Tensor(value, dtype, device)
-                    def matmul(left, _right): return Tensor(4.0, left.dtype, left.device)
-                    def full_like(tensor, value): return Tensor(value, tensor.dtype, tensor.device)
-                    def isfinite(tensor): return tensor
-                    def equal(left, right): return left.value == right.value
-                    """
-                )
-            )
             (root / "conftest.py").write_text(
                 textwrap.dedent(
                     """
@@ -184,41 +188,19 @@ class InfraDryRunBenchmarkTest(unittest.TestCase):
                     [sys.executable, "-m", "pytest", f"--test-list={test_list}", "-vv"],
                     cwd=root,
                     env=env,
-                    check=True,
                     capture_output=True,
                     text=True,
                 )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(expected, result.stdout)
                 self.assertIn("1 passed, 1 deselected", result.stdout)
 
     def test_positional_nodeid_does_not_import_unrelated_product_test(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / BENCHMARK_PATH.name).write_text(BENCHMARK_PATH.read_text())
+            _write_benchmark_sandbox(root)
             (root / "test_unrelated_product.py").write_text(
                 'raise RuntimeError("unrelated product test imported")\n'
-            )
-            (root / "torch.py").write_text(
-                textwrap.dedent(
-                    """
-                    float32 = "float32"
-                    class Device:
-                        def __init__(self, kind, index=None):
-                            self.type, self.index = kind, index
-                    class Scalar:
-                        def item(self): return True
-                    class Tensor:
-                        def __init__(self, value, dtype, device):
-                            self.value, self.dtype, self.device = value, dtype, device
-                        def all(self): return Scalar()
-                    def device(kind, index=None): return Device(kind, index)
-                    def full(_shape, value, *, dtype, device): return Tensor(value, dtype, device)
-                    def matmul(left, _right): return Tensor(4.0, left.dtype, left.device)
-                    def full_like(tensor, value): return Tensor(value, tensor.dtype, tensor.device)
-                    def isfinite(tensor): return tensor
-                    def equal(left, right): return left.value == right.value
-                    """
-                )
             )
             (root / "conftest.py").write_text(
                 textwrap.dedent(
@@ -244,10 +226,10 @@ class InfraDryRunBenchmarkTest(unittest.TestCase):
                 ],
                 cwd=root,
                 env={**os.environ, "stageName": "CPU-Generic-x86-1"},
-                check=True,
                 capture_output=True,
                 text=True,
             )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(target, result.stdout)
             self.assertNotIn("test_unrelated_product.py", result.stdout)
 

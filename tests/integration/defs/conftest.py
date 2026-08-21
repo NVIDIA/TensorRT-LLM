@@ -48,6 +48,11 @@ from _pytest.mark import ParameterSet
 # is harmless.
 from test_common import session_prefetcher_hooks as _prefetch_hooks
 
+from tensorrt_llm.bindings import ipc_nvls_supported
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
+
+from .perf.gpu_clock_lock import GPUClockLock
+from .perf.session_data_writer import SessionDataWriter
 from .test_list_parser import (TestCorrectionMode, apply_waives,
                                get_test_name_corrections_v2, handle_corrections,
                                modify_by_test_list, preprocess_test_list_lines)
@@ -60,22 +65,6 @@ try:
     from llm import trt_environment
 except ImportError:
     trt_environment = None
-
-_INFRA_DRY_RUN = os.environ.get("TRTLLM_INFRA_DRY_RUN", "").lower() == "true"
-if _INFRA_DRY_RUN:
-
-    def ipc_nvls_supported():
-        return False
-
-    def get_mpi_world_size():
-        return 1
-
-else:
-    from tensorrt_llm.bindings import ipc_nvls_supported
-    from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
-
-    from .perf.gpu_clock_lock import GPUClockLock
-    from .perf.session_data_writer import SessionDataWriter
 
 # Logger
 logger = logging.getLogger(__name__)

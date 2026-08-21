@@ -154,22 +154,11 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Source-level dry-run invariants are covered by
-// tests/unittest/tools/test_infra_dry_run_pipeline.py. Keep those checks scoped
-// to behavior owned by this mode when refactoring the surrounding pipeline.
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
-
-// InfraDryRun is an opt-in parameter supplied by the externally configured
-// L0_Stability job. It is intentionally absent from normal job definitions and
-// therefore defaults to false when not provided. Operators use an exact commit
-// SHA, InfraDryRun=true, and no explicit stage_list; the downstream phase name
-// is forced empty in launchInfraDryRunTestJob so all synthetic GPU-count stages
-// stay in the one helper run.
-boolean infraDryRun = params.InfraDryRun?.toString()?.toBoolean() ?: false
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -191,7 +180,7 @@ def testFilter = [
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
     (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
-    (INFRA_DRY_RUN): infraDryRun,
+    (INFRA_DRY_RUN): (params.InfraDryRun?.toString()?.toBoolean() ?: false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -1669,8 +1658,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
         ]
     }
 
-    // An explicit empty override is meaningful for the infrastructure dry run:
-    // it keeps L0_Test from splitting \d+_GPUs stages into a separate helper.
+    // Preserve an explicit empty phase override from the dry-run helper.
     if (!additionalParameters.containsKey('testPhase2StageName') && env.testPhase2StageName) {
         parameters += [
             'testPhase2StageName': env.testPhase2StageName,
@@ -1721,8 +1709,7 @@ def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, i
     String testFilterJson = writeJSON returnText: true, json: testFilter
     def additionalParameters = [
         'testFilter': testFilterJson,
-        // Keep this explicitly empty so the Single-GPU helper executes both
-        // single- and multi-GPU synthetic stages in one dry-run invocation.
+        // Keep all synthetic GPU-count stages in this helper.
         'testPhase2StageName': '',
     ] + imageParameters
     stage("[Test-${arch}-Single-GPU] Remote Run") {
@@ -2301,9 +2288,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     }]}
 
-    // A dry acceptance run must finish both architecture tracks so one failure
-    // does not erase the remaining coverage. Preserve the existing fail-fast
-    // behavior for every normal pipeline.
+    // Preserve both architecture tracks during dry acceptance.
     def effectiveFailFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast
     parallelJobs.failFast = effectiveFailFast
     pipeline.parallel parallelJobs
