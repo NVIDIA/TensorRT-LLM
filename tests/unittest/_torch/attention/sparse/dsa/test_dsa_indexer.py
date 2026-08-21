@@ -53,6 +53,9 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
+    _resolve_fp8_ds_mla_head_dim,
+)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
@@ -81,6 +84,30 @@ def has_deep_gemm():
         return deep_gemm is not None
     except Exception:
         return False
+
+
+def test_fp8_ds_mla_layout_resolves_shared_inline_scale_module():
+    enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
+        KvCacheConfig(dtype="fp8_ds_mla"),
+        tokens_per_block=64,
+        head_dim=576,
+        dtype=DataType.BF16,
+    )
+
+    assert enabled is True
+    assert storage_head_dim == 328
+
+
+def test_fp8_ds_mla_layout_treats_binding_config_as_auto():
+    enabled, storage_head_dim = _resolve_fp8_ds_mla_head_dim(
+        BindingKvCacheConfig(),
+        tokens_per_block=64,
+        head_dim=576,
+        dtype=DataType.BF16,
+    )
+
+    assert enabled is False
+    assert storage_head_dim == 576
 
 
 def test_metadata_cache_geometry_comes_from_sparse_metadata_params():

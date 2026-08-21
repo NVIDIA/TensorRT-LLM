@@ -737,6 +737,7 @@
         "bfloat16",
         "float32",
         "fp8",
+        "fp8_ds_mla",
         "nvfp4"
       ],
       "annotation": "<class 'str'>",
