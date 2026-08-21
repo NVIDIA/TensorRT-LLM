@@ -1514,7 +1514,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("use_kv_cache_manager_v2", [True, False])
     def test_pipelined_kv_transfer_nixl_python_accuracy(
             self, enable_block_reuse: bool, use_kv_cache_manager_v2: bool):
-        """Test Python transceiver pipelined KV transfer accuracy for a VSWA model, Gemma 3."""
+        """Test pipelined Python transfer with Gemma 3 VSWA."""
         kv_cache_config = {
             "use_kv_cache_manager_v2": use_kv_cache_manager_v2,
             "enable_block_reuse": enable_block_reuse,

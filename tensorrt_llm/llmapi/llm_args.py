@@ -4370,7 +4370,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         return "NIXL", None
 
     def _to_pybind(self):
-        # enable_pipelined_transfer is consumed by the Python transceiver only and has no C++ counterpart.
+        # Python-transceiver-only option.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,

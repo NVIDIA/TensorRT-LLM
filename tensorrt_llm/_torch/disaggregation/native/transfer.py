@@ -189,7 +189,7 @@ class WriteMeta:
     sizes: np.ndarray  # dtype=np.int64
     dst_device_id: Optional[int] = None
     slice_id: Optional[int] = None
-    # Peer's task index; slice_id stays the sender's, for local lookup.
+    # Peer task index; slice_id identifies the local sender task.
     receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
@@ -671,7 +671,7 @@ class Sender(SenderBase):
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
-        ## TODO: just last slice need to send task state?
+        # Report every chunk so failures reach the receiver immediately.
         tail = (
             encode_result_tail(write_meta)
             if send_slot_id is not None and agent_result == AgentResult.SUCCESS
@@ -891,10 +891,7 @@ class Sender(SenderBase):
             assert slice_end is not None, "KV send task requires prompt_len"
             total_blocks = (slice_end + tpb - 1) // tpb
 
-            # Narrow the peer's whole-prompt list to this slice. Only a slice that
-            # is actually a chunk needs it: a whole-request slice must reach
-            # _trim_receiver_window_head untouched, which drops leading blocks
-            # where this would drop trailing ones.
+            # Project the peer's whole-prompt list only for partial chunks.
             prompt_blocks = (
                 (task._prompt_len + tpb - 1) // tpb if task._prompt_len is not None else None
             )
@@ -936,10 +933,7 @@ class Sender(SenderBase):
             if req_info.dst_start_token is not None:
                 dst_start = max(dst_start, req_info.dst_start_token)
             if window_size is not None:
-                # SWA stale_end uses the request prompt_len (not slice_end —
-                # they differ for non-final slices). prompt_len must be plumbed
-                # via the session; falling back to slice_end is wrong on
-                # non-final slices.
+                # SWA eviction is based on the full prompt, not this slice.
                 assert task._prompt_len is not None, (
                     "SWA layer requires session.prompt_len; "
                     "set TxSession(prompt_len=request.prompt_len)."
@@ -1344,7 +1338,7 @@ class TxSession(TxSessionBase):
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
-        # A chunk can fail before the last one exists; else this sits in READY.
+        # A chunk may fail before the final task is created.
         if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self.kv_tasks):
             return SessionStatus.ERROR
         kv_all_transferred = bool(self.kv_tasks) and all(

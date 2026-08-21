@@ -202,23 +202,7 @@ def _send_prefill_chunks(
     prepopulated_blocks=0,
     boundary_offset_tokens=0,
 ):
-    """Build (and optionally send) chunks through the real ``_build_prefill_chunk`` path.
-
-    ``_build_prefill_chunk`` derives the chunk bounds from ``req.py_last_context_chunk``
-    and ``req.context_remaining_length`` and returns a ``KVSlice`` (``respond_and_send_async``
-    is responsible for sending). This helper
-    drives one call per chunk, collecting the returned slices; when ``sender_session`` is
-    provided it forwards each built slice to the real session to mirror the send path.
-
-    ``prepopulated_blocks`` models a context-side prefix-reuse hit: the scheduler's
-    chunks start after the reused prefix, while the source block list still holds
-    every block. The first slice must cover the reused prefix anyway.
-
-    ``boundary_offset_tokens`` pushes every interior chunk boundary off a block
-    boundary, which is what a scheduler that rounds chunk size rather than absolute
-    position produces. The block holding the boundary then travels with the chunk
-    that finishes computing it.
-    """
+    """Build and optionally send slices through the real prefill-chunk path."""
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
     base_slice = KVSlice(
@@ -240,8 +224,7 @@ def _send_prefill_chunks(
     req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
     req.prompt_len = prompt_len
     req.py_beam_width = 1
-    # Explicit: a MagicMock attribute never compares equal to the chunk start, so
-    # _build_prefill_chunk's first-chunk branch would never be exercised.
+    # Set explicitly so MagicMock does not bypass first-chunk detection.
     req.prepopulated_prompt_len = prepopulated_blocks * tokens_per_block
 
     first_block = min(prepopulated_blocks, total_blocks)
@@ -255,9 +238,7 @@ def _send_prefill_chunks(
     if not chunk_ranges:
         chunk_ranges = [(0, 0)]
 
-    # Token bounds, so an interior boundary can sit inside a block. The first start is
-    # left alone: _build_prefill_chunk detects the first chunk by comparing it against
-    # prepopulated_prompt_len.
+    # Offset only interior bounds; the first start identifies prefix reuse.
     chunk_bounds = []
     for idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
         start = chunk_start * tokens_per_block
@@ -394,11 +375,7 @@ def test_send_prefill_chunks_basic(all_block_ids, chunk_size_blocks, expected_nu
 
 @pytest.mark.parametrize("prepopulated_blocks", [0, 1, 5], ids=["no_reuse", "reuse_1", "reuse_5"])
 def test_send_prefill_chunks_integrity_check(prepopulated_blocks):
-    """Every block reaches exactly one slice, including a reused context-side prefix.
-
-    With a reuse hit the scheduler's chunks start past the prefix, so this is the
-    check that catches blocks that no chunk covers.
-    """
+    """Every block reaches exactly one slice, including reused prefixes."""
     all_block_ids = [list(range(17)), list(range(17))]
     slices = _send_prefill_chunks(
         all_block_ids,
@@ -2017,15 +1994,7 @@ def add_and_verify_pipelined_request(
     prepopulated_blocks=0,
     boundary_offset_tokens=0,
 ):
-    """Pipelined transfer: sender sends chunks incrementally, receiver sends 1.
-
-    ``prepopulated_blocks`` models a context-side prefix-reuse hit. The receiver
-    still posts one monolithic slice covering the whole prompt (no gen-side reuse),
-    so the block-data comparison below covers the reused prefix too.
-
-    ``boundary_offset_tokens`` makes interior chunk boundaries fall inside a block, so
-    a block is written only by the chunk that finishes computing it.
-    """
+    """Verify chunked sends against one monolithic receive."""
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
 
@@ -2122,12 +2091,7 @@ def test_transfer_worker_pipelined(
 def test_transfer_worker_pipelined_ctx_prefix_reuse(
     ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
 ):
-    """Pipelined transfer with a ctx-side reuse hit still delivers the reused prefix.
-
-    The scheduler's chunks start after the reused prefix, so without the first-slice
-    extension in _build_prefill_chunk those blocks are never written and the
-    generation-side block data diverges.
-    """
+    """Pipelined transfer includes the context-side reused prefix."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     tensorrt_llm.logger.set_level("info")
@@ -2174,11 +2138,7 @@ def test_transfer_worker_pipelined_ctx_prefix_reuse(
 def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
     ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
 ):
-    """Chunk boundaries inside a block: the boundary block waits for the next chunk.
-
-    _build_prefill_chunk rounds both bounds down, so the generation server receives
-    each block exactly once and must still end up with the full prompt.
-    """
+    """Unaligned chunk boundaries still transfer each block once."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     tensorrt_llm.logger.set_level("info")

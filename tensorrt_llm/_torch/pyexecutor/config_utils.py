@@ -18,18 +18,11 @@ def resolve_cache_transceiver_config(
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         return
 
-    # "auto" is normally resolved against the model's preference at config load
-    # time (ModelLoader.load_config_and_apply_defaults); paths that skip that
-    # step (e.g. AutoDeploy) fall back to the C++ transceiver. Collapse it to
-    # None here so every consumer below - including the pipelined-transfer
-    # auto-selection - sees a resolved runtime.
+    # Paths that skip model defaults treat "auto" as the C++ runtime.
     if cache_transceiver_config.transceiver_runtime == "auto":
         cache_transceiver_config.transceiver_runtime = None
 
-    # Resolved for the checks below only; "DEFAULT" is deliberately left on the
-    # config so that _validate_disagg_inflight_cancel_config() can still reject
-    # it as an ambiguous backend. create_kv_cache_transceiver() commits the
-    # resolved value after that validation runs.
+    # Keep "DEFAULT" on the config until in-flight-cancel validation runs.
     effective_backend = cache_transceiver_config.backend
     if effective_backend == "DEFAULT":
         effective_backend, _ = cache_transceiver_config._resolve_default_backend(

@@ -244,12 +244,7 @@ class KvCacheTransceiver(ABC):
         return False
 
     def has_retired_send_session(self, req: LlmRequest) -> bool:
-        """Whether req's send session was torn down before its last slice.
-
-        Tearing it down also drops the peer's receive registration, so no
-        further slice can reach the generation server. The request has to be
-        failed rather than fed another chunk.
-        """
+        """Whether the send session closed before its final slice."""
         return False
 
     @abstractmethod

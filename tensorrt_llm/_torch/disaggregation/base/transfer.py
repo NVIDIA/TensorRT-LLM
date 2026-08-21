@@ -14,15 +14,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 class TokenRange:
     """Half-open token range [start, end) within one request.
 
-    On a ``KVSlice`` this carries one pipelined chunk's window, and its presence
-    is what makes the slice a chunk: only ``_build_prefill_chunk`` produces it,
-    so a monolithic transfer keeps its whole-request addressing untouched.
-
-    Both bounds are block-aligned multiples of ``tokens_per_block``, because the
-    chunk window is decided in block space (the reuse-prefix extension back to
-    block 0, the rounding of the scheduler's bounds, the clamp to the prompt) and
-    the sender divides it back out. An empty range is legal: an empty prompt
-    covers no blocks.
+    ``KVSlice`` ranges are block-aligned. Empty ranges are valid.
     """
 
     start: int
@@ -51,27 +43,12 @@ class LayerRange:
 
 @dataclass
 class KVSlice:
-    """A KV cache slice of one request.
+    """KV-cache blocks for one request transfer slice.
 
-    A single-slice transfer covers the whole request: is_last_slice=True and no
-    ``token_range``, with the extent taken from the session's ``prompt_len``. A
-    pipelined chunk sets ``token_range``, its window in the request's token
-    space. Chunk geometry is decided once by the producer — the reuse-prefix
-    extension back to block 0, the rounding of the scheduler's bounds, the clamp
-    to the prompt end — so the range is block-aligned and the sender reads it
-    rather than rederiving a window from the scheduler's token bounds.
-
-    Per-layer token starts are not carried — the sender derives them from the
-    block count:
-        total_blocks    = ceil(prompt_len / tpb)
-        suffix_end      = token_range.end // tpb, or total_blocks
-        token_start_i   = (suffix_end - len(block_ids_per_layer_groups[i])) * tpb
-    Cached prefix (full-attn or per-layer SWA) shows up only by shrinking the
-    block list. Beam search keeps this field 1-D: beam 0's blocks first,
-    followed by the final unshared block from each remaining beam.
-
-    SWA stale_end is a property of the whole request, so it uses the prompt_len
-    on the session rather than how far this slice reaches.
+    Monolithic transfers omit ``token_range`` and cover ``prompt_len``.
+    Pipelined transfers use a block-aligned ``token_range`` and mark only the
+    final chunk with ``is_last_slice``. Block lists may omit cached or evicted
+    prefixes.
     """
 
     layer_range: Optional[LayerRange] = None

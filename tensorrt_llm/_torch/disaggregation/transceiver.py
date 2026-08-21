@@ -346,19 +346,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         if scratch_blocks < block_ids.size
                         else np.array([], dtype=np.int64)
                     )
-                # A pipelined chunk stops short of the prompt, so drop the pages past
-                # its end (V1 reserves them up front) now that scratch is gone. Only
-                # narrows for a chunk, and chunking requires beam_width == 1, so the
-                # packed beam tail is never at risk here.
+                # V1 may reserve the full prompt before a partial chunk completes.
                 if resident_blocks < prompt_blocks and block_ids.size > resident_blocks:
                     block_ids = block_ids[:resident_blocks]
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, resident_blocks - stale_end)
-                # Stale prefix already pruned above; skip reuse-hit blocks that
-                # land inside the window. Clamp to 0: ctx side has cached_per_lg
-                # synthetically 0, and a reuse hit may fall entirely inside the
-                # stale region (those blocks were already pruned, no extra skip).
+                # Skip reused blocks that remain after stale-prefix pruning.
                 cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
                 # Limit to the slice's blocks, matching C++ cacheFormatter behavior.
@@ -658,17 +652,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 session.close()
 
     def _retire_send_session(self, rid: int, req: Optional[LlmRequest] = None) -> None:
-        """Close a send session and bar any later chunk from re-creating it.
-
-        close() drops the peer's RecvReqInfo (Sender.clear_session) and the
-        receiver never re-sends it, so a session created after this point has
-        no peer to write to and would leave every task in INIT.
-        """
+        """Close a send session and prevent later chunks from recreating it."""
         session = self._send_sessions.pop(rid, None)
         if session is not None:
             session.close()
-        # _send_reqs is only populated once a slice has been built, so an early
-        # teardown has to be handed the request explicitly.
+        # Early teardown may occur before _send_reqs is populated.
         req = req if req is not None else self._send_reqs.get(rid)
         self._send_reqs.pop(rid, None)
         if req is not None:
@@ -731,14 +719,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return self._enable_pipelined_transfer
 
     def has_inflight_transfer(self, req: LlmRequest) -> bool:
-        """Whether transfer resources are still owned for this request.
-
-        Session membership is the ownership record: a session is registered
-        before its first slice is sent and removed only once the transfer is
-        complete, cancelled, or failed. This is deliberately independent of
-        ``req.state``, which tracks the compute phase and lags behind the
-        transfer during pipelined prefill.
-        """
+        """Whether a transfer session still owns this request's resources."""
         rid = get_unique_rid(req)
         return rid in self._send_sessions or rid in self._recv_sessions
 
@@ -750,14 +731,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self,
         req: LlmRequest,
     ) -> Optional[KVSlice]:
-        """
-        Create a KVSlice for a prefill chunk. Project the block IDs to the global chunk.
-
-        Returns None when the chunk completes no block, so there is nothing to send yet.
-
-        Args:
-            req: The context-only request being prefilled.
-        """
+        """Build a slice for completed prefill blocks, or None if none completed."""
         assert req.py_beam_width == 1, "beam_width > 1 is not supported for chunked KV transfer"
         rid = get_unique_rid(req)
         assert rid is not None
@@ -766,18 +740,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         chunk_start_pos, chunk_end_pos = req.py_last_context_chunk
         tpb = self._kv_cache_manager.tokens_per_block
 
-        # First chunk starts at pre-populated prompt length
+        # Include any reused prefix in the first transferred chunk.
         is_first_chunk = chunk_start_pos == req.prepopulated_prompt_len
         is_last_chunk = req.context_remaining_length == 0
-        # The scheduler is free to cut a chunk anywhere. Both bounds round down
-        # The last chunk rounds up instead: its tail is computed and nothing follows.
+        # Defer partial blocks except at the prompt's final chunk.
         chunk_start = 0 if is_first_chunk else chunk_start_pos // tpb
         chunk_end = (
             (chunk_end_pos + tpb - 1) // tpb if is_last_chunk else chunk_end_pos // tpb
         )
 
-        # The next chunk's start rounds down to here, so the skipped blocks travel with
-        # it. The last chunk always sends: it carries is_last_slice.
+        # The final chunk is sent even when it contains no complete block.
         if chunk_end <= chunk_start and not is_last_chunk:
             return None
         chunk_block_count = max(0, chunk_end - chunk_start)
@@ -802,16 +774,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest) -> None:
-        """Start background KV cache transfer to the generation server.
+        """Send the request's next KV slice to the generation server."""
 
-        Creates (or reuses) a ``TxSession`` and sends a KV slice (monolithic or chunked) for each request.
-
-        Args:
-            req: The completed context request whose KV cache to transfer.
-        """
-
-        # Pipelined transfer records the transfer start time of the last slice.
-        # The records of the previous slices are overwritten.
+        # Keep the latest slice's transfer-start timestamp.
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         session = self._get_or_create_send_session(req)
         if session is None:
@@ -826,9 +791,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if slice.is_last_slice:
             self._finalize_send(req, session)
-            # This marks the compute-phase boundary only. Transfer ownership
-            # began at the first session.send() above and is tracked by session
-            # membership (has_inflight_transfer), not by req.state.
+            # Session membership, not request state, tracks transfer ownership.
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
@@ -1203,15 +1166,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
 
     def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:
-        """Whether this rank can pipeline KV cache transfers.
-        """
+        """Return whether this rank supports pipelined KV transfer."""
         if not cfg.enable_pipelined_transfer:
             return False
         blockers = []
-        # Layers split across PP ranks; the sender assumes it owns every block.
+        # The sender requires all layers on one PP rank.
         if self._mapping.pp_size != 1:
             blockers.append(f"pipeline_parallel_size={self._mapping.pp_size}")
-        # Bounce stages a whole request per slice; many slices break that.
+        # Bounce buffers stage a whole request, not individual chunks.
         if cfg.kv_cache_bounce_size_mb != 0:
             blockers.append(f"kv_cache_bounce_size_mb={cfg.kv_cache_bounce_size_mb}")
         if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):

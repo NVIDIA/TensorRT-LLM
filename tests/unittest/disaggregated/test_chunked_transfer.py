@@ -319,11 +319,7 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
 
 
 def test_whole_prompt_chunk_addresses_like_a_monolithic_slice():
-    """A chunk spanning [0, total_blocks) writes exactly what an unpipelined send does.
-
-    This is the degenerate slice _build_prefill_chunk produces when the whole prompt
-    fits in one chunk, so the chunked branch must not perturb its addressing.
-    """
+    """A whole-prompt chunk has monolithic addressing."""
     sender = _make_projection_sender()
     src_per_group = [
         np.arange(8, dtype=np.int64),

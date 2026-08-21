@@ -5574,7 +5574,7 @@ class PyExecutor:
                 raise ValueError("Token ID out of range")
 
     def _validate_request(self, request: LlmRequest):
-        # Validate pipelined kv cache transfer configs
+        # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
         if (self.kv_cache_transceiver is not None
                 and self.kv_cache_transceiver.pipeline_transfer_enabled
@@ -7546,10 +7546,7 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
 
         if self.kv_cache_transceiver:
-            # A pending cancel that could not complete (a chunk was mid-write)
-            # leaves the request active and still being prefilled. Its session
-            # is already CANCELLED, so further chunks would only produce
-            # spurious FAILED results on the receiver.
+            # Do not send more chunks after an in-flight cancellation.
             cancel_pending_ids = set(self.canceled_req_ids)
             for req in scheduled_requests:
                 if req.is_context_only_request and not req.is_finished_due_to_cancellation:
@@ -7572,7 +7569,7 @@ class PyExecutor:
                         # final KV slice and (for the Python transceiver) transitions the request toward completion.
                         self.async_transfer_manager.start_transfer(req)
 
-                        # send KV slice for monolithic transfer or last chunk of pipelined transfer
+                        # Send the monolithic slice or final pipelined chunk.
                         self.kv_cache_transceiver.respond_and_send_async(req)
 
                         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
