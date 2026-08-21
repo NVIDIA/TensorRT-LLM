@@ -8,9 +8,9 @@ Video diffusion transformers repeatedly process long spatiotemporal token sequen
 denoising steps. Linear layers and attention therefore dominate much of the compute, making them
 the two most direct targets for reducing generation latency.
 
-For example, the figure below demonstrates the breakdown of pipeline-forward time for Wan 2.2 T2V-A14B on a single NVIDIA B200. For an 81-frame, 1280×720 video with 50 denoising
-steps, attention and linear-layer GEMMs account for 71.7% and 20.8% of compiled BF16
-pipeline-forward time, respectively.
+Figure 1 breaks down pipeline-forward time for Wan 2.2 T2V-A14B on a single NVIDIA B200. For an
+81-frame, 1280×720 video with 50 denoising steps, attention and linear-layer GEMMs account for
+71.7% and 20.8% of compiled BF16 pipeline-forward time, respectively.
 
 <p align="center">
   <img src="../media/tech_blog28_bf16_time_breakdown.png" alt="Pie chart showing that a compiled dense BF16 path spends 71.7% of pipeline-forward time in attention, 20.8% in GEMMs, and 7.5% in other work" width="1080">
@@ -24,9 +24,9 @@ Our earlier post,
 focused on scale-out. This post covers three complementary acceleration techniques inside one
 transformer pipeline: linear-layer quantization, quantized attention, and sparse attention. On
 the Wan 2.2 workload above, the combination of NVFP4 linear layers, SAGE quantized attention, and
-a conservative Skip Softmax setting reduces pipeline-forward latency from **525.0 to 374.9
-seconds**, a **1.40× speedup**. In this blog, we introduce these optimization techniques and
-discuss the tradeoff between quality and speed.
+Skip Softmax reduces pipeline-forward latency from **525.0 to 374.9
+seconds**, a **1.40× speedup**. The central question is how to recover that time without giving
+up more visual quality than the application can tolerate.
 
 ## Table of Contents
 
@@ -109,8 +109,6 @@ attention precision, and Skip Softmax settings.
 Classifier-free guidance runs at every step by batching the positive and negative branches
 together; CFG parallelism is disabled.
 
-For the FP8 and NVFP4 runs, VisualGen quantizes eligible BF16 weights while loading the model.
-
 The 96 configurations are a characterization sweep, not a recommended per-model tuning cost:
 
 ```text
@@ -129,46 +127,84 @@ handling, and video encoding are outside the measurement.
 ### Quality-speed frontier
 
 Skip Softmax introduces an explicit quality-speed tradeoff. Figure 2 maps every configuration
-instead of reducing the sweep to a few hand-picked points. Circles are skip-enabled runs, stars
-are the no-skip anchors for each precision family, and the dashed line traces the global Pareto
-frontier. Hover over a point for its exact configuration and use the filters to isolate a family,
-target sparsity, or denoising cutoff.
+instead of reducing the sweep to a few hand-picked points. Squares mark runs without Skip Softmax;
+stars mark the conservative configuration (`target_sparsity=0.75`,
+`disabled_until_timestep=0.86`); and triangles mark the aggressive end of the sweep
+(`target_sparsity=0.75`, `disabled_until_timestep=1.00`). The remaining sweep points are circles,
+and the dashed line traces the global Pareto frontier.
 
-<iframe
-  src="../../_static/tech_blog28_quality_speed_frontier.html"
-  title="Interactive quality-speed frontier for the Wan 2.2 optimization sweep"
-  loading="lazy"
-  sandbox="allow-scripts"
-  style="width: 100%; height: 660px; border: 0;"
-></iframe>
+The common speedup baseline is compiled BF16 with dense attention and Skip Softmax disabled. Its
+mean pipeline-forward latency is **525.0 seconds** across the seven prompts, so a point at
+1.40× corresponds to roughly 375 seconds under the same measurement.
 
-<p align="center"><sub><em>Figure 2. Interactive speedup–quality frontier across all 96
+<p align="center">
+  <img src="../media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of speedup versus mean LPIPS for the Wan 2.2 optimization sweep, with squares for runs without Skip Softmax, stars for conservative configurations, triangles for aggressive configurations, and a dashed global Pareto frontier" width="1080">
+</p>
+
+<p align="center"><sub><em>Figure 2. Speedup–quality frontier across all 96
 configurations. LPIPS is measured against eager BF16; speedup is relative to compiled dense
 BF16.</em></sub></p>
 
-<p><a href="../../_static/tech_blog28_quality_speed_frontier.html" target="_blank"
-rel="noopener noreferrer">Open the interactive frontier in a separate page</a>.</p>
+### Frontier analysis
 
-The plot separates into three broad bands. BF16 stays closest to the eager reference. FP8 block
-scaling occupies the middle of the quality-speed range, while NVFP4 reaches the highest speedups
-with a larger shift from BF16. SAGE moves every precision family to the right, and Skip Softmax
-then fills out the local frontier within that family. The denoising cutoff drives most of the
-vertical spread, especially for BF16; target sparsity is the finer adjustment.
+The table below extracts the three marked operating points from each GEMM/attention family. The
+conservative and aggressive configurations both use `target_sparsity=0.75`; they differ in
+`disabled_until_timestep`, which is 0.86 and 1.00, respectively. Latency is mean pipeline-forward
+time across the seven prompts, and LPIPS is measured against the eager BF16 outputs.
 
-### Pipeline-forward latency
+| GEMM/attention quantization | Skip Softmax configuration | Latency (s) | Speedup | Mean LPIPS |
+| :--- | :--- | ---: | ---: | ---: |
+| BF16 | Not enabled | 525.0 | 1.000× | 0.1181 |
+| BF16 | Conservative | 473.9 | 1.108× | 0.1701 |
+| BF16 | Aggressive | 445.5 | 1.179× | 0.4844 |
+| BF16 + SAGE | Not enabled | 486.2 | 1.080× | 0.2562 |
+| BF16 + SAGE | Conservative | 450.0 | 1.167× | 0.2681 |
+| BF16 + SAGE | Aggressive | 429.9 | 1.221× | 0.4883 |
+| FP8 block | Not enabled | 489.2 | 1.073× | 0.4249 |
+| FP8 block | Conservative | 429.5 | 1.223× | 0.4237 |
+| FP8 block | Aggressive | 410.9 | 1.278× | 0.4835 |
+| FP8 block + SAGE | Not enabled | 449.3 | 1.169× | 0.3971 |
+| FP8 block + SAGE | Conservative | 409.3 | 1.283× | 0.3961 |
+| FP8 block + SAGE | Aggressive | 389.3 | 1.349× | 0.4697 |
+| NVFP4 | Not enabled | 471.6 | 1.113× | 0.5042 |
+| NVFP4 | Conservative | 416.0 | 1.262× | 0.5071 |
+| NVFP4 | Aggressive | 389.1 | 1.349× | 0.5319 |
+| NVFP4 + SAGE | Not enabled | 409.7 | 1.281× | 0.5057 |
+| NVFP4 + SAGE | Conservative | 369.5 | 1.421× | 0.5076 |
+| NVFP4 + SAGE | Aggressive | 348.0 | 1.509× | 0.5234 |
 
-Quantizing the linear layers alone improves the dense-attention path to 1.07× with FP8 block
-scaling and 1.11× with NVFP4. SAGE improves each precision family further, with its largest
-incremental gain alongside NVFP4. Adding the conservative Skip Softmax setting brings NVFP4 +
-SAGE to 1.40×.
+The first large quality shift comes from dynamic GEMM quantization. BF16, FP8 block scaling, and
+NVFP4 form distinct LPIPS bands, with lower-precision GEMMs moving progressively higher in the
+plot. These runs quantize eligible weights while loading the model. Offline static quantization
+with ModelOpt can calibrate scales and protect sensitive layers, leaving substantial room to
+improve quality at the same numeric format.
+
+SAGE attention has a smaller quality impact than the dynamic GEMM conversion. The separation
+between the BF16, FP8, and NVFP4 bands is much larger than the separation between SAGE and
+non-SAGE points inside each band, while SAGE consistently moves the operating point toward higher
+speedup.
+
+Skip Softmax then fills the space within each family. `target_sparsity` controls how much work can
+be rejected, while `disabled_until_timestep` controls how early that rejection begins. Together
+they provide a continuum between the conservative stars and aggressive triangles instead of a
+single all-or-nothing sparse mode.
+
+This layered structure explains the Pareto frontier. Almost every frontier point enables Skip
+Softmax, and every FP8 or NVFP4 point on the frontier combines it with SAGE. Dynamic GEMM
+quantization chooses the broad quality band; SAGE and Skip Softmax then recover speed within that
+band.
+
+Figure 3 adds a visual check across all seven prompts. For each GEMM/attention family, the top row
+uses the conservative Skip Softmax configuration and the bottom row uses the aggressive one. The
+eager BF16 output at the left provides a common reference.
 
 <p align="center">
-  <img src="../media/tech_blog28_latency.png" alt="Grouped bar chart showing pipeline-forward latency for BF16, FP8 block-scaled, and NVFP4 linear layers with dense attention, SAGE attention, and SAGE plus conservative Skip Softmax" width="1080">
+  <img src="../media/tech_blog28_visual_comparison.jpg" alt="First-frame comparison across seven prompts, with an eager BF16 reference followed by conservative and aggressive Skip Softmax results for BF16, BF16 plus SAGE, FP8 block, FP8 block plus SAGE, NVFP4, and NVFP4 plus SAGE" width="1080">
 </p>
 
-<p align="center"><sub><em>Figure 3. Pipeline-forward latency as linear-layer quantization, SAGE,
-and conservative Skip Softmax are combined. Speedups are relative to compiled dense BF16; Skip
-Softmax uses `target_sparsity=0.65` and `disabled_until_timestep=0.86`.</em></sub></p>
+<p align="center"><sub><em>Figure 3. First-frame comparison across all seven prompts. Conservative
+uses `target_sparsity=0.75` and `disabled_until_timestep=0.86`; aggressive uses the same target
+sparsity and `disabled_until_timestep=1.00`.</em></sub></p>
 
 ## Reproduction
 
@@ -273,18 +309,31 @@ the Wan precision-cast change from [PR #15318](https://github.com/NVIDIA/TensorR
 Use the same build to match the reported numbers; newer releases can produce different compile
 paths and timing.
 
+### Agentic optimization (TODO)
+
+Finding a useful speed-quality tradeoff by hand is laborious: every candidate must be generated
+across multiple prompts, timed, compared with a quality reference, and folded back into the
+frontier. **TODO:** add an agentic workflow that launches these experiments, analyzes the frontier,
+and proposes the next configurations to evaluate.
+
 ## Conclusion
 
-For the measured Wan 2.2 workload, linear-layer quantization first shifts the dense operating
-point, SAGE quantized attention reduces attention cost, and Skip Softmax provides a final
-quality-speed control. The conservative Skip setting within the NVFP4 + SAGE family reaches
-**1.40×**, while the fastest measured point reaches **1.51×**.
+Accelerating video diffusion is not a single precision switch. It is a process of deciding where
+the pipeline can tolerate lower precision and where it can safely avoid work altogether.
+TensorRT-LLM exposes linear-layer quantization, quantized attention, and Skip Softmax as
+composable controls, so deployments can choose an operating point that matches their own quality
+bar instead of inheriting one fixed recipe.
 
-The practical sequence is to select a calibrated linear-layer precision, then select an attention
-recipe, and finally tune the Skip Softmax denoising cutoff before increasing target sparsity. These
-techniques are orthogonal to the scale-out methods in
+That operating point is model-, prompt-, and hardware-dependent. A useful optimization workflow
+therefore combines representative prompts, deployment-relevant latency, aggregate quality
+metrics, and direct inspection of generated videos. Offline calibration with ModelOpt and a more
+automated frontier search are natural next steps for making this process both more accurate and
+less labor-intensive.
+
+These single-GPU techniques are also orthogonal to the scale-out methods in
 [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md),
-so the same staged reasoning can be combined with multi-GPU parallelism for higher throughput.
+and can be combined with multi-GPU parallelism when the deployment requires higher throughput or
+larger workloads.
 
 ## References
 
