@@ -318,7 +318,6 @@ class Mamba2Mixer(nn.Module):
         num_prefill_tokens = attn_metadata.num_ctx_tokens
         num_decode_tokens = attn_metadata.num_tokens - num_prefill_tokens
         num_actual_tokens = attn_metadata.num_tokens
-        seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         batch_split_size = [num_prefills, num_decodes]
 
         state_indices = mamba_metadata.state_indices[:num_prefills +
@@ -339,7 +338,12 @@ class Mamba2Mixer(nn.Module):
         # Split z and dt with views.
         z = zxbcdt[:, :self.tp_d_inner]
         dt = zxbcdt[:, self.tp_d_inner + self.tp_conv_dim:]
-        dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
+        # Slice instead of exact-sum split: under piecewise CUDA graphs the
+        # token dim is padded to the capture bucket, so hidden_states can
+        # carry more rows than num_actual_tokens; the pad tail belongs to
+        # neither the prefill nor the decode segment.
+        dt_p = dt[:num_prefill_tokens]
+        dt_d = dt[num_prefill_tokens:num_actual_tokens]
 
         # Decode path uses regular view since no transpose is needed.
         xbc_d = zxbcdt[num_prefill_tokens:num_actual_tokens,
@@ -352,11 +356,12 @@ class Mamba2Mixer(nn.Module):
             dtype=zxbcdt.dtype,
             device=zxbcdt.device,
         )
-        preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
-            preallocated_ssm_out,
-            [num_prefill_tokens, num_decode_tokens],
-            dim=0,
-        )
+        # Zero the pad tail (torch.empty) so the full-length gated norm below
+        # sees defined values in pad rows; no-op slice when not padded.
+        preallocated_ssm_out[num_actual_tokens:].zero_()
+        preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
+        preallocated_ssm_out_d = preallocated_ssm_out[
+            num_prefill_tokens:num_actual_tokens]
 
         if num_prefills > 0:
 
@@ -764,14 +769,17 @@ class Mamba2Mixer(nn.Module):
                 )
 
         # norm
-        hidden_states = self.norm(preallocated_ssm_out, z[:num_actual_tokens])
+        # Full padded length through norm/out_proj so the residual stream
+        # keeps a consistent row count (pad rows are zeros; row-wise norm
+        # keeps them finite). The caller trims real tokens via gather_ids.
+        hidden_states = self.norm(preallocated_ssm_out, z)
 
         # out_proj
         out = self.out_proj(hidden_states,
                             lora_params=lora_params,
                             layer_idx=self.layer_idx)
 
-        return out[:num_actual_tokens]
+        return out
 
 
 # We want to cache the largest indexing vector we'd ever need and mask it, vs
