@@ -409,12 +409,12 @@ void initRequestBindings(nb::module_& m)
     auto kvCacheRetentionConfigGetstate = [](tle::KvCacheRetentionConfig const& self)
     {
         return nb::make_tuple(self.getTokenRangeRetentionConfigs(), self.getDecodeRetentionPriority(),
-            self.getDecodeDurationMs(), self.getTransferMode(), self.getDirectory());
+            self.getDecodeDurationMs(), self.getTransferMode(), self.getDirectory(), self.getDiskRetentionMs());
     };
     auto kvCacheRetentionConfigSetstate
         = [](tle::KvCacheRetentionConfig& kvCacheRetentionConfig, nb::tuple const& state)
     {
-        if (state.size() != 5)
+        if (state.size() != 6)
         {
             throw std::runtime_error("Invalid state!");
         }
@@ -422,6 +422,7 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::vector<tle::KvCacheRetentionConfig::TokenRangeRetentionConfig>>(state[0]),
             nb::cast<tle::RetentionPriority>(state[1]), nb::cast<std::optional<std::chrono::milliseconds>>(state[2]),
             nb::cast<tle::KvCacheTransferMode>(state[3]), nb::cast<std::string>(state[4]));
+        kvCacheRetentionConfig.setDiskRetentionMs(nb::cast<std::optional<std::chrono::milliseconds>>(state[5]));
     };
 
     auto kvCacheRetentionConfig = nb::class_<tle::KvCacheRetentionConfig>(m, "KvCacheRetentionConfig");
@@ -455,6 +456,8 @@ void initRequestBindings(nb::module_& m)
         .def_prop_ro("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs)
         .def_prop_ro("transfer_mode", &tle::KvCacheRetentionConfig::getTransferMode)
         .def_prop_ro("directory", &tle::KvCacheRetentionConfig::getDirectory)
+        .def_prop_rw("disk_retention_ms", &tle::KvCacheRetentionConfig::getDiskRetentionMs,
+            &tle::KvCacheRetentionConfig::setDiskRetentionMs)
         .def("__getstate__", kvCacheRetentionConfigGetstate)
         .def("__setstate__", kvCacheRetentionConfigSetstate)
         .def("__eq__", &tle::KvCacheRetentionConfig::operator==);

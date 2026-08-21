@@ -33,8 +33,9 @@ auto const kNumPriorities = kMaxPriority - kMinPriority + 1;
 auto const kDefaultPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority;
 executor::RetentionPriority const kDefaultSecondaryOffloadMinPriority = 30;
 
-int const kNumCacheLevels = 2;
-int const kPlaceholderLevel = kNumCacheLevels; // placeholder blocks live at level 2
+int const kNumCacheLevels = 3;                 // 0 = GPU (primary), 1 = host (secondary), 2 = disk
+int const kDiskLevel = 2;
+int const kPlaceholderLevel = kNumCacheLevels; // placeholders live one past the real cache levels
 
 namespace
 {
@@ -43,6 +44,10 @@ SizeType32 getCacheLevel(BlockPtr const& block)
     if (block->isPlaceholder())
     {
         return kPlaceholderLevel;
+    }
+    if (block->isOnDisk())
+    {
+        return kDiskLevel;
     }
     return block->isPrimary() ? 0 : 1;
 }
@@ -58,6 +63,12 @@ constexpr auto defaultPriorityIdx = getPriorityIdx(kDefaultPriority);
 void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::vector<SizeType32> sizes,
     std::optional<executor::RetentionPriority> secondaryOffloadMinPriority)
 {
+    TLLM_CHECK_WITH_INFO(static_cast<int>(sizes.size()) <= kNumCacheLevels,
+        "initialize expects at most one block count per cache level (%d), got %zu", kNumCacheLevels, sizes.size());
+    // Callers may pass fewer sizes than levels (e.g. legacy {primary, secondary}); missing
+    // trailing levels (disk) default to 0 blocks.
+    auto sizesPadded = sizes;
+    sizesPadded.resize(kNumCacheLevels, 0);
     SizeType32 startIdx = 0;
 
     // Create queues for all levels: primary, secondary, and placeholder (initially empty).
@@ -67,17 +78,26 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
 
     for (SizeType32 cacheLevel = 0; cacheLevel < kNumCacheLevels; cacheLevel++)
     {
-        auto& freeQueue = mFreeQueues[cacheLevel][defaultPriorityIdx];
+        // Poolless disk slots start empty; give them the lowest priority so getFreeBlock
+        // hands out empty slots as spill targets before displacing any cached disk block.
+        bool const isDisk = (cacheLevel == kDiskLevel);
+        SizeType32 const initPriIdx = isDisk ? getPriorityIdx(kMinPriority) : defaultPriorityIdx;
+        auto& freeQueue = mFreeQueues[cacheLevel][initPriIdx];
 
-        for (SizeType32 blockId = 0; blockId < sizes[cacheLevel]; blockId++)
+        for (SizeType32 blockId = 0; blockId < sizesPadded[cacheLevel]; blockId++)
         {
-            // Initialize all blocks to be the default priority level
+            // Keep block priority in lockstep with its bucket so later claim/release
+            // erase from the correct queue.
+            if (isDisk)
+            {
+                mAllBlocksById[startIdx + blockId]->setPriority(kMinPriority);
+            }
             mFreeBlockIterators[startIdx + blockId]
                 = freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]);
         }
 
-        mNumFreeBlocksPerLevel[cacheLevel] = sizes[cacheLevel];
-        startIdx += sizes[cacheLevel];
+        mNumFreeBlocksPerLevel[cacheLevel] = sizesPadded[cacheLevel];
+        startIdx += sizesPadded[cacheLevel];
     }
 
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority.value_or(kDefaultSecondaryOffloadMinPriority);
@@ -105,10 +125,11 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
 
 bool LRUEvictionPolicy::verifyQueueIntegrity() const
 {
-    static char const* const levelToStr[] = {"primary", "secondary", "placeholder"};
+    static char const* const levelToStr[] = {"primary", "secondary", "disk", "placeholder"};
     static const std::function<bool(BlockPtr const&)> levelValidators[]
         = {[](BlockPtr const& block) { return block->isPrimary(); },
-            [](BlockPtr const& block) { return !block->isPrimary(); },
+            [](BlockPtr const& block) { return !block->isPrimary() && !block->isOnDisk() && !block->isPlaceholder(); },
+            [](BlockPtr const& block) { return block->isOnDisk(); },
             [](BlockPtr const& block) { return block->isPlaceholder(); }};
     bool queueCompromised = false;
     for (SizeType32 queueLevel = 0; queueLevel < kNumCacheLevels + 1; queueLevel++)
@@ -158,6 +179,11 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
         }
     }
     TLLM_THROW("No free block found. This shouldn't happen!");
+}
+
+bool LRUEvictionPolicy::isEnqueued(BlockPtr const& block)
+{
+    return mFreeBlockIterators[block->getBlockId()] != std::nullopt;
 }
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)
