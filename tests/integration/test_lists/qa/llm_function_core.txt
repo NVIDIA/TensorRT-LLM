@@ -953,5 +953,5 @@ test_e2e.py::test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus[DeepS
 test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
 test_e2e.py::test_trtllm_multimodal_benchmark_serving
 unittest/llmapi/apps/_test_openai_embeddings.py
-unittest/_torch/modeling/test_modeling_deepseekv3.py
+unittest/_torch/modeling/test_modeling_deepseek_r1.py
 unittest/_torch/modules/test_flashinfer_fused_add_add_rmsnorm.py

@@ -6,11 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import tensorrt_llm._torch.models.modeling_deepseekv3 as deepseekv3
+# DeepSeek-R1 uses TRT-LLM's DeepSeek-V3 architecture implementation.
+import tensorrt_llm._torch.models.modeling_deepseekv3 as deepseek_r1_modeling
 
 
 def _make_gate_case() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
-    mlp = deepseekv3.Deepseekv3MoE.__new__(deepseekv3.Deepseekv3MoE)
+    mlp = deepseek_r1_modeling.Deepseekv3MoE.__new__(deepseek_r1_modeling.Deepseekv3MoE)
     torch.nn.Module.__init__(mlp)
     mlp.allreduce = None
     tensor = SimpleNamespace(
@@ -40,11 +41,11 @@ def _make_gate_case() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace
 
 
 def _enable_gate_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(deepseekv3, "IS_FLASHINFER_AVAILABLE", True)
-    monkeypatch.setattr(deepseekv3, "IS_CUTLASS_DSL_AVAILABLE", True)
-    monkeypatch.setattr(deepseekv3, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(deepseek_r1_modeling, "IS_FLASHINFER_AVAILABLE", True)
+    monkeypatch.setattr(deepseek_r1_modeling, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(deepseek_r1_modeling, "is_sm_100f", lambda: True)
     monkeypatch.setattr(
-        deepseekv3,
+        deepseek_r1_modeling,
         "flashinfer_norm",
         SimpleNamespace(_USE_CUDA_NORM=False),
     )
@@ -55,7 +56,7 @@ def _can_use(
     hidden_states: SimpleNamespace,
     residual: SimpleNamespace,
 ) -> bool:
-    return deepseekv3.DeepseekV3DecoderLayer._can_use_wideep_flashinfer_add_add_rmsnorm(
+    return deepseek_r1_modeling.DeepseekV3DecoderLayer._can_use_wideep_flashinfer_add_add_rmsnorm(
         layer,
         hidden_states=hidden_states,
         residual=residual,
@@ -104,11 +105,11 @@ def test_wideep_flashinfer_add_add_rmsnorm_fails_closed(
     if rejection == "disabled":
         layer.enable_wideep_flashinfer_add_add_rmsnorm = False
     elif rejection == "unsupported_sm":
-        monkeypatch.setattr(deepseekv3, "is_sm_100f", lambda: False)
+        monkeypatch.setattr(deepseek_r1_modeling, "is_sm_100f", lambda: False)
     elif rejection == "cuda_norm":
-        deepseekv3.flashinfer_norm._USE_CUDA_NORM = True
+        deepseek_r1_modeling.flashinfer_norm._USE_CUDA_NORM = True
     elif rejection == "missing_cuda_norm_flag":
-        del deepseekv3.flashinfer_norm._USE_CUDA_NORM
+        del deepseek_r1_modeling.flashinfer_norm._USE_CUDA_NORM
     elif rejection == "not_multi_node":
         layer.mapping.is_multi_node = lambda: False
     elif rejection == "not_attention_dp":
