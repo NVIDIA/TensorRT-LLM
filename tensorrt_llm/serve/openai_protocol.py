@@ -58,6 +58,7 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.logger import logger
 from tensorrt_llm.media.reference import MediaContentFormat, MediaRole
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
@@ -2194,18 +2195,22 @@ class VideoGenerationRequest(OpenAIBaseModel):
 
     @model_validator(mode="after")
     def _check_input_reference_format(self):
-        """Require the deprecated ``input_reference``'s wire form when it is a string.
+        """Fill in the deprecated ``input_reference``'s wire form when omitted.
 
-        A multipart upload carries its own form, so the sibling is only needed
-        for the string spelling.
+        The typed fields require an explicit ``format`` — that is the point of
+        them. This one exists only so callers written against the old API keep
+        working, and those callers sent bare base64, so demanding a new sibling
+        field here would break exactly what the field is for. A multipart
+        upload carries its own form and needs no sibling either way.
         """
         if isinstance(self.input_reference, str):
             if self.input_reference_format is None:
-                raise ValueError(
-                    "'input_reference_format' is required when 'input_reference' is a "
-                    "string; send 'path', 'url' or 'base64' (or upload the file via "
-                    "multipart/form-data)")
-            if self.input_reference_format == "bytes":
+                logger.warning(
+                    "'input_reference' without 'input_reference_format' is read as "
+                    "base64; both are deprecated, use 'image_reference' / "
+                    "'video_reference' with an explicit format.")
+                self.input_reference_format = "base64"
+            elif self.input_reference_format == "bytes":
                 raise ValueError(
                     "input_reference_format='bytes' cannot be carried in JSON; upload "
                     "the file as multipart/form-data, or send 'base64'")

@@ -1589,3 +1589,48 @@ class TestEngineFailureTransport:
         assert events == ["prepare", "warmup_cache_key", "infer"]
         executor.pipeline.request_warmup_cache_key.assert_called_once_with(req)
         executor.pipeline.run_inference.assert_called_once_with(req)
+
+
+class TestDeprecatedInputReferenceStaysCompatible:
+    """The deprecated field exists so old callers keep working.
+
+    Callers written against the old API sent bare base64 with no sibling
+    format, so requiring one here would break exactly what the field is for.
+    The typed fields still demand an explicit format — that distinction is the
+    point.
+    """
+
+    def test_bare_base64_is_read_as_base64(self):
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        request = VideoGenerationRequest(prompt="x", input_reference="aGk=")
+
+        assert request.input_reference_format == "base64"
+
+    def test_an_explicit_format_still_wins(self):
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        request = VideoGenerationRequest(
+            prompt="x", input_reference="/tmp/ref.png", input_reference_format="path"
+        )
+
+        assert request.input_reference_format == "path"
+
+    def test_bytes_over_json_is_still_rejected(self):
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        with pytest.raises(ValidationError, match="cannot be carried in JSON"):
+            VideoGenerationRequest(
+                prompt="x", input_reference="aGk=", input_reference_format="bytes"
+            )
+
+    def test_the_typed_field_still_requires_a_format(self):
+        """Relaxing the deprecated alias must not relax the new API."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+
+        with pytest.raises(ValidationError):
+            VideoGenerationRequest(prompt="x", image_reference="aGk=")
