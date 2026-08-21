@@ -1235,6 +1235,48 @@ class TestReferenceBroadcastSplit:
         gc.collect()
         assert not any(b.exists() for b in blocks)
 
+    def test_a_request_that_never_ships_hands_its_blocks_back(self):
+        """The blocks staying reachable is only half of it; the call site is
+        what has to hand them back when the request never reaches rank0."""
+        import gc
+        import itertools
+        from types import SimpleNamespace
+
+        from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+        from tensorrt_llm.visual_gen.params import MediaRef
+
+        taken = {}
+        blocks_of = self._blocks_of
+
+        class _DeadExecutor:
+            default_generation_params = {}
+            extra_param_specs = {}
+            ref_slot_specs = None
+
+            def enqueue_requests(self, requests):
+                # Read the handles while they still exist, then fail the way a
+                # dead worker queue would.
+                taken["blocks"] = blocks_of(requests[0])
+                raise RuntimeError("worker queue is gone")
+
+        caller = SimpleNamespace(
+            _req_counter=itertools.count(),
+            default_params=VisualGenParams(),
+            executor=_DeadExecutor(),
+        )
+        buf = BytesIO()
+        # A real PNG: the engine choke point content-checks before the handles
+        # are minted, so random bytes never get far enough to take a block.
+        Image.new("RGB", (256, 256)).save(buf, format="PNG")
+        params = VisualGenParams(image_reference=[MediaRef(content=buf.getvalue(), format="bytes")])
+
+        with pytest.raises(RuntimeError, match="worker queue is gone"):
+            VisualGen.generate_async(caller, "x", params)
+
+        assert taken["blocks"], "the request must have taken a block to begin with"
+        gc.collect()
+        assert not any(b.exists() for b in taken["blocks"])
+
 
 class TestSafeLocalFileRead:
     """A ``path`` reference bounds what an unlucky path can cost.
