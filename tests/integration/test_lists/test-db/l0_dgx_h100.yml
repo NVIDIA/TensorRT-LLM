@@ -35,31 +35,15 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-False]
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync[python]
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python[cache_mgr_v1]
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python[cache_mgr_v2]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-False-False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-False-True]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-True-False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-False-True-True]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-True-False-False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-True-False-True]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-True-True-False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False-True-True-True]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-False-False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-False-True]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-True-False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-False-True-True]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-False-False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-False-True]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-True-False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True-True-True-True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[block_reuse]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[ctx_block_reuse_only]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[no_block_reuse]
   - unittest/llmapi/apps/test_disagg_serving_perf_metrics.py
   - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
   # llmapi
@@ -100,6 +84,11 @@ l0_dgx_h100:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
+  # unittest/_torch/multi_gpu is otherwise only collected by the 2-GPU stage, so
+  # the 4-rank cases of the KV-pool rebalance agreement test (tp4, pp4, CP x TP,
+  # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
+  # the file here so those compositions actually run.
+  - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
   # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
@@ -217,9 +206,7 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding_4gpus[attention_dp=True-mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_4gpus[xgrammar-mtp_nextn=2]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_mpi[DeepSeek-V3-Lite-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one[DeepSeek-V3-Lite-fp8]
@@ -313,6 +300,7 @@ l0_dgx_h100:
     - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[tep2]
     - examples/test_ray.py::test_ray_disaggregated_serving[tp1]
+    - examples/test_ray.py::test_ray_disaggregated_serving_python[tp1]
 - condition:
     ranges:
       system_gpu_count:

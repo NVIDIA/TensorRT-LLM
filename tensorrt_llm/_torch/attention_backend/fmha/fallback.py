@@ -133,6 +133,8 @@ class FallbackFmha(Fmha):
             quant_scale_qkv=forward_args.quant_scale_qkv,
             dsv4_inv_rope_cos_sin_cache=forward_args.dsv4_inv_rope_cos_sin_cache,
             enable_dsv4_epilogue_fusion=forward_args.enable_dsv4_epilogue_fusion,
+            kv_norm_weight=forward_args.kv_norm_weight,
+            kv_norm_eps=forward_args.kv_norm_eps,
             sage_attn_num_elts_per_blk_q=forward_args.sage_attn_num_elts_per_blk_q,
             sage_attn_num_elts_per_blk_k=forward_args.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=forward_args.sage_attn_num_elts_per_blk_v,

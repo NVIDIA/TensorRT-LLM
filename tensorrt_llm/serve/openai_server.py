@@ -75,7 +75,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatMessage, CompletionRequest, CompletionResponse,
     CompletionResponseChoice, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
+    EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse, ImageEditRequest,
     ImageGenerationRequest, ImageGenerationResponse, ImageObject,
     MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
     ResponseFormat, ResponsesRequest, ResponsesResponse, TokenizeRequest,
@@ -104,7 +104,8 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import \
     build_visual_gen_timing_headers
-from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
+from tensorrt_llm.serve.visual_gen_utils import (
+    cleanup_materialized_conditioning_inputs, parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
@@ -179,6 +180,30 @@ if _MSGSPEC_ENABLED:
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+_warned_unresolvable_thinking = False
+
+
+def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
+    """Warn when a generation worker cannot learn the reasoning mode.
+
+    Nothing was rendered here and the context worker relayed no value, so
+    every request on this deployment is parsed in a possibly wrong mode with
+    nothing in the response saying so. Reachable via a rolling upgrade where
+    the context worker predates `resolved_thinking`, a hand-crafted
+    `generation_only` request, or an orchestration path that does not go
+    through `_get_ctx_request`.
+    """
+    global _warned_unresolvable_thinking
+    if _warned_unresolvable_thinking:
+        return
+    _warned_unresolvable_thinking = True
+    logger.warning(
+        f"Reasoning parser {reasoning_parser!r} resolves its mode from the "
+        "rendered prompt, but this request had neither a rendered prompt nor "
+        "a relayed mode from a context worker. Reasoning content will not be "
+        "separated correctly. Check that the context worker is running a "
+        "build that relays 'resolved_thinking'.")
 
 
 def _configure_parser_special_token_decoding(
@@ -293,6 +318,30 @@ def _normalize_image_output(image) -> list:
     if hasattr(image, "dim") and image.dim() == 4:
         return [image[i] for i in range(image.shape[0])]
     return [image]
+
+
+def _image_output_size(image) -> Optional[str]:
+    pil_size = getattr(image, "size", None)
+    if isinstance(pil_size, tuple) and len(pil_size) >= 2:
+        width, height = pil_size[:2]
+        return f"{int(width)}x{int(height)}"
+
+    shape = getattr(image, "shape", None)
+    if shape is None:
+        return None
+
+    dims = tuple(int(dim) for dim in shape)
+    if len(dims) == 2:
+        height, width = dims
+    elif len(dims) == 3:
+        if dims[0] in (1, 3, 4) and dims[1] > 4 and dims[2] > 4:
+            height, width = dims[1], dims[2]
+        else:
+            height, width = dims[0], dims[1]
+    else:
+        return None
+
+    return f"{width}x{height}"
 
 
 class OpenAIServer(_VideoRoutesMixin):
@@ -558,6 +607,24 @@ class OpenAIServer(_VideoRoutesMixin):
                       "/tmp/trtllm_generated"))  # nosec B108
         self.media_storage_path.mkdir(exist_ok=True, parents=True)
         self.video_gen_tasks = {}
+
+    def _supports_image_edit(self) -> bool:
+        if not self._is_visual_gen:
+            return False
+
+        executor = getattr(self.generator, "executor", None)
+        if executor is None:
+            return False
+
+        pipeline = getattr(executor, "pipeline", None)
+        if pipeline is not None:
+            return bool(getattr(pipeline, "supports_image_edit", False))
+
+        supports_image_edit = getattr(executor, "supports_image_edit", None)
+        if supports_image_edit is not None:
+            return bool(supports_image_edit)
+
+        return False
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
@@ -1533,6 +1600,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            # Pre-render, so the mode may be unresolved. Safe because the
+            # boundary lookup reads the parser class attributes, not the
+            # branch `__init__` picked.
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -1584,6 +1654,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     base64.b64decode(request.prompt_token_ids_b64),
                     dtype=np.int32).tolist()
 
+            rendered_prompt = None
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -1601,6 +1672,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
+                if isinstance(prompt, str):
+                    rendered_prompt = prompt
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -1620,6 +1693,31 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
+            # Templates that prefill <think>/</think> leave the marker in the
+            # prompt, so the request kwargs alone cannot tell the parser which
+            # mode was rendered. Take it from the prompt instead.
+            if postproc_args.reasoning_parser and (
+                    ReasoningParserFactory.resolves_thinking_from_prompt(
+                        postproc_args.reasoning_parser)):
+                thinking = None
+                if rendered_prompt and request.add_generation_prompt:
+                    thinking = ReasoningParserFactory.resolve_prefilled_thinking(
+                        postproc_args.reasoning_parser, rendered_prompt)
+                if thinking is None and request.disaggregated_params is not None:
+                    # Generation worker: it never rendered, so use the mode the
+                    # context worker resolved and relayed.
+                    thinking = request.disaggregated_params.resolved_thinking
+                    if thinking is None:
+                        _warn_unresolvable_thinking_once(
+                            postproc_args.reasoning_parser)
+                if thinking is not None:
+                    # Both keys, because the parser ORs them: leaving a stale
+                    # `thinking` in place would override what we resolved.
+                    postproc_args.chat_template_kwargs = {
+                        **(request.chat_template_kwargs or {}),
+                        "thinking": thinking,
+                        "enable_thinking": thinking,
+                    }
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(
@@ -2391,6 +2489,9 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content={"status": "success"})
 
     async def get_server_info(self) -> JSONResponse:
+        # Note: calling self.generator.disaggregated_params and startup_metrics below
+        # may trigger an RPC sync call, blocking the server event loop. Since this server_info
+        # is usually called only once before accepting requests, it's not a big concern.
         content = {"disaggregated_params": self.generator.disaggregated_params}
         args = getattr(self.generator, "args", None)
         if args is not None:
@@ -2405,6 +2506,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 if kv_cache_config.tokens_per_block is not None:
                     content[
                         "tokens_per_block"] = kv_cache_config.tokens_per_block
+        content["startup_metrics"] = getattr(self.generator, "startup_metrics",
+                                             {})
         return JSONResponse(content=content)
 
     async def openai_image_generation(self, request: ImageGenerationRequest,
@@ -2576,18 +2679,160 @@ class OpenAIServer(_VideoRoutesMixin):
         base = str(raw_request.base_url).rstrip("/")
         return f"{base}/v1/images/{image_id}/content?i={i}"
 
-    async def openai_image_edit(self, raw_request: Request) -> Response:
-        """OpenAI-compatible image editing endpoint — returns HTTP 501.
+    async def _parse_image_edit_request(
+        self,
+        raw_request: Request,
+    ) -> ImageEditRequest:
+        """Parse an image edit request from JSON or multipart form data."""
+        content_type = raw_request.headers.get("content-type", "")
+        normalized_content_type = content_type.lower()
 
-        No in-tree pipeline implements image editing today: Flux/Flux2 are
-        text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-        video, not edited images. The route is registered so callers get an
-        honest NotImplemented signal instead of a 404. The request body is
-        not parsed because no schema is committed for this endpoint yet —
-        bring a typed request model back when an edit-capable pipeline lands.
-        """
-        return self._create_not_supported_error(
-            "Image editing is not supported by any in-tree pipeline yet.")
+        if "application/json" in normalized_content_type:
+            body = await raw_request.json()
+            if not isinstance(body, dict):
+                raise ValueError(
+                    "JSON image edit request body must be an object")
+            return ImageEditRequest(**body)
+
+        if "multipart/form-data" in normalized_content_type:
+            form = await raw_request.form()
+            data = {}
+            for key in form:
+                values = form.getlist(key)
+                if key == "image":
+                    values = [
+                        value for value in values
+                        if not (isinstance(value, str) and value == "")
+                    ]
+                    if not values:
+                        continue
+                    data[key] = values if len(values) > 1 else values[-1]
+                    continue
+
+                value = values[-1]
+                if key == "extra_params":
+                    if value == "":
+                        continue
+                    if not isinstance(value, str):
+                        raise ValueError(
+                            "'extra_params' must be a JSON object string")
+                    try:
+                        data[key] = json.loads(value)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        raise ValueError(
+                            f"'extra_params' must be a JSON object string; {exc}"
+                        ) from exc
+                    continue
+                if value == "":
+                    continue
+                data[key] = value
+            return ImageEditRequest(**data)
+
+        raise ValueError(
+            f"Unsupported content-type: {content_type}. Use 'application/json' or 'multipart/form-data'"
+        )
+
+    async def openai_image_edit(self, raw_request: Request) -> Response:
+        """OpenAI-compatible image editing endpoint."""
+        if not self._supports_image_edit():
+            return self._create_not_supported_error(
+                "Image editing is not supported by the loaded visual generation model."
+            )
+
+        try:
+            image_id = f"image_{uuid.uuid4().hex}"
+            input_paths = None
+
+            try:
+                request = await self._parse_image_edit_request(raw_request)
+                params = parse_visual_gen_params(
+                    request,
+                    image_id,
+                    self.generator,
+                    media_storage_path=str(self.media_storage_path),
+                )
+                input_paths = params.image
+                logger.info(
+                    f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
+                )
+                image_edit_start = time.perf_counter()
+                try:
+                    output = self.generator.generate(inputs=request.prompt,
+                                                     params=params)
+                finally:
+                    cleanup_materialized_conditioning_inputs(input_paths)
+            except ValidationError as exc:
+                return self._render_pydantic_validation_error(exc)
+            except ValueError as exc:
+                logger.error(f"Image edit request error: {exc}")
+                return self.create_error_response(
+                    message=str(exc),
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
+            if output.image is None:
+                return self.create_error_response(
+                    message="Image editing failed",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
+            # Model-specific ``extra_params`` stay pipeline-owned. Layered
+            # image-edit models such as Qwen-Image-Layered use
+            # ``save_layers_to_grid`` to pack all layers into one image here.
+            output_images = _normalize_image_output(output.image)
+            output_size = _image_output_size(
+                output_images[0]) if output_images else None
+            pil_format = request.output_format.upper()
+            ext = f".{request.output_format}"
+            if request.response_format == "b64_json":
+                data = [
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            image_to_bytes(image,
+                                           format=pil_format)).decode("utf-8"),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
+                ]
+            else:
+                data = []
+                for i, image in enumerate(output_images):
+                    path = self.media_storage_path / f"{image_id}_{i}{ext}"
+                    path.write_bytes(image_to_bytes(image, format=pil_format))
+                    data.append(
+                        ImageObject(
+                            url=self._build_image_content_url(
+                                raw_request, image_id, i),
+                            revised_prompt=request.prompt,
+                        ))
+
+            response = ImageGenerationResponse(
+                created=int(time.time()),
+                data=data,
+                output_format=request.output_format,
+                size=output_size,
+            )
+
+            latency = time.perf_counter() - image_edit_start
+            metrics = output.metrics
+            generation = metrics.generation if metrics is not None else 0.0
+            denoise = metrics.denoise if metrics is not None else 0.0
+            logger.info(f"Image {image_id} edited and encoded: "
+                        f"latency={latency:.3f}s generation={generation:.3f}s "
+                        f"denoise={denoise:.3f}s")
+            headers = build_visual_gen_timing_headers(metrics)
+
+            return JSONResponse(content=response.model_dump(), headers=headers)
+
+        except ValidationError as exc:
+            return self._render_pydantic_validation_error(exc)
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(
+                message=str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     async def __call__(self,
                        host,

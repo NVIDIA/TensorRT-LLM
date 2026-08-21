@@ -1,11 +1,30 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # docker buildx build -t tensorrt-llm:{timestamp}_docker_dind_withbash -f jenkins/docker/Dockerfile.dind . --builder=multi-builder --platform linux/arm64,linux/amd64
 
-FROM docker:dind
+FROM docker:29.5.3-dind
 
-RUN apk add --no-cache bash git make python3 py3-pip
+RUN apk add --no-cache bash git make python3 py3-pip wget
 
 ENV PATH=/usr/local/cmake/bin:$PATH
-ENV ENV=${ENV:-/etc/shinit_v2}
+ENV ENV=/etc/shinit_v2
+COPY jenkins/docker/dind_mtu.sh jenkins/docker/test_dind_mtu.sh /tmp/dind-mtu/
+RUN chmod 0755 /tmp/dind-mtu/*.sh && \
+    /tmp/dind-mtu/test_dind_mtu.sh && \
+    mv /tmp/dind-mtu/dind_mtu.sh /usr/local/bin/dind-mtu && \
+    rm -rf /tmp/dind-mtu
 COPY docker/common/install_cmake.sh install_cmake.sh
 RUN bash ./install_cmake.sh && rm install_cmake.sh
 

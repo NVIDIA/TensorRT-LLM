@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -174,6 +175,14 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         self._prepare_sparse_forward_args(metadata, forward_args)
         return super().forward(q, k, v, metadata, forward_args=forward_args)
 
+    def _unit_scale(self, like: torch.Tensor) -> torch.Tensor:
+        """Cached [1.0], for scale pointers the Triton kernel cannot take as null."""
+        cached = getattr(self, "_unit_scale_tensor", None)
+        if cached is None or cached.device != like.device:
+            cached = torch.ones(1, dtype=torch.float32, device=like.device)
+            self._unit_scale_tensor = cached
+        return cached
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
@@ -243,6 +252,41 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             block_table_compressed = None
             compressed_local_indices = None
 
+        # FMHA scheduler prologue: this kernel is the last one before FMHA, so it owns
+        # the tile-counter reset and bmm scale derivation the MLA RoPE kernels used to
+        # do two launches earlier. Generation only -- context uses the attention
+        # workspace.
+        sched_kwargs = {}
+        if (
+            attention_input_type == AttentionInputType.generation_only
+            and has_fp8_kv_cache
+            and forward_args.fmha_scheduler_counter is not None
+            and forward_args.mla_bmm1_scale is not None
+            and forward_args.mla_bmm2_scale is not None
+        ):
+            sched_kwargs = dict(
+                fmha_tile_counter=forward_args.fmha_scheduler_counter,
+                bmm1_scale=forward_args.mla_bmm1_scale,
+                bmm2_scale=forward_args.mla_bmm2_scale,
+                # Mirrors attentionOp.cpp: quant_scale_o is the attention-output
+                # quant scale, and both dequant scales are the KV cache scale.
+                # The Triton kernel always dereferences quant_scale_o, so an absent
+                # out_scale needs an explicit 1.0 -- the value mlaKernels.cu:490
+                # substitutes for a null pointer. Falling back to the KV scale here
+                # would square it into bmm2.
+                quant_scale_o=(
+                    forward_args.out_scale
+                    if forward_args.out_scale is not None
+                    else self._unit_scale(self.kv_scale_quant_orig)
+                ),
+                dequant_scale_q=self.kv_scale_quant_orig,
+                dequant_scale_kv=self.kv_scale_quant_orig,
+                host_bmm1_scale=1.0
+                / (
+                    self.q_scaling * math.sqrt(float(self.qk_nope_head_dim + self.qk_rope_head_dim))
+                ),
+            )
+
         global_indices = deepseek_v4_local_to_global_indices(
             req_id=req_id,
             block_table_swa=block_table_swa,
@@ -257,6 +301,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compressed_buffer_ptr=compressed_buffer_ptr,
             compress_ratio=self.compress_ratio,
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
+            **sched_kwargs,
         )
 
         return global_indices, None

@@ -61,6 +61,26 @@ def _cache_device(meta) -> torch.device:
     return torch.device(f"cuda:{torch.cuda.current_device()}")
 
 
+def _stage_sparse_plan_kv_lens_host(plan: tuple, kv_lens_cpu: torch.Tensor) -> None:
+    """Give the sparse-prefill sub-plan a host copy of its kv_segment_lens.
+
+    sparse_fmha._build_page_table runs once per sparse layer and reads
+    plan["kv_segment_lens"] with .tolist(), which blocks on a D2H copy while
+    that tensor lives on the device. The page table still builds on the device
+    from kv_indices, so the host copy adds no work. Only the sparse-prefill
+    sub-plan (MM-SA-Nv) qualifies: decode and dense plans need their lengths on
+    the device for the kernel.
+    """
+    has_mixed, split = plan[0], plan[1]
+    # A non-mixed batch has one sparse sub-plan (plan[3]); a mixed batch puts
+    # the sparse prefill rows in plan[4], after the split decode rows.
+    sparse_dict = plan[4] if has_mixed else plan[3]
+    if sparse_dict is None or not sparse_dict.get("MM-SA-Nv"):
+        return
+    lens = kv_lens_cpu[split:] if has_mixed else kv_lens_cpu
+    sparse_dict["kv_segment_lens"] = lens.to(torch.int32).contiguous()
+
+
 def _worst_case_proxy_max_k_tiles(
     fmha_sm100,
     *,
@@ -585,6 +605,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_eager_proxy_plan = proxy_plan
             self._msa_eager_gqa_plan = gqa_plan
             self._msa_eager_dense_plan = dense_plan
+            _stage_sparse_plan_kv_lens_host(gqa_plan, kv_lens_cpu)
             # Stage the valid-block count to the device once for the whole step
             # (see _msa_eager_n_valid_blocks).
             n_valid_host = per_token_valid_blocks(

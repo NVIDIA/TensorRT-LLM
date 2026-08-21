@@ -61,13 +61,13 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 )
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -82,6 +82,14 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
+
+# Keep standalone TxSession waits responsive to cancellation even when callers
+# do not configure a sender-future wait slice.
+_FALLBACK_TX_WAIT_SLICE_S = 1.0
+# Keep direct/standalone TxSession block-all waits finite when the caller omits
+# an overall deadline. KvCacheTransceiverV2 requires a configured transfer
+# timeout before it creates either sender or receiver sessions.
+_FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
 @dataclass
@@ -166,6 +174,16 @@ class MessageType:
     REGISTER_RANK_INFO = b"REGISTER_RANK_INFO"
     AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
     CANCEL_SESSION = b"CANCEL_SESSION"
+
+
+class PeerIncompatibleError(ValueError):
+    """A context peer failed the KV/recurrent-state layout compatibility check.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers still
+    match, while letting dispatch_task catch peer incompatibility narrowly and
+    fail only the requests targeting that peer instead of crashing the
+    executor loop.
+    """
 
 
 class TaskStatus(Enum):
@@ -1231,12 +1249,15 @@ class TxSession(TxSessionBase):
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
         beam_width: int = 1,
+        overall_timeout_s: Optional[float] = None,
     ):
         super().__init__(
             sender,
             SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
         )
         self._timeout_s = timeout_s
+        self._overall_timeout_s = overall_timeout_s
+        self._deadline_monotonic_s: Optional[float] = None
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
@@ -1287,6 +1308,11 @@ class TxSession(TxSessionBase):
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
+            if not self.kv_tasks:
+                overall_timeout_s = self._overall_timeout_s
+                if overall_timeout_s is None or overall_timeout_s <= 0:
+                    overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+                self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(
@@ -1363,11 +1389,15 @@ class TxSession(TxSessionBase):
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
         """Poll or block until KV (and optionally aux) transfer finishes.
 
-        With blocking=True (default): waits up to _timeout_s for each task.
+        With blocking=True (default): retries bounded wait slices until the
+        transfer finishes or its overall deadline expires. Deadline expiry is
+        nonterminal: callers must retain the session and its KV pages because
+        peer writes may still be active. Errors and cancellation remain
+        terminal, but likewise do not prove that peer writes quiesced.
         With blocking=False: polls non-blockingly; returns None if any KV task
         or aux is not yet done.
         """
-        if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+        if self.has_failed():
             return WaitResult.FAILED
         if not self.kv_tasks:
             return None
@@ -1389,17 +1419,77 @@ class TxSession(TxSessionBase):
                     return None
             return WaitResult.COMPLETED
 
+        # send() normally anchors this once, at the first dispatched KV task.
+        # Keep direct/internal TxSession construction bounded as well, and never
+        # reset the deadline on a later block-all call.
+        if self._deadline_monotonic_s is None:
+            overall_timeout_s = self._overall_timeout_s
+            if overall_timeout_s is None or overall_timeout_s <= 0:
+                overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+            with self.lock:
+                if self._deadline_monotonic_s is None:
+                    self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+
+        # ``_timeout_s`` bounds one scheduler wait slice. The separate absolute
+        # deadline is shared by every KV task and aux; it is never reset by a
+        # later wait_complete() call.
+        wait_slice_s = self._timeout_s
+        if wait_slice_s is None or wait_slice_s <= 0:
+            wait_slice_s = _FALLBACK_TX_WAIT_SLICE_S
+
+        def wait_for_task(task: SendTaskBase) -> WaitResult:
+            while True:
+                # A task/session terminal state observed at the deadline
+                # boundary takes precedence over TIMEOUT.
+                if self.has_failed():
+                    return WaitResult.FAILED
+                if task.status == TaskStatus.TRANSFERRED:
+                    return WaitResult.COMPLETED
+
+                remaining_s = None
+                if self._deadline_monotonic_s is not None:
+                    remaining_s = self._deadline_monotonic_s - time.monotonic()
+                    if remaining_s <= 0:
+                        # The worker can publish terminal state between the
+                        # checks above and the clock read. Preserve boundary
+                        # precedence before classifying this as a timeout.
+                        if self.has_failed():
+                            return WaitResult.FAILED
+                        if task.status == TaskStatus.TRANSFERRED:
+                            return WaitResult.COMPLETED
+                        return WaitResult.TIMEOUT
+                timeout_s = wait_slice_s if remaining_s is None else min(wait_slice_s, remaining_s)
+                task.wait(timeout=timeout_s)
+
+        # A bounded slice keeps cancellation and sibling failure observable.
         for task in self.kv_tasks:
-            if not task.wait(timeout=self._timeout_s):
-                return WaitResult.TIMEOUT
-            if task.status == TaskStatus.ERROR:
+            result = wait_for_task(task)
+            if result != WaitResult.COMPLETED:
+                return result
+        if self._need_aux:
+            if self.aux_task is None:
+                # _finalize_send() installs the aux task synchronously before
+                # publishing the request to _send_reqs. Once every KV task is
+                # terminal, a missing required aux task is an invariant error,
+                # not an asynchronously pending transfer.
+                with self.lock:
+                    if self._terminal_status not in (
+                        SessionStatus.ERROR,
+                        SessionStatus.CANCELLED,
+                    ):
+                        self._exception = RuntimeError(
+                            "required auxiliary transfer was not dispatched"
+                        )
+                        self._terminal_status = SessionStatus.ERROR
                 return WaitResult.FAILED
-        if self._need_aux and self.aux_task is not None:
-            if not self.aux_task.wait(timeout=self._timeout_s):
-                return WaitResult.TIMEOUT
-            if self.aux_task.status == TaskStatus.ERROR:
-                return WaitResult.FAILED
-        return WaitResult.COMPLETED
+            result = wait_for_task(self.aux_task)
+            if result != WaitResult.COMPLETED:
+                return result
+        return (
+            WaitResult.FAILED
+            if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+            else WaitResult.COMPLETED
+        )
 
     def set_exception(self, reason: str = ""):
         msg = f"TxSession {self.disagg_request_id} exception"
@@ -1506,6 +1596,11 @@ class Receiver(ReceiverBase):
         self._bounce = bounce
         self._dealers = {}
         self._sender_ep_instance_map = {}
+        # info_endpoint -> diagnostic message for peers that failed the
+        # compatibility check. Requests targeting such a peer fail fast
+        # without re-validating. Executor-thread-only access, no lock (same
+        # discipline as _sender_ep_instance_map).
+        self._incompatible_peers: dict[str, str] = {}
 
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._sessions = {}  # unique_rid -> RxSession
@@ -1587,7 +1682,11 @@ class Receiver(ReceiverBase):
         )
 
     @staticmethod
-    def _fanin_bounce_safe(overlap, peer_ri) -> bool:
+    def _fanin_bounce_safe(
+        overlap: PeerOverlap,
+        peer_ri: RankInfo,
+        receiver_page_table: Optional[KVCachePageTable],
+    ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
           * duplicate_head_factor == 1 -- else some ranks don't send KV (should_send_kv) yet still
@@ -1607,22 +1706,46 @@ class Receiver(ReceiverBase):
                 return False
         # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
         # fan-in owner only, so with multiple writers their contributions
-        # differ in size and the equal split is invalid.
-        if len(overlap.ranks) > 1 and peer_ri.page_table is not None:
-            for layer_group in peer_ri.page_table.layer_groups:
-                for pool_view in getattr(layer_group, "pool_views", ()):
-                    if pool_view.mapper_kind == MapperKind.REPLICATED:
-                        return False
+        # differ in size and the equal split is invalid. Inspect both endpoints:
+        # a masked PP stage may advertise no replicated view even though another
+        # stage owns one that is visible in the receiver's page table.
+        if len(overlap.ranks) > 1:
+            for page_table in (peer_ri.page_table, receiver_page_table):
+                if page_table is None:
+                    continue
+                for layer_group in page_table.layer_groups:
+                    for pool_view in getattr(layer_group, "pool_views", ()):
+                        if pool_view.mapper_kind == MapperKind.REPLICATED:
+                            return False
         return True
 
-    def dispatch_task(self, task: KVRecvTask):
+    def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
         logger.debug(
             f"Receiver.dispatch_task: unique_rid={task._unique_rid}, ctx_dp_rank={params.ctx_dp_rank}"
         )
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
-        peer_infos: RankInfo = self._get_sender_info(params)
+        try:
+            peer_infos: RankInfo = self._get_sender_info(params)
+        except PeerIncompatibleError as e:
+            # Fail only this request via the normal transfer-error path
+            # (task ERROR -> session ERROR -> WaitResult.FAILED ->
+            # DISAGG_TRANS_ERROR), so one incompatible context peer does not
+            # take down the whole generation worker. The async path's
+            # cross-rank consensus unions failed rids, so the request fails
+            # globally once any rank fails here — ranks whose page table has
+            # no recurrent layers (e.g. a hybrid-model PP stage) pass
+            # validation and may still run a transfer that is then
+            # discarded. The task is already in the session's _kv_tasks, no
+            # bounce reservation exists yet, and session._sender_endpoints
+            # is still empty, so no cleanup is needed here.
+            logger.error(
+                "dispatch_task: context peer incompatible, failing request "
+                f"unique_rid={task._unique_rid}: {e}"
+            )
+            task.fail(e)
+            return
 
         if sender_dp_rank is not None:
             # Normal path: ctx_dp_rank is known, send to overlapping ranks.
@@ -1657,7 +1780,12 @@ class Receiver(ReceiverBase):
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
         allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None and self._fanin_bounce_safe(topo_overlap, peer_infos)
+            sender_dp_rank is not None
+            and self._fanin_bounce_safe(
+                topo_overlap,
+                peer_infos,
+                self._registrar.self_extractor.page_table,
+            )
         )
         # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks (the sender
         # appends its MambaPolicy fragments in _build_kv_write_meta), so the bounce region must be
@@ -1723,6 +1851,10 @@ class Receiver(ReceiverBase):
 
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)
+        if info_endpoint in self._incompatible_peers:
+            # Known-incompatible peer: fail fast without another
+            # REQUEST_INSTANCE_INFO round-trip or re-validation.
+            raise PeerIncompatibleError(self._incompatible_peers[info_endpoint])
         if self._should_register_peer(params):
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
@@ -1736,15 +1868,28 @@ class Receiver(ReceiverBase):
             # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
             # The sender-side check (PeerRegistrar.register) runs in the
             # sender's listener thread, where exceptions are only logged, so
-            # reject here — before REGISTER_RANK_INFO is even sent — to fail
-            # the first gen request loudly instead of hanging on a transfer
-            # the sender will never serve.
-            MambaPolicy.validate_peer_compatible(
-                self._registrar.self_rank_info,
-                sender_info,
-                self._registrar.self_extractor.page_table,
-                sender_info.page_table,
-            )
+            # reject here — before REGISTER_RANK_INFO is even sent, so no
+            # dealers are connected and no partial registration happens for
+            # the bad peer. The failure is converted to PeerIncompatibleError
+            # (handled in dispatch_task) so only requests targeting this peer
+            # fail, and cached so later requests fail fast.
+            try:
+                MambaPolicy.validate_peer_compatible(
+                    self._registrar.self_rank_info,
+                    sender_info,
+                    self._registrar.self_extractor.page_table,
+                    sender_info.page_table,
+                )
+            except ValueError as e:
+                msg = (
+                    f"context peer at '{info_endpoint}' is incompatible: {e} "
+                    "(cached: all further requests to this context peer fail "
+                    "fast; restart this generation worker to re-validate, "
+                    "e.g. after redeploying a compatible server on the same "
+                    "endpoint)"
+                )
+                self._incompatible_peers[info_endpoint] = msg
+                raise PeerIncompatibleError(msg) from e
 
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
@@ -2280,12 +2425,19 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str) -> NixlTransferAgent:
+def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
         kwargs["split_batch_size"] = int(os.environ["TRTLLM_NIXL_SPLIT_BATCH_SIZE"])
-    return NixlTransferAgent(name, True, num_threads=num_threads, **kwargs)
+    return NixlTransferAgent(
+        name,
+        True,
+        num_threads=num_threads,
+        rank=rank,
+        world_size=world_size,
+        **kwargs,
+    )
 
 
 def _make_aux_buffer(
@@ -2313,6 +2465,7 @@ class TransferWorkerConfig:
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
+    tx_overall_timeout_s: Optional[float] = None
 
 
 class TransferWorker:
@@ -2347,6 +2500,7 @@ class TransferWorker:
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
             beam_width=request.py_beam_width,
+            overall_timeout_s=self._config.tx_overall_timeout_s,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -2377,8 +2531,11 @@ class TransferWorker:
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)
         CUASSERT(cudart.cudaSetDevice(self._config.device_id))
+        mapping = self._config.kv_cache_manager.mapping
         self._agent = _create_nixl_agent(
-            self._rank_info.instance_name + str(self._rank_info.instance_rank)
+            self._rank_info.instance_name + str(self._rank_info.instance_rank),
+            rank=mapping.rank,
+            world_size=mapping.world_size,
         )
         self._registered_mem: list = []
         try:

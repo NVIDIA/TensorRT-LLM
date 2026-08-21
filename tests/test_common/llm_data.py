@@ -37,7 +37,6 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": "Mistral-Small-3.1-24B-Instruct-2503",
     "Qwen/Qwen3-30B-A3B": "Qwen3/Qwen3-30B-A3B",
     "Qwen/Qwen2.5-3B-Instruct": "Qwen2.5-3B-Instruct",
-    "microsoft/Phi-3-mini-4k-instruct": "Phi-3/Phi-3-mini-4k-instruct",
     "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
     "deepseek-ai/DeepSeek-R1": "DeepSeek-R1/DeepSeek-R1",
     "deepseek-ai/DeepSeek-R1-0528": "DeepSeek-R1/DeepSeek-R1-0528",

@@ -23,6 +23,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
+
+    from ..model_config import ModelConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -34,6 +37,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..pyexecutor.config_utils import is_mla
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -175,6 +179,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
+    # FMHA prologue buffers for the MLA generation path, hoisted out of the per-layer
+    # RoPE kernel. `mla_cu_q_rows` counts Q ROWS (cumsum(q_lens) * num_heads); the two
+    # cu_kv/ctx buffers count KV lengths and context TOKENS respectively.
+    mla_cu_q_rows: Optional[torch.Tensor] = None
+    mla_cu_kv_seqlens: Optional[torch.Tensor] = None
+    mla_ctx_cu_q_seqlens: Optional[torch.Tensor] = None
+    _mla_scheduler_buffers_valid: bool = field(default=False,
+                                               init=False,
+                                               repr=False)
+    _mla_ctx_cu_seqlens_valid: bool = field(default=False,
+                                            init=False,
+                                            repr=False)
+
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
     num_sparse_topk: int = 0
 
@@ -304,6 +321,37 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                         pin_memory=prefer_pinned())
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
+
+        # `+ 1` because these are exclusive-prefix arrays over num_seqs.
+        self.mla_cu_q_rows = self.get_empty(
+            buffers,
+            (self.max_num_sequences + 1, ),
+            cache_name="mla_cu_q_rows",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        self.mla_cu_kv_seqlens = self.get_empty(
+            buffers,
+            (self.max_num_sequences + 1, ),
+            cache_name="mla_cu_kv_seqlens",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        # Own copy because `ctx_uncached_token_indptr` holds the same values but only
+        # exists under `enable_context_mla_with_cached_kv`.
+        self.mla_ctx_cu_q_seqlens = self.get_empty(
+            buffers,
+            (self.max_num_sequences + 1, ),
+            cache_name="mla_ctx_cu_q_seqlens",
+            dtype=torch.int,
+            capture_graph=capture_graph,
+        )
+        # Entry 0 of an exclusive prefix sum is always 0 and the rebuilds below only
+        # write from index 1, so zero it once here instead of per rebuild.
+        self.mla_cu_q_rows[:1].zero_()
+        self.mla_cu_kv_seqlens[:1].zero_()
+        self.mla_ctx_cu_q_seqlens[:1].zero_()
+        self._invalidate_mla_scheduler_buffers()
 
         if self.workspace is None:
             self.workspace = torch.empty(
@@ -488,6 +536,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
+        self._invalidate_mla_scheduler_buffers()
 
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes
@@ -495,6 +544,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # so that forward() recomputes it for the next sub-step.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
+        self._invalidate_mla_scheduler_buffers()
+
+    def _invalidate_mla_scheduler_buffers(self) -> None:
+        # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
+        # buffers below must be rebuilt before the next MLA layer reads them.
+        self._mla_scheduler_buffers_valid = False
+        self._mla_ctx_cu_seqlens_valid = False
 
     def update_helix_param(
         self,
@@ -542,8 +598,72 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu_runtime = prompt_lens_cpu
         self.host_request_types_runtime = host_request_types
 
+    def mla_prepare_scheduler_buffers(
+            self, num_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cumulative Q rows / KV lengths for the MLA generation FMHA kernel.
+
+        These are layer-invariant, so they are computed once per iteration instead of
+        once per layer inside `applyMLARopeAndAssignQKVKernelGeneration`. The values
+        match what that kernel produced:
+          seqQOffset[b+1]  = num_heads * cumsum(q_lens)[b]   (Q ROWS, not tokens)
+          seqKVOffsets[b+1] = cumsum(kv_lens)[b]
+
+        Derived on device from `seq_lens_cuda` / `kv_lens_cuda` -- the same tensors the
+        C++ op reads as `cache_seq_lens` -- so spec-dec sub-steps, which rewrite those
+        in place after `prepare()`, are picked up once the buffers are invalidated.
+        Reading the host mirrors instead would silently miss those edits, since MTP only
+        touches the device copy. Results land in fixed-address buffers so a captured
+        CUDA graph keeps reading the same pointers, and no D2H sync is introduced.
+        """
+        num_ctx = self.num_contexts
+        n_gen = self.num_seqs - num_ctx
+        if not self._mla_scheduler_buffers_valid:
+            if n_gen > 0:
+                torch.cumsum(self.seq_lens_cuda[num_ctx:self.num_seqs],
+                             0,
+                             dtype=torch.int32,
+                             out=self.mla_cu_q_rows[1:n_gen + 1])
+                self.mla_cu_q_rows[1:n_gen + 1] *= num_heads
+                # `kv_lens_cuda` is the pre-`num_extra_kv_tokens` length, which is what
+                # the kernel's `cache_seq_lens` scan used. `self.kv_lens` is not.
+                torch.cumsum(self.kv_lens_cuda[num_ctx:self.num_seqs],
+                             0,
+                             dtype=torch.int32,
+                             out=self.mla_cu_kv_seqlens[1:n_gen + 1])
+            self._mla_scheduler_buffers_valid = True
+        return (self.mla_cu_q_rows[:n_gen + 1],
+                self.mla_cu_kv_seqlens[:n_gen + 1])
+
+    def mla_prepare_ctx_cu_seqlens(self) -> Optional[torch.Tensor]:
+        """Token-wise cumulative Q seqlens over the context sequences.
+
+        Layer-invariant, so it is built once per iteration into a fixed-address
+        buffer, from `seq_lens_cuda` for the same reason as the generation buffers.
+        Returns None when the batch has no context sequences.
+        """
+        num_ctx = self.num_contexts
+        if num_ctx <= 0:
+            return None
+        if not self._mla_ctx_cu_seqlens_valid:
+            torch.cumsum(self.seq_lens_cuda[:num_ctx],
+                         0,
+                         dtype=torch.int32,
+                         out=self.mla_ctx_cu_q_seqlens[1:num_ctx + 1])
+            self._mla_ctx_cu_seqlens_valid = True
+        return self.mla_ctx_cu_q_seqlens[:num_ctx + 1]
+
+    def prepare_for_draft_forward(self) -> dict | None:
+        """Prepare backend state shared by draft-forward execution paths."""
+        return None
+
+    def restore_after_draft_forward(self, saved_state: dict | None) -> None:
+        """Restore backend state modified for draft-forward execution."""
+        return None
+
     def prepare(self) -> None:
         super().prepare()
+        # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
+        self._invalidate_mla_scheduler_buffers()
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
@@ -1391,6 +1511,60 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
         self.create_fmha_libs()
 
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
+                                          mapping: "Mapping") -> int:
+        """fp8 context-MLA stages a K/V dequant workspace sized by the summed attended KV length
+        (``total_kv_len``) across the context requests in a forward step, not by ``max_num_tokens`` -- so
+        KV-cache reuse can push it far past the profiling floor. This buffer is shared across attention
+        layers. ``0`` for non-MLA / non-fp8-KV / absorption-mode sparse MLA (which reads K/V straight from
+        the paged cache and stages no dequant buffer).
+
+        The per-token cost is the single source of truth in C++
+        (``AttentionOp::contextMlaWorkspaceBytesPerToken``, exposed via nanobind), so it cannot drift
+        from the runtime allocation.
+        """
+        config = model_config.pretrained_config
+        if not is_mla(config):
+            return 0
+        quant_config = model_config.quant_config
+        fp8_context_mla = (quant_config is not None
+                           and quant_config.quant_mode.has_fp8_kv_cache()
+                           and get_sm_version() in (90, 100, 103, 120))
+        if not fp8_context_mla:
+            return 0
+        # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
+        # mNumAttnHeads).
+        attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+        num_attn_heads = config.num_attention_heads // attn_tp
+        # The buffer is skipped only where AttentionOp::useSparseMLA() holds, which needs all three of:
+        #   * DSA / DeepSeek-V4 -- only these lower to the absorption path that reads K/V from the paged
+        #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
+        #     so those layers still run dense MLA. The workspace is shared, so one dense layer forces the
+        #     reserve.
+        #   * SM 100 / 103 -- mUseTllmGen is `sm >= 100 && sm != 120`.
+        #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
+        # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
+        # under-reserving OOMs mid-forward.
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
+                      and get_sm_version() in (100, 103))
+        short_seq_mha_enabled = int(
+            os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
+        stages_no_buffer = sparse_mla and not short_seq_mha_enabled
+        return int(
+            thop.get_context_mla_workspace_bytes_per_token(
+                num_attn_heads=num_attn_heads,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                v_head_dim=config.v_head_dim,
+                fp8_context_mla=fp8_context_mla,
+                # Paged context MLA always uses separate Q/KV input; the term is otherwise gated to 0.
+                separate_q_and_kv_input=True,
+                sparse_mla=stages_no_buffer,
+            ))
+
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if self.local_layer_idx is not None:
             return self.local_layer_idx
@@ -2095,8 +2269,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def mla_rope_generation(
         self,
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
+        fused_q: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
         cu_q_seqlens: torch.Tensor,
@@ -2106,6 +2280,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm2_scale: torch.Tensor,
         quant_q_buffer: torch.Tensor,
         out_scale: Optional[torch.Tensor] = None,
+        kv_norm_weight: Optional[torch.Tensor] = None,
+        kv_norm_eps: float = 1e-6,
+        precomputed_cu_seqlens: bool = False,
+        precomputed_fmha_scheduler: bool = False,
+        kv_only: bool = False,
+        kv_done_elsewhere: bool = False,
+        quant_scale_qkv: Optional[torch.Tensor] = None,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2119,6 +2300,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             quant_q_buffer (torch.Tensor): The tensor to store the quant_q_buffer, with shape (tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
             helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
             out_scale (torch.Tensor): The tensor to store the out_scale, with shape (1) on GPU.
+            kv_norm_weight (torch.Tensor): kv_a_layernorm weight, spanning kv_lora_rank + qk_rope_head_dim. Non-None folds the RMSNorm into the KV kernel, which then reads `latent_cache` RAW, so the caller must NOT have normalized it.
+            kv_norm_eps (float): Epsilon for that folded RMSNorm. Ignored when kv_norm_weight is None.
+            precomputed_cu_seqlens (bool): cu_q_seqlens/cu_kv_seqlens already hold this step's values, so the kernel skips filling them. Required whenever the Q half is skipped, because the kernel that fills them is the one being dropped.
+            precomputed_fmha_scheduler (bool): fmha_scheduler_counter and the two bmm scales are emitted elsewhere (the sparse index kernel), so the kernel skips them. Only valid with an FP8 KV cache and both scale tensors non-None.
+            kv_only (bool): Run the KV half only; the Q half already ran (q_b_layernorm folded the Q RoPE). Mutually exclusive with kv_done_elsewhere.
+            kv_done_elsewhere (bool): Run the Q half only; the KV half already ran, hoisted onto an aux stream. Mutually exclusive with kv_only. With both halves done, do not call this at all.
+            quant_scale_qkv (torch.Tensor): Non-None means q_nope in quant_q_buffer is already FP8, so the kernel drops the q_nope quantize rows from its grid.
         """
 
         assert self.is_mla_enable and self.mla_params is not None
@@ -2171,4 +2359,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.qk_rope_head_dim,
             self.v_head_dim,
             self.rope_append,
+            kv_norm_weight,
+            kv_norm_eps,
+            precomputed_cu_seqlens,
+            precomputed_fmha_scheduler,
+            kv_only,
+            kv_done_elsewhere,
+            quant_scale_qkv,
         )

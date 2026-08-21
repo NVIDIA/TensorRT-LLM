@@ -21,13 +21,15 @@ import traceback
 import uuid
 import weakref
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.peft.lora.manager import LoraManager
+from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
@@ -37,8 +39,6 @@ from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..lora_manager import LoraManager
-from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
@@ -983,6 +983,25 @@ class BaseWorker(GenerationExecutor):
             return b""
         return self.engine.kv_cache_transceiver.get_data_transceiver_state()
 
+    def get_startup_metrics(self) -> dict:
+        """Return rank-local startup metrics for the PyTorch backend."""
+        if not self._is_pytorch_backend or self.engine is None:
+            return {}
+
+        startup_metrics = {}
+        model_engine = getattr(self.engine, "model_engine", None)
+        model_loader = getattr(model_engine, "model_loader", None)
+        if model_loader is not None:
+            startup_metrics["model_loader"] = dict(model_loader.metrics)
+
+        draft_model_engine = getattr(self.engine, "draft_model_engine", None)
+        draft_model_loader = getattr(draft_model_engine, "model_loader", None)
+        if draft_model_loader is not None:
+            startup_metrics["draft_model_loader"] = dict(
+                draft_model_loader.metrics)
+
+        return startup_metrics
+
     @staticmethod
     def _stats_serializer(stats) -> str:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
@@ -1127,6 +1146,35 @@ class AwaitResponseHelper:
             case _:
                 raise NotImplementedError
 
+    def process_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Apply engine callbacks and append deferred submission errors."""
+        responses = list(
+            filter(
+                lambda _: _,
+                [self.worker._engine_response_callback(r) for r in responses]))
+
+        # Drain with get_nowait(): this may run concurrently from the
+        # ManagedThread and RPC fetch_responses(), and empty()+get() can
+        # block forever if another consumer wins the race.
+        while True:
+            try:
+                responses.append(self.temp_error_responses.get_nowait())
+            except Empty:
+                break
+
+        return responses
+
+    def process_and_handle_responses(
+            self, responses: List[tllm.Response]) -> List[tllm.Response]:
+        """Process engine responses and dispatch the client-visible results."""
+        responses = self.process_responses(responses)
+        with nvtx_range_debug(f"await_response-{len(responses)}",
+                              color="red",
+                              category="Worker"):
+            self.responses_handler(responses)
+        return responses
+
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
         timeout = timeout or 0.1
@@ -1143,20 +1191,7 @@ class AwaitResponseHelper:
             # _await_any_response) is also a clear signal to broadcast
             # and stop the thread.
             return self._broadcast_event_loop_error(e)
-        # filter since The _engine_response_callback may return None
-        responses = list(
-            filter(
-                lambda _: _,
-                [self.worker._engine_response_callback(r) for r in responses]))
-
-        # append the error responses to the temp_error_responses
-        while not self.temp_error_responses.empty():
-            responses.append(self.temp_error_responses.get())
-
-        with nvtx_range_debug(f"await_response-{len(responses)}",
-                              color="red",
-                              category="Worker"):
-            self.responses_handler(responses)
+        self.process_and_handle_responses(responses)
 
         # Even when await_responses returned normally (e.g. via
         # _await_any_response, whose predicate already includes

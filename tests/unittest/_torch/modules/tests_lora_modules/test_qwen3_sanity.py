@@ -25,8 +25,8 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_gpu_memory_less_than_80gb
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_helper import LoraConfig
 
 # HF module name -> block path relative to layers.{idx}.
 # Attention targets work on all architectures. MLP targets only apply to

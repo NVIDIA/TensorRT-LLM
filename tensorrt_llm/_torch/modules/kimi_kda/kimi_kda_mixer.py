@@ -36,6 +36,7 @@ prove they are actually being enforced:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -241,7 +242,20 @@ class KimiKDALinearAttention(nn.Module):
         )
         self.f_a_proj = nn.Linear(hidden_size, head_dim, bias=False)
         self.f_b_proj = nn.Linear(head_dim, projection_size, bias=False)
-        self.dt_bias = nn.Parameter(torch.empty(projection_size, dtype=torch.float32))
+        # dt_bias must be initialized: torch.empty heap garbage can contain
+        # NaN bit patterns, which poison both the optimized and FLA gates in
+        # randomly-constructed modules (parity tests) — TRTLLM-15204. This
+        # matches FLA's KDA init (inverse-softplus of dt ~ LogUniform[1e-3,
+        # 1e-1], fla/layers/kda.py) in its small-dt regime where
+        # softplus(x) ≈ exp(x), expressed as a single uniform_ so it stays on
+        # MetaInitMode's random-init allowlist (exp/expm1/clamp would raise
+        # MetaInitException and force the full-CPU-init fallback). Checkpoint
+        # loading overwrites the value either way.
+        self.dt_bias = nn.Parameter(
+            torch.empty(projection_size, dtype=torch.float32).uniform_(
+                math.log(1e-3), math.log(1e-1)
+            )
+        )
         self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
 
         if use_full_rank_gate:

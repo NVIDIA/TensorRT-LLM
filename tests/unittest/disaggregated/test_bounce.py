@@ -221,48 +221,65 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
 
 
 # --------------------------------------------------------------------------- #
-# fan-in safety gate — equal total//num_writers split only for uniform TP-by-head
+# fan-in safety gate — equal total//num_writers split only for uniform writers
 # --------------------------------------------------------------------------- #
-def test_fanin_bounce_safe_gate():
+def test_fanin_bounce_safe_gate() -> None:
     """Restrict multi-writer equal-split bounce to uniform TP-by-head.
 
-    PP (overlap_pp_size>1 -> unequal per-writer sizes) and duplicate_head_factor>1
-    (MLA / duplicate TP heads -> some ranks don't send KV yet count in
-    expected_transfers) must fall back to the per-fragment path.
+    Uneven PP splits and duplicate_head_factor>1 (MLA / duplicate TP heads ->
+    some ranks don't send KV yet count in expected_transfers) must fall back to
+    the per-fragment path.
     """
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup, pp, ranks=(0,)):
+    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
         return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
 
-    def ri(lpp, page_table=None):
+    def ri(lpp: list[int], page_table: SimpleNamespace | None = None) -> SimpleNamespace:
         return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
 
-    def pt(mapper_kind):
+    def pt(mapper_kind: MapperKind) -> SimpleNamespace:
         view = SimpleNamespace(mapper_kind=mapper_kind)
         return SimpleNamespace(layer_groups=[SimpleNamespace(pool_views=[view])])
 
     # single PP stage (overlap_pp_size <= 1): only duplicate_head_factor matters
-    assert safe(ov(1, 1), ri([24])) is True
-    assert safe(ov(1, 0), ri([24])) is True
-    assert safe(ov(2, 1), ri([24])) is False  # duplicate heads / MLA -> some don't send
+    assert safe(ov(1, 1), ri([24]), None) is True
+    assert safe(ov(1, 0), ri([24]), None) is True
+    assert safe(ov(2, 1), ri([24]), None) is False  # duplicate heads / MLA -> some don't send
     # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
-    assert safe(ov(1, 4), ri([20, 20, 20, 20])) is True
+    assert safe(ov(1, 4), ri([20, 20, 20, 20]), None) is True
     # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
-    assert safe(ov(1, 4), ri([20, 20, 20, 19])) is False
+    assert safe(ov(1, 4), ri([20, 20, 20, 19]), None) is False
     # incomplete per-stage info (single element for a multi-stage fan-in) -> conservative fall back
-    assert safe(ov(1, 4), ri([20])) is False
+    assert safe(ov(1, 4), ri([20]), None) is False
     # duplicate heads blocks even an otherwise-even PP split
-    assert safe(ov(2, 4), ri([20, 20, 20, 20])) is False
+    assert safe(ov(2, 4), ri([20, 20, 20, 20]), None) is False
     # replicated views (one elected sender per destination) make multi-writer
     # contributions unequal -> fall back; single-writer overlap stays safe,
-    # and sharded-only view schemes are unaffected
-    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED))) is False
-    assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED))) is True
-    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.NHD))) is True
+    # and sharded-only view schemes are unaffected. Both page tables must be
+    # checked because the representative peer rank may be a fully masked PP
+    # stage while another sender stage owns the replicated rows.
+    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED)), None) is False
+    assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED)), None) is True
+    assert (
+        safe(
+            ov(1, 1, ranks=(0, 1)),
+            ri([24], pt(MapperKind.NHD)),
+            pt(MapperKind.REPLICATED),
+        )
+        is False
+    )
+    assert (
+        safe(
+            ov(1, 1, ranks=(0, 1)),
+            ri([24], pt(MapperKind.NHD)),
+            pt(MapperKind.NHD),
+        )
+        is True
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +386,33 @@ def _recv_req(block_counts, rid=1, slice_id=0):
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestFanInReserve:
+    def test_block_bytes_include_distinct_physical_pools_once(self) -> None:
+        entries = np.array([], dtype=BUFFER_ENTRY_DTYPE)
+        page_table = KVCachePageTable(
+            tokens_per_block=32,
+            layer_groups=[
+                AttentionLayerGroup(
+                    pool_group_idx=0,
+                    local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+                    pool_views=[
+                        PoolView(pool_idx=0, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                    ],
+                )
+            ],
+            pool_groups=[
+                PhysicalPoolGroup(
+                    pools=[
+                        PhysicalPool(base_address=0x200000, slot_bytes=100, num_slots=8),
+                        PhysicalPool(base_address=0x300000, slot_bytes=25, num_slots=8),
+                    ]
+                )
+            ],
+        )
+
+        assert btr.block_bytes_per_group(page_table) == [125]
+
     def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])  # total = 2 * 100 = 200

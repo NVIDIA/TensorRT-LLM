@@ -2870,6 +2870,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(
                 f"Unsupported convolution state layout: {conv_state_layout!r}")
+        if "model_type" in kwargs:
+            # The V1 managers select the conv-state layout by model_type; this
+            # class takes it explicitly. Silently absorbing model_type here
+            # means a caller's layout request would be dropped on the floor.
+            raise TypeError(
+                "MambaHybridCacheManagerV2 does not accept 'model_type' "
+                f"(got {kwargs['model_type']!r}); pass "
+                "conv_state_layout='x_b_c' or 'q_k_v' instead")
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers

@@ -238,6 +238,7 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
+        "_num_tokens_before_hybrid_pruning",
         "_num_committed_blocks",
         "_finish_event",
         "_tokens_per_block",
@@ -273,6 +274,8 @@ class _KVCache:
     # be computed on the fly, but that would be slow due to python.
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
+    # Internal diagnostic captured from the reuse match: see ReuseMatch.
+    _num_tokens_before_hybrid_pruning: int
     # Sometimes we can't commit a block because all its tokens are already covered by another block in
     # the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric
     # difference, 2. if our block is a partial block, we can't write to memory of the other blocks.
@@ -330,6 +333,9 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
+        self._num_tokens_before_hybrid_pruning = (
+            reuse_match.num_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        )
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
@@ -436,11 +442,12 @@ class _KVCache:
         else:
             self.manager.clear_stats_dirty(self.id)
 
+    def _is_attention_life_cycle(self, life_cycle: LifeCycleId) -> bool:
+        return isinstance(self.manager._life_cycles.get_life_cycle(life_cycle), AttnLifeCycle)
+
     def _stats_life_cycle_key(self, life_cycle: LifeCycleId) -> LifeCycleId | None:
-        life_cycle_obj = self.manager._life_cycles.get_life_cycle(life_cycle)
-        if isinstance(life_cycle_obj, AttnLifeCycle):
-            return life_cycle
-        return None
+        """Key for the attention-only block-reuse (hit/miss range) accounting."""
+        return life_cycle if self._is_attention_life_cycle(life_cycle) else None
 
     def _refresh_generation_alloc_ready(self) -> None:
         expected_prompt_length = self._expected_prompt_length
@@ -507,10 +514,12 @@ class _KVCache:
     def _record_direct_iteration_stats(
         self, life_cycle: LifeCycleId, iteration_stats: KVCacheIterationStatsDelta
     ) -> None:
-        life_cycle_key = self._stats_life_cycle_key(life_cycle)
-        if life_cycle_key is None or iteration_stats.empty or not self._should_record_stats():
+        # Every life cycle is reported, including SSM / recurrent ones: iteration
+        # statistics are keyed by life cycle, so recurrent page movement stays
+        # distinguishable from attention movement downstream.
+        if iteration_stats.empty or not self._should_record_stats():
             return
-        self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+        self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle: iteration_stats})
 
     def _record_migrated_slots(
         self,
@@ -523,9 +532,7 @@ class _KVCache:
             return
         assert len(pages) == len(slots)
         for page in pages:
-            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
-            if life_cycle_key is None:
-                continue
+            is_attention = self._is_attention_life_cycle(page.life_cycle)
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
             page_size = sum(self.manager._storage.slot_size(pg_idx))
             stats = KVCacheStatsDelta()
@@ -534,8 +541,11 @@ class _KVCache:
                 iteration_stats.iter_offload_blocks = 1
                 iteration_stats.iter_offload_bytes = page_size
             elif dst_level == GPU_LEVEL:
-                stats.alloc_total_blocks = 1
-                stats.alloc_new_blocks = 1
+                # Global cache-hit accounting is attention-only. SSM movement is
+                # reported by life-cycle/pool-group iteration statistics instead.
+                if is_attention:
+                    stats.alloc_total_blocks = 1
+                    stats.alloc_new_blocks = 1
                 iteration_stats.iter_alloc_total_blocks = 1
                 iteration_stats.iter_alloc_new_blocks = 1
                 if src_level > GPU_LEVEL:
@@ -545,7 +555,7 @@ class _KVCache:
                     iteration_stats.iter_intra_device_copy_blocks = 1
                     iteration_stats.iter_intra_device_copy_bytes = page_size
             if not stats.empty or not iteration_stats.empty:
-                self.manager.commit_stats(stats, {life_cycle_key: iteration_stats})
+                self.manager.commit_stats(stats, {page.life_cycle: iteration_stats})
 
     def _record_dropped_pages(
         self,
@@ -563,15 +573,12 @@ class _KVCache:
         if not self._should_record_stats() or not pages:
             return
         for page in pages:
-            life_cycle_key = self._stats_life_cycle_key(page.life_cycle)
-            if life_cycle_key is None:
-                continue
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
             page_size = sum(self.manager._storage.slot_size(pg_idx))
             iteration_stats = KVCacheIterationStatsDelta()
             iteration_stats.iter_host_dropped_blocks = 1
             iteration_stats.iter_host_dropped_bytes = page_size
-            self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle_key: iteration_stats})
+            self.manager.commit_stats(KVCacheStatsDelta(), {page.life_cycle: iteration_stats})
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them. After
     # close, uncommitted data in blocks for (beam_index >= beam_width) will be lost.
@@ -583,7 +590,12 @@ class _KVCache:
         self.stop_committing()
         assert NDEBUG or self._check_sanity()
         manager = self.manager
-        if self.capacity > 0:
+        # Dummy/warmup caches are reserved at the model's full declared context,
+        # not at a realistic sequence length, and _avg_sqr_capacity is an RMS --
+        # so a handful of them dominates the statistic outright and the tuner
+        # sizes pools for sequences that never arrive. They are already tracked
+        # as stats-excluded at creation; honour that here too.
+        if self.capacity > 0 and not manager.is_stats_excluded(self.id):
             self._avg_capacity.update(self.capacity)
             manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
@@ -1071,6 +1083,10 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
+    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+        """Return the pre-hybrid-pruning prefix for internal diagnostics."""
+        return self._num_tokens_before_hybrid_pruning
+
     @property
     def committed_tokens(self) -> list[TokenIdExt]:
         return list(self._committed_tokens)
@@ -1320,13 +1336,16 @@ class _KVCache:
                         )
                         if changed:
                             self.manager.mark_stats_dirty(self.id)
-                    self._record_direct_iteration_stats(
-                        lc_idx,
-                        KVCacheIterationStatsDelta(
-                            iter_intra_device_copy_blocks=1,
-                            iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
-                        ),
-                    )
+                # Block-reuse accounting above is attention-only, but the copy
+                # itself is reported for every life cycle, SSM included —
+                # matching the C++ backend's deferred-copy loop (kvCache.cpp).
+                self._record_direct_iteration_stats(
+                    lc_idx,
+                    KVCacheIterationStatsDelta(
+                        iter_intra_device_copy_blocks=1,
+                        iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
+                    ),
+                )
             # Unlock source pages — _record_event captures all prior cuda work
             # so the original pages know when we're done reading from them.
             if src_locks:

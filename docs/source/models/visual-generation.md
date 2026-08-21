@@ -44,6 +44,10 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
+| `zai-org/GLM-Image` | Text-to-Image |
 
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
@@ -60,9 +64,11 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **FastWan 2.2** | Yes | Yes | No | No | No [^7] | No | No | Yes | Yes | Yes | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes [^4] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
-| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | No | No | No | No | No |
+| **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -72,7 +78,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^4]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
 
-[^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition and returns the generated RGBA layer stack as a saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, Tensor Parallelism, and `trtllm-serve` image-edit routing are not enabled for this pipeline yet.
+[^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing and returns one RGBA image per generated layer by default. Set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, and Tensor Parallelism are not enabled for this pipeline yet.
 
 [^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
 

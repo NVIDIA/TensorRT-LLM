@@ -12,56 +12,92 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Negative-path + dispatch tests for CuteDslB12xFusedMoE.
-
-These checks run without a GPU: they verify the can_implement() gating
-matrix, the SM120/SM121 + NVFP4 selection in create_moe.get_moe_cls (the
-backend is selected on the `moe_backend=CUTEDSL` path when flashinfer
-is importable, never from `moe_backend=CUTLASS`), and the hybrid
-CUTLASS-prefill / b12x-decode dispatch predicate. Functional
-correctness of the b12x kernel is covered by end-to-end model tests on
-SM120/SM121 hardware.
-"""
+"""CuteDslB12xFusedMoE gating and dispatch tests."""
 
 import sys
 import types
+from typing import Optional
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe.create_moe import get_moe_cls
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+    MoEDeployment,
+    MoEEnvironment,
+    MoEProblem,
+    MoERejectReason,
+    canonical_quant,
+)
+from tensorrt_llm._torch.modules.fused_moe.impl_environment import MoEDep
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     NVFP4CuteDslB12xFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
-_FUSED_MOE_MODULE = "tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x"
+pytestmark = pytest.mark.cpu_only
+
+
+# Spelled out rather than read from _SUPPORTED_SM_VERSIONS: deriving the input
+# from the value under test hides a narrowing of that set, which is the
+# direction that silently drops hardware support.
+SUPPORTED_SM = [120, 121]
+
+
+def _deployment(
+    sm: int,
+    *,
+    flashinfer: bool = True,
+    ep_size: int = 1,
+    use_dp: bool = False,
+    parallel_size: Optional[int] = None,
+) -> MoEDeployment:
+    """Declare the machine rather than patching the probes that read it."""
+    return MoEDeployment(
+        ep_size=ep_size,
+        tp_size=1,
+        parallel_size=ep_size if parallel_size is None else parallel_size,
+        use_dp=use_dp,
+        num_slots=8,
+        env=MoEEnvironment(
+            sm=sm,
+            available_deps=(MoEDep.FLASHINFER.value,) if flashinfer else (),
+        ),
+    )
+
+
+def _problem(
+    quant_algo=QuantAlgo.NVFP4, dtype=torch.bfloat16, swiglu_gptoss_style=None
+) -> MoEProblem:
+    return MoEProblem(
+        quant=canonical_quant(quant_algo),
+        dtype_act=dtype,
+        hidden_size=2048,
+        intermediate_size=2048,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+    )
 
 
 @pytest.mark.parametrize("sm_version", [80, 89, 90, 100, 103])
 def test_can_implement_rejects_unsupported_sm(sm_version):
-    """can_implement returns False on every SM outside the supported set."""
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version):
-        ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4)
-    assert not ok
-    assert reason is not None and f"SM{sm_version}" in reason
+    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(sm_version))
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.SM_UNSUPPORTED
+    assert f"SM{sm_version}" in verdict.detail
 
 
-@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
+@pytest.mark.parametrize("sm_version", SUPPORTED_SM)
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
 def test_can_implement_accepts_supported_sm(sm_version, quant_algo):
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=sm_version):
-        ok, reason = CuteDslB12xFusedMoE.can_implement(quant_algo)
-    assert ok
-    assert reason is None
+    verdict = CuteDslB12xFusedMoE.can_implement(_problem(quant_algo), _deployment(sm_version))
+    assert verdict.eligible
+    assert verdict.reject_reason is None
 
 
 @pytest.mark.parametrize(
@@ -76,134 +112,46 @@ def test_can_implement_accepts_supported_sm(sm_version, quant_algo):
 )
 def test_can_implement_rejects_non_nvfp4(quant_algo):
     """Only NVFP4 is supported; everything else must be turned away."""
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120):
-        ok, reason = CuteDslB12xFusedMoE.can_implement(quant_algo)
-    assert not ok
-    assert reason is not None and "NVFP4" in reason
+    verdict = CuteDslB12xFusedMoE.can_implement(_problem(quant_algo), _deployment(120))
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
 def test_can_implement_rejects_swiglu_gptoss_style():
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120):
-        ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4, swiglu_gptoss_style=True)
-    assert not ok
-    assert reason is not None and "swiglu_gptoss_style" in reason
+    verdict = CuteDslB12xFusedMoE.can_implement(
+        _problem(swiglu_gptoss_style=True), _deployment(120)
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn])
 def test_can_implement_rejects_unsupported_activation_dtype(dtype):
-    with patch(f"{_FUSED_MOE_MODULE}.get_sm_version", return_value=120):
-        ok, reason = CuteDslB12xFusedMoE.can_implement(QuantAlgo.NVFP4, dtype_activation=dtype)
-    assert not ok
-    assert reason is not None
+    verdict = CuteDslB12xFusedMoE.can_implement(_problem(dtype=dtype), _deployment(120))
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.DTYPE_UNSUPPORTED
 
 
-def test_get_moe_cls_cutlass_path_never_auto_promotes():
-    """Explicit ``moe_backend=CUTLASS`` always returns ``CutlassFusedMoE`` —
-    no silent override to the b12x backend even on eligible hardware. b12x
-    is opted into via ``moe_backend=CUTEDSL``."""
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTLASS"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
-        cls = get_moe_cls(cfg)
-    assert cls is CutlassFusedMoE
+def test_can_implement_rejects_missing_flashinfer():
+    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120, flashinfer=False))
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.DEP_MISSING
 
 
-def test_get_moe_cls_cutedsl_falls_back_to_cutlass_on_unsupported_quant():
-    """CUTEDSL + non-(fp8_block_scales|nvfp4) → warn + fall back to CutlassFusedMoE."""
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
-        cls = get_moe_cls(cfg)
-    assert cls is CutlassFusedMoE
+def test_can_implement_rejects_expert_parallelism():
+    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120, ep_size=2))
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
 
 
-def test_get_moe_cls_cutedsl_falls_back_to_cutlass_on_missing_quant():
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = None
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
-        cls = get_moe_cls(cfg)
-    assert cls is CutlassFusedMoE
-
-
-def test_get_moe_cls_cutedsl_returns_plain_cutedsl_on_unsupported_sm():
-    """CUTEDSL + NVFP4 + non-SM120/121 → plain CuteDslFusedMoE (the SM100/103
-    cuteDSL backend); the b12x branch is bypassed."""
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=100):
-        cls = get_moe_cls(cfg)
-    assert cls is CuteDslFusedMoE
-
-
-def test_get_moe_cls_cutedsl_returns_cutlass_for_w4a16_nvfp4_on_unsupported_sm():
-    """CUTEDSL + W4A16_NVFP4 + non-SM120/121 → CutlassFusedMoE."""
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=100):
-        cls = get_moe_cls(cfg)
-    assert cls is CutlassFusedMoE
-
-
-@pytest.mark.parametrize("sm_version", sorted(CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS))
-@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
-def test_get_moe_cls_cutedsl_selects_b12x_on_supported_sm(sm_version, quant_algo):
-    """CUTEDSL + NVFP4/W4A16_NVFP4 + SM120/121 + flashinfer importable → CuteDslB12xFusedMoE."""
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=quant_algo)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
-        cls = get_moe_cls(cfg)
-    assert cls is CuteDslB12xFusedMoE
-
-
-@pytest.mark.parametrize(
-    "mapping",
-    [
-        Mapping(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2),
-        Mapping(
-            world_size=2,
-            tp_size=2,
-            enable_attention_dp=True,
-            dwdp_size=2,
-            dwdp_rank=0,
-        ),
-    ],
-)
-def test_get_moe_cls_cutedsl_falls_back_to_cutlass_for_distributed_b12x(mapping):
-    cfg = ModelConfig(mapping=mapping)
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
-
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
-        cls = get_moe_cls(cfg)
-
-    assert cls is CutlassFusedMoE
-
-
-def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing(monkeypatch):
-    """CUTEDSL + NVFP4 + SM120/121 + flashinfer NOT importable → CuteDslFusedMoE."""
-    import builtins
-
-    cfg = ModelConfig()
-    cfg.moe_backend = "CUTEDSL"
-    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-
-    real_import = builtins.__import__
-
-    def _raise_on_flashinfer(name, *args, **kwargs):
-        if name == "flashinfer":
-            raise ImportError("flashinfer not installed (simulated)")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _raise_on_flashinfer)
-    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
-        cls = get_moe_cls(cfg)
-    assert cls is CuteDslFusedMoE
+def test_can_implement_rejects_attention_dp_without_expert_parallelism():
+    """moe_tp == tp leaves ep_size at 1, so the EP gate alone would let this in."""
+    verdict = CuteDslB12xFusedMoE.can_implement(
+        _problem(), _deployment(120, ep_size=1, use_dp=True, parallel_size=2)
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+    assert "attention-DP" in verdict.detail
 
 
 # --------------------------------------------------------------------------
@@ -217,9 +165,7 @@ def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing
 
 
 class _RoutePredicateStub:
-    """Minimal carrier for ``_PREFILL_VIA_CUTLASS_THRESHOLD`` so we can call
-    the unbound ``_route_to_cutlass`` without instantiating the whole MoE
-    backend."""
+    """Minimal carrier for the unbound dispatch predicate."""
 
     _PREFILL_VIA_CUTLASS_THRESHOLD = CuteDslB12xFusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
 

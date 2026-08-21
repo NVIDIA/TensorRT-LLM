@@ -343,7 +343,7 @@
     "D212": 1,
     "E722": 1
   },
-  "tensorrt_llm/executor/ray_executor.py": {
+  "tensorrt_llm/executor/ray/executor.py": {
     "D205": 1,
     "D212": 2,
     "E712": 1

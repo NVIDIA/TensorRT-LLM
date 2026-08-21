@@ -57,13 +57,16 @@ environment:
   trtllm_wheel_path: ""
   work_dir: ""
   # Cluster notes:
-  # - On clusters where verbs UCX transports cannot initialize on the
-  #   compute nodes, UCX_TLS must be pinned — UCX_TLS=all can wedge
-  #   native NIXL init asymmetrically, leaving the surviving ranks hung
-  #   in the V2 setup MPI collectives. start_worker.sh clears
-  #   UCX_TLS (a container-provided UCX_TLS=tcp also breaks V2 NIXL VRAM
-  #   registration), so the pin is carried via TRTLLM_WORKER_UCX_TLS and
-  #   re-exported by start_worker.sh after the clear.
+  # - UCX transports: the default is no pin. start_worker.sh clears any
+  #   container-provided UCX_TLS (UCX_TLS=tcp breaks V2 NIXL VRAM
+  #   registration) and UCX then selects transports itself, RDMA/verbs
+  #   included. Only on clusters where verbs transports cannot
+  #   initialize on the compute nodes (symptom: UCX_TLS=all wedges
+  #   native NIXL init asymmetrically, surviving ranks hang in the V2
+  #   setup MPI collectives), add
+  #   TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc to
+  #   worker_env_var below; start_worker.sh re-exports it as UCX_TLS
+  #   after the clear. Note that list excludes RDMA/verbs.
   # - pairs with the workers'
   #   kv_cache_bounce_size_mb (fabric-VMM bounce; measured
   #   ~455 GB/s/GPU). The default gate of 96 blocks would silently skip
@@ -73,7 +76,7 @@ environment:
   #   in-place venv is injected via TRTLLM_PATH_PREPEND /
   #   TRTLLM_PYTHONPATH_PREPEND, which the harness scripts apply inside
   #   the container (setting PATH= here would be silently dropped).
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc TRTLLM_PATH_PREPEND=<trtllm_venv_bin_dir> TRTLLM_PYTHONPATH_PREPEND=<trtllm_repo>"
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes TRTLLM_PATH_PREPEND=<trtllm_venv_bin_dir> TRTLLM_PYTHONPATH_PREPEND=<trtllm_repo>"
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_PATH_PREPEND=<trtllm_venv_bin_dir> TRTLLM_PYTHONPATH_PREPEND=<trtllm_repo>"
 
 worker_config:

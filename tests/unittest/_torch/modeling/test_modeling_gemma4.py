@@ -45,6 +45,7 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
@@ -2410,8 +2411,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
             "FLASHINFER must dispatch to FlashInferAttention",
         )
 
-    def test_all_layers_use_trtllm_gen(self):
-        """All Gemma4 layers use trtllm-gen backend uniformly.
+    @unittest.mock.patch("tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=True)
+    def test_all_layers_use_trtllm_gen_on_sm100f(self, _mock_is_sm_100f):
+        """All Gemma4 layers use trtllm-gen uniformly on datacenter Blackwell.
 
         trtllm-gen has pre-compiled cubins for H256+H512, both BF16 and
         FP8 dtypes.  For FP8 KV cache (NVFP4), the FlashInfer backend
@@ -2424,12 +2426,33 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=config)
 
         for i in range(config.num_hidden_layers):
-            attn = Gemma4Attention(model_config, i)
+            attn = Gemma4Attention(
+                model_config,
+                i,
+                is_sliding=config.layer_types[i] == "sliding_attention",
+            )
             self.assertEqual(
                 attn.attn.flashinfer_backend,
                 "trtllm-gen",
                 f"Layer {i} should use trtllm-gen",
             )
+
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=False
+    )
+    def test_non_sm100f_layers_use_fa2(self, _mock_is_sm_100f):
+        """Gemma4 uses FlashInfer FA2 where trtllm-gen kernels are unavailable."""
+        config_dict = deepcopy(GEMMA4_SMALL_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config)
+
+        for layer_idx in range(config.num_hidden_layers):
+            attn = Gemma4Attention(
+                model_config,
+                layer_idx=layer_idx,
+                is_sliding=config.layer_types[layer_idx] == "sliding_attention",
+            )
+            self.assertEqual(attn.attn.flashinfer_backend, "fa2")
 
 
 class TestGemma4CUDAGraph(unittest.TestCase):
@@ -3388,8 +3411,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         layers = []
         for info in layers_info:
             kwargs = {}
-            # head_dim>256 needs trtllm-gen (fa2 JIT doesn't support it)
-            if info["head_dim"] > 256:
+            if info["head_dim"] > 256 and is_sm_100f():
                 kwargs["flashinfer_backend"] = "trtllm-gen"
             layers.append(
                 FlashInferAttention(

@@ -1,7 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import subprocess
 import tempfile
 import time
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -21,6 +25,55 @@ INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
 
 storage_types = ["http", "etcd"]
+
+
+@pytest.mark.asyncio
+async def test_registration_failure_without_retry_returns_false():
+    config = DisaggClusterConfig(cluster_uri="http://localhost:18000",
+                                 cluster_name="test",
+                                 minimal_instances=MinimalInstances(
+                                     context_servers=1, generation_servers=1),
+                                 inactive_timeout_sec=INACTIVE_TIMEOUT,
+                                 heartbeat_interval_sec=HEARTBEAT_INTERVAL)
+    storage = AsyncMock()
+    storage.set.return_value = False
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+
+    registered = await worker.register_worker(retry_interval=0)
+
+    assert not registered
+    assert worker._last_heartbeat == 0
+    assert worker._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_recovery_overwrites_stale_registration():
+    config = DisaggClusterConfig(cluster_uri="http://localhost:18000",
+                                 cluster_name="test",
+                                 minimal_instances=MinimalInstances(
+                                     context_servers=1, generation_servers=1),
+                                 inactive_timeout_sec=INACTIVE_TIMEOUT,
+                                 heartbeat_interval_sec=HEARTBEAT_INTERVAL)
+    storage = AsyncMock()
+    storage.expire.return_value = False
+    worker = DisaggClusterWorker(ServerRole.CONTEXT, "127.0.0.1", 8001, config,
+                                 storage)
+    worker._last_heartbeat = 0
+    worker._heartbeat_task = asyncio.current_task()
+
+    async def stop_after_registration(*args, **kwargs):
+        worker._stop = True
+        return True
+
+    storage.set.side_effect = stop_after_registration
+
+    await worker._heartbeat()
+
+    storage.set.assert_awaited_once_with(worker.worker_key,
+                                         ANY,
+                                         overwrite_if_exists=True,
+                                         ttl=config.inactive_timeout_sec)
 
 
 def get_uri(storage_type):

@@ -149,7 +149,7 @@ srun --mpi=pmix --kill-on-bad-exit=1 \
         export HF_HOME=\${HF_HOME:-$CACHE_DIR/hf_home}
         mkdir -p \"\$FLASHINFER_WORKSPACE_BASE\" \"\$FLASHINFER_CUBIN_DIR\" \"\$HF_HOME\"
         # Node-local HF remote-code modules cache: racing mkdir over shared
-        # \$HOME escapes pathlib's exist_ok on NFS (see run_gsm8k_kimi_k3).
+        # \$HOME escapes pathlib's exist_ok on NFS (see run_eval_kimi_k3).
         export HF_MODULES_CACHE=/tmp/hf-modules-rank\${SLURM_PROCID:-0}
         # Running partial score every N responses (early failure signal).
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"

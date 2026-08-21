@@ -1933,7 +1933,7 @@ void {launcher_name}(
         size_t m_steps = size_t((params.s + {loop_step} * NUM_COMPUTE_GROUPS - 1) / ({loop_step} * NUM_COMPUTE_GROUPS));
 
         // 2 * {bytes_per_elt} stands for kv cache and {bytes_per_elt} bytes per element.
-        size_t size_in_bytes = block_size.y * params.s * params.d * 2 * {bytes_per_elt};
+        size_t size_in_bytes = static_cast<size_t>(block_size.y) * params.s * params.d * 2 * {bytes_per_elt};
         if( size_in_bytes <= launch_params.device_l2_cache_size ) {{
             // strategy 1: limit to only 1 wave
             block_size.x = std::min(m_steps, sms_per_head);
@@ -1950,7 +1950,7 @@ void {launcher_name}(
         params.num_tiles = static_cast<uint32_t>(m_steps * params.b * params.h);
         if (launch_params.attention_mask_type == Attention_mask_type::CAUSAL) {{
             // 2 * {bytes_per_elt} stands for kv cache and {bytes_per_elt} bytes per element.
-            size_t size_in_bytes = params.b * params.h * params.s * params.d * 2 * {bytes_per_elt};
+            size_t size_in_bytes = static_cast<size_t>(params.b) * params.h * params.s * params.d * 2 * {bytes_per_elt};
             params.use_balanced_scheduling = (size_in_bytes <= launch_params.device_l2_cache_size);
         }}
 
@@ -2394,7 +2394,10 @@ def get_kernel_code(kspec, kname, lname):
     params_str = 'reinterpret_cast<bert::Fused_multihead_attention_params_v2 &>(params)' if generate_cu_trtllm else 'params'
     attn_mask_type_str = 'using Attention_mask_type = ContextAttentionMaskType;' if generate_cu_trtllm else 'using Attention_mask_type = fmha::Attention_mask_type;'
     bert_launch_params = '' if generate_cu_trtllm else 'using Launch_params = bert::Fused_multihead_attention_launch_params;'
-    include_str = '#include "../fused_multihead_attention_common.h"\n' if generate_cu_trtllm else ''
+    # No "../" prefix: the generated .cu may live outside the source tree
+    # (TRTLLM_FMHA_GEN_DIR); the consuming CMake target puts the
+    # contextFusedMultiHeadAttention directory on the include path.
+    include_str = '#include "fused_multihead_attention_common.h"\n' if generate_cu_trtllm else ''
     include_str += '#include "tensorrt_llm/common/config.h"' if generate_cu_trtllm else ''
     num_compute_groups_str = '' if generate_cu_trtllm else 'static constexpr int NUM_COMPUTE_GROUPS = 2;'
     fused_multihead_attention_params_v2_str = 'Fused_multihead_attention_params_v2' if generate_cu_trtllm else f'{params_type}'

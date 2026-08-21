@@ -28,6 +28,8 @@ from random import randbytes
 from statistics import median
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Sequence, cast, get_type_hints
 
+import pytest
+
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
         DEFAULT_BEAM_INDEX,
@@ -2300,6 +2302,44 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache.resume(cast(CudaStream, stream_holder.handle))
         kv_cache.close()
 
+    def test_ssm_resume_records_intra_device_copy(self) -> None:
+        """The SSM deferred copy on resume is counted in iteration stats.
+
+        First resume of a cache reusing an SSM snapshot copies the snapshot
+        into a private slot; the copy must appear in the SSM life cycle's
+        iteration stats (TRTLLM-15217). Runs against the selected backend, so
+        it checks the default C++ implementation and Python-backend parity.
+        """
+        tokens_per_block = 32
+        cfg = self._make_ssm_config(tokens_per_block=tokens_per_block)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(48)]
+
+        seed = self.manager.create_kv_cache()
+        seed.resume(stream)
+        seed.capacity = tokens_per_block
+        seed.history_length = tokens_per_block
+        seed.commit(prompt[:tokens_per_block], is_end=True)
+        seed.close()
+
+        reused = self.manager.create_kv_cache(input_tokens=prompt, id=101)
+        self.assertEqual(reused.num_committed_tokens, tokens_per_block)
+        reused.commit_pending_stats()
+        # Drop everything recorded so far; only the resume below should count.
+        self.manager.get_and_reset_ssm_snapshot_iteration_stats()
+        self.manager.get_and_reset_iteration_stats()
+
+        self.assertTrue(reused.resume(stream))
+        ssm_life_cycle_id = _introspection.ssm_life_cycle_id(self.manager)
+        assert ssm_life_cycle_id is not None
+        stats = self.manager.get_and_reset_iteration_stats()
+        self.assertIn(ssm_life_cycle_id, stats)
+        self.assertEqual(stats[ssm_life_cycle_id].iter_intra_device_copy_blocks, 1)
+        self.assertGreater(stats[ssm_life_cycle_id].iter_intra_device_copy_bytes, 0)
+        reused.close()
+
     def test_ssm(self) -> None:
         """Inference with SSM layer: prefill 63 tokens, decode 52 tokens."""
         cfg = self._make_ssm_config()
@@ -2450,6 +2490,45 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(kv4.num_committed_tokens, 64)
         kv4.resume(stream)
         kv4.close()
+
+    def test_num_tokens_before_hybrid_pruning_isolates_recurrent_truncation(self) -> None:
+        """The diagnostic separates a short attention match from recurrent pruning.
+
+        Partial reuse is required for the two numbers to differ at all: without
+        it a match is block-aligned, so the attention-only prefix and the final
+        committed prefix are cut at the same block boundary and the diagnostic
+        is indistinguishable from num_committed_tokens.
+        """
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(96)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 32
+        kv1.commit(prompt[:32])
+        kv1.capacity = 64
+        kv1.commit(prompt[32:64])
+        kv1.close()
+
+        # Attention pages partially cover all 48 lookup tokens, but the latest
+        # reusable SSM snapshot sits at 32 — so recurrent pruning, not a short
+        # attention match, is what cut the reuse.
+        kv = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        self.assertEqual(kv.num_committed_tokens, 32)
+        self.assertEqual(kv._get_num_tokens_before_hybrid_pruning(), 48)
+        kv.resume(stream)
+        kv.close()
+
+        # When the snapshot and the attention match agree, the diagnostic must
+        # collapse onto num_committed_tokens rather than reporting the lookup.
+        kv = self.manager.create_kv_cache(input_tokens=prompt[:64])
+        self.assertEqual(kv.num_committed_tokens, 64)
+        self.assertEqual(kv._get_num_tokens_before_hybrid_pruning(), 64)
+        kv.resume(stream)
+        kv.close()
 
     def test_ssm_planned_drop_targets_latest_snapshot_with_shared_plans(self) -> None:
         """Shared plans drop only their conversation endpoint snapshot."""
@@ -4322,6 +4401,203 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         )
 
 
+class TestPoolRebalance(TestKVCacheManagerV2):
+    """Drive the auto-tuner's pool rebalance end to end.
+
+    TestSlotAllocatorShrink below pokes the Python SlotAllocator directly, so it
+    never reaches the backend selected by TLLM_KV_CACHE_MANAGER_V2_BACKEND. This
+    class goes through the manager instead, covering
+    need_adjustment -> adjust() -> adjust_cache_level -> shrink/expand_pool_group
+    on whichever backend is active (C++ by default).
+    """
+
+    _TOKENS_PER_BLOCK = 32
+    _PROMPT_LEN = 64
+    _DECODE_LEN = 96
+
+    def prepare_two_pool_groups(self, gpu_quota: int = 256 << 20) -> None:
+        """Two attention life cycles with different slot sizes -> two pool groups.
+
+        Pool groups are formed per distinct slot layout, so differing window
+        sizes alone are not enough -- the buffer sizes have to differ too.
+        """
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=self._TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=8192),
+                        BufferConfig(role=Role.VALUE, size=8192),
+                    ],
+                    sliding_window_size=128,
+                    num_sink_tokens=0,
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=2048),
+                        BufferConfig(role=Role.VALUE, size=2048),
+                    ],
+                    sliding_window_size=None,
+                ),
+            ],
+            typical_step=BatchDesc(kv_caches=[KVCacheDesc(capacity=160, history_length=0)]),
+            constraints=[BatchDesc(kv_caches=[KVCacheDesc(capacity=160, history_length=0)])],
+        )
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+
+    def _gpu_ratios(self) -> list[float]:
+        return list(_introspection.current_gpu_ratio(self.manager))
+
+    def _run_sequence(
+        self, prompt: list[TokenIdExt] | None = None, expect_reuse: bool = False
+    ) -> list[TokenIdExt]:
+        """Prefill + decode one sequence with reference checking; return its prompt.
+
+        Passing a previously used prompt exercises block reuse, so the reference
+        check reads back KV from blocks committed before the pool resize.
+        """
+        if prompt is None:
+            prompt = [self.next_token() for _ in range(self._PROMPT_LEN)]
+        kv_cache = self.manager.create_kv_cache(ReuseScope(), prompt)
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self.assertTrue(kv_cache.resume(stream))
+            num_reused = kv_cache.num_committed_tokens
+            if expect_reuse:
+                self.assertGreater(
+                    num_reused, 0, "replay reused no blocks; the KV check would be vacuous"
+                )
+            self.assertTrue(kv_cache.resize(round_up(len(prompt), self._TOKENS_PER_BLOCK)))
+            capacity = kv_cache.capacity
+            history = prompt[:num_reused]
+            new_tokens = prompt[num_reused:]
+            self.engine.execute([Step(kv_cache, new_tokens, history)], stream)
+            if new_tokens:
+                kv_cache.commit(new_tokens)
+                history.extend(new_tokens)
+            for _ in range(self._DECODE_LEN):
+                if len(history) + 1 > capacity:
+                    kv_cache.commit(history[kv_cache.history_length :])
+                    self.assertTrue(
+                        kv_cache.resize(round_up(len(history) + 1, self._TOKENS_PER_BLOCK))
+                    )
+                    capacity = kv_cache.capacity
+                token = self.next_token()
+                self.engine.execute([Step(kv_cache, [token], history)], stream)
+                history.append(token)
+            kv_cache.commit(history[kv_cache.history_length :])
+            self.engine.execute([Step(kv_cache, [], history)], stream)
+        s.take_finish_event().synchronize()
+        kv_cache.close()
+        return prompt
+
+    def _slot_totals(self) -> list[int]:
+        return [s.total for s in _introspection.storage_statistics(self.manager, GPU_LEVEL)]
+
+    def test_adjust_resizes_pool_groups(self) -> None:
+        self.prepare_two_pool_groups()
+        before = self._gpu_ratios()
+        self.assertEqual(len(before), 2, f"expected two pool groups, got {before}")
+
+        self._run_sequence()
+        slots_before = self._slot_totals()
+
+        # Bypass the sample-count / cooldown gates and skew the target ratio so
+        # pool group 0 must grow and pool group 1 must shrink.
+        _introspection.force_rebalance_precondition(self.manager, skew=2.0)
+        self.assertTrue(self.manager.need_adjustment)
+
+        self.manager.adjust()
+
+        after = self._gpu_ratios()
+        self.assertEqual(len(after), len(before))
+        self.assertGreater(
+            after[0] / after[1],
+            before[0] / before[1],
+            f"adjust() did not skew the pool ratios: {before} -> {after}",
+        )
+        # Guard against a no-op adjust(): the pools must really have been
+        # resized, which means both the expand and the shrink path ran.
+        slots_after = self._slot_totals()
+        self.assertGreater(slots_after[0], slots_before[0], f"{slots_before} -> {slots_after}")
+        self.assertLess(slots_after[1], slots_before[1], f"{slots_before} -> {slots_after}")
+
+    def _close_one_cache(self, capacity: int, *, dummy: bool, cache_id: int) -> None:
+        """Create, size and close one KV cache, optionally marked as a dummy.
+
+        Only the close matters here: it is where the auto-tuner samples
+        capacity and history length.
+        """
+        prompt = [self.next_token() for _ in range(self._TOKENS_PER_BLOCK)]
+        kv_cache = self.manager.create_kv_cache(ReuseScope(), prompt, id=cache_id)
+        if dummy:
+            self.manager.mark_stats_excluded(cache_id)
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self.assertTrue(kv_cache.resume(stream))
+            self.assertTrue(kv_cache.resize(capacity, capacity - 1))
+        s.take_finish_event().synchronize()
+        kv_cache.close()
+
+    def test_dummy_kv_caches_do_not_feed_the_tuner(self) -> None:
+        """Stats-excluded caches must not move the target pool ratio.
+
+        Warmup and CUDA-graph padding requests reserve capacity at the model's
+        full declared context rather than at a realistic sequence length, and
+        the tuner averages the *square* of capacity -- so a handful of them
+        dominates the statistic outright and the pools get sized for sequences
+        that never arrive. Those caches are already marked stats-excluded at
+        creation; ``_KVCache.close`` has to honour that.
+        """
+        self.prepare_two_pool_groups()
+
+        # Open the sample-count and cooldown gates but leave the target ratio
+        # alone -- unlike force_rebalance_precondition, which also skews it.
+        # need_adjustment is then driven purely by whether a close moved the
+        # target away from the current ratio.
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+        _introspection.set_last_adjustment_time(self.manager, 0.0)
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "target should still equal the current ratio before any close",
+        )
+
+        big = 64 * self._TOKENS_PER_BLOCK
+        self._close_one_cache(big, dummy=True, cache_id=1)
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "a stats-excluded cache moved the target ratio; dummy requests are "
+            "feeding the auto-tuner",
+        )
+
+        # Control: the same close *without* the exclusion must move the target,
+        # otherwise the assertion above passes for the wrong reason.
+        self._close_one_cache(big, dummy=False, cache_id=2)
+        self.assertTrue(
+            self.manager.need_adjustment,
+            "a real close of the same shape did not move the target either, so "
+            "the check above is vacuous",
+        )
+
+    def test_kv_survives_adjust(self) -> None:
+        """Committed blocks must still verify after pages migrate between slots."""
+        self.prepare_two_pool_groups()
+        self.assertEqual(len(self._gpu_ratios()), 2)
+
+        prompt = self._run_sequence()
+
+        _introspection.force_rebalance_precondition(self.manager, skew=2.0)
+        self.manager.adjust()
+
+        # Replay the same prompt: it reuses the committed blocks, and the fake
+        # engine's reference check reads back the KV those blocks point at.
+        self._run_sequence(prompt=prompt, expect_reuse=True)
+
+
 class TestSlotAllocatorShrink(unittest.TestCase):
     def test_shrink_underused_pool(self) -> None:
         # Regression for NVBug 6225866: shrinking a pool whose new size is
@@ -4359,6 +4635,7 @@ class TestSlotAllocatorShrink(unittest.TestCase):
             allocator.release(s)
 
 
+@pytest.mark.cpu_only
 class TestBlockKeyHashing(unittest.TestCase):
     """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
 

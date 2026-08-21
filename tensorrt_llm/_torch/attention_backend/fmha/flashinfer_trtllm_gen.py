@@ -230,143 +230,6 @@ def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     return bmm1_scale.narrow(0, 1, 1)
 
 
-def _trtllm_gen_batch_decode_with_kv_cache(
-    query: torch.Tensor,
-    kv_pool: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-    multi_ctas_kv_counter_buffer: torch.Tensor,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_seq_len: int,
-    bmm1_scale: float | torch.Tensor,
-    bmm2_scale: float | torch.Tensor,
-    window_left: int,
-    out: torch.Tensor,
-    sinks: Optional[torch.Tensor],
-    enable_pdl: bool,
-    q_len_per_req: Optional[int],
-    max_q_len: Optional[int],
-    cum_seq_lens_q: Optional[torch.Tensor],
-    kv_scale_pool: Optional[torch.Tensor],
-    uses_shared_paged_kv_idx: bool,
-) -> None:
-    if q_len_per_req is not None:
-        decode_max_q_len = q_len_per_req
-        batch_size = query.size(0) // q_len_per_req
-    else:
-        if max_q_len is None or cum_seq_lens_q is None:
-            raise RuntimeError(
-                "trtllm-gen multi-token generation requires max_q_len and cum_seq_lens_q."
-            )
-        decode_max_q_len = max_q_len
-        batch_size = cum_seq_lens_q.size(0) - 1
-
-    bmm1_scale_arg = (
-        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-    )
-
-    run_func = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-    sm_count = flashinfer.decode.get_device_sm_count(query.device)
-    run_func(
-        out,
-        None,  # out_scale_factor
-        query,
-        kv_pool,
-        kv_pool,
-        workspace_buffer,
-        multi_ctas_kv_counter_buffer,
-        block_tables,
-        seq_lens,
-        decode_max_q_len,
-        max_seq_len,
-        bmm1_scale_arg,
-        bmm2_scale,
-        -1.0,  # o_sf_scale
-        -1,  # o_sf_vec_size
-        0,  # o_sf_start_index
-        batch_size,
-        window_left,
-        0,  # sparse_mla_top_k
-        sm_count,
-        enable_pdl,
-        workspace_buffer.numel() * workspace_buffer.element_size(),
-        sinks,
-        cum_seq_lens_q,
-        kv_scale_pool,  # k_block_scales
-        kv_scale_pool,  # v_block_scales
-        None,  # skip_softmax_threshold_scale_factor
-        uses_shared_paged_kv_idx,
-        None,  # lse
-        0,  # lse_stride_tokens
-        0,  # lse_stride_heads
-        False,  # enable_block_sparse_attention (added in flashinfer 0.6.16, flashinfer-ai/flashinfer#3955)
-    )
-
-
-def _trtllm_gen_batch_context_with_kv_cache(
-    query: torch.Tensor,
-    kv_pool: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-    multi_ctas_kv_counter_buffer: torch.Tensor,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_q_len: int,
-    max_kv_len: int,
-    bmm1_scale: float | torch.Tensor,
-    bmm2_scale: float | torch.Tensor,
-    batch_size: int,
-    cum_seq_lens_q: torch.Tensor,
-    cum_seq_lens_kv: torch.Tensor,
-    window_left: int,
-    out: torch.Tensor,
-    sinks: Optional[torch.Tensor],
-    enable_pdl: bool,
-    kv_scale_pool: Optional[torch.Tensor],
-    uses_shared_paged_kv_idx: bool,
-    causal: bool,
-) -> None:
-    bmm1_scale_arg = (
-        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-    )
-
-    run_func = flashinfer.prefill.get_trtllm_gen_fmha_module().trtllm_paged_attention_context
-    sm_count = flashinfer.prefill.get_device_sm_count(query.device)
-    run_func(
-        out,
-        None,  # out_scale_factor
-        query,
-        kv_pool,
-        kv_pool,
-        workspace_buffer,
-        multi_ctas_kv_counter_buffer,
-        block_tables,
-        seq_lens,
-        max_q_len,
-        max_kv_len,
-        bmm1_scale_arg,
-        bmm2_scale,
-        -1.0,  # o_sf_scale
-        -1,  # o_sf_vec_size
-        0,  # o_sf_start_index
-        batch_size,
-        window_left,
-        cum_seq_lens_q,
-        cum_seq_lens_kv,
-        sm_count,
-        enable_pdl,
-        workspace_buffer.numel() * workspace_buffer.element_size(),
-        sinks,
-        kv_scale_pool,  # key_block_scales
-        kv_scale_pool,  # value_block_scales
-        None,  # skip_softmax_threshold_scale_factor
-        uses_shared_paged_kv_idx,
-        causal,  # causal
-        None,  # lse
-        0,  # lse_stride_tokens
-        0,  # lse_stride_heads
-    )
-
-
 @lru_cache(maxsize=128)
 def _get_context_workspace_layout(
     dtype: torch.dtype,
@@ -548,9 +411,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
-    SLOWER_MLA_GENERATION_KERNELS = {
-        (576, 512, 32),
-    }
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -670,7 +530,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
-        tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -706,14 +565,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
-            )
-
-        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
-            return (
-                False,
-                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
-                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
-                f"tokens_per_block={tokens_per_block}.",
             )
 
         return True, ""
@@ -882,7 +733,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
-                    tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )
@@ -1119,36 +969,37 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 .view(torch.float8_e4m3fn)
                 .view(params.num_tokens, attn.num_heads, attn.head_dim)
             )
-        ctx_bmm1_scale = (
-            bmm1_scale if params.fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
-        )
+        ctx_bmm1_scale = bmm1_scale_static
+        if params.fp8_context_fmha and bmm1_scale is not None:
+            ctx_bmm1_scale = bmm1_scale.narrow(0, 0, 1)
         ctx_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
         causal = (
             False
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
-        _trtllm_gen_batch_context_with_kv_cache(
-            q_processed,  # query
-            kv_pool,  # kv_pool
-            fmha_workspace,  # workspace_buffer
-            self._get_multi_ctas_kv_counter_buffer(),  # multi_ctas_kv_counter_buffer
-            block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
-            max_q_len,  # max_q_len
-            max_kv_len,  # max_kv_len
-            ctx_bmm1_scale,  # bmm1_scale
-            ctx_bmm2_scale,  # bmm2_scale
-            params.batch_size,  # batch_size
-            cu_q_seqlens,  # cum_seq_lens_q
-            cu_kv_seqlens,  # cum_seq_lens_kv
-            window_left,  # window_left
-            params.context_buf,  # out
-            fwd.attention_sinks,  # sinks
-            self._enable_pdl,  # enable_pdl
-            kv_scale_pool,  # kv_scale_pool
-            self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
-            causal,  # causal
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=q_processed,
+            kv_cache=(kv_pool, kv_pool),
+            workspace_buffer=fmha_workspace,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=ctx_bmm1_scale,
+            bmm2_scale=ctx_bmm2_scale,
+            batch_size=params.batch_size,
+            cum_seq_lens_q=cu_q_seqlens,
+            cum_seq_lens_kv=cu_kv_seqlens,
+            window_left=window_left,
+            out=params.context_buf,
+            kv_layout=self._layout,
+            enable_pdl=self._enable_pdl,
+            sinks=fwd.attention_sinks,
+            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            causal=causal,
+            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
 
         if params.is_cross:
@@ -1283,25 +1134,32 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         gen_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
 
-        _trtllm_gen_batch_decode_with_kv_cache(
-            q_processed,  # query
-            kv_pool,  # kv_pool
-            fmha_workspace,  # workspace_buffer
-            self._get_multi_ctas_kv_counter_buffer(),  # multi_ctas_kv_counter_buffer
-            block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
-            max_kv_len,  # max_seq_len
-            gen_bmm1_scale,  # bmm1_scale
-            gen_bmm2_scale,  # bmm2_scale
-            window_left,  # window_left
-            params.context_buf,  # out
-            fwd.attention_sinks,  # sinks
-            self._enable_pdl,  # enable_pdl
-            q_len_per_req,  # q_len_per_req
-            decode_max_q_len,  # max_q_len
-            decode_cu_seqlens,  # cum_seq_lens_q
-            kv_scale_pool,  # kv_scale_pool
-            self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=q_processed,
+            kv_cache=(kv_pool, kv_pool),
+            workspace_buffer=fmha_workspace,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_seq_len=max_kv_len,
+            bmm1_scale=gen_bmm1_scale,
+            bmm2_scale=gen_bmm2_scale,
+            window_left=window_left,
+            out=params.context_buf,
+            sinks=fwd.attention_sinks,
+            kv_layout=self._layout,
+            enable_pdl=self._enable_pdl,
+            backend="trtllm-gen",
+            q_len_per_req=q_len_per_req,
+            max_q_len=decode_max_q_len,
+            cum_seq_lens_q=decode_cu_seqlens,
+            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            bmm1_scale_log2=(
+                _get_bmm1_scale_log2(gen_bmm1_scale)
+                if isinstance(gen_bmm1_scale, torch.Tensor)
+                else None
+            ),
+            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
 
     def run_mla_generation(
@@ -1337,14 +1195,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             batch_beam,  # batch_size
             params.attention_input.dtype,  # dtype
         )
-
-        pages_per_superblock = 128 // params.tokens_per_block
-        if pages_per_superblock > 1:
-            num_blocks = block_tables.size(-1)
-            remainder = num_blocks % pages_per_superblock
-            if remainder != 0:
-                pad = pages_per_superblock - remainder
-                block_tables = torch.nn.functional.pad(block_tables, (0, pad), value=0)
 
         kv_lora_rank = attn.kv_lora_rank or 0
         qk_nope_head_dim = attn.qk_nope_head_dim or 0

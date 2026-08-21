@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -31,7 +31,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     BatchDesc,
+    DiskCacheTierConfig,
     GpuCacheTierConfig,
+    HostCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
 )
@@ -39,6 +41,16 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+class _CacheTierInitError(Exception):
+    pass
+
+
+@dataclass
+class _FakeManagerConfig:
+    cache_tiers: list[object]
+    layers: list[object] = field(default_factory=lambda: [None])
 
 
 class _FakeKVCache:
@@ -88,6 +100,72 @@ def _make_cache_config_for_test(
         tokens_per_block=128,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 30)],
     )
+
+
+def _make_manager_for_cache_tier_test(
+    kv_cache_config: KvCacheConfig,
+    impl_side_effect: list[object],
+    *,
+    add_secondary_gpu_tier: bool = False,
+) -> tuple[KVCacheManagerV2, Mock]:
+    impl_constructor = Mock(side_effect=impl_side_effect)
+
+    def build_base_config(
+        self: KVCacheManagerV2,
+        config: KvCacheConfig,
+        *,
+        tokens_per_block: int,
+        cache_tiers: list[object],
+    ) -> _FakeManagerConfig:
+        del self, config, tokens_per_block
+        return _FakeManagerConfig(cache_tiers=cache_tiers)
+
+    def build_cache_config(
+        self: KVCacheManagerV2, config: _FakeManagerConfig
+    ) -> _FakeManagerConfig:
+        del self
+        if add_secondary_gpu_tier:
+            return _FakeManagerConfig(
+                cache_tiers=[
+                    config.cache_tiers[0],
+                    GpuCacheTierConfig(quota=1 << 20),
+                    *config.cache_tiers[1:],
+                ],
+                layers=config.layers,
+            )
+        return config
+
+    fake_impl = impl_side_effect[-1]
+    assert not isinstance(fake_impl, BaseException)
+    fake_impl.layer_grouping = [[0]]
+    fake_impl.pool_group_descs = []
+    fake_impl.get_layer_group_id.side_effect = lambda _: 0
+
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    with (
+        patch(f"{module}.CuError", _CacheTierInitError),
+        patch(f"{module}.KVCacheManagerPy", impl_constructor),
+        patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
+        patch.object(KVCacheManagerV2, "_build_cache_config", build_cache_config),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
+        patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
+        patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
+    ):
+        manager = KVCacheManagerV2(
+            kv_cache_config,
+            CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+            execution_stream=Mock(),
+        )
+    return manager, impl_constructor
 
 
 @pytest.mark.parametrize(
@@ -197,6 +275,94 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
             KvCacheConfig(avg_seq_len=2048),
             max_seq_len=1024,
         )
+
+
+def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+        ),
+        [impl],
+    )
+
+    assert manager.can_evict
+    assert impl_constructor.call_count == 1
+    cache_tiers = impl_constructor.call_args.args[0].cache_tiers
+    assert [type(tier) for tier in cache_tiers] == [
+        GpuCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+
+
+def test_disk_init_failure_does_not_use_host_fallback(tmp_path) -> None:
+    with pytest.raises(_CacheTierInitError, match="disk tier init failed"):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=0,
+                disk_cache_size=16 << 20,
+                disk_cache_path=str(tmp_path),
+            ),
+            [_CacheTierInitError("disk tier init failed"), Mock()],
+        )
+
+
+@pytest.mark.parametrize(
+    ("add_secondary_gpu_tier", "expected_can_evict"),
+    [(False, False), (True, True)],
+)
+def test_host_init_fallback_recomputes_eviction_capability(
+    add_secondary_gpu_tier: bool,
+    expected_can_evict: bool,
+) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+        ),
+        [_CacheTierInitError("host tier init failed"), impl],
+        add_secondary_gpu_tier=add_secondary_gpu_tier,
+    )
+
+    assert manager.can_evict is expected_can_evict
+    assert impl_constructor.call_count == 2
+    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
+    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
+    assert any(isinstance(tier, HostCacheTierConfig) for tier in initial_tiers)
+    assert all(isinstance(tier, GpuCacheTierConfig) for tier in fallback_tiers)
+    assert len(fallback_tiers) == 1 + int(add_secondary_gpu_tier)
+
+
+def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
+    impl = Mock()
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+        ),
+        [_CacheTierInitError("host tier init failed"), impl],
+    )
+
+    assert manager.can_evict
+    assert impl_constructor.call_count == 2
+    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
+    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
+    assert [type(tier) for tier in initial_tiers] == [
+        GpuCacheTierConfig,
+        HostCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+    assert [type(tier) for tier in fallback_tiers] == [
+        GpuCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
 
 
 def test_extra_tokens_are_in_context_capacity() -> None:
