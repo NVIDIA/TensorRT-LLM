@@ -921,6 +921,9 @@ class KvCacheCreator:
                                                profiled_output_bytes: int = 0
                                                ) -> int:
         """Return output and cache capacity absent from the measured peak."""
+        if self._llm_args.disable_mm_encoder:
+            return 0
+
         output_budget = getattr(self._model_engine,
                                 "mm_encoder_output_budget_bytes", None)
         unprofiled_output_bytes = max(0, (output_budget or 0) -
