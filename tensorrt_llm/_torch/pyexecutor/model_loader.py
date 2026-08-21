@@ -43,6 +43,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
+from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
@@ -1130,6 +1131,8 @@ class ModelLoader:
                             for name, value in self._metrics.items())
         logger.info(
             f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
+        if LOW_M_GEMM_ACTIVE:
+            prepare_low_m_gemm(model)
         return model, moe_load_balancer
 
     def _check_gms_source_identity(self, gms_backend) -> None:

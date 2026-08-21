@@ -5,7 +5,9 @@ build
 colored
 cuda-python>=13
 # FlowMatchEuler respects a supplied generator starting in 0.39.0 (huggingface/diffusers#13678).
-diffusers>=0.39.0
+# Upper bound: 0.40.0 requires huggingface-hub>=1.23.0, which requires click>=8.4.2
+# and conflicts with the click<8.4 pin below. Lift together with that pin.
+diffusers>=0.39.0,<0.40
 ftfy
 lark
 lazy_loader~=0.5
