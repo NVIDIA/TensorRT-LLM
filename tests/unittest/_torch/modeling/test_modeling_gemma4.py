@@ -2662,6 +2662,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             source_offset += page_count
         return expected
 
+    @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -2703,6 +2704,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 rtol=0,
             )
 
+    @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -2740,6 +2742,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 self.assertEqual(wrappers.decode_block_table_active_rows, len(new_page_counts))
                 self.assertEqual(wrappers.decode_block_table_active_width, max(new_page_counts))
 
+    @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -2790,6 +2793,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                     rtol=0,
                 )
 
+    @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -3215,11 +3219,12 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
-    def test_cuda_graph_decode_high_gqa(self):
+    def test_cuda_graph_decode_high_gqa(self) -> None:
         """CUDA graph decode with GQA=8 and real head_dim (E2B-like).
 
         Uses E2B real-dims config (hd=256/512, GQA=8) with multi-step
@@ -3629,11 +3634,12 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         """26B-like: GQA=2, K=V, hd=256/512."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG), "26B")
 
+    @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
-    def test_cuda_graph_multi_step_trtllm_gen(self):
+    def test_cuda_graph_multi_step_trtllm_gen(self) -> None:
         """Multi-step CG decode with trtllm-gen (hd=256/512).
 
         Verifies _block_tables update in prepare() works correctly

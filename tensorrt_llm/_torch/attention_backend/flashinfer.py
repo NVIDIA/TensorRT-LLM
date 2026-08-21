@@ -1446,11 +1446,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 wrappers = self._plan_params_to_wrappers[plan_params]
                 if wrappers.fa2_plan_num_blocks is not None:
                     num_blocks = tuple(self.num_blocks[self.num_contexts:])
-                    if not num_blocks or wrappers.fa2_plan_num_blocks == num_blocks:
+                    if not num_blocks:
+                        wrappers.fa2_plan_num_blocks = None
+                    elif wrappers.fa2_plan_num_blocks == num_blocks:
                         continue
-                    wrappers.is_planned = False
-                    self._plan_with_params(plan_params)
-                    continue
+                    else:
+                        wrappers.is_planned = False
+                        self._plan_with_params(plan_params)
+                        continue
                 wrappers.is_planned = False
                 if not defer_plan:
                     self._plan_with_params(plan_params)
