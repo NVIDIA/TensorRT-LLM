@@ -582,6 +582,135 @@ def test_load_cache_skips_non_literal_tactic():
     assert bad not in cache.cache
 
 
+_CACHE_ENTRY_KEY = ("op", "R", "0", ((1, 128), ))
+
+
+def _cache_entry() -> dict[str, object]:
+    return {"runner_id": 0, "tactic": "7", "min_time": 0.001}
+
+
+def _write_cache_doc(
+    metadata: dict[str, object] | None,
+    ranks: tuple[int, ...] = (0, ),
+) -> tuple[str, tempfile.TemporaryDirectory]:
+    """One-entry-per-rank cache file. Returns (path, tmpdir); keep tmpdir alive."""
+    doc = {"shared": {}}
+    for rank in ranks:
+        doc[f"rank_{rank}"] = {str(_CACHE_ENTRY_KEY): _cache_entry()}
+    if metadata is not None:
+        doc["metadata"] = metadata
+    temp_dir = tempfile.TemporaryDirectory()
+    cache_path = os.path.join(temp_dir.name, "cache.json")
+    with open(cache_path, "w") as f:
+        json.dump(doc, f)
+    return cache_path, temp_dir
+
+
+def test_load_cache_discards_other_device_capability() -> None:
+    """The cache key has no device in it, so a foreign entry can hit."""
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    foreign = dict(cache._serialize_metadata())
+    foreign["device_capability"] = (1, 0)
+    cache_path, _tmp = _write_cache_doc(foreign)
+
+    cache.load_cache(cache_path, rank=0)
+    assert _CACHE_ENTRY_KEY not in cache.cache
+    assert cache.device_capability == torch.cuda.get_device_capability()
+
+
+def test_load_cache_tolerates_version_and_name_drift() -> None:
+    """An upgrade or a driver rename must not throw away a good cache."""
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    drifted = dict(cache._serialize_metadata())
+    drifted["lib_version"] = "0.0.0-some-other-build"
+    drifted["device_name"] = "NVIDIA Renamed By The Driver"
+    cache_path, _tmp = _write_cache_doc(drifted)
+
+    cache.load_cache(cache_path, rank=0)
+    assert _CACHE_ENTRY_KEY in cache.cache
+
+
+def test_load_cache_without_metadata_is_discarded_not_raised() -> None:
+    """load_cache passes .get("metadata", {}), which used to hit KeyError."""
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    cache_path, _tmp = _write_cache_doc(None)
+
+    cache.load_cache(cache_path, rank=0)
+    assert _CACHE_ENTRY_KEY not in cache.cache
+
+
+def test_save_cache_replaces_discarded_foreign_cache() -> None:
+    """save_cache merges into the file, so it must replace a rejected one.
+
+    Otherwise our metadata lands next to the foreign entries and the next load
+    accepts them. The two entries use different keys so a merge cannot hide
+    behind an overwrite.
+    """
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    foreign = dict(cache._serialize_metadata())
+    foreign["device_capability"] = (1, 0)
+    cache_path, _tmp = _write_cache_doc(foreign)
+
+    cache.load_cache(cache_path, rank=0)
+    assert _CACHE_ENTRY_KEY not in cache.cache
+
+    reprofiled = ("op_reprofiled", "R", "0", ((2, 128), ))
+    cache[reprofiled] = (0, 9, 0.002)
+    cache.save_cache(cache_path, rank=0)
+
+    with open(cache_path) as f:
+        written = json.load(f)
+    assert cache._normalize_metadata_value(
+        written["metadata"]["device_capability"]) == tuple(
+            torch.cuda.get_device_capability())
+    assert str(_CACHE_ENTRY_KEY) not in written["rank_0"]
+    assert str(reprofiled) in written["rank_0"]
+
+    # And the round trip sticks: the fresh entries are not discarded again.
+    cache.clear()
+    cache.load_cache(cache_path, rank=0)
+    assert reprofiled in cache.cache
+    assert _CACHE_ENTRY_KEY not in cache.cache
+
+
+def test_save_cache_after_discard_keeps_later_ranks() -> None:
+    """Replacing the file drops every rank's section, not just ours.
+
+    That is fine for foreign entries, but ranks must not then overwrite each
+    other once the file records this device again.
+    """
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    foreign = dict(cache._serialize_metadata())
+    foreign["device_capability"] = (1, 0)
+    cache_path, _tmp = _write_cache_doc(foreign, ranks=(0, 1))
+
+    rank0_key = ("op_rank0", "R", "0", ((2, 128), ))
+    cache.load_cache(cache_path, rank=0)
+    cache[rank0_key] = (0, 9, 0.002)
+    cache.save_cache(cache_path, rank=0)
+
+    rank1_key = ("op_rank1", "R", "0", ((4, 128), ))
+    cache.clear()
+    cache.load_cache(cache_path, rank=1)
+    cache[rank1_key] = (0, 11, 0.003)
+    cache.save_cache(cache_path, rank=1)
+
+    with open(cache_path) as f:
+        written = json.load(f)
+    assert str(rank0_key) in written["rank_0"]
+    assert str(rank1_key) in written["rank_1"]
+    foreign_left = [
+        key for section in written.values() if isinstance(section, dict)
+        for key in section if key == str(_CACHE_ENTRY_KEY)
+    ]
+    assert not foreign_left
+
+
 def test_kernel_testing_single_context():
     """Test kernel testing with a single choose_one context"""
     x, w = torch.randn(16, 64), torch.randn(64, 128)

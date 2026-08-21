@@ -629,6 +629,13 @@ class AutoTunerProfilingCache:
             with _exclusive_cache_lock(lock_path):
                 current_cache = self._read_existing_cache(file_path)
 
+                # Don't merge into a file load_cache rejected. We write our
+                # metadata below, which would make its foreign entries pass
+                # validation on the next load.
+                if not self._metadata_matches_device(
+                        current_cache.get("metadata", {})):
+                    current_cache = {"metadata": self._serialize_metadata()}
+
                 # Merge shared cache entries (non-INDEPENDENT ops)
                 if self.SHARED_CACHE_KEY not in current_cache:
                     current_cache[self.SHARED_CACHE_KEY] = {}
@@ -705,6 +712,9 @@ class AutoTunerProfilingCache:
         Note:
             Loading will replace the current cache contents. The cache is loaded
             from JSON format.
+
+            A file recorded for another compute capability is discarded
+            instead of loaded, so the ops re-profile.
         """
         file_path = Path(file_path)
         if not file_path.exists():
@@ -715,12 +725,13 @@ class AutoTunerProfilingCache:
             with _exclusive_cache_lock(lock_path):
                 with open(file_path, "r") as f:
                     current_cache_contents = json.load(f)
-            self._deserialize_metadata(
-                current_cache_contents.get("metadata", {}))
-
             # Start with empty cache and independent ops set
             self.cache = {}
             self.independent_op = set()
+
+            if not self._validate_metadata(
+                    current_cache_contents.get("metadata", {}), file_path):
+                return
 
             # Load shared cache entries (non-INDEPENDENT ops)
             if self.SHARED_CACHE_KEY in current_cache_contents:
@@ -763,11 +774,48 @@ class AutoTunerProfilingCache:
             "device_capability": self.device_capability,
         }
 
-    def _deserialize_metadata(self, metadata: Dict[str, Any]) -> None:
-        self.lib_version = metadata["lib_version"]
-        self.creation_timestamp = metadata["creation_timestamp"]
-        self.device_name = metadata["device_name"]
-        self.device_capability = metadata["device_capability"]
+    @staticmethod
+    def _normalize_metadata_value(value: object) -> object:
+        # JSON turns the (10, 0) capability tuple back into [10, 0].
+        if isinstance(value, (list, tuple)):
+            return tuple(
+                AutoTunerProfilingCache._normalize_metadata_value(v)
+                for v in value)
+        return value
+
+    def _metadata_matches_device(self, metadata: object) -> bool:
+        """True if `metadata` records this device's compute capability.
+
+        Silent so save_cache can re-check without logging it twice.
+        """
+        if not isinstance(metadata,
+                          dict) or "device_capability" not in metadata:
+            return False
+        return (self._normalize_metadata_value(
+            metadata["device_capability"]) == self._normalize_metadata_value(
+                self.device_capability))
+
+    def _validate_metadata(self, metadata: object, file_path: Path) -> bool:
+        """True if the entries can be used on this device.
+
+        The cache key has no device in it, so an entry profiled on another
+        capability can hit and return a tactic never measured here.
+
+        lib_version and device_name are not checked: the version changes every
+        release without invalidating tactics, and the device name changes with
+        the driver.
+        """
+        if self._metadata_matches_device(metadata):
+            return True
+        recorded = metadata.get("device_capability") if isinstance(
+            metadata, dict) else None
+        logger.warning(
+            f"[AutoTuner] Discarding the profiling cache at {file_path}: it "
+            f"records compute capability "
+            f"{self._normalize_metadata_value(recorded)}, this device is "
+            f"{self._normalize_metadata_value(self.device_capability)}. It "
+            f"will be re-profiled. Use one cache file per GPU architecture.")
+        return False
 
     def _serialize_cache_data(self,
                               cache: Optional[Dict[Tuple, Tuple]] = None
