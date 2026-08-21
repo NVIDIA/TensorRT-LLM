@@ -672,20 +672,21 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
 // Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
 // both label existence and that the labeler is an active team member.
 // Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
-def getMultiGpuApprovalLabelGate(pipeline, globalVars) {
+// recordBlock=false performs the same check without changing the build description.
+def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch, boolean recordBlock = true) {
     if (!globalVars[GITHUB_PR_API_URL]) {
         echo "[requireMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
-        return [gateOpen: true, status: "not_applicable", reason: ""]
+        return false
     }
     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
         echo "[requireMultiGpuApprovalLabel] Skipping label check: PostMerge pipeline is exempt"
-        return [gateOpen: true, status: "not_applicable", reason: ""]
+        return false
     }
 
     def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
     if (!prMatch) {
         echo "[requireMultiGpuApprovalLabel] Could not extract PR number from ${globalVars[GITHUB_PR_API_URL]}. Failing open."
-        return [gateOpen: true, status: "unknown", reason: ""]
+        return false
     }
     def prNumber = prMatch[0][1]
 
@@ -693,35 +694,29 @@ def getMultiGpuApprovalLabelGate(pipeline, globalVars) {
     if (!result.checkCompleted) {
         // API error — fail-open: do not block CI if the label check itself fails
         echo "[requireMultiGpuApprovalLabel] Label validation incomplete (${result.error}). Failing open."
-        return [gateOpen: true, status: "unknown", reason: ""]
+        return false
     }
     if (result.labelExists && result.authorized) {
-        return [gateOpen: true, status: "approved", reason: ""]
-    }
-
-    def reason = !result.labelExists
-        ? "label 'ci: full pre-merge approved' is not present on this PR"
-        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
-    def status = result.labelExists ? "unauthorized" : "missing"
-    return [gateOpen: false, status: status, reason: reason]
-}
-
-def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
-    def gate = getMultiGpuApprovalLabelGate(pipeline, globalVars)
-    if (gate.gateOpen) {
         return false
     }
 
-    // Label missing or unauthorized — write description marker for wrapper
-    // to surface in PR comment, and return the block reason string.
-    def existingDesc = currentBuild.description ?: ""
-    currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
-        "<span data-multi-gpu-label-required='true'>" +
-        "Multi-GPU tests require label 'ci: full pre-merge approved'" +
-        "</span>"
-    def blockMsg = "${arch} Multi-GPU tests blocked: ${gate.reason}. " +
+    // Label missing or unauthorized — return the block reason and optionally
+    // write the marker that the wrapper surfaces in the PR comment.
+    if (recordBlock) {
+        def existingDesc = currentBuild.description ?: ""
+        currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
+            "<span data-multi-gpu-label-required='true'>" +
+            "Multi-GPU tests require label 'ci: full pre-merge approved'" +
+            "</span>"
+    }
+    def reason = !result.labelExists
+        ? "label 'ci: full pre-merge approved' is not present on this PR"
+        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
+    def blockMsg = "${arch} Multi-GPU tests blocked: ${reason}. " +
          "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
-    echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
+    if (recordBlock) {
+        echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
+    }
     return blockMsg
 }
 
@@ -922,20 +917,10 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                       "stages=${result.affected_stages.size()}")
         def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
         def multiGpuRequired = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
-        // The label gate is irrelevant when normal CI does not require
-        // multi-GPU. Treat it as effectively open and avoid an unnecessary
-        // GitHub API request on the common single-GPU-only path.
         def multiGpuLabelGateOpen = !multiGpuRequired ||
             _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
-        _cbtsReportDecision(
-            pipeline,
-            globalVars,
-            runStatus,
-            "",
-            output,
-            multiGpuRequired,
-            multiGpuLabelGateOpen,
-        )
+        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
+                            multiGpuRequired, multiGpuLabelGateOpen)
         return result
     } catch (InterruptedException e) {
         throw e
@@ -951,10 +936,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 {
     try {
-        def gate = getMultiGpuApprovalLabelGate(pipeline, globalVars)
-        pipeline.echo("CBTS: multi-GPU label gate at decision time: " +
-                      "status=${gate.status}, open=${gate.gateOpen}")
-        return gate.gateOpen as boolean
+        def blockReason = requireMultiGpuApprovalLabel(
+            pipeline, globalVars, "CBTS telemetry", false)
+        return !blockReason
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
