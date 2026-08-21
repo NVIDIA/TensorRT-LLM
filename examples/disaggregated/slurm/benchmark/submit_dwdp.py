@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Submit DWDP disaggregated benchmark jobs.
 
 This script handles the DWDP-specific submission flow which requires MPI-based
@@ -25,6 +40,7 @@ from submit import (
     convert_allocations_to_server_config,
     convert_envs_to_str,
     format_export_string,
+    get_server_health_timeout,
     load_config,
     replace_env_in_file,
     save_env_file,
@@ -437,12 +453,18 @@ def submit_dwdp_job(config, log_dir, dry_run):
     )
 
     # Generate wait server command
+    server_health_timeout = get_server_health_timeout(env_config)
+    wait_server_script = os.path.join(script_dir, "wait_server.sh")
+    wait_server_command = (
+        f"bash {wait_server_script} {disagg_server_hostname} "
+        f"{disagg_server_port} {server_health_timeout}"
+    )
     cmd = [
         "srun -l",
         f"--container-name={container_name}",
         f"--container-mounts={container_mount_str}",
         "--mpi=pmix --overlap -N 1 -n 1",
-        f"bash {os.path.join(script_dir, 'wait_server.sh')} {disagg_server_hostname} {disagg_server_port}",
+        wait_server_command,
         f"&> {log_dir}/5_wait_server.log",
     ]
     start_server_cmds.append(" ".join(cmd))

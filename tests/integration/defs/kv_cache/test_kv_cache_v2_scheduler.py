@@ -24,9 +24,9 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor import request as executor_request
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams, SchedulerConfig
-from tensorrt_llm.lora_helper import LoraConfig
 
 from ..conftest import llm_models_root, skip_pre_hopper
 
@@ -95,6 +95,11 @@ EVICTION_PROMPTS_SHORT = [
 # ---------------------------------------------------------------------------
 # V2 scheduler requires MAX_UTILIZATION policy
 _V2_SCHEDULER_CONFIG = SchedulerConfig(capacity_scheduler_policy="MAX_UTILIZATION")
+
+# These functional tests construct V1 and V2 LLMs back-to-back. Cap each KV pool
+# at ~256 MiB instead of using the 90% default to reduce allocator pressure
+# during teardown (Llama-3.2-1B uses ~32 KiB of KV cache per token).
+_LLAMA_KV_CACHE_MAX_TOKENS = 8192
 
 # ---------------------------------------------------------------------------
 # Eviction test parameters.
@@ -223,6 +228,9 @@ def _run_eviction_test(
 # ===========================================================================
 # Functional tests on Llama-3.2-1B
 # ===========================================================================
+# Each comparison constructs stateful V1 and V2 engines back-to-back. Keep
+# their MPI workers private so engine state cannot leak across comparisons.
+@pytest.mark.private_mpi_session
 class TestKVCacheV2Llama:
     """Functional tests for V2 scheduler using Llama-3.2-1B (1 GPU)."""
 
@@ -230,6 +238,10 @@ class TestKVCacheV2Llama:
 
     def _compare(self, prompts, max_tokens=32, kv_extra=None, **llm_kwargs):
         """Run V1 vs V2 with greedy sampling; assert outputs match."""
+        kv_extra = {
+            "max_tokens": _LLAMA_KV_CACHE_MAX_TOKENS,
+            **(kv_extra or {}),
+        }
         return _run_v1_v2_compare(
             self.MODEL_PATH,
             prompts,
@@ -328,6 +340,7 @@ class TestKVCacheV2Llama:
         )
 
     # Chunked prefill + eviction + block reuse — V2 matches V1
+    @pytest.mark.private_mpi_session
     def test_chunked_prefill_eviction_block_reuse(self):
         _run_eviction_test(
             self.MODEL_PATH,

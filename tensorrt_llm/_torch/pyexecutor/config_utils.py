@@ -2,13 +2,78 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.logger import logger
+
+
+def uses_vswa_kv_cache_layout(
+        max_attention_windows: Optional[Sequence[Optional[int]]]) -> bool:
+    """Return whether windows require a variable-window KV cache layout.
+
+    Recurrent-state cache sentinels are negative and do not represent
+    attention windows, so hybrid linear-attention layouts are not VSWA.
+    """
+    return (max_attention_windows is not None
+            and len(set(max_attention_windows)) > 1
+            and all(window is None or window > 0
+                    for window in max_attention_windows))
+
+
+def _is_sliding_attention_layer(layer_type: object) -> bool:
+    """Return whether a config layer type denotes sliding attention."""
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "sliding" in layer_type_name
+
+
+def get_layer_attention_window(
+    config: object,
+    layer_idx: int,
+) -> Optional[int]:
+    """Return the active sliding window for one layer, or ``None``.
+
+    An explicit ``use_sliding_window=False`` disables sliding attention.
+    Otherwise, infer it from ``sliding_window`` and ``layer_types`` so legacy
+    configs that omit the flag continue to work. Qwen2-style configs that omit
+    ``layer_types`` use ``max_window_layers`` as the first sliding-layer index.
+    """
+    use_sliding_window = getattr(config, "use_sliding_window", None)
+    if use_sliding_window is False:
+        return None
+
+    sliding_window = getattr(config, "sliding_window", None)
+    if isinstance(sliding_window, (list, tuple)):
+        raise NotImplementedError(
+            "Attention-window derivation assumes a single sliding-window "
+            f"size, got multiple: {sliding_window}")
+    if sliding_window is None:
+        if use_sliding_window is True:
+            raise ValueError(
+                "use_sliding_window=True requires a positive integer "
+                "sliding_window.")
+        return None
+
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types:
+        layer_type = layer_types[layer_idx % len(layer_types)]
+        if not _is_sliding_attention_layer(layer_type):
+            return None
+    else:
+        max_window_layers = getattr(config, "max_window_layers", None)
+        if (isinstance(max_window_layers, int)
+                and not isinstance(max_window_layers, bool)
+                and layer_idx < max_window_layers):
+            return None
+
+    if (not isinstance(sliding_window, int) or isinstance(sliding_window, bool)
+            or sliding_window <= 0):
+        raise ValueError(
+            "Sliding attention requires a positive integer sliding_window.")
+    return sliding_window
 
 
 def is_gemma4_hybrid(config):
@@ -20,7 +85,68 @@ def is_gemma4_hybrid(config):
 
 
 def is_hybrid_linear(config):
-    return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+    return is_nemotron_hybrid(config) or is_qwen3_hybrid(config) or \
+        is_kimi_linear(config)
+
+
+def is_kimi_linear(config):
+    """True for Kimi K3 ("kimi_linear") hybrid KDA + MLA text models.
+
+    Handles both the flattened text config (model_type "kimi_linear") and the
+    composite VLM config (model_type "kimi_k3" with a nested text_config).
+    """
+    model_type = getattr(config, "model_type", None)
+    if model_type == "kimi_linear":
+        return getattr(config, "linear_attn_config", None) is not None
+    if model_type == "kimi_k3":
+        text_config = getattr(config, "text_config", None)
+        return text_config is not None and is_kimi_linear(text_config)
+    return False
+
+
+def unwrap_kimi_text_config(config):
+    """Return the flattened Kimi text config.
+
+    ``is_kimi_linear`` accepts both the flattened text config and the
+    composite "kimi_k3" config with a nested ``text_config``; consumers read
+    text-level fields (``linear_attn_config``, ``num_hidden_layers``, ...),
+    so they must unwrap the composite form first.
+    """
+    if getattr(config, "model_type", None) == "kimi_k3":
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None:
+            return text_config
+    return config
+
+
+def get_kimi_linear_layer_masks(config):
+    """Return (full_attention_layer_mask, kda_layer_mask) for Kimi K3.
+
+    The config's ``linear_attn_config`` carries 1-indexed ``kda_layers`` and
+    ``full_attn_layers`` lists; every decoder layer must be exactly one of
+    the two.
+    """
+    config = unwrap_kimi_text_config(config)
+    lin = config.linear_attn_config
+    kda_layers = set(lin["kda_layers"])
+    full_attn_layers = set(lin["full_attn_layers"])
+    full_mask, kda_mask = [], []
+    for layer_idx in range(config.num_hidden_layers):
+        is_kda = (layer_idx + 1) in kda_layers
+        is_full = (layer_idx + 1) in full_attn_layers
+        if is_kda == is_full:
+            raise ValueError(
+                f"Kimi K3 layer {layer_idx} (1-indexed {layer_idx + 1}) must "
+                f"be exactly one of KDA / full attention; got is_kda={is_kda} "
+                f"is_full={is_full}")
+        kda_mask.append(is_kda)
+        full_mask.append(is_full)
+    return full_mask, kda_mask
+
+
+def get_kimi_linear_num_attention_layers(config):
+    full_mask, _ = get_kimi_linear_layer_masks(config)
+    return sum(full_mask)
 
 
 def _coerce_torch_dtype(dtype):
@@ -260,7 +386,8 @@ def extract_mamba_kv_cache_params(
 ) -> MambaKVCacheParams:
     """Build the mamba-related inputs for kv_cache_manager_cls.
 
-    Supports Nemotron-hybrid and Qwen3-hybrid (Qwen3-Next + Qwen3.5).
+    Supports Nemotron-hybrid, Qwen3-hybrid (Qwen3-Next + Qwen3.5) and
+    Kimi K3 (kimi_linear).
 
     Args:
         config: HuggingFace model config of a hybrid Mamba model.
@@ -288,6 +415,23 @@ def extract_mamba_kv_cache_params(
         n_groups = config.linear_num_key_heads
         head_dim = config.linear_value_head_dim
         target_full_attn_mask, mamba_mask = get_qwen3_hybrid_layer_masks(config)
+    elif is_kimi_linear(config):
+        # Kimi K3 KDA (Kimi Delta Attention) state, mapped onto the Mamba
+        # cache-manager parametrization (see PythonMambaCacheManager):
+        #   conv_dim = head_dim*num_heads + 2*n_groups*state_size
+        #            = 3 * num_heads * head_dim  -> [q | k | v] short-conv
+        #   ssm state shape = [num_heads, head_dim, state_size]
+        #            = [H, V, K] fp32 delta-rule recurrent state.
+        # conv_kernel is set to short_conv_kernel_size + 1 so the pool's
+        # (conv_kernel - 1) columns hold the FULL FLA ShortConvolution cache
+        # window of `short_conv_kernel_size` columns.
+        lin = unwrap_kimi_text_config(config).linear_attn_config
+        state_size = lin["head_dim"]
+        conv_kernel = lin["short_conv_kernel_size"] + 1
+        num_heads = lin["num_heads"]
+        n_groups = lin["num_heads"]
+        head_dim = lin["head_dim"]
+        target_full_attn_mask, mamba_mask = get_kimi_linear_layer_masks(config)
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
@@ -307,6 +451,15 @@ def extract_mamba_kv_cache_params(
         mamba_ssm_cache_dtype = (resolve_ssm_cache_dtype(config)
                                  or resolve_hf_torch_dtype(config)
                                  or torch.bfloat16)
+    if is_kimi_linear(config) and mamba_ssm_cache_dtype != torch.float32:
+        # The KDA delta-rule recurrent state must be kept in fp32 for
+        # numerical parity with the HF reference (fla chunk/fused_recurrent
+        # KDA kernels carry the state in fp32).
+        logger.info(
+            f"Kimi K3: overriding mamba_ssm_cache_dtype "
+            f"{mamba_ssm_cache_dtype} -> torch.float32 (KDA recurrent state "
+            "must be fp32)")
+        mamba_ssm_cache_dtype = torch.float32
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -425,6 +578,26 @@ def _build_minicpmv4_6_config(
     return composite_config
 
 
+def is_kimi_k3_multimodal_config(config_dict: dict) -> bool:
+    """Detect Kimi K3's composite multimodal VLM checkpoint config.
+
+    The released Kimi K3 VLM checkpoint advertises ``model_type: kimi_k3`` with
+    nested ``text_config`` (the ``kimi_linear`` text core) and ``vision_config``
+    (the MoonViT-3D tower + projector). When both sub-configs are present and
+    multimodal is not explicitly disabled, TRT-LLM keeps the composite
+    ``KimiK3Config`` and routes the checkpoint to
+    ``KimiK3ForConditionalGeneration``. Text-only ``kimi_linear`` checkpoints (or
+    a ``kimi_k3`` config with ``language_model_only: true`` / no vision_config)
+    fall through to the text-only flatten path.
+    """
+    text_config = config_dict.get("text_config")
+    vision_config = config_dict.get("vision_config")
+    return (config_dict.get("model_type") == "kimi_k3"
+            and config_dict.get("language_model_only") is not True
+            and isinstance(text_config, dict) and bool(text_config)
+            and isinstance(vision_config, dict) and bool(vision_config))
+
+
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):
 
@@ -509,6 +682,23 @@ def load_pretrained_config(model_name_or_path: str,
             model_name_or_path, **kwargs)
         _normalize_qwen35_vl_config(model_config,
                                     inner_arch="Qwen3_5ForCausalLM")
+    elif is_kimi_k3_multimodal_config(config_dict):
+        # Kimi K3 multimodal VLM: keep the composite KimiK3Config so the vision
+        # tower, projector, and multimodal token id remain available, and route
+        # to KimiK3ForConditionalGeneration. Must precede the text-only flatten
+        # branch below so vision_config isn't dropped. Built from the in-tree
+        # config classes (no trust_remote_code needed for the config).
+        from tensorrt_llm._torch.configs import KimiK3Config
+        model_config = KimiK3Config.from_dict(config_dict, **kwargs)
+        model_config.architectures = ["KimiK3ForConditionalGeneration"]
+    elif model_type in ("kimi_k3", "kimi_linear"):
+        # Kimi K3 text-only (or multimodal explicitly disabled): flatten to the
+        # in-tree KimiLinearConfig and run the text model only (this also avoids
+        # trust_remote_code for the config).
+        from tensorrt_llm._torch.configs import KimiLinearConfig
+        text_dict = dict(config_dict.get("text_config") or config_dict)
+        model_config = KimiLinearConfig.from_dict(text_dict)
+        model_config.architectures = ["KimiLinearForCausalLM"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

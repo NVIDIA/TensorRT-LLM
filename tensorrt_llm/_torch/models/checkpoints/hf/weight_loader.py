@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
+import json
 import multiprocessing
 import os
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List
+from typing import Any, Callable, List
 
 import psutil
 import safetensors
@@ -26,6 +28,7 @@ import torch
 import tqdm
 from mpi4py import MPI as _MPI
 
+from tensorrt_llm._torch.mmap_utils import populate_file_pages
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.modeling_utils import (
@@ -43,6 +46,19 @@ _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 _DEFAULT_WEIGHT_CACHE_MAX_ENTRIES = 1
 _WEIGHT_CACHE_LOCK = threading.Lock()
 _WEIGHT_CACHE: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
+
+# Prefetch warms the OS page cache with mmap + madvise(MADV_POPULATE_READ)
+# (no user-space copy, no anonymous buffer), falling back to chunked reads
+# through one bounded buffer per in-flight file where unsupported. Both paths
+# work in fixed-size windows and emit a progress log at a fixed cadence so
+# that a slow prefetch produces observable output instead of minutes of
+# silence.
+_PREFETCH_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
+_PREFETCH_LOG_INTERVAL_SEC = 60.0
+# Log the chunked-read fallback once per process instead of once per file;
+# the lock makes the check-and-set atomic across concurrent prefetch threads.
+_PREFETCH_FALLBACK_LOGGED = threading.Event()
+_PREFETCH_FALLBACK_LOG_LOCK = threading.Lock()
 
 
 @register_checkpoint_weight_loader("MX")
@@ -221,11 +237,82 @@ class HfWeightLoader(BaseWeightLoader):
             self._cache_loaded_weights(cache_key, weights)
         return weights
 
+    def cleanup(self) -> None:
+        # Drop lazy safetensors handles (if any) so the mmaps are released.
+        self._lazy_handles = []
+        super().cleanup()
+
+    @staticmethod
+    def _is_kimi_k3_checkpoint(checkpoint_dir: str) -> bool:
+        """Kimi K3 checkpoints (~1.5 TB) must not be materialized in host RAM."""
+        config_path = os.path.join(checkpoint_dir, "config.json")
+        if not os.path.isfile(config_path):
+            return False
+        # Do not swallow read/parse failures: every rank must take the same
+        # branch here (the non-Kimi path enqueues collectives), so a
+        # rank-local transient error routing one rank differently would
+        # deadlock the job. Propagating fails fast on all ranks instead.
+        with open(config_path) as f:
+            model_type = json.load(f).get("model_type")
+        return model_type in ("kimi_k3", "kimi_linear")
+
+    def _load_lazy_safetensors(
+            self,
+            checkpoint_dir: str,
+            use_consolidated: bool = False) -> dict[str, Any]:
+        """Return a dict of name -> lazy safetensors slices.
+
+        Values are ``safetensors`` PySafeSlice objects: ``v[:]`` (or any
+        indexing) materializes only the requested bytes from the mmapped
+        file. This lets a model's ``load_weights`` stream a huge checkpoint
+        and read only its rank-local shard (e.g. Kimi K3 expert-parallel
+        expert slices) without ever holding the full checkpoint in RAM.
+        """
+        weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
+        if not weight_files:
+            raise RuntimeError(f"No safetensors files in {checkpoint_dir}.")
+        # Same sharded-vs-consolidated selection as the eager path below:
+        # when both flavors are present, keep only the requested one.
+        filtered_weight_files = [
+            x for x in weight_files
+            if ("consolidated" in os.path.split(x)[1]) == use_consolidated
+        ]
+        if len(filtered_weight_files) > 0:
+            weight_files = filtered_weight_files
+        weights: dict[str, Any] = {}
+        handles = []
+        for file_name in weight_files:
+            handle = safetensors.safe_open(file_name,
+                                           framework="pt",
+                                           device="cpu")
+            handles.append(handle)
+            for name in handle.keys():
+                weights[name] = handle.get_slice(name)
+        # Keep the file handles alive for as long as the loader lives; the
+        # slices reference them. Released in cleanup().
+        self._lazy_handles = handles
+        logger.info(f"Lazily opened {len(weight_files)} safetensors files "
+                    f"({len(weights)} tensors) from {checkpoint_dir}")
+        return ConsumableWeightsDict(weights)
+
     def load_weights(self,
                      checkpoint_dir: str,
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
+        """Load model weights keyed by checkpoint tensor name.
+
+        Kimi K3 checkpoint is opened lazily as HF SafeTensors to avoid materializing any part of the checkpoint
+        in CPU memory.
+        Other models' checkpoints may be prefetched in parallel to warm up the OS file cache if
+        the CPU memory is large enough, before their tensors are loaded via mmap.
+        when `_WEIGHT_CACHE_ENV` is on, other models can also use a CPU weight cache to accelerate repeated
+        loading under the same process.
+
+        Returns a `ConsumableWeightsDict` mapping checkpoint tensor names to tensors.
+        """
+        if self._is_kimi_k3_checkpoint(checkpoint_dir):
+            return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
         # consolidated tensor. In the presence of both, we favor the former unless specified explicitly, as there really is no need
@@ -310,7 +397,7 @@ class HfWeightLoader(BaseWeightLoader):
         return ConsumableWeightsDict(weights)
 
     @staticmethod
-    def _load_safetensors_file(file):
+    def _load_safetensors_file(file: str) -> dict[str, torch.Tensor]:
         logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 
@@ -331,12 +418,74 @@ class HfWeightLoader(BaseWeightLoader):
         finally:
             return part_weights
 
-    def _prefetch_one_file(self, file_name):
+    def _prefetch_one_file(
+            self,
+            file_name: str,
+            report_progress: Callable[[int], None] | None = None) -> None:
         if os.path.exists(file_name):
             logger.info(f"Prefetching {file_name} to memory...")
-            with open(file_name, 'rb') as f:
-                f.read()
+            populated = populate_file_pages(file_name,
+                                            _PREFETCH_CHUNK_SIZE_BYTES,
+                                            report_progress)
+            # Chunked reads resume from wherever population stopped: from
+            # zero when MADV_POPULATE_READ is unsupported, reading nothing
+            # when population already covered the whole file.
+            read_back = self._read_file_in_chunks(file_name, populated,
+                                                  report_progress)
+            # Gate the fallback log on bytes actually read so a fully
+            # populated (or empty) file never logs, and name the cause:
+            # a partial populate would otherwise silently pay for both a
+            # populate and a chunked read of the remainder on every file.
+            should_log = False
+            if read_back > 0:
+                with _PREFETCH_FALLBACK_LOG_LOCK:
+                    should_log = not _PREFETCH_FALLBACK_LOGGED.is_set()
+                    if should_log:
+                        _PREFETCH_FALLBACK_LOGGED.set()
+            if should_log:
+                if populated == 0:
+                    logger.info(
+                        "madvise(MADV_POPULATE_READ) did not populate "
+                        f"{file_name} (kernel < 5.14, filesystem without "
+                        "mmap support, or open/mmap failure; enable debug "
+                        "logging for the errno); prefetching via chunked "
+                        "reads.")
+                else:
+                    logger.info(
+                        "madvise(MADV_POPULATE_READ) stopped after "
+                        f"{populated} bytes of {file_name} (enable debug "
+                        "logging for the errno); finishing affected files "
+                        "via chunked reads.")
             logger.info(f"Finished prefetching {file_name}.")
+
+    @staticmethod
+    def _read_file_in_chunks(
+            file_name: str,
+            offset: int,
+            report_progress: Callable[[int], None] | None = None) -> int:
+        # Read in fixed-size chunks into a reusable buffer instead of one
+        # whole-file read: a whole-file read pins the entire file in
+        # anonymous memory until it completes, and with up to 16 concurrent
+        # multi-GB files per local rank, slow storage lets those buffers
+        # accumulate into hundreds of GB across the local ranks, which can
+        # OOM the host. Chunked reads warm the OS page cache identically
+        # with a constant per-thread footprint. Returns the number of bytes
+        # read, i.e. how much of the file population did not cover.
+        total_read = 0
+        with open(file_name, 'rb') as f:
+            # Allocate the buffer only when there is something left to read:
+            # when population covered the whole file (the common case on
+            # capable kernels), eagerly allocating 64 MiB in each of up to 16
+            # workers would transiently waste ~1 GiB per rank to read EOF.
+            if offset >= os.fstat(f.fileno()).st_size:
+                return 0
+            buffer = memoryview(bytearray(_PREFETCH_CHUNK_SIZE_BYTES))
+            f.seek(offset)
+            while num_read := f.readinto(buffer):
+                total_read += num_read
+                if report_progress is not None:
+                    report_progress(num_read)
+        return total_read
 
     def prefetch_files(self, file_names: List[str]):
         """
@@ -349,7 +498,39 @@ class HfWeightLoader(BaseWeightLoader):
         if len(local_file_names) == 0:
             return
 
+        total_size = 0
+        for file_name in local_file_names:
+            try:
+                total_size += os.path.getsize(file_name)
+            except OSError:
+                pass  # Missing files are tolerated, as in _prefetch_one_file.
+        progress_lock = threading.Lock()
+        prefetched_size = 0
+        last_log_time = time.monotonic()
+
+        def report_progress(num_bytes: int) -> None:
+            # Periodic heartbeat: on slow storage, prefetching can run for
+            # tens of minutes without completing a single file, and log
+            # silence gets the process killed by output-stall watchdogs.
+            # Deliberately progress-gated: it proves liveness only while
+            # bytes are actually moving, so a fully hung mount still goes
+            # silent and such watchdogs retain the ability to kill it.
+            nonlocal prefetched_size, last_log_time
+            with progress_lock:
+                prefetched_size += num_bytes
+                now = time.monotonic()
+                if now - last_log_time < _PREFETCH_LOG_INTERVAL_SEC:
+                    return
+                last_log_time = now
+                current_size = prefetched_size
+            logger.info(
+                f"Prefetch progress: {current_size / (1024**3):.2f}GB / "
+                f"{total_size / (1024**3):.2f}GB (this rank's share).")
+
         max_workers = min(multiprocessing.cpu_count() * 2, 16,
                           len(local_file_names))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            list(executor.map(self._prefetch_one_file, local_file_names))
+            list(
+                executor.map(
+                    lambda file_name: self._prefetch_one_file(
+                        file_name, report_progress), local_file_names))

@@ -28,8 +28,8 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.conftest import get_sm_version, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
-                               run_ctx_worker, run_disagg_server,
-                               run_gen_worker, terminate,
+                               get_registered_worker_urls, run_ctx_worker,
+                               run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from transformers import AutoTokenizer
 
@@ -56,7 +56,22 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
+    if sm == 90:
+        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
+        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
+        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
+        return "^gdr_copy"
     return "^ib,gdr_copy"
+
+
+# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
+# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
+# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
+# address handles to cross-rail peers and time out, hanging the workers.
+# Drop it at import time so worker environments (copied from os.environ)
+# fall back to standard GID-based address resolution; no-op when absent.
+if get_sm_version() == 90:
+    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 def build_worker_config(base_config, server_type_config, disagg_cluster):
@@ -614,35 +629,35 @@ def background_workers(llm_venv, config_file: str):
 
     ctx_workers = []
     gen_workers = []
-    ctx_urls = []
-    gen_urls = []
     next_device = 0
 
     import torch
     num_gpus = torch.cuda.device_count()
 
+    # port=0 lets each worker bind an OS-assigned port in its own process and
+    # register it with the cluster, instead of pre-picking a port here and
+    # racing whoever takes it before the worker rebinds it. The real URLs are
+    # read back from the cluster registry once the server reports ready.
     for i in range(num_ctx):
-        port = get_free_port()
-        ctx_urls.append(f"http://localhost:{port}")
         ctx_workers.append(
             run_ctx_worker(model,
                            ctx_worker_config,
                            work_dir,
-                           port=port,
+                           port=0,
                            device=next_device % num_gpus,
-                           env=env))
+                           env=env,
+                           worker_index=i))
         next_device += gpus_per_ctx
 
     for i in range(num_gen):
-        port = get_free_port()
-        gen_urls.append(f"http://localhost:{port}")
         gen_workers.append(
             run_gen_worker(model,
                            gen_worker_config,
                            work_dir,
-                           port=port,
+                           port=0,
                            device=next_device % num_gpus,
-                           env=env))
+                           env=env,
+                           worker_index=i))
         next_device += gpus_per_gen
 
     server_config = {
@@ -664,6 +679,10 @@ def background_workers(llm_venv, config_file: str):
 
     try:
         asyncio.run(wait_for_disagg_server_ready(disagg_port))
+        ctx_urls, gen_urls = get_registered_worker_urls(disagg_port)
+        assert len(ctx_urls) == num_ctx and len(gen_urls) == num_gen, (
+            f"Expected {num_ctx} ctx and {num_gen} gen workers registered, "
+            f"got {ctx_urls} and {gen_urls}")
         yield ctx_urls, gen_urls, disagg_port, internal_request_auth_key
     except Exception:
         logger.error("-------- Service discovery workers error --------")

@@ -80,8 +80,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> sparse_kv_indices, std::optional<torch::Tensor> sparse_kv_offsets,
     std::optional<torch::Tensor> sparse_attn_indices, std::optional<torch::Tensor> sparse_attn_offsets,
     int64_t const sparse_attn_indices_block_size, std::optional<int64_t> num_sparse_topk,
-    std::optional<torch::Tensor> sparse_mla_topk_lens,
-    std::optional<double> skip_softmax_threshold_scale_factor_prefill,
+    std::optional<torch::Tensor> sparse_attn_kv_lens, std::optional<double> skip_softmax_threshold_scale_factor_prefill,
     std::optional<double> skip_softmax_threshold_scale_factor_decode, std::optional<torch::Tensor> skip_softmax_stat,
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
@@ -90,13 +89,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> flash_mla_num_splits = std::nullopt, int64_t sage_attn_num_elts_per_blk_q = 0,
     int64_t sage_attn_num_elts_per_blk_k = 0, int64_t sage_attn_num_elts_per_blk_v = 0, bool sage_attn_qk_int8 = false,
     int64_t num_contexts = 0, int64_t num_ctx_tokens = 0, bool trtllm_gen_jit_warmup = false,
-    std::optional<int64_t> compressed_kv_cache_pool_ptr = std::nullopt, bool const is_cross = false,
+    std::optional<int64_t> aux_kv_cache_pool_ptr = std::nullopt, bool const is_cross = false,
     std::optional<torch::Tensor> cross_kv = std::nullopt,
     std::optional<torch::Tensor> relative_attention_bias = std::nullopt, int64_t relative_attention_max_distance = 0,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens = std::nullopt,
     std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt, bool enable_dsv4_epilogue_fusion = false,
-    bool const force_prepare_spec_dec_tree_mask = false);
+    bool const force_prepare_spec_dec_tree_mask = false, std::optional<int64_t> const max_num_sequences = std::nullopt,
+    std::optional<torch::Tensor> kv_norm_weight = std::nullopt, double kv_norm_eps = 1e-6);
 
 struct KvCachePoolPointers
 {

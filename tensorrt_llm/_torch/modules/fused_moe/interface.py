@@ -16,34 +16,34 @@
 import os
 import weakref
 from abc import abstractmethod
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union, final
 
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import QuantAlgo
-
 from ...distributed.ops import reducescatter
+from .impl_blocks import MoEEplbWeightLayoutMixin, MoEWeightOwnerMixin
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
+                            MoEProblem, MoERejectReason, MoERunContext,
+                            MoEStaticCapability)
+
+# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
+# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
+# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
+# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
+# the same math the attention-DP deployments already run.
+#
+# Lives here rather than next to either reader because both need it: the
+# scheduler decides whether to precompute top-k at all, and TRTLLMGenFusedMoE
+# decides whether its kernel may route again.
+FORCE_SEPARATED_ROUTING = os.environ.get(
+    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 
-def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
-    """
-    Log a warning and return (False, reason) for can_implement() checks.
-
-    This is a common utility function used by all MoE backend implementations
-    to provide consistent logging and return values when a configuration
-    is not supported.
-
-    Args:
-        reason: The reason why the configuration is not supported.
-
-    Returns:
-        Tuple[bool, Optional[str]]: Always returns (False, reason)
-    """
-    logger.warning(reason)
-    return False, reason
+def _reject(reason: MoERejectReason, detail: str) -> MoEEligibility:
+    """Create a silent ``can_implement`` rejection."""
+    return MoEEligibility.no(reason, detail)
 
 
 from ...model_config import ModelConfig
@@ -89,22 +89,6 @@ class MoEWeightLoadingMode(Enum):
     FUSED_GATE_UP_PROJ = 1
     # Custom W4A8 weights from examples/quantization/quantize_mixed_precision_moe.py
     W4A8_CUSTOM = 2
-
-
-# The type of alltoall method
-class AlltoallMethodType(IntEnum):
-    # Not available
-    NotEnabled = 0
-    # NVLink One-Sided
-    NVLinkOneSided = 1
-    # NVLink Two-Sided
-    NVLinkTwoSided = 2
-    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
-    DeepEP = 3
-    # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
-    DeepEPLowLatency = 4
-    # NCCL EP: Low-latency expert parallelism via NCCL EP library
-    NcclEP = 5
 
 
 class MoESchedulerKind(Enum):
@@ -207,9 +191,16 @@ def _(
         return res
 
 
-class MoE(nn.Module):
+class MoE(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module):
     """
     Fused Mixture of Experts (MoE) Layer interface.
+
+    A complete layer that also happens to own expert weights, so it takes the
+    weight-owner and weight-side EPLB layout blocks from ``impl_blocks``. What
+    is stated *here* is the complete-layer half -- ``forward`` / ``forward_impl``,
+    routing, reduce/allreduce, layer registration, and the EPLB forward-time
+    orchestration the wrapper drives -- plus this layer's own abstract contract,
+    which ``MoEImplBase`` deliberately states differently.
 
     Args:
         num_experts (int): Number of experts in the MoE layer.
@@ -227,6 +218,12 @@ class MoE(nn.Module):
     # override this to ``MoESchedulerKind.FUSED_COMM``.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
 
+    # Subclasses must restate capabilities to preserve exact-class behavior.
+    capabilities: MoEStaticCapability = MoEStaticCapability()
+
+    # Scheduler-provided inputs; inherited values remain valid for subclasses.
+    input_requirement: MoEInputRequirement = MoEInputRequirement()
+
     # Opt-in flag for non-divisible EP (num_experts % ep_size != 0). False by default
     # so backends whose dispatch/combine paths still assume uniform partitioning fail
     # fast with a clear error. Backends that fully exercise the ceil/floor partition
@@ -235,34 +232,10 @@ class MoE(nn.Module):
 
     @classmethod
     @abstractmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        Check if this MoE backend can implement the given quantization algorithm.
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Purely evaluate ``p`` and ``d`` without probing runtime state.
 
-        NOTE: This is a TRANSITIONAL interface. In the future, this method will be moved
-        to the MoEBackend interface as part of the backend abstraction layer. During this
-        transition period, it remains in the MoE base class to maintain compatibility.
-
-        This method checks both:
-        1. Whether the backend supports the specified quantization algorithm
-        2. Whether the current platform (SM version) supports the backend and quantization
-
-        Each backend MUST override this method to provide accurate capability information.
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation data type.
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-                - can_implement: True if the backend can implement this configuration
-                - skip_reason: None if can_implement is True, otherwise a string explaining why not
+        Abstain rather than reject when a required problem field is unknown.
         """
         raise NotImplementedError(
             f"{cls.__name__} must implement can_implement method")
@@ -645,19 +618,6 @@ class MoE(nn.Module):
         else:
             self.allreduce = None
 
-    def _add_raw_shared_weights_for_unmap(self,
-                                          weight_tensors: List[torch.Tensor]):
-        if self._using_dynamic_load_balancer():
-            self.layer_load_balancer._add_raw_host_weight_for_unmap(
-                weight_tensors)
-
-    def _supports_load_balancer(self) -> bool:
-        """Check if this MoE implementation supports load balancer.
-
-        Subclasses can override this to indicate load balancer support.
-        """
-        return False
-
     def validate_configurable_moe(self, moe: "nn.Module") -> None:
         """Backend-specific validation hook called by ``ConfigurableMoE``.
 
@@ -669,16 +629,6 @@ class MoE(nn.Module):
         dynamic EPLB) override this.
         """
         del moe
-
-    def _using_load_balancer(self) -> bool:
-        """Check if this MoE is using load balancer."""
-        return self.layer_load_balancer is not None
-
-    def _using_dynamic_load_balancer(self) -> bool:
-        """Check if this MoE is using dynamic load balancer."""
-        if self.layer_load_balancer:
-            return self.layer_load_balancer.is_dynamic_routing()
-        return False
 
     def _get_load_balancer_aux_stream(self) -> Optional[torch.cuda.Stream]:
         """Get auxiliary stream for load balancer from aux_stream_dict.
@@ -758,77 +708,6 @@ class MoE(nn.Module):
             self.layer_load_balancer.update_statistic_with_gathered_statistic(
                 gathered_statistic)
 
-    def register_parameter_weight_slot_fn(self, weight_name: str,
-                                          local_slot_id: int):
-        """Register parameter weight slot function for load balancer."""
-        if not self._using_dynamic_load_balancer():
-            return
-
-        assert hasattr(
-            self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
-        weight_tensor = getattr(self, weight_name).data[local_slot_id]
-        self.layer_load_balancer.register_weight_slot(local_slot_id,
-                                                      weight_name,
-                                                      weight_tensor)
-
-    def register_to_fix_weight_fn(self, weight_name: str):
-        """Register weight fixing function for load balancer."""
-        if not self._using_dynamic_load_balancer():
-            return
-
-        assert hasattr(
-            self, weight_name), f"MoE doesn't have weight attr: {weight_name}"
-        param = getattr(self, weight_name)
-        weight_tensor = param.detach()
-        assert isinstance(
-            weight_tensor,
-            torch.Tensor), f'weight {weight_name} should be a tensor'
-        assert weight_tensor.is_contiguous(), (
-            f'weight {weight_name} should be contiguous, '
-            f'shape={weight_tensor.shape}, strides={weight_tensor.stride()}')
-        assert weight_tensor.numel() * weight_tensor.element_size(
-        ) == weight_tensor.untyped_storage().size(), (
-            f'weight {weight_name} shape={weight_tensor.shape} '
-            f'storage_size = {weight_tensor.untyped_storage().size()}, '
-            f'numel={weight_tensor.numel()}, eltsize={weight_tensor.element_size()}, '
-            f'dtype={weight_tensor.dtype}')
-        self.layer_load_balancer.make_tensor_host_accessible(weight_tensor)
-        param.data = weight_tensor
-
-    def register_all_parameter_slot_and_to_fix_weight_fns(
-            self, weight_and_tensor_dict: Dict[str, torch.Tensor]):
-        """Register all parameter slot and weight fixing functions for load balancer."""
-        if not self._using_dynamic_load_balancer():
-            return
-
-        # Register weight functions for each local slot
-        for local_slot_id, expert_id in enumerate(
-                self.initial_local_expert_ids):
-            for weight_name in weight_and_tensor_dict:
-                self.layer_load_balancer.add_register_weight_fn(
-                    self.register_parameter_weight_slot_fn,
-                    (weight_name, local_slot_id))
-
-        # Register weight migration functions
-        for weight_name in weight_and_tensor_dict:
-            self.layer_load_balancer.add_to_migrate_weight_fn(
-                self.register_to_fix_weight_fn, (weight_name, ))
-
-        # Setup host tensor sharing
-        local_shared_load_expert_ids = self.layer_load_balancer.get_load_expert_ids(
-        )
-        for expert_id in range(self.num_experts):
-            for weight_name, weight_tensor in weight_and_tensor_dict.items():
-                if expert_id in local_shared_load_expert_ids:
-                    local_slot_id = local_shared_load_expert_ids.index(
-                        expert_id)
-                    self.layer_load_balancer.host_tensor_sharer.share_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor[local_slot_id])
-                else:
-                    self.layer_load_balancer.host_tensor_sharer.pre_register_host_tensor_with_shape(
-                        expert_id, weight_name, weight_tensor.dtype,
-                        weight_tensor[0].shape)
-
     def _register_layer(self, model_config: ModelConfig):
         self.register_to_config = False
         if model_config is not None and self.layer_idx_str is not None:
@@ -856,42 +735,6 @@ class MoE(nn.Module):
                 When False (default), weights are loaded and quantized together.
         """
         raise NotImplementedError
-
-    def transform_weights(self) -> None:
-        if getattr(self, "_weights_transformed", False):
-            return
-        self.quant_method.transform_weights(self)
-        self._weights_transformed = True
-
-    def cache_derived_state(self) -> None:
-        self.quant_method.cache_derived_state(self)
-
-    def post_load_weights(self) -> None:
-        self.transform_weights()
-        self.cache_derived_state()
-
-    def process_weights_after_loading(self):
-        """
-        Apply quantization processing to loaded weights.
-
-        When allow_partial_loading=True is used in load_weights(), this method
-        must be called separately to complete the loading setup.
-        """
-        if hasattr(self.quant_method, 'process_weights_after_loading'):
-            self.quant_method.process_weights_after_loading(self)
-
-    def pre_reload_weights(self):
-        """
-        Prepare tensors for weight reloading by reverting them to their original creation shape.
-        """
-        assert hasattr(
-            self.quant_method, 'pre_reload_weights'
-        ), "pre_reload_weights is not supported for this quant method"
-        if self._using_load_balancer():
-            raise NotImplementedError(
-                "Weight reloading is not compatible with Expert Parallel Load Balancer (EPLB). "
-            )
-        self.quant_method.pre_reload_weights(self)
 
     @abstractmethod
     def quantize_input(
@@ -927,32 +770,32 @@ class MoE(nn.Module):
     @abstractmethod
     def run_moe(
         self,
-        # ========== Common parameters (all backends use) ==========
-        x: torch.Tensor,
-        token_selected_experts: Optional[torch.Tensor],
-        token_final_scales: Optional[torch.Tensor],
-        x_sf: Optional[torch.Tensor] = None,
-        # ========== Backend-specific parameters (via kwargs) ==========
-        **kwargs
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
-        Unified MoE computation interface
+        Unified MoE computation interface.
 
-        NOTE: This is a TEMPORARY interface. In the future, this method should be moved
-        to the MoEBackend interface as part of the backend abstraction layer.
+        Every value the caller genuinely produces travels in ``ctx``; every
+        fact the comm layer decided for this forward travels in
+        ``ctx.comm_plan``. Backends read only the fields they need, so adding a
+        backend never requires touching the scheduler.
 
-        This method performs the core MoE computation. Different backends will implement
-        their specific computation logic while following this unified interface.
-
-        Common parameters (all backends use):
-            x: Input activations [num_tokens, hidden_size]
-            token_selected_experts: Expert IDs [num_tokens, top_k] (used by DeepGemm/TRTLLMGen).
-                                    If EPLB is enabled, this represents expert slots [num_tokens, top_k].
-            token_final_scales: Routing weights [num_tokens, top_k]
-            x_sf: Input scale factor (for quantization, if applicable)
-
-        Backend-specific parameters (passed via kwargs, obtained from _get_backend_kwargs()):
-            TODO: This is not finalized, will be updated later.
+        Args:
+            ctx: Inputs for this forward. ``token_selected_experts`` holds
+                expert slots rather than expert IDs when EPLB is enabled.
+            workspace: Scratch the backend itself allocated, via
+                ``get_workspaces``; the scheduler owns only its lifetime,
+                because one allocation is reused across chunks and alternated
+                between streams and so outlives a single call. Only backends
+                declaring ``requires_run_moe_workspace`` receive one.
+                ``MoEImplBase.run_moe`` deliberately omits this parameter: it
+                describes the state after that lifetime moves inside the impl,
+                which happens as each impl moves onto that base
+                (TRTLLM-14958, TRTLLM-14960..14969). Keyword-only here so that
+                removing it is a mechanical change to named call sites rather
+                than a silent re-binding of a positional argument.
 
         Returns:
             torch.Tensor: MoE computation result [num_tokens, hidden_size]
@@ -1054,69 +897,10 @@ class MoE(nn.Module):
             )
 
     @property
-    def has_any_quant(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
-            exclude_kv_cache=True)
-
-    # The following three properties are common enough to warrant inclusion in the interface.
-    @property
-    def has_fp8_qdq(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_qdq(
-        )
-
-    @property
-    def has_deepseek_fp8_block_scales(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
-        )
-
-    @property
-    def has_nvfp4(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
-        )
-
-    @property
-    def has_w4a8_nvfp4_fp8(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
-        )
-
-    @property
-    def has_w4a8_mxfp4_fp8(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8(
-        )
-
-    @property
-    def has_w4a8_mxfp4_mxfp8(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8(
-        )
-
-    @property
-    def has_w4a16_mxfp4(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a16_mxfp4(
-        )
-
-    @property
-    def has_mxfp8(self):
-        assert self._weights_created
-        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_mxfp8(
-        )
-
-    @property
     def enable_alltoall(self):
         """ enable_alltoall (bool): whether to enable alltoall instead of allgather/reducescatter
         """
         return False
-
-    @property
-    def expand_intermediate_size_per_partition(self):
-        return self.intermediate_size_per_partition * self.intermediate_size_expand_ratio
 
     def supports_moe_output_in_alltoall_workspace(self):
         """ Supports moe_output in alltoall workspace

@@ -25,10 +25,18 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
 #include <variant>
+
+// Token hashing reinterprets TokenIdExt bytes as a raw little-endian stream (both
+// the per-element and the bulk paths), so a normal token's 4 bytes equal its
+// integer id. Guard the assumption at compile time (std::endian is C++20; C++17 here).
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__)
+#error "kv_cache_manager_v2 block hashing requires a little-endian target"
+#endif
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -82,17 +90,6 @@ void ensureSha256Detected()
 }
 } // namespace
 
-static void hashInt64(CSHA256& h, int64_t v)
-{
-    unsigned char buf[8];
-    auto const unsignedValue = static_cast<uint64_t>(v);
-    for (int i = 0; i < 8; ++i)
-    {
-        buf[i] = static_cast<unsigned char>((unsignedValue >> (8 * i)) & 0xFFU);
-    }
-    h.Write(buf, sizeof(buf));
-}
-
 Hasher::Hasher()
 {
     ensureSha256Detected();
@@ -114,13 +111,15 @@ Hasher& Hasher::update(ReuseScope const& scope)
 
 Hasher& Hasher::update(TokenId token)
 {
-    hashInt64(mState, static_cast<int64_t>(token));
+    static_assert(sizeof(TokenId) == sizeof(TokenIdExt));
+    assert(TokenIdExt(token).tokenId() == token);
+    mState.Write(reinterpret_cast<unsigned char const*>(&token), sizeof(token));
     return *this;
 }
 
-Hasher& Hasher::update(BlockKey const& key)
+Hasher& Hasher::update(Digest const& digest)
 {
-    mState.Write(reinterpret_cast<unsigned char const*>(key.data()), key.size());
+    mState.Write(reinterpret_cast<unsigned char const*>(digest.data()), digest.size());
     return *this;
 }
 
@@ -132,26 +131,50 @@ Hasher& Hasher::update(std::vector<uint8_t> const& bytes)
 
 Hasher& Hasher::update(TokenIdExt const& tokenExt)
 {
-    std::visit(
-        [this](auto const& v)
-        {
-            using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, TokenId>)
-                hashInt64(mState, static_cast<int64_t>(v));
-            else
-                mState.Write(reinterpret_cast<unsigned char const*>(v.data()), v.size());
-        },
-        tokenExt);
-    return *this;
+    if (tokenExt.isDigest())
+    {
+        return update(tokenExt.digest());
+    }
+    return update(tokenExt.tokenId());
 }
 
-Hasher& Hasher::update(TokenIdExt const* tokens, size_t count)
+Hasher& Hasher::update(TokenIdExt const* tokens, size_t count, bool knownNoDigest)
 {
-    // Python uses array("Q", data).tobytes() to reduce per-token interpreter
-    // overhead.  In C++ the compiler inlines each update() call, so the loop
-    // is already optimal; batching would only add a heap allocation.
-    for (size_t i = 0; i < count; ++i)
-        update(tokens[i]);
+    TokenIdExt const* const end = tokens + count;
+
+    // Bulk-write a contiguous run of normal tokens [begin, stop) as one raw
+    // little-endian uint32 block — the whole point of the 4-byte layout. A single
+    // Write of k tokens is byte-identical to k per-token writes.
+    auto const writeNormalRun = [this](TokenIdExt const* begin, TokenIdExt const* stop)
+    {
+        if (begin != stop)
+        {
+            mState.Write(
+                reinterpret_cast<unsigned char const*>(begin), static_cast<size_t>(stop - begin) * sizeof(TokenIdExt));
+        }
+    };
+
+    if (knownNoDigest)
+    {
+        TLLM_CHECK_DEBUG(std::none_of(tokens, end, [](TokenIdExt const& t) { return t.isDigest(); }));
+        writeNormalRun(tokens, end);
+        return *this;
+    }
+
+    // Unknown/digest-bearing: bulk-write each maximal run of normal tokens and
+    // hash each (rare, multi-modal) digest on its own. All-normal collapses to a
+    // single Write.
+    for (TokenIdExt const* pos = tokens; pos != end;)
+    {
+        TokenIdExt const* const digestIt = std::find_if(pos, end, [](TokenIdExt const& t) { return t.isDigest(); });
+        writeNormalRun(pos, digestIt);
+        if (digestIt == end)
+        {
+            break;
+        }
+        update(digestIt->digest()); // 32 digest bytes
+        pos = digestIt + 1;
+    }
     return *this;
 }
 
@@ -166,10 +189,10 @@ BlockKey Hasher::digest() const
 }
 
 // ---------------------------------------------------------------------------
-// genMultiModalTokens
+// genMultimodalCacheKeyTokens
 // ---------------------------------------------------------------------------
 
-std::vector<TokenIdExt> genMultiModalTokens(
+std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
     int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
 {
     TLLM_CHECK_DEBUG(numTokens > 0);
@@ -181,65 +204,15 @@ std::vector<TokenIdExt> genMultiModalTokens(
     {
         if (tokenOffset + i == 0)
         {
-            Digest d;
-            std::memcpy(d.data(), multiModalDataDigest.data(), kDIGEST_LEN);
-            result.emplace_back(DigestToken(d));
+            Digest digest;
+            std::memcpy(digest.data(), multiModalDataDigest.data(), kDIGEST_LEN);
+            result.emplace_back(digest);
         }
         else
         {
-            result.emplace_back(TokenId(idOffset + tokenOffset + i));
+            result.emplace_back(TokenId{idOffset + tokenOffset + i});
         }
     }
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// makeBlockchainKeyGenerator — lazy key generator.
-// Returns a callable that yields one BlockKey per call (nullopt when done).
-// First call yields root entry (empty token block). Mirrors Python's generator.
-// ---------------------------------------------------------------------------
-
-static auto makeBlockchainKeyGenerator(
-    int tokensPerBlock, ReuseScope reuseScope, TokenIdExt const* tokens, size_t numTokens)
-{
-    // digest carries the running hash from the previous block.
-    BlockKey digest = Hasher(reuseScope).digest();
-    // ordinal = -1: next call yields root (reuseScope digest).
-    // ordinal >= 0: next call yields key for tokens[ordinal*tpb .. (ordinal+1)*tpb).
-    int ordinal = -1;
-
-    return [=]() mutable -> std::optional<BlockKey>
-    {
-        if (ordinal == -1)
-        {
-            ordinal++;
-            return digest; // root key
-        }
-
-        size_t beg = static_cast<size_t>(ordinal) * static_cast<size_t>(tokensPerBlock);
-        if (beg >= numTokens)
-            return std::nullopt;
-
-        size_t end = std::min(beg + static_cast<size_t>(tokensPerBlock), numTokens);
-
-        Hasher h;
-        h.update(digest);
-        h.update(tokens + beg, end - beg);
-        digest = h.digest();
-
-        ordinal++;
-        return digest;
-    };
-}
-
-// Eager wrapper for callers that need all keys at once.
-std::vector<BlockKey> sequenceToBlockchainKeys(
-    int tokensPerBlock, ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens)
-{
-    std::vector<BlockKey> result;
-    auto gen = makeBlockchainKeyGenerator(tokensPerBlock, reuseScope, tokens.data(), tokens.size());
-    while (auto key = gen())
-        result.push_back(*key);
     return result;
 }
 
@@ -309,35 +282,55 @@ SharedPtr<Block> NodeBase::detachNext(BlockKey const& blockKey)
 namespace
 {
 
-static bool isPrefix(std::vector<TokenIdExt> const& prefix, std::vector<TokenIdExt> const& full)
+// Takes raw (ptr, size) so it works uniformly over any TokenIdExt buffer
+// (the query vector and the std::vector<TokenIdExt> that backs Block::tokens).
+bool isPrefix(TokenIdExt const* prefix, size_t prefixLen, TokenIdExt const* full, size_t fullLen)
 {
-    if (prefix.size() > full.size())
+    if (prefixLen > fullLen)
+    {
         return false;
-    for (size_t i = 0; i < prefix.size(); ++i)
+    }
+    for (size_t i = 0; i < prefixLen; ++i)
     {
         if (prefix[i] != full[i])
+        {
             return false;
+        }
     }
     return true;
 }
 
 } // anonymous namespace
 
-BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_t count)
+BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_t count, bool knownNoDigest)
 {
     Hasher h;
     h.update(prevKey);
-    h.update(tokens, count);
+    h.update(tokens, count, knownNoDigest);
     return h.digest();
 }
 
-Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode, LifeCycleId numLifeCycles)
+Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
     : NodeBase(k, prevNode->eventSink)
     , tokens(std::move(toks))
     , prev(prevNode)
-    , storage(numLifeCycles, nullptr)
+    , storage(prevNode->numLifeCycles(), nullptr) // tree-wide count, derived from prev
     , mOrdinal(prevNode->ordinal() + 1)
 {
+    // key is a caller-supplied second source of truth (precomputed for the
+    // pre-construction dedup lookup). Verify it matches what we'd derive from
+    // prev + tokens so the two can never silently drift. Debug-only and fully
+    // compiled out in release: this re-hashes (exactly the recomputation the param
+    // exists to avoid). knownNoDigest=false lets makeKey's update() scan for digests
+    // itself — correct regardless of content, so no separate scan is needed here.
+    TLLM_CHECK_DEBUG(k == Block::makeKey(prevNode->key, tokens.data(), tokens.size(), /*knownNoDigest=*/false));
+}
+
+// Delegates to the tree, mirroring Python's RootBlock.num_life_cycles. Defined
+// out-of-line so BlockRadixTree is complete at the point of use.
+LifeCycleId RootBlock::numLifeCycles() const noexcept
+{
+    return tree->numLifeCycles();
 }
 
 int Block::tokensPerBlock() const noexcept
@@ -508,8 +501,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 // addOrGetExistingBlock
 // ---------------------------------------------------------------------------
 
-SharedPtr<Block> addOrGetExistingBlock(
-    NodeBase* prev, LifeCycleId numLifeCycles, std::vector<TokenIdExt> tokens, bool* isNew)
+SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> tokens, bool knownNoDigest, bool* isNew)
 {
     TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
 
@@ -521,7 +513,7 @@ SharedPtr<Block> addOrGetExistingBlock(
 
     auto& prevNext = prev->next;
     int const tpb = prev->tokensPerBlock();
-    BlockKey newKey = Block::makeKey(prev->key, tokens.data(), tokens.size());
+    BlockKey newKey = Block::makeKey(prev->key, tokens.data(), tokens.size(), knownNoDigest);
 
     // Exact match: return existing block (not new — mirrors Python's UselessBlockError path).
     auto it = prevNext.find(newKey);
@@ -538,7 +530,8 @@ SharedPtr<Block> addOrGetExistingBlock(
     {
         for (auto const& [k, sibling] : prevNext)
         {
-            if (sibling->tokens.size() >= tokens.size() && isPrefix(tokens, sibling->tokens))
+            if (sibling->tokens.size() >= tokens.size()
+                && isPrefix(tokens.data(), tokens.size(), sibling->tokens.data(), sibling->tokens.size()))
                 throw UselessBlockError(sibling);
         }
     }
@@ -552,7 +545,8 @@ SharedPtr<Block> addOrGetExistingBlock(
     std::vector<BlockKey> toRemove;
     for (auto const& [k, sibling] : prevNext)
     {
-        if (sibling->tokens.size() < tokens.size() && isPrefix(sibling->tokens, tokens))
+        if (sibling->tokens.size() < tokens.size()
+            && isPrefix(sibling->tokens.data(), sibling->tokens.size(), tokens.data(), tokens.size()))
         {
             TLLM_CHECK_DEBUG(!sibling->isFull() && sibling->key == k && sibling->next.empty());
             toRemove.push_back(k);
@@ -562,8 +556,9 @@ SharedPtr<Block> addOrGetExistingBlock(
     // would already have replaced the shorter one.
     TLLM_CHECK_DEBUG(toRemove.size() <= 1);
 
-    // Create the new block. ordinal and tokensPerBlock are derived from prev inside the Block ctor.
-    auto block = makeShared<Block>(newKey, std::move(tokens), prev, numLifeCycles);
+    // Create the new block. ordinal, tokensPerBlock, and numLifeCycles are all
+    // derived from prev. Block stores the tokens as a plain vector (moved in).
+    auto block = makeShared<Block>(newKey, std::move(tokens), prev);
 
     // Keep the parent attached while covered children are replaced. Adding the replacement
     // first prevents detachNext() from pruning an emptied RootBlock out of the tree.
@@ -593,10 +588,6 @@ SharedPtr<Block> removeSubtree(Block& root)
 
     // Post-order traversal using prev/next links — O(1) extra space.
     // Descend to leaves first, remove on the way back up.
-    // Each block's pages are reclaimed eagerly via releasePages() while the
-    // StorageManager is still alive, rather than deferring to ~Block(): an external
-    // reference can keep a Block alive past StorageManager teardown, after which
-    // page->manager would be dangling. Mirrors Python's remove_subtree().
     while (true)
     {
         // Descend: if the current block has children, go to the first child.
@@ -606,10 +597,7 @@ SharedPtr<Block> removeSubtree(Block& root)
         }
         else
         {
-            current->releasePages();
-            // Remove this block from its parent's next map.
-            // Null prev to detach — the block may outlive the tree if held
-            // externally (e.g., by nanobind/Python shared_ptr).
+            // Remove this block from its parent's next map and null prev to detach it.
             NodeBase* parent = current->prev;
             BlockKey const currentKey = current->key;
             auto detached = parent->detachNext(currentKey);
@@ -644,7 +632,7 @@ BlockRadixTree::BlockRadixTree(
 
 BlockRadixTree::~BlockRadixTree()
 {
-    // Clear all roots (which will drop all blocks).
+    // Clear all roots (which will drop all blocks without external owners).
     mRoots.clear();
 }
 
@@ -728,51 +716,50 @@ int numMatchedTokens(std::vector<BlockRadixTree::MatchResult> const& matched, in
 } // anonymous namespace
 
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
-    ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
+    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
     drainPendingRootErases();
 
     std::vector<MatchResult> results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
-    auto gen = makeBlockchainKeyGenerator(mTokensPerBlock, reuseScope, tokens.data(), tokens.size());
+    auto gen = sequenceToBlockchainKeys(mTokensPerBlock, reuseScope, tokens.begin(), tokens.size(), knownNoDigest);
 
-    // First key is the root key.
-    auto rootKey = gen();
-    if (!rootKey)
+    // First step is the root key (empty token range).
+    auto rootStep = gen();
+    if (!rootStep)
         return results;
-    auto rootIt = mRoots.find(*rootKey);
+    auto rootIt = mRoots.find(rootStep->key);
     if (rootIt == mRoots.end())
         return results;
 
     RootBlock const& root = *rootIt->second;
     std::unordered_map<BlockKey, SharedPtr<Block>> const* currentNext = &root.next;
-    // ordinal tracks which block we're on (0-based, after root).
-    BlockOrdinal ordinal{0};
+    // Token range of the first unmatched block, captured on miss for the partial pass.
+    HalfOpenRange<size_t> missedRange;
     bool missed = false;
 
-    while (auto key = gen())
+    // Each step carries the block's key and its token range — no need to re-derive
+    // block boundaries here.
+    while (auto step = gen())
     {
-        auto blockIt = currentNext->find(*key);
+        auto blockIt = currentNext->find(step->key);
         if (blockIt == currentNext->end())
         {
+            missedRange = step->tokens;
             missed = true;
             break;
         }
-        size_t beg = toSizeT(ordinal) * static_cast<size_t>(mTokensPerBlock);
-        int numTokens = static_cast<int>(std::min(static_cast<size_t>(mTokensPerBlock), tokens.size() - beg));
         Block* block = blockIt->second.get();
-        results.push_back({block, numTokens});
+        results.push_back({block, static_cast<int>(step->tokens.length())});
         currentNext = &block->next;
-        ordinal++;
     }
 
     // Partial match in children of current node.
     if (missed && enablePartialMatch)
     {
-        size_t beg = toSizeT(ordinal) * static_cast<size_t>(mTokensPerBlock);
-        size_t missedCount = std::min(static_cast<size_t>(mTokensPerBlock), tokens.size() - beg);
-        auto [best, bestMatch] = findBestPartialMatchInNextNodes(*currentNext, tokens.data() + beg, missedCount);
+        auto [best, bestMatch]
+            = findBestPartialMatchInNextNodes(*currentNext, tokens.begin() + missedRange.beg, missedRange.length());
         if (best)
             results.push_back({best, bestMatch});
     }
@@ -780,7 +767,8 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     return results;
 }
 
-std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<MatchResult> matched) const
+std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
+    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const
 {
     // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
     TLLM_CHECK_DEBUG(matched.size() <= 1
@@ -788,7 +776,6 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
             [this](auto const& m) { return m.numMatchedTokens == mTokensPerBlock; }));
 
     auto attnLcs = mLifeCycles.attentionLifeCycles();
-    auto ssmLcId = mLifeCycles.ssmLifeCycleId();
 
     // Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
     // shorten the match to the coverage of a required page. Every retry strictly
@@ -874,12 +861,23 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
 }
 
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
-    ReuseScope const& reuseScope, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
+    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
-    auto const matched = pruneMatch(matchTokenPath(reuseScope, tokens, enablePartialMatch));
+    auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
+    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
+    // the prefix the attention pages alone support. Only hybrid models pay for
+    // the second pass; without an SSM life cycle the two results are identical.
+    std::optional<int> attnOnlyTokens;
+    if (ssmLcId.has_value())
+    {
+        attnOnlyTokens = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+    }
+    auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
+    result.numTokensBeforeHybridPruning = attnOnlyTokens.value_or(result.numTokens);
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

@@ -53,13 +53,10 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
-from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cutlass import CutlassFusedMoE, raise_moe_lora_multichunk_unsupported
-from .fused_moe_deepgemm import DeepGemmFusedMoE
-from .fused_moe_densegemm import DenseGEMMFusedMoE
-from .fused_moe_marlin import MarlinFusedMoE
+from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
-from .interface import MoESchedulerKind
+from .impl_contract import MoECommPlan, MoERunContext
+from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
 __all__ = [
     "MoEScheduler",
@@ -155,7 +152,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         if (
             num_chunks > 1
-            and moe.backend.__class__ == CutlassFusedMoE
+            and moe.backend.capabilities.supports_moe_lora
             and moe.backend._moe_lora_active(lora_params)
         ):
             raise_moe_lora_multichunk_unsupported(num_chunks)
@@ -241,12 +238,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         all_rank_num_tokens: List[int],
     ) -> Optional[torch.Tensor]:
-        """Single-chunk workspace for DeepGemmFusedMoE; otherwise ``None``.
+        """Single-chunk workspace for backends that ask for one; else ``None``.
 
         Multi-chunk execution uses ``_prepare_workspaces_for_chunk`` instead.
         """
         moe = self.moe
-        if not isinstance(moe.backend, DeepGemmFusedMoE):
+        if not moe.backend.input_requirement.requires_run_moe_workspace:
             return None
 
         num_rows = x.shape[0]
@@ -268,7 +265,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         chunk_size_list: List[int],
         use_multi_stream: bool,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Multi-chunk workspaces for DeepGemmFusedMoE; ``(None, None)`` otherwise.
+        """Multi-chunk workspaces for backends that ask for one; else ``(None, None)``.
 
         Single-chunk execution uses ``_prepare_workspace_deepgemm`` instead.
         """
@@ -276,7 +273,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         workspace_0 = None
         workspace_1 = None
 
-        if not isinstance(moe.backend, DeepGemmFusedMoE):
+        if not moe.backend.input_requirement.requires_run_moe_workspace:
             return workspace_0, workspace_1
 
         # Always need at least workspace_0; reuse chunk_0 size for workspace_1
@@ -382,24 +379,57 @@ class ExternalCommMoEScheduler(MoEScheduler):
             moe.backend._supports_load_balancer()
             or moe.routing_method.requires_separated_routing
             or moe.comm is not None
+            or FORCE_SEPARATED_ROUTING
         )
+        supports_post_quant = moe.comm is None or moe.comm.supports_post_quant_dispatch()
+        used_fused_route_quant = False
         if requires_separated_routing:
-            # Separated routing: ConfigurableMoE calls routing_method
-            token_selected_experts, token_final_scales = moe.routing_method.apply(
-                router_logits, input_ids
-            )
+            if (
+                supports_post_quant
+                and isinstance(moe.backend, TRTLLMGenFusedMoE)
+                and not moe._using_load_balancer()
+                and not moe.apply_router_weight_on_input
+            ):
+                fused_result = moe.backend.try_fused_kimi_route_quant(x, router_logits)
+            else:
+                fused_result = None
+
+            if fused_result is None:
+                # Separated routing: ConfigurableMoE calls routing_method.
+                token_selected_experts, token_final_scales = moe.routing_method.apply(
+                    router_logits, input_ids
+                )
+                if token_final_scales is not None and isinstance(moe.backend, TRTLLMGenFusedMoE):
+                    token_final_scales = token_final_scales.to(torch.bfloat16)
+            else:
+                token_selected_experts, token_final_scales, x, x_sf = fused_result
+                used_fused_route_quant = True
 
             token_selected_experts = token_selected_experts.to(torch.int32)
 
             assert token_selected_experts.shape[1] == moe.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
-            # CutlassFusedMoE and DenseGEMMFusedMoE expect float32; TRTLLMGen expects bfloat16
-            if isinstance(moe.backend, (CutlassFusedMoE, DenseGEMMFusedMoE)):
-                assert token_final_scales.dtype == torch.float32
             assert token_selected_experts.dtype == torch.int32
 
-            if token_final_scales is not None and isinstance(moe.backend, TRTLLMGenFusedMoE):
-                token_final_scales = token_final_scales.to(torch.bfloat16)
+            # Backends disagree on routing-scale precision, so the requirement
+            # names the dtype instead of the backend class.
+            scales_dtype = moe.backend.input_requirement.routing_scales_dtype
+            if scales_dtype is not None and token_final_scales is not None:
+                if scales_dtype == torch.float32:
+                    # Asking for float32 is asking for routing's own
+                    # full-precision output, so the cast below must be a no-op.
+                    # Several routing methods take an ``output_dtype``, and one
+                    # configured to a narrower type has already dropped mantissa
+                    # bits that widening here cannot recover -- which is what
+                    # this check catches. A narrower request (TRTLLM-Gen's
+                    # bfloat16) is a deliberate conversion, not a loss.
+                    assert token_final_scales.dtype == torch.float32, (
+                        f"{type(moe.backend).__name__} requires float32 routing "
+                        f"scales, but {type(moe.routing_method).__name__} produced "
+                        f"{token_final_scales.dtype}. Casting would widen a value "
+                        "that already lost precision."
+                    )
+                token_final_scales = token_final_scales.to(scales_dtype)
 
             # apply_router_weight_on_input: fuse top-k weight onto x
             if moe.apply_router_weight_on_input:
@@ -479,19 +509,20 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
         if moe.comm is not None:
-            supports_post_quant = moe.comm.supports_post_quant_dispatch()
-
             # Debug: optional dummy AllReduce to break load-balancing artifacts
             if moe.enable_dummy_allreduce:
                 moe.dummy_allreduce()
 
             dispatch_kwargs = dict(eplb_dispatch_kwargs)
-            if isinstance(moe.comm, DeepEP) and isinstance(moe.backend, TRTLLMGenFusedMoE):
+            # Only DeepEP.dispatch reads this; every other strategy absorbs it
+            # through **kwargs, so the request does not need a comm-side test.
+            if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
 
             if supports_post_quant:
                 # Quantize -> Dispatch
-                x, x_sf = moe.backend.quantize_input(x)
+                if not used_fused_route_quant:
+                    x, x_sf = moe.backend.quantize_input(x)
 
                 # W4AFP8 + DeepEPLowLatency needs pre_quant_scale_1; other strategies
                 # absorb the kwarg via **kwargs so unconditional passing is safe.
@@ -524,23 +555,26 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No comm: just quantize
-            x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+            if not used_fused_route_quant:
+                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
-        final_hidden_states = moe.backend.run_moe(
+        ctx = self._build_run_context(
             x=x,
-            token_selected_experts=token_selected_slots,
-            token_final_scales=token_final_scales,
             x_sf=x_sf,
-            **self._get_backend_kwargs(
-                router_logits,
-                do_finalize,
-                all_rank_num_tokens,
-                output_dtype,
-                x,
-                workspace,
-                lora_params=lora_params,
+            token_selected_slots=token_selected_slots,
+            token_final_scales=token_final_scales,
+            router_logits=router_logits,
+            do_finalize=do_finalize,
+            output_dtype=output_dtype,
+            all_rank_num_tokens=all_rank_num_tokens,
+            lora_params=lora_params,
+        )
+        final_hidden_states = moe.backend.run_moe(
+            ctx,
+            workspace=(
+                workspace if moe.backend.input_requirement.requires_run_moe_workspace else None
             ),
         )
 
@@ -623,7 +657,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
         )
 
         # ========== Empty-chunk substitution (DP only) ==========
-        chunked_used = torch.ones(num_chunks, dtype=torch.bool)
+        # Host-only bookkeeping, so keep it in Python state. A tensor here
+        # costs an allocation per call plus a Tensor.__bool__ dispatch per
+        # chunk read below, on a path that runs once per MoE layer per step.
+        # It is also a latent hazard: the tensor only lands on the host
+        # because no device is requested, and a CUDA one would turn each read
+        # into a device-to-host sync that is illegal under CUDA Graph capture.
+        chunked_used = [True] * num_chunks
         if moe.use_dp:
             # The split heuristic guarantees chunk 0 has >= 1 token, so it can
             # stand in for any empty chunk on this rank. Without substitution,
@@ -722,35 +762,30 @@ class ExternalCommMoEScheduler(MoEScheduler):
         return outputs
 
     # ------------------------------------------------------------------
-    # Backend run_moe kwargs builder (external-comm only)
+    # Backend run_moe inputs (external-comm only)
     # ------------------------------------------------------------------
-    def _get_nvlink_onesided_moe_output(
+    def _plan_onesided_workspace(
         self,
         all_rank_num_tokens: Optional[List[int]],
         output_dtype: Optional[torch.dtype],
-    ) -> Optional[torch.Tensor]:
-        """Workspace-backed output buffer for NVLinkOneSided combine, or None.
+    ) -> Tuple[Optional[torch.Tensor], bool]:
+        """Decide the NVLinkOneSided combine payload buffer for this forward.
 
-        Only meaningful when ``moe.comm`` is NVLinkOneSided AND the backend
-        supports payload-in-workspace combine. Returns None for all other
-        comm strategies; callers should always set the resulting kwarg
-        unconditionally and let backends ignore None.
+        Returns ``(moe_output, payload_in_workspace)``. Both are decided on
+        every path, including the ones that opt out, so the flag can never be
+        inherited from a previous forward.
         """
         moe = self.moe
         if not isinstance(moe.comm, NVLinkOneSided):
-            return None
+            return None, False
 
         if not moe.backend.supports_moe_output_in_alltoall_workspace():
-            # Backend opts out: keep payload off the workspace path.
-            moe.comm.payload_in_workspace = False
-            return None
+            # Backend emits its own output tensor; a workspace buffer would be
+            # left unfilled while combine() read from it.
+            return None, False
 
-        workspace_dtype = output_dtype
-        if isinstance(moe.backend, TRTLLMGenFusedMoE):
-            # TRTLLMGen sentinel for unfilled rows; bf16 workspace is the
-            # combine reduction precision used by the kernel.
-            moe.comm.invalid_token_expert_id = -1
-            workspace_dtype = torch.bfloat16
+        # None means "no override": the buffer matches the model output dtype.
+        workspace_dtype = moe.backend.input_requirement.onesided_workspace_dtype or output_dtype
 
         assert all_rank_num_tokens is not None, (
             "all_rank_num_tokens must be provided for NVLinkOneSided backend"
@@ -760,88 +795,68 @@ class ExternalCommMoEScheduler(MoEScheduler):
         moe_output = moe.comm.get_combine_payload_tensor_in_workspace(
             runtime_max_tokens_per_rank, moe.hidden_size, workspace_dtype
         )
+        return moe_output, True
 
-        # Toggle on for this forward; combine() reads this flag to decide
-        # whether to emit into the workspace tensor.
-        moe.comm.payload_in_workspace = True
-        return moe_output
-
-    def _get_backend_kwargs(
+    def _build_run_context(
         self,
-        router_logits: Optional[torch.Tensor] = None,
-        do_finalize: bool = True,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        output_dtype: Optional[torch.dtype] = None,
-        x: Optional[torch.Tensor] = None,
-        workspace: Optional[dict] = None,
-        lora_params: Optional[Dict] = None,
-    ) -> Dict:
-        """Backend-specific kwargs for ``backend.run_moe`` (external-comm only).
+        *,
+        x: torch.Tensor,
+        x_sf: Optional[torch.Tensor],
+        token_selected_slots: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+        router_logits: Optional[torch.Tensor],
+        do_finalize: bool,
+        output_dtype: Optional[torch.dtype],
+        all_rank_num_tokens: Optional[List[int]],
+        lora_params: Optional[Dict],
+    ) -> MoERunContext:
+        """The single ``run_moe`` argument set, identical for every backend.
 
-        ``FusedCommMoEScheduler`` constructs its own kwargs and never
-        calls this helper, so all branches here are EXTERNAL_COMM backends.
-
-        Backend-specific kwargs:
-            - Cutlass: is_sf_swizzled, enable_alltoall, tuner_*, moe_output, lora_params
-            - CuteDSL: enable_alltoall, moe_output
-            - DeepGemm: workspace
-            - TRTLLMGen: router_logits, do_finalize, moe_output
-
-        Only CutlassFusedMoE.run_moe accepts lora_params (routed-expert MoE LoRA
-        is fused there), so it is set on the Cutlass branch alone.
+        The only per-backend decision left here is dropping ``lora_params``
+        for backends that do not fuse routed-expert LoRA: handing them one
+        would silently produce un-adapted output.
         """
         moe = self.moe
-        kwargs: Dict = {}
+        return MoERunContext(
+            token_selected_experts=token_selected_slots,
+            token_final_scales=token_final_scales,
+            x=x,
+            x_sf=x_sf,
+            output_dtype=output_dtype,
+            do_finalize=do_finalize,
+            lora_params=lora_params if moe.backend.capabilities.supports_moe_lora else None,
+            router_logits=router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            comm_plan=self._build_comm_plan(all_rank_num_tokens, output_dtype),
+        )
 
-        if moe.backend.__class__ == CutlassFusedMoE:
-            # Pre-quant dispatch: SFs arrive swizzled; post-quant dispatch:
-            # SFs arrive unswizzled. Backend uses this to skip a re-swizzle.
-            supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
-            kwargs["is_sf_swizzled"] = not supports_post_quant
-            kwargs["output_dtype"] = output_dtype
-            kwargs["lora_params"] = lora_params
+    def _build_comm_plan(
+        self,
+        all_rank_num_tokens: Optional[List[int]],
+        output_dtype: Optional[torch.dtype],
+    ) -> MoECommPlan:
+        """The comm-layer facts for this forward, derived once for every backend.
 
-            # Tuner sees pre-alltoall token shapes so cached tactics from the
-            # warmup (no-alltoall) phase still apply at runtime.
-            kwargs["enable_alltoall"] = moe.enable_alltoall
-            if moe.enable_alltoall:
-                if all_rank_num_tokens is not None:
-                    kwargs["tuner_num_tokens"] = sum(all_rank_num_tokens)
-                else:
-                    kwargs["tuner_num_tokens"] = (
-                        x.shape[0] * moe.mapping.tp_size if x is not None else None
-                    )
-                kwargs["tuner_top_k"] = moe.routing_method.top_k
-
-            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
-            )
-
-        elif moe.backend.__class__ == CuteDslFusedMoE:
-            kwargs["enable_alltoall"] = moe.enable_alltoall
-            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
-            )
-
-        elif moe.backend.__class__ == DeepGemmFusedMoE:
-            if workspace is not None:
-                kwargs["workspace"] = workspace
-
-        elif moe.backend.__class__ == TRTLLMGenFusedMoE:
-            # When the scheduler precomputes top-k for DP/load-balancer paths,
-            # the backend must not route again.  Single-rank TRTLLMGen paths do
-            # not get precomputed top-k, so they still need router_logits.
-            router_logits_arg = None if moe.backend._supports_load_balancer() else router_logits
-            kwargs["router_logits"] = router_logits_arg
-            kwargs["do_finalize"] = do_finalize
-            kwargs["moe_output"] = self._get_nvlink_onesided_moe_output(
-                all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
-            )
-
-        elif moe.backend.__class__ == MarlinFusedMoE:
-            kwargs["router_logits"] = router_logits
-
-        return kwargs
+        Backends read the fields they care about and ignore the rest, so the
+        set of facts no longer depends on which class is running.
+        """
+        moe = self.moe
+        # Pre-quant dispatch: SFs arrive swizzled; post-quant dispatch: SFs
+        # arrive unswizzled. Backends use this to skip a re-swizzle.
+        supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
+        moe_output, payload_in_workspace = self._plan_onesided_workspace(
+            all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+        )
+        if isinstance(moe.comm, NVLinkOneSided):
+            # combine() still reads the flag off the strategy; the plan stays
+            # the single place that decides its value.
+            moe.comm.payload_in_workspace = payload_in_workspace
+        return MoECommPlan(
+            input_sf_swizzled=not supports_post_quant,
+            enable_alltoall=moe.enable_alltoall,
+            moe_output=moe_output,
+            payload_in_workspace=payload_in_workspace,
+        )
 
 
 # ============================================================================
@@ -1206,12 +1221,16 @@ class FusedCommMoEScheduler(MoEScheduler):
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
+        # Fused-comm backends own the EP exchange, so there is no comm plan:
+        # nothing outside the fused kernel decided anything about this forward.
         out = moe.backend.run_moe(
-            x=moe_input,
-            token_selected_experts=token_selected_slots,
-            token_final_scales=token_final_scales,
-            x_sf=x_sf,
-            output_dtype=output_dtype,
+            MoERunContext(
+                token_selected_experts=token_selected_slots,
+                token_final_scales=token_final_scales,
+                x=moe_input,
+                x_sf=x_sf,
+                output_dtype=output_dtype,
+            )
         )
 
         # ----- EPLB: start/done CPU rebalance, AFTER run_moe -----
