@@ -893,6 +893,7 @@ def _register_fake():
         has_initial_state: Optional[torch.Tensor],
         silu_activation: bool,
         pad_slot_id: int,
+        out: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
