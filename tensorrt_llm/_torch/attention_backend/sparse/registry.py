@@ -71,7 +71,9 @@ def get_vanilla_sparse_attn_attention_backend(
     if sparse_params.algorithm == "rocket":
         return RocketVanillaAttention
     elif sparse_params.algorithm == "minimax_m3":
-        return _resolve_minimax_m3_backend_cls(sparse_params)
+        from .minimax_m3 import MiniMaxM3VanillaAttention
+
+        return MiniMaxM3VanillaAttention
     else:
         raise ValueError(
             f"Unsupported sparse attention algorithm in vanilla attention backend: {sparse_params.algorithm}"
