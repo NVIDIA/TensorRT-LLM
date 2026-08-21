@@ -6952,6 +6952,122 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
         self._run_nvfp4_4gpus_eplb(eplb_config, moe_backend, mocker)
 
 
+@skip_pre_blackwell
+@pytest.mark.timeout(28800)
+class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
+    """Accuracy guards for the two Qwen3.8-2.4T-A95B MoE checkpoints."""
+
+    MODEL_NAME = "Qwen/Qwen3.8-2.4T-A95B"
+    GSM8K_MAX_OUTPUT_LEN = 512
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.parametrize(
+        "ep_size,attention_dp,moe_backend,max_draft_len",
+        [
+            (1, False, "TRTLLM", 3),
+            (16, True, "DEEPGEMM", None),
+        ],
+        ids=["tp16_mtp3_trtllm", "adp16_deepgemm"],
+    )
+    def test_fp8_block_scales(self, ep_size, attention_dp, moe_backend,
+                              max_draft_len, mocker):
+        model_path = f"{llm_models_root()}/Qwen3.8-2.4T-A95B-FP8"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        if get_sm_version() not in (100, 103):
+            pytest.skip("Qwen3.8-2.4T-A95B MoE backends run on SM100/103 only")
+
+        max_batch_size = 4 if attention_dp else 32
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="bfloat16")
+        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
+                                            enable_padding=True)
+        if max_draft_len is None:
+            mtp_config = None
+        else:
+            mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=16,
+                 moe_expert_parallel_size=ep_size,
+                 max_seq_len=8192,
+                 max_num_tokens=8192,
+                 max_batch_size=max_batch_size,
+                 enable_attention_dp=attention_dp,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=MoeConfig(backend=moe_backend),
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    # ~1.35 TiB of weights: ~169 GiB/rank at TP8, so it needs a 288 GB part.
+    @pytest.mark.skip_device_not_contain(["GB300"])
+    @pytest.mark.parametrize(
+        "ep_size,attention_dp,moe_backend,max_draft_len",
+        [
+            (1, False, "TRTLLM", 3),
+            (8, True, "CUTEDSL", None),
+        ],
+        ids=["tp8_mtp3_trtllm", "adp8_cutedsl"],
+    )
+    def test_nvfp4(self, ep_size, attention_dp, moe_backend, max_draft_len,
+                   mocker):
+        model_path = f"{llm_models_root()}/Inferact-Qwen3.8-2.4T-A95B-NVFP4"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        if get_sm_version() not in (100, 103):
+            pytest.skip("Qwen3.8-2.4T-A95B MoE backends run on SM100/103 only")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="bfloat16")
+        max_batch_size = 4 if attention_dp else 32
+        cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
+                                            enable_padding=True)
+        if max_draft_len is None:
+            mtp_config = None
+        else:
+            mtp_config = MTPDecodingConfig(max_draft_len=max_draft_len)
+
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=8,
+                 moe_expert_parallel_size=ep_size,
+                 max_seq_len=8192,
+                 max_num_tokens=8192,
+                 max_batch_size=max_batch_size,
+                 enable_attention_dp=attention_dp,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=MoeConfig(backend=moe_backend),
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Seed-OSS/Seed-OSS-36B-Instruct"
