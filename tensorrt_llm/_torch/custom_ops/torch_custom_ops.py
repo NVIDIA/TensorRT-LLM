@@ -1978,6 +1978,10 @@ def _fp8_block_scaling_gemm_sm100_constraint(inputs: List[List[int]]) -> int:
     return inputs[0][0]
 
 
+def _fp8_block_scaling_gemm_sm120_constraint(inputs: List[List[int]]) -> int:
+    return fp4_utils.pad_up(inputs[0][0], 4)
+
+
 def _fp8_quantize_1x128_sm90_constraint(inputs: List[List[int]]) -> int:
     # The implementation aligns with the fp8_quantize_1x128 custom op.
     pad_m = fp4_utils.pad_up(inputs[0][0], 4)
@@ -1988,7 +1992,10 @@ def _fp8_quantize_1x128_sm90_constraint(inputs: List[List[int]]) -> int:
 @lru_cache(maxsize=None)
 def _get_fp8_block_scaling_gemm_constraint_spec(
         sm_version: int) -> Tuple[ConstraintSpec, ...]:
-    if sm_version >= 100:
+    if sm_version == 120:
+        return (ConstraintSpec(2, 0,
+                               _fp8_block_scaling_gemm_sm120_constraint), )
+    elif sm_version >= 100:
         return (ConstraintSpec(2, 1,
                                _fp8_block_scaling_gemm_sm100_constraint), )
     else:
