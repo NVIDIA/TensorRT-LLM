@@ -1304,16 +1304,6 @@ class TestSafeLocalFileRead:
         with pytest.raises(ValueError, match="not a regular file"):
             _safe_read_local_file(str(tmp_path))
 
-    def test_an_oversized_file_is_refused_before_it_is_read(self, tmp_path, monkeypatch):
-        """The cap is checked against ``stat``, so the bytes never come in."""
-        from tensorrt_llm.visual_gen import media_refs
-
-        target = self._png(tmp_path)
-        monkeypatch.setattr(media_refs, "_MAX_RESPONSE_BYTES", 8)
-
-        with pytest.raises(ValueError, match="over the 8-byte limit"):
-            media_refs._safe_read_local_file(str(target))
-
     def test_a_missing_file_is_a_client_error(self, tmp_path):
         from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
 

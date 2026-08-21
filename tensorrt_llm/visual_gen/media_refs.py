@@ -29,7 +29,6 @@ from stat import S_ISREG
 from typing import Any
 
 from tensorrt_llm.inputs.media_io import (
-    _MAX_RESPONSE_BYTES,
     _normalize_file_uri,
     _safe_request_get,
     is_isobmff_image_bytes,
@@ -63,18 +62,19 @@ def _read_reference_payload(reference: str) -> bytes:
 
 
 def _safe_read_local_file(reference: str) -> bytes:
-    """Read a ``path`` reference, bounding what an unlucky path can cost.
+    """Read a ``path`` reference, refusing anything that has no end.
 
-    The counterpart of :func:`_safe_request_get` for the local branch. A
-    remote caller naming the path is the case worth defending: ``read_bytes``
-    on a character device or a FIFO never returns, so an unbounded read is a
-    denial of service rather than a bad request. Requiring a regular file
-    within the same size cap the remote fetch uses keeps both branches to one
-    rule.
+    The counterpart of :func:`_safe_request_get` for the local branch, and it
+    guards the one case that is unbounded rather than merely large: reading a
+    character device never reaches EOF and reading a FIFO blocks, so either
+    turns a request into a denial of service. A regular file is finite, which
+    is the property required here.
 
-    This bounds cost, not reach: any regular file the server process can read
-    is still readable. Restricting *which* files a remote caller may name is a
-    deployment-policy question, and belongs with the deployment.
+    Size is deliberately not capped. ``path`` exists for the local Python API,
+    where naming a large file of one's own is the normal case, and no
+    threshold separates that from an abusive one. This bounds the shape of
+    what may be read, then, not its size or its reach: any regular file the
+    server process can read is still readable.
     """
     path = Path(_normalize_file_uri(reference))
     try:
@@ -86,10 +86,6 @@ def _safe_read_local_file(reference: str) -> bytes:
         raise ValueError(
             f"reference path is not a regular file: {reference!r}. Character "
             "devices, FIFOs and directories cannot be read as media."
-        )
-    if stat.st_size > _MAX_RESPONSE_BYTES:
-        raise ValueError(
-            f"reference file is {stat.st_size} bytes, over the {_MAX_RESPONSE_BYTES}-byte limit."
         )
     try:
         return path.read_bytes()
