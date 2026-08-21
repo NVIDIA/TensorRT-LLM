@@ -140,14 +140,12 @@ conservative star setting from the frontier: `target_sparsity=0.75` and
     <td align="center">
       <video controls preload="metadata" poster="../media/tech_blog28_video_p01_eager_bf16.jpg" width="520">
         <source src="../media/tech_blog28_video_p01_eager_bf16.mp4" type="video/mp4">
-      </video><br>
-      <a href="../media/tech_blog28_video_p01_eager_bf16.mp4">Open video</a>
+      </video>
     </td>
     <td align="center">
       <video controls preload="metadata" poster="../media/tech_blog28_video_p01_bf16_sage_skip_softmax.jpg" width="520">
         <source src="../media/tech_blog28_video_p01_bf16_sage_skip_softmax.mp4" type="video/mp4">
-      </video><br>
-      <a href="../media/tech_blog28_video_p01_bf16_sage_skip_softmax.mp4">Open video</a>
+      </video>
     </td>
   </tr>
   <tr>
@@ -158,14 +156,12 @@ conservative star setting from the frontier: `target_sparsity=0.75` and
     <td align="center">
       <video controls preload="metadata" poster="../media/tech_blog28_video_p01_fp8_sage_skip_softmax.jpg" width="520">
         <source src="../media/tech_blog28_video_p01_fp8_sage_skip_softmax.mp4" type="video/mp4">
-      </video><br>
-      <a href="../media/tech_blog28_video_p01_fp8_sage_skip_softmax.mp4">Open video</a>
+      </video>
     </td>
     <td align="center">
       <video controls preload="metadata" poster="../media/tech_blog28_video_p01_nvfp4_sage_skip_softmax.jpg" width="520">
         <source src="../media/tech_blog28_video_p01_nvfp4_sage_skip_softmax.mp4" type="video/mp4">
-      </video><br>
-      <a href="../media/tech_blog28_video_p01_nvfp4_sage_skip_softmax.mp4">Open video</a>
+      </video>
     </td>
   </tr>
 </table>
