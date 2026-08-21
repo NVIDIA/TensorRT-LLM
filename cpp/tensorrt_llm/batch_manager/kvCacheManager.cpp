@@ -1317,16 +1317,15 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
-    std::string const& directory, bool wantPlaceholder, bool countAllocationStats, bool suppressEvents)
+    std::string const& directory, bool wantPlaceholder, bool countAllocationStats)
 {
     return getFreeBlock(std::optional<LlmRequest::RequestIdType>{sequence.getRequestId()}, priority, durationMs, mode,
-        directory, wantPlaceholder, countAllocationStats, suppressEvents);
+        directory, wantPlaceholder, countAllocationStats);
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(std::optional<LlmRequest::RequestIdType> requestId,
     executor::RetentionPriority priority, std::optional<std::chrono::milliseconds> durationMs,
-    executor::KvCacheTransferMode mode, std::string const& directory, bool wantPlaceholder, bool countAllocationStats,
-    bool suppressEvents)
+    executor::KvCacheTransferMode mode, std::string const& directory, bool wantPlaceholder, bool countAllocationStats)
 {
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     // eviction policy get free primary block
@@ -1362,7 +1361,7 @@ BlockPtr WindowBlockManager::getFreeBlock(std::optional<LlmRequest::RequestIdTyp
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
 
-        if (!suppressEvents && mEventManager && blockInRadixTree(block))
+        if (mEventManager && blockInRadixTree(block))
         {
             mEventManager->enqueueUpdatedEvent(
                 tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
@@ -1388,7 +1387,7 @@ BlockPtr WindowBlockManager::getFreeBlock(std::optional<LlmRequest::RequestIdTyp
     // detachFromLookupNode must do the same.
     {
         std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
-        if (!suppressEvents && mEventManager && blockInRadixTree(block))
+        if (mEventManager && blockInRadixTree(block))
         {
             mEventManager->enqueueRemovedEvent(block, mWindowSize);
         }
@@ -1531,15 +1530,19 @@ std::pair<std::vector<KVCacheBlock::IdType>, bool> WindowBlockManager::pinAndOnb
                 BlockPtr scratchPrimaryBlock;
                 try
                 {
-                    // Transfer preparation only needs a scratch primary allocation so the offloaded, already-pinned
-                    // block can be read by the formatter/transceiver. Do not emit eviction-style cache events here:
-                    // the logical cached prefix still belongs to the pinned block, and notifying the scheduler would
-                    // make other components treat the reusable prefix as removed.
+                    // Transfer preparation needs a temporary primary block so the formatter can read an offloaded
+                    // block. Use normal allocation semantics here: if capacity pressure requires moving or evicting
+                    // a cached victim, getFreeBlock emits the corresponding Updated/Removed KV-cache event.
                     scratchPrimaryBlock = getFreeBlock(std::nullopt, block->getPriority(), block->getDurationMs(), mode,
-                        directory, /*wantPlaceholder=*/false, /*countAllocationStats=*/false,
-                        /*suppressEvents=*/true);
+                        directory, /*wantPlaceholder=*/false, /*countAllocationStats=*/false);
                     mTransferManager->onboard(block, scratchPrimaryBlock, mPools, 0, mode, directory);
                     block->swapMemoryPoolBlockOffset(scratchPrimaryBlock);
+                    if (mEventManager && blockInRadixTree(block))
+                    {
+                        mEventManager->enqueueUpdatedEvent(
+                            tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
+                            mWindowSize);
+                    }
                 }
                 catch (...)
                 {
