@@ -95,6 +95,21 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM)
     return gpuSM == kernelSM;
 }
 
+#if defined(TLLM_FMHA_TEST_HOOKS)
+// Test-only result of probeKernelSelectionForTesting: the kernel the autotuner would launch.
+struct TllmGenFmhaSelectedKernel
+{
+    // Resolved cubin function name (empty when mFound is false).
+    std::string mFuncName;
+    bool mFound = false;
+    // True when the autotuner chose the NVRTC path instead of a precompiled cubin.
+    bool mUsedNvrtc = false;
+    // Grouping flags from the matched kernelMeta.
+    bool mGroupsHeadsQ = false;
+    bool mGroupsTokensHeadsQ = false;
+};
+#endif // TLLM_FMHA_TEST_HOOKS
+
 class TllmGenFmhaKernel
 {
 
@@ -290,6 +305,58 @@ public:
 
         return std::make_pair(true, info);
     }
+
+#if defined(TLLM_FMHA_TEST_HOOKS)
+    // Test-only: report which kernelMeta the autotuner + hash lookup resolve to for these params,
+    // without launching the kernel.
+    TllmGenFmhaSelectedKernel probeKernelSelectionForTesting(RunnerParams const& params) const
+    {
+        TllmGenFmhaSelectedKernel result;
+        if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
+        {
+            return result;
+        }
+        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
+            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+        {
+            return result;
+        }
+        int32_t ctaDim = 512;
+        FmhaOptions options;
+        FmhaOptionsFromArgs optionsFromArgs;
+        parseOptionsFromRunnerParams(params, options);
+        options.mCudaArch = intToCudaArch(mSM);
+
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+
+        checkFmhaOptions(options, optionsFromArgs);
+        updateFmhaOptions(options, optionsFromArgs);
+
+        computeNumCtas(options, params.mMultiProcessorCount);
+
+        if (shouldUseNvrtc(options))
+        {
+            result.mUsedNvrtc = true;
+            return result;
+        }
+
+        algoFilterForCubinPath(options);
+        auto [hashId, info] = hashFromFmhaOptions(options);
+
+        auto const findIter = mFunctions.find(hashId);
+        if (findIter == mFunctions.end())
+        {
+            return result;
+        }
+        auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+        result.mFound = true;
+        result.mFuncName = kernelMeta.mFuncName != nullptr ? std::string(kernelMeta.mFuncName) : std::string{};
+        result.mGroupsHeadsQ = kernelMeta.mGroupsHeadsQ;
+        result.mGroupsTokensHeadsQ = kernelMeta.mGroupsTokensHeadsQ;
+        return result;
+    }
+#endif // TLLM_FMHA_TEST_HOOKS
 
     void algoFilterForCubinPath(FmhaOptions& options) const
     {
@@ -999,6 +1066,9 @@ private:
 
         options.mEnablesAutoTuner = true;
         options.mIsMlaGen = isMlaGenKernel(params);
+        // Let the autotuner pick the grouped-token Q64 MLA generation kernel when its
+        // capability predicate matches (causal spec decode, supported head ratios/dtypes).
+        options.mSelectsGroupedMla = options.mIsMlaGen;
         options.mDtypeQ = dataTypeToDtype(mDtypeQ);
         options.mDtypeKv = dataTypeToDtype(mDtypeK);
         options.mDtypeK = dataTypeToDtype(mDtypeK);

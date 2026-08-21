@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <string>
 
 #include "fmhaKernels.h"
 #include "fmhaRunnerParams.h"
@@ -49,6 +50,14 @@ public:
 
     // Run the fmha kernel.
     void run(TllmGenFmhaRunnerParams const&);
+
+#if defined(TLLM_FMHA_TEST_HOOKS)
+    // Test-only: probe which cubin the autotuner would select for these params, without launching.
+    TllmGenFmhaSelectedKernel probeKernelSelectionForTesting(TllmGenFmhaRunnerParams const& runnerParams) const
+    {
+        return mKernel->probeKernelSelectionForTesting(runnerParams);
+    }
+#endif // TLLM_FMHA_TEST_HOOKS
 
 private:
     // The input/output datatype.
