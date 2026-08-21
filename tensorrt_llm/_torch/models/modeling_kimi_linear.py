@@ -2283,12 +2283,17 @@ class KimiLinearDecoderLayer(nn.Module):
         block_residual: torch.Tensor,
         num_snapshots: int,
         attn_metadata: AttentionMetadata,
+        capture: Optional[Tuple[Any, int]] = None,
     ) -> Tuple[torch.Tensor, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
         ``block_residual`` is a preallocated snapshot bank in kernel-native
         ``[K_max, M, H]`` layout. Returns the running prefix sum and the
         number of valid bank rows.
+
+        ``capture`` is ``(spec_metadata, layer_id)``: the attention-side mixture
+        computed below IS the aggregated stream value for ``layer_id``, so the
+        DSpark tap reuses it instead of recomputing it.
         """
         prefix_sum = hidden_states
         valid_block_residual = block_residual[:num_snapshots]
@@ -2300,6 +2305,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             )
+        if capture is not None:
+            capture[0].maybe_capture_hidden_states(capture[1], hidden_states, None)
 
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residual[num_snapshots].copy_(prefix_sum)
@@ -2397,19 +2404,48 @@ class KimiLinearModel(DecoderModel):
             hidden_states.shape[1],
         )
         num_snapshots = 0
-        for layer in self.layers:
+        capture_set = (
+            getattr(spec_metadata, "_capture_layer_set", None)
+            if spec_metadata is not None
+            else None
+        )
+        for i, layer in enumerate(self.layers):
+            # DFlash/DSpark hidden-state capture. The drafter is distilled on
+            # the aggregated stream value -- the pre-norm softmax mixture its
+            # next consumer sees -- not on the raw prefix sum a layer returns.
+            # Layer i+1 computes exactly that tensor as its own attention-side
+            # mixture, so the tap rides along instead of recomputing it.
+            # Capturing the prefix sum instead costs 4.5pt of draft acceptance
+            # on K3 + RadixArk DSpark (AR 66.9% -> 71.4%). Ground truth:
+            # SGLang kimi_k3.py:2589 _dspark_capture_stream, attn_residual.py:285
+            # aggregate_stream.
+            capture = None
+            if (
+                spec_metadata is not None
+                and i > 0
+                and (capture_set is None or self.layers[i - 1].layer_idx in capture_set)
+            ):
+                capture = (spec_metadata, self.layers[i - 1].layer_idx)
             hidden_states, num_snapshots = layer(
-                hidden_states, block_residual, num_snapshots, attn_metadata
+                hidden_states, block_residual, num_snapshots, attn_metadata, capture=capture
             )
-            if spec_metadata is not None:
-                # DFlash hidden-state capture. K3's attn-residual scheme
-                # already folds the residual into the running prefix sum
-                # returned by each layer, so unlike Qwen3/Llama we pass the
-                # full hidden state with residual=None. Whether the drafter
-                # is trained against this prefix sum or some other tap point
-                # must be confirmed against the K3 drafter training recipe
-                # before real weights are used.
-                spec_metadata.maybe_capture_hidden_states(layer.layer_idx, hidden_states, None)
+
+        # The last layer has no successor to fold the tap into, so its stream
+        # value uses the model's own output-side score weights.
+        if spec_metadata is not None and len(self.layers) > 0:
+            last = self.layers[-1]
+            if capture_set is None or last.layer_idx in capture_set:
+                tail = (
+                    _apply_attn_res(
+                        hidden_states,
+                        block_residual[:num_snapshots],
+                        self.output_attn_res_proj,
+                        self.output_attn_res_norm,
+                    )
+                    if num_snapshots > 0
+                    else hidden_states
+                )
+                spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
         hidden_states = _apply_attn_res(
             hidden_states,

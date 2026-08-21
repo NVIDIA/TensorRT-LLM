@@ -146,7 +146,13 @@ class DFlashSpecMetadata(SpecMetadata):
     def maybe_capture_hidden_states(
         self, layer_id: int, hidden_states: torch.Tensor, residual: Optional[torch.Tensor] = None
     ) -> None:
-        """Capture hidden states from a target model layer into the buffer."""
+        """Capture hidden states from a target model layer into the buffer.
+
+        The ``residual`` convention is model-specific: Qwen3/Llama-style callers
+        pass the pre-add pair and this folds them, while K3 hands in an
+        already-mixed aggregated stream value and passes ``residual=None``
+        (see the DSpark tap in ``modeling_kimi_linear.py``).
+        """
         if self.captured_hidden_states is None:
             return
         i = self._layer_to_idx.get(layer_id)
