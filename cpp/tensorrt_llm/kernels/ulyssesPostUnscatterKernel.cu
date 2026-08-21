@@ -118,8 +118,8 @@ __global__ void ulyssesPackedQkvPostUnscatterKernel(T const* __restrict__ qkv_in
     // (((((p*B + b)*Sp + sp)*3 + qkv)*H + h)*D + vec_idx*VEC)
     // out[b, p*Sp+sp, h, d]:
     // (((b*PSp + psp)*H + h)*D + vec_idx*VEC)
-    int64_t const in_base = (((((static_cast<int64_t>(p) * B + b) * Sp + sp) * 3 + qkv_idx) * H + h) * D)
-        + vec_idx * VEC;
+    int64_t const in_base
+        = (((((static_cast<int64_t>(p) * B + b) * Sp + sp) * 3 + qkv_idx) * H + h) * D) + vec_idx * VEC;
     int64_t const out_base = (((static_cast<int64_t>(b) * PSp + psp) * H + h) * D) + vec_idx * VEC;
 
     T* out_ptr = qkv_idx == 0 ? q_out : (qkv_idx == 1 ? k_out : v_out);
@@ -164,8 +164,7 @@ void launchUlyssesPackedQkvPostUnscatter(
     int const vec_per_row = D / VEC;
     int const threads = H * vec_per_row;
     TLLM_CHECK_WITH_INFO(threads <= 1024,
-        "ulyssesPackedQkvPostUnscatter: threads/block (H*D/8) must be <= 1024, got H=%d D=%d -> %d", H, D,
-        threads);
+        "ulyssesPackedQkvPostUnscatter: threads/block (H*D/8) must be <= 1024, got H=%d D=%d -> %d", H, D, threads);
 
     dim3 const grid(3 * P * Sp, B, 1);
     dim3 const block(threads);
@@ -175,8 +174,8 @@ void launchUlyssesPackedQkvPostUnscatter(
     auto* k_out_typed = reinterpret_cast<__nv_bfloat16*>(k_out);
     auto* v_out_typed = reinterpret_cast<__nv_bfloat16*>(v_out);
 
-    ulyssesPackedQkvPostUnscatterKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(
-        qkv_in_typed, q_out_typed, k_out_typed, v_out_typed, P, B, Sp, H, D, vec_per_row);
+    ulyssesPackedQkvPostUnscatterKernel<__nv_bfloat16>
+        <<<grid, block, 0, stream>>>(qkv_in_typed, q_out_typed, k_out_typed, v_out_typed, P, B, Sp, H, D, vec_per_row);
 }
 
 } // namespace kernels
