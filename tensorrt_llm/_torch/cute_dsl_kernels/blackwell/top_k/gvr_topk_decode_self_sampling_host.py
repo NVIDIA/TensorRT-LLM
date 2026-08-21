@@ -755,7 +755,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     r_const = rt["R"]
     cr_shift = 0 if cr == 1 else 2
     dev = _device()
-    fn = dev.get_compiled(tpl + (next_n, cr_shift, r_const))
+    # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
+    # machinery in whenever SPLIT); normalize it out of the compile key so
+    # row counts differing only in that slot share one engine
+    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const))
     big = num_rows * r_const <= 148
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
@@ -769,7 +772,13 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
     sd_en = 1 if (k > 1024 and not big) else 0
-    tsh_en = 1 if (tpl[5] and num_rows > 15 and k <= 1024) else 0
+    # TSH-floor staging: gate on SPLIT and K only. The old num_rows > 15
+    # condition stranded small batches (rows <= 15) in SPLIT-main without
+    # the staged floor — a distribution-dependent 6x tail on real deep-layer
+    # captures (v4_pro_512k L46/L52, n4 = 32768, rows 1-8: 142-151 us vs
+    # 25 us with staging; healthy layers and n4 > 32768 rows unaffected —
+    # the kernel gates TSH per row at runtime anyway).
+    tsh_en = 1 if (tpl[5] and k <= 1024) else 0
     pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
     tail = (aim_base, sfac, amin, sd_en, tsh_en)
     lc = (fn, pre, tail)
