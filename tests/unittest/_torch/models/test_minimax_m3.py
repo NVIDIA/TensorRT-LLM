@@ -796,6 +796,7 @@ def test_minimax_m3_fused_qk_norm_rope_index_matches_separate():
     torch.testing.assert_close(ik_f.contiguous(), ik_s.contiguous(), rtol=5e-2, atol=1e-1)
 
 
+@pytest.mark.cpu_only
 def test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons() -> None:
     """The fused kernel has one epsilon, so Q/K norms must agree."""
     attn = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
