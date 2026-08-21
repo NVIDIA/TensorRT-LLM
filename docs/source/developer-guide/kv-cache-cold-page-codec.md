@@ -180,6 +180,8 @@ acquires device staging and submits one H2D `cuMemcpyBatchAsync` entry with
 returns, while the H2D transfer remains asynchronous on the codec stream. KVCM may therefore reuse the host vector
 immediately and does not need a pinned-host index ring. The upload also sets
 `CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE` to prefer copy engines when the platform honors the hint.
+Before CUDA 12.8, where `cuMemcpyBatchAsync` is unavailable, KVCM instead uploads the pageable-host indices with a
+version-gated segmented kernel whose parameters are consumed during launch.
 
 The hot-side storage used by the codec must be GPU-accessible, either GPU memory or pinned mapped host memory. Disk
 addresses are never passed to the codec. When no host tier exists, KVCM uses temporary pinned-host staging buffers for
@@ -273,6 +275,8 @@ The default concatenating codec reports `kHost` and consumes the `PageIndexPair`
 `cuMemcpyBatchAsync` descriptor for each page and hot pool, then submits the complete descriptor array once per codec
 call. Each descriptor copies the full pool contribution for that page. There is no codec-level 2 MiB work size,
 transfer chunking policy, or 16-byte alignment requirement; DMA scheduling and partitioning belong to CUDA.
+Before CUDA 12.8, the version-gated fallback submits the same descriptors as individual stream-ordered
+`cuMemcpyAsync` calls.
 
 The batch uses stream-ordered source access and sets `CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE` to prefer
 copy engines when the platform honors the hint. Non-empty calls require a non-legacy

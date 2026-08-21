@@ -419,11 +419,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             }
             KVCacheIterationStatsDelta iterationStats;
             iterationStats.iterIntraDeviceCopyBlocks = 1;
-            PoolGroupIndex const hotPgIdx = storageMgr.getPoolGroupIndex(lcIdx);
-            for (size_t const size : storageMgr.slotSize(hotPgIdx))
-            {
-                iterationStats.iterIntraDeviceCopyBytes += static_cast<int64_t>(size);
-            }
+            iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(storageMgr, kHotLevel, lcIdx);
             _recordDirectIterationStats(lcIdx, iterationStats);
         }
 

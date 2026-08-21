@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/coldPageCopy.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 
 #include "tensorrt_llm/common/logger.h"
@@ -26,8 +27,6 @@
 #include <exception>
 #include <limits>
 #include <memory>
-#include <new>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -245,6 +244,17 @@ private:
         dsts.reserve(numCopies);
         srcs.reserve(numCopies);
         sizes.reserve(numCopies);
+        auto const releaseCopyVectors = FuncGuard(
+            [&]() noexcept
+            {
+                constexpr size_t kMaxRetainedCopyEntries = 128U << 10U;
+                if (numCopies > kMaxRetainedCopyEntries)
+                {
+                    std::vector<CUdeviceptr>().swap(dsts);
+                    std::vector<CUdeviceptr>().swap(srcs);
+                    std::vector<size_t>().swap(sizes);
+                }
+            });
 
         // Work around the interaction of two independent bugs. Linux kernels 6.11 through 6.13 cannot reliably pin
         // more than 2 GiB in one call, so HostMem registers a large allocation as adjacent 2 GiB regions. Separately,
