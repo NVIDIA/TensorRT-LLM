@@ -56,16 +56,17 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
             new_tickets[pkg] = url
     license_ticket = ticket_refs.get("license")
     license_info = {}
-    if license_ticket and license_ticket.get("ticket_url"):
-        url = license_ticket["ticket_url"]
+    if license_ticket:
         license_info = license_ticket.get("license_info", {})
-        dep_names = {pkg.get("name") for pkg in (license_ticket.get("dependencies") or [])}
-        if not dep_names:
-            # Agent created a ticket but returned no dependency list — cover all submitted packages
-            dep_names = {doc["s_package_name"] for doc in risk_docs}
-        for name in dep_names:
-            if name:
-                new_tickets[name] = url
+        url = license_ticket.get("ticket_url", "")
+        if url:
+            dep_names = {pkg.get("name") for pkg in (license_ticket.get("dependencies") or [])}
+            if not dep_names:
+                # Agent created a ticket but returned no dependency list — cover all submitted packages
+                dep_names = {doc["s_package_name"] for doc in risk_docs}
+            for name in dep_names:
+                if name:
+                    new_tickets[name] = url
     if new_tickets:
         save_triage_records(
             ES_POST_URL,
@@ -226,7 +227,7 @@ def submit_source_code_licenses(
                 "s_bdsa": "N/A",
                 "s_license_ids": ",".join(license_ids),
                 "s_bom_ref": component.get("bom-ref"),
-                "s_component_type": component.get("type"),
+                "s_package_type": component.get("type"),
                 "s_ticket_url": triaged_deps.get(package_name, ""),
             }
             if not is_preapproved(map_preapproved, package_name, "pypi"):

@@ -124,8 +124,8 @@ def extract_ticket_refs(agent_response: dict) -> dict:
     print(f"[Triage agent raw response] {agent_response}", file=sys.stderr)
     agent_resp_value = json.loads(agent_response.get("value", "{}"))
     license_ticket = agent_resp_value.get("license_correction_ticket")
-    if license_ticket and license_ticket.get("link"):
-        link = license_ticket["link"]
+    if license_ticket:
+        link = license_ticket.get("link") or ""
         deps = license_ticket.get("dependencies") or []
         license_info = {
             dep["name"]: {
@@ -140,7 +140,7 @@ def extract_ticket_refs(agent_response: dict) -> dict:
             "ticket_url": link,
             "dependencies": deps,
             "license_info": license_info,
-            "status": "CREATED",
+            "status": "CREATED" if link else "FAILED",
         }
 
     refs["vulnerability"] = []
