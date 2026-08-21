@@ -189,6 +189,11 @@ The common speedup baseline is compiled BF16 with dense attention and Skip Softm
 mean pipeline-forward latency is **525.0 seconds** across the seven prompts, so a point at
 1.40× corresponds to roughly 375 seconds under the same measurement.
 
+The 1.00× compiled BF16 point is not the LPIPS reference: quality is compared against a separate
+eager BF16 generation. Even with the same prompt and seed, compilation can change kernel fusion
+and floating-point operation ordering, and those numerical differences accumulate through the
+denoising trajectory. Its LPIPS is therefore nonzero.
+
 <p align="center">
   <img src="../media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of speedup versus mean LPIPS for the Wan 2.2 optimization sweep, with squares for runs without Skip Softmax, stars for conservative configurations, triangles for aggressive configurations, and a dashed global Pareto frontier" width="1080">
 </p>
