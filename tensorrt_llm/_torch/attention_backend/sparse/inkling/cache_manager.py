@@ -302,6 +302,48 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         poisoned[0] = salt
         return poisoned
 
+    def prepare_context(self, req):
+        """Observation only: how much prefix was reused, and from whose slot.
+
+        The framework has these counters
+        (``KVCacheV2SsmSnapshotIterationStats``) and they are the right source,
+        but on a served deployment ``/metrics`` carries no
+        ``kvCacheIterationStats*`` key at all -- measured over 1001 iterations,
+        jobs 6381795 / 6382310 -- so there is nothing to read yet. Until that is
+        fixed this is the only gate, and a reuse number without a gate reads the
+        same whether reuse worked or never ran.
+
+        The slot source is logged with it because the two failure modes look
+        identical from accuracy alone: no reuse at all, or reuse into a row the
+        kernels do not read (the defect ``_conv_slot_for_request`` fixes).
+        """
+        first = bool(getattr(req, "is_first_context_chunk", True))
+        ok = super().prepare_context(req)
+        if not first:
+            return ok
+        d = getattr(self, "_reuse_dbg", None)
+        if d is None:
+            d = self._reuse_dbg = {"n": 0, "hits": 0, "best": 0, "v2_slots": 0}
+        d["n"] += 1
+        pos = int(getattr(req, "context_current_position", 0) or 0)
+        if pos > 0:
+            d["hits"] += 1
+            d["best"] = max(d["best"], pos)
+        if (
+            self._conv_slot_for_request(
+                getattr(req, "py_request_id", getattr(req, "request_id", -1))
+            )
+            is not None
+        ):
+            d["v2_slots"] += 1
+        if d["n"] % 64 == 0:
+            logger.info(
+                f"Inkling prefix reuse: {d['hits']}/{d['n']} requests, "
+                f"longest={d['best']} tokens, conv rows from V2: "
+                f"{d['v2_slots']}/{d['n']}"
+            )
+        return ok
+
     # ======================= end KV cache block reuse =======================
 
     # ---- conv geometry, all derived from what the base already resolved -----
