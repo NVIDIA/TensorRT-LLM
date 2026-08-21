@@ -85,7 +85,8 @@ also called BLASST, keeps the QK calculation but rejects score blocks sufficient
 running maximum. Rejected blocks skip exponentiation and the corresponding value accumulation;
 the sparsity pattern is determined dynamically rather than stored with the model.
 
-Two controls shape the tradeoff: how aggressively to skip and how far into denoising to begin.
+[Two controls shape the tradeoff](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#skip-softmax-attention):
+how aggressively to skip and how far into denoising to begin.
 Calibration also protects sensitive layers by leaving them on dense attention. Together, these
 controls turn Skip Softmax into a final tuning knob after linear-layer and attention quantization
 have established the main operating point.
@@ -103,7 +104,7 @@ attention precision, and Skip Softmax settings.
 | Accelerator | NVIDIA B200 |
 | Generated video | 1280×720, 81 frames at 16 FPS |
 | Denoising | 50 steps; guidance 5.0 for the high-noise expert and 4.0 for the low-noise expert; maximum text sequence length 512 |
-| Linear-layer paths | BF16 baseline, dynamic `FP8_BLOCK_SCALES`, dynamic `NVFP4` |
+| Linear-layer paths | BF16, dynamic `FP8_BLOCK_SCALES`, dynamic `NVFP4` |
 | Attention paths | Dense, or SAGE with INT8 Q/K, FP8 V, and Q/K/V block sizes of 1/16/1 |
 
 Classifier-free guidance runs at every step by batching the positive and negative branches
@@ -131,40 +132,11 @@ show on its own. Figure 2 compares four P1 generations. All three Skip Softmax e
 conservative star setting from the frontier: `target_sparsity=0.75` and
 `disabled_until_timestep=0.86`.
 
-<table>
-  <tr>
-    <th>Eager BF16 reference</th>
-    <th>BF16 + SAGE + Skip Softmax</th>
-  </tr>
-  <tr>
-    <td align="center">
-      <video controls preload="metadata" poster="../media/tech_blog28_video_p01_eager_bf16.jpg" width="520">
-        <source src="../media/tech_blog28_video_p01_eager_bf16.mp4" type="video/mp4">
-      </video>
-    </td>
-    <td align="center">
-      <video controls preload="metadata" poster="../media/tech_blog28_video_p01_bf16_sage_skip_softmax.jpg" width="520">
-        <source src="../media/tech_blog28_video_p01_bf16_sage_skip_softmax.mp4" type="video/mp4">
-      </video>
-    </td>
-  </tr>
-  <tr>
-    <th>FP8 blockwise + SAGE + Skip Softmax</th>
-    <th>NVFP4 + SAGE + Skip Softmax</th>
-  </tr>
-  <tr>
-    <td align="center">
-      <video controls preload="metadata" poster="../media/tech_blog28_video_p01_fp8_sage_skip_softmax.jpg" width="520">
-        <source src="../media/tech_blog28_video_p01_fp8_sage_skip_softmax.mp4" type="video/mp4">
-      </video>
-    </td>
-    <td align="center">
-      <video controls preload="metadata" poster="../media/tech_blog28_video_p01_nvfp4_sage_skip_softmax.jpg" width="520">
-        <source src="../media/tech_blog28_video_p01_nvfp4_sage_skip_softmax.mp4" type="video/mp4">
-      </video>
-    </td>
-  </tr>
-</table>
+| Eager BF16 reference | BF16 + SAGE + Skip Softmax |
+| :---: | :---: |
+| ![Eager BF16 P1 generation](../media/tech_blog28_video_p01_eager_bf16.gif) | ![BF16 with SAGE and Skip Softmax P1 generation](../media/tech_blog28_video_p01_bf16_sage_skip_softmax.gif) |
+| **FP8 blockwise + SAGE + Skip Softmax** | **NVFP4 + SAGE + Skip Softmax** |
+| ![FP8 blockwise with SAGE and Skip Softmax P1 generation](../media/tech_blog28_video_p01_fp8_sage_skip_softmax.gif) | ![NVFP4 with SAGE and Skip Softmax P1 generation](../media/tech_blog28_video_p01_nvfp4_sage_skip_softmax.gif) |
 
 <p align="center"><sub><em>Figure 2. P1 video comparison across the eager BF16 reference and three
 SAGE + Skip Softmax configurations.</em></sub></p>
