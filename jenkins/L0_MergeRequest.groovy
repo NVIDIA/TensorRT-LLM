@@ -2429,6 +2429,77 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     pipeline.parallel parallelJobs
 }
 
+// THROWAWAY PR (do not merge): verify the requests/pyyaml pins from #18033
+// actually install + import in the exact off-path CI images that a normal
+// /bot run never exercises. CPU-only, no GPU, no wheel build. The "Build And
+// Test" stage below is skipped, so the whole pipeline's pass/fail is exactly
+// this verification: green = every pin resolves + imports, red = a pin failed.
+// Each check reproduces the real image + real install command.
+def verifyDepPins(pipeline)
+{
+    def UBUNTU_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
+    def PYTHON_SLIM_IMAGE = "urm.nvidia.com/docker/python:3.12-slim"
+    def DLFW_PYTORCH_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
+
+    def checks = [:]
+
+    // ubuntu:24.04 + --break-system-packages. Covers UpdateTestDurations.groovy:153
+    // (same base image), the non-DLFW branch of L0_Test.groovy:6477, and the pyyaml
+    // sbatch install at L0_Test.groovy:2129.
+    checks["ubuntu24.04-break-system-packages"] = {
+        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(UBUNTU_IMAGE, "package"), "trt-llm", {
+            stage("[dep-pin] ubuntu:24.04") {
+                sh """
+                    set -ex
+                    apt-get update -qq
+                    apt-get install -y -qq python3-pip
+                    pip3 install --quiet --break-system-packages 'requests>=2.32.4,<3' 'pyyaml>=6.0.1,<6.0.3'
+                    python3 -c "import requests, yaml; print('OK requests', requests.__version__, '| pyyaml', yaml.__version__)"
+                """
+            }
+        })
+    }
+
+    // python:3.12-slim. Covers BuildDockerImage.groovy:851 (after `pip install
+    // --upgrade pip`), the clean-env GH label workflows (label_community_pr.yml:28,
+    // label_component_pr.yml:33), and PLC's clean venv install (TensorRT_LLM_PLC.groovy:366).
+    checks["python3.12-slim"] = {
+        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(PYTHON_SLIM_IMAGE, "package"), "trt-llm", {
+            stage("[dep-pin] python:3.12-slim") {
+                sh """
+                    set -ex
+                    pip3 install --upgrade pip
+                    pip3 install 'requests>=2.32.4,<3'
+                    python3 -c "import requests; print('OK requests', requests.__version__)"
+                    python3 -m venv /tmp/plcvenv
+                    /tmp/plcvenv/bin/pip install 'requests>=2.32.4,<3' elasticsearch==7.13.4
+                    /tmp/plcvenv/bin/python -c "import requests; print('OK plc-venv requests', requests.__version__)"
+                """
+            }
+        })
+    }
+
+    // DLFW image (nvidia/pytorch) — the one site a public GH runner cannot pull.
+    // Mirrors L0_Test.groovy:6461-6491: clear the base-image pip constraint file,
+    // set break-system-packages, then install requests.
+    checks["dlfw-nvidia-pytorch"] = {
+        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(DLFW_PYTORCH_IMAGE, "package"), "trt-llm", {
+            stage("[dep-pin] DLFW nvidia/pytorch") {
+                sh """
+                    set -ex
+                    [ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true
+                    pip3 config set global.break-system-packages true
+                    pip3 install 'requests>=2.32.4,<3'
+                    python3 -c "import requests; print('OK requests', requests.__version__)"
+                """
+            }
+        })
+    }
+
+    parallel checks
+    echo "==== ALL DEP-PIN CHECKS PASSED (throwaway PR; Build And Test is skipped) ===="
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -2498,7 +2569,20 @@ pipeline {
                 }
             }
         }
+        // THROWAWAY PR (do not merge): dep-pin verification, runs before any build.
+        stage("Verify Dep Pins") {
+            steps {
+                script {
+                    verifyDepPins(this)
+                }
+            }
+        }
+        // THROWAWAY PR (do not merge): skipped so the pipeline stops after the
+        // dep-pin verification above instead of building the wheel / running tests.
         stage("Build And Test") {
+            when {
+                expression { return false }
+            }
             steps {
                 script {
                     if (isReleaseCheckMode) {
