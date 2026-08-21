@@ -485,6 +485,18 @@ def test_rx_session_wait_complete_reports_task_outcome():
 # ---------------------------------------------------------------------------
 
 
+def _make_respond_transceiver(session, kv_slice, *, pipelined=True):
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._enable_pipelined_transfer = pipelined
+    transceiver._get_or_create_send_session = MagicMock(return_value=session)
+    transceiver._build_prefill_chunk = MagicMock(return_value=kv_slice)
+    transceiver._create_kv_slice = MagicMock(return_value=kv_slice)
+    transceiver._finalize_send = MagicMock()
+    return transceiver
+
+
 def test_pipelined_transfer_disabled_by_default():
     """pipeline_transfer_enabled reflects the configured flag."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -648,11 +660,7 @@ def test_pipelined_last_chunk_sends_and_finalizes():
         block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
     )
 
-    transceiver = MagicMock()
-    transceiver._enable_pipelined_transfer = True
-    transceiver.kv_transfer_timeout_ms = None
-    transceiver._get_or_create_send_session.return_value = session
-    transceiver._build_prefill_chunk.return_value = last_slice
+    transceiver = _make_respond_transceiver(session, last_slice)
 
     request = SimpleNamespace(
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=42),
@@ -666,9 +674,39 @@ def test_pipelined_last_chunk_sends_and_finalizes():
     KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
 
     transceiver._build_prefill_chunk.assert_called_once_with(request)
+    transceiver._create_kv_slice.assert_not_called()
     session.send.assert_called_once_with(last_slice)
     transceiver._finalize_send.assert_called_once_with(request, session)
     assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+
+def test_non_pipelined_transfer_builds_whole_slice():
+    """respond_and_send_async builds a monolithic slice when pipelining is disabled."""
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    session = MagicMock()
+    whole_slice = KVSlice(
+        is_last_slice=True,
+        block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
+    )
+    transceiver = _make_respond_transceiver(
+        session, whole_slice, pipelined=False
+    )
+    request = SimpleNamespace(
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=42),
+        request_id=42,
+        prompt_len=8,
+        py_beam_width=1,
+        py_kv_transfer_start_time=None,
+        set_kv_cache_transfer_start=lambda _ts: None,
+    )
+
+    KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
+
+    transceiver._create_kv_slice.assert_called_once_with(request)
+    transceiver._build_prefill_chunk.assert_not_called()
+    session.send.assert_called_once_with(whole_slice)
+    transceiver._finalize_send.assert_called_once_with(request, session)
 
 
 def test_pipelined_non_last_chunk_does_not_finalize():
@@ -683,11 +721,7 @@ def test_pipelined_non_last_chunk_does_not_finalize():
         block_ids_per_layer_groups=[np.array([0, 1], dtype=np.int64)],
     )
 
-    transceiver = MagicMock()
-    transceiver._enable_pipelined_transfer = True
-    transceiver.kv_transfer_timeout_ms = None
-    transceiver._get_or_create_send_session.return_value = session
-    transceiver._build_prefill_chunk.return_value = mid_slice
+    transceiver = _make_respond_transceiver(session, mid_slice)
 
     request = SimpleNamespace(
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=42),
@@ -700,6 +734,8 @@ def test_pipelined_non_last_chunk_does_not_finalize():
 
     KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
 
+    transceiver._build_prefill_chunk.assert_called_once_with(request)
+    transceiver._create_kv_slice.assert_not_called()
     session.send.assert_called_once_with(mid_slice)
     transceiver._finalize_send.assert_not_called()
 
@@ -711,11 +747,7 @@ def test_pipelined_chunk_without_a_complete_block_is_not_sent():
     session = MagicMock()
     session.kv_tasks = []
 
-    transceiver = MagicMock()
-    transceiver._enable_pipelined_transfer = True
-    transceiver.kv_transfer_timeout_ms = None
-    transceiver._get_or_create_send_session.return_value = session
-    transceiver._build_prefill_chunk.return_value = None
+    transceiver = _make_respond_transceiver(session, None)
 
     request = SimpleNamespace(
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=42),
@@ -728,6 +760,8 @@ def test_pipelined_chunk_without_a_complete_block_is_not_sent():
 
     KvCacheTransceiverV2.respond_and_send_async(transceiver, request)
 
+    transceiver._build_prefill_chunk.assert_called_once_with(request)
+    transceiver._create_kv_slice.assert_not_called()
     session.send.assert_not_called()
     transceiver._finalize_send.assert_not_called()
 
