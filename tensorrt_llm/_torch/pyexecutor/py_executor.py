@@ -7550,6 +7550,10 @@ class PyExecutor:
             cancel_pending_ids = set(self.canceled_req_ids)
             for req in scheduled_requests:
                 if req.is_context_only_request and not req.is_finished_due_to_cancellation:
+                    request_id = (req.parent_request_id
+                                  if req.is_child else req.py_request_id)
+                    if request_id in cancel_pending_ids:
+                        continue
                     if self.kv_cache_transceiver.has_retired_send_session(req):
                         # The peer registration went away with the session, so
                         # no further slice can land. Checked before the branch
@@ -7575,10 +7579,7 @@ class PyExecutor:
                         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                             req.py_kv_transfer_start_time = time.monotonic()
                     elif (self.kv_cache_transceiver.pipeline_transfer_enabled
-                          and req.state != LlmRequestState.GENERATION_COMPLETE
-                          and
-                          (req.py_request_id if not req.is_child else
-                           req.parent_request_id) not in cancel_pending_ids):
+                          and req.state != LlmRequestState.GENERATION_COMPLETE):
                         # send intermediate chunk for pipelined transfer.
                         # GENERATION_COMPLETE means an error path already failed
                         # and freed this request; _update_request_states skips

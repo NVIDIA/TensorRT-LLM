@@ -1140,3 +1140,18 @@ def test_send_kv_async_sends_intermediate_chunk_when_not_cancelled():
     PyExecutor._send_kv_async(executor, [request])
 
     executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize("is_last_chunk", [False, True])
+def test_send_kv_async_skips_pending_cancellation(is_last_chunk):
+    """A pending cancellation suppresses both intermediate and final slices."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    request = _make_send_kv_request(is_last_chunk=is_last_chunk)
+    executor = _make_send_kv_executor([request.py_request_id])
+
+    PyExecutor._send_kv_async(executor, [request])
+
+    executor.kv_cache_transceiver.respond_and_send_async.assert_not_called()
+    executor.async_transfer_manager.start_transfer.assert_not_called()
+    executor.kv_cache_manager.release_index_slot.assert_not_called()
