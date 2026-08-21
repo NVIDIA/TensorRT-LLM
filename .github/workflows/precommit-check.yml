@@ -59,3 +59,13 @@ jobs:
           else
             python3 -u scripts/release_check.py
           fi
+
+      # Informational only: list test-list entries whose parametrize IDs cannot
+      # be verified statically (runtime-computed argvalues/ids), grouped by
+      # reason, so they can be swept without rerunning the analysis locally. The
+      # pre-commit step above remains the gate for actual validation errors;
+      # this step never fails the job.
+      - name: Report unverifiable test-list param IDs
+        if: always()
+        continue-on-error: true
+        run: python3 -u scripts/check_test_list.py --validate --report-unverifiable
