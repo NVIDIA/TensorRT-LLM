@@ -72,8 +72,11 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
         self.assertIn("parallelJobs.failFast = effectiveFailFast", L0_PARENT)
         self.assertIn("collectTestResults(this, testFilter, globalVars)", L0_PARENT)
+
+    def test_docs_skip_junit_after_a_successful_build(self) -> None:
         self.assertIn(
-            'junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")',
+            'cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, '
+            "isFinalAttempt, retryContext)",
             L0_TEST,
         )
 
