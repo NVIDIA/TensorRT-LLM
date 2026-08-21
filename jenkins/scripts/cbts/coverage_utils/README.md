@@ -9,6 +9,9 @@ Capture uses `sys.monitoring` `PY_START` (Python 3.12+): each function a test en
 then that code object is disabled until the next test — so overhead scales with functions entered,
 not lines executed (far cheaper than line tracing).
 
+`COLLECTION.md` summarises what the data model is and, importantly, what it does not record;
+`../coverage_selection/SELECTION.md` covers how the consumer side uses it.
+
 ## Files
 
 | File | Role |
@@ -39,6 +42,8 @@ Non-CBTS stages get an empty `.coveragerc` and run uninstrumented.
 - **Integration tests**: the outer pytest carries `-p cbts_plugin`, so each test-db entry (one pytest item) is its own context.
 - **Unit tests** (`test_unittests_v2[entry]`): the inner pytest carries no plugin, so the whole batch runs under the one inherited `CBTS_TEST_ID` context = the test-db entry. This matches CBTS's selection granularity (entry level).
 - `co_qualname` gives `Class.method`, so results roll up to function → class → file. Comprehension / generator / lambda frames are skipped.
+- **Closures are skipped too**: any frame whose qualname contains `<locals>` is dropped, so a decorator's `wrapper` or a registered callback leaves no row however often it runs. The consumer side compensates by widening such a change to file level; see `COLLECTION.md` §5.1.
+- **A pool worker's import phase is not captured**: activation is deferred until `tensorrt_llm` has imported, so module and class bodies get no rows there. See `COLLECTION.md` §5.2.
 
 ## Output
 

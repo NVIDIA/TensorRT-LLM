@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,6 +25,64 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tests" / "integration"))
 
 from defs.perf import test_perf_sanity as perf_sanity  # noqa: E402
+
+
+def test_run_benchmark_with_log_returns_successful_output(tmp_path: Path) -> None:
+    benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
+    command = [sys.executable, "-c", "print('benchmark succeeded')"]
+
+    output = perf_sanity._run_benchmark_with_log(command, {}, str(benchmark_log))
+
+    assert output == "benchmark succeeded\n"
+    assert benchmark_log.read_text(encoding="utf-8") == output
+
+
+def test_run_benchmark_with_log_preserves_failed_output(tmp_path: Path) -> None:
+    benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "print('benchmark stdout'); "
+            "print('benchmark stderr', file=sys.stderr); "
+            "sys.exit(7)"
+        ),
+    ]
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        perf_sanity._run_benchmark_with_log(command, {}, str(benchmark_log))
+
+    expected_output = "benchmark stdout\nbenchmark stderr\n"
+    assert exc_info.value.returncode == 7
+    assert exc_info.value.output.decode() == expected_output
+    assert benchmark_log.read_text(encoding="utf-8") == expected_output
+
+
+def test_benchmark_log_is_included_in_report_logs(tmp_path: Path) -> None:
+    benchmark_log = tmp_path / "trtllm-benchmark.0.0.log"
+    benchmark_log.touch()
+    aggr_commands = perf_sanity.AggrTestCmds(
+        server_cmds=[[]],
+        client_cmds={0: [[]]},
+        timeout=1,
+        output_dir=str(tmp_path),
+        test_output_dir=str(tmp_path),
+    )
+    disagg_commands = perf_sanity.DisaggTestCmds(
+        server_cmds=[],
+        client_cmds={},
+        timeout=1,
+        hostname="localhost",
+        disagg_serving_type="BENCHMARK",
+        num_ctx_servers=0,
+        num_gen_servers=0,
+        output_dir=str(tmp_path),
+        test_output_dir=str(tmp_path),
+    )
+
+    assert str(benchmark_log) in aggr_commands.get_server_logs(0)
+    assert str(benchmark_log) in disagg_commands.get_server_logs(0)
 
 
 def test_sentinel_timeout_falls_back_to_current_gen_logs(

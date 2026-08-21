@@ -5,7 +5,9 @@ build
 colored
 cuda-python>=13
 # FlowMatchEuler respects a supplied generator starting in 0.39.0 (huggingface/diffusers#13678).
-diffusers>=0.39.0
+# Upper bound: 0.40.0 requires huggingface-hub>=1.23.0, which requires click>=8.4.2
+# and conflicts with the click<8.4 pin below. Lift together with that pin.
+diffusers>=0.39.0,<0.40
 ftfy
 lark
 lazy_loader~=0.5
@@ -76,17 +78,17 @@ xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeplo
 tiktoken
 blobfile
 openai-harmony==0.0.4
-nvidia-cutlass-dsl[cu13]==4.5.0; python_version >= "3.10"
+nvidia-cutlass-dsl[cu13]==4.6.1; python_version >= "3.10" # required by Blackwell CuTe DSL kernels
 nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
-quack-kernels>=0.2.10; python_version >= "3.10" # required for MinimaxM3 MSA
+quack-kernels==0.6.2; python_version >= "3.10" # required for MinimaxM3 MSA and FlashAttention 4; pins CUTLASS DSL 4.6.1
 jinja2 # required for MinimaxM3 MSA
 plotly
 numexpr
 partial_json_parser
 mcp<2.0.0 # 2.0.0 removed mcp.server.fastmcp; scaffolding still uses the 1.x APIs
-apache-tvm-ffi==0.1.6 # used for reduce nvidia-cutlass-dsl host overhead
+apache-tvm-ffi==0.1.13.post2 # required by CUTLASS DSL 4.6.1's TVM-FFI provider
 torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
-flash-attn-4==4.0.0b11
+flash-attn-4==4.0.0b19
 mistral-common>=1.10.0
 torchao>=0.14.1,<0.16.0
 cuda-core
