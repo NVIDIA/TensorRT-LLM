@@ -28,7 +28,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 

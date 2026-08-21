@@ -706,7 +706,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
       2. A sparse GQA attention runs only over the selected blocks.
 
     At runtime one of the MiniMax-M3 sparse attention backends under
-    tensorrt_llm._torch.attention_backend.sparse.minimax_m3 is selected. The
+    tensorrt_llm._torch.attention.backends.sparse.minimax_m3 is selected. The
     chosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a
     paged side index-K cache of shape [num_slots, 1, sparse_index_dim] parallel
     to the main K/V cache. The M3 checkpoint sets disable_index_value=True on
@@ -783,7 +783,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         return self.sparse_block_size
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import \
             MiniMaxM3SparseParams
 
         return MiniMaxM3SparseParams(
@@ -805,7 +805,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default; num_key_value_heads falls back to num_attention_heads. Setting
         them on the config lets tests skip building a pretrained_config.
         """
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import \
             MiniMaxM3SparseMetadataParams
 
         pretrained_config = kwargs.get("pretrained_config", None)
@@ -853,7 +853,7 @@ class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         return self.page_size
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.rocket import \
+        from tensorrt_llm._torch.attention.backends.sparse.rocket import \
             RocketKVParams
 
         def _value(name: str, default):
@@ -871,7 +871,7 @@ class RocketSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         )
 
     def to_sparse_metadata_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.rocket import \
+        from tensorrt_llm._torch.attention.backends.sparse.rocket import \
             RocketKVMetadataParams
 
         def _value(name: str, default):
@@ -1047,7 +1047,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         return is_full
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.dsa import DSAParams
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAParams
 
         pretrained_config = kwargs.get("pretrained_config", None)
 
@@ -1078,7 +1078,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         )
 
     def to_sparse_metadata_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.dsa import \
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import \
             DSAMetadataParams
 
         pretrained_config = kwargs.get("pretrained_config", None)
@@ -1165,7 +1165,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         return False
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import \
             DeepSeekV4Params
 
         pretrained_config = kwargs.get("pretrained_config", None)
@@ -1195,7 +1195,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         )
 
     def to_sparse_metadata_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import \
             DeepSeekV4MetadataParams
 
         pretrained_config = kwargs.get("pretrained_config", None)
@@ -1252,7 +1252,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     def to_sparse_params(self, **kwargs):
         import fnmatch
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             SkipSoftmaxParams, SkipSoftmaxScheduler,
             skip_softmax_ignore_from_ckpt_sparse_attention_config,
             skip_softmax_target_sparsity_from_ckpt_sparse_attention_config)
@@ -5315,7 +5315,7 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Attention backend to use.",
         status="beta",
         # Recognized values mirror get_attention_backend dispatch in
-        # tensorrt_llm/_torch/attention_backend/utils.py.
+        # tensorrt_llm/_torch/attention/backends/utils.py.
         telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER",
                                              "FLASHINFER_STAR_ATTENTION"))
 

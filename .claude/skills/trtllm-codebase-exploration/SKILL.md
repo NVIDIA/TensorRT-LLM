@@ -31,13 +31,13 @@ Before adding code to a class, understand its full structure:
 
 ```bash
 # List all methods (not just forward*)
-grep -n "def " tensorrt_llm/_torch/modules/attention.py | head -50
+grep -n "def " tensorrt_llm/_torch/attention/attention.py | head -50
 
 # List all attributes set in __init__
-grep -n "self\." tensorrt_llm/_torch/modules/attention.py | grep "__init__" -A 200 | head -80
+grep -n "self\." tensorrt_llm/_torch/attention/attention.py | grep "__init__" -A 200 | head -80
 
 # Find the class hierarchy
-grep -n "class MLA\|class Attention\|class TrtllmAttention" tensorrt_llm/_torch/modules/attention.py
+grep -n "class MLA\|class Attention\|class TrtllmAttention" tensorrt_llm/_torch/attention/attention.py
 ```
 
 ### Step 2: Trace Existing Forward Methods
@@ -46,7 +46,7 @@ Read EVERY forward method in the class. Understand what each one does, what inpu
 
 ```bash
 # Find all forward methods
-grep -n "def forward" tensorrt_llm/_torch/modules/attention.py
+grep -n "def forward" tensorrt_llm/_torch/attention/attention.py
 
 # For each one, read the full implementation (not just the signature)
 ```
@@ -77,7 +77,7 @@ Many operations you might implement manually are already handled by fused C++ ke
 
 ```bash
 # Find what the attention kernel handles internally
-grep -rn "latent_cache\|rope.*fuse\|rope_fusion" tensorrt_llm/_torch/attention_backend/
+grep -rn "latent_cache\|rope.*fuse\|rope_fusion" tensorrt_llm/_torch/attention/backends/
 ```
 
 **Common surprise**: When `rope_fusion=True` (`apply_rotary_emb=False`), the fused attention kernel handles RoPE internally via `latent_cache`. Writing custom RoPE code in Python is unnecessary and will double-apply RoPE.
@@ -88,7 +88,7 @@ Existing assertions may need updating when you add a new code path. Don't work a
 
 ```bash
 # Find assertions in the class
-grep -n "assert " tensorrt_llm/_torch/modules/attention.py
+grep -n "assert " tensorrt_llm/_torch/attention/attention.py
 ```
 
 **Example**: DSA models had `assert self.mha is None`. When adding short-seq MHA (which creates `self.mha` for DSA models), the assertion was changed to `assert self.mqa is not None` — the actual invariant being tested.
@@ -113,7 +113,7 @@ After identifying a method to reuse, understand what it does **NOT** handle:
 
 ```bash
 # Find all callers of the method to see its dispatch context
-grep -rn "forward_context_default\|forward_context(" tensorrt_llm/_torch/modules/attention.py
+grep -rn "forward_context_default\|forward_context(" tensorrt_llm/_torch/attention/attention.py
 
 # Look for the dispatcher that routes to this method
 # Often named similarly but without a suffix (e.g., forward_context dispatches to forward_context_default)
@@ -152,7 +152,7 @@ grep -rn "forward_context_default\|forward_context(" tensorrt_llm/_torch/modules
 
 ```bash
 # Find what calls forward_context_default to discover the dispatch chain
-grep -n "forward_context_default" tensorrt_llm/_torch/modules/attention.py
+grep -n "forward_context_default" tensorrt_llm/_torch/attention/attention.py
 ```
 
 ### Pattern: "Does a Utility Already Exist?"
@@ -169,7 +169,7 @@ grep -n "forward_context_default" tensorrt_llm/_torch/modules/attention.py
 | Searching only for the exact function name | Miss equivalent implementations | Search for the *concept* (e.g., "attention", "rope", "expand kv") |
 | Assuming assertions are immutable | Work around them with hacks (separate attributes) | Question whether the assertion's intent still applies |
 | Not reading the fused kernel's capabilities | Reimplement what it already does | Check what `latent_cache`, `rope_fusion` etc. control |
-| Only reading Python code | Miss C++ implementations called via bindings | Check `tensorrt_llm/_torch/attention_backend/` for native kernels |
+| Only reading Python code | Miss C++ implementations called via bindings | Check `tensorrt_llm/_torch/attention/backends/` for native kernels |
 | Calling a method directly instead of through its dispatcher | Miss edge cases (cached KV, chunked prefill, SM-version gating) | Search for callers of the method to find the dispatch chain |
 | Assuming hardware-uniform numerical behavior | Silent accuracy degradation on specific SM versions | Check for `get_sm_version()` guards near the call site; test on multiple hardware |
 
@@ -177,10 +177,10 @@ grep -n "forward_context_default" tensorrt_llm/_torch/modules/attention.py
 
 | Area | Key files to read |
 |------|-------------------|
-| Attention modules | `tensorrt_llm/_torch/modules/attention.py` |
-| Attention backends | `tensorrt_llm/_torch/attention_backend/` (trtllm_attention.py, sparse/) |
+| Attention modules | `tensorrt_llm/_torch/attention/attention.py` |
+| Attention backends | `tensorrt_llm/_torch/attention/backends/` (trtllm_attention.py, sparse/) |
 | Model definitions | `tensorrt_llm/_torch/models/modeling_*.py` |
 | Utilities | `tensorrt_llm/_torch/utils.py` |
-| RoPE | `tensorrt_llm/_torch/modules/rotary_embedding.py` |
+| RoPE | `tensorrt_llm/_torch/attention/rotary_embedding.py` |
 | Test fixtures | `tests/unittest/_torch/attention/` |
 | Weight loading | `tensorrt_llm/_torch/models/modeling_deepseekv3.py` (search `load_`) |

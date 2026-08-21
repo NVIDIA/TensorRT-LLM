@@ -5,16 +5,16 @@ import torch
 from torch import nn
 from transformers import Gemma3TextConfig
 
+from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
-from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
-                                           PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.backends import AttentionMetadata, FlashInferAttentionMetadata
+from ..attention.backends.interface import (AttentionMask, CustomAttentionMask,
+                                            PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer

@@ -11,7 +11,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
 )

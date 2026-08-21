@@ -13,7 +13,7 @@ import torch
 import tensorrt_llm._torch.model_config
 import tensorrt_llm._torch.pyexecutor.config_utils
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig

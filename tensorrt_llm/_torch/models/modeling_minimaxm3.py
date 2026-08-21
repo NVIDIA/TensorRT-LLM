@@ -34,21 +34,21 @@ from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
     RopeParams,
 )
-from ..attention_backend.sparse.minimax_m3 import (
+from ..attention.backends.sparse.minimax_m3 import (
     MiniMaxM3MsaSparseAttention,
     MiniMaxM3SparseRuntimeBackend,
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..attention_backend.sparse.params import SparseBackendForwardArgs
+from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
@@ -1042,7 +1042,7 @@ class MiniMaxM3Attention(Attention):
         :class:`Attention` forward unchanged. Sparse layers (3+) drive
         the two-step block-sparse attention (index attention + top-k
         block selection + sparse GQA) implemented in
-        :mod:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3`.
+        :mod:`tensorrt_llm._torch.attention.backends.sparse.minimax_m3`.
 
         The sparse forward expects ``attn_metadata.kv_cache_manager`` to
         be a :class:`MiniMaxM3KVCacheManagerV2` (the cache manager

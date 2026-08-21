@@ -17,25 +17,26 @@ from utils.util import skip_pre_blackwell
 
 # from utils.util import default_dtype
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.compressor import Compressor
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     _fused_q_rope_specs,
     _is_fused_kv_norm_enabled,
     _is_fused_prologue_active,
     _is_fused_q_fp8_quant_enabled,
 )
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -51,7 +52,6 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     _resolve_enable_fused_hc,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -1064,7 +1064,7 @@ def _make_mla(
         rope=RopeParams(dim=QK_ROPE_HEAD_DIM, max_positions=8192),
     )
     with patch(
-        "tensorrt_llm._torch.modules.mla.create_attention",
+        "tensorrt_llm._torch.attention.mla.create_attention",
         side_effect=lambda *a, **kw: _FakeAttention(has_fp8_kv_cache),
     ):
         mla = MLA(

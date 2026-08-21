@@ -42,7 +42,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,

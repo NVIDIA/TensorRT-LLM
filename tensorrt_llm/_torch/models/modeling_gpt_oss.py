@@ -12,13 +12,13 @@ from transformers import GptOssConfig
 from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 

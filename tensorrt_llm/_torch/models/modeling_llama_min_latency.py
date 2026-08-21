@@ -26,8 +26,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 
 from ...models.modeling_utils import QuantConfig
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PredefinedAttentionMask
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
 from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  FusedMoEQuantScalesFP8,

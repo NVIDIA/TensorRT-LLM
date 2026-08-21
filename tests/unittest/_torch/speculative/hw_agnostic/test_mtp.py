@@ -9,7 +9,7 @@ from parameterized import parameterized
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache

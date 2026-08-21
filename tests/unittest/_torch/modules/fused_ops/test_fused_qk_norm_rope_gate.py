@@ -16,7 +16,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.attention import Attention
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
     fused_qkv_gemma_rmsnorm_rope_gate,
     fused_sigmoid_mul_inplace,

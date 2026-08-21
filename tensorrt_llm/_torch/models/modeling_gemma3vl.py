@@ -17,7 +17,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm

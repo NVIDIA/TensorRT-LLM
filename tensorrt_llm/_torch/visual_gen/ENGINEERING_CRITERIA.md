@@ -109,7 +109,7 @@ when to reach for which knob — material that survives releases.
    is the cautionary tale.
 5. **Developer guides co-locate with code.** Long-form subsystem
    guidance lives next to the code it governs (precedent:
-   [`ATTENTION_DEVELOPER_GUIDE.md`](../modules/ATTENTION_DEVELOPER_GUIDE.md),
+   [`ATTENTION_DEVELOPER_GUIDE.md`](../attention/ATTENTION_DEVELOPER_GUIDE.md),
    [`MOE_DEVELOPER_GUIDE.md`](../modules/fused_moe/MOE_DEVELOPER_GUIDE.md)).
 
 ## 5. Tests

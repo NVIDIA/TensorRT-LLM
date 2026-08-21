@@ -32,4 +32,4 @@ measured: []
 - **Accuracy risk:** lossless for bf16/non-quant reuse; with FP8 KV reuse (#4535) the stored latent is FP8 — lossy in the same way FP8 KV cache already is, not an additional reuse-specific loss.
 - **Verify:** prefill throughput / TTFT + KV-cache-hit rate on a repeated-prefix trace; GPU memory headroom. For FP8 KV reuse run an accuracy/parity check vs bf16 KV.
 - **Rollback:** `KvCacheConfig(enable_block_reuse=False)`. Trigger: E2E regression on a low-reuse workload, memory pressure shrinking batch/KV, or accuracy drift with FP8 KV.
-- **Prior art:** PRs #3571, #4535, #4869. Files: `cpp/.../kernels/mlaKernels.cu` (`invokeMLARopeAppendPagedKVAssignQ`), `thop/mlaPreprocessOp.cpp`, `_torch/attention_backend/trtllm.py` (`prepare_paged_context_mla`), `pyexecutor/py_executor_creator.py` (SM/quant gating).
+- **Prior art:** PRs #3571, #4535, #4869. Files: `cpp/.../kernels/mlaKernels.cu` (`invokeMLARopeAppendPagedKVAssignQ`), `thop/mlaPreprocessOp.cpp`, `_torch/attention/backends/trtllm.py` (`prepare_paged_context_mla`), `pyexecutor/py_executor_creator.py` (SM/quant gating).
