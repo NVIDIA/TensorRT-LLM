@@ -34,6 +34,7 @@ try:
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+        COSMOS3_EDGE_BACKBONE_TYPE,
         Cosmos3VFMTransformer,
     )
 
@@ -47,6 +48,9 @@ try:
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
+    # Module-level configs below reference this; every test skips in this
+    # branch, but the definitions still have to import cleanly.
+    COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
@@ -78,7 +82,7 @@ _COSMOS3_TEST_CONFIG = dict(
     num_attention_heads=8,
     num_key_value_heads=4,
     head_dim=64,
-    rope_scaling={"rope_type": "default", "mrope_section": [16, 12, 12]},
+    rope_scaling={"rope_type": "default", "mrope_section": [12, 10, 10]},
     rms_norm_eps=1e-6,
     vocab_size=1024,
     rope_theta=1_000_000.0,
@@ -91,13 +95,37 @@ _COSMOS3_TEST_CONFIG = dict(
 
 # attn2d needs an LSE-capable backend (FA4); FA4's CUTE kernels run with head_dim=128.
 # Same architecture as _COSMOS3_TEST_CONFIG otherwise (heads still divisible by
-# Ulysses=2 for the attn2d+ulysses case). mrope_section is unchanged: the interleave
-# slices clip to head_dim//2 (=64 here), so [16, 12, 12] stays valid.
+# Ulysses=2 for the attn2d+ulysses case). mrope_section must sum to head_dim//2
+# (=64 here), so this config uses the real checkpoint sections.
 _COSMOS3_FA4_CONFIG = dict(
     _COSMOS3_TEST_CONFIG,
     head_dim=128,
     hidden_size=8 * 128,
     intermediate_size=1024,
+    rope_scaling={"rope_type": "default", "mrope_section": [24, 20, 20]},
+)
+
+# Edge (Nemotron-dense) recipe. The point of covering it here is the MLP: the
+# Qwen recipe builds a GatedMLP whose gate_proj/up_proj the loader fuses into
+# gate_up_proj, while Edge builds a plain relu² MLP with no fusion — a
+# different column/row sharding path that the configs above never reach. The
+# latent-geometry values are the recipe's validated invariants and cannot
+# shrink; only the backbone dimensions do.
+_COSMOS3_EDGE_CONFIG = dict(
+    _COSMOS3_TEST_CONFIG,
+    backbone_type=COSMOS3_EDGE_BACKBONE_TYPE,
+    hidden_act="relu2",
+    use_und_k_norm_for_gen=True,
+    attention_bias=False,
+    sound_gen=False,
+    sound_dim=None,
+    latent_channel=48,
+    latent_patch_size=2,
+    patch_latent_dim=192,
+    rope_axes_dim=[12, 10, 10],
+    qk_norm_for_text=False,
+    rms_norm_eps=1e-5,
+    temporal_compression_factor=4,
 )
 
 # Video: [B, C, T, H, W]. patch_size=2 → seq_len = T * (H/2) * (W/2).
@@ -379,8 +407,16 @@ def _cosmos3_inputs(
     return hidden_states, timestep, text_ids, text_mask, (_LATENT_T, _LATENT_H, _LATENT_W)
 
 
-def _forward(model: Cosmos3VFMTransformer, device: torch.device, text_seed: int) -> torch.Tensor:
-    channels = _COSMOS3_TEST_CONFIG["latent_channel"]
+def _forward(
+    model: Cosmos3VFMTransformer,
+    device: torch.device,
+    text_seed: int,
+    pretrained_dict: dict = None,
+) -> torch.Tensor:
+    # Latent channel count is a recipe invariant, not a free knob: the Edge
+    # recipe validates 48 where the Qwen test config uses 4.
+    config = pretrained_dict if pretrained_dict is not None else _COSMOS3_TEST_CONFIG
+    channels = config["latent_channel"]
     hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
         device, channels=channels, text_seed=text_seed
     )
@@ -507,6 +543,36 @@ def _logic_cosmos3_tp_vs_single_gpu(rank, world_size):
         )
 
     _assert_parity(tp_out, ref_out, msg=f"Rank {rank}: TP output differs from single-GPU reference")
+
+
+def _logic_cosmos3_edge_tp_vs_single_gpu(rank, world_size):
+    ref_model, tp_model, _, device = _build_ref_and_parallel(
+        tp_size=world_size, pretrained_dict=_COSMOS3_EDGE_CONFIG
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=world_size, ulysses_size=1, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed, _COSMOS3_EDGE_CONFIG)
+    tp_out = _forward(tp_model, device, text_seed, _COSMOS3_EDGE_CONFIG)
+
+    _assert_parity(
+        tp_out, ref_out, msg=f"Rank {rank}: Edge TP output differs from single-GPU reference"
+    )
+
+
+def _logic_cosmos3_edge_ulysses_vs_single_gpu(rank, world_size):
+    ref_model, ulysses_model, _, device = _build_ref_and_parallel(
+        ulysses_size=world_size, pretrained_dict=_COSMOS3_EDGE_CONFIG
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed, _COSMOS3_EDGE_CONFIG)
+    ulysses_out = _forward(ulysses_model, device, text_seed, _COSMOS3_EDGE_CONFIG)
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: Edge Ulysses output differs from single-GPU reference",
+    )
 
 
 def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
@@ -704,6 +770,18 @@ class TestCosmos3TransformerParallel:
     def test_ulysses2_vs_single_gpu(self):
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
+
+    def test_edge_tp2_vs_single_gpu(self):
+        """Edge's non-gated relu² MLP shards without the gate_up fusion the
+        Qwen recipe uses, so column/row splitting takes a different path."""
+        self._skip_if_unavailable()
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_edge_tp_vs_single_gpu)
+
+    def test_edge_ulysses2_vs_single_gpu(self):
+        """Edge under sequence sharding: no und Q/K norm, and the reasoner's
+        keys are normed only where the generator consumes them."""
+        self._skip_if_unavailable()
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_edge_ulysses_vs_single_gpu)
 
     def test_ulysses2_audio_vs_single_gpu(self):
         """Ulysses parity with the audio modality on: video + audio tokens are

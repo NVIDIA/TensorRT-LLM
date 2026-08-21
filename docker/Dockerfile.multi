@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
@@ -52,11 +66,13 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
+# constraints.txt is also consumed as a pip constraint file, which forbids extras.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy wandb || true && \
+    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+        nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 numpy wandb || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
-    pip3 install -r /tmp/constraints.txt && \
+    pip3 install -r /tmp/constraints.txt "nvidia-cutlass-dsl[cu13]==4.6.1" && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
@@ -110,7 +126,7 @@ COPY scripts scripts
 COPY tensorrt_llm tensorrt_llm
 COPY triton_kernels triton_kernels
 COPY 3rdparty 3rdparty
-COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt README.md ./
+COPY setup.py requirements.txt requirements-dev.txt requirements-grpc-smg.txt constraints.txt LICENSE README.md ./
 
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel

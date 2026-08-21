@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from PIL.Image import Image
@@ -15,12 +15,12 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -1133,6 +1133,13 @@ class LlamaModel(DecoderModel):
 
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
 
     def __init__(
         self,

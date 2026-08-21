@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import os
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
@@ -40,6 +42,249 @@ _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
     "Gemma4ForCausalLM",
     "Gemma4ForConditionalGeneration",
 )
+
+# MTP structure fields copied from a separate MTP-head checkpoint onto the
+# target pretrained config when ``speculative_model`` is set.
+# Prefer writable HF fields: NemotronHConfig exposes mtp_hybrid_override_pattern
+# as a read-only property derived from mtp_layers_block_type.
+_MTP_STRUCTURE_FIELDS_FROM_DRAFT = (
+    "num_nextn_predict_layers",
+    "mtp_layers_block_type",
+    "mtp_block_configs",
+)
+
+_MTP_PATTERN_TO_LAYER = {
+    "M": "mamba",
+    "E": "moe",
+    "*": "attention",
+    "-": "mlp",
+}
+
+
+def _set_pretrained_config_attr(model_config,
+                                name: str,
+                                value,
+                                *,
+                                required: bool = True) -> bool:
+    """Set a config field, tolerating read-only properties / strict dataclasses.
+
+    Each write is verified by reading the value back: a class-level property
+    shadows ``__dict__``, so writing through ``vars()`` can appear to succeed
+    while the config keeps reporting its old value. When ``required`` is False,
+    failures are logged and ignored (used for optional fields like
+    ``mtp_block_configs``).
+    """
+    writes = (
+        lambda: setattr(model_config, name, value),
+        lambda: vars(model_config).__setitem__(name, value),
+    )
+    for write in writes:
+        try:
+            write()
+        except (TypeError, AttributeError):
+            continue
+        if getattr(model_config, name, None) == value:
+            return True
+
+    message = (f"Unable to set MTP config field '{name}' on "
+               f"{type(model_config).__name__}")
+    if required:
+        raise AttributeError(message)
+    logger.warning("%s; keeping the target checkpoint's value.", message)
+    return False
+
+
+def _pattern_to_mtp_layers_block_type(pattern: str) -> list:
+    try:
+        return [_MTP_PATTERN_TO_LAYER[char] for char in pattern]
+    except KeyError as exc:
+        raise ValueError(
+            f"Invalid mtp_hybrid_override_pattern {pattern!r}: "
+            f"expected characters in {sorted(_MTP_PATTERN_TO_LAYER)}") from exc
+
+
+def _is_mtp_checkpoint_weight_key(key: str) -> bool:
+    """Return True for checkpoint keys that belong to MTP heads."""
+    return key.startswith("mtp.") or key.startswith("mtp/")
+
+
+def filter_mtp_checkpoint_weights(weights: dict) -> dict:
+    """Drop ``mtp.*`` keys so embedded MTP heads do not override a separate MTP checkpoint."""
+    return {
+        k: v
+        for k, v in weights.items() if not _is_mtp_checkpoint_weight_key(k)
+    }
+
+
+def select_mtp_checkpoint_weights(weights: dict) -> dict:
+    """Keep only ``mtp.*`` keys from a (possibly full) checkpoint dict.
+
+    Separate MTP-head checkpoints may still ship unrelated tensors (or a full
+    target copy). Loading those into the one-engine model would overwrite the
+    already-loaded target backbone and corrupt generation.
+    """
+    return {
+        k: v
+        for k, v in weights.items() if _is_mtp_checkpoint_weight_key(k)
+    }
+
+
+def remap_preprocessed_mtp_weights_for_draft_model(
+    weights: dict,
+    num_hidden_layers: int,
+    num_mtp_layers: int,
+) -> dict:
+    """Map ``model.layers.{{N[+h]}}.*`` keys onto ``mtp_layers.{{h}}.*``.
+
+    Nemotron preprocess rewrites ``mtp.layers.*`` onto the target module path
+    ``model.layers.{{num_hidden_layers}}.*``. For a strict draft-only load we
+    re-home those keys under ``draft_model.mtp_layers``.
+    """
+    remapped: dict = {}
+    unused: list[str] = []
+    for key, value in weights.items():
+        matched = False
+        for head_idx in range(num_mtp_layers):
+            prefix = f"model.layers.{num_hidden_layers + head_idx}."
+            if key.startswith(prefix):
+                remapped[f"mtp_layers.{head_idx}.{key[len(prefix):]}"] = value
+                matched = True
+                break
+        if not matched:
+            unused.append(key)
+    if unused:
+        sample = ", ".join(unused[:8])
+        more = "" if len(unused) <= 8 else f" (+{len(unused) - 8} more)"
+        raise ValueError(
+            "After MTP preprocess, expected keys under "
+            f"'model.layers.{{{num_hidden_layers}+h}}.*' for "
+            f"h in [0, {num_mtp_layers}), but found unmatched keys: "
+            f"{sample}{more}")
+    return remapped
+
+
+def skip_modules_for_separate_mtp_checkpoint(weights: dict) -> list[str]:
+    """Modules to skip when loading a separate MTP checkpoint into draft_model.
+
+    ``shared_head`` is optional across MTP architectures:
+    - Nemotron ``mtp.*`` checkpoints omit it (final_layernorm on the last
+      sublayer is the trained norm; ``shared_head`` only wraps ``lm_head``).
+    - DeepSeek / Qwen / Exaone / Step3 ship ``shared_head.norm`` (and Step3
+      also ships a dedicated ``shared_head.output``).
+
+    Skip only when the remapped weight dict has no ``shared_head`` keys so
+    strict loading stays architecture-agnostic.
+    """
+    skip: list[str] = []
+    if not any("shared_head" in key for key in weights):
+        skip.append("shared_head")
+    return skip
+
+
+def uses_mtp_head_checkpoint(spec_config) -> bool:
+    """True when `speculative_model` contains replacement MTP heads."""
+    if spec_config is None:
+        return False
+    return spec_config.uses_replacement_heads
+
+
+def _refers_to_same_checkpoint(lhs, rhs) -> bool:
+    """True when two model references point at the same checkpoint."""
+    if lhs is None or rhs is None:
+        return False
+    if str(lhs) == str(rhs):
+        return True
+    try:
+        return os.path.samefile(str(lhs), str(rhs))
+    except OSError:
+        # At least one side is not an existing local directory (e.g. a Hub
+        # model id), so string equality above was the only comparison.
+        return False
+
+
+def resolve_mtp_checkpoint_source(spec_config, checkpoint_dir) -> None:
+    """Keep one-model MTP on the target checkpoint when both paths match.
+
+    Before separate MTP checkpoints were supported, ``speculative_model`` was
+    ignored for one-model MTP and the heads always came from the target
+    weights. Configs that point ``speculative_model`` at the target checkpoint
+    keep that behavior instead of switching to the separate-heads load path,
+    which the target checkpoint's key layout may not even satisfy.
+    """
+    from tensorrt_llm.llmapi.llm_args import (MTPDecodingConfig,
+                                              _MTPDraftCheckpointType)
+    if not isinstance(spec_config, MTPDecodingConfig):
+        return
+    if spec_config.speculative_model is None:
+        return
+    if not _refers_to_same_checkpoint(spec_config.speculative_model,
+                                      checkpoint_dir):
+        return
+    if (spec_config._mtp_draft_checkpoint_type
+            != _MTPDraftCheckpointType.TARGET):
+        logger.info(
+            "speculative_model points at the target checkpoint "
+            f"({checkpoint_dir}); loading MTP heads from the target weights.")
+        spec_config._mtp_draft_checkpoint_type = _MTPDraftCheckpointType.TARGET
+
+
+def _load_speculative_model_config_dict(spec_config) -> Optional[dict]:
+    """Read ``config.json`` from ``spec_config.speculative_model``, if present."""
+    draft_dir = getattr(spec_config, "speculative_model", None)
+    if not draft_dir:
+        return None
+    try:
+        cfg_path = os.path.join(str(draft_dir), "config.json")
+        if not os.path.isfile(cfg_path):
+            return None
+        with open(cfg_path) as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning(
+            f"Unable to read speculative_model config from {draft_dir}: {exc}")
+        return None
+
+
+def _merge_mtp_fields_from_speculative_model(spec_config,
+                                             model_config) -> Optional[int]:
+    """Overlay MTP structure fields from ``speculative_model`` onto ``model_config``.
+
+    Returns the MTP layer count from the draft checkpoint when available.
+    """
+    draft_cfg = _load_speculative_model_config_dict(spec_config)
+    if not draft_cfg:
+        return None
+
+    draft_nextn = draft_cfg.get("num_nextn_predict_layers")
+    if draft_nextn is None:
+        draft_nextn = draft_cfg.get("mtp_num_hidden_layers")
+
+    for field in _MTP_STRUCTURE_FIELDS_FROM_DRAFT:
+        if field in draft_cfg and draft_cfg[field] is not None:
+            _set_pretrained_config_attr(
+                model_config,
+                field,
+                draft_cfg[field],
+                required=(field != "mtp_block_configs"),
+            )
+
+    # HF NemotronHConfig: mtp_hybrid_override_pattern is a read-only property
+    # derived from mtp_layers_block_type. Convert the pattern when the draft
+    # checkpoint only provides the legacy string form.
+    if (draft_cfg.get("mtp_layers_block_type") is None
+            and draft_cfg.get("mtp_hybrid_override_pattern") is not None):
+        _set_pretrained_config_attr(
+            model_config,
+            "mtp_layers_block_type",
+            _pattern_to_mtp_layers_block_type(
+                draft_cfg["mtp_hybrid_override_pattern"]),
+        )
+
+    if draft_nextn is not None:
+        _set_pretrained_config_attr(model_config, "num_nextn_predict_layers",
+                                    draft_nextn)
+        return int(draft_nextn)
+    return None
 
 
 def _is_effective_dynamic_tree(spec_config) -> bool:
@@ -88,6 +333,29 @@ def get_spec_metadata(spec_config,
                       is_draft_model=False,
                       max_seq_len=262144,
                       num_seq_slots=None):
+    metadata = _build_spec_metadata(spec_config,
+                                    model_config,
+                                    max_num_requests,
+                                    max_num_tokens,
+                                    spec_resource_manager=spec_resource_manager,
+                                    is_draft_model=is_draft_model,
+                                    max_seq_len=max_seq_len,
+                                    num_seq_slots=num_seq_slots)
+    # Set here rather than in each branch below: every one-model mode needs it and
+    # the per-mode constructors are easy to miss one of.
+    if metadata is not None:
+        metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
+    return metadata
+
+
+def _build_spec_metadata(spec_config,
+                         model_config,
+                         max_num_requests,
+                         max_num_tokens,
+                         spec_resource_manager=None,
+                         is_draft_model=False,
+                         max_seq_len=262144,
+                         num_seq_slots=None):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
     # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
@@ -209,6 +477,7 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
             use_rejection_sampling=use_rejection_sampling,
+            advanced_sampling_mode=spec_config.advanced_sampling_mode,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
@@ -413,7 +682,17 @@ def get_spec_decoder(
         accepted_path_len = None
         if getattr(spec_config, "eagle_choices", None):
             accepted_path_len = sampler_args.max_total_draft_tokens + 1
-        return SpecSampler(sampler_args, accepted_path_len=accepted_path_len)
+        # Occurrence penalties assume the linear row layout: one logits row per
+        # speculative position, so a position's prefix is the positions before it.
+        # A tree's rows are nodes whose prefix is their root path instead, and
+        # sibling branches must not penalize each other -- so tree modes are not
+        # supported yet and are rejected at admission rather than mispenalized.
+        penalty_supported = not (getattr(spec_config, "eagle_choices", None)
+                                 or _is_effective_dynamic_tree(spec_config))
+        return SpecSampler(sampler_args,
+                           accepted_path_len=accepted_path_len,
+                           enable_penalty=spec_config.enable_penalty,
+                           penalty_supported=penalty_supported)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -550,15 +829,46 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
 
 
-def update_spec_config_from_model_config(spec_config, model_config):
-    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+def update_spec_config_from_model_config(spec_config,
+                                         model_config,
+                                         target_model_cls=None):
+    from tensorrt_llm.llmapi.llm_args import (MTPDecodingConfig,
+                                              _MTPDraftCheckpointType)
     if not isinstance(spec_config, MTPDecodingConfig):
         return
+
     architectures = getattr(model_config, "architectures", None) or ()
     if (architectures
             and architectures[0] in _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES):
         spec_config._use_shared_kv_cache = (
             spec_config.spec_dec_mode.is_mtp_eagle_one_model())
+
+    # The target implementation owns the contract for its MTP drafter. Some one-model MTP
+    # implementations construct `MTPForCausalLM` from the target config, and optionally load a
+    # head replacement checkpoint (e.g. NemotronH).
+    # Other implementations advertise an external assistant architecture, which must be
+    # constructed from the assistant's own config.
+    checkpoint_type = spec_config._mtp_draft_checkpoint_type
+    if spec_config.speculative_model is None:
+        checkpoint_type = _MTPDraftCheckpointType.TARGET
+    elif checkpoint_type != _MTPDraftCheckpointType.TARGET:
+        if target_model_cls is not None:
+            checkpoint_type = (
+                _MTPDraftCheckpointType.EXTERNAL_DRAFT_MODEL if getattr(
+                    target_model_cls, "build_mtp_draft_model_from_config",
+                    False) else _MTPDraftCheckpointType.HEAD_REPLACEMENT)
+        elif checkpoint_type == _MTPDraftCheckpointType.UNRESOLVED:
+            checkpoint_type = _MTPDraftCheckpointType.HEAD_REPLACEMENT
+    spec_config._mtp_draft_checkpoint_type = checkpoint_type
+
+    # When MTP heads live in a separate checkpoint, prefer that checkpoint's
+    # layer count / pattern over the target model's (which may have no MTP or
+    # an older embedded MTP head that will be overridden at weight load).
+    draft_nextn = None
+    if uses_mtp_head_checkpoint(spec_config):
+        draft_nextn = _merge_mtp_fields_from_speculative_model(
+            spec_config, model_config)
+
     # Read the MTP layer count from the model's pretrained config. This
     # determines the actual MTP layer count in the checkpoint and drives the
     # spec_dec_mode decision (EAGLE vs vanilla MTP). Different checkpoints expose
@@ -566,13 +876,16 @@ def update_spec_config_from_model_config(spec_config, model_config):
     # `num_nextn_predict_layers`, while Qwen3Next-style configs (including
     # Qwen3.5) use `mtp_num_hidden_layers`. Fall back to a single shared MTP /
     # EAGLE layer when neither field is present.
-    num_nextn_predict_layers = getattr(model_config, "num_nextn_predict_layers",
-                                       None)
-    if num_nextn_predict_layers is None:
+    if draft_nextn is not None:
+        num_nextn_predict_layers = draft_nextn
+    else:
         num_nextn_predict_layers = getattr(model_config,
-                                           "mtp_num_hidden_layers", None)
-    if num_nextn_predict_layers is None:
-        num_nextn_predict_layers = 1
+                                           "num_nextn_predict_layers", None)
+        if num_nextn_predict_layers is None:
+            num_nextn_predict_layers = getattr(model_config,
+                                               "mtp_num_hidden_layers", None)
+        if num_nextn_predict_layers is None:
+            num_nextn_predict_layers = 1
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
 

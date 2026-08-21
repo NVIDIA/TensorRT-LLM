@@ -40,7 +40,8 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear, is_minimax_m3
+from .config_utils import (is_hybrid_linear, is_minimax_m3,
+                           uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -535,10 +536,34 @@ def create_py_executor(
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
-    # Initialize DWDP Manager (only for context workers in disaggregated serving)
+    # Initialize DWDP Manager.
+    #
+    # DWDP needs every global MPI rank to be a complete, unsharded model replica
+    # owning one expert slice -- `dwdp_rank = global_mpi_rank() % dwdp_size` is
+    # only meaningful under that bijection. Disaggregated context workers satisfy
+    # this with TP=1, aggregated serving with full attention DP; everything that
+    # shards a replica across ranks is rejected. Pipeline and context parallelism
+    # are rejected even under attention DP, since pairing ranks that hold
+    # different layers as DWDP peers gives wrong expert weights rather than an
+    # error. The TP check tests `dp_size == tp_size` rather than
+    # `enable_attention_dp` so a future partial attention DP cannot slip through.
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
-        assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
+        if llm_args.dwdp_config.dwdp_size <= 1:
+            raise ValueError(
+                f"DWDP requires dwdp_size > 1, got {llm_args.dwdp_config.dwdp_size}."
+            )
+        if mapping.pp_size > 1 or mapping.cp_size > 1:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica, so "
+                "pipeline and context parallelism are not supported, but got "
+                f"pp_size={mapping.pp_size}, cp_size={mapping.cp_size}.")
+        if mapping.tp_size > 1 and mapping.dp_size != mapping.tp_size:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica: use "
+                "tp_size=1 (disaggregated context worker) or "
+                "enable_attention_dp=True (aggregated serving), but got "
+                f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
@@ -844,8 +869,7 @@ def create_py_executor(
             )
 
         max_attention_window = kv_cache_config.max_attention_window
-        if max_attention_window is not None and len(
-                set(max_attention_window)) > 1:
+        if uses_vswa_kv_cache_layout(max_attention_window):
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )
