@@ -695,3 +695,70 @@ def test_selfsampling_warmup_drops_rows_beyond_envelope():
     assert not any(r > ss_host.MAX_VARLEN_ROWS for r in new_rows), new_rows
     have_rows = {key[0] for key in ss_host._VARLEN_CACHE}
     assert {nn, 8 * nn} <= have_rows, "in-envelope rows must still be warmed"
+
+
+def test_selfsampling_varlen_regclus_parity_and_oracle():
+    """The varlen launcher must admit the clustered register-resident family
+    exactly where the free route picks it (route() parity tier 1), and the
+    per-row varlen port must match the reference oracle on a heterogeneous
+    batch: long rows, a short row (n <= k, in-kernel identity + -1 tail) and
+    a zero-window row, under MTP row windows (next_n=4)."""
+    k, msl_c, nn, cr = 1024, 131072, 4, 4
+    npad = msl_c  # 256-aligned already
+    assert ss_host.route(8, msl_c, npad, k)["kernel"] == "reg_clus"
+    batch = 3
+    rows = batch * nn
+    torch.manual_seed(7)
+    lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
+    pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
+    kv = torch.tensor([msl_c * cr, 900, nn - 1], dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    key = (rows, npad, k, msl_c, nn, cr)
+    assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
+    ss_host.run_varlen(
+        lg,
+        pre,
+        kv,
+        ref,
+        next_n=nn,
+        compress_ratio=cr,
+        max_seq_len=msl_c * cr,
+        engine="reference",
+    )
+    torch.cuda.synchronize()
+    for r in range(rows):
+        if (ref[r] >= 0).any():
+            row = lg[r].float()
+            got = row[out[r].long().clamp_min(0)].sort().values
+            want = row[ref[r].long().clamp_min(0)].sort().values
+            assert torch.equal(got, want), f"row {r} value multiset mismatch"
+            assert torch.equal(out[r] < 0, ref[r] < 0), f"row {r} pad mask mismatch"
+        else:
+            assert torch.equal(out[r], ref[r]), f"row {r} expected all -1"
+
+
+def test_selfsampling_varlen_regclus_cuda_graph():
+    """Cluster-family varlen engine must be CUDA-graph capturable: warmed
+    engine, capture one launch, replay twice, tie-aware exact each time."""
+    k, msl_c, cr = 1024, 131072, 4
+    rows = 8
+    torch.manual_seed(11)
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    out.fill_(-7)
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
+    for _ in range(2):
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
+        assert torch.equal(got, ref_v)

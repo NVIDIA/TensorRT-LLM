@@ -749,12 +749,28 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
-    plan = route_streaming(num_rows, max(min(n_env, npad), k + 1), npad, k, force_main=True)
+    n_eff = max(min(n_env, npad), k + 1)
+    cr_shift = 0 if cr == 1 else 2
+    dev = _device()
+    # ---- route() parity, family tier 1: clustered register-resident --------
+    # Admit reg_clus exactly where the free route picks it (886-real-capture
+    # grid: this family recovers the deep-layer distribution tail and the
+    # large-N small-rows band; its whole admission window n4 <= 32768 fits
+    # capture-frozen envelopes). The choice is a pure function of this cache
+    # key, so CUDA-graph replay safety is unchanged; per-row n / short-row
+    # handling lives in-kernel (GvrMainKernel varlen discipline).
+    plan_free = route(num_rows, n_eff, npad, k)
+    if plan_free["kernel"] == "reg_clus":
+        fn = dev.get_compiled__regclus(
+            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+        )
+        lc = ("reg_clus", fn, n_eff)
+        _VARLEN_CACHE[key] = lc
+        return lc
+    plan = route_streaming(num_rows, n_eff, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
     rt = plan["rt"]
     r_const = rt["R"]
-    cr_shift = 0 if cr == 1 else 2
-    dev = _device()
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
@@ -781,7 +797,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     tsh_en = 1 if (tpl[5] and k <= 1024) else 0
     pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
     tail = (aim_base, sfac, amin, sd_en, tsh_en)
-    lc = (fn, pre, tail)
+    lc = ("main", fn, pre, tail)
     _VARLEN_CACHE[key] = lc
     return lc
 
@@ -1066,9 +1082,16 @@ def _build_launcher(b, n, npad, k):
         return (fn, args, False)
     if fam == "reg_clus":
         dev = _device()
-        # compiled ABI: (logits, pre_idx, out, n) -- smem/k derived in-module
+        # compiled ABI: (logits, pre_idx, kv_lens, out, n) -- kv_lens is the
+        # dead varlen slot in batch-uniform mode (dummy, gvr_main precedent);
+        # smem/k derived in-module
         fn = dev.get_compiled__regclus(tpl)
-        return (fn, (rt["n"],), False)
+        n_arg = rt["n"]
+
+        def _call(lg, pi, idx, _fn=fn, _n=n_arg):
+            _fn(lg, pi, _dummy_kv(lg.get_device(), lg.device), idx, _n)
+
+        return (_call, (), False)
     # unreachable: route() only emits the five families above
     raise RuntimeError(f"unknown dispatch family {fam!r}")
 
@@ -1403,14 +1426,18 @@ def run_varlen(
                     "before CUDA graph capture"
                 )
             lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr)
-        fn, pre, tail = lc
         idx = indices
         if idx.shape[1] != k:
             idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
         vals = values
         if vals is not None and vals.shape[1] != k:
             vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
-        fn(lg, pre_idx, idx, ws, *pre, kv_lens, *tail)
+        if lc[0] == "reg_clus":
+            # compiled ABI: (logits, pre_idx, kv_lens, out, n_envelope)
+            lc[1](lg, pre_idx, kv_lens, idx, lc[2])
+        else:
+            _, fn, pre, tail = lc
+            fn(lg, pre_idx, idx, ws, *pre, kv_lens, *tail)
         if vals is not None:
             idx64 = idx.to(torch.int64)
             vals.copy_(lg.gather(1, idx64.clamp_min(0)))
