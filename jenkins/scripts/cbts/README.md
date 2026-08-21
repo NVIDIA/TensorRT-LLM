@@ -91,7 +91,7 @@ jenkins/scripts/cbts/
 │   ├── selector.py        CoverageSelector.decide(): changed lines → qualnames → impacted / skippable per stage family
 │   ├── qualname_map.py    changed lines → co_qualname, plus the import-time and closure classifications
 │   ├── touch_db.py        read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
-│   └── artifact.py        resolve which post-merge touch DB to use (by collected revision)
+│   └── artifact.py        resolve and merge the x86/SBSA post-merge touch DBs
 ├── coverage_utils/        post-merge collection that produces the touch DB (see its README / COLLECTION.md)
 └── tools/
     ├── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
