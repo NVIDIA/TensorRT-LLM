@@ -60,12 +60,16 @@ submodel.
 
 The Llama, Qwen2, and Qwen3 profiles are text-only and do not enable
 reward-model, embedding, MoE, or vision-language roots. FP16, quantized weights
-or KV cache, alternate attention backends, YaRN or unfused RoPE, tied
-embeddings, TP greater than 2, PP greater than 1, CP greater than 1, LoRA,
-sparse attention, attention DP, multi-node transfer, and speculative decoding
-require separate qualification rows. The profiles do not constrain MoE-only
-backend and mapping settings because these dense roots do not consume them.
-`SourceIdentity` still requires donor and receiver configurations to match.
+or KV cache, alternate attention backends, YaRN, tied embeddings, TP greater
+than 2, PP greater than 1, CP greater than 1, LoRA, sparse attention, attention
+DP, multi-node transfer, and speculative decoding require separate
+qualification rows. Each profile also pins its qualified RoPE realization:
+Llama and Qwen2 require the default fused RoPE path, so unfused RoPE requires
+separate qualification for them, while Qwen3 fuses RoPE into the QK-norm
+kernel and therefore requires realized `rope_fusion=False`. The profiles do
+not constrain MoE-only backend and mapping settings because these dense roots
+do not consume them. `SourceIdentity` still requires donor and receiver
+configurations to match.
 
 ### Adding a Model Family
 
