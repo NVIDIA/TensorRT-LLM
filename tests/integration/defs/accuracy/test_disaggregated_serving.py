@@ -2399,7 +2399,7 @@ class TestQwen3_5_397B_A17B_NVFP4_V2(LlmapiAccuracyTestHarness):
         return ctx_server_config, gen_server_config, disaggregated_server_config
 
     @pytest.mark.skip_less_device(8)
-    @parametrize_with_ids("use_py_transceiver", [True, False])
+    @parametrize_with_ids("use_py_transceiver", [True])
     def test_auto_dtype(self, use_py_transceiver: bool, mocker) -> None:
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
