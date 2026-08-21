@@ -3397,12 +3397,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     )
     def _run_cuda_graph_real_headdim(
         self,
-        config_dict,
-        label="",
-        batch_size=2,
-        initial_cached=None,
-        replay_cached=None,
-        num_blocks=16,
+        config_dict: dict,
+        label: str = "",
+        batch_size: int = 2,
+        initial_cached: list[int] | None = None,
+        replay_cached_steps: list[list[int]] | None = None,
+        num_blocks: int = 16,
+        expect_split_kv: bool = False,
     ) -> None:
         """Helper: CUDA graph decode test with real head_dim configs."""
         from tensorrt_llm._torch.attention_backend import (
@@ -3425,14 +3426,14 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         if initial_cached is None:
             initial_cached = [30, 45]
         self.assertEqual(len(initial_cached), batch_size)
-        if replay_cached is not None:
+        if replay_cached_steps is None:
+            replay_cached_steps = [initial_cached]
+        for replay_cached in replay_cached_steps:
             self.assertEqual(len(replay_cached), batch_size)
-        reserved_cached = initial_cached
-        if replay_cached is not None:
-            reserved_cached = [
-                max(initial, replay)
-                for initial, replay in zip(initial_cached, replay_cached, strict=True)
-            ]
+        reserved_cached = [
+            max(cached_tokens)
+            for cached_tokens in zip(initial_cached, *replay_cached_steps, strict=True)
+        ]
         token_nums = [t + 1 for t in reserved_cached]
         requests = kv_cache_manager.add_dummy_requests(request_ids, token_nums)
         self.assertIsNotNone(requests)
@@ -3535,47 +3536,76 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             for i in range(num_layers):
                 cg_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], cg_metadata))
 
-        reference_cached = initial_cached
-        if replay_cached is not None:
-            reference_cached = replay_cached
+        captured_split_kv_plans = {}
+        if expect_split_kv and torch.cuda.get_device_capability() == (9, 0):
+            split_kv_head_dims = set()
+            for plan_params, wrappers in cg_metadata._plan_params_to_wrappers.items():
+                decode_wrapper = wrappers.decode_wrapper
+                if decode_wrapper is None or decode_wrapper._backend != "fa2":
+                    continue
+                self.assertTrue(wrappers.cuda_graph_plan_captured)
+                self.assertEqual(len(decode_wrapper._plan_info), 15)
+                self.assertTrue(
+                    decode_wrapper._plan_info[14],
+                    f"{label}: FA2 hd={plan_params.head_dim} did not enable split-K",
+                )
+                self.assertEqual(wrappers.cuda_graph_plan_info, tuple(decode_wrapper._plan_info))
+                captured_split_kv_plans[plan_params] = (
+                    tuple(decode_wrapper._plan_info),
+                    decode_wrapper._int_workspace_buffer.data_ptr(),
+                )
+                split_kv_head_dims.add(plan_params.head_dim)
+            self.assertEqual(split_kv_head_dims, {256, 512})
+
+        for replay_step, reference_cached in enumerate(replay_cached_steps):
             cg_metadata.kv_cache_params = KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=replay_cached,
+                use_cache=True, num_cached_tokens_per_seq=reference_cached
             )
             cg_metadata.prepare()
-        graph.replay()
 
-        # --- Reference (eager) ---
-        ref_metadata = FlashInferAttentionMetadata(
-            seq_lens=seq_lens,
-            num_contexts=0,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=reference_cached,
-            ),
-            max_num_requests=batch_size,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-        )
-        ref_metadata.prepare()
-        ref_results = []
-        for i in range(num_layers):
-            ref_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], ref_metadata))
+            for plan_params, (captured_plan_info, workspace_ptr) in captured_split_kv_plans.items():
+                wrappers = cg_metadata._plan_params_to_wrappers[plan_params]
+                decode_wrapper = wrappers.decode_wrapper
+                self.assertEqual(tuple(decode_wrapper._plan_info), captured_plan_info)
+                self.assertEqual(decode_wrapper._int_workspace_buffer.data_ptr(), workspace_ptr)
+                self.assertEqual(
+                    wrappers.decode_plan_num_blocks,
+                    tuple(cg_metadata.num_blocks[cg_metadata.num_contexts :]),
+                )
 
-        for i in range(num_layers):
-            torch.testing.assert_close(
-                cg_results[i],
-                ref_results[i],
-                atol=1e-2,
-                rtol=0,
-                msg=(
-                    f"{label} Layer {i} ({layer_types[i]}, "
-                    f"hd={layers_info[i]['head_dim']}, "
-                    f"kv={layers_info[i]['num_kv_heads']}): "
-                    f"CUDA graph diverges from eager"
+            graph.replay()
+
+            # --- Reference (eager) ---
+            ref_metadata = FlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=reference_cached,
                 ),
+                max_num_requests=batch_size,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
             )
+            ref_metadata.prepare()
+            ref_results = []
+            for i in range(num_layers):
+                ref_results.append(layers[i].forward(gen_qs[i], gen_ks[i], gen_vs[i], ref_metadata))
+
+            for i in range(num_layers):
+                torch.testing.assert_close(
+                    cg_results[i],
+                    ref_results[i],
+                    atol=1e-2,
+                    rtol=0,
+                    msg=(
+                        f"{label} replay {replay_step}, Layer {i} ({layer_types[i]}, "
+                        f"hd={layers_info[i]['head_dim']}, "
+                        f"kv={layers_info[i]['num_kv_heads']}): "
+                        f"CUDA graph diverges from eager"
+                    ),
+                )
 
         kv_cache_manager.shutdown()
 
@@ -3592,15 +3622,20 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
     def test_cuda_graph_decode_long_multi_request(self) -> None:
-        """FA2 CUDA Graph decode matches eager with split-K-sized inputs."""
+        """E2B-like split-K schedules refresh across graph replays."""
         batch_size = 8
         self._run_cuda_graph_real_headdim(
             deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG),
-            "E2B long multi-request",
+            "E2B split-K schedule refresh",
             batch_size=batch_size,
-            initial_cached=[1024 + 7 * i for i in range(batch_size)],
-            replay_cached=[30 + i for i in range(batch_size)],
-            num_blocks=2048,
+            initial_cached=[4095] + [31] * (batch_size - 1),
+            replay_cached_steps=[
+                [511] * batch_size,
+                [31] * (batch_size - 1) + [4095],
+                [30, 31, 32, 33, 1023, 1024, 1025, 2048],
+            ],
+            num_blocks=8192,
+            expect_split_kv=True,
         )
 
     @torch.no_grad()
@@ -3608,15 +3643,20 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
     def test_cuda_graph_decode_long_multi_request_12b_like(self) -> None:
-        """12B-like FA2 CUDA Graph decode matches eager after capture."""
-        batch_size = 1
+        """12B-like split-K schedules refresh across graph replays."""
+        batch_size = 8
         self._run_cuda_graph_real_headdim(
             deepcopy(GEMMA4_12B_REAL_DIMS_CONFIG),
-            "12B long multi-request",
+            "12B split-K schedule refresh",
             batch_size=batch_size,
-            initial_cached=[1024],
-            replay_cached=[30],
-            num_blocks=2048,
+            initial_cached=[4095] + [31] * (batch_size - 1),
+            replay_cached_steps=[
+                [511] * batch_size,
+                [31] * (batch_size - 1) + [4095],
+                [30, 31, 32, 33, 1023, 1024, 1025, 2048],
+            ],
+            num_blocks=8192,
+            expect_split_kv=True,
         )
 
     @torch.no_grad()

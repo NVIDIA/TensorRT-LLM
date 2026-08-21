@@ -234,6 +234,10 @@ class MLAPlanParams:
 class FlashInferWrappers:
     is_planned: bool
     cuda_graph_plan_captured: bool = False
+    cuda_graph_plan_info: Optional[tuple[int, ...]] = field(default=None,
+                                                            repr=False)
+    decode_plan_num_blocks: Optional[tuple[int, ...]] = field(default=None,
+                                                              repr=False)
     decode_wrapper: Optional[
         flashinfer.BatchDecodeWithPagedKVCacheWrapper] = None
     prefill_wrapper: Optional[
@@ -1027,6 +1031,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._host_paged_kv_indices: Optional[torch.Tensor] = None
         self._host_paged_kv_indptr_decode: Optional[torch.Tensor] = None
         self._uses_full_generation_page_table = False
+        self._host_paged_kv_last_page_len: Optional[torch.Tensor] = None
         self._max_num_blocks_per_seq = 0
 
         # VSWA (Variable Sliding Window Attention): models with per-layer
@@ -1442,10 +1447,24 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # subsequent forward calls.
             if plan_params.attention_mask_data is None and plan_params.multi_item_params is None:
                 wrappers = self._plan_params_to_wrappers[plan_params]
-                # The captured tensor-core kernel owns this plan's launch
-                # configuration and workspace state. Runtime prepare() still
-                # refreshes the stable page-table buffers below.
                 if self.is_cuda_graph and wrappers.cuda_graph_plan_captured:
+                    if wrappers.cuda_graph_plan_info is None:
+                        continue
+                    num_blocks = tuple(self.num_blocks[self.num_contexts:])
+                    if wrappers.decode_plan_num_blocks == num_blocks:
+                        continue
+                    wrappers.is_planned = False
+                    self._plan_with_params(plan_params,
+                                           synchronize_before_plan=False)
+                    refreshed_plan_info = self._get_fa2_cuda_graph_plan_info(
+                        plan_params, wrappers)
+                    if refreshed_plan_info != wrappers.cuda_graph_plan_info:
+                        raise RuntimeError(
+                            "FlashInfer FA2 CUDA Graph decode plan layout "
+                            f"changed for head_dim={plan_params.head_dim}: "
+                            f"captured={wrappers.cuda_graph_plan_info}, "
+                            f"refreshed={refreshed_plan_info}. The captured "
+                            "graph cannot safely replay this KV distribution.")
                     continue
                 wrappers.is_planned = False
                 if not defer_plan:
@@ -1624,6 +1643,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         paged_kv_last_page_len = _to_int32_tensor(kv_lens_host -
                                                   (logical_num_blocks - 1) *
                                                   self.page_size)
+        self._host_paged_kv_last_page_len = paged_kv_last_page_len
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
 
@@ -1893,6 +1913,28 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         ] or (plan_params.num_heads // plan_params.num_kv_heads >= 4)
 
     @staticmethod
+    def _get_fa2_cuda_graph_plan_info(
+            plan_params: PlanParams,
+            wrappers: FlashInferWrappers) -> tuple[int, ...]:
+        decode_wrapper = wrappers.decode_wrapper
+        if decode_wrapper is None:
+            raise RuntimeError(
+                "Missing FlashInfer FA2 CUDA Graph decode wrapper "
+                f"for head_dim={plan_params.head_dim}.")
+        plan_info = getattr(decode_wrapper, '_plan_info', None)
+        if plan_info is None or len(plan_info) != 15:
+            raise RuntimeError(
+                "FlashInfer FA2 CUDA Graph tensor-core decode expected a "
+                f"15-element plan_info for head_dim={plan_params.head_dim}, "
+                f"got {plan_info}.")
+        if not plan_info[13] or not plan_info[14]:
+            raise RuntimeError(
+                "FlashInfer FA2 CUDA Graph tensor-core decode requires both "
+                "CUDA Graph and split-K planning for "
+                f"head_dim={plan_params.head_dim}, got plan_info={plan_info}.")
+        return tuple(plan_info)
+
+    @staticmethod
     @functools.wraps(flashinfer.BatchPrefillWithPagedKVCacheWrapper)
     def _page_size_one_prefill_wrapper_builder(*args, **kwargs):
         return _PageSizeOnePrefillWrapper(
@@ -1900,7 +1942,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
     def _plan_with_params(self,
                           plan_params: PlanParams,
-                          flashinfer_backend: str = "fa2") -> PlanParams:
+                          flashinfer_backend: str = "fa2",
+                          *,
+                          synchronize_before_plan: bool = True) -> PlanParams:
         if not self.needs_plan(plan_params):
             if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
                 wrappers = self._plan_params_to_wrappers[plan_params]
@@ -1908,6 +1952,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         and wrappers.decode_wrapper is not None
                         and wrappers.decode_wrapper.use_tensor_cores):
                     wrappers.cuda_graph_plan_captured = True
+                    if wrappers.decode_wrapper._backend == 'fa2':
+                        plan_info = self._get_fa2_cuda_graph_plan_info(
+                            plan_params, wrappers)
+                        if (wrappers.cuda_graph_plan_info is not None
+                                and wrappers.cuda_graph_plan_info != plan_info):
+                            raise RuntimeError(
+                                "FlashInfer FA2 CUDA Graph decode plan changed "
+                                "during capture for "
+                                f"head_dim={plan_params.head_dim}.")
+                        wrappers.cuda_graph_plan_info = plan_info
             return plan_params
 
         if self.is_cuda_graph and torch.cuda.is_current_stream_capturing():
@@ -2028,9 +2082,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         if wrappers.decode_wrapper is None:
             use_tensor_cores = self._use_tensor_cores(plan_params)
-            # Gemma4's H256/H512 plans need one immutable tensor-core plan for
-            # graph capture and replay. The CUDA-core plan is re-planned as KV
-            # pages change and can mutate state owned by the captured graph.
+            # Gemma4's H256/H512 plans need a tensor-core wrapper with a stable
+            # CUDA Graph launch layout. prepare() may refresh its split-K
+            # schedule in the wrapper's fixed workspace as KV pages change.
             use_graph_tensor_cores = self.is_cuda_graph and plan_params.head_dim > 128
 
             wrappers.decode_wrapper = \
@@ -2049,7 +2103,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         9, 0) else "auto"),
                 )
         decode_wrapper = wrappers.decode_wrapper
-        use_graph_tensor_cores = self.is_cuda_graph and plan_params.head_dim > 128
 
         def decode_plan():
             assert decode_wrapper is not None
@@ -2063,6 +2116,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # its indptr.cpu()/get_seq_lens calls stay free of D2H syncs.
             paged_kv_indptr = self._host_paged_kv_indptr_decode
             assert paged_kv_indptr is not None
+            paged_kv_last_page_len = self._host_paged_kv_last_page_len
+            assert paged_kv_last_page_len is not None
             # Persistent, host-built block table: skips flashinfer's
             # per-request rebuild loop, whose GPU-scalar slice bounds cost
             # one sync + one scalar D2H per generation request per plan.
@@ -2073,7 +2128,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             decode_wrapper.plan(
                 paged_kv_indptr[:self.num_generations + 1],
                 self.paged_kv_indices[self.num_context_blocks:],
-                self.paged_kv_last_page_len[self.num_contexts:],
+                paged_kv_last_page_len[self.num_contexts:],
                 plan_params.num_heads,
                 plan_params.num_kv_heads,
                 plan_params.head_dim,
@@ -2086,14 +2141,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 block_tables=block_tables,
                 # Keep FlashInfer's recorded graph shape aligned with the wrapper cache key.
                 q_len_per_req=plan_params.q_len_per_req,
-                # Split-K can change its launch grid as KV lengths grow.
-                # Graph replay must retain the grid captured by this plan.
-                disable_split_kv=use_graph_tensor_cores,
+                # FlashInfer pads the FA2 split-K launch grid when
+                # use_cuda_graph=True. prepare() refreshes the schedule in the
+                # wrapper's stable workspace and verifies the captured layout.
+                disable_split_kv=False,
             )
+            wrappers.decode_plan_num_blocks = tuple(
+                self.num_blocks[self.num_contexts:])
             self._publish_decode_wrapper_kv_lens(decode_wrapper)
 
-        # Must sync after append_paged_kv_cache and before plan.
-        torch.cuda.current_stream().synchronize()
+        # Forward-time planning follows append_paged_kv_cache and retains the
+        # synchronization. prepare()-time schedule refreshes are ordered on
+        # the current stream and use host planning metadata, so they skip it.
+        if synchronize_before_plan:
+            torch.cuda.current_stream().synchronize()
 
         if self.num_contexts > 0:
             prefill_plan()
