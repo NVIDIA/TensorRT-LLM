@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -38,6 +39,7 @@ from tensorrt_llm.llmapi import (
     SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
     TorchCompileConfig)
 # isort: on
+from tensorrt_llm.evaluate.post_processing import extract_inkling_content
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -8507,3 +8509,66 @@ class TestStep3_7(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
+    """Text-only accuracy for the Inkling NVFP4 checkpoint.
+
+    The multimodal counterpart (MMMU, vision path) lives in
+    test_llm_api_pytorch_multimodal.py; this covers the shared text decoder,
+    which is what GSM8K and MMLU exercise.
+    """
+
+    MODEL_NAME = "thinkingmachines/Inkling-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/Inkling-NVFP4"
+    MAX_NUM_TOKENS = 16384
+
+    # Inkling is a long-CoT reasoning model: leave room for the chain of
+    # thought so the visible answer is not truncated away.
+    sampling_params = SamplingParams(max_tokens=MAX_NUM_TOKENS)
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    # Inkling emits typed-content channels. Keep the markers through
+    # detokenization and drop the <|content_thinking|> channel, so only the
+    # visible answer is scored.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        post_process_fn=extract_inkling_content,
+        keep_special_tokens=True,
+        preserve_caller_max_tokens=True,
+    )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(183000)
+    def test_nvfp4(self):
+        """NVFP4 text accuracy on GSM8K and MMLU (Blackwell, TP=4).
+
+        See references/gsm8k.yaml and references/mmlu.yaml for the reference
+        provenance. They were taken with this TP size and KV fraction, so the
+        runtime configuration here has to match. TP=4 is also required to fit
+        the checkpoint on Blackwell at this KV fraction.
+        """
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=4,
+                max_num_tokens=self.MAX_NUM_TOKENS,
+                kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            # A fresh SamplingParams per task: AccuracyTask.evaluate sets
+            # truncate_prompt_tokens in place, so sharing one instance would
+            # leak GSM8K's input budget into MMLU.
+            for task in (GSM8K(self.MODEL_NAME), MMLU(self.MODEL_NAME)):
+                task.evaluate(
+                    llm,
+                    sampling_params=copy.deepcopy(self.sampling_params),
+                    extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+                )
+
+
+class TestInkling_Small_NVFP4(TestInkling_NVFP4):
+    """Text-only accuracy for Inkling-Small; setup inherited from TestInkling_NVFP4."""
+
+    MODEL_NAME = "thinkingmachines/Inkling-Small-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/Inkling-Small-NVFP4"

@@ -105,3 +105,18 @@ stepfun-ai/Step-3.7-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 60
+# Inkling NVFP4 (thinkingmachines/Inkling-NVFP4): RoPE-free hybrid-attention
+# reasoning model. Reasoning traces are stripped before MMMU answer extraction
+# (see TestInkling_NVFP4). Measured on the full 858-item pool at TP=4. Gate on
+# aggregate accuracy, not per-item identity -- long-CoT near-ties resolve
+# differently across NVFP4 implementations. KV cache is unquantized (the
+# checkpoint sets kv_cache_quant_algo=none).
+thinkingmachines/Inkling-NVFP4:
+  - quant_algo: NVFP4
+    accuracy: 79.72
+# Inkling-Small NVFP4: smaller sibling of the above, same hMLP vision path.
+# Full validation pool at TP=4. Gate on aggregate accuracy, not per-item
+# identity.
+thinkingmachines/Inkling-Small-NVFP4:
+  - quant_algo: NVFP4
+    accuracy: 77.95

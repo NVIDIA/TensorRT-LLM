@@ -1062,6 +1062,170 @@ def test_gemma4_reasoning_parser_finish_unterminated_reasoning():
     assert result.reasoning_content == "<chan"
 
 
+# --- Inkling typed-content channel reasoning parser --------------------------
+INK_MM = "<|message_model|>"
+INK_CT = "<|content_text|>"
+INK_CH = "<|content_thinking|>"
+INK_EM = "<|end_message|>"
+INK_END = "<|content_model_end_sampling|>"
+
+
+@pytest.mark.parametrize(
+    ("text", "content", "reasoning"),
+    [
+        # Canonical thinking-then-answer turn: only the content_text is visible.
+        (f"{INK_CH}3+4=7{INK_EM}{INK_MM}{INK_CT}The answer is 7{INK_EM}{INK_END}",
+         "The answer is 7", "3+4=7"),
+        # Answer-only (no thinking block).
+        (f"{INK_CT}42{INK_EM}", "42", ""),
+        # Thinking-only turn (looped / no answer emitted): visible content is
+        # empty, not the reasoning text -- a truncated chain-of-thought must not
+        # be scored as the answer.
+        (f"{INK_CH}reasoning only, no answer{INK_EM}{INK_END}", "",
+         "reasoning only, no answer"),
+        # Truncated mid-thinking (generation hit the token cap): still empty content.
+        (f"{INK_CH}looping 12 13 14", "", "looping 12 13 14"),
+        # No Inkling markers at all -> passthrough as visible content (non-Inkling /
+        # already-stripped output is untouched).
+        ("plain text no markers", "plain text no markers", ""),
+        # Multiple content_text blocks concatenate.
+        (f"{INK_CT}Step 1{INK_EM}{INK_MM}{INK_CT} Step 2{INK_EM}",
+         "Step 1 Step 2", ""),
+    ])
+def test_inkling_reasoning_parser(text: str, content: str, reasoning: str):
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    result = parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning
+
+
+def test_inkling_reasoning_parser_registered_needs_raw_special_tokens():
+    """The parser is registered and declares needs_raw_special_tokens.
+
+    That flag is what makes the OpenAI server keep the <|content_*|>
+    delimiters in the decoded text.
+    """
+    assert "inkling" in ReasoningParserFactory.keys()
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    assert getattr(parser, "needs_raw_special_tokens", False) is True
+
+
+def test_inkling_reasoning_parser_stream_across_deltas():
+    """Streaming parse reconstructs the same visible content as a full parse.
+
+    Covers a control token split across two deltas.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    # Split the <|content_text|> marker across two deltas to exercise the
+    # partial-control holdback.
+    deltas = [
+        f"{INK_CH}think a{INK_EM}{INK_MM}<|content_te", "xt|>ANS 5", INK_END
+    ]
+    content = "".join(parser.parse_delta(d).content for d in deltas)
+    content += parser.finish().content
+    assert content == "ANS 5"
+
+
+# --- streaming == batch under any chunk boundary -----------------------------
+# The streamed result (deltas + finish) must equal the full parse for every chunk
+# boundary, including one that splits a control token mid-token.
+_INK_STREAM_CASES = [
+    # thinking -> visible answer
+    f"{INK_CH}3+4=7{INK_EM}{INK_MM}{INK_CT}The answer is 7{INK_EM}{INK_END}",
+    # interleaved thinking / two content_text blocks
+    (f"{INK_CH}try A{INK_EM}{INK_MM}{INK_CT}Step 1{INK_EM}"
+     f"{INK_CH}reconsider{INK_EM}{INK_MM}{INK_CT} Step 2{INK_EM}{INK_END}"),
+    # tool-invocation block (routes to content, matching SGLang)
+    f'{INK_CH}need a tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"name":"f"}}{INK_EM}{INK_END}',
+    # separator-interleaved repetition (the pre-fix EOS-bug runtime shape)
+    f"{INK_CH}reason{INK_EM}" +
+    f"{INK_MM}{INK_CT}Answer: A{INK_EM}{INK_END}" * 6,
+    # non-Inkling / already-stripped passthrough
+    "plain answer without any markers",
+]
+
+
+def _ink_stream(text, splits):
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    edges = [0] + list(splits) + [len(text)]
+    content = reasoning = ""
+    for a, b in zip(edges, edges[1:]):
+        r = parser.parse_delta(text[a:b])
+        content += r.content
+        reasoning += r.reasoning_content
+    r = parser.finish()
+    return content + r.content, reasoning + r.reasoning_content
+
+
+@pytest.mark.parametrize("text", _INK_STREAM_CASES)
+def test_inkling_reasoning_parser_stream_equals_batch_any_split(text: str):
+    """Streamed result equals the full parse for every possible split.
+
+    Covers char-by-char streaming and a split at every single index, each of
+    which may land mid-control-token.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    batch = parser.parse(text)
+    c, r = _ink_stream(text, range(1, len(text)))
+    assert (c, r) == (batch.content, batch.reasoning_content)
+    for k in range(1, len(text)):
+        c, r = _ink_stream(text, [k])
+        assert c == batch.content, f"content mismatch at split {k}"
+        assert r == batch.reasoning_content, f"reasoning mismatch at split {k}"
+
+
+def test_inkling_reasoning_parser_tool_and_repetition_segmentation():
+    """Tool-invocation blocks route to visible content, not to reasoning.
+
+    A separator-interleaved repetition splits into one reasoning block plus the
+    repeated visible answers, with no control tokens leaking into either
+    channel.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    r = parser.parse(
+        f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_json|>{{"n":1}}{INK_EM}{INK_END}'
+    )
+    assert r.content == '{"n":1}'
+    assert r.reasoning_content == "need tool"
+    r = parser.parse(
+        f'{INK_CH}need tool{INK_EM}{INK_MM}<|content_invoke_tool_text|>lookup{INK_EM}{INK_END}'
+    )
+    assert r.content == "lookup"
+    assert r.reasoning_content == "need tool"
+    rep = f"{INK_CH}reason{INK_EM}" + f"{INK_MM}{INK_CT}Answer: A{INK_EM}{INK_END}" * 6
+    r = parser.parse(rep)
+    assert r.reasoning_content == "reason"
+    assert r.content == "Answer: A" * 6
+    assert "<|" not in r.content and "<|" not in r.reasoning_content
+
+
+def test_inkling_reasoning_parser_end_tokens_split_across_deltas():
+    """A control token split across delta boundaries still closes its block.
+
+    Covers <|end_message|> and <|content_model_end_sampling|>, both of which go
+    through the partial-control holdback.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    deltas = [
+        f"{INK_CH}think{INK_EM}{INK_MM}{INK_CT}ANS<|end_mes",
+        "sage|><|content_model_end_", "sampling|>"
+    ]
+    content = "".join(parser.parse_delta(d).content for d in deltas)
+    content += parser.finish().content
+    assert content == "ANS"
+
+
+def test_inkling_reasoning_parser_non_text_controls_close_content():
+    """Non-text control tokens close the visible channel instead of inheriting it."""
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+
+    r = parser.parse(
+        f"{INK_CT}Answer<|content_image|>not text{INK_EM}{INK_END}tail")
+
+    assert r.content == "Answer"
+    assert r.reasoning_content == ""
+
+
 # ---------------------------------------------------------------------------
 # Kimi K3 reasoning parser tests
 #

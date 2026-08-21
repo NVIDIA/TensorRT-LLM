@@ -524,3 +524,83 @@ def test_thinking_budget_text_generation_caps_reasoning_tokens(thinking_token_bu
     assert tokenizer.decode(generated_ids) == tokenizer.decode(
         [start_id, *expected_reasoning_ids, end_id, answer_id]
     )
+
+
+class _FakeTokenizer:
+    """Minimal tokenizer stand-in for SamplingParams._setup."""
+
+    def __init__(self, eos_token_id=None, pad_token_id=None):
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+
+class _FakeConfig:
+    def __init__(self, eos_token_id=None):
+        self.eos_token_id = eos_token_id
+
+
+def test_setup_prefers_tokenizer_eos_over_model_config():
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=2), _FakeConfig(eos_token_id=200006), None)
+    assert params.end_id == 2
+
+
+def test_setup_falls_back_to_model_config_eos():
+    """A checkpoint may declare eos_token_id ONLY in config.json.
+
+    Multi-part chat formats have no single terminator, so they register their
+    control tokens under extra_special_tokens / additional_special_tokens, which
+    leaves tokenizer.eos_token_id unset. Without the config.json fallback end_id
+    stays None and every request runs to max_tokens instead of stopping on EOS.
+    """
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=200006), None)
+    assert params.end_id == 200006
+    assert params.pad_id == 200006
+
+
+def test_setup_model_config_eos_list_sets_end_id_and_stop_tokens():
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=[7, 8, 9]), None)
+    assert params.end_id == 7
+    assert params.stop_token_ids == [8, 9]
+
+
+def test_setup_model_config_eos_list_excludes_a_repeated_primary_eos():
+    """A config listing the primary EOS twice must not put it in both places.
+
+    eos_token_id=[7, 7, 8] made 7 both end_id and a stop token. The
+    generation_config path already skipped self.end_id; this one did not.
+    """
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=[7, 7, 8]), None)
+    assert params.end_id == 7
+    assert params.stop_token_ids == [8]
+
+
+def test_setup_model_config_eos_list_of_one_leaves_no_stop_tokens():
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=[7]), None)
+    assert params.end_id == 7
+    assert not params.stop_token_ids
+
+
+def test_setup_explicit_end_id_is_not_overridden():
+    params = SamplingParams(end_id=42)
+    params._setup(_FakeTokenizer(eos_token_id=2), _FakeConfig(eos_token_id=200006), None)
+    assert params.end_id == 42
+
+
+def test_setup_without_any_eos_leaves_end_id_none():
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), _FakeConfig(eos_token_id=None), None)
+    assert params.end_id is None
+
+
+def test_setup_tolerates_missing_model_config():
+    params = SamplingParams()
+    params._setup(_FakeTokenizer(eos_token_id=None), None, None)
+    assert params.end_id is None

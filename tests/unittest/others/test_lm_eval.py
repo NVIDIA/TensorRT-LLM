@@ -49,6 +49,7 @@ from tensorrt_llm.evaluate.lm_eval import (
     MAX_IN_FLIGHT_ENV_VAR,
     LmEvalWrapper,
     MultimodalLmEvalWrapper,
+    _resolve_post_process_fn,
 )
 from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     is_equiv,
@@ -56,6 +57,11 @@ from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     process_results,
     remove_boxed,
     strip_string,
+)
+from tensorrt_llm.evaluate.post_processing import (
+    extract_inkling_content,
+    strip_inkling_and_extract_mmmu_answer,
+    strip_thinking_and_extract_mmmu_answer,
 )
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
@@ -190,6 +196,7 @@ def test_process_results_answer_key_case_insensitive():
 def _make_lm_eval_wrapper(
     sampling_params: SamplingParams | None = None,
     sampling_override: bool = False,
+    preserve_caller_max_tokens: bool = False,
 ) -> LmEvalWrapper:
     """Build a wrapper with a fake llm.
 
@@ -202,6 +209,7 @@ def _make_lm_eval_wrapper(
         fake_llm,
         sampling_params=sampling_params,
         sampling_override=sampling_override,
+        preserve_caller_max_tokens=preserve_caller_max_tokens,
     )
 
 
@@ -293,6 +301,18 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
     assert out.stop == ["</s>"]
 
 
+def test_preserve_caller_max_tokens_keeps_larger_text_budget():
+    """Opt-in text evaluators keep a larger caller max_tokens budget."""
+    wrapper = _make_lm_eval_wrapper(
+        sampling_params=SamplingParams(max_tokens=1024),
+        preserve_caller_max_tokens=True,
+    )
+
+    out = wrapper._get_sampling_params({"max_gen_toks": 512})
+
+    assert out.max_tokens == 1024
+
+
 # ===========================================================================
 # Multimodal wrapper interleave — apply_chat_template content_parts
 # ===========================================================================
@@ -316,6 +336,8 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
 def _make_multimodal_wrapper(
     model_type: str = "gemma3",
     interleave: bool = False,
+    *,
+    keep_special_tokens: bool = False,
 ) -> MultimodalLmEvalWrapper:
     fake_llm = MagicMock()
     fake_llm.tokenizer = MagicMock()
@@ -334,7 +356,17 @@ def _make_multimodal_wrapper(
             sampling_params=None,
             streaming=False,
             model_type=model_type,
+            keep_special_tokens=keep_special_tokens,
         )
+
+
+def test_multimodal_wrapper_can_preserve_special_tokens_for_post_processing():
+    """Inkling multimodal scoring needs raw <|content_*|> markers preserved."""
+    wrapper = _make_multimodal_wrapper(keep_special_tokens=True)
+
+    out = wrapper._get_sampling_params({"max_gen_toks": 8})
+
+    assert out.skip_special_tokens is False
 
 
 def _call_apply(wrapper, text: str, *, content_format: ContentFormat):
@@ -1623,6 +1655,142 @@ def test_e2e_windowed_matches_final_score(monkeypatch):
 
 
 # ===========================================================================
+# extract_inkling_content — Inkling typed-content channel extraction
+# ===========================================================================
+#
+# ``extract_inkling_content`` is the offline analog of SGLang's
+# ``--reasoning-parser inkling``: it must return only the visible
+# ``<|content_text|>`` channel and drop the reasoning channel, so
+# flexible-extract scores the answer rather than the chain-of-thought. These
+# tests pin it to SGLang's ``normal_text`` semantics case-for-case.
+
+_CT = "<|content_text|>"
+_CTH = "<|content_thinking|>"
+_EM = "<|end_message|>"
+_MM = "<|message_model|>"
+_CES = "<|content_model_end_sampling|>"
+
+
+def test_inkling_content_only():
+    """A single visible content-text block returns exactly that text."""
+    assert extract_inkling_content(f"{_CT}The answer is 42.{_EM}") == "The answer is 42."
+
+
+def test_inkling_thinking_then_content():
+    """Reasoning is dropped; only the visible content-text is kept.
+
+    Full realistic block sequence: a thinking block, then a
+    ``<|message_model|>`` header, then the visible content-text answer, closed
+    by ``<|end_message|>`` and the sampling-end token.
+    """
+    text = f"{_CTH}Let me compute 6*7=42.{_EM}{_MM}{_CT}42{_EM}{_CES}"
+    assert extract_inkling_content(text) == "42"
+
+
+def test_inkling_thinking_only_returns_empty():
+    """Markers present but NO content-text -> empty visible content.
+
+    This is the SGLang ``InklingDetector`` contract: a generation that stays
+    inside the ``<|content_thinking|>`` block (e.g. it looped / was truncated
+    before emitting an answer) has ``normal_text == ""``. The extractor must
+    NOT leak the reasoning text, otherwise flexible-extract would harvest the
+    reasoning's trailing number as if it were the answer.
+    """
+    assert extract_inkling_content(f"{_CTH}unfinished reasoning says 12") == ""
+
+
+def test_inkling_reasoning_loop_with_trailing_number_returns_empty():
+    """A looping/truncated thinking block with trailing numbers -> empty.
+
+    Directly guards the scoring bug: without the reasoning channel dropped, GSM8K
+    flexible-extract would grab ``15`` (or ``14``) from the chain-of-thought and
+    score a non-answer as a visible answer.
+    """
+    text = f"{_CTH}so 3+4=7 and then 7*2=14 hmm actually 15"
+    assert extract_inkling_content(text) == ""
+
+
+def test_inkling_truncated_content_is_kept():
+    """A content-text block truncated before its closing marker is kept."""
+    assert extract_inkling_content(f"{_CT}The answer is 4") == "The answer is 4"
+
+
+def test_inkling_no_markers_passthrough():
+    """Non-Inkling text (no markers) is returned unchanged.
+
+    Guarantees every other model/benchmark is byte-for-byte untouched when the
+    ``inkling`` post-processor is not selected or special tokens were skipped.
+    """
+    raw = "The answer is 42."
+    assert extract_inkling_content(raw) == raw
+
+
+def test_inkling_multi_block_content_concatenated():
+    """Multiple visible content-text runs are concatenated in order."""
+    text = f"{_CT}Part A. {_EM}{_MM}{_CT}Part B.{_EM}"
+    assert extract_inkling_content(text) == "Part A. Part B."
+
+
+def test_inkling_content_then_thinking_keeps_only_content():
+    """Out-of-order blocks: content kept, later reasoning dropped."""
+    assert extract_inkling_content(f"{_CT}Answer: 5{_CTH}wait no") == "Answer: 5"
+
+
+def test_inkling_non_text_control_closes_content():
+    """Non-text content markers close the visible channel."""
+    assert extract_inkling_content(f"{_CT}Answer<|content_image|>not visible{_EM}") == "Answer"
+
+
+def test_inkling_framing_only_output_is_not_passed_through():
+    """A header with no visible channel must yield nothing, not raw tokens.
+
+    The passthrough test used to look only for the two channel markers, so
+    output that carried framing but never opened a content block was returned
+    verbatim and the evaluator scored raw special tokens -- or text sitting
+    outside any visible block -- as the answer. InklingReasoningParser treats
+    this as framing and drops it, so this must too.
+    """
+    assert extract_inkling_content(f"{_MM}raw leak 42") == ""
+
+
+def test_inkling_truncated_after_header_is_not_passed_through():
+    """Same failure with nothing after the header at all."""
+    assert extract_inkling_content(_MM) == ""
+    assert extract_inkling_content(f"{_MM}{_CES}") == ""
+
+
+def test_inkling_passthrough_still_applies_without_any_control_token():
+    """Passthrough for non-Inkling output is unchanged.
+
+    Text carrying no Inkling control token at all is returned verbatim, so
+    every other model and benchmark is untouched by the wider test.
+    """
+    for text in ("The answer is 42.", "", "<|not_an_inkling_token|>x"):
+        assert extract_inkling_content(text) == text
+
+
+def test_inkling_mmmu_answer_extraction_uses_visible_content_only():
+    """MMMU extraction must ignore numbers/options from Inkling reasoning."""
+    text = f"{_CTH}wrong trail says answer is (D){_EM}{_MM}{_CT}The answer is (B).{_EM}{_CES}"
+
+    assert strip_inkling_and_extract_mmmu_answer(text) == "B"
+
+
+def test_lm_eval_post_process_resolver_special_token_modes():
+    fn, keep_special_tokens = _resolve_post_process_fn("inkling")
+    assert fn is extract_inkling_content
+    assert keep_special_tokens is True
+
+    fn, keep_special_tokens = _resolve_post_process_fn("inkling_mmmu")
+    assert fn is strip_inkling_and_extract_mmmu_answer
+    assert keep_special_tokens is True
+
+    fn, keep_special_tokens = _resolve_post_process_fn("strip_thinking_mmmu")
+    assert fn is strip_thinking_and_extract_mmmu_answer
+    assert keep_special_tokens is False
+
+
+# ===========================================================================
 # post_processing — Kimi K3 channel-structured MMMU answer extraction
 # ===========================================================================
 #
@@ -1638,7 +1806,6 @@ def test_e2e_windowed_matches_final_score(monkeypatch):
 from tensorrt_llm.evaluate.post_processing import (  # noqa: E402
     extract_kimi_k3_mmmu_answer,
     strip_thinking,
-    strip_thinking_and_extract_mmmu_answer,
 )
 
 

@@ -536,3 +536,15 @@ stepfun-ai/Step-3.7-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 88
+# Inkling NVFP4 (thinkingmachines/Inkling-NVFP4): RoPE-free hybrid-attention
+# reasoning model, text-only path. Measured on the full 1319-item set at TP=4,
+# greedy, with CUDA graph and the overlap scheduler on. KV cache is unquantized
+# (the checkpoint sets kv_cache_quant_algo=none).
+thinkingmachines/Inkling-NVFP4:
+  - quant_algo: NVFP4
+    accuracy: 96.13
+# Inkling-Small NVFP4: smaller sibling of the above (42 layers / hidden 4096
+# against 66 / 6144). Full 1319-item set at TP=4, greedy.
+thinkingmachines/Inkling-Small-NVFP4:
+  - quant_algo: NVFP4
+    accuracy: 95.75
