@@ -17,8 +17,10 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
+#include <cstddef>
 #include <cuda.h>
 #include <stdexcept>
 #include <string>
@@ -85,6 +87,41 @@ public:
     explicit AssertionError(std::string const& msg)
         : std::logic_error(msg)
     {
+    }
+};
+
+// A configured tier quota cannot satisfy its minimum storage layout.
+class InsufficientQuotaError : public std::invalid_argument
+{
+public:
+    CacheTier cacheTier;
+    size_t quota;
+    size_t minQuota;
+
+    InsufficientQuotaError(CacheTier tier, size_t configuredQuota, size_t requiredQuota)
+        : std::invalid_argument(makeMessage(tier, configuredQuota, requiredQuota))
+        , cacheTier(tier)
+        , quota(configuredQuota)
+        , minQuota(requiredQuota)
+    {
+    }
+
+private:
+    static char const* tierName(CacheTier tier)
+    {
+        switch (tier)
+        {
+        case CacheTier::GPU_MEM: return "GPU";
+        case CacheTier::HOST_MEM: return "host";
+        case CacheTier::DISK: return "disk";
+        }
+        return "unknown";
+    }
+
+    static std::string makeMessage(CacheTier tier, size_t quota, size_t minQuota)
+    {
+        return std::string(tierName(tier)) + " cache tier quota " + std::to_string(quota)
+            + " is insufficient for the minimum storage layout (requires at least " + std::to_string(minQuota) + ")";
     }
 };
 

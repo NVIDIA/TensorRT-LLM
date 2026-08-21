@@ -31,6 +31,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
     BatchDesc,
+    CacheLevel,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
@@ -363,6 +364,74 @@ def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
         GpuCacheTierConfig,
         DiskCacheTierConfig,
     ]
+
+
+@pytest.mark.parametrize("max_util_for_resume", [1.0, 0.5])
+def test_host_quota_follows_host_cache_size(max_util_for_resume: float) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    host_cache_size = 1 << 20
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            avg_seq_len=512,
+            enable_block_reuse=False,
+            host_cache_size=host_cache_size,
+            max_gpu_total_bytes=16 << 20,
+            max_util_for_resume=max_util_for_resume,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=1024,
+        max_batch_size=64,
+        max_num_tokens=128,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+    try:
+        assert manager.impl.get_quota(CacheLevel(1)) == host_cache_size
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("max_util_for_resume", [1.0, 0.5])
+def test_disk_quota_follows_disk_cache_size(tmp_path, max_util_for_resume: float) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    disk_cache_size = 16 << 20
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            avg_seq_len=512,
+            disk_cache_path=str(tmp_path),
+            disk_cache_size=disk_cache_size,
+            enable_block_reuse=False,
+            host_cache_size=0,
+            max_gpu_total_bytes=16 << 20,
+            max_util_for_resume=max_util_for_resume,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=1024,
+        max_batch_size=64,
+        max_num_tokens=128,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+    try:
+        assert manager.impl.get_quota(CacheLevel(1)) == disk_cache_size
+    finally:
+        manager.shutdown()
 
 
 def test_extra_tokens_are_in_context_capacity() -> None:

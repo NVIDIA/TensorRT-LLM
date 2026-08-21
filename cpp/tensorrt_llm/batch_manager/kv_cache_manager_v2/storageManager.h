@@ -276,8 +276,9 @@ private:
     TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratio) const;
-    size_t minQuotaForLevel(
-        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity) const;
+    TypedVec<PoolGroupIndex, SlotCount> minSlotsForTier(CacheTier tier) const;
+    size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
 
     PoolIndex mNumPools(PoolGroupIndex pgIdx) const;
 

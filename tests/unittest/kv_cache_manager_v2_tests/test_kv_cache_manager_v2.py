@@ -17,6 +17,7 @@ import functools
 import gc
 import hashlib
 import itertools
+import math
 import os
 import random
 import time
@@ -43,6 +44,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
+        InsufficientQuotaError,
         KVCacheDesc,
         KVCacheManager,
         KVCacheManagerConfig,
@@ -97,6 +99,7 @@ else:
         DiskCacheTierConfig,
         GpuCacheTierConfig,
         HostCacheTierConfig,
+        InsufficientQuotaError,
         KVCacheDesc,
         KVCacheManager,
         KVCacheManagerConfig,
@@ -3159,11 +3162,13 @@ class TestInitRatioConfig(unittest.TestCase):
         num_requests = 32
         constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
         granularity = 2 << 20
-        gpu_quota = round_up(num_requests * self.PG0_SLOT_SIZE, granularity) + round_up(
-            num_requests * self.PG1_SLOT_SIZE, granularity
+        max_util_for_resume = 0.95
+        min_slots = math.ceil(num_requests / max_util_for_resume)
+        gpu_quota = round_up(min_slots * self.PG0_SLOT_SIZE, granularity) + round_up(
+            min_slots * self.PG1_SLOT_SIZE, granularity
         )
         cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
-        cfg.max_util_for_resume = 0.95
+        cfg.max_util_for_resume = max_util_for_resume
         manager = KVCacheManager(cfg)
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
@@ -3178,6 +3183,25 @@ class TestInitRatioConfig(unittest.TestCase):
         for kv_cache in kv_caches:
             kv_cache.close()
         manager.shutdown()
+
+    def test_gpu_quota_below_constraint_minimum_raises(self):
+        """A configured GPU quota below its constraint floor is rejected."""
+        num_requests = 32
+        constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
+        granularity = 2 << 20
+        gpu_quota = round_up(num_requests * self.PG0_SLOT_SIZE, granularity) + round_up(
+            num_requests * self.PG1_SLOT_SIZE, granularity
+        )
+        cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
+        cfg.max_util_for_resume = 0.95
+
+        with self.assertRaisesRegex(
+            InsufficientQuotaError, "GPU cache tier quota .* is insufficient"
+        ) as raised:
+            KVCacheManager(cfg)
+        self.assertEqual(raised.exception.cache_tier.value, CacheTier.GPU_MEM.value)
+        self.assertEqual(raised.exception.quota, gpu_quota)
+        self.assertGreater(raised.exception.min_quota, gpu_quota)
 
     def test_constraint_floor_overrides_infeasible_initial_pool_ratio(self):
         """A constraint's feasibility floor overrides an infeasible initial_pool_ratio.
