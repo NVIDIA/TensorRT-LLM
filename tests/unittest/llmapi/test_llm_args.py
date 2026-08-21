@@ -1094,6 +1094,16 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
 
+    def test_disable_mm_encoder_disables_encoder_cache(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            checkpoint_format="HF",
+            disable_mm_encoder=True,
+            multimodal_config={"encoder_cache_max_bytes": "1MiB"},
+        )
+
+        assert args.multimodal_config.encoder_cache_max_bytes == 0
+
     @pytest.mark.parametrize(
         ("value", "expected"),
         [

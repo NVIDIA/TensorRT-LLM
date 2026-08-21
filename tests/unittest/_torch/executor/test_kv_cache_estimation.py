@@ -10,6 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,7 +23,8 @@ from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -56,6 +58,49 @@ class _MultimodalModel(MultimodalModelMixin):
 
 class _EncoderCacheMultimodalModel(_MultimodalModel):
     supports_encoder_cache = True
+
+
+@dataclass
+class _ModelEngine:
+    model: _TextModel | _MultimodalModel
+    mm_encoder_output_budget_bytes: int | None = None
+
+
+def _make_reserve_creator(
+    model: _TextModel | _MultimodalModel,
+    *,
+    mm_encoder_output_budget_bytes: int | None = None,
+    disable_mm_encoder: bool = False,
+) -> KvCacheCreator:
+    llm_args = TorchLlmArgs(
+        model="dummy",
+        checkpoint_format="HF",
+        disable_mm_encoder=disable_mm_encoder,
+        multimodal_config=model.model_config.multimodal_config,
+    )
+    model_engine = _ModelEngine(
+        model=model,
+        mm_encoder_output_budget_bytes=mm_encoder_output_budget_bytes,
+    )
+    return KvCacheCreator(
+        model_engine=model_engine,
+        draft_model_engine=None,
+        mapping=Mapping(),
+        net_max_seq_len=1,
+        kv_connector_manager=None,
+        max_num_tokens=1,
+        max_beam_width=1,
+        tokens_per_block=1,
+        max_seq_len=1,
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(),
+        llm_args=llm_args,
+        speculative_config=None,
+        sparse_attention_config=None,
+        profiling_stage_data=None,
+        is_disagg=False,
+        skip_est=True,
+    )
 
 
 def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
@@ -292,17 +337,25 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     encoder_cache_max_bytes,
     expected_reserve,
 ):
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = SimpleNamespace(model=model_cls(encoder_cache_max_bytes))
+    creator = _make_reserve_creator(model_cls(encoder_cache_max_bytes))
 
     assert creator._get_multimodal_encoder_memory_reserve() == expected_reserve
 
 
-def test_reserve_adds_only_unprofiled_output_capacity():
-    creator = object.__new__(KvCacheCreator)
-    creator._model_engine = SimpleNamespace(
+def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
+    creator = _make_reserve_creator(
+        _EncoderCacheMultimodalModel(64),
         mm_encoder_output_budget_bytes=512,
-        model=_MultimodalModel(0),
+        disable_mm_encoder=True,
+    )
+
+    assert creator._get_multimodal_encoder_memory_reserve() == 0
+
+
+def test_reserve_adds_only_unprofiled_output_capacity():
+    creator = _make_reserve_creator(
+        _MultimodalModel(0),
+        mm_encoder_output_budget_bytes=512,
     )
     assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
 
