@@ -342,6 +342,66 @@ TEST(BounceTransportFailure, DuplicateWantIsDroppedWithoutRegrant)
     receiver->tx->shutdown();
 }
 
+// WANT chunk sizes are untrusted peer input, and each of the two out-of-contract shapes is its own
+// DoS pre-fix: a chunk of 0 can never be allocated, so the flow blocks forever, and once
+// maybeActivateDrain() latches it as the drain flow, schedule() short-circuits before sweeping any
+// other flow — every grant to every peer stops with no reclaim path (a pending-only flow holds no
+// regions, so the lease sweep skips it). A chunk above the handshake-pinned maxChunkSizeBytes
+// instead buddy-rounds up to the WHOLE usable arena (test config: 4097 -> 8192 = capacity), gets
+// granted, and squats on it, starving all peers until the lease sweep. The receiver must reject
+// both up front. The test drives each mode separately: park the zero-size flow, push the grant
+// sequence past the drain bypass threshold with legitimate traffic, require fresh demand to still
+// be granted; then send the oversized WANT and require the same.
+TEST(BounceTransportFailure, MalformedWantChunkSizeIsRejectedNotWedged)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto c = cfg(/*timeoutMs=*/5000);
+    capRegions(c, c.maxInflightChunksPerRequest);
+    b::ZmqControlChannel sender("badWantSender");
+    auto receiver = bounce_test::makeNode("badWantReceiver", c, 1024); // receiver posts no writes
+    if (!receiver)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(sender.addPeer("badWantReceiver", receiver->ch->localEndpoint()));
+
+    sender.sendTo("badWantReceiver", b::encodeWant(/*rid=*/1, {0}, sender.localEndpoint()));
+
+    // Drive enough legitimate grant/cancel cycles to push mGrantSequence past the drain bypass
+    // threshold (max(kMinimumBypassGrants, kBypassRounds * ringSize) = 8 here); pre-fix this
+    // latches rid=1 as the drain flow and the cycle after the eighth grant starves.
+    for (std::uint64_t rid = 100; rid < 112; ++rid)
+    {
+        sender.sendTo("badWantReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
+        std::vector<b::BounceCreditEntry> credits;
+        ASSERT_TRUE(waitGrant(sender, rid, std::chrono::seconds(5), credits)) << "legit WANT starved, rid=" << rid;
+        // Cancel to release the granted region and drop the flow from the ring.
+        sender.sendTo("badWantReceiver", b::encodeWant(rid, {}, sender.localEndpoint()));
+    }
+
+    // The receiver must still grant fresh legitimate demand — pre-fix the drain latch wedges this.
+    sender.sendTo("badWantReceiver", b::encodeWant(/*rid=*/200, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    EXPECT_TRUE(waitGrant(sender, 200, std::chrono::seconds(5), credits)) << "receiver wedged after zero-size WANT";
+    sender.sendTo("badWantReceiver", b::encodeWant(200, {}, sender.localEndpoint()));
+
+    // Oversized mode: pre-fix this grant monopolizes the whole arena, so the follow-up legitimate
+    // WANT starves.
+    sender.sendTo("badWantReceiver",
+        b::encodeWant(/*rid=*/2, {static_cast<std::uint32_t>(c.maxChunkSizeBytes) + 1}, sender.localEndpoint()));
+    sender.sendTo("badWantReceiver", b::encodeWant(/*rid=*/201, {256}, sender.localEndpoint()));
+    credits.clear();
+    EXPECT_TRUE(waitGrant(sender, 201, std::chrono::seconds(5), credits)) << "arena monopolized by oversized WANT";
+
+    // The malformed flows themselves must never have been granted. The reactor is a single FIFO
+    // consumer, so the completed rid=200/201 grants above prove both malformed WANTs were already
+    // processed — these are not timing-window assertions.
+    std::vector<b::BounceCreditEntry> badCredits;
+    EXPECT_FALSE(waitGrant(sender, 1, std::chrono::milliseconds(200), badCredits)) << "zero-size WANT was granted";
+    EXPECT_FALSE(waitGrant(sender, 2, std::chrono::milliseconds(200), badCredits)) << "oversized WANT was granted";
+
+    receiver->tx->shutdown();
+}
+
 // The scatter worker sizes its plan by iterating the DATA run list; a hostile/corrupt run whose
 // count is near 2^32 (bounceStride 0 keeps the span check happy) must be rejected up front, not
 // counted piece by piece — pre-fix the worker (and the flow's region) is pinned for the whole

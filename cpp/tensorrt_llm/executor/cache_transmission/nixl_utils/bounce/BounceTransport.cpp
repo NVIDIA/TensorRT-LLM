@@ -307,6 +307,23 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     {
         return;
     }
+    // Chunk sizes are untrusted peer input. The capability handshake pins both sides to the same
+    // effective maxChunkSizeBytes (already clamped to usable arena capacity in the ctor), so a
+    // compliant sender never emits a chunk of 0 or above that cap. An ungrantable size must not
+    // reach the scheduler: BuddyAllocator::alloc() can never satisfy it, the flow would stay
+    // blocked forever, and once maybeActivateDrain() latches it as the drain flow every grant to
+    // every peer stops — with no reclaim path, because a pending-only flow holds no regions and
+    // the lease sweep skips it.
+    for (auto const bytes : chunkBytes)
+    {
+        if (bytes == 0 || bytes > mCtx.cfg.maxChunkSizeBytes)
+        {
+            TLLM_LOG_WARNING("BounceTransport(%s): rejected WANT from peer %s rid=%llu: chunk size %u outside (0, %zu]",
+                mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned long long>(h.requestId), bytes,
+                static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes));
+            return;
+        }
+    }
     // A non-empty WANT has no retransmission path (submit() sends it exactly once per fresh rid),
     // so one for an already-tracked flow is a replay or rid collision. Re-queueing would re-grant
     // over the still-held regions — the sender never writes the extras, so they leak — and the
