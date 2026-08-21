@@ -18,7 +18,6 @@ from tensorrt_llm.serve.openai_protocol import (
     ImageGenerationRequest,
     VideoGenerationRequest,
 )
-from tensorrt_llm.visual_gen.media_refs import _resolve_reference
 
 if TYPE_CHECKING:
     from fastapi import UploadFile
@@ -406,11 +405,16 @@ def _apply_deprecated_input_reference(
     logger.warning("'input_reference' is deprecated; use 'image_reference' / 'video_reference'.")
     if params.image_reference or params.video_reference:
         return
-    from tensorrt_llm.visual_gen.params import MediaRef
+    from tensorrt_llm.media.reference import MediaRef
 
     if hasattr(input_reference, "file"):  # multipart upload — form implied
         payload = input_reference.file.read()
     else:
+        # Imported here, not at module scope: the resolver reaches into
+        # VisualGen, and a plain LLM deployment must not pull a vertical in
+        # behind its request schema.
+        from tensorrt_llm.visual_gen.media_refs import _resolve_reference
+
         payload = _resolve_reference(input_reference, input_reference_format)
     kind = sniff_media_kind(payload)
     if kind == "image":

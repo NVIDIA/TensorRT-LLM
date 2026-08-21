@@ -58,10 +58,10 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.media.reference import ContentFormat, Role
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
-from tensorrt_llm.visual_gen.params import ContentFormat, Role
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
