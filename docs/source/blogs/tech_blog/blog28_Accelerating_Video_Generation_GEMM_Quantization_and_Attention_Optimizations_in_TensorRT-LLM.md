@@ -1,4 +1,4 @@
-# Accelerating Video Generation: Quantization and Attention Optimizations in TensorRT-LLM
+# Accelerating Video Generation: GEMM Quantization and Attention Optimizations in TensorRT-LLM
 
 By NVIDIA TensorRT-LLM Team
 
