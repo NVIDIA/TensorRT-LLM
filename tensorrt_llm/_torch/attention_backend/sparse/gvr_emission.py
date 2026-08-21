@@ -75,7 +75,12 @@ class GvrEmissionState:
     """Per-attention-backend emission state (persistent buffers)."""
 
     def __init__(
-        self, max_rows: int, top_k: int, device: torch.device, enable_list_tier: bool = True
+        self,
+        max_rows: int,
+        top_k: int,
+        device: torch.device,
+        enable_list_tier: bool = True,
+        own_prior: bool = True,
     ):
         self.max_rows = max_rows
         self.top_k = top_k
@@ -102,8 +107,12 @@ class GvrEmissionState:
             self.cand_ctl = torch.zeros((cand_rows, 4), dtype=torch.int32, device=device)
             self.cand_cur = torch.zeros((cand_rows, 4), dtype=torch.int32, device=device)
         # previous-step top-k feedback (address-stable; zero-init ->
-        # first step's pre_idx points at index 0, a benign candidate)
-        self.prev_topk = torch.zeros((max_rows, top_k), dtype=torch.int32, device=device)
+        # first step's pre_idx points at index 0, a benign candidate).
+        # own_prior=False when the caller already keeps this state (the
+        # TopK module rides metadata's gvr_prior_indices).
+        self.prev_topk = (
+            torch.zeros((max_rows, top_k), dtype=torch.int32, device=device) if own_prior else None
+        )
         # block_max prefix ([rows, nb_pad*4] fp32 warp-partials),
         # allocated lazily once max_seq_len is known
         self.block_max: Optional[torch.Tensor] = None
