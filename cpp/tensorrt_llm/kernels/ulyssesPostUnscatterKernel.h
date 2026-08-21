@@ -63,8 +63,8 @@ void launchUlyssesPostUnscatter(void const* q_in, // [P, B, Sp_q, H_q, D]
 // Packed-QKV variant for self-attention. Consumes the raw packed all-to-all
 // receive buffer [P, B, Sp, 3, H, D] and writes per-tensor NHD-contig outputs
 // [B, P*Sp, H, D].
-void launchUlyssesPackedQkvPostUnscatter(void const* qkv_in, void* q_out, void* k_out, void* v_out, int P, int B,
-    int Sp, int H, int D, cudaStream_t stream);
+void launchUlyssesPackedQkvPostUnscatter(
+    void const* qkv_in, void* q_out, void* k_out, void* v_out, int P, int B, int Sp, int H, int D, cudaStream_t stream);
 
 } // namespace kernels
 
