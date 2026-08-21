@@ -926,7 +926,15 @@ class BounceReactor:
         self._dispatch_row(route, cid, kind, bool(ok))
 
     def _park_unrouted_locked(self, cid: int, kind: int, ok: int) -> None:
-        """Park an unrouted row (bounded). _req_mu held."""
+        """Park an unrouted row (bounded). _req_mu held.
+
+        Pathological-only caveat: with the dict full, the evicted "oldest"
+        could in principle be a legitimate mid-registration row; that chunk
+        then waits for the request timeout — with request_timeout_ms=0 that
+        wait() never resolves. Reaching 4096 simultaneously parked rows
+        requires a wedged registration path, so the loud warning is the
+        actionable signal.
+        """
         if len(self._unrouted) >= _UNROUTED_MAX:
             oldest = min(self._unrouted, key=lambda c: self._unrouted[c][0])
             del self._unrouted[oldest]
@@ -1047,6 +1055,13 @@ class BounceReactor:
         (``req.pump_busy`` True) — either via :meth:`_pump` or pre-owned at
         request registration (``submit``'s eager-gather guarantee)."""
         did_work = False
+        # Tracks whether THIS thread still holds pump ownership: the idle
+        # exit below releases it atomically with the pump_again re-check, and
+        # from that instant another thread may legitimately own the pump —
+        # the finally must not stomp pump_busy it no longer owns (a second
+        # concurrent owner could re-select a mid-post chunk and duplicate the
+        # RDMA write into a region the ACK chain then recycles under it).
+        owned = True
         try:
             while True:
                 action = None
@@ -1078,6 +1093,7 @@ class BounceReactor:
                         # other retry path (_drain_pending_posts only rescans
                         # requests with parked credits / unlaunched chunks).
                         req.pump_busy = False
+                        owned = False
                         break
                 try:
                     rc = self._execute_action(rid, req, action)
@@ -1099,21 +1115,30 @@ class BounceReactor:
                 if rc != _PUMP_CONTINUE:
                     break  # copy pool BUSY / request failed
         finally:
-            # Idempotent (the idle exit above cleared it atomically with its
-            # pump_again check): this is the exception backstop. pump_again is
-            # deliberately NOT consumed here — with pump_busy False the next
-            # _pump (handler or the per-tick _drain_pending_posts) owns the
-            # sweep and clears it.
-            with self._req_mu:
-                req.pump_busy = False
+            # Exception/early-exit backstop: release ownership ONLY if this
+            # thread still holds it — after the atomic idle release another
+            # thread may already own the pump, and clearing its flag would
+            # admit a concurrent second owner. pump_again is deliberately NOT
+            # consumed here — with pump_busy False the next _pump (handler or
+            # the per-tick _drain_pending_posts) owns the sweep and clears
+            # it. KNOWN LIMIT (defense-in-depth path only): if an exception
+            # escapes _execute_action, a fully-launched request whose only
+            # remaining work is a GATHERED+credited post is not rescanned by
+            # _drain_pending_posts and waits for the request timeout.
+            if owned:
+                with self._req_mu:
+                    req.pump_busy = False
         return did_work
 
     def _next_action_locked(self, rid: int, req: _Request) -> Optional[tuple]:
         """Pick (and mark, via ``busy_op``) the next C++ transition. _req_mu
         held; PURE STATE. Chunk transitions first (FIFO over ``posted``),
-        then a new gather launch. Only the pump owner calls this, so no chunk
-        can already be busy here."""
+        then a new gather launch. Only the pump owner calls this; the
+        ``busy_op`` skip is belt-and-braces against any future ownership bug
+        re-selecting a chunk that is mid-EXECUTE on another thread."""
         for p in req.posted:
+            if p.busy_op is not None:
+                continue
             if p.state == _PostState.GATHERING and p.has_credit and p.copy_id >= 0:
                 if p.reserved and not p.fulfilled:
                     # Two-phase chain: the credit completes the reservation
