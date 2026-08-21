@@ -727,6 +727,87 @@ def test_selfsampling_varlen_regclus_cuda_graph():
         assert torch.equal(got, ref_v)
 
 
+def test_selfsampling_varlen_reg_parity_and_oracle():
+    """The varlen launcher must admit the register-resident family (and its
+    img flavor) exactly where the free route picks it (route() parity tier 2),
+    and the per-row varlen port must match the reference oracle on a
+    heterogeneous batch: long rows, a short row (n <= k; k can exceed BLK on
+    this family, exercising the strided identity + -1 tail loop) and a
+    zero-window row, under MTP row windows (next_n=4)."""
+    torch.manual_seed(13)
+    # (k, msl_c, cr, expected free-route family)
+    cases = [
+        (512, 6144, 4, "reg"),  # v4-style small-N band
+        (2048, 8192, 1, "reg"),  # k > BLK: strided short-row emit
+        (512, 3072, 4, "regimg"),  # img window (n4 in (512, 1024])
+    ]
+    nn = 4
+    batch = 3
+    rows = batch * nn
+    for k, msl_c, cr, want in cases:
+        npad = (msl_c + 63) // 64 * 64
+        fam = ss_host.route(rows, msl_c, npad, k)["kernel"]
+        assert fam == want, (fam, want, k, msl_c)
+        msl = msl_c * cr
+        lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
+        pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
+        kv = torch.tensor(
+            [msl, max((k - 3) * cr, nn), nn - 1], dtype=torch.int32, device=_DEV
+        )
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
+        key = (rows, npad, k, msl_c, nn, cr)
+        assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
+        ss_host.run_varlen(
+            lg,
+            pre,
+            kv,
+            ref,
+            next_n=nn,
+            compress_ratio=cr,
+            max_seq_len=msl,
+            engine="reference",
+        )
+        torch.cuda.synchronize()
+        for r in range(rows):
+            if (ref[r] >= 0).any():
+                row = lg[r].float()
+                got = row[out[r].long().clamp_min(0)].sort().values
+                want_v = row[ref[r].long().clamp_min(0)].sort().values
+                assert torch.equal(got, want_v), f"k={k} row {r} value multiset mismatch"
+                assert torch.equal(out[r] < 0, ref[r] < 0), f"k={k} row {r} pad mask mismatch"
+            else:
+                assert torch.equal(out[r], ref[r]), f"k={k} row {r} expected all -1"
+
+
+def test_selfsampling_varlen_reg_cuda_graph():
+    """Register-family varlen engine must be CUDA-graph capturable: warmed
+    engine, capture one launch, replay twice, tie-aware exact each time."""
+    k, msl_c, cr = 512, 4096, 4
+    rows = 16
+    torch.manual_seed(17)
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    pre = torch.randint(0, msl_c, (rows, k), dtype=torch.int32, device=_DEV)
+    kv = torch.full((rows,), msl_c * cr, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    key = (rows, msl_c, k, msl_c, 1, cr)
+    assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
+    g = torch.cuda.CUDAGraph()
+    out.fill_(-7)
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(lg, pre, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
+    ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
+    for _ in range(2):
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values
+        assert torch.equal(got, ref_v)
+
+
 def test_selfsampling_varlen_full_row_range():
     """Full-range production contract: with self-sampling enabled, EVERY row
     count dispatches to the self-sampling engines (no rows-based fall-through)

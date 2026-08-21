@@ -757,6 +757,25 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
         lc = ("reg_clus", fn, n_eff)
         _VARLEN_CACHE[key] = lc
         return lc
+    # ---- route() parity, family tier 2: register-resident (+img flavor) ----
+    # Same admission rule as tier 1: exactly where the free route picks
+    # reg/regimg (the whole small/mid-N band across all row counts). CMP/QC/
+    # smem are envelope-derived launch constants -- in-kernel they are pure
+    # capacity clamps (CMP), a fast-path threshold (QC) and the launch smem
+    # size, all safe upper bounds for every per-row n <= envelope; per-row n
+    # / short-row handling lives in-kernel (GvrRegClusKernel discipline).
+    if plan_free["kernel"] in ("reg", "regimg"):
+        fn = dev.get_compiled__reg(
+            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+        )
+        rt_f = plan_free["rt"]
+        lc = (
+            "reg",
+            fn,
+            (rt_f["n"], rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+        )
+        _VARLEN_CACHE[key] = lc
+        return lc
     plan = route_streaming(num_rows, n_eff, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
     rt = plan["rt"]
@@ -1021,8 +1040,14 @@ def _build_launcher(b, n, npad, k):
     rt = rd["rt"]
     if fam in ("reg", "regimg"):
         dev = _device()
-        fn = dev.get_compiled__reg(tpl)
-        # compiled ABI: (logits, pre_idx, out, n, CMP, QC, smem_total)
+        raw = dev.get_compiled__reg(tpl)
+
+        # compiled ABI: (logits, pre_idx, kv_lens, out, n, CMP, QC,
+        # smem_total) -- kv_lens is the dead varlen slot in batch-uniform
+        # mode (dummy, gvr_main/reg_clus precedent)
+        def fn(lg, pi, o, *a, _raw=raw):
+            _raw(lg, pi, _dummy_kv(lg.get_device(), lg.device), o, *a)
+
         args = (rt["n"], rt["CMP"], rt["QC"], dev.STATIC_BYTES + rd["smem"])
         return (fn, args, False)
     if fam == "main":
@@ -1424,6 +1449,9 @@ def run_varlen(
         if lc[0] == "reg_clus":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_envelope)
             lc[1](lg, pre_idx, kv_lens, idx, lc[2])
+        elif lc[0] == "reg":
+            # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, CMP, QC, smem)
+            lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
         else:
             _, fn, pre, tail = lc
             fn(lg, pre_idx, idx, ws, *pre, kv_lens, *tail)
@@ -1543,6 +1571,8 @@ def warmup_varlen(
         plan_free = route(r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k))
         if plan_free["kernel"] == "reg_clus":
             ekey = ("reg_clus", tuple(plan_free["tpl"]))
+        elif plan_free["kernel"] in ("reg", "regimg"):
+            ekey = ("reg", tuple(plan_free["tpl"]))
         else:
             p = route_streaming(
                 r,
