@@ -1988,8 +1988,9 @@ class PerfSanityTestConfig:
             ctx_config = dict(worker_config.get("ctx", {}))
             # Ignore cache_transceiver_config for ctx_only
             ctx_config.pop("cache_transceiver_config", None)
-            # Disable overlap scheduler for ctx_only
-            ctx_config["disable_overlap_scheduler"] = True
+            # The overlap scheduler setting is taken from the ctx worker config
+            # so that ctx_only measures the same scheduler path the ctx worker
+            # uses in e2e. ServerConfig defaults it to False when unset.
 
             # Create server config for ctx_only (single ServerConfig, not tuple)
             ctx_server_config_data = {
