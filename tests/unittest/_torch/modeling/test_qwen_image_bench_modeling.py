@@ -122,6 +122,38 @@ def test_qwen_image_bench_config_uses_internal_arch_and_normalizes_text(tmp_path
     assert extract_mamba_kv_cache_params(config.text_config).mamba_ssm_cache_dtype is torch.bfloat16
 
 
+def test_qwen_image_bench_config_normalizes_top_level_quantization(tmp_path):
+    model_dir = tmp_path / "Qwen-Image-Bench-FP8"
+    model_dir.mkdir()
+    _write_qwen_image_bench_config(model_dir)
+
+    config_path = model_dir / "config.json"
+    raw_config = json.loads(config_path.read_text())
+    raw_config["quantization_config"] = {
+        "activation_scheme": "dynamic",
+        "modules_to_not_convert": [
+            "model.language_model.layers.0.linear_attn.in_proj_a",
+            "model.visual.blocks.0.attn.qkv",
+            "mtp.layers.0.self_attn.q_proj",
+        ],
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    config_path.write_text(json.dumps(raw_config))
+
+    config = load_pretrained_config(str(model_dir))
+
+    excluded = config.quantization_config["modules_to_not_convert"]
+    assert "model.layers.0.linear_attn.in_proj_ba" in excluded
+    assert "model.layers.0.linear_attn.in_proj_qkvz" in excluded
+    assert "model.layers.1.linear_attn.in_proj_qkvz" in excluded
+    assert "model.layers.2.linear_attn.in_proj_qkvz" in excluded
+    assert "model.layers.3.linear_attn.in_proj_qkvz" not in excluded
+    assert not any(name.startswith("model.language_model.") for name in excluded)
+    assert not any(name.startswith("model.visual.") for name in excluded)
+    assert not any(name.startswith("mtp.") for name in excluded)
+
+
 def test_qwen3_5_conditional_text_config_does_not_use_image_bench_arch(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(_qwen3_5_text_config()))
 
