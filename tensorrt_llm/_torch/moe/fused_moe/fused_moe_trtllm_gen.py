@@ -28,9 +28,9 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
+from ...modules.gated_mlp import GatedMLP
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
                       Fp4QuantizedTensor, MxFp8QuantizedTensor)
-from ..gated_mlp import GatedMLP
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
                             require_comm_plan)
