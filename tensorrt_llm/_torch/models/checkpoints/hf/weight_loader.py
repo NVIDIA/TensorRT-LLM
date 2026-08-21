@@ -293,7 +293,14 @@ class HfWeightLoader(BaseWeightLoader):
         self._lazy_handles = handles
         logger.info(f"Lazily opened {len(weight_files)} safetensors files "
                     f"({len(weights)} tensors) from {checkpoint_dir}")
-        return ConsumableWeightsDict(weights)
+        lazy_weights = ConsumableWeightsDict(weights)
+        # A lazy slice does not carry the file it came from, and a model that
+        # wants to re-open shards itself (Kimi K3 streams rank-local experts
+        # per shard file, precisely to avoid holding this mapping open) has no
+        # other reliable source: transformers no longer sets
+        # ``PretrainedConfig._name_or_path``.
+        lazy_weights.checkpoint_dir = checkpoint_dir
+        return lazy_weights
 
     def load_weights(self,
                      checkpoint_dir: str,
