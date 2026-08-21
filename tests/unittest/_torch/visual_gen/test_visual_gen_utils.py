@@ -68,7 +68,7 @@ def image_request_defaults():
 
 @pytest.fixture
 def video_request_defaults():
-    return VideoGenerationRequest(prompt="storm", response_format="b64_json")
+    return VideoGenerationRequest(prompt="storm", response_format="file")
 
 
 # =============================================================================
