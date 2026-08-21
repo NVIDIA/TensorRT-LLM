@@ -55,30 +55,10 @@ void initBounceV2Bindings(nb::module_& m, nb::class_<kvc::NixlTransferAgent, kvc
         .def(nb::init<std::uint32_t>(), nb::arg("poll_interval_us") = 50, nb::call_guard<nb::gil_scoped_release>())
         .def_ro_static("KIND_EVENT", &CompletionPoller::kKindEvent)
         .def_ro_static("KIND_XFER", &CompletionPoller::kKindXfer)
-        .def_ro_static("FULFILL_DECLINED", &CompletionPoller::kFulfillDeclined)
-        .def_ro_static("FULFILL_ARMED", &CompletionPoller::kFulfillArmed)
-        .def_ro_static("FULFILL_POSTED", &CompletionPoller::kFulfillPosted)
-        .def_ro_static("CANCEL_TERMINAL", &CompletionPoller::kCancelTerminal)
-        .def_ro_static("CANCEL_REVERTED", &CompletionPoller::kCancelReverted)
         .def("set_wakeup_fd", &CompletionPoller::setWakeupFd, nb::arg("fd"), nb::call_guard<nb::gil_scoped_release>(),
             "Completion wakeup fd: publishing (or retiring) completions writes one 8-byte token "
             "(uint64 1 — eventfd- and pipe-compatible) to fd, non-blocking, errors ignored. Pass "
             "-1 to clear; after that returns no thread writes the old fd, so it may be closed.")
-        .def("reserve_chain", &CompletionPoller::reserveChain, nb::arg("copy_id"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Two-phase chain, phase 1 (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): reserve a chain id on a "
-            "still-pending copy_id BEFORE the RDMA destination is known. The event's own "
-            "completion is consumed in C++ from here on: gather-ok waits for fulfill_chain_1to1 "
-            "(nothing published), gather-fail publishes (reserved, KIND_EVENT, 0), shutdown "
-            "publishes (reserved, KIND_XFER, 0). Returns the reserved id, or -1 when the copy_id "
-            "is no longer pending — keep the classic route.")
-        .def("cancel_chain", &CompletionPoller::cancelChain, nb::arg("reserved_id"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Abandon a reserved-but-unfulfilled chain. Returns CANCEL_REVERTED when the gather is "
-            "still pending (its completion publishes under the ORIGINAL copy_id again — re-route "
-            "it), or CANCEL_TERMINAL when the reservation is already terminal (gather done or "
-            "failed / shutdown: the staging region is recyclable now; any already-published "
-            "failure row should find its route removed).")
         .def(
             "drain",
             [](CompletionPoller& self, int timeoutMs)
@@ -137,24 +117,42 @@ void initBounceV2Bindings(nb::module_& m, nb::class_<kvc::NixlTransferAgent, kvc
             "device addresses) as one batched kernel launch. Returns the poller completion id, or "
             "BUSY when no stream context is free.")
         .def(
-            "submit_copy_chained",
-            [](BatchedCopyPool& self, U64Array srcs, U64Array dsts, U32Array sizes)
+            "register_plan",
+            [](BatchedCopyPool& self, U64Array srcs, U64Array bounceOffsets, U32Array sizes, U64Array chunkStarts)
             {
                 std::size_t const n = srcs.shape(0);
-                if (dsts.shape(0) != n || sizes.shape(0) != n)
+                if (bounceOffsets.shape(0) != n || sizes.shape(0) != n)
                 {
-                    throw std::invalid_argument("submit_copy_chained: srcs/dsts/sizes must have the same length");
+                    throw std::invalid_argument("register_plan: srcs/bounce_offsets/sizes must have the same length");
                 }
-                std::uint64_t reserved = 0;
-                std::int64_t const copyId = self.submitCopy(srcs.data(), dsts.data(), sizes.data(), n, &reserved);
-                return std::make_pair(copyId, reserved == 0 ? std::int64_t{-1} : static_cast<std::int64_t>(reserved));
+                if (chunkStarts.shape(0) < 2)
+                {
+                    throw std::invalid_argument("register_plan: chunk_starts must have at least 2 entries");
+                }
+                return self.registerPlan(
+                    srcs.data(), bounceOffsets.data(), sizes.data(), chunkStarts.data(), n, chunkStarts.shape(0) - 1);
             },
-            nb::arg("srcs"), nb::arg("dsts"), nb::arg("sizes"), nb::call_guard<nb::gil_scoped_release>(),
-            "submit_copy + a two-phase chain reservation taken ATOMICALLY with the completion-event "
-            "registration (never loses the reserve race to the poll thread, unlike a separate "
-            "reserve_chain call). Returns (copy_id, reserved_id); (BUSY, -1) when no stream context "
-            "is free, and reserved_id -1 when the poller is already shut down (the copy_id then "
-            "resolves classically).")
+            nb::arg("srcs"), nb::arg("bounce_offsets"), nb::arg("sizes"), nb::arg("chunk_starts"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Register one request's ENTIRE gather plan in ONE call (per-request plan handle): flat "
+            "per-desc source addresses, REGION-RELATIVE bounce offsets and sizes over all chunks, "
+            "sliced by chunk_starts ([n_chunks + 1] desc-index boundaries). The arrays are copied "
+            "into pool-owned memory. Returns the plan handle; free it with release_plan() on the "
+            "request's terminal paths (remaining plans are dropped at pool destruction). The plan "
+            "holds no arena-region addresses — the staging base is a launch_chunk argument.")
+        .def("release_plan", &BatchedCopyPool::releasePlan, nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(),
+            "Drop a registered plan (idempotent). A launch_chunk racing this call either completes "
+            "on its pinned plan snapshot or raises ValueError (unknown handle) deterministically; "
+            "a launch AFTER release always raises.")
+        .def(
+            "launch_chunk",
+            [](BatchedCopyPool& self, std::uint64_t handle, std::size_t chunkIdx, std::uint64_t stagingBase)
+            { return self.launchChunk(handle, chunkIdx, stagingBase); },
+            nb::arg("handle"), nb::arg("chunk_idx"), nb::arg("staging_base"), nb::call_guard<nb::gil_scoped_release>(),
+            "Launch ONE chunk of a registered plan: gather its descs to staging_base + offset as "
+            "one batched kernel, entirely from the pre-marshalled plan (scalar args only — no "
+            "per-call array marshalling). Returns the poller completion id, or BUSY when no stream "
+            "context is free. Raises ValueError on an unknown/released handle or chunk index.")
         .def(
             "submit_scatter_runs",
             [](BatchedCopyPool& self, std::uint64_t regionBase, std::uint64_t regionBytes, U8Array runs)
@@ -236,64 +234,52 @@ void initBounceV2Bindings(nb::module_& m, nb::class_<kvc::NixlTransferAgent, kvc
             "VMM splitter) and hand its TransferStatus to the poller. Returns the poller completion "
             "id, or -1 when the post failed.")
         .def(
-            "post_transfer_1to1_on_event",
-            [](kvc::NixlTransferAgent& self, std::uint64_t copyId, std::uintptr_t srcPtr, std::uintptr_t dstPtr,
-                std::size_t nbytes, std::uint32_t srcDev, std::uint32_t dstDev, std::string const& peer,
-                CompletionPoller& poller) -> std::int64_t
+            "launch_chunk_chained",
+            [](kvc::NixlTransferAgent& self, BatchedCopyPool& pool, std::uint64_t handle, std::size_t chunkIdx,
+                std::uint64_t stagingBase, std::uintptr_t dstPtr, std::size_t nbytes, std::uint32_t srcDev,
+                std::uint32_t dstDev, std::string const& peer,
+                CompletionPoller& poller) -> std::pair<std::int64_t, std::int64_t>
             {
-                auto poster = [agent = &self, srcPtr, dstPtr, nbytes, srcDev, dstDev,
-                                  peer]() -> std::unique_ptr<kvc::TransferStatus>
+                std::uint64_t reserved = 0;
+                std::int64_t const copyId = pool.launchChunk(handle, chunkIdx, stagingBase, &reserved);
+                if (copyId == BatchedCopyPool::kBusy || reserved == 0)
+                {
+                    // BUSY, or no reservation possible (poller shut down): the caller keeps the
+                    // classic route — the copy_id (if any) resolves under its own completion id.
+                    return {copyId, std::int64_t{-1}};
+                }
+                auto poster = [agent = &self, srcPtr = static_cast<std::uintptr_t>(stagingBase), dstPtr, nbytes, srcDev,
+                                  dstDev, peer]() -> std::unique_ptr<kvc::TransferStatus>
                 {
                     kvc::TransferDescs srcDescs{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{srcPtr, nbytes, srcDev}}};
                     kvc::TransferDescs dstDescs{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{dstPtr, nbytes, dstDev}}};
                     return agent->postXferRequestLocked(
                         kvc::TransferOp::kWRITE, srcDescs, dstDescs, peer, /*syncMessage=*/{});
                 };
-                return poller.armXferAfterEvent(copyId, std::move(poster));
+                // The reservation was taken atomically with the event registration, so this
+                // fulfill can only be DECLINED when the gather already FAILED (its terminal row
+                // (reserved, KIND_EVENT, 0) is published/pending) — nothing to do either way:
+                // exactly one terminal row per reserved id is guaranteed by the poller.
+                static_cast<void>(poller.fulfillChain(reserved, std::move(poster)));
+                return {copyId, static_cast<std::int64_t>(reserved)};
             },
-            nb::arg("copy_id"), nb::arg("src_ptr"), nb::arg("dst_ptr"), nb::arg("nbytes"), nb::arg("src_dev"),
-            nb::arg("dst_dev"), nb::arg("peer"), nb::arg("poller"),
-            // The armed poster captures the agent; keep the agent alive at least as long as the
+            nb::arg("pool"), nb::arg("handle"), nb::arg("chunk_idx"), nb::arg("staging_base"), nb::arg("dst_ptr"),
+            nb::arg("nbytes"), nb::arg("src_dev"), nb::arg("dst_dev"), nb::arg("peer"), nb::arg("poller"),
+            // The chain poster captures the agent; keep the agent alive at least as long as the
             // poller that may still run it (the engine teardown order already guarantees this;
-            // keep_alive is belt-and-braces for ad-hoc scripts).
-            nb::keep_alive<9, 1>(), nb::call_guard<nb::gil_scoped_release>(),
-            "EXPERIMENTAL (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): arm a gather->RDMA chain — when the "
-            "given copy_id (a submit_copy completion id still pending in the poller) completes "
-            "successfully, the C++ poll thread itself posts this single-descriptor RDMA write and "
-            "polls it under a RESERVED completion id, which is returned. The gather completion is "
-            "consumed in C++ (never drained), so Python sees exactly ONE completion per chunk: "
-            "(reserved, KIND_XFER, ok) after the write, (reserved, KIND_XFER, 0) when the post "
-            "failed or shutdown intervened, (reserved, KIND_EVENT, 0) when the gather itself "
-            "failed (write never posted). Returns -1 when the copy_id is no longer pending "
-            "(already completed / unknown / double-arm) — fall back to the classic path.")
-        .def(
-            "fulfill_chain_1to1",
-            [](kvc::NixlTransferAgent& self, std::int64_t reservedId, std::uintptr_t srcPtr, std::uintptr_t dstPtr,
-                std::size_t nbytes, std::uint32_t srcDev, std::uint32_t dstDev, std::string const& peer,
-                CompletionPoller& poller) -> std::int64_t
-            {
-                auto poster = [agent = &self, srcPtr, dstPtr, nbytes, srcDev, dstDev,
-                                  peer]() -> std::unique_ptr<kvc::TransferStatus>
-                {
-                    kvc::TransferDescs srcDescs{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{srcPtr, nbytes, srcDev}}};
-                    kvc::TransferDescs dstDescs{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{dstPtr, nbytes, dstDev}}};
-                    return agent->postXferRequestLocked(
-                        kvc::TransferOp::kWRITE, srcDescs, dstDescs, peer, /*syncMessage=*/{});
-                };
-                return poller.fulfillChain(static_cast<std::uint64_t>(reservedId), std::move(poster));
-            },
-            nb::arg("reserved_id"), nb::arg("src_ptr"), nb::arg("dst_ptr"), nb::arg("nbytes"), nb::arg("src_dev"),
-            nb::arg("dst_dev"), nb::arg("peer"), nb::arg("poller"),
-            // Same keep-alive rationale as post_transfer_1to1_on_event: the poster captures the
-            // agent, which the poller may still run after this call returns.
-            nb::keep_alive<9, 1>(), nb::call_guard<nb::gil_scoped_release>(),
-            "Two-phase chain, phase 2 (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): attach this "
-            "single-descriptor RDMA write to a reserve_chain() reservation now that the "
-            "destination is known. Returns FULFILL_ARMED (gather still pending; posts on the poll "
-            "thread when it fires), FULFILL_POSTED (gather already done; the write was posted "
-            "inline and is polled under the reserved id), or FULFILL_DECLINED (a terminal row for "
-            "the reserved id is already published/pending — do not post; just wait for it). Every "
-            "outcome keeps exactly ONE terminal row per reserved id.");
+            // keep_alive is belt-and-braces for ad-hoc scripts). `poller` MUST be the pool's own
+            // poller (the engine wires exactly one).
+            nb::keep_alive<11, 1>(), nb::call_guard<nb::gil_scoped_release>(),
+            "Gather->RDMA chain for a credited chunk in ONE call: launch chunk_idx's gather from "
+            "the registered plan (see BatchedCopyPool.register_plan) into staging_base, and have "
+            "the C++ poll thread post this single-descriptor RDMA write of the staged region the "
+            "moment the gather completes — no Python hop between gather and post. Returns "
+            "(copy_id, reserved_id). Python sees exactly ONE completion per chained chunk, under "
+            "reserved_id: (reserved, KIND_XFER, 1) after the write, (reserved, KIND_XFER, 0) when "
+            "the post failed or shutdown intervened, (reserved, KIND_EVENT, 0) when the gather "
+            "itself failed (write never posted). (BUSY, -1) when no stream context is free; "
+            "(copy_id, -1) when the poller is already shut down — the copy_id then resolves "
+            "classically under its own id. Raises ValueError on an unknown/released plan handle.");
 }
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce_v2

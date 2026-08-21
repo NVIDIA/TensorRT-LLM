@@ -22,7 +22,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime_api.h>
@@ -90,12 +92,40 @@ public:
     /// Returns the CompletionPoller id of the recorded completion event, or kBusy when no stream
     /// context is free. Thread-safe. Throws on CUDA failure (the context is returned first).
     ///
-    /// `reserveChainId` (optional, two-phase chain): forwarded to
+    /// `reserveChainId` (optional, gather->RDMA chain): forwarded to
     /// CompletionPoller::registerEvent so the chain reservation is taken ATOMICALLY with the event
     /// registration (guaranteed — never loses the race to the poll sweep). 0 when unavailable
     /// (poller shut down); untouched on kBusy/throw.
     [[nodiscard]] std::int64_t submitCopy(std::uint64_t const* srcs, std::uint64_t const* dsts,
         std::uint32_t const* sizes, std::size_t n, std::uint64_t* reserveChainId = nullptr);
+
+    /// Register one sender request's ENTIRE gather plan (per-request plan handle): flat per-desc
+    /// arrays over all chunks, sliced by `chunkStarts` ([nChunks + 1] monotonic desc-index
+    /// boundaries; chunkStarts[0] == 0, chunkStarts[nChunks] == nDescs). `bounceOffsets` are
+    /// REGION-RELATIVE staging offsets — the absolute destination is stagingBase + offset,
+    /// resolved per launchChunk() call, so the registered plan never references arena regions.
+    /// The arrays are copied into pool-owned memory (the caller's buffers may be freed after this
+    /// returns). Returns the plan handle. Thread-safe. Throws std::invalid_argument on malformed
+    /// boundaries or a chunk exceeding maxPlanEntries().
+    ///
+    /// Lifecycle: the caller frees a handle explicitly via releasePlan() on the request's
+    /// terminal paths; every remaining plan is dropped at pool destruction. A launchChunk()
+    /// concurrent with releasePlan() is safe (the launch pins the plan via shared ownership);
+    /// a launch AFTER release throws std::invalid_argument (unknown handle) deterministically.
+    [[nodiscard]] std::uint64_t registerPlan(std::uint64_t const* srcs, std::uint64_t const* bounceOffsets,
+        std::uint32_t const* sizes, std::uint64_t const* chunkStarts, std::size_t nDescs, std::size_t nChunks);
+
+    /// Drop a registered plan (idempotent for unknown handles).
+    void releasePlan(std::uint64_t handle);
+
+    /// Launch ONE chunk of a registered plan: gather chunk `chunkIdx`'s descs from their source
+    /// addresses to stagingBase + bounceOffsets (with the same <= 64 KiB run splitting as
+    /// submitCopy), entirely from the pre-marshalled plan — no per-call array marshalling.
+    /// Returns the CompletionPoller id of the completion event, or kBusy. `reserveChainId` as in
+    /// submitCopy. Thread-safe. Throws std::invalid_argument on an unknown handle or chunk index,
+    /// and on CUDA failure like submitCopy.
+    [[nodiscard]] std::int64_t launchChunk(
+        std::uint64_t handle, std::size_t chunkIdx, std::uint64_t stagingBase, std::uint64_t* reserveChainId = nullptr);
 
     /// Receiver-side scatter of one DATA chunk in ONE call: validate the RAW wire runs against the
     /// granted region, expand them to per-piece copies (with the same <= 64 KiB run splitting as
@@ -139,8 +169,22 @@ private:
         void* hostPinnedDev{nullptr}; // device alias of hostPinned (kernel reads the plan in place)
     };
 
+    /// One registered per-request gather plan (see registerPlan). Immutable after construction;
+    /// held by shared_ptr so an in-flight launchChunk survives a concurrent releasePlan.
+    struct RequestPlan
+    {
+        std::vector<std::uint64_t> srcs;
+        std::vector<std::uint64_t> bounceOffsets;
+        std::vector<std::uint32_t> sizes;
+        std::vector<std::uint64_t> chunkStarts;
+    };
+
     [[nodiscard]] Ctx* tryAcquire();
     void release(Ctx* ctx);
+    /// Shared launch body of submitCopy/launchChunk: dst[i] = dstBase + dstOffsets[i] (submitCopy
+    /// passes absolute dsts with dstBase 0).
+    [[nodiscard]] std::int64_t launchGather(std::uint64_t const* srcs, std::uint64_t const* dstOffsets,
+        std::uint64_t dstBase, std::uint32_t const* sizes, std::size_t n, std::uint64_t* reserveChainId);
     /// Free every allocated context resource (never throws; used by the destructor and the
     /// constructor's failure path).
     void destroyContexts();
@@ -152,6 +196,11 @@ private:
     std::vector<Ctx> mCtxs;
     std::mutex mMu;
     std::deque<std::uint32_t> mFree;
+
+    std::mutex mPlanMu; // guards mPlans / mNextPlanId (separate from mMu: plan lookups must not
+                        // serialize behind context acquire/release)
+    std::uint64_t mNextPlanId{1};
+    std::unordered_map<std::uint64_t, std::shared_ptr<RequestPlan const>> mPlans;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce_v2

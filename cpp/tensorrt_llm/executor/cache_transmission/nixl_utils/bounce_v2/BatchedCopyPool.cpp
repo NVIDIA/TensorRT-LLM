@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
+#include <stdexcept>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache::bounce_v2
@@ -248,8 +250,71 @@ std::size_t BatchedCopyPool::freeCount()
 std::int64_t BatchedCopyPool::submitCopy(std::uint64_t const* srcs, std::uint64_t const* dsts,
     std::uint32_t const* sizes, std::size_t n, std::uint64_t* reserveChainId)
 {
+    return launchGather(srcs, dsts, /*dstBase=*/0, sizes, n, reserveChainId);
+}
+
+std::uint64_t BatchedCopyPool::registerPlan(std::uint64_t const* srcs, std::uint64_t const* bounceOffsets,
+    std::uint32_t const* sizes, std::uint64_t const* chunkStarts, std::size_t nDescs, std::size_t nChunks)
+{
+    if (nChunks == 0 || chunkStarts[0] != 0 || chunkStarts[nChunks] != nDescs)
+    {
+        throw std::invalid_argument("BatchedCopyPool::registerPlan: malformed chunk boundaries");
+    }
+    for (std::size_t c = 0; c < nChunks; ++c)
+    {
+        if (chunkStarts[c + 1] < chunkStarts[c] || chunkStarts[c + 1] - chunkStarts[c] > mMaxPlanEntries)
+        {
+            throw std::invalid_argument(
+                "BatchedCopyPool::registerPlan: chunk boundaries non-monotonic or chunk exceeds maxPlanEntries");
+        }
+    }
+    auto plan = std::make_shared<RequestPlan>();
+    plan->srcs.assign(srcs, srcs + nDescs);
+    plan->bounceOffsets.assign(bounceOffsets, bounceOffsets + nDescs);
+    plan->sizes.assign(sizes, sizes + nDescs);
+    plan->chunkStarts.assign(chunkStarts, chunkStarts + nChunks + 1);
+    std::lock_guard<std::mutex> lk(mPlanMu);
+    std::uint64_t const handle = mNextPlanId++;
+    mPlans.emplace(handle, std::move(plan));
+    return handle;
+}
+
+void BatchedCopyPool::releasePlan(std::uint64_t handle)
+{
+    std::lock_guard<std::mutex> lk(mPlanMu);
+    mPlans.erase(handle);
+}
+
+std::int64_t BatchedCopyPool::launchChunk(
+    std::uint64_t handle, std::size_t chunkIdx, std::uint64_t stagingBase, std::uint64_t* reserveChainId)
+{
+    std::shared_ptr<RequestPlan const> plan;
+    {
+        std::lock_guard<std::mutex> lk(mPlanMu);
+        auto const it = mPlans.find(handle);
+        if (it == mPlans.end())
+        {
+            // Deterministic terminal for a launch racing the plan's release (the request already
+            // failed): the caller's launch-error path handles it (no kernel was launched).
+            throw std::invalid_argument("BatchedCopyPool::launchChunk: unknown plan handle");
+        }
+        plan = it->second;
+    }
+    if (chunkIdx >= plan->chunkStarts.size() - 1)
+    {
+        throw std::invalid_argument("BatchedCopyPool::launchChunk: chunk index out of range");
+    }
+    std::size_t const lo = static_cast<std::size_t>(plan->chunkStarts[chunkIdx]);
+    std::size_t const hi = static_cast<std::size_t>(plan->chunkStarts[chunkIdx + 1]);
+    return launchGather(plan->srcs.data() + lo, plan->bounceOffsets.data() + lo, stagingBase, plan->sizes.data() + lo,
+        hi - lo, reserveChainId);
+}
+
+std::int64_t BatchedCopyPool::launchGather(std::uint64_t const* srcs, std::uint64_t const* dstOffsets,
+    std::uint64_t dstBase, std::uint32_t const* sizes, std::size_t n, std::uint64_t* reserveChainId)
+{
     TLLM_CHECK_WITH_INFO(
-        n <= mMaxPlanEntries, "BatchedCopyPool::submitCopy: n (%zu) > maxPlanEntries (%zu)", n, mMaxPlanEntries);
+        n <= mMaxPlanEntries, "BatchedCopyPool::launchGather: n (%zu) > maxPlanEntries (%zu)", n, mMaxPlanEntries);
     Ctx* ctx = tryAcquire();
     if (ctx == nullptr)
     {
@@ -269,7 +334,7 @@ std::int64_t BatchedCopyPool::submitCopy(std::uint64_t const* srcs, std::uint64_
             nTotal += piecesFor(sizes[i], splitBudget(nTotal, n - 1 - i, mMaxPlanEntries));
         }
         TLLM_CHECK_WITH_INFO(nTotal <= mMaxPlanEntries,
-            "BatchedCopyPool::submitCopy: split plan (%zu) exceeds maxPlanEntries (%zu)", nTotal, mMaxPlanEntries);
+            "BatchedCopyPool::launchGather: split plan (%zu) exceeds maxPlanEntries (%zu)", nTotal, mMaxPlanEntries);
 
         // Fill the plan arrays in place in the context's pinned buffer, splitting runs so the
         // one-block-per-entry kernel keeps its grid-level parallelism.
@@ -277,7 +342,8 @@ std::int64_t BatchedCopyPool::submitCopy(std::uint64_t const* srcs, std::uint64_
         std::size_t idx = 0;
         for (std::size_t i = 0; i < n; ++i)
         {
-            appendSplitInto(bufs, idx, srcs[i], dsts[i], sizes[i], splitBudget(idx, n - 1 - i, mMaxPlanEntries));
+            appendSplitInto(
+                bufs, idx, srcs[i], dstBase + dstOffsets[i], sizes[i], splitBudget(idx, n - 1 - i, mMaxPlanEntries));
         }
 
         // The kernel reads the plan straight from pinned memory through the device alias.
@@ -291,7 +357,7 @@ std::int64_t BatchedCopyPool::submitCopy(std::uint64_t const* srcs, std::uint64_
         // The poller's onTerminal returns the context to the free list from the poll thread —
         // contexts recycle in C++ without waiting for Python to drain the completion. Registered
         // inside the try so a throwing registration still releases the context below.
-        // `reserveChainId` (two-phase chain) is taken atomically WITH the registration, so the
+        // `reserveChainId` (gather->RDMA chain) is taken atomically WITH the registration, so the
         // poll thread can never complete the event before the reservation exists.
         return static_cast<std::int64_t>(mPoller.registerEvent(
             ctx->event, [this, ctx] { release(ctx); }, reserveChainId));

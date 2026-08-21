@@ -90,18 +90,6 @@ class BounceV2Config:
     enable_eager_gather: bool = True
     #: CI-only escape hatch: fall back to plain device memory for the arena.
     disable_fabric_memory: bool = False
-    #: EXPERIMENTAL (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): as a sender, arm the
-    #: gather->RDMA chain in C++ — the CompletionPoller's poll thread posts a
-    #: credited chunk's RDMA write the moment its gather event completes,
-    #: instead of reporting the gather to Python and having the reactor post.
-    #: Python then handles ONE completion per chunk (the write) instead of
-    #: two. Sender-local: no protocol or handshake impact. With the two-phase
-    #: binding (poller.reserve_chain + agent.fulfill_chain_1to1) the chain is
-    #: RESERVED at gather launch and completed when the credit arrives, so a
-    #: gather that finished before its GRANT still takes the C++ path; the
-    #: one-shot post_transfer_1to1_on_event arm is the next fallback, and
-    #: older bindings fall back (with a warning) to the classic path.
-    enable_cpp_chain: bool = False
     #: Receiver-side lease on granted regions. Derived (``None`` default) as
     #: 2 x ``request_timeout_ms``: a dead sender emits neither DATA nor a
     #: cancel — unobservable through the protocol alone — so a flow holding

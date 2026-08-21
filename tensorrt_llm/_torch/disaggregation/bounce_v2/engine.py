@@ -63,7 +63,6 @@ from .scheduler import CreditScheduler
 
 __all__ = [
     "BOUNCE_V2_ENV",
-    "BOUNCE_V2_CPP_CHAIN_ENV",
     "BounceEngine",
     "BounceTransferStatus",
     "NoBounceEngine",
@@ -77,9 +76,6 @@ __all__ = [
 #: native/rank_info.py). All ranks of a disaggregated deployment must run the
 #: same version when the flag is enabled.
 BOUNCE_V2_ENV = "TRTLLM_BOUNCE_V2_ENABLE"
-#: EXPERIMENTAL opt-in: sender-side C++ gather->RDMA chain (see
-#: BounceV2Config.enable_cpp_chain). Purely local — no handshake impact.
-BOUNCE_V2_CPP_CHAIN_ENV = "TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN"
 
 _TRUTHY = ("1", "true", "TRUE", "True")
 
@@ -263,8 +259,7 @@ class BounceEngine:
         logger.info(
             f"bounce_v2({self_name}): engine ready endpoint={self._reactor.endpoint} "
             f"chunk={config.max_chunk_size_bytes} arena={config.arena_size_bytes} "
-            f"inflight={config.max_inflight_chunks_per_request} "
-            f"cpp_chain={config.enable_cpp_chain}"
+            f"inflight={config.max_inflight_chunks_per_request}"
         )
 
     # ---------------------------- handshake ---------------------------- #
@@ -471,10 +466,7 @@ def create_bounce_v2_engine(
     ``TRTLLM_BOUNCE_V2_ENABLE`` is truthy, the null object otherwise.
     Construction errors RAISE (the user explicitly opted in; a silent
     fallback would be a ~1000x perf cliff discovered in production)."""
-    if os.environ.get(BOUNCE_V2_ENV, "0") not in ("1", "true", "TRUE", "True"):
+    if os.environ.get(BOUNCE_V2_ENV, "0") not in _TRUTHY:
         return NoBounceEngine()
-    config = BounceV2Config(
-        enabled=True,
-        enable_cpp_chain=os.environ.get(BOUNCE_V2_CPP_CHAIN_ENV, "0") in _TRUTHY,
-    )
+    config = BounceV2Config(enabled=True)
     return BounceEngine(agent, config, device_id, self_name)

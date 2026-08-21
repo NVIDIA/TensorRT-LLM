@@ -65,10 +65,6 @@ public:
     static constexpr std::int64_t kFulfillArmed = 1;    // poster attached; posts when the gather event completes
     static constexpr std::int64_t kFulfillPosted = 2;   // gather already done; the write was posted inline
 
-    // cancelChain() results (see cancelChain).
-    static constexpr std::int64_t kCancelTerminal = 0; // reservation terminal; nothing further publishes for it
-    static constexpr std::int64_t kCancelReverted = 1; // event still pending; publishes under its ORIGINAL id
-
     struct Completion
     {
         std::uint64_t id;
@@ -88,11 +84,13 @@ public:
     /// published — BatchedCopyPool uses it to return the stream context to its free list, so exec
     /// contexts are recycled in C++ without waiting for Python to drain. Returns the completion id.
     ///
-    /// `reserveChainId` (optional, two-phase chain): take the chain reservation (see reserveChain)
-    /// ATOMICALLY with the registration — in the same critical section, before any poll sweep can
-    /// see the event — so unlike a separate reserveChain call it can never lose the race to the
-    /// event's own completion. On success *reserveChainId is the reserved id; when the poller is
-    /// already shut down it is 0 (no reservation; the event id itself resolves classically).
+    /// `reserveChainId` (optional, gather->RDMA chain): take a chain reservation ATOMICALLY with
+    /// the registration — in the same critical section, before any poll sweep can see the event —
+    /// so it can never lose the race to the event's own completion. From then on the event's own
+    /// completion is consumed in C++ and the chunk's ONE terminal row publishes under the reserved
+    /// id (see fulfillChain for the row contract). On success *reserveChainId is the reserved id;
+    /// when the poller is already shut down it is 0 (no reservation; the event id itself resolves
+    /// classically).
     [[nodiscard]] std::uint64_t registerEvent(
         cudaEvent_t event, std::function<void()> onTerminal = {}, std::uint64_t* reserveChainId = nullptr);
 
@@ -107,35 +105,14 @@ public:
     /// agent) and belt-and-braces by the binding's keep_alive.
     using ChainPoster = std::function<std::unique_ptr<TransferStatus>()>;
 
-    /// EXPERIMENTAL (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): arm a gather->RDMA chain on a still-pending
-    /// event id (a registerEvent/BatchedCopyPool::submitCopy completion id). When that event later
-    /// completes SUCCESSFULLY, the poll thread runs `poster` to post the RDMA write and polls the
-    /// resulting handle under a RESERVED completion id — the event's own completion is consumed in
-    /// C++ (never published), so the caller sees exactly ONE completion for the whole chain:
+    /// Attach the RDMA poster to a registerEvent(reserveChainId) reservation (the C++-internal
+    /// half of the pool/agent binding's launch_chunk_chained; not exposed to Python on its own).
+    /// The reserved id carries the chunk's ONE terminal row:
     ///   {reservedId, kKindXfer, ok}       write posted and reached a terminal state
     ///   {reservedId, kKindXfer, 0}        post failed / shutdown before the write resolved
     ///   {reservedId, kKindEvent, 0}       the gather event itself failed (write never posted)
-    /// Returns the reserved id, or -1 when the event is no longer pending (already terminal,
-    /// unknown, double-arm, or shutdown) — the caller then falls back to the classic two-hop path
-    /// and will receive the event's own completion as usual. Thread-safe.
-    [[nodiscard]] std::int64_t armXferAfterEvent(std::uint64_t eventId, ChainPoster poster);
-
-    /// Two-phase chain, phase 1 (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): reserve a chain id on a
-    /// still-pending event WITHOUT a poster (the RDMA destination is not known yet — the credit is
-    /// still in flight). From this point the chunk's ONE completion is the RESERVED id and the
-    /// event's own completion is consumed in C++:
-    ///   - event completes OK before fulfillChain(): nothing publishes; the reservation is
-    ///     remembered as gather-done and fulfillChain() later posts the write inline;
-    ///   - event FAILS: {reservedId, kKindEvent, 0} publishes (write never posted);
-    ///   - shutdown(): {reservedId, kKindXfer, 0} publishes (armed-chain semantics).
-    /// Returns the reserved id, or -1 when the event is no longer pending (already terminal,
-    /// unknown, double-reserve/arm, or shutdown) — the caller keeps the classic route and the
-    /// event's own completion publishes as usual. Thread-safe.
-    [[nodiscard]] std::int64_t reserveChain(std::uint64_t eventId);
-
-    /// Two-phase chain, phase 2: attach the poster (destination now known) to `reservedId`.
-    ///   kFulfillArmed    gather still pending -> the poll thread posts when the event fires
-    ///                    (identical to armXferAfterEvent from here on);
+    /// Return codes:
+    ///   kFulfillArmed    gather still pending -> the poll thread posts when the event fires;
     ///   kFulfillPosted   gather already done OK -> the write was posted INLINE on the calling
     ///                    thread (executeChains path, mChainsInFlight accounted) and its handle is
     ///                    now polled under the reserved id;
@@ -144,18 +121,6 @@ public:
     ///                    do NOT post; just wait for that row.
     /// Every outcome preserves exactly ONE terminal row per reserved id. Thread-safe.
     [[nodiscard]] std::int64_t fulfillChain(std::uint64_t reservedId, ChainPoster poster);
-
-    /// Abandon a reserved-but-UNFULFILLED chain (the request died between reserve and fulfill).
-    /// PRECONDITION: fulfillChain() was never called for this id (a fulfilled chain resolves via
-    /// its own row; cancel is undefined for it).
-    ///   kCancelReverted  the gather event is still pending: the reservation is detached and the
-    ///                    event publishes under its ORIGINAL id again (the caller re-routes it,
-    ///                    e.g. as an orphaned gather); the reserved id never publishes;
-    ///   kCancelTerminal  the reservation is already terminal — gather-done (erased, nothing
-    ///                    publishes), gather-failed (its failure row is published/pending), or
-    ///                    swept by shutdown — the caller may recycle the staging region now.
-    /// Thread-safe.
-    std::int64_t cancelChain(std::uint64_t reservedId);
 
     /// Completion wakeup fd (Feature: event-driven Python reactor): whenever completions are
     /// PUBLISHED, or a tracked entry is retired (freeing a copy-stream context), one 8-byte token
@@ -195,8 +160,8 @@ private:
         std::uint64_t id;
         cudaEvent_t event;
         std::function<void()> onTerminal;
-        // 0 = no chain. chainId != 0 with a poster = ARMED (armXferAfterEvent / fulfilled reserve);
-        // chainId != 0 WITHOUT a poster = RESERVED, awaiting fulfillChain (see reserveChain).
+        // 0 = no chain. chainId != 0 with a poster = ARMED (fulfilled reservation); chainId != 0
+        // WITHOUT a poster = RESERVED (registerEvent's reserveChainId), awaiting fulfillChain.
         std::uint64_t chainId{0};
         ChainPoster chainPoster;
     };
@@ -235,7 +200,7 @@ private:
     std::condition_variable mCv;
     std::vector<EventEntry> mEvents;
     // Reserved chain ids whose gather event completed OK before fulfillChain arrived (nothing
-    // published for them yet; fulfillChain posts inline, cancelChain/shutdown terminate them).
+    // published for them yet; fulfillChain posts inline, shutdown terminates them).
     std::vector<std::uint64_t> mGatherDoneChains;
     int mWakeupFd{-1};
     // Chain posters currently executing OUTSIDE mMu on the poll thread (incremented under mMu when

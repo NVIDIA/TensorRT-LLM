@@ -119,6 +119,32 @@ class Plan:
     def num_chunks(self) -> int:
         return len(self.chunks)
 
+    def flat_gather(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Flat per-desc gather view over ALL chunks, in chunk order — the
+        one-call marshalling input of the C++ per-request plan handle
+        (``BatchedCopyPool.register_plan``).
+
+        Returns ``(srcs, bounce_offsets, sizes, chunk_starts)``: uint64
+        source addresses, uint64 REGION-RELATIVE bounce offsets (the staging
+        base is a per-launch argument, so the flat plan never references
+        arena regions), uint32 sizes, and uint64 ``[num_chunks + 1]``
+        desc-index boundaries (chunk c is ``[chunk_starts[c],
+        chunk_starts[c + 1])``).
+        """
+        counts = np.array([c.num_descs for c in self.chunks], dtype=np.uint64)
+        chunk_starts = np.concatenate((np.zeros(1, dtype=np.uint64), np.cumsum(counts)))
+        if not self.chunks:
+            return (
+                np.empty(0, dtype=np.uint64),
+                np.empty(0, dtype=np.uint64),
+                np.empty(0, dtype=np.uint32),
+                chunk_starts.astype(np.uint64),
+            )
+        srcs = np.concatenate([c.src_ptrs for c in self.chunks])
+        offsets = np.concatenate([c.bounce_offsets for c in self.chunks])
+        sizes = np.concatenate([c.sizes for c in self.chunks])
+        return srcs, offsets, sizes, chunk_starts.astype(np.uint64)
+
 
 def _block_end_of(cont_false_idx: np.ndarray, start: int, n: int) -> int:
     """Last index j >= start-1 such that ``cont`` holds for all of

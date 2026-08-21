@@ -89,9 +89,9 @@ std::uint64_t CompletionPoller::registerEvent(
     EventEntry entry{id, event, std::move(onTerminal)};
     if (reserveChainId != nullptr)
     {
-        // Atomic two-phase reservation: created in the SAME critical section as the registration,
-        // so the poll sweep can never complete the event before the reservation exists — unlike a
-        // separate reserveChain call, this cannot lose the race (guaranteed chain).
+        // Atomic chain reservation: created in the SAME critical section as the registration, so
+        // the poll sweep can never complete the event before the reservation exists (guaranteed
+        // chain — the reserve race is structurally impossible).
         entry.chainId = mNextId.fetch_add(1, std::memory_order_relaxed);
         *reserveChainId = entry.chainId;
     }
@@ -119,64 +119,6 @@ void CompletionPoller::signalWakeupLocked() noexcept
     std::uint64_t const token = 1;
     ssize_t const rc = ::write(mWakeupFd, &token, sizeof(token));
     static_cast<void>(rc);
-}
-
-std::int64_t CompletionPoller::armXferAfterEvent(std::uint64_t eventId, ChainPoster poster)
-{
-    if (!poster)
-    {
-        return -1;
-    }
-    std::lock_guard<std::mutex> lk(mMu);
-    if (mStop.load(std::memory_order_acquire))
-    {
-        // Shutting down: refuse the arm; the shutdown sweep terminates the event id itself with
-        // ok=0, which the caller's classic route still owns.
-        return -1;
-    }
-    for (auto& e : mEvents)
-    {
-        if (e.id == eventId)
-        {
-            if (e.chainId != 0)
-            {
-                return -1; // double arm refused
-            }
-            std::uint64_t const id = mNextId.fetch_add(1, std::memory_order_relaxed);
-            e.chainId = id;
-            e.chainPoster = std::move(poster);
-            return static_cast<std::int64_t>(id);
-        }
-    }
-    // Event already terminal (its completion is published or pending in mDone) or unknown: the
-    // caller lost the race and falls back to the classic path.
-    return -1;
-}
-
-std::int64_t CompletionPoller::reserveChain(std::uint64_t eventId)
-{
-    std::lock_guard<std::mutex> lk(mMu);
-    if (mStop.load(std::memory_order_acquire))
-    {
-        // Shutting down: refuse; the event id itself resolves via the shutdown sweep, which the
-        // caller's classic route still owns.
-        return -1;
-    }
-    for (auto& e : mEvents)
-    {
-        if (e.id == eventId)
-        {
-            if (e.chainId != 0)
-            {
-                return -1; // double reserve/arm refused
-            }
-            std::uint64_t const id = mNextId.fetch_add(1, std::memory_order_relaxed);
-            e.chainId = id; // chainPoster stays empty: reserved, awaiting fulfillChain
-            return static_cast<std::int64_t>(id);
-        }
-    }
-    // Already terminal (its own completion publishes/published) or unknown: classic path.
-    return -1;
 }
 
 std::int64_t CompletionPoller::fulfillChain(std::uint64_t reservedId, ChainPoster poster)
@@ -223,42 +165,6 @@ std::int64_t CompletionPoller::fulfillChain(std::uint64_t reservedId, ChainPoste
     }
     executeChains(ready);
     return kFulfillPosted;
-}
-
-std::int64_t CompletionPoller::cancelChain(std::uint64_t reservedId)
-{
-    std::lock_guard<std::mutex> lk(mMu);
-    for (auto& e : mEvents)
-    {
-        if (e.chainId == reservedId)
-        {
-            if (e.chainPoster)
-            {
-                // Documented-unreachable (cancel is only called for reserved-UNFULFILLED chains):
-                // warn but leave the armed chain alone — its own terminal row still publishes, so
-                // kCancelTerminal would be a lie only about WHO frees the region; the caller's
-                // contract violation is the real bug to surface.
-                TLLM_LOG_WARNING(
-                    "CompletionPoller: cancelChain(%llu) hit a FULFILLED chain (contract violation); "
-                    "leaving it armed — its terminal row still publishes",
-                    static_cast<unsigned long long>(reservedId));
-                return kCancelTerminal;
-            }
-            // Revert the reservation: the event publishes under its ORIGINAL id again (the caller
-            // re-routes it, e.g. as an orphaned gather); the reserved id never publishes.
-            e.chainId = 0;
-            return kCancelReverted;
-        }
-    }
-    auto it = std::find(mGatherDoneChains.begin(), mGatherDoneChains.end(), reservedId);
-    if (it != mGatherDoneChains.end())
-    {
-        mGatherDoneChains.erase(it); // gather done, write never posted: nothing ever publishes
-        return kCancelTerminal;
-    }
-    // Gather failed (failure row published/pending) or the shutdown sweep terminated it: terminal
-    // either way — the caller pops its route, so a pending row drains into a no-op.
-    return kCancelTerminal;
 }
 
 std::uint64_t CompletionPoller::registerXfer(std::unique_ptr<TransferStatus> status)
