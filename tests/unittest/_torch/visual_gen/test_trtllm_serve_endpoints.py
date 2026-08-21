@@ -1670,11 +1670,11 @@ class TestVideoGenerationAsync:
 
     @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
     @pytest.mark.asyncio
-    async def test_async_video_status_transitions_generating_then_encoding(
+    async def test_async_video_status_transitions_generating_then_postprocessing(
         self, async_video_client, monkeypatch
     ):
-        """queued -> generating -> encoding -> completed, in order, so clients
-        can detect when generation finishes before encoding starts."""
+        """queued -> generating -> postprocessing -> completed, in order, so
+        clients can detect when generation finishes before postprocessing."""
         seen = []
         original_upsert = VIDEO_STORE.upsert
 
@@ -1695,24 +1695,24 @@ class TestVideoGenerationAsync:
         status = await _adrive_job_to_completion(async_video_client, video_id)
         assert status == "completed"
 
-        assert "generating" in seen and "encoding" in seen
-        assert seen.index("generating") < seen.index("encoding") < seen.index("completed")
+        assert "generating" in seen and "postprocessing" in seen
+        assert seen.index("generating") < seen.index("postprocessing") < seen.index("completed")
 
     @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
     @pytest.mark.asyncio
-    async def test_async_encoding_state_observable_during_encode(
+    async def test_async_postprocessing_state_observable_during_encode(
         self, async_video_client, monkeypatch
     ):
         """The encode is offloaded to a thread, so the event loop stays
-        responsive and a poll observes ``encoding`` while the file is written —
-        not just ``generating`` then ``completed``."""
+        responsive and a poll observes ``postprocessing`` while the file is
+        written — not just ``generating`` then ``completed``."""
         import threading
 
         release = threading.Event()
         original_save = VisualGenOutput.save
 
         def _blocking_save(self, *args, **kwargs):
-            # Runs in the executor thread; hold until the test sees ``encoding``.
+            # Runs in the executor thread; hold until the test sees the state.
             release.wait(timeout=5)
             return original_save(self, *args, **kwargs)
 
@@ -1721,7 +1721,7 @@ class TestVideoGenerationAsync:
         resp = await async_video_client.post(
             "/v1/videos",
             json={
-                "prompt": "observe encoding",
+                "prompt": "observe postprocessing",
                 "size": "32x32",
                 "seconds": 1.0,
                 "fps": 8,
@@ -1737,11 +1737,13 @@ class TestVideoGenerationAsync:
         while time.time() < deadline:
             poll = await async_video_client.get(f"/v1/videos/{video_id}")
             observed = poll.json().get("status")
-            if observed in ("encoding", "completed", "failed"):
+            if observed in ("postprocessing", "completed", "failed"):
                 break
             await asyncio.sleep(0.02)
         release.set()  # never leave the encoder blocked
-        assert observed == "encoding", f"GET never observed 'encoding' (saw {observed!r})"
+        assert observed == "postprocessing", (
+            f"GET never observed 'postprocessing' (saw {observed!r})"
+        )
 
     def test_async_video_multipart(self, video_client, tmp_path):
         """Multipart async request with a real ``input_reference`` file."""
@@ -1979,9 +1981,9 @@ class TestGetVideoContent:
         assert resp.status_code == 400
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
-    @pytest.mark.parametrize("status", ["generating", "encoding"])
+    @pytest.mark.parametrize("status", ["generating", "postprocessing"])
     def test_get_video_content_not_ready_in_flight(self, tmp_path, status):
-        """A generating/encoding job is not downloadable yet → 400."""
+        """A generating/postprocessing job is not downloadable yet → 400."""
         gen = MockVisualGen(video_output=_make_dummy_video_tensor())
         os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
         client = _create_server(gen)
