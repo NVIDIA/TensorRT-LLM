@@ -317,9 +317,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         except ImportError:
             return
-        rows = {int(next_n)}
+        # warm EVERY admissible row count (next_n multiples up to the
+        # engine's admission envelope): eager mixed prefill+decode batches
+        # arrive at arbitrary in-flight generation counts, and each unwarmed
+        # r_const band costs a multi-second first-touch JIT on the serving
+        # path. The envelope keeps this bounded (<= 32/next_n launches,
+        # ~4-13 distinct engine compiles); over-envelope rows dispatch
+        # in-tree and need no warmup (the helper drops them anyway).
+        nn = int(next_n)
+        rows = set(range(nn, int(_ss_host.MAX_VARLEN_ROWS) + 1, nn)) or {nn}
         for bs in batch_sizes or ():
-            rows.add(int(bs) * int(next_n))
+            rows.add(int(bs) * nn)
         msl_c = int(self.get_indexer_max_seq_len())
         if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
             # mirror the DSL paged-MQA arena stride (cute_dsl_custom_ops

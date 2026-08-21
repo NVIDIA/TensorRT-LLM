@@ -1874,6 +1874,11 @@ class Indexer(nn.Module):
                     and logits_decode.stride(1) == 1
                     and logits_decode.stride(0) % 4 == 0
                     and logits_decode.data_ptr() % 16 == 0
+                    # single-row batches derive their row window from
+                    # shape[1] (arena last-row safety), so that width must
+                    # satisfy the same float4 rule — otherwise run_varlen
+                    # raises instead of falling through
+                    and (num_gen_tokens > 1 or logits_decode.shape[1] % 4 == 0)
                 ):
                     logger.warning_once(
                         "TRTLLM_GVR_SELF_SAMPLING=1 but the decode logits do "
