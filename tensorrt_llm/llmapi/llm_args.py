@@ -5493,6 +5493,25 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    checkpoint_io_policy: Literal[
+        "auto", "native", "rank_striped_read_ahead"] = Field(
+            default="auto",
+            description=
+            "Controls checkpoint storage I/O independently of checkpoint format. "
+            "'auto' selects rank-striped read-ahead for compatible built-in "
+            "PyTorch/HF loads and selects native I/O otherwise. "
+            "'native' preserves the existing loader. "
+            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+            "SafeTensors extents while native mapping, materialization, and H2D "
+            "continue. Incompatible configurations select native I/O before "
+            "optimized reader or collective setup. Runtime-ineligible loads fall "
+            "back to native before model mutation.",
+            status="prototype",
+            json_schema_extra={
+                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
+            },
+        )
+
     mx_config: ModelExpressConfig = Field(
         default_factory=ModelExpressConfig,
         description="ModelExpress (MX) P2P checkpoint loading config.",
@@ -6097,6 +6116,21 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def resolve_non_pytorch_checkpoint_io_policy(self) -> 'TorchLlmArgs':
+        # AutoDeploy does not construct a checkpoint loader, so its explicit
+        # best-effort request is resolved here. PyTorch requests are resolved
+        # at loader construction, where the actual format and registered
+        # loader implementations are known.
+        if (self.checkpoint_io_policy == "rank_striped_read_ahead"
+                and self.backend != "pytorch"):
+            self.checkpoint_io_policy = "native"
+            logger.warning(
+                "Checkpoint I/O policy resolved before loading: "
+                "requested=rank_striped_read_ahead, selected=native, "
+                "reason=rank-striped read-ahead requires the PyTorch backend.")
         return self
 
     @model_validator(mode="after")

@@ -6,8 +6,9 @@ The PyTorch backend provides a flexible and extensible infrastructure for loadin
 1. [Overview](#overview)
 2. [Core Components](#core-components)
 3. [Built-in Checkpoint Formats](#built-in-checkpoint-formats)
-4. [Using Checkpoint Loaders](#using-checkpoint-loaders)
-5. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
+4. [Checkpoint I/O Policies](#checkpoint-io-policies)
+5. [Using Checkpoint Loaders](#using-checkpoint-loaders)
+6. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
 
 ## Overview
 
@@ -91,6 +92,64 @@ checkpoint loading. Selecting MX does not require an MX-specific on-disk
 checkpoint or conversion of the Hugging Face checkpoint. For installation, MX
 service deployment, and configuration details, see
 [ModelExpress (MX) Checkpoint Loading](./model-express.md).
+
+## Checkpoint I/O Policies
+
+Checkpoint format describes how weights are represented and mapped. The
+experimental `checkpoint_io_policy` independently controls how file-backed
+checkpoint bytes reach host memory:
+
+- `auto` (default) selects rank-striped read-ahead for compatible built-in
+  PyTorch/HF loads and selects native I/O for other configurations.
+- `native` always preserves the existing checkpoint loader and its synchronous
+  SafeTensors prefetch when the load group is eligible.
+- `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
+  Node-local ranks issue disjoint background `pread` requests into the Linux
+  page cache while the existing mapping, transformation, and H2D path runs.
+  Once every rank finishes materialization, unfinished advisory reads are
+  cancelled. Shutdown can still wait for at most one in-flight 8 MiB
+  synchronous read per worker; degraded storage can therefore delay the join.
+
+```yaml
+checkpoint_format: HF
+load_format: auto
+checkpoint_io_policy: rank_striped_read_ahead
+```
+
+The optimized path currently requires identical policy configuration across
+all ranks, the automatically constructed built-in HF loader
+(`checkpoint_loader` must be unset), `load_format: auto`, SafeTensors, and an
+active MPI model-load communicator for distributed jobs. Static incompatibility
+such as MX, AutoDeploy, a custom or explicitly provided loader, a non-automatic
+load format, or known partial-model loading selects native I/O before any
+rank-striped communicator or reader setup. An explicit incompatible
+`rank_striped_read_ahead` request emits a warning instead of failing startup;
+`auto` records the native selection at info level.
+
+Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
+loading, raw-weight caching, layer overrides, insufficient host-memory
+headroom, and `.bin`/`.pth` select native materialization before readers start
+or the model is mutated. These runtime fallbacks emit a warning because the
+rank-striped policy had already been selected from configuration. With a valid
+node communicator, fallback preserves native prefetch collectives on that load
+group; if communicator setup failed or its size did not match the model-load
+mapping, native loading safely skips prefetch.
+Memory admission reserves cgroup-aware startup headroom. Reader setup failures
+also clean up and fall back before mapping; mapping, transformation, or H2D
+failure after activation never retries a partially mutated model. A later
+advisory read failure keeps successfully materialized weights.
+
+Read-ahead is intentionally not TP/PP/CP/EP-selective: each active load group
+may warm one logical checkpoint copy per node, although the work stops when
+materialization completes. The 64-reader budget is per active load group per
+node, not a host-wide arbitration mechanism across colocated independent
+TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
+effective policy, so `auto` selection and native fallback remain observable;
+activation logs also report the local reader assignment.
+
+This policy remains separate from future ModelStreamer, MX, GMS, or snapshot
+integration. Those systems may change the source or bypass raw loading without
+requiring a new combined checkpoint format.
 
 ## Using Checkpoint Loaders
 

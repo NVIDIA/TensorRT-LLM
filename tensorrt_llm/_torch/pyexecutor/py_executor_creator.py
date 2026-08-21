@@ -273,6 +273,10 @@ def _load_config_and_create_checkpoint_loader(
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,
         mx_model_name=llm_args.model,
+        checkpoint_io_policy=llm_args.checkpoint_io_policy,
+        load_format=llm_args.load_format,
+        partial_model_loading=(llm_args.model_kwargs is not None and
+                               "num_hidden_layers" in llm_args.model_kwargs),
     )
     llm_args = ModelLoader.load_config_and_apply_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
