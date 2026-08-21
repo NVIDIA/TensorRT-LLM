@@ -43,7 +43,7 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.media.reference import ContentFormat, MediaRole
+from tensorrt_llm.media.reference import MediaContentFormat, MediaRole
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
@@ -1692,7 +1692,7 @@ class MediaReferenceItem(OpenAIBaseModel):
     content: str = Field(
         description="The reference payload, in the form declared by ``format``."
     )
-    format: ContentFormat = Field(description=(
+    format: MediaContentFormat = Field(description=(
         "Wire form of ``content``: ``path`` (a file readable by the server; a "
         "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
         "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
@@ -1779,7 +1779,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
          "ignored whenever a typed ``image_reference`` or ``video_reference`` "
          "is provided. A string form requires ``input_reference_format``."),
     )
-    input_reference_format: Optional[ContentFormat] = Field(
+    input_reference_format: Optional[MediaContentFormat] = Field(
         default=None,
         description=(
             "Deprecated, alongside ``input_reference``: the wire form of that "

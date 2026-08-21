@@ -1491,7 +1491,7 @@ models:
         required: false
       input_reference_format:
         kind: extension
-        type: Optional[ContentFormat]
+        type: Optional[MediaContentFormat]
         default: null
         status: deprecated
         required: false
@@ -1577,7 +1577,7 @@ models:
         required: true
       format:
         kind: extension
-        type: ContentFormat
+        type: MediaContentFormat
         default: null
         status: prototype
         required: true
