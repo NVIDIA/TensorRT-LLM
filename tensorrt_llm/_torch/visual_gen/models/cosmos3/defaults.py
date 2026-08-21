@@ -20,7 +20,6 @@ Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 from typing import Dict, Iterable
 
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
-from tensorrt_llm.inputs.media_io import sniff_media_kind
 
 # ---------------------------------------------------------------------------
 # Constant tables
@@ -88,17 +87,6 @@ def _normalize_condition_video_keep(keep: str | None) -> str:
 def _validate_output_type(output_type: str) -> None:
     if output_type not in ("video", "image"):
         raise ValueError(f"Cosmos3 output_type must be 'video' or 'image', got {output_type!r}.")
-
-
-def _validate_video_reference(video) -> None:
-    """Preflight for the ``video`` extra param: encoded MP4/AVI bytes."""
-    if not video:
-        raise ValueError("Cosmos3 video reference bytes are empty.")
-    if sniff_media_kind(video) != "video":
-        raise ValueError(
-            "Cosmos3 video reference bytes are not a recognized video "
-            "container (supported: MP4/AVI)."
-        )
 
 
 # Text-to-image (``output_type="image"``) defaults; resolved in ``infer()``.

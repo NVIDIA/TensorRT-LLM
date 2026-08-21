@@ -46,7 +46,6 @@ from .defaults import (
     COSMOS3_GENERATION_DEFAULTS,
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
-    _validate_video_reference,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
@@ -629,9 +628,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         guidance_scale = resolved["guidance_scale"]
         refs_i = req.params.image_reference
         refs_v = req.params.video_reference
+        # Container and modality are already checked at the coordinator's
+        # reference choke point, so the bytes reaching here are known video.
         video = refs_v[0].content if refs_v else None
-        if video is not None:
-            _validate_video_reference(video)
 
         return self.forward(
             prompt=req.prompt,
