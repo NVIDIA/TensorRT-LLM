@@ -2384,7 +2384,17 @@ class KVCacheManagerV2(BaseResourceManager):
             # activations. A connector that offers the whole prompt therefore
             # loses at most one token, which the forward recomputes.
             req.py_connector_prefix_start = local_end
-            req.py_connector_prefix_end = min(local_end + num_tokens, req.prompt_len - 1)
+            offered_end = local_end + num_tokens
+            req.py_connector_prefix_end = min(offered_end, req.prompt_len - 1)
+            # Hand back what that clamp just dropped, because nothing
+            # downstream can: `_deliver_connector_prefix` and
+            # `_release_undelivered_connector_prefix` both read the
+            # *clamped* end, so the tail past it would stay owned by the
+            # connector for the life of the process -- the exact leak
+            # those two exist to prevent.
+            dropped_start = max(local_end, req.py_connector_prefix_end)
+            if offered_end > dropped_start:
+                self.kv_connector_manager.cancel_load(req, dropped_start, offered_end)
             # Deliberately not conditioned on the clamp above: if the connector
             # said it would transfer asynchronously it has already started, and
             # the request must be held out of the batch until it reports done.
