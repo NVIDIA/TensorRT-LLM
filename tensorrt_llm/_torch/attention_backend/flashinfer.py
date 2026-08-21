@@ -33,7 +33,7 @@ import torch
 from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
 
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import is_sm_100f, nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -63,6 +63,14 @@ _FORCE_RAGGED_FA2 = False
 """Used for testing."""
 
 _MAX_CUDA_THREADS_PER_BLOCK = 1024
+
+_FLASHINFER_MAX_PAGED_HEAD_DIM = 256
+"""Largest head_dim FlashInfer's fa2/fa3 paged kernels handle.
+
+Beyond this only trtllm-gen has cubins, and those ship for datacenter Blackwell
+only. Layers above this threshold run through Triton on other architectures --
+see the ``use_triton_attention`` path in ``FlashInferAttention.forward_impl``.
+"""
 
 
 def _slice_paged_kv_cache_heads(
@@ -2334,6 +2342,106 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             wrapper.run(q[num_ctx_tokens:],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
+
+        # Triton attention for layers FlashInfer's paged kernels cannot serve
+        # at all.  fa2/fa3 cover head_dim<=256; beyond that only trtllm-gen has
+        # cubins, and those are datacenter-Blackwell only.  On every other
+        # architecture (Hopper included) run both phases through Triton.
+        #
+        # Both phases are handled here so that no FlashInfer wrapper is ever
+        # created for these layers: the Triton kernels use their own scratch
+        # and never touch ``workspace_buffer``.  That keeps a single wrapper
+        # type in play across the rest of the model, avoiding the workspace
+        # corruption that mixing wrapper types under CUDA graphs causes.
+        use_triton_attention = (self.head_dim > _FLASHINFER_MAX_PAGED_HEAD_DIM
+                                and not is_sm_100f())
+
+        if use_triton_attention:
+            if (metadata._is_shared_kv_draft_view
+                    or metadata._is_separate_kv_draft_view):
+                raise NotImplementedError(
+                    "Speculative decoding draft metadata views require the "
+                    "trtllm-gen decode backend, which has no cubins for "
+                    f"head_dim {self.head_dim} on this architecture.")
+            if num_contexts > 0 and k is None:
+                # KV-shared layers read another layer's cache and pass k=None,
+                # so the current tokens' KV is already paged.  Feeding them as
+                # Triton's "prefix" would drop causal masking between them, so
+                # refuse rather than return wrong numbers.
+                raise NotImplementedError(
+                    "KV-shared layers are not yet supported on the Triton "
+                    f"attention path (head_dim {self.head_dim}, layer "
+                    f"{self.layer_idx}). Use a model without "
+                    "num_kv_shared_layers, or run on datacenter Blackwell.")
+
+            from .triton_decode import triton_decode
+            from .triton_prefill import triton_prefill_with_custom_mask
+
+            logger.info_once(
+                "FlashInfer paged kernels do not cover head_dim "
+                f"{self.head_dim}; using the Triton prefill/decode path.",
+                key=f"triton_attention_hd{self.head_dim}")
+
+            sm_scale = 1 / (math.sqrt(self.head_dim) * self.q_scaling)
+            # attention_window_size is already in flashinfer convention here
+            # (forward() subtracts 1 from the exclusive TRTLLM window).
+            window_left = (attention_window_size
+                           if attention_window_size is not None else -1)
+
+            if num_contexts > 0:
+                triton_prefill_with_custom_mask(
+                    q=q[:num_ctx_tokens],
+                    k=k[:num_ctx_tokens],
+                    v=v[:num_ctx_tokens],
+                    output=output[:num_ctx_tokens].view(-1, self.num_heads,
+                                                        self.head_dim),
+                    qo_indptr=metadata.qo_indptr[:num_contexts + 1],
+                    kv_cache=kv_cache,
+                    prefix_lens=metadata.
+                    cached_token_lens[:num_contexts].clone(),
+                    page_table_indptr=metadata.
+                    paged_kv_indptr_prefill[:num_contexts + 1],
+                    page_table_indices=metadata.
+                    _paged_kv_indices[:metadata.num_context_blocks],
+                    page_size=metadata.page_size,
+                    custom_mask=attention_mask_data,
+                    sm_scale=sm_scale,
+                    window_left=window_left,
+                )
+
+            if num_generations > 0:
+                # triton_decode derives its batch size from q's leading dim, so
+                # it assumes exactly one query token per generation request.
+                num_gen_tokens = q.shape[0] - num_ctx_tokens
+                if num_gen_tokens != num_generations:
+                    raise NotImplementedError(
+                        "Triton decode expects one query token per generation "
+                        f"request, got {num_gen_tokens} tokens for "
+                        f"{num_generations} requests. Multi-token generation "
+                        "steps are not supported on this path.")
+                # triton_decode's sliding_window counts the tokens attended to
+                # *including* the current one; window_left excludes it.
+                sliding_window = (attention_window_size +
+                                  1 if attention_window_size is not None else
+                                  None)
+                # Same decode-slice convention as the FlashInfer decode plan:
+                # indptr rebased to the generation range, indices offset past
+                # the context blocks.
+                triton_decode(
+                    q=q[num_ctx_tokens:],
+                    kv_cache=kv_cache,
+                    kv_indices=metadata.
+                    paged_kv_indices[metadata.num_context_blocks:],
+                    kv_indptr=metadata.
+                    paged_kv_indptr_decode[:num_generations + 1],
+                    kv_last_page_len=metadata.
+                    paged_kv_last_page_len[metadata.num_contexts:],
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    out=output[num_ctx_tokens:].view(-1, self.num_heads,
+                                                     self.head_dim),
+                )
+            return
 
         # Triton prefill fallback: trtllm-gen cannot handle custom
         # (bidirectional) attention masks for head_dim>256 layers.  Use a

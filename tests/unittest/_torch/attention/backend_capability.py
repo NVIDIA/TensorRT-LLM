@@ -67,7 +67,14 @@ BACKEND_CAPS = {
     ),
 }
 
-_FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS = (96, 512)
+_FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS = (96,)
+
+# head_dim>256 has no FlashInfer paged kernel. Below sm100 the backend routes
+# these layers through Triton instead (the ``use_triton_attention`` path in
+# FlashInferAttention.forward_impl), so they are testable there. On sm100+ that
+# path is off -- the model-level backend uses trtllm-gen cubins, which this
+# harness does not select (it builds FlashInfer with the default "fa2").
+_FLASHINFER_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS = (512,)
 
 _TRTLLM_PAGED_UNSUPPORTED_HEAD_DIMS = (512,)
 _TRTLLM_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS = (96,)
@@ -132,6 +139,18 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
         and case.head_dim in _FLASHINFER_PAGED_UNSUPPORTED_HEAD_DIMS
     ):
         return f"FLASHINFER paged kernels do not support head_dim {case.head_dim}"
+
+    if (
+        backend == "FLASHINFER"
+        and sm >= 100
+        and getattr(case, "cache", "paged") != "none"
+        and not getattr(case, "is_mla", False)
+        and case.head_dim in _FLASHINFER_BLACKWELL_PAGED_UNSUPPORTED_HEAD_DIMS
+    ):
+        return (
+            f"FLASHINFER head_dim {case.head_dim} needs trtllm-gen on sm100+; "
+            "the Triton fallback is only enabled below sm100"
+        )
 
     # TRTLLM's standard paged FMHA/MMHA kernels in this build do not cover the
     # Gemma4 head_dim 512 path.

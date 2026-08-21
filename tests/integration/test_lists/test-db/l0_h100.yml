@@ -69,6 +69,15 @@ l0_h100:
   - unittest/_torch/modeling -k "modeling_gemma3"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling -k "modeling_whisper"  # CPU-only log-mel parity
+  # Gemma4's head_dim=512 full-attention layers have no trtllm-gen cubins
+  # outside datacenter Blackwell and no FlashInfer paged kernel, so they run on
+  # the Triton prefill/decode path here. Individual node ids rather than the
+  # whole file: the rest of test_modeling_gemma4.py assumes trtllm-gen.
+  - unittest/_torch/modeling/test_modeling_gemma4.py::TestGemma4HFComparison::test_e2b_real_dims_triton_path
+  - unittest/_torch/modeling/test_modeling_gemma4.py::TestGemma4HFComparison::test_31b_real_dims_triton_path
+  - unittest/_torch/modeling/test_modeling_gemma4.py::TestGemma4HFComparison::test_26b_real_dims_triton_path
+  - unittest/_torch/modeling/test_modeling_gemma4.py::TestGemma4HFComparison::test_triton_path_is_actually_taken
+  - unittest/_torch/modeling/test_modeling_gemma4.py::TestGemma4ModelDefaults::test_only_full_attention_layers_exceed_flashinfer_head_dim_limit
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_sanity
   # Real-weight Nano CG/overlap and chunked-prefill path smoke (MoE L0 cannot
   # reuse dense-8B greedy/logprob equality; accuracy stays on GSM8K/MMLU).
