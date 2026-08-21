@@ -1749,8 +1749,7 @@ class KimiKDARuntime(nn.Module):
         """
         if not self._has_kda_replay_caches(layer_cache):
             return
-        layer_cache.commit_conv_window(slot_indices, conv_q, conv_k, conv_v,
-                                       self.mixer.conv_size)
+        layer_cache.commit_conv_window(slot_indices, conv_q, conv_k, conv_v, self.mixer.conv_size)
 
     def _forward_prefill(
         self,
@@ -3065,10 +3064,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 kda_tp_rank = layer.self_attn._kda_tp_rank
                 break
 
-        COL = TensorParallelMode.COLUMN   # shards output rows (dim 0)
-        ROW = TensorParallelMode.ROW      # shards input columns (dim 1)
-        is_kda_by_layer = [getattr(l, "is_kda", False)
-                           for l in self.model.layers]
+        COL = TensorParallelMode.COLUMN  # shards output rows (dim 0)
+        ROW = TensorParallelMode.ROW  # shards input columns (dim 1)
+        is_kda_by_layer = [getattr(layer, "is_kda", False) for layer in self.model.layers]
 
         def _layer_is_kda(name: str) -> bool:
             idx = int(name.split("layers.", 1)[1].split(".", 1)[0])
@@ -3096,7 +3094,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 gate = load_weight_shard(gate_full, tp, rk, COL)
                 up = load_weight_shard(
                     _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights),
-                    tp, rk, COL,
+                    tp,
+                    rk,
+                    COL,
                 )
                 if gate.shape != (inter, param.shape[1]) or up.shape != gate.shape:
                     raise ValueError(
@@ -3171,11 +3171,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 # subgroup smaller than model TP repeats, so the shard index is
                 # model tp_rank modulo the parameter's shard count.
                 if src.shape != param.shape:
-                    mode, axis = ((ROW, 1) if name.endswith(".down_proj.weight")
-                                  else (COL, 0))
+                    mode, axis = (ROW, 1) if name.endswith(".down_proj.weight") else (COL, 0)
                     tp = src.shape[axis] // param.shape[axis]
-                    src = load_weight_shard(
-                        src, tp, (model_tp_rank % tp) if tp > 1 else 0, mode)
+                    src = load_weight_shard(src, tp, (model_tp_rank % tp) if tp > 1 else 0, mode)
 
             if src.shape != param.shape:
                 # MLA q_b/g/o head-shard: delegate to the same Linear modules
@@ -3194,7 +3192,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     return
                 raise ValueError(
                     f"{name}: shard/pad result {tuple(src.shape)} != param "
-                    f"shape {tuple(param.shape)}")
+                    f"shape {tuple(param.shape)}"
+                )
             param.data.copy_(src.to(param.dtype))
             # Keep the checkpoint's FP8 pair for the weight-read conversion,
             # but ONLY on this path -- the branches above shard or pad, and the
