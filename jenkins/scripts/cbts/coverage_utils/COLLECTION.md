@@ -150,7 +150,7 @@ stays large, `py_executor` rows are still there).
 `L0_MergeRequest.groovy` decides pipeline-level eligibility and `isCbtsStage()` decides each
 stage:
 
-- temporarily enabled for all pipelines through `ENABLE_CBTS_COVERAGE` for CI validation
+- official post-merge pipeline only (`ENABLE_CBTS_COVERAGE && JOB_NAME ==~ /.*PostMerge.*/`)
 - not a perf stage, not a TensorRT / CPP / AutoDeploy stage
 - single-GPU stages only (name carries no `-<N>_GPUs` / `-<N>_Nodes`)
 - not listed in `CBTS_EXCLUDE_STAGES`
