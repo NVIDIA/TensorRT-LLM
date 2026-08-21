@@ -2338,6 +2338,31 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertFalse(mask_26b[0, 1].item(), "Text token 0 should NOT attend to 1")
 
     @torch.no_grad()
+    def test_chunked_context_mask_applies_prefix_window(self) -> None:
+        """Chunked prefill preserves the full-sequence sliding-window mask."""
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        window = 64
+        chunk_start = 48
+        token_type_ids = torch.zeros(96, dtype=torch.long, device="cuda")
+        token_type_ids[64:80] = 1
+
+        full_mask = model.get_context_mask(token_type_ids, effective_sliding_window=window)
+        chunk_mask = model.get_context_mask(
+            token_type_ids[chunk_start:],
+            effective_sliding_window=window,
+            prefix_len=chunk_start,
+        )
+
+        torch.testing.assert_close(chunk_mask, full_mask[chunk_start:])
+        self.assertFalse(chunk_mask[-1, 0].item())
+        self.assertTrue(chunk_mask[-1, 32].item())
+
+    @torch.no_grad()
     def test_bidirectional_mask_only_applies_to_sliding_layers(self):
         """Full-attention layers retain the standard causal mask."""
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
