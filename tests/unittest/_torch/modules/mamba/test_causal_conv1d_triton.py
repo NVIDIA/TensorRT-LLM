@@ -22,9 +22,12 @@ thread that read it, so the two phases need an explicit ``tl.debug_barrier()``
 between them; otherwise correctness depends on whether the Triton compiler
 happens to emit a ``bar.sync`` for the chosen launch configuration.
 
-The tests therefore sweep several ``(num_warps, BLOCK_N)`` combinations - some
-of which get no compiler-inserted barrier - and always feed a non-zero initial
-state, since that is the only case where the stale-read is observable.
+The tests therefore sweep several ``(num_warps, BLOCK_N, num_stages)``
+combinations - some of which get no compiler-inserted barrier - and always feed
+a non-zero initial state, since that is the only case where the stale-read is
+observable. ``num_stages`` is swept because the prefill kernel's token loop is a
+dynamic ``range``, so the pipeliner rewrites the code around the barrier; the
+decode kernel only uses ``tl.static_range`` and is unaffected by it.
 """
 
 import pytest
@@ -40,9 +43,11 @@ skip_unsupported = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Triton causal conv1d kernels require CUDA"
 )
 
-# (num_warps, BLOCK_N): the last two get no compiler-inserted `bar.sync`, so they
-# only produce correct results if the kernels barrier explicitly.
-LAUNCH_CONFIGS = [(4, 128), (8, 32), (16, 64)]
+# (num_warps, BLOCK_N, num_stages): the last two `(num_warps, BLOCK_N)` pairs get
+# no compiler-inserted `bar.sync`, so they only produce correct results if the
+# kernels barrier explicitly. The stage counts cover both the unpipelined case
+# and one either side of the kernels' defaults.
+LAUNCH_CONFIGS = [(4, 128, 3), (8, 32, 1), (16, 64, 2)]
 
 
 def _conv1d_ref(x, conv_state, weight, bias, activation):
@@ -85,10 +90,10 @@ def _tolerance(dtype):
 
 
 @skip_unsupported
-@pytest.mark.parametrize("num_warps, block_n", LAUNCH_CONFIGS)
+@pytest.mark.parametrize("num_warps, block_n, num_stages", LAUNCH_CONFIGS)
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_update_preserves_initial_state(num_warps, block_n, width, dtype):
+def test_update_preserves_initial_state(num_warps, block_n, num_stages, width, dtype):
     """The decode kernel must convolve against the *old* conv_state."""
     device = "cuda"
     batch, dim, seqlen = 4, 64, 1
@@ -119,6 +124,7 @@ def test_update_preserves_initial_state(num_warps, block_n, width, dtype):
         conv_state_indices=conv_state_indices,
         _block_n=block_n,
         _num_warps=num_warps,
+        _num_stages=num_stages,
     )
 
     tol = _tolerance(dtype)
@@ -127,10 +133,10 @@ def test_update_preserves_initial_state(num_warps, block_n, width, dtype):
 
 
 @skip_unsupported
-@pytest.mark.parametrize("num_warps, block_n", LAUNCH_CONFIGS)
+@pytest.mark.parametrize("num_warps, block_n, num_stages", LAUNCH_CONFIGS)
 @pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_fwd_preserves_initial_state(num_warps, block_n, width, dtype):
+def test_fwd_preserves_initial_state(num_warps, block_n, num_stages, width, dtype):
     """The varlen prefill kernel must convolve against the *old* conv_state.
 
     ``seq_lens`` mixes sequences longer and shorter than ``state_len`` so both
@@ -174,6 +180,7 @@ def test_fwd_preserves_initial_state(num_warps, block_n, width, dtype):
         activation="silu",
         _block_n=block_n,
         _num_warps=num_warps,
+        _num_stages=num_stages,
     )
 
     tol = _tolerance(dtype)
