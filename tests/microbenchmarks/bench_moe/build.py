@@ -29,8 +29,12 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind, MoEWeightLoadingMode
-from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._torch.modules.fused_moe.interface import (
+    MoESchedulerKind,
+    MoEWeightLoadingMode,
+    _compute_ep_partition,
+)
+from tensorrt_llm._torch.utils import ActivationType, ActType_TrtllmGen
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -90,12 +94,16 @@ def _epilogue_activation_name(moe) -> str:
     The SiTU request can be dropped for reasons the spec cannot see (wrong
     backend, wrong quant, upstream fallback), so read it back rather than
     reporting what was asked for. MegaMoE DeepGEMM / CuteDSL store the
-    resolved name; TRTLLM-Gen exposes a predicate.
+    resolved name; TRTLLM-Gen exposes a predicate; CUTLASS uses
+    ``ActivationType.SiTu``.
     """
     backend = getattr(moe, "backend", None) or moe
     if getattr(backend, "activation", None) == "situ" or getattr(
         backend, "is_situ_activation", False
     ):
+        return "situ"
+    activation_type = getattr(backend, "activation_type", None)
+    if activation_type is not None and ActivationType(activation_type) == ActivationType.SiTu:
         return "situ"
     return "swiglu"
 
@@ -114,7 +122,12 @@ def _calculate_num_chunks_safe(moe, all_rank_num_tokens: List[int]) -> Optional[
         return None
 
 
-def _situ_kwargs(model: ModelSpec, moe_backend: str, quant_algo: Optional[QuantAlgo]) -> Dict:
+def _situ_kwargs(
+    model: ModelSpec,
+    moe_backend: str,
+    quant_algo: Optional[QuantAlgo],
+    mapping: Optional[Mapping] = None,
+) -> Dict:
     """``create_moe`` kwargs that switch the epilogue to SiTU, or ``{}``.
 
     Each backend takes SiTU through its own parameters and ``create_moe``
@@ -142,6 +155,29 @@ def _situ_kwargs(model: ModelSpec, moe_backend: str, quant_algo: Optional[QuantA
             "trtllm_gen_activation_type": ActType_TrtllmGen.SiTu,
             "trtllm_gen_activation_alpha": model.situ_beta,
             "trtllm_gen_activation_beta": model.situ_linear_beta,
+        }
+    if backend == "CUTLASS" and quant_algo == QuantAlgo.NVFP4:
+        # CUTLASS takes SiTU as ActivationType plus per-rank alpha/beta
+        # (same packing as modeling_kimi_linear). Size the tensors with
+        # the ceil/floor EP partition so uneven splits stay valid.
+        ep_size = 1 if mapping is None else max(mapping.moe_ep_size, 1)
+        ep_rank = 0 if mapping is None else mapping.moe_ep_rank
+        local_num_experts, _, _ = _compute_ep_partition(model.num_experts, ep_size, ep_rank)
+        device = torch.device("cuda", torch.cuda.current_device())
+        return {
+            "activation_type": ActivationType.SiTu,
+            "swiglu_alpha": torch.full(
+                (local_num_experts,),
+                float(model.situ_beta),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "swiglu_beta": torch.full(
+                (local_num_experts,),
+                float(model.situ_linear_beta),
+                dtype=torch.float32,
+                device=device,
+            ),
         }
     return {}
 
@@ -337,7 +373,7 @@ def _build_moe_module(
         swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
         swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
         activation_type=activation_type,
-        **_situ_kwargs(model, moe_backend, quant_algo),
+        **_situ_kwargs(model, moe_backend, quant_algo, mapping),
     )
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:

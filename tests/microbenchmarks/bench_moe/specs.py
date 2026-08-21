@@ -436,7 +436,8 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
     # Kimi-K3. SiTU is gated, so ``activation_type`` stays SWIGLU (same fc1
     # geometry). ``build._situ_kwargs`` switches the epilogue for the backends
     # that implement it (TRTLLM / MEGAMOE_DEEPGEMM on W4A8_MXFP4_MXFP8,
-    # MEGAMOE_CUTEDSL on NVFP4); other combinations keep the SwiGLU proxy.
+    # MEGAMOE_CUTEDSL / CUTLASS on NVFP4); other combinations keep the SwiGLU
+    # proxy.
     "kimi_k3": ModelSpec(
         name="kimi_k3",
         num_experts=896,
