@@ -539,9 +539,9 @@ def _mock_video_encoding():
     ],
 )
 def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endpoint, payload):
-    """With ``TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1``, ``response_format='path'``
+    """With ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``, ``response_format='path'``
     is rejected with 400 on the image and video (sync + async) endpoints."""
-    monkeypatch.setenv("TRTLLM_DISABLE_RESPONSE_FORMAT_PATH", "1")
+    monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
     monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
     gen = MockVisualGen(
         image_output=_make_dummy_image_tensor(),

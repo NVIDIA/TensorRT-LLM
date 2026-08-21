@@ -2692,22 +2692,22 @@ class OpenAIServer(_VideoRoutesMixin):
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
         ``path`` discloses absolute server-side filesystem paths, so it can be
-        turned off via ``TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1`` on shared /
+        turned off via ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` on shared /
         untrusted deployments (enabled by default). Returns ``None`` when
         allowed.
         """
         if response_format != "path":
             return None
-        raw = os.environ.get("TRTLLM_DISABLE_RESPONSE_FORMAT_PATH", "0")
+        raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
         if raw not in ("0", "1"):
             logger.warning(
-                "Unrecognized value for TRTLLM_DISABLE_RESPONSE_FORMAT_PATH: "
+                "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
                 f"{raw!r}. Expected '0' or '1'. Treating as '0' "
                 "(response_format='path' enabled).")
         if raw == "1":
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
-                "(TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1); it returns "
+                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
                 "server-side filesystem paths and is only meaningful for "
                 "co-located clients.",
                 err_type="BadRequestError",
