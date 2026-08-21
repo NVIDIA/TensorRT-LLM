@@ -217,15 +217,11 @@
 /cpp/tests/unit_tests/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/radixBlockTree* @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tensorrt_llm/_torch/pyexecutor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/runtime/kv_cache_manager_v2 @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/executor/test_dual_pool_kv_cache.py @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/executor/test_kv_cache* @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/executor/test_kv_pool_rebalance.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
 /tests/unittest/_torch/executor/test_kvcache_aware_router.py @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/executor/test_mamba_cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tests/unittest/kv_cache_manager_v2_tests @NVIDIA/trt-llm-kv-cache-manager-devs
 
 # ===== DISAGGREGATED SERVING =====
@@ -242,7 +238,6 @@
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-perf-devs
 /tensorrt_llm/_torch/disaggregation @NVIDIA/trt-llm-disagg-devs
-/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
 # Disagg tests: co-own with the owning team so disagg-devs review disagg-test changes.
@@ -251,7 +246,7 @@
 /tests/integration/defs/stress_test/disagg_cancel @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa-serving
 /tests/scripts/perf-sanity/disaggregated @NVIDIA/trt-llm-perf-devs @NVIDIA/trt-llm-disagg-devs
 /tests/scripts/perf/disaggregated @NVIDIA/trt-llm-perf-devs @NVIDIA/trt-llm-disagg-devs
-/tests/unittest/_torch/executor/*disagg* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
+/tests/unittest/_torch/disaggregation @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tests/unittest/_torch/multimodal/*disagg* @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-disagg-devs
 /tests/unittest/disaggregated @NVIDIA/trt-llm-disagg-devs
 /tests/unittest/llmapi/*disagg* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
@@ -419,7 +414,6 @@
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
-/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheFormatter.h @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheTransBuffer.cpp @NVIDIA/trt-llm-disagg-devs
@@ -444,7 +438,7 @@
 /cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheUtilsTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/attention_backend/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tensorrt_llm/_torch/pyexecutor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs

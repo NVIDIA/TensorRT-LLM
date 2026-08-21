@@ -19,14 +19,14 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import BindKvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import BindKvCacheTransceiver
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 

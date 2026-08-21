@@ -49,7 +49,7 @@ from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 _FLASHINFER_WORKSPACE_BYTES = 320 * 1024 * 1024
 _TRTLLM_GEN_TOKENS_PER_BLOCK = 32
@@ -884,7 +884,7 @@ def _build_gemma4_kv_cache_manager(
     sizes line up with what the model actually requests at runtime.
     """
     import tensorrt_llm
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 
     dtype = config.torch_dtype

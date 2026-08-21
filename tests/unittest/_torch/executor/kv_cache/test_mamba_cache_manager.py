@@ -23,13 +23,11 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    ATTENTION_DP_DUMMY_REQUEST_ID,
-    LlmRequest,
-    SamplingConfig,
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2,
@@ -43,6 +41,11 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     _get_num_cuda_graph_padding_dummy_slots,
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
+)
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID,
+    LlmRequest,
+    SamplingConfig,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
@@ -1223,11 +1226,11 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
 
     promote_calls = []
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
         lambda *args, **kwargs: promote_calls.append((args, kwargs)),
     )
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._advance_replay_state",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._advance_replay_state",
         lambda *args, **kwargs: pytest.fail(
             "Cpp replay bookkeeping must not advance before conv promotion"
         ),
@@ -1608,7 +1611,7 @@ def test_v2_hybrid_estimator_counts_dummy_states_without_attention_capacity(
         lambda *args, **kwargs: 11,
     )
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._get_local_mamba_cache_layout",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._get_local_mamba_cache_layout",
         lambda *args, **kwargs: (
             SimpleNamespace(get_states_bytes_per_layer=lambda mapping: 64),
             1,
@@ -1744,7 +1747,7 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
     mgr.max_seq_len = 4096
     warnings_seen = []
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.warning",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.logger.warning",
         lambda message: warnings_seen.append(message),
     )
 
@@ -2507,7 +2510,7 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
     log_debug = MagicMock()
     monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.debug", log_debug
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.logger.debug", log_debug
     )
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
@@ -2579,7 +2582,9 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     )
     monkeypatch.setattr(KVCacheManagerV2, "get_iteration_stats", MagicMock(return_value=report))
     log_info = MagicMock()
-    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.mamba_cache_manager.logger.info", log_info)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.logger.info", log_info
+    )
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.mapping = SimpleNamespace(rank=rank)
@@ -3068,11 +3073,11 @@ def test_v2_gdn_replay_commits_before_advancing_bookkeeping(monkeypatch):
     events = []
     mgr._commit_gdn_cached_replay_history_layers = lambda *_args, **_kwargs: events.append("commit")
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._advance_replay_state",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._advance_replay_state",
         lambda *_args, **_kwargs: events.append("advance"),
     )
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
         lambda *_args, **_kwargs: None,
     )
 
@@ -3112,7 +3117,7 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
     mgr.all_conv_states = [torch.empty(0)]
     mgr.intermediate_conv_states = torch.empty(0)
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
         lambda *args, **kwargs: None,
     )
 
@@ -3149,7 +3154,7 @@ def test_v2_hybrid_dynamic_tree_promotes_accepted_leaf_state(monkeypatch):
         promoted_positions.append(positions.clone())
 
     monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
         capture_promoted_position,
     )
 

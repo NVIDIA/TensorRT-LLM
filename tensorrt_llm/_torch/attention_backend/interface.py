@@ -26,8 +26,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
-from ..pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from ..pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs

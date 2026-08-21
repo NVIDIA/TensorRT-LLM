@@ -55,7 +55,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,

@@ -21,7 +21,10 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -141,7 +144,7 @@ def _make_manager_for_cache_tier_test(
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
-    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     with (
         patch(f"{module}.CuError", _CacheTierInitError),
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
@@ -623,7 +626,7 @@ def test_per_conversation_policy_releases_cancelled_request(
 
         batch_b = _prepare_context_resources(manager, request_b)
         with patch(
-            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning"
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning"
         ) as mock_warning:
             assert manager.prepare_context(request_b)
             mock_warning.assert_not_called()
@@ -714,7 +717,7 @@ def test_per_conversation_policy_ignores_overlapping_request(
 
         batch_b = _prepare_context_resources(manager, request_b)
         with patch(
-            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning"
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning"
         ) as mock_warning:
             assert manager.prepare_context(request_b)
             mock_warning.assert_called_once_with(
@@ -780,7 +783,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
 
 def test_disagg_role_mapper_kinds_default_to_indexed():
     from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 
     manager = object.__new__(KVCacheManagerV2)
 
