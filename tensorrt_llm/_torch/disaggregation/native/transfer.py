@@ -91,6 +91,10 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
+# Preconnect runs before readiness, so a shared control-plane deadline bounds
+# metadata discovery and registration ACKs before falling back to lazy setup.
+PRECONNECT_CONTROL_TIMEOUT_MS = 120_000
+
 
 @dataclass
 class RecvReqInfo:
@@ -171,7 +175,10 @@ class MessageType:
     KV_AGENT_RESULT = b"KV_AGENT_RESULT"
     REQUEST_DATA = b"REQUEST_DATA"
     REQUEST_INSTANCE_INFO = b"REQUEST_INSTANCE_INFO"
+    REQUEST_ALL_RANK_INFO = b"REQUEST_ALL_RANK_INFO"
     REGISTER_RANK_INFO = b"REGISTER_RANK_INFO"
+    PRECONNECT_RANK_INFO = b"PRECONNECT_RANK_INFO"
+    PRECONNECT_RANK_INFO_ACK = b"PRECONNECT_RANK_INFO_ACK"
     AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
     CANCEL_SESSION = b"CANCEL_SESSION"
 
@@ -1051,6 +1058,27 @@ class Sender(SenderBase):
                         self._register_peer_rank(send_id, msg)
                     except Exception as e:
                         logger.error(f"Sender: error handling REGISTER_RANK_INFO: {e}")
+                case MessageType.PRECONNECT_RANK_INFO:
+                    try:
+                        if not self._register_peer_rank(send_id, msg):
+                            raise RuntimeError("Sender is shutting down")
+                        self._messenger.send(
+                            [
+                                send_id,
+                                MessageType.PRECONNECT_RANK_INFO_ACK,
+                                AgentResult.SUCCESS.value.encode("ascii"),
+                            ]
+                        )
+                    except Exception as e:
+                        logger.error(f"Sender: error handling PRECONNECT_RANK_INFO: {e}")
+                        self._messenger.send(
+                            [
+                                send_id,
+                                MessageType.PRECONNECT_RANK_INFO_ACK,
+                                AgentResult.FAILED.value.encode("ascii"),
+                                str(e).encode("utf-8"),
+                            ]
+                        )
                 case MessageType.CANCEL_SESSION:
                     try:
                         self._handle_cancel_session(msg)
@@ -1061,20 +1089,25 @@ class Sender(SenderBase):
 
         self._messenger.start_listener(handle_message)
 
-    def _register_peer_rank(self, _send_id: bytes, message: list[bytes]):
+    def _register_peer_rank(self, _send_id: bytes, message: list[bytes]) -> bool:
         # Skip late messages so we don't race shutdown's invalidate loop.
         if self._shutdown:
-            return
-        torch.cuda.set_device(self._device_id)
-        CUASSERT(cudart.cudaSetDevice(self._device_id))
+            return False
         ri: RankInfo = RankInfo.from_bytes(message[1])
 
         self._registrar.register(ri.instance_name, ri.instance_rank, ri)
 
         agent_name = ri.instance_name + str(ri.instance_rank)
+        with self._loaded_remote_agents_lock:
+            if agent_name in self._loaded_remote_agents:
+                logger.debug(f"Remote transfer agent '{agent_name}' is already loaded")
+                return True
+
+        torch.cuda.set_device(self._device_id)
+        CUASSERT(cudart.cudaSetDevice(self._device_id))
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
         self._agent.load_remote_agent(
-            ri.instance_name + str(ri.instance_rank),
+            agent_name,
             ri.transfer_engine_info,
         )
         with self._loaded_remote_agents_lock:
@@ -1082,6 +1115,7 @@ class Sender(SenderBase):
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
+        return True
 
     def _handle_cancel_session(self, message: list[bytes]):
         unique_rid = int(message[1])
@@ -2372,6 +2406,7 @@ class RxSession(RxSessionBase):
 class RankInfoServer:
     def __init__(self, rank_info: RankInfo, addr: Optional[str] = None, port: Optional[int] = None):
         self._rank_info = rank_info
+        self._instance_rank_infos: Optional[list[bytes]] = None
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
             endpoint = f"tcp://{get_local_ip()}:*"
@@ -2383,6 +2418,9 @@ class RankInfoServer:
     @property
     def endpoint(self) -> str:
         return self._messenger.endpoint
+
+    def set_instance_rank_infos(self, rank_infos: list[bytes]) -> None:
+        self._instance_rank_infos = list(rank_infos)
 
     def shutdown(self):
         if self._shutdown:
@@ -2403,6 +2441,11 @@ class RankInfoServer:
                         self._handle_rank_info_request(send_id, msg)
                     except Exception as e:
                         logger.error(f"RankInfoServer: error handling REQUEST_INSTANCE_INFO: {e}")
+                case MessageType.REQUEST_ALL_RANK_INFO:
+                    try:
+                        self._handle_all_rank_info_request(send_id)
+                    except Exception as e:
+                        logger.error(f"RankInfoServer: error handling REQUEST_ALL_RANK_INFO: {e}")
                 case _:
                     logger.error(f"Instance info server received unknown message type: {msg[0]}")
             return True
@@ -2411,6 +2454,12 @@ class RankInfoServer:
 
     def _handle_rank_info_request(self, send_id: bytes, _message: list[bytes]):
         self._messenger.send([send_id, self._rank_info.to_bytes()])
+
+    def _handle_all_rank_info_request(self, send_id: bytes) -> None:
+        rank_infos = self._instance_rank_infos
+        if rank_infos is None:
+            rank_infos = [self._rank_info.to_bytes()]
+        self._messenger.send([send_id, *rank_infos])
 
     def __del__(self):
         try:
@@ -2423,6 +2472,76 @@ class RankInfoServer:
 
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
+
+
+def _validate_preconnect_rank_info_ack(message: list[bytes], endpoint: str) -> None:
+    if len(message) < 2 or message[0] != MessageType.PRECONNECT_RANK_INFO_ACK:
+        raise RuntimeError(f"Invalid PRECONNECT_RANK_INFO ACK from '{endpoint}': {message!r}")
+    if message[1] != AgentResult.SUCCESS.value.encode("ascii"):
+        detail = (
+            message[2].decode("utf-8", errors="replace") if len(message) > 2 else "unknown error"
+        )
+        raise RuntimeError(f"PRECONNECT_RANK_INFO failed on '{endpoint}': {detail}")
+
+
+def preconnect_instances(
+    context_info_endpoint: str,
+    generation_info_endpoint: str,
+    control_timeout_ms: int = PRECONNECT_CONTROL_TIMEOUT_MS,
+) -> None:
+    """Register every generation rank with every context sender rank."""
+    deadline = time.monotonic() + control_timeout_ms / 1000
+
+    def receive_before_deadline(messenger: ZMQMessenger) -> list[bytes]:
+        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+        try:
+            return messenger.receive(timeout_ms=remaining_ms)
+        except TimeoutError as error:
+            raise TimeoutError(
+                f"Preconnect control transaction exceeded {control_timeout_ms} ms"
+            ) from error
+
+    with ZMQMessenger(mode="DEALER", endpoint=context_info_endpoint) as messenger:
+        messenger.send([MessageType.REQUEST_INSTANCE_INFO])
+        context_messages = receive_before_deadline(messenger)
+    if len(context_messages) != 1:
+        raise RuntimeError(
+            f"Expected one context instance descriptor, received {len(context_messages)}"
+        )
+    context_info = RankInfo.from_bytes(context_messages[0])
+    if not context_info.sender_endpoints:
+        raise RuntimeError("Context instance descriptor has no sender endpoints")
+
+    with ZMQMessenger(mode="DEALER", endpoint=generation_info_endpoint) as messenger:
+        messenger.send([MessageType.REQUEST_ALL_RANK_INFO])
+        generation_rank_infos = receive_before_deadline(messenger)
+    if not generation_rank_infos:
+        raise RuntimeError("Generation instance returned no rank descriptors")
+    for rank_info_bytes in generation_rank_infos:
+        RankInfo.from_bytes(rank_info_bytes)
+
+    registration_dealers = []
+    try:
+        for endpoint in context_info.sender_endpoints:
+            dealer = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+            registration_dealers.append((endpoint, dealer))
+
+        # Fan out before waiting so context ranks perform cold UCX setup in parallel.
+        for _, dealer in registration_dealers:
+            for rank_info_bytes in generation_rank_infos:
+                dealer.send([MessageType.PRECONNECT_RANK_INFO, rank_info_bytes])
+
+        for endpoint, dealer in registration_dealers:
+            for _ in generation_rank_infos:
+                _validate_preconnect_rank_info_ack(receive_before_deadline(dealer), endpoint)
+    finally:
+        for _, dealer in registration_dealers:
+            dealer.stop()
+
+    logger.info(
+        f"Preconnected {len(generation_rank_infos)} generation ranks to "
+        f"{len(context_info.sender_endpoints)} context sender ranks"
+    )
 
 
 def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
@@ -2488,6 +2607,15 @@ class TransferWorker:
         assert self._rank_info is not None
         self._rank_info.sender_endpoints = endpoints
         self._rank_info.layer_num_per_pp = layer_num_per_pp
+
+    @property
+    def rank_info(self) -> RankInfo:
+        assert self._rank_info is not None
+        return self._rank_info
+
+    def publish_instance_rank_infos(self, rank_infos: list[bytes]) -> None:
+        if self._rank_info_server is not None:
+            self._rank_info_server.set_instance_rank_infos(rank_infos)
 
     def create_tx_session(self, request: LlmRequest) -> TxSession:
         params = request.py_disaggregated_params

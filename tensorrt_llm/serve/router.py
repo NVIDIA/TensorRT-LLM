@@ -376,11 +376,18 @@ class Router(ABC):
 
     @property
     def num_prepared_servers(self) -> int:
-        return len(self._prepared_ready_servers)
+        # A server may be prepared before it becomes routable while the
+        # coordinator establishes its disaggregated peer connections.  Such a
+        # staged server must not make cluster readiness advance prematurely.
+        return len(self._prepared_ready_servers.intersection(self._servers))
 
     @property
     def prepared_servers(self) -> set[str]:
         return set(self._prepared_ready_servers)
+
+    def get_server_info(self, server: str) -> dict:
+        """Return the cached metadata collected while preparing a server."""
+        return dict(self._server_info.get(server, {}))
 
     @property
     def server_role(self) -> ServerRole:
@@ -425,6 +432,28 @@ class Router(ABC):
                 continue
             await self._prepare_server(server)
 
+    async def prepare_server(self, server: str) -> bool:
+        """Prepare one server without making it available for routing."""
+        async with self._lock:
+            self._stage_server(server)
+        try:
+            await self._prepare_server(server)
+        except Exception:
+            await self.discard_prepared_server(server)
+            raise
+        if server not in self._prepared_ready_servers:
+            await self.discard_prepared_server(server)
+        return server in self._prepared_ready_servers
+
+    async def discard_prepared_server(self, server: str) -> None:
+        """Discard a staged server that never became routable."""
+        async with self._lock:
+            if server in self._servers:
+                return
+            self._prepared_ready_servers.discard(server)
+            self._server_info.pop(server, None)
+            self._unstage_server(server)
+
     def _stage_server(self, server: str) -> None:
         pass
 
@@ -435,17 +464,9 @@ class Router(ABC):
         if server in self._servers:
             logger.warning(f"Server {server} already exists")
             return True
-        async with self._lock:
-            self._stage_server(server)
-        try:
-            await self._prepare_server(server)
-        except Exception:
-            async with self._lock:
-                self._unstage_server(server)
-            raise
         if server not in self._prepared_ready_servers:
-            async with self._lock:
-                self._unstage_server(server)
+            await self.prepare_server(server)
+        if server not in self._prepared_ready_servers:
             logger.warning(
                 f"Server {server} was not added because preparation failed")
             return False
