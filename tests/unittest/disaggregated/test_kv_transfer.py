@@ -265,7 +265,7 @@ def _send_prefill_chunks(
         return []
     return slices
 
-
+@pytest.mark.cpu_only
 def test_build_prefill_chunk_projects_incremental_source_against_chunk_end():
     """A growing source is projected against the current chunk end, not the full prompt."""
     tokens_per_block = 128
