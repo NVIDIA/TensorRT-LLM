@@ -25,14 +25,15 @@ focused on scale-out. This post covers three complementary acceleration techniqu
 transformer pipeline: linear-layer quantization, quantized attention, and sparse attention. On
 the Wan 2.2 workload above, the combination of NVFP4 linear layers, SAGE quantized attention, and
 a conservative Skip Softmax setting reduces pipeline-forward latency from **525.0 to 374.9
-seconds**, a **1.40× speedup**. In this blog, we introduce these optimization techniques and discuss the trade off between quality and speed.
+seconds**, a **1.40× speedup**. In this blog, we introduce these optimization techniques and
+discuss the tradeoff between quality and speed.
 
 ## Table of Contents
 
 - [Quantization](#quantization)
 - [Attention Optimizations](#attention-optimizations)
 - [Results](#results)
-- [Agentic Automation and Reproduction](#agentic-automation-and-reproduction)
+- [Reproduction](#reproduction)
 - [Conclusion](#conclusion)
 - [References](#references)
 
@@ -55,9 +56,10 @@ means loading a prequantized checkpoint with its scales. Static checkpoints can 
 apply model-aware choices such as calibrated scales and keeping sensitive layers at higher
 precision. At the same target format, these algorithmic choices generally preserve accuracy
 better than quantizing every eligible layer dynamically at load time. This distinction describes
-how weights are prepared; activations are quantized as the model runs. All FP8 blockwise and
-NVFP4 results below use dynamic quantization from the public BF16 checkpoint. NVFP4 pushes
-precision lower for more throughput.
+how weights are prepared; activations are quantized as the model runs. The FP8 blockwise and
+NVFP4 results below dynamically quantize eligible BF16 weights at load time. The ModelOpt
+metadata stored with the checkpoint calibrates Skip Softmax; it does not prequantize those
+weights. NVFP4 pushes precision lower for more throughput.
 
 ## Attention Optimizations
 
@@ -97,7 +99,7 @@ attention precision, and Skip Softmax settings.
 
 | Item | Setting |
 | :--- | :--- |
-| Checkpoint | [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) |
+| Checkpoint | [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) BF16 weights with ModelOpt-generated Skip Softmax metadata for both transformers |
 | Accelerator | NVIDIA B200 |
 | Generated video | 1280×720, 81 frames at 16 FPS |
 | Denoising | 50 steps; guidance 5.0 for the high-noise expert and 4.0 for the low-noise expert; maximum text sequence length 512 |
@@ -126,31 +128,32 @@ handling, and video encoding are outside the measurement.
 
 ### Quality-speed frontier
 
-Skip Softmax introduces an explicit quality-speed tradeoff. Figure 2 places every skip-enabled run
-next to its no-skip precision-family anchor. LPIPS is measured against eager BF16, so the compiled
-dense BF16 anchor starts at 0.118 rather than zero.
+Skip Softmax introduces an explicit quality-speed tradeoff. Figure 2 maps every configuration
+instead of reducing the sweep to a few hand-picked points. Circles are skip-enabled runs, stars
+are the no-skip anchors for each precision family, and the dashed line traces the global Pareto
+frontier. Hover over a point for its exact configuration and use the filters to isolate a family,
+target sparsity, or denoising cutoff.
 
-<p align="center">
-  <img src="../media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of all 96 configurations showing speedup over compiled dense BF16 against mean LPIPS distance to eager BF16, with dense family anchors marked as stars and three operating points marked by numbered arrows" width="1080">
-</p>
+<iframe
+  src="../../_static/tech_blog28_quality_speed_frontier.html"
+  title="Interactive quality-speed frontier for the Wan 2.2 optimization sweep"
+  loading="lazy"
+  sandbox="allow-scripts"
+  style="width: 100%; height: 660px; border: 0;"
+></iframe>
 
-<p align="center"><sub><em>Figure 2. Quality-speed frontier across all 96 configurations; ①–③
-identify the operating points below.</em></sub></p>
+<p align="center"><sub><em>Figure 2. Interactive speedup–quality frontier across all 96
+configurations. LPIPS is measured against eager BF16; speedup is relative to compiled dense
+BF16.</em></sub></p>
 
-| Point | Goal | Configuration | Latency | Speedup | Mean LPIPS |
-| :---: | :--- | :--- | ---: | ---: | ---: |
-| ① | Conservative BF16 skipping | BF16 + dense attention + Skip (target 0.65, cutoff 0.86) | 487.6s | 1.08× | 0.141 |
-| ② | Conservative Skip setting within the quantized family | NVFP4 + SAGE + Skip (target 0.65, cutoff 0.86) | 374.9s | 1.40× | 0.504 |
-| ③ | Highest measured speed | NVFP4 + SAGE + Skip (target 0.75, cutoff 1.00) | 348.0s | 1.51× | 0.523 |
+<p><a href="../../_static/tech_blog28_quality_speed_frontier.html" target="_blank"
+rel="noopener noreferrer">Open the interactive frontier in a separate page</a>.</p>
 
-At point ②, Skip Softmax moves the NVFP4 + SAGE path from 1.28× to 1.40×. Its mean LPIPS is close
-to the matching no-skip anchor (0.504 versus 0.506), so the conservative Skip setting adds little
-incremental drift within that precision family on these seven prompt-and-seed pairs. The larger
-quality shift has already happened between BF16 and the quantized family: at an LPIPS near 0.5,
-synchronized video review becomes more useful than the metric alone. Check prompt adherence,
-motion, and temporal consistency before choosing between points ② and ③. In this sweep, the
-denoising cutoff influences similarity more strongly than target sparsity, making it the better
-parameter to tune first.
+The plot separates into three broad bands. BF16 stays closest to the eager reference. FP8 block
+scaling occupies the middle of the quality-speed range, while NVFP4 reaches the highest speedups
+with a larger shift from BF16. SAGE moves every precision family to the right, and Skip Softmax
+then fills out the local frontier within that family. The denoising cutoff drives most of the
+vertical spread, especially for BF16; target sparsity is the finer adjustment.
 
 ### Pipeline-forward latency
 
@@ -167,72 +170,24 @@ SAGE to 1.40×.
 and conservative Skip Softmax are combined. Speedups are relative to compiled dense BF16; Skip
 Softmax uses `target_sparsity=0.65` and `disabled_until_timestep=0.86`.</em></sub></p>
 
-## Agentic Automation and Reproduction
-
-The full 96-run sweep explains the interactions between the three techniques, but adapting the
-recipe to another model should use a staged search:
-
-1. Establish a compiled BF16 latency and quality reference.
-2. Compare the supported linear-layer quantization paths with dense attention, treating dynamic
-   and static weights as separate candidates, then retain only families that pass the quality gate.
-3. Compare dense and supported quantized-attention recipes for those families.
-4. Starting from `target_sparsity=0.65`, sweep a few conservative denoising cutoffs first.
-5. Sweep target sparsity only around the best cutoff, expand locally near the Pareto frontier, and
-   validate finalists on a broader prompt set.
-
-An agent can generate the YAML variants, invoke the supplied reproduction command, collect both
-pipeline-forward and client-observed latency, run the quality evaluator, and return the Pareto
-frontier. The model-specific checkpoint calibration and its `ignore` lists remain authoritative;
-the agent should not copy Wan 2.2 thresholds to another model.
-
-<details>
-<summary>Starter prompt for a client-side tuning agent</summary>
-
-```text
-Tune a TensorRT-LLM VisualGen configuration for a quality-constrained latency target.
-
-Inputs I will provide:
-- MODEL_DIR or Hugging Face model ID
-- base VisualGen YAML
-- one exact generation command
-- prompt/seed manifest
-- quality-evaluator command and acceptance thresholds
-- target GPU and software image
-
-Rules:
-1. Do not modify TensorRT-LLM source code or checkpoint weights.
-2. Label every FP8/NVFP4 result as dynamic or static. Do not compare or combine the two as if they
-   were the same quantization recipe.
-3. Keep resolution, frame count, denoising steps, scheduler, guidance, prompts, seeds, warmup,
-   and synchronization identical across candidates.
-4. Preserve checkpoint sparse-attention calibration and ignore lists. Change only documented
-   user controls such as target_sparsity and disabled_until_timestep.
-5. Stop evaluating a family when it fails a hard quality threshold. Never describe a recipe as
-   quality-preserving from a small LPIPS delta alone.
-
-Procedure:
-A. Run compiled BF16 and eager BF16 references.
-B. Benchmark the available dense-attention FP8 and NVFP4 anchors; retain passing families.
-C. Benchmark each supported quantized-attention recipe for the retained families.
-D. At target_sparsity=0.65, sweep a small set of conservative cutoffs. Around the best passing
-   cutoff, sweep target sparsity and refine only near the Pareto frontier.
-E. Re-run finalists enough times to report variation, then evaluate them on the full manifest.
-
-Return:
-- exact checkpoint, YAML, command, environment, and seed manifest for every reported point
-- pipeline-forward latency and client-observed end-to-end breakdown
-- aggregate and per-prompt quality metrics with pass/fail reasons
-- achieved sparsity by layer/timestep when available
-- a Pareto table and one recommended configuration, with unresolved risks stated explicitly
-```
-
-</details>
+## Reproduction
 
 The [Wan 2.2 Skip Softmax example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b)
-packages the component-specific calibration overlays and VisualGen configuration. The
-measurements in this post use the TensorRT-LLM release image
-`nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19`; set `MODEL_DIR` and `TRTLLM_ROOT` to local paths in
-that environment.
+contains the two ModelOpt calibration overlays and the VisualGen configuration for the 1.40×
+NVFP4 + SAGE result. Start with a local copy of the public BF16 checkpoint and apply the overlays
+to its high-noise and low-noise transformer configs:
+
+```bash
+export MODEL_DIR=/path/to/Wan2.2-T2V-A14B-Diffusers
+export TRTLLM_ROOT=/path/to/TensorRT-LLM
+export EXAMPLE_DIR="$TRTLLM_ROOT/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b"
+
+python "$EXAMPLE_DIR/apply_calibration.py" --model-dir "$MODEL_DIR"
+```
+
+The helper adds only the calibrated Skip Softmax metadata. The packaged `visual_gen.yaml` then
+selects dynamic NVFP4 linear-layer quantization, SAGE attention, `target_sparsity=0.65`, and
+`disabled_until_timestep=0.86`.
 
 ### Configuration details
 
@@ -255,48 +210,68 @@ calibration formula; achieved sparsity can therefore vary by layer and timestep.
 lower value keeps more early steps dense. Calibration also supplies an `ignore` list for layers
 that should stay dense.
 
-### Reproduce point ②
-
-Apply the high-noise and low-noise calibration overlays to their matching transformer configs:
+Generate the gallery prompt through the public VisualGen API:
 
 ```bash
-export MODEL_DIR=/path/to/Wan2.2-T2V-A14B-Diffusers
-export TRTLLM_ROOT=/path/to/TensorRT-LLM
-export EXAMPLE_DIR="$TRTLLM_ROOT/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b"
+python - <<'PY'
+import os
 
-python "$EXAMPLE_DIR/apply_calibration.py" --model-dir "$MODEL_DIR"
+from tensorrt_llm import VisualGen, VisualGenArgs
+
+model_dir = os.environ["MODEL_DIR"]
+example_dir = os.environ["EXAMPLE_DIR"]
+generator = VisualGen(
+    model=model_dir,
+    args=VisualGenArgs.from_yaml(f"{example_dir}/visual_gen.yaml"),
+)
+params = generator.default_params
+params.height = 720
+params.width = 1280
+params.num_frames = 81
+params.frame_rate = 16
+params.num_inference_steps = 50
+params.guidance_scale = 5.0
+params.max_sequence_length = 512
+params.seed = 1004
+params.extra_params = {**(params.extra_params or {}), "guidance_scale_2": 4.0}
+
+output = generator.generate(
+    inputs=(
+        "Drone shot flying over a rugged coastline at sunset, waves crashing on cliffs below, "
+        "golden hour lighting"
+    ),
+    params=params,
+)
+output.save("wan22_nvfp4_sage_skip.mp4")
+PY
 ```
 
-The helper merges the matching `sparse_attention_config` overlay into each transformer config and
-leaves all other fields unchanged. Each overlay carries 44 layer names in `ignore`; those layers
-remain dense. The packaged
-[`visual_gen.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b/visual_gen.yaml)
-selects point ②: `target_sparsity=0.65`,
-`disabled_until_timestep=0.86`, dynamic NVFP4 linear-layer quantization, and the INT8/FP8 SAGE
-recipe.
+<details>
+<summary>Seven-prompt evaluation manifest</summary>
 
-Start VisualGen with the packaged configuration:
+| ID | Seed | Prompt |
+| :--- | ---: | :--- |
+| `p01_cat_garden` | 1001 | A cat walking through a sunlit garden, gentle breeze rustling leaves, slow tracking shot |
+| `p03_park_kids` | 1003 | Children playing in a busy park, a golden retriever running between them, sunny afternoon, wide shot |
+| `p04_drone_coast` | 1004 | Drone shot flying over a rugged coastline at sunset, waves crashing on cliffs below, golden hour lighting |
+| `p05_neon_sign` | 1005 | A neon sign reading 'OPEN' flickering in a rainy alley at night, reflections on wet pavement, cinematic |
+| `p06_woman_smile` | 1006 | A young woman smiling at the camera, soft studio lighting, slight head tilt, cinematic close-up portrait |
+| `p07_horse_gallop` | 1007 | A racehorse galloping on a dirt track, kicking up dust, side tracking shot, dramatic lighting |
+| `p10_market` | 1010 | A bustling outdoor street market with people walking and vendors selling fresh fruit, Mediterranean style, midday sun |
 
-```bash
-trtllm-serve "$MODEL_DIR" --visual_gen_args "$EXAMPLE_DIR/visual_gen.yaml"
-```
+</details>
 
-### Measure latency and quality
+For the reported latency, each prompt first runs one untimed 50-step generation to compile both
+Wan transformer stages. After CUDA synchronization, a second 50-step pipeline forward is timed
+and synchronized; the seven prompt times are then averaged. Video encoding is outside this timed
+region. The eager BF16 quality reference disables compilation, quantization, SAGE, and Skip
+Softmax. AlexNet LPIPS is computed between corresponding frames, averaged over all 81 frames and
+then over the seven prompts.
 
-The latency and speedup values in Figures 2 and 3 measure the pipeline forward rather than HTTP
-handling or video encoding. For each prompt, run one untimed six-step forward at the same
-1280×720, 81-frame shape, enough to compile both Wan transformer stages. Synchronize the GPU, time
-one complete 50-step forward, and average the resulting times over the seven prompts.
-
-The YAML mirrors the current sweep: `torch.compile` is enabled, CUDA graphs are disabled because
-rc19 did not support this feature combination, and `compilation_config.skip_warmup=true` bypasses
-the generic multi-shape warmup in favor of the six-step exact-shape forward above. Autotuning is
-disabled as well; in this pipeline, it is invoked by the skipped generic warmup, so enabling it
-would not affect the sweep.
-
-For the quality axis, generate an eager BF16 reference with the same prompt and seed, compute
-AlexNet LPIPS between corresponding frames, average over the 81 frames, and then average over the
-seven prompts. Treat LPIPS as one diagnostic rather than a complete video-quality measure.
+The sweep ran on B200 with a TensorRT-LLM rc19-era source build at commit `e1135bbdfa`, including
+the Wan precision-cast change from [PR #15318](https://github.com/NVIDIA/TensorRT-LLM/pull/15318).
+Use the same build to match the reported numbers; newer releases can produce different compile
+paths and timing.
 
 ## Conclusion
 

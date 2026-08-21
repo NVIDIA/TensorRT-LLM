@@ -1,0 +1,178 @@
+<!--
+Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wan 2.2 quality-speed frontier</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#fff;color:#16191f;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+.frontier{padding:12px 14px 4px}
+.controls{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;padding:8px 10px;background:#f6f7f9;border:1px solid #dfe3e8;border-radius:7px}
+.control-group{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+.control-group b{font-size:12px}
+label{white-space:nowrap;font-size:12px}
+.count{margin-left:auto;color:#5c6470;font-size:12px}
+.plot{position:relative;margin-top:8px;border:1px solid #dfe3e8;border-radius:7px;background:#fff;overflow:hidden}
+svg{display:block;width:100%;height:auto}
+.tooltip{display:none;position:fixed;z-index:10;pointer-events:none;white-space:pre;background:#16191f;color:#fff;padding:7px 9px;border-radius:5px;font-size:11px;line-height:1.45;transform:translate(12px,12px);box-shadow:0 2px 8px #0004}
+.tooltip.on{display:block}
+@media(max-width:760px){.count{width:100%;margin-left:0}.frontier{padding:6px}}
+</style>
+</head>
+<body>
+<div class="frontier">
+  <div class="controls">
+    <div class="control-group"><b>Family</b><span id="families"></span></div>
+    <div class="control-group"><b>Target sparsity</b><span id="targets"></span></div>
+    <div class="control-group"><b>Cutoff</b><span id="cutoffs"></span></div>
+    <div class="control-group">
+      <label><input id="dense" type="checkbox" checked> Dense anchors</label>
+      <label><input id="pareto" type="checkbox" checked> Pareto frontier</label>
+    </div>
+    <output class="count" id="count"></output>
+  </div>
+  <div class="plot" id="plot"></div>
+  <div class="tooltip" id="tooltip"></div>
+</div>
+<script>
+(() => {
+const DATA=[{"family":"BF16","target":0.65,"cutoff":0.86,"speedup":1.0767,"latency":487.611,"lpips":0.14093,"dense":false},{"family":"BF16","target":0.65,"cutoff":0.9,"speedup":1.0878,"latency":482.657,"lpips":0.163053,"dense":false},{"family":"BF16","target":0.65,"cutoff":0.94,"speedup":1.1021,"latency":476.356,"lpips":0.184719,"dense":false},{"family":"BF16","target":0.65,"cutoff":0.97,"speedup":1.0966,"latency":478.777,"lpips":0.238278,"dense":false},{"family":"BF16","target":0.65,"cutoff":1.0,"speedup":1.1163,"latency":470.304,"lpips":0.443043,"dense":false},{"family":"BF16","target":0.7,"cutoff":0.86,"speedup":1.0911,"latency":481.178,"lpips":0.146362,"dense":false},{"family":"BF16","target":0.7,"cutoff":0.9,"speedup":1.1014,"latency":476.657,"lpips":0.164747,"dense":false},{"family":"BF16","target":0.7,"cutoff":0.94,"speedup":1.1003,"latency":477.149,"lpips":0.196726,"dense":false},{"family":"BF16","target":0.7,"cutoff":0.97,"speedup":1.1285,"latency":465.217,"lpips":0.252676,"dense":false},{"family":"BF16","target":0.7,"cutoff":1.0,"speedup":1.1451,"latency":458.487,"lpips":0.467293,"dense":false},{"family":"BF16","target":null,"cutoff":null,"speedup":1.0,"latency":525.011,"lpips":0.118139,"dense":true},{"family":"BF16","target":0.75,"cutoff":0.86,"speedup":1.108,"latency":473.854,"lpips":0.170124,"dense":false},{"family":"BF16","target":0.75,"cutoff":0.9,"speedup":1.1006,"latency":477.016,"lpips":0.178109,"dense":false},{"family":"BF16","target":0.75,"cutoff":0.94,"speedup":1.1227,"latency":467.641,"lpips":0.205644,"dense":false},{"family":"BF16","target":0.75,"cutoff":0.97,"speedup":1.148,"latency":457.345,"lpips":0.271422,"dense":false},{"family":"BF16","target":0.75,"cutoff":1.0,"speedup":1.1785,"latency":445.499,"lpips":0.484391,"dense":false},{"family":"BF16 + SAGE","target":0.65,"cutoff":0.86,"speedup":1.1377,"latency":461.473,"lpips":0.258128,"dense":false},{"family":"BF16 + SAGE","target":0.65,"cutoff":0.9,"speedup":1.1577,"latency":453.484,"lpips":0.261267,"dense":false},{"family":"BF16 + SAGE","target":0.65,"cutoff":0.94,"speedup":1.159,"latency":452.996,"lpips":0.270265,"dense":false},{"family":"BF16 + SAGE","target":0.65,"cutoff":0.97,"speedup":1.1829,"latency":443.825,"lpips":0.277699,"dense":false},{"family":"BF16 + SAGE","target":0.65,"cutoff":1.0,"speedup":1.1783,"latency":445.579,"lpips":0.436405,"dense":false},{"family":"BF16 + SAGE","target":0.7,"cutoff":0.86,"speedup":1.1607,"latency":452.323,"lpips":0.261709,"dense":false},{"family":"BF16 + SAGE","target":0.7,"cutoff":0.9,"speedup":1.1642,"latency":450.97,"lpips":0.265341,"dense":false},{"family":"BF16 + SAGE","target":0.7,"cutoff":0.94,"speedup":1.1882,"latency":441.87,"lpips":0.273117,"dense":false},{"family":"BF16 + SAGE","target":0.7,"cutoff":0.97,"speedup":1.1814,"latency":444.382,"lpips":0.29057,"dense":false},{"family":"BF16 + SAGE","target":0.7,"cutoff":1.0,"speedup":1.2069,"latency":435.024,"lpips":0.468905,"dense":false},{"family":"BF16 + SAGE","target":null,"cutoff":null,"speedup":1.0799,"latency":486.16,"lpips":0.256227,"dense":true},{"family":"BF16 + SAGE","target":0.75,"cutoff":0.86,"speedup":1.1666,"latency":450.048,"lpips":0.268093,"dense":false},{"family":"BF16 + SAGE","target":0.75,"cutoff":0.9,"speedup":1.193,"latency":440.06,"lpips":0.27222,"dense":false},{"family":"BF16 + SAGE","target":0.75,"cutoff":0.94,"speedup":1.1872,"latency":442.219,"lpips":0.283026,"dense":false},{"family":"BF16 + SAGE","target":0.75,"cutoff":0.97,"speedup":1.2115,"latency":433.361,"lpips":0.300414,"dense":false},{"family":"BF16 + SAGE","target":0.75,"cutoff":1.0,"speedup":1.2212,"latency":429.921,"lpips":0.488339,"dense":false},{"family":"FP8 block","target":0.65,"cutoff":0.86,"speedup":1.1915,"latency":440.632,"lpips":0.422811,"dense":false},{"family":"FP8 block","target":0.65,"cutoff":0.9,"speedup":1.1905,"latency":441.009,"lpips":0.42064,"dense":false},{"family":"FP8 block","target":0.65,"cutoff":0.94,"speedup":1.1914,"latency":440.656,"lpips":0.415668,"dense":false},{"family":"FP8 block","target":0.65,"cutoff":0.97,"speedup":1.233,"latency":425.814,"lpips":0.423697,"dense":false},{"family":"FP8 block","target":0.65,"cutoff":1.0,"speedup":1.228,"latency":427.531,"lpips":0.458816,"dense":false},{"family":"FP8 block","target":0.7,"cutoff":0.86,"speedup":1.1983,"latency":438.13,"lpips":0.421577,"dense":false},{"family":"FP8 block","target":0.7,"cutoff":0.9,"speedup":1.2051,"latency":435.645,"lpips":0.417739,"dense":false},{"family":"FP8 block","target":0.7,"cutoff":0.94,"speedup":1.2384,"latency":423.936,"lpips":0.418825,"dense":false},{"family":"FP8 block","target":0.7,"cutoff":0.97,"speedup":1.235,"latency":425.127,"lpips":0.420844,"dense":false},{"family":"FP8 block","target":0.7,"cutoff":1.0,"speedup":1.2543,"latency":418.576,"lpips":0.463955,"dense":false},{"family":"FP8 block","target":null,"cutoff":null,"speedup":1.0732,"latency":489.204,"lpips":0.424911,"dense":true},{"family":"FP8 block","target":0.75,"cutoff":0.86,"speedup":1.2225,"latency":429.472,"lpips":0.423689,"dense":false},{"family":"FP8 block","target":0.75,"cutoff":0.9,"speedup":1.2231,"latency":429.248,"lpips":0.418335,"dense":false},{"family":"FP8 block","target":0.75,"cutoff":0.94,"speedup":1.2324,"latency":426.022,"lpips":0.420661,"dense":false},{"family":"FP8 block","target":0.75,"cutoff":0.97,"speedup":1.2766,"latency":411.246,"lpips":0.428463,"dense":false},{"family":"FP8 block","target":0.75,"cutoff":1.0,"speedup":1.2777,"latency":410.9,"lpips":0.483452,"dense":false},{"family":"FP8 block + SAGE","target":0.65,"cutoff":0.86,"speedup":1.2559,"latency":418.025,"lpips":0.393964,"dense":false},{"family":"FP8 block + SAGE","target":0.65,"cutoff":0.9,"speedup":1.2566,"latency":417.809,"lpips":0.390431,"dense":false},{"family":"FP8 block + SAGE","target":0.65,"cutoff":0.94,"speedup":1.2762,"latency":411.39,"lpips":0.396601,"dense":false},{"family":"FP8 block + SAGE","target":0.65,"cutoff":0.97,"speedup":1.2924,"latency":406.222,"lpips":0.39541,"dense":false},{"family":"FP8 block + SAGE","target":0.65,"cutoff":1.0,"speedup":1.2999,"latency":403.892,"lpips":0.446775,"dense":false},{"family":"FP8 block + SAGE","target":0.7,"cutoff":0.86,"speedup":1.2582,"latency":417.273,"lpips":0.393388,"dense":false},{"family":"FP8 block + SAGE","target":0.7,"cutoff":0.9,"speedup":1.2804,"latency":410.021,"lpips":0.391276,"dense":false},{"family":"FP8 block + SAGE","target":0.7,"cutoff":0.94,"speedup":1.2944,"latency":405.606,"lpips":0.394482,"dense":false},{"family":"FP8 block + SAGE","target":0.7,"cutoff":0.97,"speedup":1.3126,"latency":399.991,"lpips":0.39787,"dense":false},{"family":"FP8 block + SAGE","target":0.7,"cutoff":1.0,"speedup":1.3122,"latency":400.105,"lpips":0.457005,"dense":false},{"family":"FP8 block + SAGE","target":null,"cutoff":null,"speedup":1.1685,"latency":449.296,"lpips":0.397062,"dense":true},{"family":"FP8 block + SAGE","target":0.75,"cutoff":0.86,"speedup":1.2828,"latency":409.27,"lpips":0.396103,"dense":false},{"family":"FP8 block + SAGE","target":0.75,"cutoff":0.9,"speedup":1.2986,"latency":404.298,"lpips":0.396521,"dense":false},{"family":"FP8 block + SAGE","target":0.75,"cutoff":0.94,"speedup":1.3206,"latency":397.56,"lpips":0.39466,"dense":false},{"family":"FP8 block + SAGE","target":0.75,"cutoff":0.97,"speedup":1.3257,"latency":396.015,"lpips":0.402262,"dense":false},{"family":"FP8 block + SAGE","target":0.75,"cutoff":1.0,"speedup":1.3486,"latency":389.305,"lpips":0.469716,"dense":false},{"family":"NVFP4","target":0.65,"cutoff":0.86,"speedup":1.2262,"latency":428.151,"lpips":0.509149,"dense":false},{"family":"NVFP4","target":0.65,"cutoff":0.9,"speedup":1.25,"latency":420.007,"lpips":0.506121,"dense":false},{"family":"NVFP4","target":0.65,"cutoff":0.94,"speedup":1.2448,"latency":421.767,"lpips":0.506294,"dense":false},{"family":"NVFP4","target":0.65,"cutoff":0.97,"speedup":1.2728,"latency":412.501,"lpips":0.511707,"dense":false},{"family":"NVFP4","target":0.65,"cutoff":1.0,"speedup":1.2912,"latency":406.621,"lpips":0.520059,"dense":false},{"family":"NVFP4","target":0.7,"cutoff":0.86,"speedup":1.2509,"latency":419.706,"lpips":0.509795,"dense":false},{"family":"NVFP4","target":0.7,"cutoff":0.9,"speedup":1.2512,"latency":419.599,"lpips":0.503392,"dense":false},{"family":"NVFP4","target":0.7,"cutoff":0.94,"speedup":1.282,"latency":409.527,"lpips":0.505304,"dense":false},{"family":"NVFP4","target":0.7,"cutoff":0.97,"speedup":1.3045,"latency":402.454,"lpips":0.506625,"dense":false},{"family":"NVFP4","target":0.7,"cutoff":1.0,"speedup":1.3257,"latency":396.017,"lpips":0.522503,"dense":false},{"family":"NVFP4","target":null,"cutoff":null,"speedup":1.1134,"latency":471.556,"lpips":0.504199,"dense":true},{"family":"NVFP4","target":0.75,"cutoff":0.86,"speedup":1.2619,"latency":416.042,"lpips":0.507056,"dense":false},{"family":"NVFP4","target":0.75,"cutoff":0.9,"speedup":1.2881,"latency":407.578,"lpips":0.507848,"dense":false},{"family":"NVFP4","target":0.75,"cutoff":0.94,"speedup":1.3005,"latency":403.707,"lpips":0.506064,"dense":false},{"family":"NVFP4","target":0.75,"cutoff":0.97,"speedup":1.3124,"latency":400.028,"lpips":0.514389,"dense":false},{"family":"NVFP4","target":0.75,"cutoff":1.0,"speedup":1.3494,"latency":389.067,"lpips":0.53187,"dense":false},{"family":"NVFP4 + SAGE","target":0.65,"cutoff":0.86,"speedup":1.4006,"latency":374.852,"lpips":0.504253,"dense":false},{"family":"NVFP4 + SAGE","target":0.65,"cutoff":0.9,"speedup":1.4025,"latency":374.327,"lpips":0.504136,"dense":false},{"family":"NVFP4 + SAGE","target":0.65,"cutoff":0.94,"speedup":1.4235,"latency":368.815,"lpips":0.504466,"dense":false},{"family":"NVFP4 + SAGE","target":0.65,"cutoff":0.97,"speedup":1.4278,"latency":367.715,"lpips":0.505249,"dense":false},{"family":"NVFP4 + SAGE","target":0.65,"cutoff":1.0,"speedup":1.4549,"latency":360.86,"lpips":0.516995,"dense":false},{"family":"NVFP4 + SAGE","target":0.7,"cutoff":0.86,"speedup":1.4053,"latency":373.59,"lpips":0.506175,"dense":false},{"family":"NVFP4 + SAGE","target":0.7,"cutoff":0.9,"speedup":1.4182,"latency":370.207,"lpips":0.505404,"dense":false},{"family":"NVFP4 + SAGE","target":0.7,"cutoff":0.94,"speedup":1.4474,"latency":362.72,"lpips":0.50538,"dense":false},{"family":"NVFP4 + SAGE","target":0.7,"cutoff":0.97,"speedup":1.47,"latency":357.155,"lpips":0.505233,"dense":false},{"family":"NVFP4 + SAGE","target":0.7,"cutoff":1.0,"speedup":1.4783,"latency":355.141,"lpips":0.520603,"dense":false},{"family":"NVFP4 + SAGE","target":null,"cutoff":null,"speedup":1.2814,"latency":409.717,"lpips":0.505681,"dense":true},{"family":"NVFP4 + SAGE","target":0.75,"cutoff":0.86,"speedup":1.4207,"latency":369.548,"lpips":0.507574,"dense":false},{"family":"NVFP4 + SAGE","target":0.75,"cutoff":0.9,"speedup":1.4578,"latency":360.139,"lpips":0.508576,"dense":false},{"family":"NVFP4 + SAGE","target":0.75,"cutoff":0.94,"speedup":1.4755,"latency":355.814,"lpips":0.507205,"dense":false},{"family":"NVFP4 + SAGE","target":0.75,"cutoff":0.97,"speedup":1.4903,"latency":352.288,"lpips":0.508719,"dense":false},{"family":"NVFP4 + SAGE","target":0.75,"cutoff":1.0,"speedup":1.5085,"latency":348.037,"lpips":0.523382,"dense":false}];
+const FAMILIES=['BF16','BF16 + SAGE','FP8 block','FP8 block + SAGE','NVFP4','NVFP4 + SAGE'];
+const COLORS={
+  'BF16':'#1a73e8','BF16 + SAGE':'#e8710a','FP8 block':'#9334e6',
+  'FP8 block + SAGE':'#188038','NVFP4':'#d93025','NVFP4 + SAGE':'#00897b'
+};
+const TARGETS=[0.65,0.70,0.75], CUTOFFS=[0.86,0.90,0.94,0.97,1.00];
+const NS='http://www.w3.org/2000/svg';
+const plot=document.getElementById('plot'), tooltip=document.getElementById('tooltip');
+function chips(id,values,key,format){
+  document.getElementById(id).innerHTML=values.map(v=>
+    `<label><input type="checkbox" data-${key}="${v}" checked> ${format(v)}</label>`
+  ).join(' ');
+}
+chips('families',FAMILIES,'family',v=>v);
+chips('targets',TARGETS,'target',v=>v.toFixed(2));
+chips('cutoffs',CUTOFFS,'cutoff',v=>v.toFixed(2));
+function selected(key){
+  return [...document.querySelectorAll(`[data-${key}]:checked`)].map(e=>e.getAttribute(`data-${key}`));
+}
+function star(cx,cy,r){
+  let d='';
+  for(let i=0;i<10;i++){
+    const a=Math.PI*i/5-Math.PI/2, rr=i%2?r*.45:r;
+    d+=(i?'L':'M')+(cx+rr*Math.cos(a)).toFixed(1)+' '+(cy+rr*Math.sin(a)).toFixed(1)+' ';
+  }
+  return d+'Z';
+}
+function pareto(points){
+  const ordered=[...points].sort((a,b)=>b.speedup-a.speedup);
+  let best=Infinity;
+  const result=[];
+  for(const point of ordered){
+    if(point.lpips<best-1e-12){best=point.lpips;result.push(point)}
+  }
+  return result.sort((a,b)=>a.speedup-b.speedup);
+}
+function draw(){
+  const families=selected('family');
+  const targets=selected('target').map(Number);
+  const cutoffs=selected('cutoff').map(Number);
+  const showDense=document.getElementById('dense').checked;
+  const variants=DATA.filter(p=>!p.dense&&families.includes(p.family)&&targets.includes(p.target)&&cutoffs.includes(p.cutoff));
+  const anchors=showDense?DATA.filter(p=>p.dense&&families.includes(p.family)):[];
+  const visible=variants.concat(anchors);
+  document.getElementById('count').textContent=`${variants.length} / 90 variants${anchors.length?' + '+anchors.length+' dense anchors':''}`;
+
+  const W=1120,H=590,m={l:78,r:205,t:24,b:66};
+  const svg=document.createElementNS(NS,'svg');
+  svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+  svg.setAttribute('role','img');
+  svg.setAttribute('aria-label','Interactive scatter plot of speedup versus mean LPIPS');
+  function add(tag,attrs,text){
+    const e=document.createElementNS(NS,tag);
+    Object.entries(attrs).forEach(([k,v])=>e.setAttribute(k,v));
+    if(text!==undefined)e.textContent=text;
+    svg.appendChild(e);return e;
+  }
+  add('rect',{x:0,y:0,width:W,height:H,fill:'#fff'});
+  const domain=visible.length?visible:DATA;
+  let xmin=Math.min(...domain.map(p=>p.speedup)),xmax=Math.max(...domain.map(p=>p.speedup));
+  let ymin=Math.min(...domain.map(p=>p.lpips)),ymax=Math.max(...domain.map(p=>p.lpips));
+  const xpad=Math.max((xmax-xmin)*.06,.015),ypad=Math.max((ymax-ymin)*.08,.012);
+  xmin-=xpad;xmax+=xpad;ymin=Math.max(0,ymin-ypad);ymax+=ypad;
+  const X=v=>m.l+(v-xmin)/(xmax-xmin)*(W-m.l-m.r);
+  const Y=v=>H-m.b-(v-ymin)/(ymax-ymin)*(H-m.t-m.b);
+  for(let i=0;i<=5;i++){
+    const y=m.t+(H-m.t-m.b)*i/5,value=ymax-(ymax-ymin)*i/5;
+    add('line',{x1:m.l,y1:y,x2:W-m.r,y2:y,stroke:'#e3e7eb','stroke-dasharray':'2 3'});
+    add('text',{x:m.l-9,y:y+4,'text-anchor':'end','font-size':12,fill:'#5c6470'},value.toFixed(2));
+  }
+  for(let i=0;i<=5;i++){
+    const x=m.l+(W-m.l-m.r)*i/5,value=xmin+(xmax-xmin)*i/5;
+    add('line',{x1:x,y1:m.t,x2:x,y2:H-m.b,stroke:'#f0f2f4'});
+    add('text',{x:x,y:H-m.b+21,'text-anchor':'middle','font-size':12,fill:'#5c6470'},value.toFixed(2)+'×');
+  }
+  add('line',{x1:m.l,y1:H-m.b,x2:W-m.r,y2:H-m.b,stroke:'#59636e'});
+  add('line',{x1:m.l,y1:m.t,x2:m.l,y2:H-m.b,stroke:'#59636e'});
+  add('text',{x:(m.l+W-m.r)/2,y:H-15,'text-anchor':'middle','font-size':14,'font-weight':600},'Speedup over compiled dense BF16 (higher is better)');
+  add('text',{transform:`translate(20,${(m.t+H-m.b)/2}) rotate(-90)`,'text-anchor':'middle','font-size':14,'font-weight':600},'Mean LPIPS vs eager BF16 (lower is better)');
+
+  if(document.getElementById('pareto').checked&&visible.length){
+    const front=pareto(visible);
+    if(front.length>1){
+      add('path',{d:'M'+front.map(p=>`${X(p.speedup).toFixed(1)} ${Y(p.lpips).toFixed(1)}`).join(' L'),fill:'none',stroke:'#30363d','stroke-width':2.2,'stroke-dasharray':'7 4'});
+    }
+  }
+  function bind(element,p){
+    element.style.cursor='pointer';
+    element.addEventListener('mousemove',event=>{
+      const config=p.dense?'Dense attention':`target sparsity ${p.target.toFixed(2)} · cutoff ${p.cutoff.toFixed(2)}`;
+      tooltip.textContent=`${p.family} · ${config}
+Speedup ${p.speedup.toFixed(3)}× · latency ${p.latency.toFixed(1)} s
+Mean LPIPS ${p.lpips.toFixed(4)}`;
+      tooltip.style.left=event.clientX+'px';tooltip.style.top=event.clientY+'px';tooltip.classList.add('on');
+    });
+    element.addEventListener('mouseleave',()=>tooltip.classList.remove('on'));
+  }
+  for(const p of variants){
+    const c=add('circle',{cx:X(p.speedup).toFixed(1),cy:Y(p.lpips).toFixed(1),r:5.5,fill:COLORS[p.family],'fill-opacity':.72,stroke:'#fff','stroke-width':1});
+    bind(c,p);
+  }
+  for(const p of anchors){
+    const s=add('path',{d:star(X(p.speedup),Y(p.lpips),9),fill:COLORS[p.family],stroke:'#fff','stroke-width':1.2});
+    bind(s,p);
+  }
+  const lx=W-m.r+18,ly=m.t+15;
+  FAMILIES.forEach((family,i)=>{
+    add('circle',{cx:lx,cy:ly+i*27,r:6,fill:COLORS[family]});
+    add('text',{x:lx+12,y:ly+i*27+4,'font-size':12},family);
+  });
+  const sy=ly+FAMILIES.length*27+18;
+  add('path',{d:star(lx,sy,8),fill:'#59636e'});
+  add('text',{x:lx+12,y:sy+4,'font-size':12},'Dense anchor');
+  add('line',{x1:lx-7,y1:sy+27,x2:lx+7,y2:sy+27,stroke:'#30363d','stroke-width':2.2,'stroke-dasharray':'7 4'});
+  add('text',{x:lx+12,y:sy+31,'font-size':12},'Pareto frontier');
+  plot.replaceChildren(svg);
+}
+document.querySelectorAll('input').forEach(input=>input.addEventListener('change',draw));
+draw();
+})();
+</script>
+</body>
+</html>
