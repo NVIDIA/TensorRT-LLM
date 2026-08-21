@@ -384,11 +384,6 @@ region. The eager BF16 quality reference disables compilation, quantization, SAG
 Softmax. AlexNet LPIPS is computed between corresponding frames, averaged over all 81 frames and
 then over the seven prompts.
 
-The sweep ran on B200 with a TensorRT-LLM rc19-era source build at commit `e1135bbdfa`, including
-the Wan precision-cast change from [PR #15318](https://github.com/NVIDIA/TensorRT-LLM/pull/15318).
-Use the same build to match the reported numbers; newer releases can produce different compile
-paths and timing.
-
 ### Agentic optimization (TODO)
 
 Finding a useful speed-quality tradeoff by hand is laborious: every candidate must be generated
