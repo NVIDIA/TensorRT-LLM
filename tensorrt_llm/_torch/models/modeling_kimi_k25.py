@@ -1733,6 +1733,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         if any(k.startswith(self._LANG_PREFIX) for k in weights):
             lm_weights = filter_weights("language_model", weights)
             lm_weights = ConsumableWeightsDict(lm_weights)
+            checkpoint_dir = getattr(weights, "checkpoint_dir", None)
+            if checkpoint_dir is not None:
+                lm_weights.checkpoint_dir = checkpoint_dir
+            lm_weights.checkpoint_prefix = self._LANG_PREFIX
         else:
             lm_weights = weights
         self.llm.load_weights(lm_weights)
