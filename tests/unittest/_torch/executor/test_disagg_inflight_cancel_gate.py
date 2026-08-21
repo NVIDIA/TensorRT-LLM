@@ -300,6 +300,8 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    # Transfer ownership is released once the request leaves the manager.
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor._disagg_inflight_cancel_unsupported_logged = False
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {

@@ -5605,6 +5605,21 @@ class PyExecutor:
                 raise ValueError("Token ID out of range")
 
     def _validate_request(self, request: LlmRequest):
+        # Validate context-side pipelined-transfer constraints.
+        disagg_params = request.py_disaggregated_params
+        if (self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.pipeline_transfer_enabled
+                and disagg_params is not None and request.llm_request_type
+                == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY):
+            if request.py_beam_width != 1:
+                raise ValueError(
+                    "enable_pipelined_transfer requires beam_width == 1, got "
+                    f"{request.py_beam_width}.")
+            if disagg_params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
+                raise ValueError(
+                    "enable_pipelined_transfer requires "
+                    "schedule_style='generation_first' on the request.")
+
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
@@ -5662,6 +5677,20 @@ class PyExecutor:
 
         # Check token ID ranges
         self._validate_token_id_range(request)
+
+        disagg_params = request.py_disaggregated_params
+        if (not self.is_warmup and self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.pipeline_transfer_enabled
+                and request.is_context_only_request
+                and disagg_params is not None):
+            if request.py_beam_width != 1:
+                raise ValueError(
+                    "beam_width > 1 is not supported when enable_pipelined_transfer is set."
+                )
+
+            if disagg_params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
+                raise ValueError("schedule_style must be generation_first when "
+                                 "enable_pipelined_transfer is set.")
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
@@ -6881,6 +6910,8 @@ class PyExecutor:
                     f"kv_transfer_timeout_ms={timeout_ms}ms")
                 req.py_kv_transfer_timed_out = True
 
+        # Context requests start their clock on the last chunk, which is also when
+        # they enter the transfer manager, so this covers the whole context side.
         for req in self.async_transfer_manager.requests_in_transfer().values():
             flag_if_kv_transfer_timed_out(req, "context")
 
@@ -7563,23 +7594,45 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
 
         if self.kv_cache_transceiver:
+            # Do not send more chunks after an in-flight cancellation.
+            cancel_pending_ids = set(self.canceled_req_ids)
             for req in scheduled_requests:
-                if req.is_context_only_request and (
-                        req.is_context_finished or req.is_finished_due_to_length
-                ) and not req.is_finished_due_to_cancellation:
-                    # Forward is done for this request — release the
-                    # IndexMapper slot so new requests can reuse it.
-                    # KV blocks stay allocated for the upcoming transfer.
-                    if hasattr(self.kv_cache_manager, 'release_index_slot'):
-                        self.kv_cache_manager.release_index_slot(
-                            req.py_request_id)
-                    # Order is important here: we need to start the transfer before responding
-                    # to make sure the blocks are stored for reuse before they are sent.
-                    self.async_transfer_manager.start_transfer(req)
-                    self.kv_cache_transceiver.respond_and_send_async(req)
+                if req.is_context_only_request and not req.is_finished_due_to_cancellation:
+                    request_id = (req.parent_request_id
+                                  if req.is_child else req.py_request_id)
+                    if request_id in cancel_pending_ids:
+                        continue
+                    if self.kv_cache_transceiver.has_retired_send_session(req):
+                        # The peer registration went away with the session, so
+                        # no further slice can land. Checked before the branch
+                        # below because start_transfer() would otherwise pin
+                        # blocks that only end_transfer() can release.
+                        req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                        continue
+                    if req.is_context_finished or req.is_finished_due_to_length:
+                        # Forward is done for this request — release the
+                        # IndexMapper slot so new requests can reuse it.
+                        # KV blocks stay allocated for the upcoming transfer.
+                        if hasattr(self.kv_cache_manager, 'release_index_slot'):
+                            self.kv_cache_manager.release_index_slot(
+                                req.py_request_id)
+                        # Order matters: start_transfer commits the request's blocks to the reuse
+                        # tree and pins them, and must run before respond_and_send_async sends the
+                        # final KV slice and (for the Python transceiver) transitions the request toward completion.
+                        self.async_transfer_manager.start_transfer(req)
 
-                    if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-                        req.py_kv_transfer_start_time = time.monotonic()
+                        # Send the monolithic slice or final pipelined chunk.
+                        self.kv_cache_transceiver.respond_and_send_async(req)
+
+                        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+                            req.py_kv_transfer_start_time = time.monotonic()
+                    elif (self.kv_cache_transceiver.pipeline_transfer_enabled
+                          and req.state != LlmRequestState.GENERATION_COMPLETE):
+                        # send intermediate chunk for pipelined transfer.
+                        # GENERATION_COMPLETE means an error path already failed
+                        # and freed this request; _update_request_states skips
+                        # those, so its chunk bounds are unset.
+                        self.kv_cache_transceiver.respond_and_send_async(req)
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -8216,11 +8269,19 @@ class PyExecutor:
         self.inflight_req_ids.erase(request_id)
 
     def _is_request_in_transmission(self, request) -> bool:
-        """Check if a request is currently in transmission state."""
-        return (request.state
-                == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        """Check if a request's KV cache may still be read by the fabric.
+
+        The request state only tracks the compute phase. Under pipelined
+        transfer a chunk can be in flight while the request is still being
+        prefilled, so the transceiver's own ownership record has to be
+        consulted as well.
+        """
+        if (request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
                 or request.state
-                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
+            return True
+        return (self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.has_inflight_transfer(request))
 
     def _try_cancel_request(self, request) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.

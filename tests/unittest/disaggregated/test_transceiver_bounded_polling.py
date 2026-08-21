@@ -58,12 +58,14 @@ class _FakeSession:
         status: SessionStatus = SessionStatus.READY,
         is_completed: bool = False,
         has_failed: bool = False,
+        has_transferring_tasks: bool = False,
     ) -> None:
         self._rid = rid
         self._wait_result = wait_result
         self._status = status
         self._is_completed = is_completed
         self._has_failed = has_failed
+        self._has_transferring_tasks = has_transferring_tasks
         self.blocking_calls: list[bool] = []
         self.closed = False
         self.aux_slot: Optional[int] = 0
@@ -85,6 +87,9 @@ class _FakeSession:
 
     def has_failed(self) -> bool:
         return self._has_failed
+
+    def has_transferring_tasks(self) -> bool:
+        return self._has_transferring_tasks
 
     def close(self) -> None:
         self.closed = True
@@ -300,6 +305,60 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert 13 not in transceiver._send_sessions
     assert 13 not in transceiver._send_reqs
+
+
+@pytest.mark.parametrize(
+    ("status", "has_failed"),
+    [
+        (SessionStatus.CANCELLED, True),
+        (SessionStatus.ERROR, True),
+    ],
+)
+def test_context_transfer_status_retains_terminal_session_during_write(
+    status: SessionStatus,
+    has_failed: bool,
+) -> None:
+    session = _FakeSession(
+        rid=17,
+        wait_result=WaitResult.FAILED,
+        status=status,
+        has_failed=has_failed,
+        has_transferring_tasks=True,
+    )
+    req = _FakeRequest()
+    transceiver = _make_transceiver({17: session}, {17: req})
+
+    completed, failed = transceiver.check_context_transfer_status(
+        at_least_request_num=0
+    )
+
+    assert completed == []
+    assert failed == []
+    assert not session.closed
+    assert transceiver._send_sessions == {17: session}
+    assert transceiver._send_reqs == {17: req}
+    assert req.state is None
+
+
+def test_context_transfer_status_retires_quiesced_cancelled_session() -> None:
+    session = _FakeSession(
+        rid=18,
+        wait_result=WaitResult.FAILED,
+        status=SessionStatus.CANCELLED,
+        has_failed=True,
+    )
+    req = _FakeRequest()
+    transceiver = _make_transceiver({18: session}, {18: req})
+
+    completed, failed = transceiver.check_context_transfer_status(
+        at_least_request_num=0
+    )
+
+    assert completed == []
+    assert failed == []
+    assert session.closed
+    assert 18 not in transceiver._send_sessions
+    assert 18 not in transceiver._send_reqs
 
 
 def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
@@ -681,6 +740,7 @@ def test_tx_session_first_send_anchors_deadline_once(monkeypatch) -> None:
         request_id=31,
         params=params,
         sender=sender,
+        prompt_len=8,
         timeout_s=0.25,
         overall_timeout_s=2.0,
     )
