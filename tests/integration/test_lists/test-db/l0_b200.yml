@@ -97,6 +97,7 @@ l0_b200:
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
@@ -122,6 +123,7 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
@@ -130,6 +132,9 @@ l0_b200:
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
   - unittest/_torch/modules/moe/test_megamoe_streaming_load.py
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
@@ -185,6 +190,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
+  - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests
   # ------------- KV Cache V2 Scheduler IT ---------------
@@ -227,6 +233,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_fa4_key_padding_mask.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
@@ -273,6 +280,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_example TIMEOUT (30)
   - unittest/_torch/visual_gen/test_cosmos3_edge.py
   - unittest/_torch/visual_gen/test_cosmos3_example_prompts.py
+  - unittest/_torch/visual_gen/test_glm_image_transformer.py
+  - unittest/_torch/visual_gen/test_glm_image_pipeline.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -365,6 +374,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_api_walkthrough
   - examples/visual_gen/test_visual_gen_flux.py::test_flux1_lpips_against_golden
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_lpips_against_golden
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-cuda-graph]
@@ -376,6 +386,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[cuda-graph]
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[fp8-blockwise]
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_feature_accuracy_against_golden[fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_feature_accuracy_against_golden[nvfp4]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[fp8-blockwise]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[nvfp4]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[cuda-graph]

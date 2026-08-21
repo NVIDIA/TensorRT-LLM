@@ -18,6 +18,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
@@ -42,8 +44,6 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend.interface import (AttentionMetadata,
@@ -530,6 +530,7 @@ class PyTorchModelEngine(ModelEngine):
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
+            # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
@@ -5686,6 +5687,7 @@ class PyTorchModelEngine(ModelEngine):
                     input_ids.append(
                         request.get_tokens(0)[request.context_current_position])
                     past_seen_token_num = request.context_current_position
+                    request_has_previous_tensor = False
                 # The request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -5707,17 +5709,34 @@ class PyTorchModelEngine(ModelEngine):
                             else:
                                 input_ids.append(request.get_last_tokens(beam))
                     past_seen_token_num = request.max_beam_num_tokens - 1
+                    request_has_previous_tensor = False
                 else:
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
+                    request_has_previous_tensor = True
 
                 position_id = past_seen_token_num
                 if _has_cp_helix:
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    if request_has_previous_tensor:
+                        # With the overlap scheduler this batch is prepared
+                        # before the previous iteration's _update_requests has
+                        # advanced py_decoding_iter, so the counter is one
+                        # behind. Compensate exactly like the non-helix path
+                        # above, which uses max_beam_num_tokens *without* the
+                        # -1 in this case. Without this, the position repeats
+                        # once (L, L, L+1, ...) and the new token's K is roped
+                        # at the wrong position before being written to the KV
+                        # cache, corrupting every later step.
+                        # TODO: revisit for helix x speculative decoding -
+                        # the base formula and this +1 both assume exactly
+                        # one new token per step (draft-token modes are
+                        # currently rejected under helix).
+                        position_id += 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
                     else:

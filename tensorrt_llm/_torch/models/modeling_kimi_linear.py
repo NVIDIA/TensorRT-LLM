@@ -85,8 +85,20 @@ import gc
 import json
 import math
 import os
+import threading
 from contextlib import ExitStack
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import torch
 from safetensors import safe_open
@@ -100,13 +112,14 @@ from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
+from ..modules.fused_moe.interface import _compute_ep_partition
 from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..utils import ActType_TrtllmGen
+from ..utils import ActivationType, ActType_TrtllmGen
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -306,6 +319,23 @@ def _resolve_fp8_weight_read_gates() -> tuple[bool, bool, bool]:
     return fp8_weight_read, kda_fp8, kda_glue_fp8
 
 
+def _resolve_kimi_situ_betas(cfg: Any) -> tuple[float, float]:
+    """Return the finite SiTu betas required by the routed-expert kernels."""
+    config_situ_beta = getattr(cfg, "activation_situ_beta", None)
+    situ_beta = 1.0 if config_situ_beta is None else config_situ_beta
+    situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
+    if situ_linear_beta is None:
+        raise ValueError(
+            "Kimi K3 routed SiTu experts require activation_situ_linear_beta; "
+            "None means an identity linear branch that the fused kernels cannot represent."
+        )
+    if situ_beta <= 0 or situ_linear_beta <= 0:
+        raise ValueError(
+            f"Kimi K3 SiTu betas must be positive; got {situ_beta} and {situ_linear_beta}."
+        )
+    return float(situ_beta), float(situ_linear_beta)
+
+
 # ---------------------------------------------------------------------------
 # Config helpers.
 # ---------------------------------------------------------------------------
@@ -500,11 +530,156 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         )
         return weight_fp8, weight_scale
 
+    @staticmethod
+    def prepare_checkpoint_scale(
+        weight_fp8: torch.Tensor, weight_scale: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Checkpoint FP8 + FP32 128x128 block scale -> deep_gemm-ready pair.
+
+        This is ``quantize_weight`` without its first step. A checkpoint that
+        already stores FP8_PB_WO weights (``nvidia/Kimi-K3-NVFP4``) supplies
+        exactly what ``per_block_cast_to_fp8`` would have produced, so the only
+        work left is the scale bridge: resmooth to UE8M0 and pack into
+        deep_gemm's TMA-aligned MN-major layout, because ``fp8_swap_ab_gemm``
+        runs with ``disable_ue8m0_cast=True`` and would misread a plain FP32
+        block scale.
+
+        Taking this route instead of dequantizing to BF16 and re-quantizing
+        avoids a lossy round trip: the re-quantization recomputes each block's
+        scale from the dequantized values, which need not reproduce the
+        scale the checkpoint was written with.
+        """
+        from ...quantization.utils.fp8_utils import (
+            resmooth_to_fp8_e8m0,
+            transform_sf_into_required_layout,
+        )
+
+        weight_fp8, weight_scale = resmooth_to_fp8_e8m0(
+            weight_fp8.contiguous(), weight_scale.contiguous().float()
+        )
+        weight_scale = transform_sf_into_required_layout(
+            weight_scale,
+            mn=weight_fp8.shape[0],
+            k=weight_fp8.shape[1],
+            recipe=(1, 128, 128),
+            is_sfa=False,
+        )
+        return weight_fp8, weight_scale
+
     @classmethod
     def from_linear(cls, linear: nn.Linear | TrtllmLinear) -> "_Fp8BlockScaleWeightReadLinear":
         assert linear.bias is None, "FP8 weight read expects a bias-free Linear"
+        # If the checkpoint stored this projection as FP8_PB_WO, the loader
+        # kept the original pair on the parameter. Using it skips a lossy
+        # round trip: dequantizing to BF16 and re-quantizing recomputes each
+        # block's scale from the dequantized values, which need not reproduce
+        # the scale the checkpoint was written with.
+        ckpt_pair = getattr(linear.weight, _K3_CKPT_FP8_ATTR, None)
+        if ckpt_pair is not None:
+            converted = cls.from_checkpoint_fp8(ckpt_pair[0], ckpt_pair[1], linear.out_features)
+            delattr(linear.weight, _K3_CKPT_FP8_ATTR)
+            return converted
         weight_fp8, weight_scale = cls.quantize_weight(linear.weight.data)
         return cls(weight_fp8, weight_scale, linear.out_features)
+
+    @classmethod
+    def empty_placeholder(
+        cls, out_features: int, in_features: int
+    ) -> "_Fp8BlockScaleWeightReadLinear":
+        """A module that occupies (almost) nothing until the loader fills it.
+
+        This is the contract construction-time FP8 dispatch has to satisfy:
+        build one of these instead of an ``nn.Linear`` and the BF16 weight is
+        never allocated at all. That matters because the DEP8 failure was an
+        OOM during module CONSTRUCTION, before a single weight had been read,
+        so any scheme that allocates BF16 and converts afterwards cannot fix
+        it however cheap the steady state ends up.
+
+        Same shape of trick MegaMoE uses for its raw NVFP4 params -- and with
+        the same hazard, learned there: anything that indexes these before the
+        loader has filled them sees an empty tensor. ``load_checkpoint_pair``
+        is the only way to populate them, and ``forward`` refuses to run while
+        they are still empty rather than producing garbage.
+        """
+        # Shaped [0, in_features] rather than a flat empty: __init__ reads
+        # in_features off the weight, and numel() == 0 still marks it unfilled.
+        return cls(
+            torch.empty(0, in_features, dtype=torch.float8_e4m3fn),
+            torch.empty(0, 0, dtype=torch.int32),
+            out_features,
+        )
+
+    @property
+    def is_placeholder(self) -> bool:
+        return self.weight.numel() == 0
+
+    def load_checkpoint_pair(self, pairs) -> None:
+        """Fill a placeholder from one or more checkpoint FP8_PB_WO pairs.
+
+        Several pairs fuse along ``out`` (KDA's q/k/v/g); one is the plain
+        case. Rejects a second fill so a double-load is loud rather than
+        silently keeping whichever arrived last.
+        """
+        if not self.is_placeholder:
+            raise RuntimeError(
+                "Kimi K3 FP8 placeholder was filled twice; the second load would silently win."
+            )
+        pairs = list(pairs)
+        filled = (
+            self.fuse_checkpoint_fp8(pairs)
+            if len(pairs) > 1
+            else self.from_checkpoint_fp8(pairs[0][0], pairs[0][1], self.out_features)
+        )
+        if filled.out_features != self.out_features:
+            raise ValueError(
+                f"Kimi K3 FP8 placeholder expects out_features="
+                f"{self.out_features}, checkpoint gives {filled.out_features}."
+            )
+        self.register_buffer("weight", filled.weight, persistent=False)
+        self.register_buffer("weight_scale", filled.weight_scale, persistent=False)
+        self.in_features = filled.in_features
+
+    @classmethod
+    def fuse_checkpoint_fp8(cls, pairs) -> "_Fp8BlockScaleWeightReadLinear":
+        """Fuse per-projection checkpoint FP8_PB_WO pairs along ``out``.
+
+        ``pairs`` is an ordered sequence of ``(weight_fp8, fp32 block scale)``
+        sharing one input dim -- e.g. KDA's q/k/v/g.
+
+        This exists so a fused projection can be built WITHOUT ever
+        materializing the BF16 concatenation the current path goes through,
+        which is what makes constructing attention as FP8 possible at all.
+        It is sound for the reason ``quantize_weight`` documents: with every
+        ``out`` a multiple of 128 no 128x128 block crosses a boundary, so the
+        fused quantization is per-block identical to the individual ones --
+        hence the fused FP8 rows ARE the individual FP8 rows, and likewise
+        for the block-scale rows.
+
+        The layout transform is applied ONCE to the assembled scale rather
+        than per part: ``transform_sf_into_required_layout`` packs against the
+        full ``mn``, so transforming the pieces and stacking afterwards would
+        not produce the same bytes.
+        """
+        weights = [w for w, _ in pairs]
+        scales = [s for _, s in pairs]
+        if any(w.shape[0] % _FP8_BLOCK for w in weights):
+            raise ValueError(
+                "Kimi K3 fused FP8 read requires every out dim to be a "
+                f"multiple of {_FP8_BLOCK}; got "
+                f"{[tuple(w.shape) for w in weights]}."
+            )
+        fused_weight = torch.cat(weights, dim=0)
+        fused_scale = torch.cat(scales, dim=0)
+        prepared, scale = cls.prepare_checkpoint_scale(fused_weight, fused_scale)
+        return cls(prepared, scale, fused_weight.shape[0])
+
+    @classmethod
+    def from_checkpoint_fp8(
+        cls, weight_fp8: torch.Tensor, weight_scale: torch.Tensor, out_features: int
+    ) -> "_Fp8BlockScaleWeightReadLinear":
+        """Build directly from a checkpoint's FP8_PB_WO pair, no BF16 detour."""
+        prepared, scale = cls.prepare_checkpoint_scale(weight_fp8, weight_scale)
+        return cls(prepared, scale, out_features)
 
     def forward(
         self,
@@ -514,6 +689,15 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
+        if self.is_placeholder:
+            # An unfilled placeholder would otherwise reach fp8_swap_ab_gemm
+            # with empty operands. Fail here instead: this whole path has a
+            # habit of turning wrong weights into plausible-looking numbers
+            # rather than errors.
+            raise RuntimeError(
+                "Kimi K3 FP8 placeholder was never filled by the loader; "
+                "load_checkpoint_pair must run before forward."
+            )
         if lora_params:
             raise NotImplementedError("Kimi K3 FP8 weight read does not support LoRA.")
         out_shape = x.shape[:-1] + (self.out_features,)
@@ -549,6 +733,16 @@ def _swap_linear_to_fp8_weight_read(
     return 1
 
 
+def _has_weights(module: nn.Module) -> bool:
+    """False once ``modeling_utils.remove_weights()`` has stripped a module.
+
+    Post-load finalization walks every decoder layer, so it must skip layers
+    whose parameters were dropped — the layer-wise benchmarks keep only the
+    profiled slice resident.
+    """
+    return not getattr(module, "_weights_removed", False)
+
+
 def _convert_moe_mlps_to_fp8_weight_read(
     model: nn.Module, include_fused_gate_up: bool = True
 ) -> int:
@@ -563,6 +757,8 @@ def _convert_moe_mlps_to_fp8_weight_read(
     count = 0
 
     for layer in model.layers:
+        if not _has_weights(layer):
+            continue
         moe = getattr(layer, "block_sparse_moe", None)
         if moe is None:
             continue
@@ -623,7 +819,7 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
     count = 0
 
     for layer in model.layers:
-        if not getattr(layer, "is_kda", False):
+        if not getattr(layer, "is_kda", False) or not _has_weights(layer):
             continue
         mixer = getattr(getattr(layer, "self_attn", None), "mixer", None)
         if mixer is None:
@@ -673,78 +869,6 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
     return count
 
 
-@torch.no_grad()
-def _load_kimi_k3_mla_kv_b_proj(
-    mixer: nn.Module,
-    source: torch.Tensor,
-    *,
-    head_start: int,
-) -> None:
-    """Load checkpoint-interleaved KV-B rows into MLA runtime tensors."""
-    weight = mixer.kv_b_proj.weight
-    h = mixer.num_heads
-    n = mixer.qk_nope_head_dim
-    v = mixer.v_head_dim
-    kv = mixer.kv_lora_rank
-    head_width = n + v
-
-    if source.ndim != 2 or source.shape[1] != kv:
-        raise ValueError(
-            "Kimi K3 MLA kv_b_proj checkpoint shape "
-            f"{tuple(source.shape)} is not [heads * {head_width}, {kv}]"
-        )
-    if source.shape[0] % head_width != 0:
-        raise ValueError(
-            "Kimi K3 MLA kv_b_proj checkpoint rows "
-            f"{source.shape[0]} are not divisible by {head_width}"
-        )
-    if head_start < 0:
-        raise ValueError(f"Kimi K3 MLA head_start must be non-negative, got {head_start}")
-    if weight.device.type == "meta":
-        raise RuntimeError("Kimi K3 MLA kv_b_proj loading requires materialized weights")
-
-    source_heads = source.shape[0] // head_width
-    source = source.view(source_heads, head_width, kv)
-    num_local_source_heads = max(0, min(source_heads - head_start, h))
-    if num_local_source_heads == h:
-        local = source[head_start : head_start + h]
-    else:
-        local = source.new_zeros((h, head_width, kv))
-        if num_local_source_heads > 0:
-            local[:num_local_source_heads].copy_(
-                source[head_start : head_start + num_local_source_heads]
-            )
-
-    k_weight, v_weight = local.split([n, v], dim=1)
-    grouped = torch.cat(
-        [
-            k_weight.reshape(h * n, kv),
-            v_weight.reshape(h * v, kv),
-        ],
-        dim=0,
-    )
-    if grouped.shape != weight.shape:
-        raise ValueError(
-            "Kimi K3 MLA grouped kv_b_proj shape "
-            f"{tuple(grouped.shape)} does not match {tuple(weight.shape)}"
-        )
-    weight.copy_(grouped.to(weight.dtype))
-
-    loaded_k, loaded_v = weight.split([h * n, h * v], dim=0)
-    k_b_proj_trans = loaded_k.view(h, n, kv).transpose(1, 2).contiguous()
-    if k_b_proj_trans.shape != mixer.k_b_proj_trans.shape:
-        raise ValueError(
-            "Kimi K3 MLA k_b_proj_trans shape "
-            f"{tuple(k_b_proj_trans.shape)} does not match "
-            f"{tuple(mixer.k_b_proj_trans.shape)}"
-        )
-    mixer.k_b_proj_trans.copy_(k_b_proj_trans)
-    mixer.v_b_proj = nn.Parameter(
-        loaded_v.view(h, v, kv),
-        requires_grad=False,
-    )
-
-
 def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     """Swap the MLA q_a/q_b/o and output-gate projections to an FP8 weight read.
 
@@ -765,7 +889,7 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
     for layer in model.layers:
         # MLA layers are the non-KDA layers (each layer is exactly one of the
         # two); their projections live on the KimiK3MLAAttention mixer.
-        if getattr(layer, "is_kda", False):
+        if getattr(layer, "is_kda", False) or not _has_weights(layer):
             continue
         mixer = getattr(getattr(layer, "self_attn", None), "mixer", None)
         if mixer is None:
@@ -786,6 +910,97 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
 # ---------------------------------------------------------------------------
 # Latent MoE block using the unified ConfigurableMoE stack.
 # ---------------------------------------------------------------------------
+
+# Routed-expert key spellings that ModelOpt emits for Kimi K3. The NVFP4
+# checkpoint (``nvidia/Kimi-K3-NVFP4``) lists every prefix x module-name
+# combination in ``quantized_layers``, so a lookup over this product finds it
+# without needing the MiniMax-M3-style prefix normalization in ``ModelConfig``.
+_K3_ROUTED_EXPERT_KEY_PREFIXES = ("language_model.model.", "model.", "")
+_K3_ROUTED_EXPERT_KEY_SUFFIXES = ("block_sparse_moe.experts", "mlp.experts")
+
+# Routed-expert quantization used when the checkpoint declares nothing per
+# layer. The original ``moonshotai/Kimi-K3`` ships a compressed-tensors
+# ``mxfp4-pack-quantized`` config with no ModelOpt per-layer entries, and that
+# checkpoint is what this default has always served.
+_K3_DEFAULT_ROUTED_QUANT_ALGO = QuantAlgo.W4A8_MXFP4_MXFP8
+
+
+# ---------------------------------------------------------------------------
+# Routed-expert checkpoint layouts.
+#
+# K3 streams routed experts one at a time (see ``load_weights``), so the tensor
+# names, the per-expert loader and the finalization it needs are all decided by
+# the checkpoint's routed-expert quantization rather than by the MoE backend.
+# Three call sites need that decision — the expected-key plan, the loader, and
+# the file grouping — so it lives in one spec instead of three conditionals.
+# ---------------------------------------------------------------------------
+
+
+def _load_packed_mxfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
+    backend.quant_method.load_packed_mxfp4_expert(
+        backend,
+        global_expert_id=expert_idx,
+        local_slot_id=local_slot_id,
+        w1_weight=get_tensor(f"{base}.{expert_idx}.w1.weight_packed"),
+        w1_weight_scale=get_tensor(f"{base}.{expert_idx}.w1.weight_scale"),
+        w2_weight=get_tensor(f"{base}.{expert_idx}.w2.weight_packed"),
+        w2_weight_scale=get_tensor(f"{base}.{expert_idx}.w2.weight_scale"),
+        w3_weight=get_tensor(f"{base}.{expert_idx}.w3.weight_packed"),
+        w3_weight_scale=get_tensor(f"{base}.{expert_idx}.w3.weight_scale"),
+    )
+
+
+def _load_nvfp4_expert(backend, base, expert_idx, local_slot_id, get_tensor) -> None:
+    backend.quant_method.load_streaming_nvfp4_expert(
+        backend,
+        global_expert_id=expert_idx,
+        local_slot_id=local_slot_id,
+        **{
+            f"{w}_{kind}": get_tensor(f"{base}.{expert_idx}.{w}.{kind}")
+            for w in ("w1", "w2", "w3")
+            for kind in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+        },
+    )
+
+
+class _K3ExpertCkptSpec(NamedTuple):
+    """How one routed-expert quantization is spelled and loaded."""
+
+    # Per-``w{1,2,3}`` checkpoint tensor suffixes this layout stores.
+    kinds: Tuple[str, ...]
+    loader: Callable[..., None]
+    # Set of filled slots the loader maintains, checked after the load.
+    loaded_slots_attr: str
+    # NVFP4 defers cat/pad/interleave and the alpha computation to
+    # ``process_weights_after_loading``; the MXFP4 loaders write through.
+    needs_layer_finalize: bool
+
+
+_K3_EXPERT_CKPT_SPECS = {
+    QuantAlgo.W4A8_MXFP4_MXFP8: _K3ExpertCkptSpec(
+        kinds=("weight_packed", "weight_scale"),
+        loader=_load_packed_mxfp4_expert,
+        loaded_slots_attr="_packed_mxfp4_loaded_slots",
+        needs_layer_finalize=False,
+    ),
+    QuantAlgo.NVFP4: _K3ExpertCkptSpec(
+        kinds=("weight", "weight_scale", "weight_scale_2", "input_scale"),
+        loader=_load_nvfp4_expert,
+        loaded_slots_attr="_streamed_expert_slots",
+        needs_layer_finalize=True,
+    ),
+}
+
+
+def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
+    spec = _K3_EXPERT_CKPT_SPECS.get(quant_algo)
+    if spec is None:
+        raise NotImplementedError(
+            f"Kimi K3 routed experts are quantized as {quant_algo}, for which "
+            "no per-expert checkpoint layout is known. Supported: "
+            f"{sorted(a.name for a in _K3_EXPERT_CKPT_SPECS)}."
+        )
+    return spec
 
 
 class KimiK3MoERuntime(nn.Module):
@@ -811,8 +1026,7 @@ class KimiK3MoERuntime(nn.Module):
         if not getattr(cfg, "latent_moe_use_norm", False):
             raise ValueError("Kimi K3 runtime expects latent_moe_use_norm=True")
 
-        situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
-        situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
+        situ_beta, situ_linear_beta = _resolve_kimi_situ_betas(cfg)
         dtype = torch.bfloat16
 
         # Routing scores stay fp32; with attention-DP off the gate GEMM runs
@@ -832,7 +1046,10 @@ class KimiK3MoERuntime(nn.Module):
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
-        routed_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
+        routed_quant_config = self._resolve_routed_quant_config(model_config, layer_idx)
+        # Resolved here so ``load_weights`` reads the checkpoint layout off the
+        # module instead of re-deriving it at each of its three call sites.
+        self.expert_ckpt_spec = _k3_expert_ckpt_spec(routed_quant_config.quant_algo)
         routed_moe_kwargs = dict(
             routing_method=self.gate.routing_method,
             num_experts=self.num_experts,
@@ -848,22 +1065,75 @@ class KimiK3MoERuntime(nn.Module):
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
         )
-        if routed_moe_model_config.moe_backend == "TRTLLM":
+        # trtllm-gen ships SiTu cubins for exactly one dtype combination
+        # (``Bmm_MxE4m3_MxE2m1MxE4m3`` = MXFP8 act x MXFP4 weight) and has no
+        # standalone SiTu activation kernel to fall back on, so a non-MXFP4
+        # routed-expert format cannot be served here. Fail with the fix rather
+        # than with a cubin lookup error deep inside the runner. Checked against
+        # the resolved backend, not the K3 architecture branch, because the
+        # generic FP8_BLOCK_SCALES fallback in ``resolve_moe_backend`` can also
+        # land on TRTLLM.
+        if (
+            routed_moe_model_config.moe_backend == "TRTLLM"
+            and routed_quant_config.quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8
+        ):
+            raise ValueError(
+                f"Kimi K3 routed experts are quantized as "
+                f"{routed_quant_config.quant_algo}, which the TRTLLM "
+                "(trtllm-gen) MoE backend cannot serve: its SiTu activation "
+                "exists only for W4A8_MXFP4_MXFP8. Set moe_config.backend to "
+                "CUTLASS or MEGAMOE_CUTEDSL."
+            )
+
+        if routed_moe_model_config.moe_backend == "CUTLASS":
+            # Size the per-expert SiTU constants with the same ceil/floor
+            # partition the MoE backend uses for ``expert_size_per_partition``.
+            # A plain ``num_experts // ep_size`` is one element short on the
+            # first ``num_experts % ep_size`` ranks, which trips the
+            # ``swiglu_alpha must have num_experts_on_rank elements`` check in
+            # moeOp.cpp. K3's 384 experts divide evenly at EP8/EP16, so the
+            # mismatch is latent there but real for any uneven split.
+            local_num_experts, _, _ = _compute_ep_partition(
+                self.num_experts,
+                routed_moe_model_config.mapping.moe_ep_size,
+                routed_moe_model_config.mapping.moe_ep_rank,
+            )
+            device = torch.device("cuda", torch.cuda.current_device())
+            self.routed_situ_alpha = torch.full(
+                (local_num_experts,), float(situ_beta), dtype=torch.float32, device=device
+            )
+            self.routed_situ_beta = torch.full(
+                (local_num_experts,),
+                situ_linear_beta,
+                dtype=torch.float32,
+                device=device,
+            )
+            routed_moe_kwargs.update(
+                activation_type=ActivationType.SiTu,
+                swiglu_alpha=self.routed_situ_alpha,
+                swiglu_beta=self.routed_situ_beta,
+            )
+        elif routed_moe_model_config.moe_backend == "TRTLLM":
             routed_moe_kwargs.update(
                 trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
                 # Cubin alpha is the gate-side SiTU beta; cubin beta is the
                 # linear-side SiTU beta.
-                trtllm_gen_activation_alpha=float(situ_beta),
-                trtllm_gen_activation_beta=float(
-                    situ_linear_beta if situ_linear_beta is not None else 1.0
-                ),
+                trtllm_gen_activation_alpha=situ_beta,
+                trtllm_gen_activation_beta=situ_linear_beta,
             )
         elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
             routed_moe_kwargs.update(
                 activation="situ",
-                situ_beta=float(situ_beta),
-                situ_linear_beta=float(situ_linear_beta if situ_linear_beta is not None else 1.0),
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
+        # MEGAMOE_CUTEDSL has no branch on purpose. ``MegaMoECuteDsl`` resolves
+        # SiTU from the pretrained config in ``_resolve_activation_config``
+        # (``activation=None`` -> "situ" when ``activation_situ_beta`` is
+        # present), and ``create_moe`` currently rejects the explicit
+        # ``activation``/``situ_beta``/``situ_linear_beta`` trio for anything
+        # other than ``MegaMoEDeepGemm``, so passing them here would raise.
+        # Unifying that plumbing is tracked in TRTLLM-15649.
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
@@ -875,6 +1145,20 @@ class KimiK3MoERuntime(nn.Module):
             if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
                 raise RuntimeError(
                     "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
+                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
+                )
+        if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
+            from ..modules.fused_moe.mega_moe import MegaMoECuteDsl
+
+            # Same guard as MEGAMOE_DEEPGEMM above, and for the same reason:
+            # create_moe silently falls back when a backend declines the
+            # config, and for MegaMoE the decline is easy to trigger (it is
+            # EP-only and has its own token/top-k limits), so an explicit
+            # request that quietly became CUTLASS would be measured as if it
+            # were MegaMoE.
+            if not isinstance(self.routed_experts.backend, MegaMoECuteDsl):
+                raise RuntimeError(
+                    "Kimi K3 explicitly requested MEGAMOE_CUTEDSL, but the "
                     f"MoE factory selected {type(self.routed_experts.backend).__name__}."
                 )
         if self.routed_experts.layer_load_balancer is not None:
@@ -986,14 +1270,53 @@ class KimiK3MoERuntime(nn.Module):
         return 1, tp_size
 
     @staticmethod
+    def _resolve_routed_quant_config(model_config: ModelConfig, layer_idx: int) -> QuantConfig:
+        """Routed-expert quantization for ``layer_idx``, taken from the checkpoint.
+
+        ``nvidia/Kimi-K3-NVFP4`` declares the routed experts per layer as
+        ``NVFP4`` with ``group_size=16``; the original ``moonshotai/Kimi-K3``
+        declares nothing per layer and keeps the historical
+        ``W4A8_MXFP4_MXFP8`` default. Reading the checkpoint instead of
+        hardcoding is what lets one code path serve both.
+        """
+        per_layer = getattr(model_config, "quant_config_dict", None)
+        if per_layer:
+            for prefix in _K3_ROUTED_EXPERT_KEY_PREFIXES:
+                for suffix in _K3_ROUTED_EXPERT_KEY_SUFFIXES:
+                    cfg = per_layer.get(f"{prefix}layers.{layer_idx}.{suffix}")
+                    if cfg is not None and cfg.quant_algo is not None:
+                        # Logged once per layer: the routed-expert format decides
+                        # which MoE backends can serve this checkpoint at all.
+                        logger.debug(
+                            "Kimi K3 layer %d routed experts: %s (group_size=%s) "
+                            "from the checkpoint",
+                            layer_idx,
+                            cfg.quant_algo,
+                            cfg.group_size,
+                        )
+                        return cfg
+        logger.debug(
+            "Kimi K3 layer %d routed experts: no per-layer quant config in the "
+            "checkpoint, defaulting to %s",
+            layer_idx,
+            _K3_DEFAULT_ROUTED_QUANT_ALGO,
+        )
+        return QuantConfig(quant_algo=_K3_DEFAULT_ROUTED_QUANT_ALGO)
+
+    @staticmethod
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
-        supported_backends = {"TRTLLM", "MEGAMOE_DEEPGEMM"}
+        supported_backends = {
+            "CUTLASS",
+            "TRTLLM",
+            "MEGAMOE_DEEPGEMM",
+            "MEGAMOE_CUTEDSL",
+        }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
-                "Kimi K3 SiTU routed experts only support the TRTLLM and "
-                "MEGAMOE_DEEPGEMM backends; "
+                "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
+                "MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:
@@ -1038,7 +1361,10 @@ class KimiK3MoERuntime(nn.Module):
         # divides it by EP size for the per-rank allocation. Other backends
         # keep the user-configured value as their MoE chunking bound.
         # Preserve an explicitly larger capacity.
-        if routed_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+        if routed_model_config.moe_backend in {
+            "MEGAMOE_DEEPGEMM",
+            "MEGAMOE_CUTEDSL",
+        }:
             default_moe_max_num_tokens = routed_model_config.max_num_tokens * routed_mapping.dp_size
             configured_moe_max_num_tokens = int(routed_model_config.moe_max_num_tokens or 0)
             if configured_moe_max_num_tokens < default_moe_max_num_tokens:
@@ -2076,15 +2402,13 @@ class KimiKDARuntime(nn.Module):
 
 
 class KimiMLARuntime(nn.Module):
-    """Owns K3 MLA head padding, TP sharding, and output reduction."""
+    """Wraps K3 MLA and applies its external TP output reduction."""
 
     def __init__(
         self,
         cfg,
         layer_idx: int,
-        mapping=None,
-        quant_config=None,
-        allreduce_strategy=AllReduceStrategy.AUTO,
+        model_config: ModelConfig,
     ):
         super().__init__()
 
@@ -2097,44 +2421,23 @@ class KimiMLARuntime(nn.Module):
             )
         )
         self.layer_idx = layer_idx
-        # The trtllm-gen MLA generation kernels group query heads per CTA and
-        # require numHeadsQ divisible by the group size (a power of two, up
-        # to 128). K3's 96 query heads are unsupported, so pad to the next
-        # power of two (128) with zero weights: padded heads produce exactly
-        # zero output (their kv_b_proj "v_absorb" rows are zero), so the
-        # numerics are unchanged at ~33% extra MLA-layer q compute.
-        self.num_real_heads = cfg.num_attention_heads
-        padded_heads = 1
-        while padded_heads < self.num_real_heads:
-            padded_heads *= 2
-        self.num_padded_heads = padded_heads
-        # Attention-family TP semantics (DeepSeek MLA pattern, mla.py):
-        # replicated under attention-DP, head-sharded otherwise. Pad
-        # FIRST, then divide, so every rank gets a power-of-two head
-        # count (128/16 = 8; sharding the real 96 would give 6/rank and
-        # break the generation-FMHA per-CTA head grouping). q_b/kv_b/g
-        # column-shard and o_proj row-shards by padded head range; ranks
-        # holding only padded heads contribute exact zeros. The latent KV
-        # cache and both *_a_proj down-projections stay replicated — with
-        # a single latent KV head the TP ranks hold duplicated KV cache,
-        # exactly like DeepSeek MLA under TP (attention-DP dedups it).
-        self._mla_tp_size = (
-            mapping.tp_size
-            if (mapping is not None and not mapping.enable_attention_dp and mapping.tp_size > 1)
-            else 1
-        )
-        self._mla_tp_rank = mapping.tp_rank if self._mla_tp_size > 1 else 0
-        assert padded_heads % self._mla_tp_size == 0, (
-            f"padded MLA heads {padded_heads} not divisible by tp_size {self._mla_tp_size}"
-        )
+        # KimiK3MLAAttention owns MLA projection/head sharding. Keep only the
+        # final output reduction in this wrapper so the output gate remains
+        # between attention and the row-parallel o_proj.
+        mapping = model_config.mapping
+        reduce_output = not mapping.enable_attention_dp and mapping.tp_size > 1
         self._o_allreduce = (
-            AllReduce(mapping=mapping, strategy=allreduce_strategy, dtype=torch.bfloat16)
-            if self._mla_tp_size > 1
+            AllReduce(
+                mapping=mapping,
+                strategy=model_config.allreduce_strategy,
+                dtype=torch.bfloat16,
+            )
+            if reduce_output
             else None
         )
         self.mixer = KimiK3MLAAttention(
             hidden_size=cfg.hidden_size,
-            num_heads=padded_heads // self._mla_tp_size,
+            num_heads=cfg.num_attention_heads,
             q_lora_rank=cfg.q_lora_rank,
             kv_lora_rank=cfg.kv_lora_rank,
             qk_nope_head_dim=cfg.qk_nope_head_dim,
@@ -2145,7 +2448,7 @@ class KimiMLARuntime(nn.Module):
             layer_idx=layer_idx,
             use_output_gate=cfg.mla_use_output_gate,
             max_position_embeddings=max_positions,
-            quant_config=quant_config,
+            model_config=model_config,
         )
 
     def forward(
@@ -2203,12 +2506,12 @@ class KimiLinearDecoderLayer(nn.Module):
             )
             if kv_quant_algo is not None:
                 mla_quant_config = QuantConfig(kv_cache_quant_algo=kv_quant_algo)
+            mla_model_config = copy.copy(model_config)
+            mla_model_config.quant_config = mla_quant_config or QuantConfig()
             self.self_attn = KimiMLARuntime(
                 cfg,
                 layer_idx,
-                mapping=model_config.mapping,
-                quant_config=mla_quant_config,
-                allreduce_strategy=model_config.allreduce_strategy,
+                model_config=mla_model_config,
             )
 
         self.is_moe = (
@@ -2330,6 +2633,20 @@ class KimiLinearDecoderLayer(nn.Module):
         prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
 
+    def skip_forward(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """No-op stand-in for ``forward``, matching ``DecoderLayer.skip_forward``.
+
+        ``modeling_utils.skip_forward()`` only drops a module's weights when it
+        finds this attribute, so without it the layer-wise benchmarks would
+        allocate all 93 layers instead of the profiled slice.
+        """
+        return hidden_states, block_residual
+
 
 # ---------------------------------------------------------------------------
 # Model.
@@ -2425,11 +2742,97 @@ class KimiLinearModel(DecoderModel):
 # ---------------------------------------------------------------------------
 
 
+_FP8_BLOCK_SCALE_SUFFIX = "_scale"
+_FP8_BLOCK = 128
+# Set on a Parameter by the loader when the checkpoint stored that projection
+# as FP8_PB_WO, so the FP8 weight-read conversion can reuse the original pair
+# instead of re-deriving it from the dequantized BF16.
+_K3_CKPT_FP8_ATTR = "_k3_ckpt_fp8_pair"
+
+
+def _fp8_block_scale_key(weight_key: str) -> str:
+    return weight_key + _FP8_BLOCK_SCALE_SUFFIX
+
+
+def _checkpoint_fp8_pair(ckpt_key: str, src: torch.Tensor, weights):
+    """``(fp8 weight, fp32 128x128 block scale)`` if this tensor is FP8_PB_WO.
+
+    ``None`` for an ordinary (BF16) checkpoint tensor. Raises when an FP8
+    tensor has no companion scale rather than letting the caller fall through
+    to a cast that would silently drop it.
+    """
+    if src.dtype != torch.float8_e4m3fn:
+        return None
+    scale_key = _fp8_block_scale_key(ckpt_key)
+    if scale_key not in weights:
+        raise KeyError(
+            f"Kimi K3: {ckpt_key} is FP8 E4M3 but has no {scale_key}; refusing "
+            "to load it as if it were unquantized."
+        )
+    scale = _materialize(weights[scale_key]).float()
+    # The checkpoint stores the block scale 4-D as
+    # [ceil(N/128), 1, ceil(K/128), 1]. Normalize here, once, so every
+    # consumer sees the plain 2-D [n_blocks_m, n_blocks_k] that both the
+    # dequantization below and deep_gemm's transform_sf_into_required_layout
+    # expect -- the latter asserts on rank and gave an unhelpful
+    # ``assert sf.dim() == ...`` when handed the raw 4-D tensor.
+    if scale.dim() == 4:
+        scale = scale.reshape(scale.shape[0], scale.shape[2])
+    return src, scale
+
+
+def _dequantize_fp8_block_scaled(ckpt_key: str, src: torch.Tensor, weights) -> torch.Tensor:
+    """Undo FP8_PB_WO block quantization, returning a BF16-compatible tensor.
+
+    ``nvidia/Kimi-K3-NVFP4`` stores the attention projections as FP8 E4M3
+    weights plus a per-128x128-block FP32 scale, where ``moonshotai/Kimi-K3``
+    stores plain BF16. **The two are the same shape**, so nothing downstream
+    can tell them apart: the shape check passes and ``src.to(param.dtype)``
+    happily reinterprets quantized values as if they were the real ones, with
+    the scale left behind as an unreferenced checkpoint key. The model then
+    loads clean and generates nonsense.
+
+    Dequantizing here keeps the runtime on its existing BF16 attention path
+    (the same tensors the MXFP4 checkpoint would have supplied) instead of
+    requiring the FP8 weight-read path to be finished first.
+    """
+    pair = _checkpoint_fp8_pair(ckpt_key, src, weights)
+    if pair is None:
+        return src
+    src, scale = pair
+    out = src.to(torch.float32)
+    if scale.numel() == 1:
+        return (out * scale.reshape(())).to(torch.bfloat16)
+    expanded = scale.repeat_interleave(_FP8_BLOCK, dim=0).repeat_interleave(_FP8_BLOCK, dim=1)
+    if expanded.shape[0] < out.shape[0] or expanded.shape[1] < out.shape[1]:
+        raise ValueError(
+            f"Kimi K3: {_fp8_block_scale_key(ckpt_key)} covers "
+            f"{tuple(expanded.shape)} but {ckpt_key} is {tuple(out.shape)}."
+        )
+    return (out * expanded[: out.shape[0], : out.shape[1]]).to(torch.bfloat16)
+
+
 def _materialize(value) -> torch.Tensor:
     """Materialize a (possibly lazy safetensors slice) weight value."""
     if isinstance(value, torch.Tensor):
         return value
+    # ``[:]`` is how a lazy slice is realized, but it is invalid on a 0-dim
+    # entry. The NVFP4 checkpoint stores weight_scale_2 / input_scale as
+    # scalars, so realize those entries with ``[()]`` instead.
+    get_shape = getattr(value, "get_shape", None)
+    if get_shape is not None and len(get_shape()) == 0:
+        return value[()]
     return value[:]
+
+
+def _clear_checkpoint_fp8_pairs(module: nn.Module) -> int:
+    """Release checkpoint FP8 pairs left on parameters after conversion."""
+    cleared = 0
+    for param in module.parameters():
+        if hasattr(param, _K3_CKPT_FP8_ATTR):
+            delattr(param, _K3_CKPT_FP8_ATTR)
+            cleared += 1
+    return cleared
 
 
 @register_auto_model("KimiLinearForCausalLM")
@@ -2567,14 +2970,15 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # when the routed MoE is TP-sharded (moe_ep=1 -> ids 0..num_experts)).
         expert_jobs = []
         for layer_idx, layer in enumerate(self.model.layers):
-            if not getattr(layer, "is_moe", False):
+            if not getattr(layer, "is_moe", False) or not _has_weights(layer):
                 continue
             moe = layer.block_sparse_moe
             base = f"{prefix}model.layers.{layer_idx}.block_sparse_moe.experts"
+            kinds = moe.expert_ckpt_spec.kinds
             for expert_idx in moe.local_expert_ids:
                 for w in ("w1", "w2", "w3"):
-                    expected_keys.add(f"{base}.{expert_idx}.{w}.weight_packed")
-                    expected_keys.add(f"{base}.{expert_idx}.{w}.weight_scale")
+                    for kind in kinds:
+                        expected_keys.add(f"{base}.{expert_idx}.{w}.{kind}")
             expert_jobs.append((layer_idx, moe, base))
         return name_map, expected_keys, expert_jobs
 
@@ -2636,9 +3040,16 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         mla_mixers = [
             layer.self_attn.mixer
             for layer in self.model.layers
-            if not getattr(layer, "is_kda", True)
+            if not getattr(layer, "is_kda", True) and _has_weights(layer)
         ]
         mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
+        mla_head_shard_linears = {}
+        for mixer in mla_mixers:
+            mla_head_shard_linears[id(mixer.q_b_proj.weight)] = mixer.q_b_proj
+            mla_head_shard_linears[id(mixer.o_proj.weight)] = mixer.o_proj
+            g_proj = getattr(mixer, "g_proj", None)
+            if g_proj is not None:
+                mla_head_shard_linears[id(g_proj.weight)] = g_proj
 
         device = next(self.parameters()).device
 
@@ -2646,6 +3057,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # divide model TP uses a smaller repeated TP subgroup, so its local
         # shard rank is model tp_rank modulo the parameter's shard count.
         model_tp_rank = self.model_config.mapping.tp_rank
+        # Keep each FP8_PB_WO checkpoint pair alongside the BF16
+        # parameter only when the later weight-read conversion consumes it.
+        stash_ckpt_fp8 = _resolve_fp8_weight_read_gates()[0]
         # KDA head-shard (attention-DP off): rank r loads head rows/cols
         # [r*local : (r+1)*local] of every head-major KDA tensor.
         kda_tp_size, kda_tp_rank = 1, 0
@@ -2653,14 +3067,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             if getattr(layer, "is_kda", False):
                 kda_tp_size = layer.self_attn._kda_tp_size
                 kda_tp_rank = layer.self_attn._kda_tp_rank
-                break
-        # MLA head-shard (attention-DP off): rank slice of the zero-padded
-        # 128-head layout (pad before divide).
-        mla_tp_size, mla_tp_rank = 1, 0
-        for layer in self.model.layers:
-            if not getattr(layer, "is_kda", True):
-                mla_tp_size = layer.self_attn._mla_tp_size
-                mla_tp_rank = layer.self_attn._mla_tp_rank
                 break
 
         def load_param(name: str, param: torch.nn.Parameter):
@@ -2670,8 +3076,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 # Row-concat the checkpoint's separate gate_proj / up_proj
                 # tensors into the fused [gate | up] parameter.
                 gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
-                gate = _materialize(weights[gate_key])
-                up = _materialize(weights[up_key])
+                # This branch materializes its own sources, so it needs the
+                # same FP8 handling as the single-tensor path below.
+                gate = _dequantize_fp8_block_scaled(
+                    gate_key, _materialize(weights[gate_key]), weights
+                )
+                up = _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights)
                 inter = param.shape[0] // 2
                 if gate.shape[0] != inter and gate.shape[0] % inter == 0:
                     # TP-sharded fused MLP (shared experts on the direct
@@ -2692,6 +3102,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 param.data[inter:].copy_(up.to(param.dtype))
                 return
             src = _materialize(weights[name_map[name]])
+            ckpt_fp8_pair = (
+                _checkpoint_fp8_pair(name_map[name], src, weights) if stash_ckpt_fp8 else None
+            )
+            src = _dequantize_fp8_block_scaled(name_map[name], src, weights)
             if name == "lm_head.weight":
                 # LMHead is vocab-sharded (TP column) + gathered; its
                 # load_weights shards the full checkpoint tensor.
@@ -2699,11 +3113,23 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 return
             mla_mixer = mla_kv_b_mixers.get(id(param))
             if mla_mixer is not None:
-                _load_kimi_k3_mla_kv_b_proj(
-                    mla_mixer,
-                    src,
-                    head_start=mla_tp_rank * mla_mixer.num_heads,
+                h = mla_mixer.num_heads_tp
+                n = mla_mixer.qk_nope_head_dim
+                v = mla_mixer.v_head_dim
+                kv = mla_mixer.kv_lora_rank
+                local = mla_mixer.kv_b_proj.load_shard(src, device=param.device).view(h, n + v, kv)
+                k_weight, v_weight = local.split([n, v], dim=1)
+                param.data.copy_(
+                    torch.cat(
+                        [
+                            k_weight.reshape(h * n, kv),
+                            v_weight.reshape(h * v, kv),
+                        ],
+                        dim=0,
+                    ).to(param.dtype)
                 )
+                mla_mixer.k_b_proj_trans.data.copy_(k_weight.transpose(1, 2))
+                mla_mixer.v_b_proj.data.copy_(v_weight)
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
                 # The checkpoint pads A_log from [num_heads] to [head_dim]
@@ -2723,14 +3149,25 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         )
                     src = src[: param.numel()]
             if src.shape != param.shape:
+                # Delegate MLA q_b/g/o slicing to the same Linear modules that
+                # own their COLUMN/ROW sharding policy. KV-B is handled above.
+                mla_sharded_linear = mla_head_shard_linears.get(id(param))
+                if mla_sharded_linear is not None:
+                    shard = mla_sharded_linear.load_shard(src, device=param.device)
+                    if shard.shape != param.shape:
+                        raise ValueError(
+                            f"{name}: MLA shard shape {tuple(shard.shape)} does "
+                            f"not match param shape {tuple(param.shape)}"
+                        )
+                    param.data.copy_(shard.to(param.dtype))
+                    return
                 # KDA head-shard (attention-DP off): every mismatching KDA
                 # tensor is head-major with the checkpoint exactly
                 # kda_tp_size times larger on one axis — q/k/v/g/f_b
                 # projections, b_proj, dt_bias, and the depthwise conv
                 # weights on dim 0 (rows), o_proj on dim 1 (columns).
-                # MLA layers never produce a x-tp_size ratio (their
-                # mismatches are the padding branches below), so shape
-                # ratios alone identify the KDA slices.
+                # MLA head-sharded projections were handled by parameter
+                # identity above, so shape ratios identify the KDA slices.
                 if kda_tp_size > 1 and ".self_attn." in name:
                     if (
                         src.shape[0] == param.shape[0] * kda_tp_size
@@ -2748,41 +3185,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         s = param.shape[1]
                         lo = kda_tp_rank * s
                         param.data.copy_(src[:, lo : lo + s].to(param.dtype))
-                        return
-                # MLA head-shard (attention-DP off): the checkpoint holds
-                # the real 96 heads; the param holds this rank's slice of
-                # the zero-PADDED 128-head layout (pad before divide, so
-                # per-rank counts stay a power of two). Head-major output
-                # rows for q_b/g_proj and input columns for o_proj. KV-B has
-                # a dedicated head-aware loader above. A rank whose padded
-                # range lies beyond the real heads gets zeros. KDA layers
-                # never reach here: their identically named g/o projections
-                # match the exact-ratio branch above.
-                if mla_tp_size > 1 and ".self_attn." in name:
-                    if (
-                        name.endswith((".q_b_proj.weight", ".g_proj.weight"))
-                        and src.shape[1:] == param.shape[1:]
-                        and src.shape[0] < param.shape[0] * mla_tp_size
-                    ):
-                        s = param.shape[0]
-                        lo = mla_tp_rank * s
-                        param.data.zero_()
-                        n = max(0, min(src.shape[0] - lo, s))
-                        if n > 0:
-                            param.data[:n].copy_(src[lo : lo + n].to(param.dtype))
-                        return
-                    if (
-                        name.endswith(".o_proj.weight")
-                        and src.dim() == 2
-                        and src.shape[0] == param.shape[0]
-                        and src.shape[1] < param.shape[1] * mla_tp_size
-                    ):
-                        s = param.shape[1]
-                        lo = mla_tp_rank * s
-                        param.data.zero_()
-                        n = max(0, min(src.shape[1] - lo, s))
-                        if n > 0:
-                            param.data[:, :n].copy_(src[:, lo : lo + n].to(param.dtype))
                         return
                 # Shared-expert TP (direct MoE path): the module holds a
                 # 1/tp shard of the FFN dim — column shard for gate/up
@@ -2810,36 +3212,19 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         lo = (model_tp_rank % shard_count) * param.shape[1]
                         param.data.copy_(src[:, lo : lo + param.shape[1]].to(param.dtype))
                         return
-                # MLA head padding (96 -> 128 query heads, see
-                # KimiMLARuntime): pad the head-major output rows
-                # (q_b_proj / g_proj) or the head-major input columns
-                # (o_proj) with zeros. KV-B is handled above. KDA layers'
-                # identically named projections match exactly and never take
-                # this path.
-                if (
-                    ".self_attn." in name
-                    and name.endswith((".q_b_proj.weight", ".g_proj.weight"))
-                    and src.shape[1:] == param.shape[1:]
-                    and src.shape[0] < param.shape[0]
-                ):
-                    param.data.zero_()
-                    param.data[: src.shape[0]].copy_(src.to(param.dtype))
-                    return
-                if (
-                    ".self_attn." in name
-                    and name.endswith(".o_proj.weight")
-                    and src.shape[0] == param.shape[0]
-                    and src.shape[1] < param.shape[1]
-                ):
-                    param.data.zero_()
-                    param.data[:, : src.shape[1]].copy_(src.to(param.dtype))
-                    return
                 raise ValueError(
                     f"{name}: checkpoint shape "
                     f"{tuple(src.shape)} != param shape "
                     f"{tuple(param.shape)}"
                 )
             param.data.copy_(src.to(param.dtype))
+            # Keep the checkpoint's FP8 pair for the weight-read conversion,
+            # but ONLY on this path -- the branches above shard or pad, and the
+            # conversion consumes linear.weight in its module-local shape, so a
+            # full-size pair would not match. Under enable_attention_dp the
+            # attention projections are replicated, which is exactly this path.
+            if ckpt_fp8_pair is not None and ckpt_fp8_pair[0].shape == param.shape:
+                setattr(param, _K3_CKPT_FP8_ATTR, ckpt_fp8_pair)
 
         param_jobs = [(name, params[name]) for name in name_map]
         run_concurrently(load_param, param_jobs, num_workers=8)
@@ -2858,23 +3243,81 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         the backend expert slots, then verify every slot was filled."""
         device = next(self.parameters()).device
 
+        # Layouts whose per-expert loader only stages its input must have the
+        # staging containers created before any thread runs, and must be
+        # finalized once the layer's last slot lands: nothing else on this path
+        # calls process_weights_after_loading. Which thread completes a layer is
+        # a race, so the completion test and the "already finalized" bookkeeping
+        # are one critical section.
+        finalize_lock = threading.Lock()
+        finalized_backends = set()
+        prepared_backends = set()
+
+        def ensure_prepared(moe: KimiK3MoERuntime):
+            """Prepare a layer's streaming state on its FIRST expert, not up front.
+
+            Preparing every layer before the load starts is what OOM-ed the
+            MegaMoE CuteDSL backend: it keeps its raw NVFP4 source params as
+            0-element placeholders and rematerializes them at full shape here,
+            so preparing all 92 layers held 92 layers of raw weights at once
+            instead of the handful actually being filled. Cutlass did not care
+            because its parameters are allocated either way.
+
+            Bounded lazily instead. The paired shrink already happens per layer
+            in process_weights_after_loading, so the live set is whatever is
+            genuinely in flight -- measured at 1 layer per shard file for this
+            checkpoint (its rank-local experts are 1:1 with files), so ~4 with
+            4 loader threads. Correctness does not depend on that layout
+            though; a checkpoint that split a layer across files would only
+            raise the peak, not break this.
+
+            The membership add happens AFTER preparing, so the lock-free fast
+            path can only ever be stale in the safe direction.
+            """
+            spec = moe.expert_ckpt_spec
+            if not spec.needs_layer_finalize:
+                return
+            backend = moe.routed_experts.backend
+            if id(backend) in prepared_backends:
+                return
+            with finalize_lock:
+                if id(backend) in prepared_backends:
+                    return
+                backend.quant_method.prepare_streaming_expert_load(backend)
+                prepared_backends.add(id(backend))
+
+        def maybe_finalize_layer(moe: KimiK3MoERuntime):
+            spec = moe.expert_ckpt_spec
+            if not spec.needs_layer_finalize:
+                return
+            backend = moe.routed_experts.backend
+            with finalize_lock:
+                loaded = len(getattr(backend, spec.loaded_slots_attr, ()))
+                if loaded != backend.expert_size_per_partition:
+                    return
+                if id(backend) in finalized_backends:
+                    return
+                finalized_backends.add(id(backend))
+            # Computes the alphas, interleaves the w2 scales, and (MegaMoE)
+            # packs into the mega buffers and shrinks the raw source params
+            # back to placeholders. Paired with ensure_prepared above, that
+            # pairing is what bounds the per-layer footprint. The per-expert
+            # drain inside load_streaming_nvfp4_expert separately bounds the
+            # Cutlass w3_w1 staging, which is per expert rather than per layer.
+            backend.process_weights_after_loading()
+
         def load_expert(
             moe: KimiK3MoERuntime, base: str, local_slot_id: int, expert_idx: int, get_tensor
         ):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
             backend = moe.routed_experts.backend
-            backend.quant_method.load_packed_mxfp4_expert(
-                backend,
-                global_expert_id=expert_idx,
-                local_slot_id=local_slot_id,
-                w1_weight=get_tensor(f"{base}.{expert_idx}.w1.weight_packed"),
-                w1_weight_scale=get_tensor(f"{base}.{expert_idx}.w1.weight_scale"),
-                w2_weight=get_tensor(f"{base}.{expert_idx}.w2.weight_packed"),
-                w2_weight_scale=get_tensor(f"{base}.{expert_idx}.w2.weight_scale"),
-                w3_weight=get_tensor(f"{base}.{expert_idx}.w3.weight_packed"),
-                w3_weight_scale=get_tensor(f"{base}.{expert_idx}.w3.weight_scale"),
-            )
+            # Every route into an expert goes through here (file-grouped,
+            # split-file and the shared-dict fallback alike), so this is the
+            # one place preparation has to be hooked.
+            ensure_prepared(moe)
+            moe.expert_ckpt_spec.loader(backend, base, expert_idx, local_slot_id, get_tensor)
+            maybe_finalize_layer(moe)
 
         def load_experts_from_weights(layer_idx: int, moe: KimiK3MoERuntime, base: str):
             del layer_idx
@@ -2896,8 +3339,19 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # trays). Instead, group the rank-local expert tensors by shard file
         # and stream each file through a short-lived handle:
         # open -> copy -> close (unmap) -> fadvise(DONTNEED).
-        ckpt_dir = getattr(self.model_config.pretrained_config, "_name_or_path", None)
+        # The lazy loader records the directory it opened; prefer it over
+        # ``_name_or_path``, which transformers no longer populates (it is
+        # empty on transformers 5.x, which silently sent the whole load down
+        # the fallback below and OOM-killed the step).
+        ckpt_dir = getattr(weights, "checkpoint_dir", None) or getattr(
+            self.model_config.pretrained_config, "_name_or_path", None
+        )
         index_path = os.path.join(ckpt_dir or "", "model.safetensors.index.json")
+        checkpoint_prefix = getattr(weights, "checkpoint_prefix", "")
+
+        def checkpoint_key(key: str) -> str:
+            return f"{checkpoint_prefix}{key}"
+
         if expert_jobs and ckpt_dir and os.path.isfile(index_path):
             with open(index_path) as f:
                 weight_map = json.load(f)["weight_map"]
@@ -2909,9 +3363,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     keys = [
                         f"{base}.{expert_idx}.{w}.{kind}"
                         for w in ("w1", "w2", "w3")
-                        for kind in ("weight_packed", "weight_scale")
+                        for kind in moe.expert_ckpt_spec.kinds
                     ]
-                    files = {weight_map[key] for key in keys}
+                    files = {weight_map[checkpoint_key(key)] for key in keys}
                     job = (moe, base, local_slot_id, expert_idx)
                     if len(files) == 1:
                         per_file.setdefault(files.pop(), []).append(job)
@@ -2935,7 +3389,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 path = os.path.join(ckpt_dir, file_name)
                 with safe_open(path, framework="pt", device="cpu") as fh:
                     for moe, base, local_slot_id, expert_idx in jobs:
-                        load_expert(moe, base, local_slot_id, expert_idx, fh.get_tensor)
+                        load_expert(
+                            moe,
+                            base,
+                            local_slot_id,
+                            expert_idx,
+                            lambda key: fh.get_tensor(checkpoint_key(key)),
+                        )
                 # Handle closed -> pages unmapped -> the drop takes effect.
                 drop_file_pages(file_name)
 
@@ -2953,7 +3413,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     }
 
                     def get_tensor(key):
-                        return handles[weight_map[key]].get_tensor(key)
+                        source_key = checkpoint_key(key)
+                        return handles[weight_map[source_key]].get_tensor(source_key)
 
                     load_expert(*job, get_tensor)
                 for file_name in files:
@@ -2962,17 +3423,41 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             run_concurrently(load_expert_file, sorted(per_file.items()), num_workers=4)
             run_concurrently(load_split_file_expert, split_file_jobs, num_workers=4)
         else:
+            # Falling back is a silent loss of the whole point of the block
+            # above: the shared lazy dict keeps every shard mapped, which is
+            # the OOM this streaming path exists to avoid. Say so.
+            if expert_jobs:
+                logger.warning(
+                    f"Kimi K3: no safetensors index at '{index_path}', so routed "
+                    "experts are loaded from the shared lazy weight dict instead "
+                    "of being streamed per shard file. Every shard stays mapped "
+                    "for the whole load, which OOM-kills the step at DEP8 scale."
+                )
             run_concurrently(load_experts_from_weights, expert_jobs, num_workers=4)
 
         for _, moe, _ in expert_jobs:
+            spec = moe.expert_ckpt_spec
             backend = moe.routed_experts.backend
-            loaded_slots = getattr(backend, "_packed_mxfp4_loaded_slots", set())
+            loaded_slots = getattr(backend, spec.loaded_slots_attr, set())
             expected_slots = set(range(backend.expert_size_per_partition))
             if loaded_slots != expected_slots:
                 missing_slots = sorted(expected_slots - loaded_slots)
                 raise RuntimeError(
-                    "Kimi K3 packed expert loading did not fill all backend "
+                    "Kimi K3 streaming expert loading did not fill all backend "
                     f"slots; missing {missing_slots[:10]}."
+                )
+            if (
+                spec.needs_layer_finalize
+                and expected_slots
+                and id(backend) not in finalized_backends
+            ):
+                # Unreachable via load_expert (the last slot finalizes), so
+                # reaching it means the two bookkeeping paths disagree. Guarded
+                # on expected_slots because a layer that owns no local slots is
+                # never prepared and so is legitimately never finalized.
+                raise RuntimeError(
+                    "Kimi K3 streaming expert loading filled every slot but "
+                    "never finalized the layer."
                 )
             backend._weights_transformed = False
 
@@ -2996,7 +3481,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # This must run after every KDA parameter is loaded and sharded.
         num_kda_fused = 0
         for layer in self.model.layers:
-            if getattr(layer, "is_kda", False):
+            if getattr(layer, "is_kda", False) and _has_weights(layer):
                 if not kda_fp8:
                     layer.self_attn.finalize_decode_weights()
                 num_kda_fused += int(
@@ -3051,7 +3536,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     # in BF16.
                     n_glue = 0
                     for layer in self.model.layers:
-                        if getattr(layer, "is_kda", False):
+                        if getattr(layer, "is_kda", False) and _has_weights(layer):
                             layer.self_attn.finalize_decode_weights_fp8()
                             n_glue += int(layer.self_attn._bfa_proj_weight is not None)
                     logger.info(
@@ -3068,3 +3553,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 logger.info(
                     f"Kimi K3: reading {n_mla} MLA q_a/q_b/o/g projections at FP8 block-scale"
                 )
+
+        # Sub-switches may leave checkpoint pairs on BF16 parameters that were
+        # deliberately not converted. No later stage consumes them.
+        cleared_pairs = _clear_checkpoint_fp8_pairs(self.model)
+        if cleared_pairs:
+            logger.debug(f"Kimi K3: released {cleared_pairs} unconsumed checkpoint FP8 pairs")
