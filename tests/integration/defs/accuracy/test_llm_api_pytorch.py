@@ -5500,6 +5500,182 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
+    def test_w4_1gpu_suspend_resume(self) -> None:
+        # Suspend / resume correctness for an ACTIVE request -- the
+        # V2-only preemption round-trip, distinct from idle committed-block reuse.
+        # Under capacity pressure the scheduler preempts an in-flight request:
+        # live pages go ACTIVE -> SUSPENDED (LOCKED->HELD), are lazily offloaded
+        # to host when a competing request needs the slots, and on resume are
+        # onboarded with their host page-index buffers RECONNECTED
+        kv_cache_config = KvCacheConfig(
+            # Hard cap sized for ~one request's full context+decode. It sits above
+            # a single request's peak (~context + 128 decode) but below even two
+            # requests' *context*, so the four concurrent requests cannot co-reside:
+            # three are admitted then suspended (ACTIVE->SUSPENDED, pages
+            # LOCKED->HELD) and resumed one at a time.
+            max_tokens=512,
+            free_gpu_memory_fraction=0.5,
+            # Bounce resume() when the tier is near-full so a suspended request
+            # genuinely defers then is recalled (V2-only knob).
+            max_util_for_resume=0.7,
+            enable_block_reuse=False,
+            host_cache_size=4 * (1 << 30),
+            use_kv_cache_manager_v2=True)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=8,
+                  max_seq_len=1024,
+                  disable_overlap_scheduler=True,
+                  enable_iter_perf_stats=True,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        # Several distinct long prompts; each alone fits the ~1-request pool,
+        # but together they cannot be co-resident, forcing suspend/resume.
+        base = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ")
+        # One distinct needle per prompt, planted at the very start of the
+        # context -- i.e. in the first KV pages, exactly the ones that go
+        # LOCKED->HELD on suspend and are reconnected on resume. Recalling it
+        # after a round trip is the KV-integrity signal (assertion (3) below).
+        # The needles also keep the four prompts genuinely distinct: a bare
+        # "Alpha:"/"Beta:" prefix is ignored by the model, which made two
+        # contended completions come back byte-identical.
+        needles = ("BANANA", "TRUMPET", "GLACIER", "VIOLIN")
+        prompts = [
+            f"Remember this code word: {n}. {base * 8}"
+            f"Question: what was the code word? Answer in one word."
+            for n in needles
+        ]
+        # Long generation so each suspend/resume round trip spans many decode
+        # steps and the suspended requests are held across a long active run of
+        # the request that owns the pool
+        sampling = SamplingParams(max_tokens=128, temperature=0.0)
+
+        def _drain_stats() -> tuple[int, int, int, int]:
+            # Single drain: llm.get_stats() consumes the per-iteration records,
+            # so suspend/resume counts AND offload/onboard bytes must be summed
+            # in one pass. iterSuspendedRequests/iterResumedRequests are manager-
+            # level (top-level of each record); offload/onboard are per pool
+            # group. Both are V2-only.
+            suspended = resumed = offload = onboard = 0
+            for s in llm.get_stats(timeout=10):
+                suspended += s.get("iterSuspendedRequests", 0)
+                resumed += s.get("iterResumedRequests", 0)
+                pgs = s.get("kvCacheIterationStatsByPoolGroup")
+                if not pgs:
+                    continue
+                for pg in pgs.values():
+                    offload += pg.get("iterOffloadBytes", 0)
+                    onboard += pg.get("iterOnboardBytes", 0)
+            return suspended, resumed, offload, onboard
+
+        def _common_prefix_len(a: list[int], b: list[int]) -> int:
+            # Diagnostic only -- do NOT turn this into an assertion. Contended
+            # and uncontended runs use different batch compositions, which is
+            # enough to change MoE routing and GEMM tiling, so greedy decoding
+            # may legitimately diverge at any index including 0. See (3) below.
+            n = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                n += 1
+            return n
+
+        with llm:
+            # Uncontended references: each prompt alone fits the tight pool, so
+            # no suspend occurs (the deterministic single-request path).
+            ref_ids = []
+            ref_txt = []
+            for p in prompts:
+                r = llm.generate([p], sampling)
+                ref_ids.append(list(r[0].outputs[0].token_ids))
+                ref_txt.append(r[0].outputs[0].text)
+            _drain_stats()  # discard the reference runs' stats
+            # Contended: all prompts in flight against a ~1-request pool, so the
+            # scheduler must suspend/resume (and may offload/onboard) to serve them.
+            # Bounded wait: a V2 scheduler deadlock (all requests suspended, none
+            # resumable) would otherwise hang the test until the CI stage timeout,
+            # with no diagnostics. TimeoutError here IS the deadlock signal.
+            futures = [llm.generate_async(p, sampling) for p in prompts]
+            contended = [f.result(timeout=600) for f in futures]
+            suspended, resumed, offload, onboard = _drain_stats()
+
+        con_ids = [list(r.outputs[0].token_ids) for r in contended]
+        con_txt = [r.outputs[0].text for r in contended]
+        prefixes = [
+            _common_prefix_len(ref_ids[i], con_ids[i])
+            for i in range(len(prompts))
+        ]
+        # Diagnostics FIRST, so the round-trip evidence and the ref/contended
+        # comparison are always visible even when an assertion fails.
+        print(f"[I-10 suspend/resume] suspended={suspended} resumed={resumed} "
+              f"offload_bytes={offload} onboard_bytes={onboard} "
+              f"common_prefix_tokens={prefixes}")
+        for i in range(len(prompts)):
+            print(f"[I-10 out {i}] needle={needles[i]} "
+                  f"ref_recall={needles[i] in ref_txt[i].upper()} "
+                  f"con_recall={needles[i] in con_txt[i].upper()} "
+                  f"ref={ref_txt[i]!r} con={con_txt[i]!r}")
+
+        # (1) No crash / no deadlock: every request completed within the bounded
+        # wait above and produced a non-empty completion (a KV-corrupting bad
+        # page-index reconnect would instead illegal-memory-access crash here).
+        assert len(contended) == len(prompts)
+        assert all(len(ids) > 0 for ids in con_ids), (
+            "a request produced no tokens under suspend/resume contention "
+            "(possible V2 scheduler deadlock or illegal-memory-access crash)")
+        # (2) The ACTIVE<->SUSPENDED state machine genuinely fired (not mere
+        # queuing): an in-flight request was suspended under pressure and later
+        # recovered. These per-iteration manager counters are the direct signal;
+        # offload/onboard bytes may legitimately be 0 (suspend keeps HELD pages
+        # on GPU and offloads only lazily), so they are not gated -- only printed
+        # above. iterResumedRequests counts preemption recovery only: a request's
+        # initial admission also drives a SUSPENDED->ACTIVE transition internally
+        # but is excluded, so a non-zero value here cannot come from mere arrivals.
+        assert suspended > 0 and resumed > 0, (
+            "expected an active-request suspend->resume round trip "
+            "(iterSuspendedRequests>0 and iterResumedRequests>0); "
+            f"suspended={suspended} resumed={resumed} -- if 0, the pool was not "
+            "tight enough to force preemption of an in-flight request; "
+            "retune max_tokens")
+        # Not asserted: `resumed <= suspended` holds globally but not necessarily
+        # within one drain window -- a request suspended just before a drain and
+        # recovered just after straddles the boundary. The deterministic guard
+        # against the counter regressing to admission-counting is the model-free
+        # unit test test_admission_is_not_counted_as_a_resume; the ratio is only
+        # printed above.
+        # (3) KV integrity: the needle planted in each prompt's first KV pages
+        # survives the suspend/resume round trip. A bad page-index reconnect
+        # loses the prompt content and the recall fails; benign numerical drift
+        # does not touch it.
+        #
+        # Token-level equality against the uncontended reference is deliberately
+        # NOT asserted: batch composition changes MoE routing and GEMM tiling,
+        # so greedy decoding is not required to match a batch-of-1 reference at
+        # any index -- not even index 0. `prefixes` is a diagnostic only.
+        #
+        # The contended check is gated on the reference recalling the needle
+        # first, so a model-capability miss fails loudly as a workload
+        # precondition instead of masquerading as KV corruption.
+        missing_ref = [
+            n for n, t in zip(needles, ref_txt) if n not in t.upper()
+        ]
+        assert not missing_ref, (
+            "workload precondition failed: the uncontended reference run did "
+            f"not recall {missing_ref} -- retune the prompt; this is not a "
+            "KV-path failure")
+        missing_con = [
+            n for n, t in zip(needles, con_txt) if n not in t.upper()
+        ]
+        assert not missing_con, (
+            "a preempted request lost prompt content that it recalls "
+            f"uncontended: {missing_con} -- possible KV corruption across "
+            f"suspend/resume; common_prefix_tokens={prefixes}")
+
     def test_dummy_load_format(self):
         llm = LLM(
             self.MODEL_PATH,
