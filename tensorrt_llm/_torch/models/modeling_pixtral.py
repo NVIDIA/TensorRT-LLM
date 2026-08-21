@@ -8,8 +8,8 @@ import transformers
 
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention import attention as trtllm_attention
-from tensorrt_llm._torch.attention_backend import interface as attention_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.attention.backends import interface as attention_interface
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.modules import gated_mlp as trtllm_gated_mlp

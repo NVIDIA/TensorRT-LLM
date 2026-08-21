@@ -8,8 +8,8 @@ from tensorrt_llm.llmapi.utils import logger_debug
 from tensorrt_llm.logger import logger
 
 from ..attention.attention import Attention
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PredefinedAttentionMask
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding

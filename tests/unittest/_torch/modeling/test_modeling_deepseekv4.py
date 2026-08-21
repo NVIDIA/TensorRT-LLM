@@ -17,26 +17,26 @@ from utils.util import skip_pre_blackwell
 
 # from utils.util import default_dtype
 import tensorrt_llm
-from tensorrt_llm._torch.attention.mla import MLA
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.compressor import Compressor
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     _fused_q_rope_specs,
     _is_fused_kv_norm_enabled,
     _is_fused_prologue_active,
     _is_fused_q_fp8_quant_enabled,
 )
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig

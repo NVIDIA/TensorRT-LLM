@@ -5,7 +5,7 @@ import sys
 import torch
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.speculative.drafting_loops import StaticTreeDraftingLoopWrapper
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager

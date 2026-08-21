@@ -57,9 +57,9 @@ from ...inputs import (
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
 from ..attention.cross_attention import CrossAttention
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
 from ..modules.embedding import Embedding, LMHead
 from ..modules.layer_norm import LayerNorm

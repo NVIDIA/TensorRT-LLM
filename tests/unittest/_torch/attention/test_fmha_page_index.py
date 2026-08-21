@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
+from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
     _get_multi_ctas_kv_counter_size,
 )
@@ -72,7 +72,7 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
         raise RuntimeError("counter size arguments observed")
 
     monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen."
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen."
         "_get_multi_ctas_kv_counter_size",
         check_counter_size_args,
     )

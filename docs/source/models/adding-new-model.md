@@ -49,7 +49,7 @@ from typing import Optional
 
 import torch
 from torch import nn
-from tensorrt_llm._torch.attention_backend import AttentionMetadata
+from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.attention.attention import Attention

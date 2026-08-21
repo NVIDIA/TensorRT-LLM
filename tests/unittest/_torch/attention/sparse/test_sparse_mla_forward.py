@@ -26,20 +26,20 @@ import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention.mla import MLA
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import \
     DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import \
     forward_context_sparse_attn as forward_context_deepseek_v4_mla
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import \
     forward_generation_sparse_attn as forward_generation_deepseek_v4_mla
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
-                                                              DSACacheManager)
-from tensorrt_llm._torch.attention_backend.sparse.dsa.module import \
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
+    HAS_FAST_HADAMARD, DSACacheManager)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.module import \
     _forward_dsa_attn
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
@@ -2338,7 +2338,7 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
     """
     monkeypatch.setenv("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0")
 
-    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import \
         module as deepseek_v4_module
 
     original_fwd = deepseek_v4_module.forward_context_sparse_attn

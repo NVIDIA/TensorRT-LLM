@@ -77,7 +77,7 @@ Many operations you might implement manually are already handled by fused C++ ke
 
 ```bash
 # Find what the attention kernel handles internally
-grep -rn "latent_cache\|rope.*fuse\|rope_fusion" tensorrt_llm/_torch/attention_backend/
+grep -rn "latent_cache\|rope.*fuse\|rope_fusion" tensorrt_llm/_torch/attention/backends/
 ```
 
 **Common surprise**: When `rope_fusion=True` (`apply_rotary_emb=False`), the fused attention kernel handles RoPE internally via `latent_cache`. Writing custom RoPE code in Python is unnecessary and will double-apply RoPE.
@@ -169,7 +169,7 @@ grep -n "forward_context_default" tensorrt_llm/_torch/attention/attention.py
 | Searching only for the exact function name | Miss equivalent implementations | Search for the *concept* (e.g., "attention", "rope", "expand kv") |
 | Assuming assertions are immutable | Work around them with hacks (separate attributes) | Question whether the assertion's intent still applies |
 | Not reading the fused kernel's capabilities | Reimplement what it already does | Check what `latent_cache`, `rope_fusion` etc. control |
-| Only reading Python code | Miss C++ implementations called via bindings | Check `tensorrt_llm/_torch/attention_backend/` for native kernels |
+| Only reading Python code | Miss C++ implementations called via bindings | Check `tensorrt_llm/_torch/attention/backends/` for native kernels |
 | Calling a method directly instead of through its dispatcher | Miss edge cases (cached KV, chunked prefill, SM-version gating) | Search for callers of the method to find the dispatch chain |
 | Assuming hardware-uniform numerical behavior | Silent accuracy degradation on specific SM versions | Check for `get_sm_version()` guards near the call site; test on multiple hardware |
 
@@ -178,7 +178,7 @@ grep -n "forward_context_default" tensorrt_llm/_torch/attention/attention.py
 | Area | Key files to read |
 |------|-------------------|
 | Attention modules | `tensorrt_llm/_torch/attention/attention.py` |
-| Attention backends | `tensorrt_llm/_torch/attention_backend/` (trtllm_attention.py, sparse/) |
+| Attention backends | `tensorrt_llm/_torch/attention/backends/` (trtllm_attention.py, sparse/) |
 | Model definitions | `tensorrt_llm/_torch/models/modeling_*.py` |
 | Utilities | `tensorrt_llm/_torch/utils.py` |
 | RoPE | `tensorrt_llm/_torch/attention/rotary_embedding.py` |

@@ -17,7 +17,7 @@
 Holds the module-layer implementations -- standard attention, cross attention,
 Multi-head Latent Attention, QK-norm attention and rotary embedding -- that
 were previously mixed into the shared ``_torch/modules`` bucket. The backend
-classes those modules dispatch to still live in ``_torch/attention_backend``.
+classes those modules dispatch to live in the ``backends`` sub-package here.
 
 ``ATTENTION_DEVELOPER_GUIDE.md`` in this directory is the contract document for
 attention metadata, backend families and KV-cache behaviour; read it before

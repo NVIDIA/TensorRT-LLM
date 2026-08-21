@@ -79,7 +79,7 @@ measured: []
 - **Prior art:** PRs #11899, #12322, #8701, #13340. Files:
   `cpp/tensorrt_llm/kernels/fusedCatFp8.{cu,h}`, `fusedCatFp4.{cu,h}`,
   `cpp/tensorrt_llm/thop/fusedCatFp8Op.cpp`,
-  `tensorrt_llm/_torch/attention_backend/sparse/{dsa.py,kernel.py}`
+  `tensorrt_llm/_torch/attention/backends/sparse/{dsa.py,kernel.py}`
   (`triton_gather_k_cache`, `_prep_q_or_k`). Owning specialists:
   **kernel-cuda-specialist**, **kernel-triton-writing**. Related:
   [fold-scale-swizzle](fold-scale-swizzle-into-kernel.md) and

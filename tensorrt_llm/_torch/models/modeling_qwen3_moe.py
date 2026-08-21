@@ -7,7 +7,7 @@ from transformers import Qwen3MoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig

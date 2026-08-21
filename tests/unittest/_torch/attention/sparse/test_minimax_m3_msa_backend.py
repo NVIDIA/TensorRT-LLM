@@ -14,14 +14,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
-from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import msa_paged_kv
+from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
 def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monkeypatch):
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )
 
@@ -45,7 +45,7 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):
-    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_availability as avail
+    import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_availability as avail
 
     monkeypatch.setattr(avail, "ensure_msa_available", lambda: None)
     params = MiniMaxM3SparseAttentionConfig(implementation="msa").to_sparse_params()
@@ -110,7 +110,7 @@ def test_msa_paged_kv_preserves_tma_compatible_outer_stride() -> None:
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 (Blackwell) required")
 
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )
 
@@ -152,7 +152,7 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 (Blackwell) required")
 
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )
 
@@ -218,8 +218,10 @@ def test_msa_index_k_uses_hnd_cache_view_and_writer():
 
 
 def test_msa_indexer_preserves_strided_hnd_index_k(monkeypatch):
-    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer as indexer_module
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+    import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer as indexer_module
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+        MiniMaxM3SparseConfig,
+    )
 
     config = MiniMaxM3SparseConfig(
         num_q_heads=4,
@@ -275,8 +277,10 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed():
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 (Blackwell) required")
 
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import _proxy_max_score
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import (
+        _proxy_max_score,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )
 

@@ -15,9 +15,9 @@ from typing import Optional
 import torch
 
 from ....functional import PositionEmbeddingType
+from ...attention.backends import AttentionMetadata, TrtllmAttention
+from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ...attention.mla import MLA
-from ...attention_backend import AttentionMetadata, TrtllmAttention
-from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
 

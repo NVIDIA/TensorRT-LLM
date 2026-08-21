@@ -13,8 +13,8 @@ from typing import Sequence
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.attention_backend.interface import RopeParams
 
 
 def fill_kv_cache_logical(

@@ -23,7 +23,7 @@ try:
     import sys
     from pathlib import Path
 
-    from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.interface import (

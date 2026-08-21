@@ -14,10 +14,10 @@ from tensorrt_llm.logger import logger
 
 from ...functional import PositionEmbeddingType, RotaryScalingType
 from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..attention.rotary_embedding import RotaryEmbedding
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig, TConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding

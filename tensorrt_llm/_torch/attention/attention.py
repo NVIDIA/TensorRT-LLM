@@ -11,14 +11,6 @@ from torch import nn
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
-                                 FlashInferAttentionMetadata,
-                                 TrtllmAttentionMetadata)
-from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
-                                           PositionalEmbeddingParams,
-                                           PredefinedAttentionMask)
-from ..attention_backend.sparse.hooks import get_sparse_attention_hooks
-from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
@@ -31,6 +23,13 @@ from ..pyexecutor.breakable_cuda_graph import (eager_on_graph,
                                                is_in_breakable_cuda_graph)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling)
+from .backends import (AttentionForwardArgs, AttentionMetadata,
+                       FlashInferAttentionMetadata, TrtllmAttentionMetadata)
+from .backends.interface import (AttentionMask, CustomAttentionMask,
+                                 PositionalEmbeddingParams,
+                                 PredefinedAttentionMask)
+from .backends.sparse.hooks import get_sparse_attention_hooks
+from .backends.utils import create_attention, get_attention_backend
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
 

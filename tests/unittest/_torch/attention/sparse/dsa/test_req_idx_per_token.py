@@ -27,7 +27,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSAtrtllmAttentionMetadata,
     build_req_idx_per_token,
 )

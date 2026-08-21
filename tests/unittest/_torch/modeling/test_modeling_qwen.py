@@ -10,7 +10,7 @@ from transformers import Qwen2ForCausalLM as HFQwenForCausalLM
 
 # isort: off
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 # yapf: disable
