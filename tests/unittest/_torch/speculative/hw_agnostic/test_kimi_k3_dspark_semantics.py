@@ -19,6 +19,9 @@ Confidence-scheduled verification is MR B: here we only check that
 confidence_proj weights load without being used.
 """
 
+import re
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -205,11 +208,29 @@ CTX_LEN = 24  # > SWA_WINDOW so the window binds
 NUM_CAPTURE = 2
 
 
-def _tiny_config(dspark: bool):
+def _tiny_config(dspark: bool, *, published_spelling: bool = False):
+    """Tiny drafter config.
+
+    ``published_spelling`` reproduces the two public K3 DSpark checkpoints
+    (RadixArk, Inferact): the head switches sit at the TOP level, the
+    confidence flag is ``enable_confidence_head``, and neither ``shift_label``
+    nor ``projector_type`` is declared at all -- shift_label rides on the
+    DSpark default. Reading only ``dflash_config`` resolves markov_rank to 0
+    there, which drops the heads without raising.
+    """
     from transformers import Qwen3Config
 
     cfg = dict(TINY)
     dflash = {"mask_token_id": VOCAB - 2, "target_layer_ids": [0, 1]}
+    if dspark and published_spelling:
+        cfg.update(
+            markov_rank=RANK,
+            markov_head_type="vanilla",
+            enable_confidence_head=True,
+            confidence_head_with_markov=True,
+        )
+        cfg["dflash_config"] = dflash
+        return Qwen3Config.from_dict(cfg)
     if dspark:
         dflash.update(
             projector_type="dspark",
@@ -227,7 +248,13 @@ def _tiny_config(dspark: bool):
     return Qwen3Config.from_dict(cfg)
 
 
-def _tiny_weights(seed=7):
+def _tiny_weights(seed=7, *, published_head_keys=False):
+    """Tiny drafter weights.
+
+    ``published_head_keys`` names the head tensors the way both public
+    checkpoints ship them -- after the submodules that own them -- instead of
+    the bare spellings the DSv4 stage weights use.
+    """
     g = torch.Generator().manual_seed(seed)
 
     def rnd(*shape):
@@ -235,14 +262,24 @@ def _tiny_weights(seed=7):
 
     h, inter = TINY["hidden_size"], TINY["intermediate_size"]
     nh, nkv, hd = (TINY["num_attention_heads"], TINY["num_key_value_heads"], TINY["head_dim"])
-    w = {
-        "fc.weight": rnd(h, h * NUM_CAPTURE),
-        "hidden_norm.weight": rnd(h) + 1.0,
-        "norm.weight": rnd(h) + 1.0,
+    head = {
         "markov_w1.weight": rnd(VOCAB, RANK),
         "markov_w2.weight": rnd(VOCAB, RANK),
         "confidence_proj.weight": rnd(1, h + RANK),
         "confidence_proj.bias": rnd(1),
+    }
+    if published_head_keys:
+        head = {
+            "markov_head.markov_w1.weight": head["markov_w1.weight"],
+            "markov_head.markov_w2.weight": head["markov_w2.weight"],
+            "confidence_head.proj.weight": head["confidence_proj.weight"],
+            "confidence_head.proj.bias": head["confidence_proj.bias"],
+        }
+    w = {
+        "fc.weight": rnd(h, h * NUM_CAPTURE),
+        "hidden_norm.weight": rnd(h) + 1.0,
+        "norm.weight": rnd(h) + 1.0,
+        **head,
     }
     for i in range(TINY["num_hidden_layers"]):
         p = f"layers.{i}."
@@ -260,13 +297,24 @@ def _tiny_weights(seed=7):
     return w
 
 
-def _build_drafter(dspark: bool, weights):
+def _build_drafter(
+    dspark: bool,
+    weights,
+    *,
+    published_spelling: bool = False,
+    dflash_attention_backend: str = "VANILLA",
+):
     from tensorrt_llm._torch.model_config import ModelConfig
 
-    model_config = ModelConfig(pretrained_config=_tiny_config(dspark), attn_backend="TRTLLM")
+    model_config = ModelConfig(
+        pretrained_config=_tiny_config(dspark, published_spelling=published_spelling),
+        attn_backend="TRTLLM",
+    )
     # The DSpark head set lives in the DSpark drafter, not in the DFlash base.
     drafter_cls = GQADSparkForCausalLM if dspark else DFlashForCausalLM
-    drafter = drafter_cls(model_config).to("cuda")
+    drafter = drafter_cls(model_config, dflash_attention_backend=dflash_attention_backend).to(
+        "cuda"
+    )
     # Drop dspark head tensors for the plain drafter (schema without them).
     if not dspark:
         weights = {k: v for k, v in weights.items() if not k.startswith(("markov_", "confidence_"))}
@@ -369,6 +417,100 @@ def test_dspark_drafter_loads_head_weights_and_parses_config():
         drafter.confidence_proj_weight.cpu(), weights["confidence_proj.weight"]
     )
     assert drafter.confidence_proj_bias is not None
+
+
+@needs_gpu
+def test_published_drafter_spelling_activates_the_heads():
+    """Both public K3 DSpark checkpoints load with their heads live.
+
+    They declare the switches at the top level and name the head tensors after
+    the owning submodules. Reading only ``dflash_config`` and the bare tensor
+    names resolves markov_rank to 0 and drops markov_w1/w2 on the floor:
+    correct output, lower acceptance, nothing raised.
+    """
+    weights = _tiny_weights(published_head_keys=True)
+    # TRTLLM block decode: same semantics, and unlike VANILLA it needs no
+    # flash-attn, so this covers the published spellings anywhere SM100+ runs.
+    drafter = _build_drafter(
+        True, weights, published_spelling=True, dflash_attention_backend="TRTLLM"
+    )
+
+    assert drafter.has_markov_head, "markov weights dropped despite being in the checkpoint"
+    assert drafter._dspark_use_confidence_head, "enable_confidence_head spelling not resolved"
+    # Declared nowhere in the published config, so it rides on the DSpark
+    # default. False would run slots 1..K on a block_size-K drafter and read
+    # the next request's anchor slot.
+    assert drafter._dspark_shift_label
+    torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
+    assert drafter.confidence_proj_bias is not None
+
+
+@needs_gpu
+def test_head_weights_without_a_resolvable_rank_raise():
+    """The inverse of the missing-weights check.
+
+    A checkpoint that ships markov_w1/w2 while the rank resolves to 0 means the
+    switches were spelled somewhere this build cannot read. Loading it anyway
+    would silently cost acceptance, so it is an error.
+    """
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    # dspark head weights, but a config that declares no head switches at all.
+    model_config = ModelConfig(pretrained_config=_tiny_config(False), attn_backend="TRTLLM")
+    drafter = GQADSparkForCausalLM(model_config, dflash_attention_backend="TRTLLM").to("cuda")
+
+    with pytest.raises(ValueError, match="markov_rank resolved to 0"):
+        drafter.load_weights(_tiny_weights(published_head_keys=True))
+
+
+def test_dflash_refuses_a_drafter_that_declares_the_dspark_heads():
+    """``decoding_type: DFlash`` must reject a DSpark drafter, not degrade it.
+
+    DFlash does not implement the Markov / confidence / shift_label semantics,
+    so serving one here would lower the acceptance rate with no error and no
+    way to attribute it back.
+    """
+    from tensorrt_llm._torch.models import modeling_dflash
+
+    model_config = SimpleNamespace(
+        spec_config=SimpleNamespace(attention_backend="TRTLLM", speculative_model="/nonexistent")
+    )
+    draft_config = SimpleNamespace(pretrained_config=_tiny_config(True))
+
+    with pytest.raises(ValueError, match="DSpark"):
+        modeling_dflash._build_dflash_draft(model_config, draft_config, None, None)
+
+
+@pytest.mark.parametrize(
+    "layers,expected",
+    [
+        # MLA-shaped: no per-head q/k/v projection to split at all.
+        ([SimpleNamespace(self_attn=SimpleNamespace())], "qkv_proj"),
+        # GQA-shaped but heterogeneous: the cross-layer K/V fusion needs one
+        # uniform num_key_value_heads.
+        (
+            [
+                SimpleNamespace(self_attn=SimpleNamespace(qkv_proj=object(), num_key_value_heads=n))
+                for n in (8, 8, 4)
+            ],
+            "[2]",
+        ),
+    ],
+    ids=["no_fused_qkv", "mismatched_kv_heads"],
+)
+def test_block_decode_rejects_a_backbone_it_cannot_express(layers, expected):
+    """The GQA precondition replaced the old per-model_type whitelist.
+
+    Without it the registry happily builds an unsupported backbone and the
+    failure surfaces much later inside _build_fused_kv_buffers, or as silently
+    mis-sliced weights.
+    """
+    drafter = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    drafter.model = SimpleNamespace(layers=layers)
+    drafter.config = SimpleNamespace()
+
+    with pytest.raises(ValueError, match=re.escape(expected)):
+        drafter._validate_gqa_shape()
 
 
 @needs_gpu
