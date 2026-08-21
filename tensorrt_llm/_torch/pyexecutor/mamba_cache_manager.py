@@ -17,8 +17,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
-                    Optional, Tuple, Union)
+from typing import TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
 import triton
@@ -29,28 +28,42 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
-    BlockReusePolicy, KVCacheManagerV2, Role)
-from tensorrt_llm._torch.pyexecutor.llm_request import (
-    ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest)
+    BlockReusePolicy,
+    KVCacheManagerV2,
+    Role,
+)
+from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
-    PoolConfiguration, get_pp_layers)
+    BaseResourceManager,
+    CacheTypeCpp,
+    DataType,
+    KVCacheManager,
+    PoolConfiguration,
+    get_pp_layers,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
-                                 nvtx_range, prefer_pinned,
-                                 torch_dtype_to_binding)
-from tensorrt_llm.bindings.internal.batch_manager import (
-    LinearAttentionMetadata, LinearCacheType)
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    convert_to_torch_tensor,
+    nvtx_range,
+    prefer_pinned,
+    torch_dtype_to_binding,
+)
+from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata, LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
-                                                      BatchDesc, BufferConfig,
-                                                      DataRole, KVCacheDesc)
-from tensorrt_llm.runtime.kv_cache_manager_v2 import \
-    KVCacheManagerConfig as KVCacheManagerConfigPy
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
-                                                      SsmLayerConfig)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    DEFAULT_BEAM_INDEX,
+    BatchDesc,
+    BufferConfig,
+    DataRole,
+    KVCacheDesc,
+    LayerId,
+    PageIndexMode,
+    SsmLayerConfig,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 
 GB = 1 << 30
 
@@ -890,8 +903,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         # cuda_graph_runner caches one dummy per runtime_draft_len value
         # (see _get_padded_batch), so any id in the range of dummy request IDs
         # may be live concurrently.
-        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-            CUDA_GRAPH_DUMMY_REQUEST_ID
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
         max_dl = self.speculative_num_draft_tokens or 0
         return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
                 CUDA_GRAPH_DUMMY_REQUEST_ID)
@@ -2012,8 +2024,7 @@ def _get_local_mamba_cache_layout(
     draft-layer count so estimation selects the same combined or per-manager
     layout as runtime.
     """
-    from tensorrt_llm._torch.pyexecutor.config_utils import \
-        extract_mamba_kv_cache_params
+    from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
 
     params = extract_mamba_kv_cache_params(
         model_config.pretrained_config,
@@ -2469,7 +2480,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         """Synchronously advance every local GDN checkpoint in one launch."""
         from tensorrt_llm._torch.modules.fla.cached_replay import (
             CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
-            commit_gdn_cached_replay_history_layers)
+            commit_gdn_cached_replay_history_layers,
+        )
 
         if (not self._use_gdn_cached_replay_all_layer_commit
                 or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE):
@@ -3138,7 +3150,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Advance all V2 GDN checkpoints through their state views."""
         from tensorrt_llm._torch.modules.fla.cached_replay import (
             CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
-            commit_gdn_cached_replay_history_layers)
+            commit_gdn_cached_replay_history_layers,
+        )
 
         if (not getattr(self, "_use_gdn_cached_replay_all_layer_commit", False)
                 or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE):
