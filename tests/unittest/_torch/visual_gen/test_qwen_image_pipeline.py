@@ -287,3 +287,66 @@ def test_forward_honors_profile_step_range(tmp_path):
         str(tmp_path / "visual-gen-trace-rank-0.json")
     )
     cudart.cudaProfilerStop.assert_called_once_with()
+
+
+class TestQwenImageEditReferenceLoading:
+    """``forward`` doubles as a library entry point, so it takes PIL too.
+
+    A request always arrives as encoded bytes, but a direct caller may already
+    hold a decoded image and should not have to re-encode it just to get in.
+    """
+
+    @staticmethod
+    def _png(mode="RGB", color=(10, 20, 30)):
+        import io
+
+        import PIL.Image
+
+        buffer = io.BytesIO()
+        PIL.Image.new(mode, (8, 8), color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def test_bytes_and_pil_both_load(self):
+        import io
+
+        import PIL.Image
+
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
+            QwenImageEditPlusPipeline,
+        )
+
+        data = self._png()
+        images = QwenImageEditPlusPipeline._load_edit_images(
+            [data, PIL.Image.open(io.BytesIO(data))]
+        )
+
+        assert len(images) == 2
+        assert all(image.mode == "RGB" for image in images)
+        assert all(image.size == (8, 8) for image in images)
+
+    def test_a_path_is_a_type_error(self):
+        """References reach a pipeline as bytes; a path is not a filesystem read."""
+        import pytest
+
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
+            QwenImageEditPlusPipeline,
+        )
+
+        with pytest.raises(ValueError, match="PIL images or encoded bytes"):
+            QwenImageEditPlusPipeline._load_edit_images(["/tmp/ref.png"])
+
+    def test_alpha_is_composited_onto_white(self):
+        """This pipeline went through ``load_image``, which flattens onto white
+        rather than dropping the channel the way diffusers does."""
+        import PIL.Image
+
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
+            QwenImageEditPlusPipeline,
+        )
+
+        transparent = PIL.Image.new("RGBA", (4, 4), (10, 20, 30, 0))
+
+        (image,) = QwenImageEditPlusPipeline._load_edit_images([transparent])
+
+        assert image.mode == "RGB"
+        assert image.getpixel((0, 0)) == (255, 255, 255)

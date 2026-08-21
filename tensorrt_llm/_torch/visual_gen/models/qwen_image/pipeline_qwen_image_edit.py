@@ -13,13 +13,14 @@ import time
 from typing import Any
 
 import numpy as np
+import PIL.Image
 import torch
 import torch.distributed as dist
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm.inputs.media_io import ImageMediaIO
+from tensorrt_llm.inputs.media_io import ImageMediaIO, convert_image_mode
 from tensorrt_llm.logger import logger
 
 from .pipeline_qwen_image import QwenImagePipeline, _calculate_shift
@@ -159,11 +160,28 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
     @staticmethod
     def _load_edit_images(image: Any) -> list[Any]:
+        """Normalize reference inputs to RGB images.
+
+        A request always arrives as encoded bytes; a direct caller may hand
+        over a PIL image instead, and converting it here costs nothing while
+        keeping ``forward`` usable as a library entry point.
+        """
         if image is None:
             raise ValueError("Qwen-Image-Edit requires image_reference.")
         images = image if isinstance(image, list) else [image]
         media_io = ImageMediaIO(format="pil")
-        return [media_io.load_bytes(item) for item in images]
+        loaded = []
+        for index, item in enumerate(images):
+            if isinstance(item, PIL.Image.Image):
+                loaded.append(convert_image_mode(item, "RGB"))
+            elif isinstance(item, bytes):
+                loaded.append(media_io.load_bytes(item))
+            else:
+                raise ValueError(
+                    "Reference images must be PIL images or encoded bytes; "
+                    f"item {index} has type {type(item).__name__}."
+                )
+        return loaded
 
     def _preprocess_edit_images(
         self,
