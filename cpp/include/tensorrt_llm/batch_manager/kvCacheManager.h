@@ -1376,20 +1376,17 @@ private:
     //! \param sequence Sequence which the free block is allocated for
     //! \param wantPlaceholder If true, return a pre-allocated placeholder block instead of a normal block
     //! \param countAllocationStats If true, update request-allocation counters for the returned block
-    //! \param suppressEvents If true, do not emit cache update/remove events while acquiring the block. This is used
-    //! when transfer preparation borrows a scratch primary block for an already-pinned cache block; the cache ownership
-    //! visible to scheduling has not changed, so update/remove events would incorrectly invalidate reusable prefixes.
     [[nodiscard]] BlockPtr getFreeBlock(GenerationRequest& sequence,
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
-        bool wantPlaceholder = false, bool countAllocationStats = true, bool suppressEvents = false);
+        bool wantPlaceholder = false, bool countAllocationStats = true);
 
     [[nodiscard]] BlockPtr getFreeBlock(std::optional<LlmRequest::RequestIdType> requestId,
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
-        bool wantPlaceholder = false, bool countAllocationStats = true, bool suppressEvents = false);
+        bool wantPlaceholder = false, bool countAllocationStats = true);
 
     void unpinBlocksByIdNoLock(std::vector<KVCacheBlock::IdType> const& blockIds);
 

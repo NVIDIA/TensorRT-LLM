@@ -50,6 +50,7 @@
 #include <set>
 #include <sys/types.h>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <variant>
 
@@ -5124,6 +5125,245 @@ TEST_F(KVCacheManagerTest, DisaggTransferBlockRangePreparationOnboardsOffloadedB
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*setup.llmRequest);
     (void) kvCacheManager.removeSequence(setup.llmRequest->mRequestId, setup.llmRequest);
+}
+
+namespace
+{
+struct DisaggTransferScratchPressureSetup
+{
+    std::unique_ptr<KVCacheManager> kvCacheManager;
+    std::shared_ptr<LlmRequest> sourceRequest;
+    std::shared_ptr<LlmRequest> consumerRequest2;
+    std::shared_ptr<LlmRequest> consumerRequest3;
+    BlockPtr sourceBlock;
+    KVCacheBlock::IdType sourceBlockId{};
+    BlockPtr victimBlock;
+    size_t victimHash{};
+    SizeType32 maxAttentionWindow{};
+};
+
+DisaggTransferScratchPressureSetup makeDisaggTransferScratchPressureSetup(SizeType32 blocksInSecondaryPool)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 3;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr beamWidth = 1;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    auto kvCacheManager = std::make_unique<KVCacheManager>(numLayers, numKvHeads, sizePerHead, tokensPerBlock,
+        blocksPerWindow, maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
+        tensorrt_llm::DataType::kHALF, 0, stream, maxAttentionWindow, maxAttentionWindow, true, CacheType::kSELF,
+        std::nullopt, std::make_unique<tlk::KVCacheEventManager>(1024));
+    kvCacheManager->allocatePools(false);
+    (void) getEvents(*kvCacheManager);
+
+    auto& blockManager = tensorrt_llm::testing::KvCacheManagerTestUtil::mutableBlockManager(*kvCacheManager);
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto makeRequest = [&](LlmRequest::RequestIdType requestId, TokenIdType firstToken)
+    {
+        auto inputTokens = std::make_shared<VecTokens>(VecTokens{firstToken, static_cast<TokenIdType>(firstToken + 1),
+            static_cast<TokenIdType>(firstToken + 2), static_cast<TokenIdType>(firstToken + 3)});
+        auto request = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
+        return std::make_tuple(std::move(request), std::move(inputTokens));
+    };
+
+    auto [victimRequest, victimTokens] = makeRequest(0, 0);
+    victimRequest->setKvCacheRetentionConfig(tle::KvCacheRetentionConfig(
+        std::vector{tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(0, std::nullopt, 90)}, 90));
+    kvCacheManager->addSequenceBatch(
+        {{{0, static_cast<SizeType32>(victimTokens->size()), beamWidth}}}, {std::ref(*victimRequest)});
+    auto const victimBlockId = kvCacheManager->getCacheBlockIds(0, maxAttentionWindow)[0].front();
+    auto victimBlock = blockManager.getBlockById(victimBlockId, maxAttentionWindow);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*victimRequest);
+    (void) kvCacheManager->removeSequence(0, victimRequest);
+    (void) getEvents(*kvCacheManager);
+
+    TLLM_CHECK(victimBlock != nullptr);
+    TLLM_CHECK(victimBlock->isPrimary());
+    TLLM_CHECK(!victimBlock->isDetached());
+    TLLM_CHECK(!victimBlock->getUniqueTokens().empty());
+    auto const victimHash = victimBlock->getHash();
+
+    auto [sourceRequest, sourceTokens] = makeRequest(1, 100);
+    kvCacheManager->addSequenceBatch(
+        {{{1, static_cast<SizeType32>(sourceTokens->size()), beamWidth}}}, {std::ref(*sourceRequest)});
+    auto const sourceBlockId = kvCacheManager->getCacheBlockIds(1, maxAttentionWindow)[0].front();
+    auto sourceBlock = blockManager.getBlockById(sourceBlockId, maxAttentionWindow);
+    TLLM_CHECK(sourceBlock != nullptr);
+    TLLM_CHECK(sourceBlockId != victimBlockId);
+    blockManager.offloadBlock(sourceBlock, maxAttentionWindow);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    TLLM_CHECK(!sourceBlock->isPrimary());
+
+    auto consumePrimaryBlock = [&](LlmRequest::RequestIdType requestId, TokenIdType firstToken)
+    {
+        auto [request, tokens] = makeRequest(requestId, firstToken);
+        kvCacheManager->addSequenceBatch(
+            {{{requestId, static_cast<SizeType32>(tokens->size()), beamWidth}}}, {std::ref(*request)});
+        auto const blockId = kvCacheManager->getCacheBlockIds(requestId, maxAttentionWindow)[0].front();
+        TLLM_CHECK(blockId != victimBlockId);
+        return request;
+    };
+    auto consumerRequest2 = consumePrimaryBlock(2, 200);
+    auto consumerRequest3 = consumePrimaryBlock(3, 300);
+
+    TLLM_CHECK(blockManager.getNumFreeBlocksPerWindowSize().at(maxAttentionWindow) == 1);
+    return {std::move(kvCacheManager), std::move(sourceRequest), std::move(consumerRequest2),
+        std::move(consumerRequest3), sourceBlock, sourceBlockId, victimBlock, victimHash, maxAttentionWindow};
+}
+
+bool hasCacheLevelUpdate(
+    std::deque<tle::KVCacheEvent> const& events, size_t blockHash, SizeType32 oldLevel, SizeType32 newLevel)
+{
+    return std::any_of(events.begin(), events.end(),
+        [blockHash, oldLevel, newLevel](tle::KVCacheEvent const& event)
+        {
+            if (!std::holds_alternative<tle::KVCacheUpdatedData>(event.data))
+            {
+                return false;
+            }
+            auto const& data = std::get<tle::KVCacheUpdatedData>(event.data);
+            return data.blockHash == blockHash && data.cacheLevel.has_value() && data.cacheLevel->oldValue == oldLevel
+                && data.cacheLevel->newValue == newLevel;
+        });
+}
+
+bool hasRemoveEvent(std::deque<tle::KVCacheEvent> const& events, size_t blockHash)
+{
+    return std::any_of(events.begin(), events.end(),
+        [blockHash](tle::KVCacheEvent const& event)
+        {
+            if (!std::holds_alternative<tle::KVCacheRemovedData>(event.data))
+            {
+                return false;
+            }
+            auto const& data = std::get<tle::KVCacheRemovedData>(event.data);
+            return std::find(data.blockHashes.begin(), data.blockHashes.end(), blockHash) != data.blockHashes.end();
+        });
+}
+} // namespace
+
+TEST_F(KVCacheManagerTest, DisaggTransferPreparationPromotesCachedSourceEvent)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 2;
+    auto constexpr blocksInSecondaryPool = 1;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr beamWidth = 1;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
+        maxAttentionWindow, maxAttentionWindow, true, CacheType::kSELF, std::nullopt,
+        std::make_unique<tlk::KVCacheEventManager>(1024));
+    kvCacheManager.allocatePools(false);
+    (void) getEvents(kvCacheManager);
+
+    LlmRequest::RequestIdType requestId{0};
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequenceBatch(
+        {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+    auto const sourceBlockId = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0].front();
+    auto& blockManager = tensorrt_llm::testing::KvCacheManagerTestUtil::mutableBlockManager(kvCacheManager);
+    auto sourceBlock = blockManager.getBlockById(sourceBlockId, maxAttentionWindow);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    (void) kvCacheManager.removeSequence(requestId, llmRequest);
+
+    TLLM_CHECK(sourceBlock != nullptr);
+    TLLM_CHECK(sourceBlock->isPrimary());
+    TLLM_CHECK(!sourceBlock->isDetached());
+    auto const sourceHash = sourceBlock->getHash();
+    (void) getEvents(kvCacheManager);
+
+    blockManager.offloadBlock(sourceBlock, maxAttentionWindow);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    TLLM_CHECK(!sourceBlock->isPrimary());
+    TLLM_CHECK(!sourceBlock->isDetached());
+    (void) getEvents(kvCacheManager);
+
+    {
+        auto transferLease = kvCacheManager.prepareBlocksForTransfer({{maxAttentionWindow, {sourceBlockId}}});
+        EXPECT_TRUE(transferLease.issuedOnboardCopies());
+        transferLease.syncReadyForFormat(blockManager.getBufferManager(maxAttentionWindow));
+    }
+
+    EXPECT_TRUE(sourceBlock->isPrimary());
+    EXPECT_FALSE(sourceBlock->isDetached());
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
+
+    auto const events = getEvents(kvCacheManager);
+    EXPECT_TRUE(hasCacheLevelUpdate(events, sourceHash, kSecondaryLevel, kPrimaryLevel));
+}
+
+TEST_F(KVCacheManagerTest, DisaggTransferPreparationOffloadsCachedVictimForScratch)
+{
+    auto setup = makeDisaggTransferScratchPressureSetup(/*blocksInSecondaryPool=*/2);
+    auto& kvCacheManager = *setup.kvCacheManager;
+    auto& blockManager = tensorrt_llm::testing::KvCacheManagerTestUtil::mutableBlockManager(kvCacheManager);
+
+    {
+        auto transferLease
+            = kvCacheManager.prepareBlocksForTransfer({{setup.maxAttentionWindow, {setup.sourceBlockId}}});
+        EXPECT_TRUE(transferLease.issuedOnboardCopies());
+        transferLease.syncReadyForFormat(blockManager.getBufferManager(setup.maxAttentionWindow));
+    }
+
+    EXPECT_TRUE(setup.sourceBlock->isPrimary());
+    EXPECT_FALSE(setup.victimBlock->isPrimary());
+    EXPECT_FALSE(setup.victimBlock->isDetached());
+    EXPECT_FALSE(setup.victimBlock->getUniqueTokens().empty());
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(setup.maxAttentionWindow));
+
+    auto const events = getEvents(kvCacheManager);
+    EXPECT_TRUE(hasCacheLevelUpdate(events, setup.victimHash, kPrimaryLevel, kSecondaryLevel));
+
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(1, std::nullopt)));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(2, std::nullopt)));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(3, std::nullopt)));
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 3);
+}
+
+TEST_F(KVCacheManagerTest, DisaggTransferPreparationEvictsCachedVictimForScratch)
+{
+    auto setup = makeDisaggTransferScratchPressureSetup(/*blocksInSecondaryPool=*/1);
+    auto& kvCacheManager = *setup.kvCacheManager;
+    auto& blockManager = tensorrt_llm::testing::KvCacheManagerTestUtil::mutableBlockManager(kvCacheManager);
+
+    {
+        auto transferLease
+            = kvCacheManager.prepareBlocksForTransfer({{setup.maxAttentionWindow, {setup.sourceBlockId}}});
+        EXPECT_TRUE(transferLease.issuedOnboardCopies());
+        transferLease.syncReadyForFormat(blockManager.getBufferManager(setup.maxAttentionWindow));
+    }
+
+    EXPECT_TRUE(setup.sourceBlock->isPrimary());
+    EXPECT_TRUE(setup.victimBlock->isDetached());
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(setup.maxAttentionWindow));
+
+    auto const events = getEvents(kvCacheManager);
+    EXPECT_TRUE(hasRemoveEvent(events, setup.victimHash));
+
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(1, std::nullopt)));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(2, std::nullopt)));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(3, std::nullopt)));
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), 3);
 }
 
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block
