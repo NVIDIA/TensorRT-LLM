@@ -1016,6 +1016,14 @@ class SwapABSwigluFp4Epilogue:
             static_expert_shape: Optional[Tuple[
                 int, int, int]] = None,  # [expert, intermediate, hidden]
             gate_up_clamp: Optional[float] = None,  # Swiglu style only
+            # SiTU (Kimi K3). Both None -> SwiGLU. Both set -> SiTU, and
+            # ``gate_up_clamp`` must be None (SiTU has no clamp, matching
+            # DeepGEMM's ``DG_HOST_ASSERT(not use_situ or not
+            # activation_clamp_opt.has_value())``). Baked in as codegen-time
+            # constants exactly like ``gate_up_clamp``, so they must also be
+            # part of the compiled-kernel cache key.
+        situ_beta: Optional[float] = None,
+            situ_linear_beta: Optional[float] = None,
             epi_flag_batch: Optional[Tuple[int, int]] = (
                 1, 1),  # (fc1, fc2) done-counter publish batch
     ) -> None:
@@ -1042,6 +1050,22 @@ class SwapABSwigluFp4Epilogue:
         self.sf_vec_size = sf_vec_size
         # Swiglu gate/up clamp limit; None disables clamping.
         self.gate_up_clamp = gate_up_clamp
+        # SiTU activation constants; None/None selects SwiGLU.
+        if (situ_beta is None) != (situ_linear_beta is None):
+            raise ValueError(
+                "situ_beta and situ_linear_beta must be set together, got "
+                f"{situ_beta} and {situ_linear_beta}.")
+        if situ_beta is not None:
+            if situ_beta <= 0 or situ_linear_beta <= 0:
+                raise ValueError("SiTU beta parameters must be positive, got "
+                                 f"{situ_beta} and {situ_linear_beta}.")
+            if gate_up_clamp is not None:
+                raise ValueError(
+                    "SiTU does not support gate_up_clamp (matches DeepGEMM, "
+                    "which rejects activation_clamp together with SiTU).")
+        self.situ_beta = None if situ_beta is None else float(situ_beta)
+        self.situ_linear_beta = (None if situ_linear_beta is None else
+                                 float(situ_linear_beta))
         # Done-counter publish batch granularity
         _fc1_eb, _fc2_eb = (1, 1) if epi_flag_batch is None else epi_flag_batch
         self.fc1_epi_flag_batch = max(1, min(32, int(_fc1_eb)))
@@ -1732,20 +1756,61 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                         asm_dialect=llvm.AsmDialect.AD_ATT,
                     ))
 
-            # 3) swiglu on the dequanted (and clamped) real values:
-            #    out = up * gate * sigmoid(gate)
-            ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
-            neg_g_log2e = cute.arch.mul_packed_f32x2((g0, g1), neg_log2e_pair)
-            exp_pair = (
-                cute.math.exp2(neg_g_log2e[0], fastmath=True),
-                cute.math.exp2(neg_g_log2e[1], fastmath=True),
-            )
-            one_plus_exp = cute.arch.add_packed_f32x2(exp_pair, one_pair)
-            sigmoid_pair = (
-                cute.arch.rcp_approx(one_plus_exp[0]),
-                cute.arch.rcp_approx(one_plus_exp[1]),
-            )
-            out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
+            # 3) gated activation on the dequanted (and clamped) real values.
+            #    sigmoid(x) = rcp(1 + exp2(-x * log2e)) -- shared by both cores.
+            def _sigmoid(p0, p1):
+                neg = cute.arch.mul_packed_f32x2((p0, p1), neg_log2e_pair)
+                e = (
+                    cute.math.exp2(neg[0], fastmath=True),
+                    cute.math.exp2(neg[1], fastmath=True),
+                )
+                d = cute.arch.add_packed_f32x2(e, one_pair)
+                return (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
+
+            sigmoid_pair = _sigmoid(g0, g1)
+
+            if cutlass.const_expr(self.situ_beta is None):
+                # SwiGLU: out = up * gate * sigmoid(gate)
+                ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
+                out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
+            else:
+                # SiTU (Kimi K3), matching ``kimi_k3_moe/_mlp.py::SituAndMul``
+                # (itself byte-identical to HF ``modeling_kimi.py``):
+                #     situ_gate = beta        * tanh(gate / beta) * sigmoid(gate)
+                #     situ_up   = linear_beta * tanh(up   / linear_beta)
+                #     out       = situ_gate * situ_up
+                #
+                # ``tanh(z) = 2 * sigmoid(2z) - 1`` (same identity
+                # ``blackwell/utils.py::gelu_tanh_f32`` uses) keeps the whole
+                # core on the packed f32x2 path -- there is no packed tanh, so
+                # calling one would force this loop back to scalar.
+                #
+                # beta * tanh(x/beta) = beta * (2*sigmoid(2x/beta) - 1)
+                #                     = 2*beta*sigmoid(2x/beta) - beta
+                # so the reciprocals and the 2*beta factors fold at trace time.
+                inv_2beta = cutlass.Float32(2.0 / self.situ_beta)
+                two_beta = cutlass.Float32(2.0 * self.situ_beta)
+                neg_beta = cutlass.Float32(-self.situ_beta)
+                inv_2lbeta = cutlass.Float32(2.0 / self.situ_linear_beta)
+                two_lbeta = cutlass.Float32(2.0 * self.situ_linear_beta)
+                neg_lbeta = cutlass.Float32(-self.situ_linear_beta)
+
+                gs = _sigmoid(
+                    *cute.arch.mul_packed_f32x2((g0, g1), (inv_2beta,
+                                                           inv_2beta)))
+                tanh_g = cute.arch.add_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(gs, (two_beta, two_beta)),
+                    (neg_beta, neg_beta))
+
+                us = _sigmoid(
+                    *cute.arch.mul_packed_f32x2((u0, u1), (inv_2lbeta,
+                                                           inv_2lbeta)))
+                tanh_u = cute.arch.add_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(us, (two_lbeta, two_lbeta)),
+                    (neg_lbeta, neg_lbeta))
+
+                situ_gate = cute.arch.mul_packed_f32x2(tanh_g, sigmoid_pair)
+                out_pair = cute.arch.mul_packed_f32x2(situ_gate, tanh_u)
 
             out[i] = out_pair[0]
             out[i + 1] = out_pair[1]
