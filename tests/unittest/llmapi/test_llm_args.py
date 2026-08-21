@@ -4289,3 +4289,90 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+# A Hub repo id may contain at most one "/", so a draft bundled beside its
+# target cannot be addressed as "org/repo/DFlash" and needs a subfolder.
+
+
+@pytest.mark.cpu_only
+def test_speculative_model_subfolder_reads_the_bundled_draft_config(tmp_path):
+    # The target's own config sits at the repo root and must NOT be the one
+    # read: the differing block size is what distinguishes the two.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 9, "dspark_target_layer_ids": [7, 7, 7]}')
+    draft = tmp_path / "DFlash"
+    draft.mkdir()
+    (draft / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [3, 1, 2]}')
+
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    speculative_model_subfolder="DFlash")
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.target_layer_ids == [3, 1, 2]
+
+
+@pytest.mark.cpu_only
+def test_speculative_model_subfolder_absent_still_reads_the_root(tmp_path):
+    """Control for the subfolder tests.
+
+    Without the subfolder the root config is used, so a failure above is the
+    subfolder path rather than the fixture.
+    """
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [7, 7, 7]}')
+
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.target_layer_ids == [7, 7, 7]
+
+
+@pytest.mark.cpu_only
+def test_speculative_model_subfolder_requires_a_model():
+    with pytest.raises(ValidationError, match="requires speculative_model"):
+        DSparkDecodingConfig(max_draft_len=5,
+                             speculative_model_subfolder="DFlash")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("subfolder",
+                         ["/abs/DFlash", "../DFlash", "DFlash/../../etc"])
+def test_speculative_model_subfolder_rejects_paths_escaping_the_model(
+        subfolder, tmp_path):
+    with pytest.raises(ValidationError, match="must be a relative path"):
+        DSparkDecodingConfig(max_draft_len=5,
+                             speculative_model=str(tmp_path),
+                             speculative_model_subfolder=subfolder)
+
+
+@pytest.mark.cpu_only
+def test_speculative_model_subfolder_normalises_the_dot_slash_form(tmp_path):
+    # generation_config.json writes "./DFlash"; the Hub needs "DFlash" as an
+    # allow_patterns prefix.
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    speculative_model_subfolder="./DFlash")
+
+    assert spec_cfg.speculative_model_subfolder == "DFlash"
+
+
+@pytest.mark.cpu_only
+def test_model_wrapper_model_dir_appends_the_subfolder(tmp_path):
+    wrapper = llm_args_mod._ModelWrapper(tmp_path, subfolder="DFlash")
+    assert wrapper.model_dir == tmp_path / "DFlash"
+
+    assert llm_args_mod._ModelWrapper(tmp_path).model_dir == tmp_path

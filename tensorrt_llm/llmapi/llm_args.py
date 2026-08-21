@@ -1782,6 +1782,18 @@ class DecodingBaseConfig(StrictBaseModel):
         "draft model, depending on the target model implementation. Pointing it at the target checkpoint uses the "
         "target's embedded mtp.* weights.")
 
+    speculative_model_subfolder: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("speculative_model_subfolder",
+                                      "speculative_model_dir_subfolder"),
+        description=
+        "Optional sub-path inside speculative_model that holds the draft, for drafts bundled beside their "
+        "target model rather than published as a standalone repo. Works for both forms of speculative_model. "
+        "The Hub has no single-string form for this: a repo id may contain at most one '/', so "
+        "'org/repo/subdir' is not a valid id and must be given as repo id + subfolder.",
+        status="prototype",
+    )
+
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
         description=
@@ -1931,6 +1943,25 @@ class DecodingBaseConfig(StrictBaseModel):
                                                    None) is not None:
             if "use_rejection_sampling" not in self.model_fields_set:
                 self.use_rejection_sampling = False
+        return self
+
+    @model_validator(mode='after')
+    def validate_speculative_model_subfolder(self) -> 'DecodingBaseConfig':
+        subfolder = self.speculative_model_subfolder
+        if subfolder is None:
+            return self
+        if self.speculative_model is None:
+            raise ValueError(
+                "speculative_model_subfolder requires speculative_model to be "
+                "set; it names a path inside that repo or directory.")
+        sub_path = Path(subfolder)
+        if sub_path.is_absolute() or ".." in sub_path.parts:
+            raise ValueError(
+                "speculative_model_subfolder must be a relative path inside "
+                f"the model, got {subfolder!r}.")
+        # Normalise the "./DFlash" form that generation_config.json uses to
+        # "DFlash", so it is a valid Hub allow_patterns prefix.
+        self.speculative_model_subfolder = sub_path.as_posix()
         return self
 
     @model_validator(mode='before')
@@ -4375,6 +4406,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
 @dataclass
 class _ModelWrapper:
     model: Union[str, Path]
+    subfolder: Optional[str] = None
 
     def __post_init__(self):
         if not self.model:
@@ -4398,6 +4430,8 @@ class _ModelWrapper:
     @property
     def model_dir(self) -> Path:
         assert self.is_local_model, f"model_dir is only available for local model, {self.model}."
+        if self.subfolder:
+            return self.model / self.subfolder
         return self.model
 
     @model_dir.setter
@@ -5918,9 +5952,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 needs_mask_token_id = self.speculative_config.mask_token_id is None
                 if (needs_target_layer_ids or needs_mask_token_id
                     ) and self.speculative_config.speculative_model is not None:
+                    # This runs before CachedModelLoader folds the subfolder
+                    # in, so join it here too. Otherwise a bundled draft reads
+                    # the target's config.json from the repo root.
                     draft_config_path = os.path.join(
                         self.speculative_config.speculative_model,
-                        "config.json")
+                        self.speculative_config.speculative_model_subfolder
+                        or "", "config.json")
                     if os.path.exists(draft_config_path):
                         with open(draft_config_path) as f:
                             draft_cfg = json.load(f)
@@ -5955,8 +5993,9 @@ class TorchLlmArgs(BaseLlmArgs):
                 # DSpark ships these as top-level ``dspark_*`` keys in the
                 # DeepSeek-V4-Pro config.json; also accept a nested
                 # ``dspark_config`` dict for forward compatibility.
-                draft_config_path = os.path.join(spec_cfg.speculative_model,
-                                                 "config.json")
+                draft_config_path = os.path.join(
+                    spec_cfg.speculative_model,
+                    spec_cfg.speculative_model_subfolder or "", "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)

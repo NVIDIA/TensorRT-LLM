@@ -28,6 +28,9 @@ methods:
       speculative_model:
         annotation: Union[str, pathlib.Path, NoneType]
         default: null
+      speculative_model_subfolder:
+        annotation: str
+        default: null
       use_rejection_sampling:
         annotation: bool
         default: false
