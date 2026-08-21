@@ -42,6 +42,7 @@ namespace
 
 using U64Array = nb::ndarray<std::uint64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using U32Array = nb::ndarray<std::uint32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+using U8Array = nb::ndarray<std::uint8_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 } // namespace
 
@@ -116,6 +117,7 @@ void initBounceV2Bindings(nb::module_& m, nb::class_<kvc::NixlTransferAgent, kvc
             // The pool registers its events with the poller; the poller must outlive the pool.
             nb::keep_alive<1, 5>(), nb::call_guard<nb::gil_scoped_release>())
         .def_ro_static("BUSY", &BatchedCopyPool::kBusy)
+        .def_ro_static("SCATTER_REJECTED", &BatchedCopyPool::kScatterRejected)
         .def_prop_ro("max_plan_entries", &BatchedCopyPool::maxPlanEntries)
         .def_prop_ro("num_streams", &BatchedCopyPool::size)
         .def("free_count", &BatchedCopyPool::freeCount)
@@ -152,7 +154,28 @@ void initBounceV2Bindings(nb::module_& m, nb::class_<kvc::NixlTransferAgent, kvc
             "registration (never loses the reserve race to the poll thread, unlike a separate "
             "reserve_chain call). Returns (copy_id, reserved_id); (BUSY, -1) when no stream context "
             "is free, and reserved_id -1 when the poller is already shut down (the copy_id then "
-            "resolves classically).");
+            "resolves classically).")
+        .def(
+            "submit_scatter_runs",
+            [](BatchedCopyPool& self, std::uint64_t regionBase, std::uint64_t regionBytes, U8Array runs)
+            {
+                std::size_t const nbytes = runs.shape(0);
+                if (nbytes % sizeof(ScatterRunWire) != 0)
+                {
+                    throw std::invalid_argument(
+                        "submit_scatter_runs: runs blob length must be a multiple of the 36-byte wire run");
+                }
+                return self.submitScatterRuns(regionBase, regionBytes,
+                    reinterpret_cast<ScatterRunWire const*>(runs.data()), nbytes / sizeof(ScatterRunWire));
+            },
+            nb::arg("region_base"), nb::arg("region_bytes"), nb::arg("runs"), nb::call_guard<nb::gil_scoped_release>(),
+            "Receiver-side scatter of one DATA chunk in ONE call: validate the RAW wire runs (`runs` "
+            "is the DATA payload viewed as a uint8 array — n*36-byte packed SCATTER_RUN_DTYPE "
+            "records) against the granted region [region_base, region_base + region_bytes), expand "
+            "them to per-piece copies, and launch as one batched kernel. The caller must have "
+            "verified the region lies inside the registered arena. Returns the poller completion id, "
+            "BUSY (-1) when no stream context is free (retry later), or SCATTER_REJECTED (-2) when "
+            "validation failed — the caller must NOT ack the chunk but should release the region.");
 
     // ---- FabricArena (wraps BounceArena) -------------------------------------------------------
     nb::class_<BounceArena>(m, "FabricArena",

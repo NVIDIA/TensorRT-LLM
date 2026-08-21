@@ -30,18 +30,38 @@ hybrid design (PYTHON_BOUNCE_DESIGN.en.md Sections 2, 5.1-5.5):
 
 THREADING CONTRACT (every cross-thread interaction):
   - ``submit()`` runs on any caller thread: plan build (numpy, no shared
-    state), request creation + eager pump under ``_req_mu``, WANT send under
-    the channel lock. ``CreditScheduler`` is internally locked;
+    state), request creation under ``_req_mu`` (BEFORE the WANT goes out, so
+    a fast GRANT always finds the request), WANT send under the channel
+    lock, then the eager pump. ``CreditScheduler`` is internally locked;
     ``BatchedCopyPool.submit_copy`` is thread-safe;
     ``NixlTransferAgent.post_transfer_1to1`` (and the two-phase chain's
-    ``fulfill_chain_1to1``, whose gather-already-done flavor posts INLINE on
-    the calling thread) runs on the reactor thread AND on submit threads (a
-    racing GRANT parks credits, then the submitter's eager pump attaches
-    them: _pump_locked -> _post_write_locked / _fulfill_chain_locked) — every
-    such call site holds ``_req_mu``, which serializes the posts.
-  - ``_req_mu`` guards the sender request table AND ``_completions`` (the
-    completion-id routing map): both are touched by submit threads (eager
-    pump registers gather ids) and the reactor.
+    ``fulfill_chain_1to1``) runs on the reactor thread AND on submit threads.
+  - NO C++ BINDING CALL EVER RUNS WHILE ``_req_mu`` IS HELD (anti-convoy
+    rule): the bound calls release the GIL and take tens to hundreds of
+    microseconds, so holding the request lock across one turned every other
+    submit/handler into a lock+GIL convoy (measured multi-ms submit() stalls
+    under concurrent load). Every sender-side C++ transition (gather launch,
+    chain reserve/fulfill/arm/cancel, RDMA post) follows DECIDE (mutate
+    state under ``_req_mu``) -> EXECUTE (C++ call, lock dropped) -> RECORD
+    (re-acquire, register routes / finish the transition). Per request the
+    transitions are serialized by a SINGLE-OWNER PUMP
+    (``_Request.pump_busy``): whoever pumps owns all of that request's C++
+    transitions until the pump drains; concurrent pumpers set ``pump_again``
+    and leave, and handlers (_on_gather_done / _on_xfer_done / _on_grant)
+    only mutate state and re-trigger the pump. The chunk that is mid-EXECUTE
+    is marked ``_Posted.busy_op``, so the failure path never recycles a
+    staging region that the in-flight call may still hand to the kernel/NIC
+    (see ``_fail_request`` for the per-busy_op contract).
+  - ``_req_mu`` guards the sender request table, ``_completions`` (the
+    completion-id routing map) and ``_unrouted`` (completion parking): with
+    C++ calls outside the lock, a completion row can be drained BEFORE the
+    launching thread re-acquires ``_req_mu`` to register its route. Such
+    rows PARK in ``_unrouted`` (bounded, timestamped); route registration
+    checks the parking dict first and dispatches a parked row inline (after
+    releasing the lock), so no completion is ever lost to the race. Rows
+    that never find a route age out after ``_UNROUTED_MAX_AGE_S`` with a
+    warning — they can only belong to already-failed/cancelled requests
+    whose cleanup consumed their region through another path.
   - ALL receiver-role state (``_scattering``, ``_rx_flows``,
     ``_scatter_backlog``, ``_ack_batch``) is reactor-thread-only — the
     single-owner invariant of design Section 5.2. Cross-thread requests that
@@ -153,6 +173,24 @@ _KIND_XFER = 1
 _FULFILL_DECLINED = 0
 _FULFILL_POSTED = 2
 _CANCEL_REVERTED = 1
+#: BatchedCopyPool.submit_scatter_runs validation-failure code (mirrors the
+#: binding's SCATTER_REJECTED; hardcoded for the same importability reason).
+_SCATTER_REJECTED = -2
+#: Unrouted-completion parking (see the module THREADING CONTRACT): rows
+#: older than this can only belong to already-failed requests -> dropped
+#: with a warning. Generous — the registration race it covers is closed in
+#: microseconds.
+_UNROUTED_MAX_AGE_S = 60.0
+#: Hard bound on parked rows (defense against a routing bug flooding the
+#: dict); beyond it the oldest row is dropped with a warning.
+_UNROUTED_MAX = 4096
+#: Pump execute-phase results (see _pump): CONTINUE keeps sweeping; STOP ends
+#: the run after real progress (a failure counts as progress); STOP_IDLE ends
+#: it with NO progress (copy pool BUSY — the decided launch was undone, and
+#: reporting work would busy-spin the reactor loop while the pool is full).
+_PUMP_CONTINUE = 0
+_PUMP_STOP = 1
+_PUMP_STOP_IDLE = 2
 #: Runtime stats log cadence (one INFO line; only when counters changed).
 _STATS_LOG_S = 30.0
 
@@ -185,7 +223,22 @@ class _PostState(Enum):
 
 @dataclass
 class _Posted:
-    """One in-flight chunk of a sender request."""
+    """One in-flight chunk of a sender request.
+
+    INTERMEDIATE (mid-C++-call) states, marked by ``busy_op`` (only the
+    request's single pump owner sets/clears it; every mutation under
+    ``_req_mu``):
+      - "launch":  ``state == GATHERING`` and ``copy_id == -1`` — the gather
+        submit is in flight on the pump thread; no completion id exists yet.
+      - "fulfill": ``state == GATHERING``, ``reserved`` — fulfill_chain_1to1
+        in flight; the chunk's one completion id is already ``xfer_id``.
+      - "arm":     ``state == GATHERING``, not reserved — the one-shot arm is
+        in flight; the gather route (``copy_id``) is still registered.
+      - "post":    ``state == GATHERED`` and ``xfer_id == -1`` — the classic
+        POSTING intermediate: post_transfer_1to1 in flight; the NIC may
+        receive the staging region at any moment, so the failure path must
+        NOT recycle it (it defers to the pump's record phase instead).
+    """
 
     chunk_idx: int
     local_offset: int
@@ -202,6 +255,16 @@ class _Posted:
     #: own completion is consumed in C++). While GATHERING it awaits its
     #: fulfill; a request failing before then must cancel the reservation.
     reserved: bool = False
+    #: The C++ call currently in flight for this chunk (None when idle); see
+    #: the class docstring. Guards the failure path against recycling a
+    #: region the in-flight call may still hand to the kernel/NIC.
+    busy_op: Optional[str] = None
+    #: Two-phase chain: fulfill_chain_1to1 was issued (exactly-once latch —
+    #: a DECLINED fulfill leaves the chunk GATHERING, waiting for the already
+    #: published/pending terminal row; it must never be fulfilled again).
+    fulfilled: bool = False
+    #: One-shot chain: the arm was attempted (win or lose) — never retried.
+    arm_attempted: bool = False
 
 
 @dataclass
@@ -219,20 +282,35 @@ class _Request:
     acked: int = 0
     last_progress: float = 0.0
     abandon_reason: str = ""
+    #: Single-owner pump (see the module THREADING CONTRACT): True while some
+    #: thread is inside ``_pump`` for this request; ``pump_again`` asks the
+    #: owner for one more decide sweep before it exits.
+    pump_busy: bool = False
+    pump_again: bool = False
 
 
 @dataclass
 class _ScatterJob:
-    """Receiver-side prepared scatter (run-expanded copy arrays)."""
+    """Receiver-side scatter of one DATA chunk.
+
+    Two flavors, by mechanism capability: with the compiled pool's
+    ``submit_scatter_runs`` the job carries the RAW wire runs (``runs`` set;
+    validation + run expansion + plan fill happen in ONE C++ call); the
+    pure-Python fallback carries the pre-expanded per-piece copy arrays
+    (``srcs``/``dsts``/``sizes`` set).
+    """
 
     key: str
     peer: str
     rid: int
     chunk_idx: int
     offset: int  # arena region offset (the DATA region handle)
-    srcs: np.ndarray  # [n] uint64 absolute source addresses inside the region
-    dsts: np.ndarray  # [n] uint64 final KV destination addresses
-    sizes: np.ndarray  # [n] uint32
+    srcs: Optional[np.ndarray] = None  # [n] u64 absolute source addrs in the region
+    dsts: Optional[np.ndarray] = None  # [n] u64 final KV destination addresses
+    sizes: Optional[np.ndarray] = None  # [n] u32
+    runs: Optional[np.ndarray] = None  # [m] SCATTER_RUN_DTYPE raw wire runs
+    region_base: int = 0  # absolute device address of the granted region
+    region_bytes: int = 0  # granted (buddy-block) region length
 
 
 def _resolve(future: "Future[BounceResult]", result: BounceResult) -> None:
@@ -281,6 +359,13 @@ class BounceReactor:
         self._poller = poller
         self._set_device = set_device_fn
         self._max_chunk = config.max_chunk_size_bytes
+        # Receiver-side C++ scatter sink (per-instance capability detection,
+        # like submit_copy_chained): one bound call validates the raw wire
+        # runs, expands them and launches the scatter — replacing the
+        # per-chunk numpy expansion that dominated the Python _on_data cost.
+        # Absent (old binding / fake pool) -> the pure-Python path below.
+        self._submit_scatter_fn = getattr(copy_pool, "submit_scatter_runs", None)
+        self._pool_rejected = int(getattr(copy_pool, "SCATTER_REJECTED", _SCATTER_REJECTED))
         self._max_descs_per_chunk = min(
             self._max_plan_entries, max(1024, config.max_chunk_size_bytes // 256)
         )
@@ -368,6 +453,14 @@ class BounceReactor:
                     f"bounce_v2({self_name}): completion wakeup fd setup failed ({e}); "
                     f"keeping the legacy 1 ms reactor tick"
                 )
+                if rfd is not None:
+                    # set_wakeup_fd may have failed AFTER the zmq register:
+                    # drop the registration before closing so the poller can
+                    # never poll a closed fd.
+                    try:
+                        self._zpoller.unregister(rfd)
+                    except KeyError:
+                        pass
                 for fd in {rfd, wfd} - {None}:
                     try:
                         os.close(fd)
@@ -388,6 +481,10 @@ class BounceReactor:
         #   ("orphan_gather", local_offset)    failed request, gather still running
         #   ("orphan_xfer", local_offset, rid) failed request, write still in flight
         self._completions: dict[int, tuple] = {}
+        # Unrouted-completion parking: cid -> (monotonic time, kind, ok) for
+        # rows drained before their route was registered (see the module
+        # THREADING CONTRACT). Guarded by _req_mu like _completions.
+        self._unrouted: dict[int, tuple[float, int, int]] = {}
         # rid -> in-flight orphan write count; a deferred cancel for the rid
         # is sent once this reaches zero (mirrors mPendingCancel).
         self._orphan_writes: dict[int, int] = {}
@@ -578,16 +675,24 @@ class BounceReactor:
                 future=future,
                 last_progress=time.monotonic(),
             )
+            if self._cfg.enable_eager_gather:
+                # PRE-OWN the pump in the same critical section that
+                # registers the request: the eager gathers are GUARANTEED to
+                # launch on THIS (the caller's) thread — perf-critical, they
+                # overlap the WANT->GRANT round-trip with the gather kernel.
+                # Without this, the reactor tick (or a fast GRANT) could win
+                # the pump between the registration and the caller's pump
+                # call and launch them on the reactor instead.
+                req.pump_busy = True
             self._requests[rid] = req
         # WANT carries our endpoint so the receiver self-bootstraps the
-        # reverse route (sent outside _req_mu, like the C++).
+        # reverse route (sent outside _req_mu, like the C++). ORDERING: the
+        # request is already in _requests (above), so the earliest possible
+        # GRANT always finds it (and hands its credits to our pre-owned pump
+        # via pump_again).
         self._send_to(peer, encode_want(rid, chunk_bytes, self._endpoint))
         if self._cfg.enable_eager_gather:
-            with self._req_mu:
-                # A racing GRANT may already have pumped (or failed) the request.
-                cur = self._requests.get(rid)
-                if cur is not None:
-                    self._pump_locked(rid, cur)
+            self._pump_loop(rid, req)
         return future
 
     def shutdown(self) -> None:
@@ -661,6 +766,7 @@ class BounceReactor:
                 did_work |= self._drain_completions()
                 did_work |= self._drain_pending_posts()
                 did_work |= self._retry_scatter_backlog()
+                self._reap_unrouted()
                 self._check_sender_timeouts()
                 self._check_receiver_lease()
                 self._flush_acks()
@@ -775,22 +881,80 @@ class BounceReactor:
         if rows.shape[0] == 0:
             return False
         for cid, kind, ok in rows.tolist():
+            cid, kind, ok = int(cid), int(kind), int(ok)
             with self._req_mu:
                 route = self._completions.pop(cid, None)
-            if route is None:
-                continue  # e.g. a completion for an already-failed request
-            tag = route[0]
-            if tag == "gather":
-                self._on_gather_done(route[1], cid, bool(ok))
-            elif tag == "xfer":
-                self._on_xfer_done(route[1], cid, bool(ok), int(kind))
-            elif tag == "scatter":
-                self._finish_scatter(route[1], bool(ok))
-            elif tag == "orphan_gather":
-                self._send_grants(self._sched.release_local(route[1]))
-            elif tag == "orphan_xfer":
-                self._on_orphan_xfer_done(route[1], route[2])
+                if route is None:
+                    # No route YET (a launching thread has not re-acquired
+                    # _req_mu to register it — the anti-convoy restructure
+                    # allows this ordering): PARK the row; registration
+                    # checks the parking dict and dispatches it inline. Rows
+                    # of already-failed requests age out with a warning.
+                    self._park_unrouted_locked(cid, kind, ok)
+                    continue
+            self._dispatch_row(route, cid, kind, bool(ok))
         return True
+
+    def _dispatch_row(self, route: tuple, cid: int, kind: int, ok: bool) -> None:
+        """Deliver one drained/parked completion row to its routed handler.
+        Never called with ``_req_mu`` held (handlers take it)."""
+        tag = route[0]
+        if tag == "gather":
+            self._on_gather_done(route[1], cid, ok)
+        elif tag == "xfer":
+            self._on_xfer_done(route[1], cid, ok, kind)
+        elif tag == "scatter":
+            # Receiver state is reactor-thread-only; scatter routes are only
+            # ever registered from the reactor thread, so this dispatch (and
+            # any parked-row inline dispatch at that registration) runs there.
+            self._finish_scatter(route[1], ok)
+        elif tag == "orphan_gather":
+            self._send_grants(self._sched.release_local(route[1]))
+        elif tag == "orphan_xfer":
+            self._on_orphan_xfer_done(route[1], route[2])
+
+    def _repark_row(self, cid: int, kind: int, ok: int) -> None:
+        """A dispatched row found its request already gone (it raced a
+        concurrent failure between the drain's route pop and the handler):
+        give it back — the failure cleanup may have re-registered an orphan
+        route for it (dispatch now), or will look in the parking dict."""
+        with self._req_mu:
+            route = self._completions.pop(cid, None)
+            if route is None:
+                self._park_unrouted_locked(cid, kind, ok)
+                return
+        self._dispatch_row(route, cid, kind, bool(ok))
+
+    def _park_unrouted_locked(self, cid: int, kind: int, ok: int) -> None:
+        """Park an unrouted row (bounded). _req_mu held."""
+        if len(self._unrouted) >= _UNROUTED_MAX:
+            oldest = min(self._unrouted, key=lambda c: self._unrouted[c][0])
+            del self._unrouted[oldest]
+            logger.warning(
+                f"bounce_v2({self._self_name}): unrouted-completion parking full "
+                f"({_UNROUTED_MAX}); dropped oldest row id={oldest}"
+            )
+        self._unrouted[cid] = (time.monotonic(), kind, ok)
+
+    def _reap_unrouted(self) -> None:
+        """Age out parked rows nothing ever claimed. They can only belong to
+        already-failed/cancelled requests whose cleanup recycled the region
+        through another path (e.g. a row consumed mid-dispatch was treated as
+        terminal), so dropping them leaks nothing."""
+        if not self._unrouted:
+            return
+        now = time.monotonic()
+        with self._req_mu:
+            expired = [
+                cid for cid, (t, _k, _ok) in self._unrouted.items() if now - t > _UNROUTED_MAX_AGE_S
+            ]
+            for cid in expired:
+                del self._unrouted[cid]
+        if expired:
+            logger.warning(
+                f"bounce_v2({self._self_name}): dropped {len(expired)} unrouted completion "
+                f"row(s) older than {_UNROUTED_MAX_AGE_S:.0f}s (failed/cancelled requests)"
+            )
 
     # ------------------------------------------------------------------ #
     # sender role
@@ -798,11 +962,13 @@ class BounceReactor:
 
     def _attach_credits_locked(self, rid: int, req: _Request) -> None:
         """Pair parked credits with already-posted (eager) chunks, strictly
-        FIFO. Validates the mispair guard: a credit smaller than its chunk
-        would make the RDMA write overflow into an adjacent flow's region on
-        the peer -> the request FAILS IMMEDIATELY (via _fail_request_locked;
-        the timeout sweep alone would never resolve it when
-        request_timeout_ms <= 0 — the R5 guarantee)."""
+        FIFO. PURE STATE (no C++ calls — anti-convoy rule): the resulting
+        fulfill/arm/post actions are picked up by the pump's decide sweep.
+        Validates the mispair guard: a credit smaller than its chunk would
+        make the RDMA write overflow into an adjacent flow's region on the
+        peer -> the abandon latch is set and the pump FAILS the request
+        immediately (the timeout sweep alone would never resolve it when
+        request_timeout_ms <= 0 — the R5 guarantee). _req_mu held."""
         while req.pending_credits and req.next_credit < req.next_post:
             credit = req.pending_credits[0]
             target = next((p for p in req.posted if p.chunk_idx == req.next_credit), None)
@@ -823,7 +989,6 @@ class BounceReactor:
                 )
                 req.abandon_reason = FAIL_PROTOCOL
                 req.pending_credits.clear()
-                self._fail_request_locked(rid, req, FAIL_PROTOCOL)
                 return
             target.remote_handle = credit.region_handle
             target.remote_addr = credit.addr
@@ -834,32 +999,21 @@ class BounceReactor:
             req.pending_credits.popleft()
             req.next_credit += 1
             req.last_progress = time.monotonic()
-            if target.state == _PostState.GATHERING:
-                if target.reserved:
-                    # Two-phase chain: the reservation was taken at gather
-                    # launch, so the credit completes it regardless of whether
-                    # the gather already finished (the arm race is gone).
-                    self._fulfill_chain_locked(rid, req, target)
-                else:
-                    # Eager chunk still gathering: with the C++ chain enabled
-                    # the credit lets us arm the gather->post chain right now;
-                    # losing the race to the gather's own completion is fine —
-                    # the classic path then posts from _on_gather_done.
-                    self._arm_chain_locked(rid, req, target)
-            elif target.state == _PostState.GATHERED:
-                # Eagerly-gathered chunk was only waiting for its credit.
-                if self._chain_fn is not None and self._reserve_fn is None:
-                    # One-shot arm mode: the gather completed BEFORE its
-                    # credit, so the arm race was lost before an arm could
-                    # even be attempted. Count it here so tx_chain_arm_race
-                    # is ordering-independent (exactly one bump per chunk the
-                    # chain could not take, whether the credit found the
-                    # chunk GATHERING — attempt refused in C++ — or already
-                    # GATHERED like now).
-                    self._bump("tx_chain_arm_race")
-                self._post_write_locked(rid, req, target)
-                if req.abandon_reason:
-                    return
+            if (
+                target.state == _PostState.GATHERED
+                and self._chain_fn is not None
+                and self._reserve_fn is None
+                and not target.arm_attempted
+            ):
+                # One-shot arm mode: the gather completed BEFORE its credit,
+                # so the arm race was lost before an arm could even be
+                # attempted. Count it here (and latch arm_attempted) so
+                # tx_chain_arm_race is ordering-independent: exactly one bump
+                # per chunk the chain could not take, whether the credit
+                # found the chunk GATHERING (attempt refused in C++) or
+                # already GATHERED like now.
+                target.arm_attempted = True
+                self._bump("tx_chain_arm_race")
         if req.next_credit >= req.num_chunks and req.pending_credits:
             logger.warning(
                 f"bounce_v2({self._self_name}): rid={rid} over-grant, dropping "
@@ -867,175 +1021,324 @@ class BounceReactor:
             )
             req.pending_credits.clear()
 
-    def _pump_locked(self, rid: int, req: _Request) -> None:
-        """Advance the request: attach credits, then launch gathers for as
-        many chunks as credits/eager-budget/copy-streams allow. _req_mu held."""
-        self._attach_credits_locked(rid, req)
-        if req.abandon_reason:
-            return
-        grants: list[Grant] = []
-        while req.next_post < req.num_chunks:
-            chunk_idx = req.next_post
-            chunk = req.plan.chunks[chunk_idx]
-            have_credit = bool(req.pending_credits)
-            if not have_credit:
-                if not self._cfg.enable_eager_gather:
-                    break  # classic path: gather starts only once granted
-                if len(req.posted) >= self._cfg.max_inflight_chunks_per_request:
-                    break  # eager gathers capped by the in-flight window
-            if have_credit and chunk.packed_bytes > req.pending_credits[0].length:
-                logger.warning(
-                    f"bounce_v2({self._self_name}): rid={rid} chunk={chunk_idx} "
-                    f"packed_bytes={chunk.packed_bytes} > granted region "
-                    f"len={req.pending_credits[0].length} (GRANT mispair/reorder); abandoning flow"
+    # ------------------------------------------------------------------ #
+    # sender pump: DECIDE (locked) -> EXECUTE (C++, unlocked) -> RECORD
+    # (locked). Single owner per request; see the module THREADING CONTRACT.
+    # ------------------------------------------------------------------ #
+
+    def _pump(self, rid: int) -> bool:
+        """Advance a request: attach credits, then run every ready C++
+        transition (gather launches, chain fulfills/arms, classic posts) with
+        ``_req_mu`` DROPPED around each bound call. Any thread; returns True
+        if anything advanced. Concurrent callers hand the work to the current
+        owner via ``pump_again``."""
+        with self._req_mu:
+            req = self._requests.get(rid)
+            if req is None:
+                return False
+            if req.pump_busy:
+                req.pump_again = True
+                return False
+            req.pump_busy = True
+        return self._pump_loop(rid, req)
+
+    def _pump_loop(self, rid: int, req: _Request) -> bool:
+        """The pump body; the caller has already taken ownership
+        (``req.pump_busy`` True) — either via :meth:`_pump` or pre-owned at
+        request registration (``submit``'s eager-gather guarantee)."""
+        did_work = False
+        try:
+            while True:
+                action = None
+                fail_reason = None
+                with self._req_mu:
+                    if self._requests.get(rid) is not req:
+                        break  # failed/completed while we were executing
+                    self._attach_credits_locked(rid, req)
+                    if not req.abandon_reason:
+                        action = self._next_action_locked(rid, req)
+                    if req.abandon_reason:
+                        fail_reason = req.abandon_reason
+                        action = None
+                if fail_reason is not None:
+                    self._fail_request(rid, req, fail_reason)
+                    did_work = True
+                    break
+                if action is None:
+                    with self._req_mu:
+                        if self._requests.get(rid) is req and req.pump_again:
+                            req.pump_again = False
+                            continue
+                        # Release ownership ATOMICALLY with the pump_again
+                        # check: a handler that hands over work after this
+                        # point sees pump_busy False and becomes the owner
+                        # itself — clearing in a separate critical section
+                        # (the finally alone) would drop that wakeup, and a
+                        # GATHERED+credited chunk awaiting its post has no
+                        # other retry path (_drain_pending_posts only rescans
+                        # requests with parked credits / unlaunched chunks).
+                        req.pump_busy = False
+                        break
+                try:
+                    rc = self._execute_action(rid, req, action)
+                except BaseException:
+                    # Defense in depth: an exception escaping an executor
+                    # (each already catches the expected launch errors) must
+                    # not leave the chunk marked busy forever — the failure
+                    # path SKIPS busy chunks, expecting a record phase that
+                    # would now never run, silently wedging the region.
+                    with self._req_mu:
+                        action[1].busy_op = None
+                    raise
+                if rc != _PUMP_STOP_IDLE:
+                    # A BUSY copy pool undoes the decided launch with no net
+                    # progress: reporting it as work would make the reactor
+                    # loop skip its poll sleep and spin while the pool is
+                    # saturated (its retry is capacity-driven, one tick away).
+                    did_work = True
+                if rc != _PUMP_CONTINUE:
+                    break  # copy pool BUSY / request failed
+        finally:
+            # Idempotent (the idle exit above cleared it atomically with its
+            # pump_again check): this is the exception backstop. pump_again is
+            # deliberately NOT consumed here — with pump_busy False the next
+            # _pump (handler or the per-tick _drain_pending_posts) owns the
+            # sweep and clears it.
+            with self._req_mu:
+                req.pump_busy = False
+        return did_work
+
+    def _next_action_locked(self, rid: int, req: _Request) -> Optional[tuple]:
+        """Pick (and mark, via ``busy_op``) the next C++ transition. _req_mu
+        held; PURE STATE. Chunk transitions first (FIFO over ``posted``),
+        then a new gather launch. Only the pump owner calls this, so no chunk
+        can already be busy here."""
+        for p in req.posted:
+            if p.state == _PostState.GATHERING and p.has_credit and p.copy_id >= 0:
+                if p.reserved and not p.fulfilled:
+                    # Two-phase chain: the credit completes the reservation
+                    # regardless of whether the gather already finished.
+                    p.fulfilled = True
+                    p.busy_op = "fulfill"
+                    return ("fulfill", p)
+                if not p.reserved and self._chain_fn is not None and not p.arm_attempted:
+                    # One-shot arm: losing the race to the gather's own
+                    # completion is fine — the classic path then posts once
+                    # the chunk goes GATHERED.
+                    p.arm_attempted = True
+                    p.busy_op = "arm"
+                    return ("arm", p)
+            elif p.state == _PostState.GATHERED and p.has_credit and p.xfer_id < 0:
+                p.busy_op = "post"
+                return ("post", p)
+        if req.next_post >= req.num_chunks:
+            return None
+        chunk_idx = req.next_post
+        chunk = req.plan.chunks[chunk_idx]
+        have_credit = bool(req.pending_credits)
+        if not have_credit:
+            if not self._cfg.enable_eager_gather:
+                return None  # classic path: gather starts only once granted
+            if len(req.posted) >= self._cfg.max_inflight_chunks_per_request:
+                return None  # eager gathers capped by the in-flight window
+        if have_credit and chunk.packed_bytes > req.pending_credits[0].length:
+            logger.warning(
+                f"bounce_v2({self._self_name}): rid={rid} chunk={chunk_idx} "
+                f"packed_bytes={chunk.packed_bytes} > granted region "
+                f"len={req.pending_credits[0].length} (GRANT mispair/reorder); abandoning flow"
+            )
+            req.abandon_reason = FAIL_PROTOCOL
+            req.pending_credits.clear()
+            return None
+        # Non-blocking staging: no region right now -> park; the reactor's
+        # drain_pending_posts retries once an ACK frees space. Never blocks,
+        # so oversubscription degrades to backpressure, not deadlock.
+        local_off = self._sched.acquire_local(chunk.packed_bytes, eager=not have_credit)
+        if local_off is None:
+            return None
+        posted = _Posted(
+            chunk_idx=chunk_idx,
+            local_offset=local_off,
+            write_bytes=chunk.packed_bytes,
+            busy_op="launch",
+        )
+        credit = None
+        if have_credit:
+            credit = req.pending_credits.popleft()
+            req.next_credit += 1
+            posted.has_credit = True
+            posted.remote_handle = credit.region_handle
+            posted.remote_addr = credit.addr
+            posted.remote_dev = credit.dev_id
+        req.posted.append(posted)
+        req.next_post += 1
+        return ("launch", posted, chunk, credit)
+
+    def _execute_action(self, rid: int, req: _Request, action: tuple) -> int:
+        """Run one decided transition (C++ outside ``_req_mu``) and record
+        it. Returns a ``_PUMP_*`` code (STOP_IDLE only for a BUSY pool)."""
+        kind = action[0]
+        if kind == "launch":
+            return self._exec_launch(rid, req, action[1], action[2], action[3])
+        if kind == "fulfill":
+            return self._exec_fulfill(rid, req, action[1])
+        if kind == "arm":
+            return self._exec_arm(rid, req, action[1])
+        return self._exec_post(rid, req, action[1])
+
+    def _register_route_locked(self, cid: int, route: tuple) -> list[tuple]:
+        """Register a completion route, honoring the parking dict: a row that
+        was drained before this registration is returned as a dispatch tuple
+        ``(cid, route, kind, ok)`` — the caller MUST dispatch it after
+        releasing ``_req_mu``. _req_mu held."""
+        parked = self._unrouted.pop(cid, None)
+        if parked is None:
+            self._completions[cid] = route
+            return []
+        _, kind, ok = parked
+        return [(cid, route, kind, ok)]
+
+    def _orphan_route_locked(self, cid: int, route: tuple) -> tuple[bool, list[tuple]]:
+        """Point an id at an orphan route during failure cleanup. Returns
+        ``(row_pending, dispatches)``: row_pending False means the id's row
+        was ALREADY consumed (drained and dispatched, or mid-dispatch) — the
+        target is terminal and the caller must recycle the region itself.
+        _req_mu held."""
+        if cid in self._completions:
+            self._completions[cid] = route
+            return True, []
+        parked = self._unrouted.pop(cid, None)
+        if parked is not None:
+            _, kind, ok = parked
+            return True, [(cid, route, kind, ok)]
+        return False, []
+
+    def _remove_launch_locked(self, req: _Request, posted: _Posted, credit) -> None:
+        """Undo a decided launch whose submit did not stick (pool BUSY or a
+        launch error): the chunk is the newest posted entry (only the pump
+        appends), so next_post rolls back cleanly; a credit taken for it goes
+        back to the head of the queue. _req_mu held."""
+        req.posted.remove(posted)
+        req.next_post -= 1
+        if credit is not None:
+            req.pending_credits.appendleft(credit)
+            req.next_credit -= 1
+
+    def _exec_launch(self, rid: int, req: _Request, posted: _Posted, chunk, credit) -> int:
+        """EXECUTE+RECORD of a gather launch (and its atomic/two-phase chain
+        reservation). The C++ submit runs WITHOUT _req_mu."""
+        region_base = self._arena_base + posted.local_offset
+        copy_id = self._pool_busy
+        reserved = -1
+        err: Optional[BaseException] = None
+        try:
+            bounce_dsts = (np.uint64(region_base) + chunk.bounce_offsets).astype(np.uint64)
+            if self._submit_chained_fn is not None:
+                # Atomic submit+reserve: the reservation exists before the
+                # C++ poll thread can even see the event — the reserve race
+                # is structurally impossible on this path.
+                copy_id, reserved = self._submit_chained_fn(
+                    chunk.src_ptrs, bounce_dsts, chunk.sizes
                 )
-                req.abandon_reason = FAIL_PROTOCOL
-                req.pending_credits.clear()
-                self._fail_request_locked(rid, req, FAIL_PROTOCOL)
-                break
-            # Non-blocking staging: no region right now -> park; the reactor's
-            # drain_pending_posts retries once an ACK frees space. Never blocks,
-            # so oversubscription degrades to backpressure, not deadlock.
-            local_off = self._sched.acquire_local(chunk.packed_bytes, eager=not have_credit)
-            if local_off is None:
-                break
-            region_base = self._arena_base + local_off
-            reserved = -1
-            try:
-                bounce_dsts = (np.uint64(region_base) + chunk.bounce_offsets).astype(np.uint64)
-                if self._submit_chained_fn is not None:
-                    # Atomic submit+reserve: the reservation exists before the
-                    # C++ poll thread can even see the event — the reserve
-                    # race is structurally impossible on this path.
-                    copy_id, reserved = self._submit_chained_fn(
-                        chunk.src_ptrs, bounce_dsts, chunk.sizes
-                    )
-                    copy_id, reserved = int(copy_id), int(reserved)
-                else:
-                    copy_id = self._pool.submit_copy(chunk.src_ptrs, bounce_dsts, chunk.sizes)
-            except RuntimeError as e:
+                copy_id, reserved = int(copy_id), int(reserved)
+            else:
+                copy_id = int(self._pool.submit_copy(chunk.src_ptrs, bounce_dsts, chunk.sizes))
+                if copy_id != self._pool_busy and self._reserve_fn is not None:
+                    # Two-phase chain, separate-call fallback (older pool
+                    # binding): CAN lose the reserve race to the 50 us poll
+                    # thread on a tiny gather — a decline keeps the classic
+                    # route.
+                    reserved = int(self._reserve_fn(copy_id))
+        except (RuntimeError, ValueError) as e:
+            # RuntimeError: CUDA error / plan overflow from the pool.
+            # ValueError: the binding's argument validation (nanobind maps
+            # std::invalid_argument) — should-not-happen, but it must take
+            # the same deterministic failure path, not escape mid-launch.
+            err = e
+        grants: list[Grant] = []
+        dispatches: list[tuple] = []
+        fail_reason = None
+        dead_cancel = False
+        bumps: list[str] = []
+        rc = _PUMP_CONTINUE
+        with self._req_mu:
+            alive = self._requests.get(rid) is req and not req.abandon_reason
+            posted.busy_op = None
+            if err is not None:
                 # Gather launch failed (CUDA error / plan overflow). No event
                 # was registered, so the region is safe to recycle now; fail
                 # deterministically like the C++ GatherFailed path.
                 logger.warning(
-                    f"bounce_v2({self._self_name}): rid={rid} chunk={chunk_idx} "
-                    f"gather launch failed: {e}"
+                    f"bounce_v2({self._self_name}): rid={rid} chunk={posted.chunk_idx} "
+                    f"gather launch failed: {err}"
                 )
-                grants.extend(self._sched.release_local(local_off))
-                self._fail_request_locked(rid, req, FAIL_GATHER)
-                break
-            if copy_id == self._pool_busy:
-                grants.extend(self._sched.release_local(local_off))
-                break  # every copy stream busy: retry next tick
-            self._bump("tx_gather_credit" if have_credit else "tx_gather_eager")
-            posted = _Posted(
-                chunk_idx=chunk_idx,
-                local_offset=local_off,
-                write_bytes=chunk.packed_bytes,
-                copy_id=copy_id,
-            )
-            if have_credit:
-                credit = req.pending_credits.popleft()
-                req.next_credit += 1
-                posted.has_credit = True
-                posted.remote_handle = credit.region_handle
-                posted.remote_addr = credit.addr
-                posted.remote_dev = credit.dev_id
-            if self._reserve_fn is not None:
-                # Two-phase C++ chain: the chunk's ONE completion id is the
-                # reservation from here on. The atomic path above already
-                # reserved; the separate-call fallback (older pool binding)
-                # reserves here and CAN lose to the 50 us poll thread on a
-                # tiny gather. A decline (race lost / poller shutdown) keeps
-                # the classic route below.
-                if reserved < 0 and self._submit_chained_fn is None:
-                    reserved = int(self._reserve_fn(copy_id))
-                if reserved >= 0:
+                self._remove_launch_locked(req, posted, credit)
+                grants.extend(self._sched.release_local(posted.local_offset))
+                if alive:
+                    fail_reason = FAIL_GATHER
+                rc = _PUMP_STOP
+            elif copy_id == self._pool_busy:
+                # Every copy stream busy: undo and retry next tick (STOP_IDLE:
+                # no net progress — see _pump's did_work handling).
+                self._remove_launch_locked(req, posted, credit)
+                grants.extend(self._sched.release_local(posted.local_offset))
+                rc = _PUMP_STOP_IDLE
+            elif alive:
+                posted.copy_id = copy_id
+                bumps.append("tx_gather_credit" if posted.has_credit else "tx_gather_eager")
+                if self._reserve_fn is not None and reserved >= 0:
+                    # Two-phase chain: the chunk's ONE completion id is the
+                    # reservation from here on.
                     posted.reserved = True
                     posted.xfer_id = reserved
-                    self._completions[reserved] = ("xfer", rid)
-                    self._bump("tx_chain_reserved")
+                    bumps.append("tx_chain_reserved")
+                    dispatches.extend(self._register_route_locked(reserved, ("xfer", rid)))
                 else:
-                    self._bump("tx_chain_reserve_declined")
-                    self._completions[copy_id] = ("gather", rid)
+                    if self._reserve_fn is not None:
+                        bumps.append("tx_chain_reserve_declined")
+                    dispatches.extend(self._register_route_locked(copy_id, ("gather", rid)))
+                req.last_progress = time.monotonic()
             else:
-                self._completions[copy_id] = ("gather", rid)
-            req.posted.append(posted)
-            req.next_post += 1
-            req.last_progress = time.monotonic()
-            if posted.has_credit:
-                # Credited at launch: complete/arm the C++ chain immediately
-                # (no-op when the chain is disabled/unavailable).
-                if posted.reserved:
-                    self._fulfill_chain_locked(rid, req, posted)
+                # The request FAILED while the submit was in flight; the fail
+                # path skipped this chunk (busy_op == "launch") — clean up
+                # here. A reservation must not outlive the request. The fresh
+                # copy_id was never routed, so its row can only be pending or
+                # parked — _register_route_locked covers both.
+                if reserved >= 0:
+                    dead_cancel = True
                 else:
-                    self._arm_chain_locked(rid, req, posted)
+                    dispatches.extend(
+                        self._register_route_locked(copy_id, ("orphan_gather", posted.local_offset))
+                    )
+        if dead_cancel:
+            # cancel_chain OUTSIDE the lock (anti-convoy rule). REVERTED: the
+            # gather is still pending and will publish under its ORIGINAL
+            # copy_id — route it as the orphaned gather. TERMINAL: the kernel
+            # is done and the write was never posted — recycle now.
+            if int(self._cancel_fn(reserved)) == _CANCEL_REVERTED:
+                with self._req_mu:
+                    dispatches.extend(
+                        self._register_route_locked(copy_id, ("orphan_gather", posted.local_offset))
+                    )
+            else:
+                grants.extend(self._sched.release_local(posted.local_offset))
+        for key in bumps:
+            self._bump(key)
         self._send_grants(grants)
+        for cid, route, kind, ok in dispatches:
+            self._dispatch_row(route, cid, kind, bool(ok))
+        if fail_reason is not None:
+            self._fail_request(rid, req, fail_reason)
+        return rc
 
-    def _drain_pending_posts(self) -> bool:
-        did_work = False
-        with self._req_mu:
-            for rid in list(self._requests):
-                req = self._requests.get(rid)
-                if req is None:
-                    continue
-                if req.pending_credits or (
-                    self._cfg.enable_eager_gather and req.next_post < req.num_chunks
-                ):
-                    before = (req.next_post, req.next_credit)
-                    self._pump_locked(rid, req)
-                    cur = self._requests.get(rid)
-                    did_work |= cur is None or (cur.next_post, cur.next_credit) != before
-        return did_work
-
-    def _arm_chain_locked(self, rid: int, req: _Request, posted: _Posted) -> bool:
-        """Try to arm the C++ gather->RDMA chain for a credited, still-
-        gathering chunk (_req_mu held). On success the chunk's ONE remaining
-        completion is the reserved xfer id: the gather completion is consumed
-        in C++ (never drained), the write posts on the C++ poll thread, and
-        the classic copy_id route is dropped; the chunk moves to WRITING so
-        the failure path treats its staging region exactly like an in-flight
-        write (recycled only once the chain reaches a terminal state — the
-        reserved id resolves only after the gather is terminal AND the write,
-        if posted, is terminal). Returns False when the chain is disabled,
-        the chunk is not eligible, or the arm lost the race to the gather's
-        own completion — the classic two-hop path then proceeds unchanged."""
-        if self._chain_fn is None or not posted.has_credit:
-            return False
-        if posted.state != _PostState.GATHERING:
-            return False
-        reserved = self._chain_fn(
-            posted.copy_id,
-            self._arena_base + posted.local_offset,
-            posted.remote_addr,
-            posted.write_bytes,
-            self._device_id,
-            posted.remote_dev,
-            req.peer,
-            self._poller,
-        )
-        if reserved < 0:
-            # Lost the race to the gather's own completion (or C++ refused):
-            # the classic path proceeds; count it so an A/B run can tell how
-            # often the chain actually fired vs fell back.
-            self._bump("tx_chain_arm_race")
-            return False
-        self._bump("tx_chain_armed")
-        self._completions.pop(posted.copy_id, None)
-        posted.xfer_id = int(reserved)
-        posted.state = _PostState.WRITING
-        self._completions[posted.xfer_id] = ("xfer", rid)
-        req.last_progress = time.monotonic()
-        return True
-
-    def _fulfill_chain_locked(self, rid: int, req: _Request, posted: _Posted) -> None:
-        """Two-phase chain, phase 2: the credit arrived for a RESERVED chunk
-        (_req_mu held) — hand C++ the destination. On ARMED/POSTED the chunk
-        moves to WRITING (its one completion, the reserved id, resolves after
-        the write like any armed chain). On DECLINED a terminal FAILURE row
-        for the reserved id is already published/pending (the gather failed
-        in C++, or the poller shut down): post nothing, leave the chunk
-        GATHERING — the row's _on_xfer_done advances and fails it."""
+    def _exec_fulfill(self, rid: int, req: _Request, posted: _Posted) -> int:
+        """Two-phase chain, phase 2: hand C++ the destination for a RESERVED
+        chunk. On ARMED/POSTED the chunk moves to WRITING (its one
+        completion, the reserved id, resolves after the write). On DECLINED a
+        terminal row for the reserved id is already published/pending (the
+        gather failed in C++, or the poller shut down): post nothing, leave
+        the chunk GATHERING — the row's _on_xfer_done advances and fails it.
+        The C++ call runs WITHOUT _req_mu."""
         rc = int(
             self._fulfill_fn(
                 posted.xfer_id,
@@ -1048,112 +1351,332 @@ class BounceReactor:
                 self._poller,
             )
         )
-        if rc == _FULFILL_DECLINED:
-            self._bump("tx_chain_fulfill_declined")
-            return
-        posted.state = _PostState.WRITING
-        self._bump("tx_chain_armed")
-        if rc == _FULFILL_POSTED:
-            # The gather had already finished: the write was posted inline —
-            # exactly the chunks the one-shot arm used to lose to the race.
-            self._bump("tx_chain_fulfilled_late")
-        req.last_progress = time.monotonic()
+        grants: list[Grant] = []
+        dispatches: list[tuple] = []
+        settle = False
+        bumps: list[str] = []
+        # RECORD. Unlike arm/post — whose fresh completion ids can at worst
+        # PARK — the fulfill's reserved id has been ROUTED ("xfer", rid) since
+        # the gather launch, so its row can be drained AND dispatched while
+        # the C++ call is in flight (a POSTED write can complete before this
+        # thread re-acquires the lock). `posted.state != GATHERING` is the
+        # row-already-consumed signal, REGARDLESS of rc:
+        #   ok row consumed   -> _on_xfer_done moved the chunk to SENT and
+        #                        emitted DATA;
+        #   fail row consumed -> _on_xfer_done advanced it (WRITING->SENT or
+        #                        GATHERING->GATHERED) and failed the request,
+        #                        so `alive` is False.
+        # EXACTLY-ONCE ledger over (row pending | consumed-ok | consumed-fail)
+        # x (alive | dead):
+        #   alive + pending:       DECLINED leaves GATHERING for the pending
+        #                          row; ARMED/POSTED -> WRITING, row later;
+        #   alive + consumed-ok:   leave SENT untouched — overwriting it with
+        #                          WRITING would make _on_ack reject the ACK
+        #                          as stale and time the request out;
+        #   alive + consumed-fail: impossible (the failure deleted the rid);
+        #   dead + consumed:       recycle the region + settle the deferred
+        #                          write HERE (the fail path counted this
+        #                          busy chunk and popped its route) — no
+        #                          further row can come, so re-registering
+        #                          the consumed cid as an orphan would never
+        #                          fire (region leak, deferred cancel-WANT
+        #                          never sent). Holds for EVERY rc: an
+        #                          ARMED/POSTED fulfill whose write finished
+        #                          before this record lands here too;
+        #   dead + pending/parked/mid-dispatch: a terminal row is guaranteed
+        #                          (DECLINED: already published or pending;
+        #                          ARMED/POSTED: after the write) — register
+        #                          the orphan route (a row mid-dispatch
+        #                          reparks against it; _repark_row checks
+        #                          _completions first).
+        with self._req_mu:
+            alive = self._requests.get(rid) is req
+            posted.busy_op = None
+            if alive:
+                if rc == _FULFILL_DECLINED:
+                    bumps.append("tx_chain_fulfill_declined")
+                else:
+                    if posted.state == _PostState.GATHERING:
+                        posted.state = _PostState.WRITING
+                    bumps.append("tx_chain_armed")
+                    if rc == _FULFILL_POSTED:
+                        # The gather had already finished: the write was
+                        # posted inline — exactly the chunks the one-shot arm
+                        # used to lose to the race.
+                        bumps.append("tx_chain_fulfilled_late")
+                    req.last_progress = time.monotonic()
+            else:
+                # Request failed mid-fulfill; the fail path counted this
+                # chunk as a deferred write and popped its route.
+                if posted.state != _PostState.GATHERING:
+                    grants.extend(self._sched.release_local(posted.local_offset))
+                    settle = True
+                else:
+                    dispatches.extend(
+                        self._register_route_locked(
+                            posted.xfer_id, ("orphan_xfer", posted.local_offset, rid)
+                        )
+                    )
+        for key in bumps:
+            self._bump(key)
+        self._send_grants(grants)
+        for cid, route, kind, ok in dispatches:
+            self._dispatch_row(route, cid, kind, bool(ok))
+        if settle:
+            self._settle_orphan_write(rid)
+        return _PUMP_CONTINUE
 
-    def _post_write_locked(self, rid: int, req: _Request, posted: _Posted) -> None:
-        """Gathered + credited -> post the 1:1 RDMA write. _req_mu held."""
-        xfer_id = self._agent.post_transfer_1to1(
-            self._arena_base + posted.local_offset,
-            posted.remote_addr,
-            posted.write_bytes,
-            self._device_id,
-            posted.remote_dev,
-            req.peer,
-            self._poller,
+    def _exec_arm(self, rid: int, req: _Request, posted: _Posted) -> int:
+        """One-shot chain arm for a credited, still-gathering chunk. On
+        success the chunk's ONE remaining completion is the reserved xfer id
+        (the gather completion is consumed in C++) and the chunk moves to
+        WRITING. A decline keeps the classic two-hop path. The C++ call runs
+        WITHOUT _req_mu."""
+        rc = int(
+            self._chain_fn(
+                posted.copy_id,
+                self._arena_base + posted.local_offset,
+                posted.remote_addr,
+                posted.write_bytes,
+                self._device_id,
+                posted.remote_dev,
+                req.peer,
+                self._poller,
+            )
         )
-        if xfer_id < 0:
-            self._fail_request_locked(rid, req, FAIL_WRITE)
-            return
-        self._bump("tx_post_classic")
-        posted.xfer_id = xfer_id
-        posted.state = _PostState.WRITING
-        self._completions[xfer_id] = ("xfer", rid)
-        req.last_progress = time.monotonic()
+        grants: list[Grant] = []
+        dispatches: list[tuple] = []
+        settle = False
+        bumps: list[str] = []
+        with self._req_mu:
+            alive = self._requests.get(rid) is req
+            posted.busy_op = None
+            if alive:
+                if rc < 0:
+                    # Lost the race to the gather's own completion (or C++
+                    # refused): the classic path proceeds (the copy_id route
+                    # is still registered).
+                    bumps.append("tx_chain_arm_race")
+                else:
+                    bumps.append("tx_chain_armed")
+                    self._completions.pop(posted.copy_id, None)
+                    posted.xfer_id = rc
+                    posted.state = _PostState.WRITING
+                    dispatches.extend(self._register_route_locked(rc, ("xfer", rid)))
+                    req.last_progress = time.monotonic()
+            else:
+                # Request failed mid-arm; the fail path counted this chunk as
+                # a deferred write and popped its copy_id route.
+                if rc >= 0:
+                    # Armed: the gather row is consumed in C++; the write's
+                    # terminal row comes under the reserved id.
+                    dispatches.extend(
+                        self._register_route_locked(rc, ("orphan_xfer", posted.local_offset, rid))
+                    )
+                elif posted.state != _PostState.GATHERING:
+                    # Gather row already consumed (live route, pre-failure):
+                    # kernel terminal, write never posted — recycle.
+                    grants.extend(self._sched.release_local(posted.local_offset))
+                    settle = True
+                else:
+                    # Gather row pending/parked under copy_id (the fail path
+                    # popped its route); route it as an orphan WRITE so its
+                    # dispatch also settles the deferred cancel (kind is
+                    # ignored by _on_orphan_xfer_done). A row mid-dispatch
+                    # reparks against this fresh route.
+                    dispatches.extend(
+                        self._register_route_locked(
+                            posted.copy_id, ("orphan_xfer", posted.local_offset, rid)
+                        )
+                    )
+        for key in bumps:
+            self._bump(key)
+        self._send_grants(grants)
+        for cid, route, kind, ok in dispatches:
+            self._dispatch_row(route, cid, kind, bool(ok))
+        if settle:
+            self._settle_orphan_write(rid)
+        return _PUMP_CONTINUE
+
+    def _exec_post(self, rid: int, req: _Request, posted: _Posted) -> int:
+        """Classic RDMA post for a gathered + credited chunk (the POSTING
+        intermediate: state GATHERED, busy_op "post"). The C++ call runs
+        WITHOUT _req_mu; a synchronous post failure fails the request with
+        the existing FAIL_WRITE semantics."""
+        xid = int(
+            self._agent.post_transfer_1to1(
+                self._arena_base + posted.local_offset,
+                posted.remote_addr,
+                posted.write_bytes,
+                self._device_id,
+                posted.remote_dev,
+                req.peer,
+                self._poller,
+            )
+        )
+        grants: list[Grant] = []
+        dispatches: list[tuple] = []
+        settle = False
+        fail_reason = None
+        posted_ok = False
+        with self._req_mu:
+            alive = self._requests.get(rid) is req
+            posted.busy_op = None
+            if alive:
+                if xid < 0:
+                    # Chunk stays GATHERED (terminal for its region: the NIC
+                    # never saw it) — _fail_request recycles it.
+                    fail_reason = FAIL_WRITE
+                else:
+                    posted_ok = True
+                    posted.xfer_id = xid
+                    posted.state = _PostState.WRITING
+                    dispatches.extend(self._register_route_locked(xid, ("xfer", rid)))
+                    req.last_progress = time.monotonic()
+            else:
+                # Request failed mid-post; the fail path counted this chunk
+                # as a deferred write.
+                if xid >= 0:
+                    dispatches.extend(
+                        self._register_route_locked(xid, ("orphan_xfer", posted.local_offset, rid))
+                    )
+                else:
+                    grants.extend(self._sched.release_local(posted.local_offset))
+                    settle = True
+        if posted_ok:
+            self._bump("tx_post_classic")
+        self._send_grants(grants)
+        for cid, route, kind, ok in dispatches:
+            self._dispatch_row(route, cid, kind, bool(ok))
+        if settle:
+            self._settle_orphan_write(rid)
+        if fail_reason is not None:
+            self._fail_request(rid, req, fail_reason)
+            return _PUMP_STOP
+        return _PUMP_CONTINUE
+
+    def _drain_pending_posts(self) -> bool:
+        did_work = False
+        with self._req_mu:
+            rids = [
+                rid
+                for rid, req in self._requests.items()
+                if req.pending_credits
+                or (self._cfg.enable_eager_gather and req.next_post < req.num_chunks)
+            ]
+        for rid in rids:
+            did_work |= self._pump(rid)
+        return did_work
 
     def _on_gather_done(self, rid: int, copy_id: int, ok: bool) -> None:
-        self._bump("tx_gather_events")
+        repark = False
+        fail_req: Optional[_Request] = None
+        advanced = False
         with self._req_mu:
             req = self._requests.get(rid)
             if req is None:
-                return
-            # Route by the completion id: gathers of one request may finish
-            # OUT OF ORDER across copy streams, so "oldest gathering" would
-            # be wrong (it could post a write for an unfinished gather).
-            target = next((p for p in req.posted if p.copy_id == copy_id), None)
-            if not ok:
-                # The failed gather's completion id was already consumed by
-                # the drain and the kernel is DONE with the staging region:
-                # advance the chunk to a terminal state BEFORE failing, so
-                # _fail_request_locked releases its region now instead of
-                # re-registering the consumed id as an orphan_gather that
-                # would never fire (poller ids report exactly once).
-                if target is not None and target.state == _PostState.GATHERING:
+                # The request died between the drain's route pop and this
+                # dispatch: RE-PARK the row so the failure cleanup's orphan
+                # registration (which checks the parking dict) still finds
+                # it — never silently consume a row another path relies on.
+                repark = True
+            else:
+                # Route by the completion id: gathers of one request may
+                # finish OUT OF ORDER across copy streams, so "oldest
+                # gathering" would be wrong (it could post a write for an
+                # unfinished gather).
+                target = next((p for p in req.posted if p.copy_id == copy_id), None)
+                if not ok:
+                    # The failed gather's completion id was already consumed
+                    # by the drain and the kernel is DONE with the staging
+                    # region: advance the chunk to a terminal state BEFORE
+                    # failing, so _fail_request releases its region now
+                    # instead of re-registering the consumed id as an
+                    # orphan_gather that would never fire (poller ids report
+                    # exactly once).
+                    if target is not None and target.state == _PostState.GATHERING:
+                        target.state = _PostState.GATHERED
+                    fail_req = req
+                elif target is not None and target.state == _PostState.GATHERING:
+                    # STATE ONLY (anti-convoy rule): a credited chunk's post
+                    # is issued by the pump below, never under this lock.
                     target.state = _PostState.GATHERED
-                self._fail_request_locked(rid, req, FAIL_GATHER)
-                return
-            if target is None or target.state != _PostState.GATHERING:
-                return
-            target.state = _PostState.GATHERED
-            if target.has_credit:
-                self._post_write_locked(rid, req, target)
+                    advanced = True
+        if repark:
+            # Not counted as a handled gather event: the row goes back for
+            # its real consumer (the failure cleanup's orphan route).
+            self._repark_row(copy_id, _KIND_EVENT, 1 if ok else 0)
+            return
+        self._bump("tx_gather_events")
+        if fail_req is not None:
+            self._fail_request(rid, fail_req, FAIL_GATHER)
+            return
+        if advanced:
+            self._pump(rid)
 
     def _on_xfer_done(self, rid: int, xfer_id: int, ok: bool, kind: int = _KIND_XFER) -> None:
         data_msg: Optional[tuple[str, bytes]] = None
+        repark = False
+        fail_req: Optional[_Request] = None
         with self._req_mu:
             req = self._requests.get(rid)
             if req is None:
-                return
-            target = next((p for p in req.posted if p.xfer_id == xfer_id), None)
-            if target is None:
-                return
-            if not ok:
-                # The chunk's completion id was already consumed by the drain,
-                # so the chunk must go terminal HERE: _fail_request_locked
-                # would otherwise re-register the consumed id as an orphan
-                # write that can never fire (wedging _orphan_writes and the
-                # deferred cancel, and leaking the region). Every failed row
-                # that lands here is terminal for the staging region:
-                #   (id, KIND_XFER, 0)  classic write or chained post failed /
-                #       shutdown -> the NIC/agent is DONE with the region;
-                #   (id, KIND_EVENT, 0) chained gather failed -> the kernel is
-                #       done and the write was never posted (NIC never saw the
-                #       region) — reported as FAIL_GATHER to keep the reason
-                #       accurate.
-                # Guarded like the gather path: a duplicate delivery must not
-                # relabel a chunk that is no longer WRITING.
-                if target.state == _PostState.WRITING:
+                repark = True  # see _on_gather_done: never lose a raced row
+            else:
+                target = next((p for p in req.posted if p.xfer_id == xfer_id), None)
+                if target is None:
+                    return
+                if not ok:
+                    # The chunk's completion id was already consumed by the
+                    # drain, so the chunk must go terminal HERE:
+                    # _fail_request would otherwise re-register the consumed
+                    # id as an orphan write that can never fire (wedging
+                    # _orphan_writes and the deferred cancel, and leaking the
+                    # region). Every failed row that lands here is terminal
+                    # for the staging region:
+                    #   (id, KIND_XFER, 0)  classic write or chained post
+                    #       failed / shutdown -> the NIC/agent is DONE with
+                    #       the region;
+                    #   (id, KIND_EVENT, 0) chained gather failed -> the
+                    #       kernel is done and the write was never posted
+                    #       (NIC never saw the region) — reported as
+                    #       FAIL_GATHER to keep the reason accurate.
+                    # Guarded like the gather path: a duplicate delivery must
+                    # not relabel a chunk that is no longer WRITING.
+                    if target.state == _PostState.WRITING:
+                        target.state = _PostState.SENT
+                    elif target.state == _PostState.GATHERING and target.reserved:
+                        # A RESERVED chunk's failure row landed before its
+                        # fulfill completed (chained gather failed, or the
+                        # poller shut down): the reservation is terminal —
+                        # the kernel is done and the write was never posted —
+                        # so the staging region is safe to recycle in
+                        # _fail_request below (or by the pump's record phase
+                        # if the fulfill is still in flight).
+                        target.state = _PostState.GATHERED
+                    fail_req = req
+                else:
+                    chunk = req.plan.chunks[target.chunk_idx]
+                    data_msg = (
+                        req.peer,
+                        encode_data(
+                            rid,
+                            target.chunk_idx,
+                            req.num_chunks,
+                            target.remote_handle,
+                            chunk.scatter_runs,
+                        ),
+                    )
                     target.state = _PostState.SENT
-                elif target.state == _PostState.GATHERING and target.reserved:
-                    # A RESERVED chunk's failure row landed before its fulfill
-                    # (chained gather failed, or the poller shut down): the
-                    # reservation is terminal — the kernel is done and the
-                    # write was never posted — so the staging region is safe
-                    # to recycle in _fail_request_locked below.
-                    target.state = _PostState.GATHERED
-                self._fail_request_locked(
-                    rid, req, FAIL_GATHER if kind == _KIND_EVENT else FAIL_WRITE
-                )
-                return
-            chunk = req.plan.chunks[target.chunk_idx]
-            data_msg = (
-                req.peer,
-                encode_data(
-                    rid, target.chunk_idx, req.num_chunks, target.remote_handle, chunk.scatter_runs
-                ),
-            )
-            target.state = _PostState.SENT
-            req.last_progress = time.monotonic()
-        self._bump("tx_xfer_events")
+                    req.last_progress = time.monotonic()
+        if repark:
+            self._repark_row(xfer_id, kind, 1 if ok else 0)
+            return
+        if fail_req is not None:
+            self._fail_request(rid, fail_req, FAIL_GATHER if kind == _KIND_EVENT else FAIL_WRITE)
+            return
         if data_msg is not None:
+            self._bump("tx_xfer_events")
             self._bump("tx_data_sent")
             self._send_to(*data_msg)
 
@@ -1222,7 +1745,7 @@ class BounceReactor:
                 )
                 return
             req.pending_credits.extend(credits)
-            self._pump_locked(header.request_id, req)
+        self._pump(header.request_id)
 
     def _check_sender_timeouts(self) -> None:
         if self._cfg.request_timeout_ms <= 0:
@@ -1233,78 +1756,142 @@ class BounceReactor:
         self._next_sender_sweep = now + _SENDER_SWEEP_S
         limit = self._cfg.request_timeout_ms / 1000.0
         with self._req_mu:
-            stuck = [rid for rid, req in self._requests.items() if now - req.last_progress > limit]
-            for rid in stuck:
-                req = self._requests.get(rid)
-                if req is not None:
-                    self._fail_request_locked(rid, req, FAIL_NO_PROGRESS)
+            stuck = [
+                (rid, req) for rid, req in self._requests.items() if now - req.last_progress > limit
+            ]
+        for rid, req in stuck:
+            self._fail_request(rid, req, FAIL_NO_PROGRESS)
 
-    def _fail_request_locked(self, rid: int, req: _Request, reason: str) -> None:
-        """Terminal failure path (mirrors the C++ failRequest). _req_mu held.
+    def _fail_request(self, rid: int, req: _Request, reason: str) -> None:
+        """Terminal failure path (mirrors the C++ failRequest). Call WITHOUT
+        ``_req_mu`` held (any thread); idempotent — only the caller whose
+        request object is still registered performs the cleanup.
 
         Regions are recycled only once nothing can still touch their memory:
-        a WRITING chunk's region defers until its RDMA completion (the NIC
-        may still read it); a GATHERING chunk's region defers until its copy
-        event fires (the kernel may still write it) — a RESERVED one first
-        cancels its chain reservation, which either reverts the completion to
-        the original copy_id (then deferred the same way) or reports the
-        gather already terminal (then recycled now); GATHERED/SENT recycle
-        now. The chunk whose FAILED completion triggered this call must be
+          - WRITING: defers until the RDMA completion (the NIC may still read
+            it) — the ("xfer", rid) route becomes an orphan_xfer route;
+          - GATHERING: defers until the copy event fires (the kernel may
+            still write it) — the copy route becomes an orphan_gather route.
+            A RESERVED (unfulfilled) one first cancels its chain reservation
+            OUTSIDE the lock (anti-convoy rule): REVERTED re-routes the
+            original copy_id as the orphaned gather, TERMINAL recycles now.
+            A reserved chunk whose fulfill was DECLINED has a terminal row
+            pending under its reserved id — routed as an orphan write;
+          - GATHERED / SENT: nothing touches the region anymore — recycle.
+          - BUSY chunks (a pump's C++ call is in flight; at most one, the
+            pump owner's current chunk): "launch" is skipped entirely — no
+            completion id exists yet, and the pump's record phase releases or
+            orphans the region itself. "fulfill"/"arm"/"post" may still turn
+            into (or already be) an RDMA write, so they count as deferred
+            writes here (holding the cancel-WANT back) and their known routes
+            are POPPED so a racing row PARKS instead of hitting the dead rid;
+            the pump's record phase then registers the orphan route (finding
+            a parked row inline) or releases + settles when no row can come.
+
+        The chunk whose FAILED completion triggered this call must be
         advanced to a terminal state (GATHERED/SENT) by its handler first:
         its completion id was already consumed by the drain, so registering
-        it as an orphan here would never fire and leak the region. The
-        cancel-WANT to the receiver is deferred while any write is in flight
-        (it is landing on the receiver's region; an early cancel would let
-        the receiver re-grant that region under the write)."""
-        if req.abandon_reason:
-            reason = req.abandon_reason
-        # Latch the terminal reason on the (now-dead) request object: callers
-        # still iterating over it (_attach_credits_locked/_pump_locked after a
-        # failed _post_write_locked) check abandon_reason and stop advancing.
-        # Without the latch they would keep pumping a DELETED request — a
-        # second failure would KeyError on `del self._requests[rid]`, a second
-        # success would RDMA-write from an already-released staging region,
-        # and every further iteration would leak an arena region.
-        req.abandon_reason = reason
-        logger.warning(
-            f"bounce_v2({self._self_name}): request FAILED rid={rid} peer={req.peer} "
-            f'reason="{reason}" acked={req.acked} posted={req.next_post}/{req.num_chunks}'
-        )
+        it as an orphan here would never fire and leak the region (the
+        _orphan_route_locked existence check backstops exactly that). The
+        cancel-WANT to the receiver is deferred while any write is (or may
+        be) in flight — it is landing on the receiver's region; an early
+        cancel would let the receiver re-grant that region under the write."""
         grants: list[Grant] = []
-        deferred_write = False
-        for p in req.posted:
-            if p.state == _PostState.WRITING:
-                self._completions[p.xfer_id] = ("orphan_xfer", p.local_offset, rid)
-                self._orphan_writes[rid] = self._orphan_writes.get(rid, 0) + 1
-                deferred_write = True
-            elif p.state == _PostState.GATHERING:
-                if p.reserved:
-                    # Reserved, not yet fulfilled: the reservation must not
-                    # outlive the request (an unfulfilled reservation neither
-                    # publishes nor frees anything until poller shutdown).
-                    # cancel_chain either REVERTS it — the gather is still
-                    # running and will publish under its ORIGINAL copy_id,
-                    # which we re-route as the orphaned gather — or reports it
-                    # TERMINAL (gather done or failed): the kernel is done and
-                    # the write was never posted, so the region recycles now;
-                    # an already-published failure row finds its route popped
-                    # below and drains into a no-op.
-                    self._completions.pop(p.xfer_id, None)
-                    if int(self._cancel_fn(p.xfer_id)) == _CANCEL_REVERTED:
-                        self._completions[p.copy_id] = ("orphan_gather", p.local_offset)
-                    else:
+        dispatches: list[tuple] = []
+        to_cancel: list[_Posted] = []
+        with self._req_mu:
+            if self._requests.get(rid) is not req:
+                return  # already failed/completed by another path
+            if req.abandon_reason:
+                reason = req.abandon_reason
+            # Latch the terminal reason on the (now-dead) request object: the
+            # pump owner (and any handler) re-checks the registry/latch and
+            # stops advancing. Without it a second failure would KeyError on
+            # `del self._requests[rid]`, a second success would RDMA-write
+            # from an already-released staging region, and every further
+            # iteration would leak an arena region.
+            req.abandon_reason = reason
+            logger.warning(
+                f"bounce_v2({self._self_name}): request FAILED rid={rid} peer={req.peer} "
+                f'reason="{reason}" acked={req.acked} posted={req.next_post}/{req.num_chunks}'
+            )
+            deferred = 0
+            for p in req.posted:
+                if p.busy_op == "launch":
+                    continue  # no ids yet; the pump's record phase cleans up
+                if p.busy_op is not None:  # fulfill / arm / post in flight
+                    if p.busy_op == "fulfill":
+                        self._completions.pop(p.xfer_id, None)
+                    elif p.busy_op == "arm":
+                        self._completions.pop(p.copy_id, None)
+                    deferred += 1
+                    continue
+                if p.state == _PostState.WRITING:
+                    pending, out = self._orphan_route_locked(
+                        p.xfer_id, ("orphan_xfer", p.local_offset, rid)
+                    )
+                    dispatches.extend(out)
+                    if pending or out:
+                        deferred += 1
+                    else:  # row already consumed mid-race: xfer terminal
                         grants.extend(self._sched.release_local(p.local_offset))
-                else:
-                    self._completions[p.copy_id] = ("orphan_gather", p.local_offset)
-            else:  # GATHERED / SENT: nothing touches the region anymore
+                elif p.state == _PostState.GATHERING:
+                    if p.reserved and not p.fulfilled:
+                        # Reserved, never fulfilled: the reservation must not
+                        # outlive the request (it neither publishes nor frees
+                        # anything until poller shutdown). Pop the route so an
+                        # already-published failure row parks/no-ops; cancel
+                        # OUTSIDE the lock below.
+                        self._completions.pop(p.xfer_id, None)
+                        to_cancel.append(p)
+                    elif p.reserved:
+                        # Fulfill was DECLINED (terminal row published or
+                        # pending under the reserved id): route it as an
+                        # orphan write.
+                        pending, out = self._orphan_route_locked(
+                            p.xfer_id, ("orphan_xfer", p.local_offset, rid)
+                        )
+                        dispatches.extend(out)
+                        if pending or out:
+                            deferred += 1
+                        else:
+                            grants.extend(self._sched.release_local(p.local_offset))
+                    else:
+                        pending, out = self._orphan_route_locked(
+                            p.copy_id, ("orphan_gather", p.local_offset)
+                        )
+                        dispatches.extend(out)
+                        if not pending and not out:
+                            grants.extend(self._sched.release_local(p.local_offset))
+                else:  # GATHERED / SENT: nothing touches the region anymore
+                    grants.extend(self._sched.release_local(p.local_offset))
+            if deferred:
+                self._orphan_writes[rid] = self._orphan_writes.get(rid, 0) + deferred
+                self._pending_cancels[rid] = req.peer
+                cancel_now = False
+            else:
+                cancel_now = True
+            future = req.future
+            del self._requests[rid]
+        # --- outside _req_mu: C++ cancels, sends, dispatches, resolve ---
+        for p in to_cancel:
+            # cancel_chain either REVERTS the reservation — the gather is
+            # still running and will publish under its ORIGINAL copy_id,
+            # re-routed as the orphaned gather (never routed before, so
+            # register fresh; a racing row is parked) — or reports it
+            # TERMINAL (gather done or failed): the kernel is done and the
+            # write was never posted, so the region recycles now.
+            if int(self._cancel_fn(p.xfer_id)) == _CANCEL_REVERTED:
+                with self._req_mu:
+                    out = self._register_route_locked(p.copy_id, ("orphan_gather", p.local_offset))
+                dispatches.extend(out)
+            else:
                 grants.extend(self._sched.release_local(p.local_offset))
-        if deferred_write:
-            self._pending_cancels[rid] = req.peer
-        else:
+        if cancel_now:
             self._send_to(req.peer, encode_cancel(rid, self._endpoint))
-        future = req.future
-        del self._requests[rid]
         self._send_grants(grants)
+        for cid, route, kind, ok in dispatches:
+            self._dispatch_row(route, cid, kind, bool(ok))
         _resolve(future, BounceResult(False, reason))
         # This may run on a SUBMIT thread (mispair / gather-launch failure at
         # submit time): the regions released above can unblock another request
@@ -1315,10 +1902,16 @@ class BounceReactor:
 
     def _on_orphan_xfer_done(self, local_offset: int, rid: int) -> None:
         """A failed request's in-flight write reached a terminal state: its
-        staging region is recyclable, and once the rid's last such write
-        drains, the deferred cancel may finally be sent (the receiver can
+        staging region is recyclable, and once the rid's last deferred write
+        settles, the deferred cancel may finally be sent (the receiver can
         then safely reclaim its regions)."""
         self._send_grants(self._sched.release_local(local_offset))
+        self._settle_orphan_write(rid)
+
+    def _settle_orphan_write(self, rid: int) -> None:
+        """One deferred write of a failed request reached a terminal state
+        (or provably never became a write): decrement the rid's count and
+        send the deferred cancel-WANT once it reaches zero."""
         with self._req_mu:
             remaining = self._orphan_writes.get(rid, 0) - 1
             if remaining > 0:
@@ -1334,6 +1927,7 @@ class BounceReactor:
             requests = list(self._requests.values())
             self._requests.clear()
             self._completions.clear()
+            self._unrouted.clear()
             self._orphan_writes.clear()
             self._pending_cancels.clear()
         for req in requests:
@@ -1412,23 +2006,60 @@ class BounceReactor:
             return
         region_bytes = self._sched.region_bytes(offset)
         region_base = self._arena_base + offset
-        job = self._validate_and_expand_runs(
-            key, peer, header, runs, offset, region_base, region_bytes
-        )
-        if job is None:
-            # Bounds/size violation: no scatter, NO ACK (a false ACK would
-            # claim the data landed), but the region is released so it cannot
-            # leak — the sender times out. Still chunk-terminal for the flow
-            # accounting, or the _rx_flows entry would leak forever.
+        # Scatter validation check (1) — the granted region itself must lie
+        # inside the registered arena. Shared by BOTH scatter paths (the C++
+        # submit_scatter_runs sink validates checks (2)/(3); this one stays
+        # in Python, which owns the arena bounds).
+        if region_bytes <= 0 or region_base + region_bytes > self._arena_base + self._arena_bytes:
+            logger.warning(
+                f"bounce_v2({self._self_name}): DATA region out of arena bounds peer={peer} "
+                f"rid={header.request_id} region={offset}"
+            )
             self._flow_chunk_done(key)
             self._send_grants(self._sched.on_scatter_done(key, offset))
             return
-        self._bump("rx_data")
+        if self._submit_scatter_fn is None:
+            # Pure-Python fallback: validate + expand the runs here.
+            job = self._validate_and_expand_runs(
+                key, peer, header, runs, offset, region_base, region_bytes
+            )
+            if job is None:
+                # Bounds/size violation: no scatter, NO ACK (a false ACK
+                # would claim the data landed), but the region is released so
+                # it cannot leak — the sender times out. Still chunk-terminal
+                # for the flow accounting, or the _rx_flows entry would leak
+                # forever.
+                self._flow_chunk_done(key)
+                self._send_grants(self._sched.on_scatter_done(key, offset))
+                return
+            empty = job.srcs.shape[0] == 0
+        else:
+            # C++ scatter sink: hand the RAW wire runs to submit_scatter_runs
+            # (validation checks (2)/(3) + run expansion + plan fill + launch
+            # in ONE bound call). A validation failure surfaces as
+            # SCATTER_REJECTED from the launch below and takes the same
+            # no-ACK / release-region path (via _finish_scatter(ok=False)).
+            job = _ScatterJob(
+                key=key,
+                peer=peer,
+                rid=header.request_id,
+                chunk_idx=header.chunk_idx,
+                offset=offset,
+                runs=runs,
+                region_base=region_base,
+                region_bytes=region_bytes,
+            )
+            empty = runs.shape[0] == 0
         self._scattering[offset] = False
-        if job.srcs.shape[0] == 0:
+        if empty:
+            self._bump("rx_data")
             self._finish_scatter(job, ok=True)  # empty plan: vacuous success
             return
-        self._launch_scatter(job)
+        if self._launch_scatter(job):
+            # Launched / backlogged / launch-failed — but NOT validation-
+            # rejected, which must not count as accepted DATA (parity with
+            # the Python fallback, whose validation failure returns above).
+            self._bump("rx_data")
 
     def _validate_and_expand_runs(
         self,
@@ -1443,14 +2074,13 @@ class BounceReactor:
         """Bounds-check every scatter run against THIS flow's granted region
         (per-run: exact Python-int arithmetic — hostile u64 strides cannot
         wrap), then expand runs to per-piece (src, dst, size) arrays for the
-        copy op. Returns None on any violation (logged)."""
+        copy op. Returns None on any violation (logged). These are checks
+        (2) (run/piece counts vs the plan capacity) and (3) (per-run region
+        bounds) — check (1) (region vs arena) runs in _on_data. The compiled
+        pool's submit_scatter_runs replicates (2)/(3) in C++ (see
+        BatchedCopyPool::submitScatterRuns for the mapping); this Python
+        version remains the fallback for bindings without it."""
         n_runs = int(runs.shape[0])
-        if region_bytes <= 0 or region_base + region_bytes > self._arena_base + self._arena_bytes:
-            logger.warning(
-                f"bounce_v2({self._self_name}): DATA region out of arena bounds peer={peer} "
-                f"rid={header.request_id} region={offset}"
-            )
-            return None
         total_pieces = int(runs["count"].astype(np.uint64).sum())
         if n_runs > self._max_plan_entries or total_pieces > self._max_plan_entries:
             logger.warning(
@@ -1494,28 +2124,56 @@ class BounceReactor:
             sizes=sizes,
         )
 
-    def _launch_scatter(self, job: _ScatterJob) -> None:
+    def _submit_scatter(self, job: _ScatterJob) -> int:
+        """Submit one scatter job to the copy pool: the C++ raw-runs sink
+        when the job carries wire runs, the classic expanded-arrays call
+        otherwise. Returns the completion id, BUSY, or (raw-runs path only)
+        SCATTER_REJECTED."""
+        if job.runs is not None:
+            # A 1-D contiguous structured array views as one flat u8 blob of
+            # n*36 bytes — exactly the wire payload the binding expects.
+            return int(
+                self._submit_scatter_fn(job.region_base, job.region_bytes, job.runs.view(np.uint8))
+            )
+        return int(self._pool.submit_copy(job.srcs, job.dsts, job.sizes))
+
+    def _launch_scatter(self, job: _ScatterJob) -> bool:
+        """Launch (or backlog) one scatter job. Returns False only when the
+        C++ sink REJECTED the runs (bounds/size validation — details logged
+        in C++): the job is then terminal with the no-ACK semantics
+        (_finish_scatter(ok=False) releases the region and settles the flow
+        accounting without acking)."""
         try:
-            copy_id = self._pool.submit_copy(job.srcs, job.dsts, job.sizes)
+            copy_id = self._submit_scatter(job)
         except RuntimeError as e:
             logger.warning(
                 f"bounce_v2({self._self_name}): scatter launch failed rid={job.rid} "
                 f"chunk={job.chunk_idx}: {e}"
             )
             self._finish_scatter(job, ok=False)
-            return
+            return True
+        if copy_id == self._pool_rejected:
+            logger.warning(
+                f"bounce_v2({self._self_name}): scatter runs rejected by validation "
+                f"rid={job.rid} chunk={job.chunk_idx} region={job.offset}; no ACK"
+            )
+            self._finish_scatter(job, ok=False)
+            return False
         if copy_id == self._pool_busy:
-            self._scatter_backlog.append(job)  # retried next tick
-            return
+            self._scatter_backlog.append(job)  # retried next tick (raw runs kept)
+            return True
         with self._req_mu:
-            self._completions[copy_id] = ("scatter", job)
+            dispatches = self._register_route_locked(copy_id, ("scatter", job))
+        for cid, route, kind, ok in dispatches:
+            self._dispatch_row(route, cid, kind, bool(ok))
+        return True
 
     def _retry_scatter_backlog(self) -> bool:
         did_work = False
         while self._scatter_backlog:
             job = self._scatter_backlog[0]
             try:
-                copy_id = self._pool.submit_copy(job.srcs, job.dsts, job.sizes)
+                copy_id = self._submit_scatter(job)
             except RuntimeError as e:
                 logger.warning(
                     f"bounce_v2({self._self_name}): scatter launch failed rid={job.rid} "
@@ -1525,11 +2183,21 @@ class BounceReactor:
                 self._finish_scatter(job, ok=False)
                 did_work = True
                 continue
+            if copy_id == self._pool_rejected:
+                # Deterministically impossible on a retry (validation runs
+                # before the BUSY check and the inputs are unchanged), but
+                # handled defensively with the same no-ACK terminal.
+                self._scatter_backlog.popleft()
+                self._finish_scatter(job, ok=False)
+                did_work = True
+                continue
             if copy_id == self._pool_busy:
                 break
             self._scatter_backlog.popleft()
             with self._req_mu:
-                self._completions[copy_id] = ("scatter", job)
+                dispatches = self._register_route_locked(copy_id, ("scatter", job))
+            for cid, route, kind, ok in dispatches:
+                self._dispatch_row(route, cid, kind, bool(ok))
             did_work = True
         return did_work
 
@@ -1666,10 +2334,13 @@ class BounceReactor:
         no worse than the C++ drainForgets, which also cuts by peer name at
         execution time."""
         with self._req_mu:
-            for rid in victim_rids:
-                req = self._requests.get(rid)
-                if req is not None and req.peer == peer:
-                    self._fail_request_locked(rid, req, FAIL_PEER_DROPPED)
+            victims = [
+                (rid, self._requests[rid])
+                for rid in victim_rids
+                if rid in self._requests and self._requests[rid].peer == peer
+            ]
+        for rid, req in victims:
+            self._fail_request(rid, req, FAIL_PEER_DROPPED)
         # Purge the peer's queued scatters BEFORE computing the busy set (see
         # _purge_scatter_backlog's ordering contract).
         self._purge_scatter_backlog(lambda job: job.peer == peer)

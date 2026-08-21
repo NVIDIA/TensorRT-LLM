@@ -307,4 +307,117 @@ std::int64_t BatchedCopyPool::submitCopy(std::uint64_t const* srcs, std::uint64_
     }
 }
 
+std::int64_t BatchedCopyPool::submitScatterRuns(
+    std::uint64_t regionBase, std::uint64_t regionBytes, ScatterRunWire const* runs, std::size_t nRuns)
+{
+    // ---- validation: a check-by-check replica of the Python reactor's _validate_and_expand_runs
+    // (reactor.py), which guards against a malicious/corrupt DATA scattering outside the granted
+    // region. Mapping (Python -> here):
+    //   (1) region inside the arena (region_bytes <= 0 / region beyond arena end): stays in the
+    //       PYTHON caller — it owns the arena bounds and checks BEFORE calling this.
+    //   (2) n_runs > max_plan_entries or total_pieces > max_plan_entries: the two size checks
+    //       below (nRuns first so the summing loop is itself bounded).
+    //   (3) per run: count < 1, or bounce_offset > region_bytes, or
+    //       span = (count-1)*bounce_stride + piece_size > region_bytes - bounce_offset:
+    //       the per-run loop below. Arithmetic is exact like Python's int math: count,
+    //       bounceStride and pieceSize are u32, so (count-1)*stride + piece < 2^64 — the u64
+    //       span can never wrap, and bounceOffset <= regionBytes is established before the
+    //       regionBytes - bounceOffset subtraction.
+    // Destination addresses are NOT range-checked, exactly like the Python fallback: dst comes
+    // from the sender's plan against addresses the receiver handed out; the region checks above
+    // are the hostile-input guard.
+    if (nRuns > mMaxPlanEntries)
+    {
+        TLLM_LOG_WARNING("BatchedCopyPool::submitScatterRuns: rejected %zu runs (max %zu)", nRuns, mMaxPlanEntries);
+        return kScatterRejected;
+    }
+    std::uint64_t totalPieces = 0;
+    for (std::size_t i = 0; i < nRuns; ++i)
+    {
+        ScatterRunWire const& r = runs[i];
+        std::uint64_t const span
+            = static_cast<std::uint64_t>(r.count - 1) * r.bounceStride + static_cast<std::uint64_t>(r.pieceSize);
+        if (r.count < 1 || r.bounceOffset > regionBytes || span > regionBytes - r.bounceOffset)
+        {
+            TLLM_LOG_WARNING(
+                "BatchedCopyPool::submitScatterRuns: run %zu out of region bounds "
+                "(off=%llu span=%llu region=%llu count=%u)",
+                i, static_cast<unsigned long long>(r.bounceOffset), static_cast<unsigned long long>(span),
+                static_cast<unsigned long long>(regionBytes), r.count);
+            return kScatterRejected;
+        }
+        totalPieces += r.count;
+    }
+    if (totalPieces > mMaxPlanEntries)
+    {
+        TLLM_LOG_WARNING("BatchedCopyPool::submitScatterRuns: rejected %llu pieces over %zu runs (max %zu)",
+            static_cast<unsigned long long>(totalPieces), nRuns, mMaxPlanEntries);
+        return kScatterRejected;
+    }
+
+    Ctx* ctx = tryAcquire();
+    if (ctx == nullptr)
+    {
+        return kBusy; // every stream context busy — caller retries on its next tick
+    }
+    try
+    {
+        TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+
+        // Exact-count pass over the EXPANDED pieces (same budgeted <= 64 KiB splitting as
+        // submitCopy): the packed [srcs|dsts|sizes] pinned layout needs the total before the
+        // first write. `remaining` counts the pre-split pieces not yet appended, so splitBudget
+        // reserves one slot for each of them exactly like submitCopy's n - 1 - i.
+        std::size_t nTotal = 0;
+        std::size_t remaining = static_cast<std::size_t>(totalPieces);
+        for (std::size_t i = 0; i < nRuns; ++i)
+        {
+            for (std::uint32_t p = 0; p < runs[i].count; ++p)
+            {
+                --remaining;
+                nTotal += piecesFor(runs[i].pieceSize, splitBudget(nTotal, remaining, mMaxPlanEntries));
+            }
+        }
+        TLLM_CHECK_WITH_INFO(nTotal <= mMaxPlanEntries,
+            "BatchedCopyPool::submitScatterRuns: split plan (%zu) exceeds maxPlanEntries (%zu)", nTotal,
+            mMaxPlanEntries);
+
+        // Fill pass: expand each run to its pieces in place in the pinned plan buffer. The
+        // destination address dstAddr + p*dstStride intentionally wraps modulo 2^64 like the
+        // Python fallback's np.uint64 arithmetic (sources cannot wrap: bounds-checked above).
+        auto const bufs = planBufs(ctx->hostPinned, nTotal);
+        std::size_t idx = 0;
+        remaining = static_cast<std::size_t>(totalPieces);
+        for (std::size_t i = 0; i < nRuns; ++i)
+        {
+            ScatterRunWire const& r = runs[i];
+            for (std::uint32_t p = 0; p < r.count; ++p)
+            {
+                --remaining;
+                appendSplitInto(bufs, idx, regionBase + r.bounceOffset + static_cast<std::uint64_t>(p) * r.bounceStride,
+                    r.dstAddr + static_cast<std::uint64_t>(p) * r.dstStride, r.pieceSize,
+                    splitBudget(idx, remaining, mMaxPlanEntries));
+            }
+        }
+
+        std::size_t const b64 = nTotal * sizeof(std::uint64_t);
+        auto* base = static_cast<std::uint8_t*>(ctx->hostPinnedDev);
+        auto const* dSrcs = reinterpret_cast<std::uint64_t const*>(base);
+        auto const* dDsts = reinterpret_cast<std::uint64_t const*>(base + b64);
+        auto const* dSizes = reinterpret_cast<std::uint32_t const*>(base + 2 * b64);
+        TLLM_CUDA_CHECK(launchBatchedCopy(dSrcs, dDsts, dSizes, static_cast<std::uint32_t>(nTotal), ctx->stream));
+        TLLM_CUDA_CHECK(cudaEventRecord(ctx->event, ctx->stream));
+        return static_cast<std::int64_t>(mPoller.registerEvent(ctx->event, [this, ctx] { release(ctx); }));
+    }
+    catch (...)
+    {
+        // Same unwind contract as submitCopy: the launch may have succeeded before a later step
+        // threw — drain the stream so the recycled context cannot have a live kernel still
+        // reading its pinned plan buffer. Warn-only: we are already unwinding.
+        TLLM_CUDA_CHECK_WARN(cudaStreamSynchronize(ctx->stream));
+        release(ctx);
+        throw;
+    }
+}
+
 } // namespace tensorrt_llm::executor::kv_cache::bounce_v2
