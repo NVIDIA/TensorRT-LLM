@@ -2715,30 +2715,22 @@ class BlockManager:
 
 
 class KVCacheCompressionManager(BaseResourceManager):
-    """Framework-level base class for all KV-cache compression managers.
+    """Base for iteration-driven and storage-boundary KV compression."""
 
-    Inherits :class:`BaseResourceManager` so PyExecutor's main loop
-    auto-invokes ``prepare_resources`` / ``update_resources`` /
-    ``free_resources`` each iteration without any PyExecutor code changes; the
-    base implementations below translate those callbacks into the lifecycle
-    hooks.
+    uses_iteration_lifecycle = True
+    provides_cold_page_codec = False
 
-    Concrete compression methods subclass this directly. The hooks default to
-    no-op; subclasses override what they need. The manager never inherits from
-    any cache manager because this layer decides *how* the physical KV is used,
-    not *what* physical KV exists. Subclasses hold ``KVCacheManagerV2`` as a tool.
+    def __init__(self, config: "KvCacheCompressionConfig") -> None:
+        self.config = config
+        self.kv_cache_manager: Optional["KVCacheManagerV2"] = None
+        self.draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None
 
-    A subclass compacts through the ``KVCacheManagerV2`` it holds and records
-    the evicted count on ``LlmRequest.py_num_compressed_tokens``; the model
-    engine subtracts that count when building ``num_cached_tokens_per_seq``.
-    """
-
-    def __init__(
+    def bind_kv_cache_managers(
         self,
-        config: "KvCacheCompressionConfig",
         kv_cache_manager: "KVCacheManagerV2",
         draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
-    ):
+    ) -> None:
+        """Bind the target and optional draft KVCMs after their construction."""
         from .kv_cache_manager_v2 import KVCacheManagerV2
 
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
@@ -2750,15 +2742,26 @@ class KVCacheCompressionManager(BaseResourceManager):
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
         kv_cache_manager.kv_compression_manages_history = (
-            config.changes_physical_kv_length)
+            self.config.changes_physical_kv_length)
         if draft_kv_cache_manager is not None:
-            # The draft cache is compacted together with the target.
             draft_kv_cache_manager.kv_compression_manages_history = (
-                config.changes_physical_kv_length)
+                self.config.changes_physical_kv_length)
 
     @property
     def has_independent_draft_kv_cache(self) -> bool:
         return self.draft_kv_cache_manager is not None
+
+    def create_cold_page_codec(
+        self,
+        cache_config: object,
+        *,
+        runtime_dtype: DataType,
+        pp_layers: Sequence[int],
+        num_kv_heads_per_layer: Sequence[int],
+        head_dim_per_layer: Sequence[int],
+    ) -> Optional[object]:
+        """Create a native storage-boundary codec when the algorithm provides one."""
+        return None
 
     # ================================================================== #
     # KV-cache lifecycle hooks (5, in temporal order).                   #

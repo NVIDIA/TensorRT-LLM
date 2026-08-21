@@ -286,6 +286,59 @@ def test_build_capture_manifest_matches_committed_golden():
     _assert_committed_manifest_current(golden_manifest())
 
 
+def test_kv_cache_compression_discriminator_captures_both_algorithms():
+    """Flattened telemetry preserves both discriminator Literal values."""
+    from tensorrt_llm.llmapi.llm_args import (
+        ColdPageQuantizationCompressionConfig,
+        TorchLlmArgs,
+        TriAttentionKvCacheCompressionConfig,
+    )
+    from tensorrt_llm.usage.llmapi_config import (
+        build_capture_manifest,
+        collect_llm_api_config_payloads,
+    )
+
+    entry = next(
+        item
+        for item in build_capture_manifest(TorchLlmArgs)
+        if item.path == "kv_cache_compression_config.algorithm"
+    )
+    assert repr(entry.annotation) == (
+        "typing.Literal['quantization_for_cold_page', 'triattention']"
+    )
+    assert entry.converter == ""
+    assert set(entry.allowed_values) == {
+        "quantization_for_cold_page",
+        "triattention",
+    }
+    for config_cls, annotation in (
+        (
+            ColdPageQuantizationCompressionConfig,
+            "typing.Literal['quantization_for_cold_page']",
+        ),
+        (TriAttentionKvCacheCompressionConfig, "typing.Literal['triattention']"),
+    ):
+        field = config_cls.model_fields["algorithm"]
+        assert repr(field.annotation) == annotation
+
+    configs = (
+        ColdPageQuantizationCompressionConfig(),
+        TriAttentionKvCacheCompressionConfig(
+            calibration_path="/triattention.pt",
+        ),
+    )
+    for config in configs:
+        args = TorchLlmArgs(
+            model="/model",
+            kv_cache_compression_config=config,
+        )
+        config_json, metadata_json = collect_llm_api_config_payloads(args)
+        captured = json.loads(config_json)
+        metadata = json.loads(metadata_json)
+        assert captured["kv_cache_compression_config.algorithm"] == config.algorithm
+        assert metadata["capture_succeeded"] is True
+
+
 def test_load_generator_does_not_leak_sys_modules():
     """_load_generator must not leak its temporary module into sys.modules.
 

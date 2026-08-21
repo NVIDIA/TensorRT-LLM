@@ -22,6 +22,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
 endif()
 
 add_subdirectory(common)
+add_subdirectory(kv_cache_compression)
 add_subdirectory(kernels)
 add_subdirectory(multi_gpu)
 add_subdirectory(layers)

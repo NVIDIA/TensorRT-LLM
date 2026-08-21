@@ -17,6 +17,7 @@ set(SRCS
     executor/bindings.cpp
     executor/executorConfig.cpp
     executor/request.cpp
+    kvCacheCompression/bindings.cpp
     process_group/bindings.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp
