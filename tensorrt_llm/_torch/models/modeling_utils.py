@@ -605,6 +605,7 @@ class DecoderModelForCausalLM(nn.Module,
             if quant_config.exclude_modules is not None:
                 for name, module in self.named_modules():
                     candidates = [name]
+                    moe_expert_exclusions = None
                     if isinstance(module, Linear):
                         weight_mode = module.weights_loading_config.weight_mode
                         if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
@@ -622,9 +623,54 @@ class DecoderModelForCausalLM(nn.Module,
                                 name.replace('qkv_proj', 'k_proj'),
                                 name.replace('qkv_proj', 'v_proj')
                             ]
+                    elif isinstance(module, (MoE, VanillaMoE)):
+                        # Fused MoE: a checkpoint's ignore list names the
+                        # per-expert weights (re:...experts.[0-9]+.gate_proj),
+                        # but the fused module has no per-expert child, so such
+                        # a rule never matches and those experts get quantized
+                        # despite being bf16 in the checkpoint. Probe every
+                        # expert index so a rule targeting any single expert
+                        # (not only expert 0) is honoured.
+                        #
+                        # Strip a trailing ".backend" for these synthesized
+                        # candidates: ConfigurableMoE wraps the module that owns
+                        # the weights, so a synthesized name must point at the
+                        # backend (create_weights() delegates to it). A plain
+                        # rule naming the wrapper already reaches the backend via
+                        # is_module_excluded_from_quantization's ancestor walk,
+                        # so the strip is only needed here.
+                        base = (name[:-len('.backend')]
+                                if name.endswith('.backend') else name)
+                        num_experts = getattr(module, 'num_experts', None)
+                        expert_ids = (range(num_experts)
+                                      if isinstance(num_experts, int)
+                                      and num_experts > 0 else [0])
+                        moe_expert_exclusions = [
+                            any(
+                                quant_config.
+                                is_module_excluded_from_quantization(
+                                    f'{base}.{e}.{proj}')
+                                for proj in ('gate_proj', 'up_proj',
+                                             'down_proj')) for e in expert_ids
+                        ]
                     is_excluded = any(
                         quant_config.is_module_excluded_from_quantization(n)
                         for n in candidates)
+                    if moe_expert_exclusions is not None:
+                        n_excluded = sum(moe_expert_exclusions)
+                        if 0 < n_excluded < len(moe_expert_exclusions):
+                            # A fused MoE shares one quant config across all
+                            # experts, so a partial ignore list cannot be
+                            # honoured per-expert. Treat the module as excluded
+                            # (never leave a bf16 expert quantized) but warn so
+                            # the partial list is visible rather than silently
+                            # rounded to all-or-nothing.
+                            logger.warning(
+                                f"Quantization ignore list excludes "
+                                f"{n_excluded}/{len(moe_expert_exclusions)} "
+                                f"experts of fused module '{base}'; treating "
+                                f"the whole module as excluded.")
+                        is_excluded = is_excluded or n_excluded > 0
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
