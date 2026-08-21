@@ -434,11 +434,11 @@ class _VideoRoutesMixin:
                     await VIDEO_STORE.upsert(video_id, job)
                 return
 
-            # Generation finished, encoding starts: expose the transition so
-            # clients can measure pure generation time on their side.
+            # Generation finished, postprocessing starts: expose the transition
+            # so clients can measure pure generation time on their side.
             job = await VIDEO_STORE.get(video_id)
             if job:
-                job.status = "encoding"
+                job.status = "postprocessing"
                 await VIDEO_STORE.upsert(video_id, job)
 
             if is_tensor_format(request.format):
@@ -461,8 +461,8 @@ class _VideoRoutesMixin:
                 )
                 if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
                     # Offload the blocking encode to a thread so the event loop
-                    # stays responsive during ``encoding`` — pollers can observe
-                    # the state and other requests progress while it encodes.
+                    # stays responsive during ``postprocessing`` — pollers can
+                    # observe the state and other requests progress meanwhile.
                     saved_paths = await asyncio.get_running_loop().run_in_executor(
                         None, lambda: output.save(paths_in, **_save_kwargs)
                     )
