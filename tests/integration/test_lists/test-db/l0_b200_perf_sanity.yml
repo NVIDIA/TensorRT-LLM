@@ -14,7 +14,7 @@ l0_b200_perf_sanity:
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: pytorch
       orchestrator: mpi
   tests:
