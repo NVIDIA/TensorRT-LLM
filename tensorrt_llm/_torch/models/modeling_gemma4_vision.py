@@ -50,8 +50,8 @@ from transformers.activations import ACT2FN
 from tensorrt_llm._utils import maybe_pin_memory
 
 from ..attention.attention import Attention
-from ..attention_backend.interface import AttentionMetadata, PredefinedAttentionMask
-from ..attention_backend.utils import get_attention_backend
+from ..attention.backends.interface import AttentionMetadata, PredefinedAttentionMask
+from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.linear import Linear
 from .modeling_multimodal_encoder import MultimodalEncoderMixin

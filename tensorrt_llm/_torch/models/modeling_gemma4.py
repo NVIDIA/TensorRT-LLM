@@ -36,12 +36,12 @@ from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (
+from ..attention.backends import (
     AttentionMetadata,
     FlashInferAttentionMetadata,
     TrtllmAttentionMetadata,
 )
-from ..attention_backend.interface import (
+from ..attention.backends.interface import (
     AttentionMask,
     CustomAttentionMask,
     PositionalEmbeddingParams,

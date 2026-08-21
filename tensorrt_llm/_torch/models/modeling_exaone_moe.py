@@ -28,8 +28,8 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,

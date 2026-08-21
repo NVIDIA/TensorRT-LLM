@@ -27,21 +27,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
-from ..attention_backend import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    AttentionMetadata,
-    FlashInferAttentionMetadata,
-    TrtllmAttention,
-    TrtllmAttentionMetadata,
-)
-from ..attention_backend.interface import (
-    AttentionBackend,
-    PositionalEmbeddingParams,
-    PredefinedAttentionMask,
-)
-from ..attention_backend.sparse.hooks import get_sparse_mla_hooks
-from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
@@ -62,6 +47,17 @@ from .attention import (
     _helix_zero_kv_mask,
     extract_extra_attrs,
 )
+from .backends import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    AttentionMetadata,
+    FlashInferAttentionMetadata,
+    TrtllmAttention,
+    TrtllmAttentionMetadata,
+)
+from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
+from .backends.sparse.hooks import get_sparse_mla_hooks
+from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
 
 

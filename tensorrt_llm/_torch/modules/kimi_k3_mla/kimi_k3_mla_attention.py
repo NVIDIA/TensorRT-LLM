@@ -20,9 +20,9 @@ from ....functional import PositionEmbeddingType
 from ....logger import logger
 from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
+from ...attention.backends import TrtllmAttention, TrtllmAttentionMetadata
+from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ...attention.mla import MLA
-from ...attention_backend import TrtllmAttention, TrtllmAttentionMetadata
-from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
 

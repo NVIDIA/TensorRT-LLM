@@ -29,7 +29,7 @@ from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftma
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ....attention_backend.interface import PredefinedAttentionMask
+from ....attention.backends.interface import PredefinedAttentionMask
 from ..interface import AttentionBackend, AttentionTensorLayout
 
 _cute_dsl_import_error: BaseException | None = None

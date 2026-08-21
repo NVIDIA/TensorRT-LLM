@@ -51,8 +51,8 @@ from typing import List, Optional
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import TrtllmAttention
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     AttentionRuntimeFeatures,
     MLAParams,
@@ -681,8 +681,8 @@ def _build_dsa_ctx(case: AttnCase, device: torch.device):
 
     Pure prefill: batch_size requests of seq_len new tokens, no cached tokens.
     """
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
-    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManager
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 
     sparse_config = _dsa_sparse_config(case)
     model_config = _dsa_model_config(sparse_config)

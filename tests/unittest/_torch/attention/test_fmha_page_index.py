@@ -11,14 +11,14 @@ from typing import TypeAlias
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.fmha.cute_dsl_mla import CuteDslMlaFmha
-from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
+from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
+from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
     _get_multi_ctas_kv_counter_size,
 )
-from tensorrt_llm._torch.attention_backend.fmha.interface import _CuteDslMlaStagingKey
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.fmha.interface import _CuteDslMlaStagingKey
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner
 
 
@@ -101,7 +101,7 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
         raise RuntimeError("counter size arguments observed")
 
     monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen."
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen."
         "_get_multi_ctas_kv_counter_size",
         check_counter_size_args,
     )

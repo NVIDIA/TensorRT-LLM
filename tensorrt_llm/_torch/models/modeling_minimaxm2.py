@@ -24,8 +24,8 @@ from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.attention import Attention
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduce, MiniMaxAllReduceRMS
 from ..models.modeling_utils import ModelConfig
 from ..modules.decoder_layer import DecoderLayer

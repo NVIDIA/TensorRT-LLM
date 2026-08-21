@@ -12,8 +12,8 @@ The PyTorch oracle is ported from the vLLM reference linked in the file header
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import _cutedsl_score
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _cutedsl_score
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
@@ -273,7 +273,7 @@ def test_index_decode_score_matches_msa_proxy(dtype):
     read off the MMA accumulator before the softmax scale, which in
     output_maxscore mode is never applied, so the values compare directly.
     """
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import _proxy_max_score
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _proxy_max_score
 
     seq_lens = [1025, 4097, 300]
     idx_q, k_cache, block_table, seq_lens_dev, backing, score, _ = _make_inputs(

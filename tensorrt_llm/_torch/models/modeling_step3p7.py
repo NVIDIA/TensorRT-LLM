@@ -45,8 +45,8 @@ from transformers import PretrainedConfig
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention.attention import Attention
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,

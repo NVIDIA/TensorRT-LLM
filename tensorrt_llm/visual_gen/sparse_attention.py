@@ -69,7 +69,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     )
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
         )
@@ -132,7 +132,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         ckpt_sparse_attention_config: Optional[Dict[str, Any]],
     ) -> bool:
         """Return whether skip-softmax should be disabled for this layer."""
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_ignore_from_ckpt_sparse_attention_config,
         )
 
@@ -167,7 +167,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
         sparsity = self.target_sparsity
         if sparsity is None:
-            from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+            from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
                 skip_softmax_target_sparsity_from_ckpt_sparse_attention_config,
             )
 
@@ -184,7 +184,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if sparsity is None:
             return None
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_formula_from_ckpt_sparse_attention_config,
         )
 

@@ -26,11 +26,12 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionMetadata, FlashInferAttentionMetadata,
-                                 TrtllmAttentionMetadata)
-from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
-                                           PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.backends import (AttentionMetadata,
+                                  FlashInferAttentionMetadata,
+                                  TrtllmAttentionMetadata)
+from ..attention.backends.interface import (AttentionMask, CustomAttentionMask,
+                                            PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer

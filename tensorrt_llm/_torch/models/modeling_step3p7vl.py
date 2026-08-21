@@ -48,9 +48,9 @@ from ...inputs import (
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.attention import Attention
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PredefinedAttentionMask
-from ..attention_backend.utils import get_attention_backend
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
+from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear

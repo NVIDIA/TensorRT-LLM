@@ -25,13 +25,13 @@ from transformers import PretrainedConfig
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention.attention import _helix_cp_allgather_input, _helix_cp_output_projection
-from ..attention.qk_norm_attention import QKNormRoPEAttention
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
+from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import AllReduce, AllReduceParams
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
