@@ -33,6 +33,7 @@ GB = 1 << 30
 def _make_creator(
     max_gpu_total_bytes: int,
     host_cache_size=None,
+    disk_cache_size=None,
     total_kv_per_token: int = 100,
     target_kv_per_token: int = 80,
     total_kv_intercept: int = 0,
@@ -47,16 +48,23 @@ def _make_creator(
     """
     c = object.__new__(KvCacheCreator)
 
-    c._kv_cache_config = KvCacheConfig(
+    config_kwargs = dict(
         max_gpu_total_bytes=max_gpu_total_bytes,
         host_cache_size=host_cache_size,
     )
+    if disk_cache_size is not None:
+        config_kwargs.update(
+            disk_cache_size=disk_cache_size,
+            disk_cache_path="/tmp",
+        )
+    c._kv_cache_config = KvCacheConfig(**config_kwargs)
     c._tokens_per_block = 64
     c._max_seq_len = 1024
     c._max_batch_size = 1
     c._speculative_config = None
     c._mapping = Mock()
     c._model_engine = Mock()
+    c._llm_args = SimpleNamespace(kv_cache_compression_config=None)
 
     c._kv_cache_manager_cls = Mock()
     c._kv_cache_manager_cls.get_cache_size_per_token = Mock(
@@ -412,6 +420,26 @@ class TestSplitHostCacheBudgetForDraft:
         assert (target_config.host_cache_size + draft_config.host_cache_size) == total_host
         assert c._kv_cache_config.max_gpu_total_bytes == total_gpu
         assert c._kv_cache_config.host_cache_size == total_host
+
+
+class TestSplitDiskCacheBudgetForDraft:
+    def test_disk_budget_is_split_without_duplication(self):
+        total_disk = 40 * GB
+        c = _make_creator(
+            max_gpu_total_bytes=10 * GB,
+            disk_cache_size=total_disk,
+            total_kv_per_token=100,
+            target_kv_per_token=80,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("disk_cache_size")
+
+        assert draft_config is not None
+        assert target_config.disk_cache_size == 32 * GB
+        assert draft_config.disk_cache_size == 8 * GB
+        assert target_config.disk_cache_size + draft_config.disk_cache_size == total_disk
+        assert target_config.disk_cache_path == draft_config.disk_cache_path == "/tmp"
+        assert c._kv_cache_config.disk_cache_size == total_disk
 
 
 class TestHostSplitIgnoresGpuFixedCost:

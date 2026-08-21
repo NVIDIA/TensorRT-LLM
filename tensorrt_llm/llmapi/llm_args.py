@@ -3667,9 +3667,10 @@ class KvCacheCompressionConfig(StrictBaseModel):
     algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
 
     Kept separate from SparseAttentionConfig by design -- compression changes
-    which KV is stored, not the attention computation. The manager is registered
-    as a resource manager in create_py_executor (_util.py), like the KV cache
-    manager itself. Concrete algorithms subclass this and add their parameters.
+    which KV is stored, not the attention computation. Iteration-driven methods
+    use the resource-manager cycle; storage-boundary managers provide a native
+    codec that KVCacheManagerV2 retains and invokes. Concrete algorithms
+    subclass this and add their parameters.
     """
 
     changes_physical_kv_length: ClassVar[bool] = False
@@ -3686,6 +3687,30 @@ class KvCacheCompressionConfig(StrictBaseModel):
 
     def supports_speculative_decoding(self) -> bool:
         return False
+
+
+class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
+    """Quantize Host and Disk KV pages without changing the active GPU cache."""
+
+    algorithm: Literal["quantization_for_cold_page"] = "quantization_for_cold_page"
+    quant: Literal["nvfp4"] = Field(
+        default="nvfp4",
+        description="Quantization format stored in the compressed cache tier.")
+    scale_checkpoint_path: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        telemetry=False,
+        description=
+        "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
+        "K/V global scales. Omit it to use identity global scales.")
+
+    def supports_block_reuse(self) -> bool:
+        # Compression changes representation and residency, not token identity.
+        return True
+
+    def supports_speculative_decoding(self) -> bool:
+        # Each target or draft KVCM encodes its own pages at the storage boundary.
+        return True
 
 
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
@@ -3740,7 +3765,8 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
 
 KvCacheCompressionConfigType: TypeAlias = Annotated[
-    Union[TriAttentionKvCacheCompressionConfig],
+    Union[ColdPageQuantizationCompressionConfig,
+          TriAttentionKvCacheCompressionConfig],
     Field(discriminator="algorithm"),
 ]
 

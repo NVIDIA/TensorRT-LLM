@@ -107,6 +107,7 @@ def _make_manager_for_cache_tier_test(
     impl_side_effect: list[object],
     *,
     add_secondary_gpu_tier: bool = False,
+    cold_page_codec_provider: object | None = None,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
 
@@ -164,6 +165,7 @@ def _make_manager_for_cache_tier_test(
             dtype=DataType.HALF,
             vocab_size=16,
             execution_stream=Mock(),
+            cold_page_codec_provider=cold_page_codec_provider,
         )
     return manager, impl_constructor
 
@@ -359,6 +361,34 @@ def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
         HostCacheTierConfig,
         DiskCacheTierConfig,
     ]
+    assert [type(tier) for tier in fallback_tiers] == [
+        GpuCacheTierConfig,
+        DiskCacheTierConfig,
+    ]
+
+
+def test_host_init_fallback_recreates_cold_codec_and_keeps_disk(tmp_path) -> None:
+    impl = Mock()
+    codecs = [object(), object()]
+    codec_provider = Mock()
+    codec_provider.create_cold_page_codec.side_effect = codecs
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+            disk_cache_size=16 << 20,
+            disk_cache_path=str(tmp_path),
+        ),
+        [_CacheTierInitError("host tier init failed"), impl],
+        cold_page_codec_provider=codec_provider,
+    )
+
+    assert manager.can_evict
+    assert codec_provider.create_cold_page_codec.call_count == 2
+    assert impl_constructor.call_count == 2
+    assert impl_constructor.call_args_list[0].kwargs["cold_page_codec"] is codecs[0]
+    assert impl_constructor.call_args_list[1].kwargs["cold_page_codec"] is codecs[1]
+    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
     assert [type(tier) for tier in fallback_tiers] == [
         GpuCacheTierConfig,
         DiskCacheTierConfig,

@@ -305,9 +305,10 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     The single source of truth. Type-safe annotations auto-enroll; str/Any
     allowlist escape hatches opt in; telemetry=False opts out. Recurses into
     statically reachable nested BaseModels with a cycle guard. Collapses
-    duplicate keys (shared union-arm base fields): keeps the first by
-    (key, defining_class), unions allowed_values across arms, and FAILS if two
-    arms give a key a different kind.
+    duplicate keys (shared union-arm base fields): unions Literal annotations
+    and allowed_values across arms, and FAILS if two arms give a key a
+    different kind. Other duplicate annotations retain the first deterministic
+    representative.
     """
     rows: list[dict[str, Any]] = []
 
@@ -339,6 +340,7 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
 
     rows.sort(key=lambda r: (r["key"], r["defining"]))
     first: dict[str, dict] = {}
+    union_annotations: dict[str, list[Any]] = {}
     union_allowed: dict[str, list[str]] = {}
     for r in rows:
         if r["key"] not in first:
@@ -348,15 +350,27 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
                 f"telemetry manifest: key '{r['key']}' has conflicting kinds "
                 f"across union arms: {first[r['key']]['kind']} vs {r['kind']}"
             )
+        annotations = union_annotations.setdefault(r["key"], [])
+        if r["annotation"] not in annotations:
+            annotations.append(r["annotation"])
         seen = union_allowed.setdefault(r["key"], [])
         for v in r["allowed"]:
             if v not in seen:
                 seen.append(v)
 
+    def merged_annotation(key: str) -> Any:
+        annotations = union_annotations[key]
+        if len(annotations) > 1 and all(_is_literal(ann) for ann in annotations):
+            values = tuple(
+                value for ann in annotations for value in get_args(ann)
+            )
+            return Literal[values]
+        return annotations[0]
+
     entries = [
         _ManifestEntry(
             path=key,
-            annotation=r["annotation"],
+            annotation=merged_annotation(key),
             kind=r["kind"],
             converter=r["converter"],
             allowed_values=tuple(union_allowed[key]),

@@ -299,7 +299,7 @@
         "decode",
         "encode"
       ],
-      "annotation": "Literal['decode']",
+      "annotation": "Literal['decode', 'encode']",
       "converter": "",
       "kind": "categorical",
       "path": "cuda_graph_config.mode"
@@ -631,9 +631,10 @@
     },
     {
       "allowed_values": [
+        "quantization_for_cold_page",
         "triattention"
       ],
-      "annotation": "Literal['triattention']",
+      "annotation": "Literal['quantization_for_cold_page', 'triattention']",
       "converter": "",
       "kind": "categorical",
       "path": "kv_cache_compression_config.algorithm"
@@ -669,6 +670,15 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
+      "allowed_values": [
+        "nvfp4"
+      ],
+      "annotation": "Literal['nvfp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.quant"
     },
     {
       "allowed_values": [],
@@ -1548,7 +1558,7 @@
         "rocket",
         "skip_softmax"
       ],
-      "annotation": "Literal['dsa']",
+      "annotation": "Literal['dsa', 'deepseek_v4', 'minimax_m3', 'rocket', 'skip_softmax']",
       "converter": "",
       "kind": "categorical",
       "path": "sparse_attention_config.algorithm"
@@ -1862,7 +1872,7 @@
         "SaveState",
         "User_Provided"
       ],
-      "annotation": "Literal['AUTO']",
+      "annotation": "Literal['AUTO', 'DFlash', 'DSpark', 'Draft_Target', 'Eagle3', 'Eagle', 'Lookahead', 'MTP', 'Medusa', 'NGram', 'PARD', 'SA', 'SaveState', 'User_Provided']",
       "converter": "",
       "kind": "categorical",
       "path": "speculative_config.decoding_type"

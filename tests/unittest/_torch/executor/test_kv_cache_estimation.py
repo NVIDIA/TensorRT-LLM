@@ -947,8 +947,13 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
             return_value=Mock(),
         ) as create_manager,
     ):
-        creator._create_one_model_draft_kv_cache_manager(creator._max_seq_len)
+        codec_provider = object()
+        creator._create_one_model_draft_kv_cache_manager(
+            creator._max_seq_len,
+            cold_page_codec_provider=codec_provider,
+        )
 
     draft_config = create_manager.call_args.kwargs["kv_cache_config"]
     assert draft_config.pool_ratio == [1.0]
+    assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio
