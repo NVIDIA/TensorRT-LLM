@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import (
     classify_worker_error,
+    make_noise_generator,
     postprocess_video_tensor,
     synchronize_media_prepare_status,
 )
@@ -1265,7 +1266,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if text_blocked.item():
             return PipelineOutput()
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed)
 
         if negative_prompt is None:
             negative_prompt = default_negative_prompt(output_type)

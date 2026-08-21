@@ -11,6 +11,20 @@ from torch.distributed import ProcessGroup
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
 
+def make_noise_generator(seed: int) -> torch.Generator:
+    """Create the CPU RNG used to sample a pipeline's initial noise.
+
+    Returns a **CPU** generator because an on-device CUDA generator is not
+    identical across GPU archs (``torch.randn`` on CUDA keys its Philox stream to
+    an SM-count-dependent thread grid, so e.g. sm_100 and sm_107 yield different
+    latents for the same seed). Callers sample with this generator on CPU and copy
+    the result to the device -- ``diffusers.randn_tensor`` does this automatically
+    -- which makes cross-architecture output comparison valid at the cost of one
+    small host draw plus an H2D copy.
+    """
+    return torch.Generator(device="cpu").manual_seed(seed)
+
+
 @torch.compile
 def postprocess_video_tensor(video: torch.Tensor) -> torch.Tensor:
     """Post-process video tensor from VAE decoder output to final format.

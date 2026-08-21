@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import safetensors.torch
 import torch
 import torch.distributed as dist
+from diffusers.utils.torch_utils import randn_tensor
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
@@ -22,7 +23,7 @@ from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CU
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
@@ -1481,7 +1482,7 @@ class LTX2Pipeline(BasePipeline):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed)
 
         # Build guider params
         video_guider_params = MultiModalGuiderParams(
@@ -1607,7 +1608,7 @@ class LTX2Pipeline(BasePipeline):
         self.transformer.configure_audio_ulysses(audio_shape.frames)
 
         # ---- 4. Generate initial noise / image conditioning ---------------
-        latents = torch.randn(
+        latents = randn_tensor(
             video_shape.to_torch_shape(),
             generator=generator,
             device=self.device,
@@ -1637,7 +1638,9 @@ class LTX2Pipeline(BasePipeline):
             )
             mask_5d[:, :, :1, :, :] = 1.0 - cond_strength
 
-            noise = torch.randn_like(latents)
+            noise = randn_tensor(
+                latents.shape, generator=generator, device=latents.device, dtype=latents.dtype
+            )
             latents = noise * mask_5d + latents * (1.0 - mask_5d)
 
             # Token-space mask for per-token timesteps (after patchification)
@@ -1660,7 +1663,7 @@ class LTX2Pipeline(BasePipeline):
 
         latents = self.video_patchifier.patchify(latents)
 
-        audio_latents = torch.randn(
+        audio_latents = randn_tensor(
             audio_shape.to_torch_shape(),
             generator=generator,
             device=self.device,
@@ -1686,8 +1689,9 @@ class LTX2Pipeline(BasePipeline):
         )
 
         # ---- 6. Prepare scheduler / timesteps ---------------------------
-        latents_5d = torch.randn(
+        latents_5d = randn_tensor(
             video_shape.to_torch_shape(),
+            generator=generator,
             device=self.device,
         )
         self.scheduler.set_timesteps(num_inference_steps, latent=latents_5d)

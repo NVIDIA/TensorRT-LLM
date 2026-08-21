@@ -27,6 +27,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
 from .transformer_qwen_image import QwenImageTransformer2DModel
@@ -560,7 +561,7 @@ class QwenImagePipeline(BasePipeline):
         )
 
         device = self.device
-        generator = torch.Generator(device=device).manual_seed(seed)
+        generator = make_noise_generator(seed)
 
         # Text encoding.
         logger.info("Encoding prompt...")
