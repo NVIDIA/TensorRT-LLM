@@ -48,7 +48,7 @@ if(NIXL_ROOT)
   # whenever zmq is available, INDEPENDENT of ENABLE_UCX. cppzmq (header-only)
   # is fetched at the top level when NIXL or UCX is on. Activates the
   # TLLM_BOUNCE_V2 code paths; runtime use is still opt-in via
-  # TRTLLM_NIXL_BOUNCE_ENABLE.
+  # CacheTransceiverConfig.agent_buffer_size_mb.
   # ------------------------------------------------------------------------
   find_package(PkgConfig)
   if(PKG_CONFIG_FOUND)
