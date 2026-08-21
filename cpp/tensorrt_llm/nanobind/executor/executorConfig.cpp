@@ -303,11 +303,12 @@ void initConfigBindings(nb::module_& m)
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
     {
         return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getKvTransferTimeoutMs(),
-            self.getKvTransferSenderFutureTimeoutMs(), self.getKvTransferPollIntervalMs(), self.getAgentBufferEnable());
+            self.getKvTransferSenderFutureTimeoutMs(), self.getKvTransferPollIntervalMs(), self.getAgentBufferSizeMb(),
+            self.getAgentBounceParams());
     };
     auto cacheTransceiverConfigSetstate = [](tle::CacheTransceiverConfig& self, nb::tuple const& state)
     {
-        if (state.size() < 3 || state.size() > 6)
+        if (state.size() < 3 || state.size() > 7)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
@@ -316,12 +317,21 @@ void initConfigBindings(nb::module_& m)
         auto kvTransferPollIntervalMs = state.size() >= 5
             ? nb::cast<std::optional<int>>(state[4])
             : std::optional<int>{tle::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs};
-        auto agentBufferEnable
-            = state.size() >= 6 ? nb::cast<std::optional<bool>>(state[5]) : std::optional<bool>{std::nullopt};
+        // Older pickles stored the retired Optional[bool] agent_buffer_enable at index 5.
+        // convert=false accepts only an exact int (the new format): a legacy True would otherwise
+        // be number-converted to 1 and silently enable bounce with a 1 MiB arena. Legacy
+        // True/False/None all fall back to 0 (bounce off) instead of throwing.
+        size_t agentBufferSizeMb = 0;
+        if (state.size() >= 6 && !nb::try_cast<size_t>(state[5], agentBufferSizeMb, /*convert=*/false))
+        {
+            agentBufferSizeMb = 0;
+        }
+        auto agentBounceParams = state.size() >= 7 ? nb::cast<std::map<std::string, std::string>>(state[6])
+                                                   : std::map<std::string, std::string>{};
         auto backendType = nb::cast<std::optional<tle::CacheTransceiverConfig::BackendType>>(state[0]);
         new (&self) tle::CacheTransceiverConfig(backendType, nb::cast<std::optional<size_t>>(state[1]),
             nb::cast<std::optional<int>>(state[2]), kvTransferSenderFutureTimeoutMs, kvTransferPollIntervalMs,
-            agentBufferEnable);
+            agentBufferSizeMb, std::move(agentBounceParams));
     };
 
     nb::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
@@ -347,13 +357,14 @@ void initConfigBindings(nb::module_& m)
             });
 
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
-                 std::optional<int>, std::optional<int>, std::optional<int>, std::optional<bool>>(),
+        .def(
+            nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>, std::optional<int>,
+                std::optional<int>, std::optional<int>, size_t, std::map<std::string, std::string>>(),
             nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt,
             nb::arg("kv_transfer_timeout_ms") = std::nullopt,
             nb::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt,
             nb::arg("kv_transfer_poll_interval_ms") = tle::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs,
-            nb::arg("agent_buffer_enable") = std::nullopt)
+            nb::arg("agent_buffer_size_mb") = 0, nb::arg("agent_bounce_params") = std::map<std::string, std::string>{})
         .def_prop_rw(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
@@ -365,8 +376,10 @@ void initConfigBindings(nb::module_& m)
             &tle::CacheTransceiverConfig::setKvTransferSenderFutureTimeoutMs)
         .def_prop_rw("kv_transfer_poll_interval_ms", &tle::CacheTransceiverConfig::getKvTransferPollIntervalMs,
             &tle::CacheTransceiverConfig::setKvTransferPollIntervalMs)
-        .def_prop_rw("agent_buffer_enable", &tle::CacheTransceiverConfig::getAgentBufferEnable,
-            &tle::CacheTransceiverConfig::setAgentBufferEnable)
+        .def_prop_rw("agent_buffer_size_mb", &tle::CacheTransceiverConfig::getAgentBufferSizeMb,
+            &tle::CacheTransceiverConfig::setAgentBufferSizeMb)
+        .def_prop_rw("agent_bounce_params", &tle::CacheTransceiverConfig::getAgentBounceParams,
+            &tle::CacheTransceiverConfig::setAgentBounceParams)
         .def("__getstate__", cacheTransceiverConfigGetstate)
         .def("__setstate__", cacheTransceiverConfigSetstate);
 }

@@ -33,7 +33,9 @@ target_sources(bounceTransferPlanTest
                PRIVATE ${BOUNCE_DIR}/BounceTransferPlan.cpp)
 add_gtest(bounceMessageCodecTest bounceMessageCodecTest.cpp)
 target_sources(bounceMessageCodecTest PRIVATE ${BOUNCE_DIR}/BounceMessage.cpp)
-# Header-only: env-var parsing (byte-size suffixes, garbage fallback).
+# Header-only: knob resolution (agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_*
+# env > default), byte-size suffixes, garbage fallback, derived-timeout
+# invariants.
 add_gtest(bounceConfigTest bounceConfigTest.cpp)
 add_gtest(buddyAllocatorTest buddyAllocatorTest.cpp)
 target_sources(buddyAllocatorTest PRIVATE ${BOUNCE_DIR}/BuddyAllocator.cpp)

@@ -1028,11 +1028,17 @@ def run_transfer_test(
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
         # Keep the Python-native bounce layer disabled. Dedicated C++ bounce
-        # coverage enables the NIXL agent's bounce v2 through agent_buffer_enable,
-        # which exercises the config plumbing end-to-end (the expert tuning knobs
-        # stay on TRTLLM_NIXL_BOUNCE_* environment variables).
+        # coverage enables the NIXL agent's bounce v2 through agent_buffer_size_mb
+        # (0 keeps it off) plus agent_bounce_params, which exercises the config
+        # plumbing end-to-end.
         kv_cache_bounce_size_mb=0,
-        agent_buffer_enable=True if expect_cpp_bounce else None,
+        agent_buffer_size_mb=64 if expect_cpp_bounce else 0,
+        agent_bounce_params={
+            "min_descriptor_count": "1",
+            "max_average_descriptor_size": "1MB",
+        }
+        if expect_cpp_bounce
+        else None,
     )
     ctx_tcs = create_instance_transceivers(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
@@ -1629,12 +1635,10 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         {
             _NIXL_BOUNCE_SUBPROCESS_ENV: "1",
             "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
-            # Bounce is enabled via CacheTransceiverConfig.agent_buffer_enable inside
-            # run_transfer_test (not TRTLLM_NIXL_BOUNCE_ENABLE), covering the config
-            # path end-to-end; only the expert tuning knobs ride the environment.
-            "TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES": "64MB",
-            "TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT": "1",
-            "TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES": "1MB",
+            # Bounce is enabled (arena size) and tuned (expert knobs) via
+            # CacheTransceiverConfig.agent_buffer_size_mb / agent_bounce_params inside
+            # run_transfer_test — no TRTLLM_NIXL_BOUNCE_* environment variables —
+            # covering the config path end-to-end.
             # Pin the transport deterministically: the child would otherwise inherit
             # developer/CI UCX settings (an injected UCX_NET_DEVICES or differing
             # UCX_TLS can fail the transfer or oversubscribe CPUs).

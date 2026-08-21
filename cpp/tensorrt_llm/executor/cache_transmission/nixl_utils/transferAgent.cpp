@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cstdlib>
 #include <cuda.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -58,8 +59,8 @@ namespace tensorrt_llm::executor::kv_cache
 {
 
 // ============================================================================
-// Bounce v2 integration (opt-in via TRTLLM_NIXL_BOUNCE_ENABLE). When disabled, transfers remain on
-// the standard NIXL path.
+// Bounce v2 integration (opt-in via CacheTransceiverConfig.agent_buffer_size_mb). When disabled,
+// transfers remain on the standard NIXL path.
 // ============================================================================
 #ifdef TLLM_BOUNCE_V2
 namespace bounce
@@ -138,19 +139,37 @@ private:
 };
 } // namespace
 
-void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
+void NixlTransferAgent::maybeInitBounce(
+    std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams)
 {
-    auto cfg = bounce::BounceConfig::fromEnv();
-    // An explicit agent_buffer_enable from CacheTransceiverConfig / BaseAgentConfig overrides the
-    // TRTLLM_NIXL_BOUNCE_ENABLE environment variable; unset keeps the env-var behavior.
-    if (agentBufferEnable.has_value())
+    // The size doubles as the on/off switch (CacheTransceiverConfig.agent_buffer_size_mb): 0 keeps
+    // bounce disabled, >0 enables it at that arena capacity. The expert knobs resolve as
+    // agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_* env var > built-in default.
+    // The retired on/off & arena-size env vars no longer do anything — call that out instead of
+    // silently ignoring a deployment that still sets them.
+    for (char const* legacyEnv : {"TRTLLM_NIXL_BOUNCE_ENABLE", "TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES"})
     {
-        cfg.enabled = agentBufferEnable.value();
+        if (std::getenv(legacyEnv) != nullptr)
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): %s is deprecated and has NO effect; configure bounce via "
+                "CacheTransceiverConfig.agent_buffer_size_mb instead",
+                mName.c_str(), legacyEnv);
+        }
     }
-    if (!cfg.enabled)
+    if (agentBufferSizeMb == 0)
     {
+        if (!bounceParams.empty())
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): agent_bounce_params set but agent_buffer_size_mb is 0 -> "
+                "bounce stays disabled and the params are ignored",
+                mName.c_str());
+        }
         return;
     }
+    auto cfg = bounce::BounceConfig::fromParams(bounceParams, bounce::BounceConfig::fromEnv());
+    cfg.arenaSizeBytes = agentBufferSizeMb << 20;
     // A single chunk must fit a fresh arena; otherwise its request cannot make progress before
     // requestTimeoutMs. Clamp the per-chunk cap to the configured arena size first. BounceTransport
     // applies a second clamp to the buddy allocator's smaller usable capacity when necessary.
@@ -218,12 +237,18 @@ void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
         st->transport = std::make_unique<bounce::BounceTransport>(
             mName, cfg, dev, st->channel.get(), *this, st->arena.get(), st->exec.get());
         mBounce = std::move(st);
+        // Log EVERY resolved knob so a mis-tuned deployment can tell which of dict/env/default won.
         TLLM_LOG_INFO(
-            "NixlTransferAgent(%s): bounce v2 enabled "
-            "(arena=%zuB chunk<=%zuB maxInflight=%u copyStreams=%u control=%s)",
-            mName.c_str(), cfg.arenaSizeBytes, cfg.maxChunkSizeBytes,
+            "NixlTransferAgent(%s): bounce v2 enabled (arenaSizeBytes=%zu arenaAllocationGranularityBytes=%zu "
+            "maxChunkSizeBytes=%zu maxInflightChunksPerRequest=%u copyStreamCount=%u scatterWorkerCount=%u "
+            "minDescriptorCount=%zu maxAverageDescriptorSizeBytes=%zu requestTimeoutMs=%d receiverFlowTimeoutMs=%d "
+            "quarantineMs=%d disableFabricMemory=%d enableEagerGather=%d useZeroCopyArguments=%d control=%s)",
+            mName.c_str(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes, cfg.maxChunkSizeBytes,
             static_cast<unsigned>(cfg.maxInflightChunksPerRequest), static_cast<unsigned>(cfg.copyStreamCount),
-            controlDesc.c_str());
+            static_cast<unsigned>(cfg.scatterWorkerCount), cfg.minDescriptorCount, cfg.maxAverageDescriptorSizeBytes,
+            cfg.requestTimeoutMs, cfg.receiverFlowTimeoutMs, cfg.quarantineMs,
+            static_cast<int>(cfg.disableFabricMemory), static_cast<int>(cfg.enableEagerGather),
+            static_cast<int>(cfg.useZeroCopyArguments), controlDesc.c_str());
     }
     catch (std::exception const& e)
     {
@@ -298,11 +323,12 @@ struct NixlBounceState
 };
 } // namespace bounce
 
-void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
+void NixlTransferAgent::maybeInitBounce(
+    std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& /*bounceParams*/)
 {
-    if (agentBufferEnable.value_or(false))
+    if (agentBufferSizeMb > 0)
     {
-        TLLM_LOG_WARNING("agent_buffer_enable requested but bounce support is not built; ignoring");
+        TLLM_LOG_WARNING("agent_buffer_size_mb > 0 requested but bounce support is not built; ignoring");
     }
 }
 
@@ -755,7 +781,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
     // Bring up bounce v2 now, if enabled, so its shared arena is registered before any peer fetches
     // our metadata. This is a no-op when bounce is disabled or not built.
-    maybeInitBounce(config.agentBufferEnable);
+    maybeInitBounce(config.agentBufferSizeMb, config.bounceParams);
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)

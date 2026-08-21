@@ -193,7 +193,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 enforce_physical_ownership=enforce_physical_ownership,
                 # Transfer-agent staging-buffer (bounce v2); mutually exclusive with `bounce`
                 # (enforced by CacheTransceiverConfig validation).
-                agent_buffer_enable=cache_transceiver_config.agent_buffer_enable,
+                agent_buffer_size_mb=cache_transceiver_config.agent_buffer_size_mb,
+                agent_bounce_params=cache_transceiver_config.agent_bounce_params,
             )
         )
         if enforce_physical_ownership:

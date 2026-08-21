@@ -174,14 +174,16 @@ private:
     /// Per-agent maps because different remote agents may have overlapping virtual addresses.
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
 
-    /// Bounce v2 transport (opt-in via TRTLLM_NIXL_BOUNCE_ENABLE). Null unless enabled & built;
-    /// when null the agent behaves exactly as before. See bounce/DESIGN.md.
+    /// Bounce v2 transport (opt-in via CacheTransceiverConfig.agent_buffer_size_mb). Null unless
+    /// enabled & built; when null the agent behaves exactly as before. See bounce/DESIGN.md.
     std::unique_ptr<bounce::NixlBounceState> mBounce;
 
     /// Lazily create the bounce transport (ctor, before any metadata exchange) when enabled.
-    /// @param agentBufferEnable explicit enable/disable from BaseAgentConfig; unset falls back to
-    /// the TRTLLM_NIXL_BOUNCE_ENABLE environment variable.
-    void maybeInitBounce(std::optional<bool> agentBufferEnable);
+    /// @param agentBufferSizeMb arena size in MiB from BaseAgentConfig; 0 keeps bounce disabled.
+    /// @param bounceParams expert knobs from BaseAgentConfig, layered over the
+    /// TRTLLM_NIXL_BOUNCE_* env fallback (dict > env > default).
+    void maybeInitBounce(
+        std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams);
     /// Heuristic gate: is this request eligible for the bounce fast path?
     [[nodiscard]] bool shouldUseBounce(TransferRequest const& request) const;
 };

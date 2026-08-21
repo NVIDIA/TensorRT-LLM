@@ -402,10 +402,18 @@ struct BaseAgentConfig
     std::unordered_map<std::string, std::string> backendParams;
     std::optional<int> rank;
     std::optional<int> worldSize;
-    /// Enable the agent's staging-buffer (bounce) fast path, currently implemented by the NIXL
-    /// agent. Unset falls back to the TRTLLM_NIXL_BOUNCE_ENABLE environment variable; an explicit
-    /// value overrides it. Ignored by agents without bounce support (e.g. mooncake).
-    std::optional<bool> agentBufferEnable;
+    /// Size in MiB of the agent's staging-buffer (bounce) arena, currently implemented by the
+    /// NIXL agent. 0 (default) disables the fast path; >0 enables it at that arena capacity.
+    /// Ignored by agents without bounce support (e.g. mooncake).
+    size_t agentBufferSizeMb{0};
+    /// Expert tuning knobs for the bounce pipeline, keyed by the TRTLLM_NIXL_BOUNCE_*
+    /// environment-variable names without the prefix and the trailing _BYTES, lowercased (e.g.
+    /// TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES -> "max_chunk_size").
+    /// Kept SEPARATE from backendParams on purpose: backendParams is forwarded verbatim to the
+    /// backend plugin (e.g. NIXL createBackend), so bounce keys must not leak into it.
+    /// Precedence: this map > environment variable > built-in default. Ignored when
+    /// agentBufferSizeMb == 0.
+    std::unordered_map<std::string, std::string> bounceParams;
 };
 
 class BaseTransferAgent
