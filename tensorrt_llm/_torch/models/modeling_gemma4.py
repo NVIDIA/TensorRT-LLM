@@ -1227,6 +1227,8 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    build_mtp_draft_model_from_config = True
+
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],

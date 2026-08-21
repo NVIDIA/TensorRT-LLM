@@ -2424,11 +2424,11 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif model_config.spec_config._use_shared_kv_cache:
+    elif model_config.spec_config.uses_external_draft_model:
         if draft_config is None:
             raise ValueError(
-                "Shared-KV speculative decoding requires an external draft "
-                "model config.")
+                "MTP speculative decoding with an external draft model requires "
+                "its model config.")
         return AutoModelForCausalLM.from_config(draft_config)
     elif spec_dec_mode.is_mtp_one_model():
         return MTPForCausalLM(model_config,
@@ -2540,7 +2540,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
-                elif spec_config._use_shared_kv_cache:
+                elif spec_config.uses_external_draft_model:
                     self.draft_config = ModelConfig.from_pretrained(
                         spec_config.speculative_model,
                         trust_remote_code=True,
@@ -2686,10 +2686,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
         from tensorrt_llm._torch.speculative.utils import (
-            filter_mtp_checkpoint_weights, loads_mtp_from_speculative_model)
+            filter_mtp_checkpoint_weights, uses_mtp_head_checkpoint)
 
         skip_modules = ["draft_model"]
-        if loads_mtp_from_speculative_model(self.spec_config):
+        if uses_mtp_head_checkpoint(self.spec_config):
             # The heads come from speculative_model in a second pass
             # (load_draft_weights), so exclude them here. They must be
             # *skipped* rather than tolerated via allow_partial_loading:
@@ -2711,12 +2711,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         from tensorrt_llm._torch.models.modeling_utils import \
             _load_weights_impl_v2
         from tensorrt_llm._torch.speculative.utils import (
-            loads_mtp_from_speculative_model,
             remap_preprocessed_mtp_weights_for_draft_model,
             select_mtp_checkpoint_weights,
-            skip_modules_for_separate_mtp_checkpoint)
+            skip_modules_for_separate_mtp_checkpoint, uses_mtp_head_checkpoint)
 
-        if loads_mtp_from_speculative_model(self.spec_config):
+        if uses_mtp_head_checkpoint(self.spec_config):
             # Load MTP heads into draft_model only, and verify every non-shared
             # MTP parameter has a matching tensor. The previous parent-model
             # load used allow_partial_loading=True, which silently left MTP

@@ -27,7 +27,7 @@ _PRIVATE_NODEID_PATTERNS = (
 
 def _is_private_nodeid(nodeid: str) -> bool:
     lowered = nodeid.lower()
-    return any(pat in lowered for pat in _PRIVATE_NODEID_PATTERNS)
+    return any(pat.lower() in lowered for pat in _PRIVATE_NODEID_PATTERNS)
 
 
 def pytest_configure(config):
