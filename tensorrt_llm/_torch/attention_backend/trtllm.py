@@ -2341,6 +2341,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.kv_cache_pool_mapping,
             None,  # kv_scale_orig_quant
             None,  # kv_scale_quant_orig
+            getattr(self, "_nvfp4_mla_kv_scale_orig_quant", None),
             out_scale,
             metadata.block_ids_per_seq,
             helix_tensor_params,
@@ -2349,6 +2350,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
+            getattr(metadata.kv_cache_manager, "mla_kv_cache_residual_dim", 0),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.max_seq_len,  # attention_window_size
             metadata.beam_width,

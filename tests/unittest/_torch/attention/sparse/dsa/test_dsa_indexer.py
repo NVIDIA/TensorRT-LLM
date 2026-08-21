@@ -281,7 +281,7 @@ def test_nvfp4_context_topk_uses_device_compaction_path():
     gather.assert_called_once()
     assert gather.call_args.args[2] is topk_indices
     scratch = gather.call_args.args[6]
-    assert scratch.shape == (8, 1, 16)
+    assert scratch.shape == (8, 1, cache_manager.head_dim)
     assert scratch.dtype == torch.float8_e4m3fn
     assert gather.call_args.args[11] == 64
     assert gather.call_args.args[12] == 128

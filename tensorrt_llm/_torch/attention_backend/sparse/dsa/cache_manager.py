@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -384,9 +385,28 @@ class DSACacheManagerV2(KVCacheManagerV2):
         self.quant_block_size = 128
         self.index_head_dim = sparse_params.index_head_dim
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
-        # Keep the validated single-level NVFP4 layout. The RoPE residual
-        # layout is not numerically equivalent under sparse MLA attention.
-        self.mla_kv_cache_residual_dim = 0
+        residual_config = (
+            pretrained_config
+            if pretrained_config is not None
+            else getattr(model_config, "pretrained_config", None)
+        )
+        rope_head_dim = int(getattr(residual_config, "qk_rope_head_dim", 0))
+        residual_quantization_enabled = (
+            os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1"
+        )
+        self.mla_kv_cache_residual_dim = (
+            rope_head_dim if dtype == DataType.NVFP4 and residual_quantization_enabled else 0
+        )
+        if self.mla_kv_cache_residual_dim % 16 != 0:
+            raise ValueError(
+                "NVFP4 MLA residual dimension must be divisible by 16, got "
+                f"{self.mla_kv_cache_residual_dim}"
+            )
+        if self.mla_kv_cache_residual_dim > head_dim:
+            raise ValueError(
+                "NVFP4 MLA residual dimension cannot exceed the KV head dimension: "
+                f"{self.mla_kv_cache_residual_dim} > {head_dim}"
+            )
         self._unique_primary_pool: Optional[torch.Tensor] = None
 
         from tensorrt_llm._torch.speculative import get_num_spec_layers
@@ -624,9 +644,25 @@ class DSACacheManagerV2(KVCacheManagerV2):
         num_layers: Optional[int] = None,
         **kwargs,
     ):
-        return DSACacheManager.get_cache_size_per_token(
+        cache_bytes = DSACacheManager.get_cache_size_per_token(
             model_config, mapping, num_layers=num_layers, **kwargs
         )
+        quant_config = model_config.quant_config
+        residual_quantization_enabled = (
+            os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1"
+        )
+        if (
+            quant_config is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
+            and residual_quantization_enabled
+        ):
+            config = model_config.pretrained_config
+            residual_dim = int(getattr(config, "qk_rope_head_dim", 0))
+            num_attention_layers = KVCacheManager._resolve_num_attention_layers(
+                model_config, mapping, num_layers
+            )
+            cache_bytes += num_attention_layers * (residual_dim // 2 + math.ceil(residual_dim / 16))
+        return cache_bytes
 
     def shutdown(self) -> None:
         self.indexer_k_cache_pool_per_layer = []

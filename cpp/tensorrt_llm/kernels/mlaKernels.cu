@@ -39,11 +39,43 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-__device__ __forceinline__ float decodeMlaE2m1(uint8_t value)
+__device__ __forceinline__ void decodeMlaE2m1x8(uint32_t packed, float (&output)[8])
 {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    uint32_t fp16[4];
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n"
+        "mov.b32 {byte0, byte1, byte2, byte3}, %4;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
+        "cvt.rn.f16x2.e2m1x2 %1, byte1;\n"
+        "cvt.rn.f16x2.e2m1x2 %2, byte2;\n"
+        "cvt.rn.f16x2.e2m1x2 %3, byte3;\n"
+        "}\n"
+        : "=r"(fp16[0]), "=r"(fp16[1]), "=r"(fp16[2]), "=r"(fp16[3])
+        : "r"(packed));
+    float2 const pair0 = __half22float2(reinterpret_cast<__half2 const&>(fp16[0]));
+    float2 const pair1 = __half22float2(reinterpret_cast<__half2 const&>(fp16[1]));
+    float2 const pair2 = __half22float2(reinterpret_cast<__half2 const&>(fp16[2]));
+    float2 const pair3 = __half22float2(reinterpret_cast<__half2 const&>(fp16[3]));
+    output[0] = pair0.x;
+    output[1] = pair0.y;
+    output[2] = pair1.x;
+    output[3] = pair1.y;
+    output[4] = pair2.x;
+    output[5] = pair2.y;
+    output[6] = pair3.x;
+    output[7] = pair3.y;
+#else
     constexpr float kMagnitude[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
-    float const magnitude = kMagnitude[value & 0x7U];
-    return (value & 0x8U) == 0 ? magnitude : -magnitude;
+#pragma unroll
+    for (int32_t index = 0; index < 8; ++index)
+    {
+        uint8_t const value = static_cast<uint8_t>(packed >> (index * 4));
+        float const magnitude = kMagnitude[value & 0x7U];
+        output[index] = (value & 0x8U) == 0 ? magnitude : -magnitude;
+    }
+#endif
 }
 
 template <typename T>
@@ -101,14 +133,16 @@ inline __device__ void quantizeAndWriteMlaFp4Residual(PackedVec<T> const& values
     mainOut[0] = packedMainLow;
     mainOut[1] = packedMainHigh;
 
+    float dequantMainLow[8];
+    float dequantMainHigh[8];
+    decodeMlaE2m1x8(packedMainLow, dequantMainLow);
+    decodeMlaE2m1x8(packedMainHigh, dequantMainHigh);
     float residual[16];
 #pragma unroll
     for (int32_t index = 0; index < 8; ++index)
     {
-        residual[index]
-            = input[index] - decodeMlaE2m1(static_cast<uint8_t>(packedMainLow >> (index * 4))) * narrowedMainScale;
-        residual[index + 8]
-            = input[index + 8] - decodeMlaE2m1(static_cast<uint8_t>(packedMainHigh >> (index * 4))) * narrowedMainScale;
+        residual[index] = input[index] - dequantMainLow[index] * narrowedMainScale;
+        residual[index + 8] = input[index + 8] - dequantMainHigh[index] * narrowedMainScale;
     }
 
     maxValue = 0.F;
