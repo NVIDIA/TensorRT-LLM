@@ -297,6 +297,55 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
+
+## Launch Modes and Multi-Node Execution
+
+VisualGen worker ranks can be brought up in three ways. The mode is detected automatically when `VisualGen` (or `trtllm-serve`) starts, based on the launch environment:
+
+| Mode | Launch | Scope | Where user code runs |
+|---|---|---|---|
+| **Spawn** (default) | `python script.py` / `trtllm-serve ...` | Single node | Client process only; workers are spawned as local processes |
+| **External launcher** | `torchrun --nproc_per_node=N script.py` or `srun --ntasks-per-node=N python script.py` | Single or multi node | Every rank runs the program (SPMD); ranks ≥ 1 become workers and exit inside `VisualGen()` |
+| **MGMN launcher** | `trtllm-llmapi-launch` under an MPI launcher (`srun --mpi=pmix` or OpenMPI `mpirun`) | Single or multi node | Rank 0's wrapped program only; the launcher hosts a worker on every MPI rank |
+
+Pick a mode as follows:
+
+- **Spawn** — the default for single-node runs; nothing to configure.
+- **External launcher** — SPMD-style launches where running the same script on every rank is acceptable. `RANK`/`WORLD_SIZE` (torchrun) or `SLURM_PROCID` (plain `srun`) in the environment selects this mode.
+- **MGMN launcher** — the recommended multi-node mode. VisualGen launches exactly like LLM workloads under `trtllm-llmapi-launch`: one MPI rank per GPU, and only rank 0 executes the wrapped program (a Python script, `trtllm-serve`, `trtllm-bench`, or `pytest`), so the program does not need to be SPMD-safe.
+
+### World-Size Contract
+
+In the external-launcher and MGMN modes, the number of launched ranks must equal
+
+```
+parallel_config.n_workers = cfg_size × cp_size × ulysses_size × tp_size
+```
+
+where `cp_size` comes from `attn2d_size` or `ring_size`. The default `parallel_config` has `n_workers = 1`, so every multi-rank launch must pass an explicit `parallel_config` whose product matches the rank count; a mismatch fails fast at startup with the expected rank count in the error. Launch one rank per GPU.
+
+### MGMN Launcher Usage
+
+Wrap any single program — a Python script, `trtllm-serve`, `trtllm-bench`, or `pytest` — with `trtllm-llmapi-launch` under an MPI launcher, one rank per GPU:
+
+```bash
+mpirun -n 4 trtllm-llmapi-launch python my_visual_gen_script.py
+```
+
+On Slurm, the same wrapped command runs multi-node under `srun --mpi=pmix`, exactly like the LLM recipe in [`examples/llm-api/llm_mgmn_trtllm_serve.sh`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/llm_mgmn_trtllm_serve.sh).
+
+Behavior notes:
+
+- The HTTP server runs in rank 0's wrapped program on the first node of the allocation; send requests to `http://<first-node>:<port>`.
+- The torch rendezvous (`MASTER_ADDR`/`MASTER_PORT`) is resolved on the rank-0 worker's host and distributed to all ranks over MPI; setting those variables in rank 0's environment overrides the resolved values.
+- Supported MPI launchers are Slurm `srun --mpi=pmix` and OpenMPI `mpirun`. PMI-only launchers are not supported (the launcher derives the world size from `OMPI_COMM_WORLD_SIZE` / `SLURM_NTASKS`).
+- MGMN workers set `TORCH_NCCL_ASYNC_ERROR_HANDLING=1` and a bounded process-group timeout, so when a rank dies its peers abort their collectives and the failure propagates to the client instead of hanging the job. Combine with `srun --kill-on-bad-exit=1` so the job step tears down promptly.
+- MGMN worker dispatch and rendezvous log lines are emitted at `info` level; run with `TLLM_LOG_LEVEL=info` to see them.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `TLLM_VG_MGMN_PG_TIMEOUT_SEC` | `1800` | `torch.distributed` process-group timeout (seconds) for MGMN workers. Bounds how long surviving ranks block in a collective after a peer dies, and therefore the worker-death signal latency to the client. Raise it when model load / warmup barriers exceed the default; lower it for faster failure detection. |
+
 ## Developer Guide
 
 ### Architecture Overview

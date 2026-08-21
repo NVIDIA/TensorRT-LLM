@@ -1097,11 +1097,14 @@ def all_to_all_4d(
         # Transform back from head sharding to sequence sharding
         output = all_to_all_4d(input, scatter_dim=1, gather_dim=2, process_group=pg)
     """
-    # Only support PyTorch distributed mode (not MPI mode)
-    if not mpi_disabled():
+    # Implemented purely on torch.distributed; the TRT-LLM MPI runtime path
+    # is not supported. Gate on torch.distributed itself rather than the
+    # TLLM_DISABLE_MPI env flag: VG MGMN workers run inside persistent MPI
+    # rank processes (flag unset) but always initialize a process group.
+    if not torch.distributed.is_initialized():
         raise NotImplementedError(
-            "all_to_all_4d currently only supports PyTorch distributed mode. "
-            "MPI mode is not supported.")
+            "all_to_all_4d requires an initialized torch.distributed process "
+            "group. The TRT-LLM MPI runtime mode is not supported.")
 
     # Get world size from process group
     world_size = torch.distributed.get_world_size(group=process_group)
@@ -1205,9 +1208,11 @@ def all_to_all_5d(
     - scatter_dim=3 (heads), gather_dim=1 (seq): [B, S/P, 3, H, D] -> [B, S, 3, H/P, D]
     - scatter_dim=1 (seq), gather_dim=3 (heads): [B, S, 3, H/P, D] -> [B, S/P, 3, H, D]
     """
-    if not mpi_disabled():
+    # Same torch.distributed-only gate as all_to_all_4d (see comment there).
+    if not torch.distributed.is_initialized():
         raise NotImplementedError(
-            "all_to_all_5d currently only supports PyTorch distributed mode.")
+            "all_to_all_5d requires an initialized torch.distributed process "
+            "group. The TRT-LLM MPI runtime mode is not supported.")
 
     world_size = torch.distributed.get_world_size(group=process_group)
     if world_size == 1:

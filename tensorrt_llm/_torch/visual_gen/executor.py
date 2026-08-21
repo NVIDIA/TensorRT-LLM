@@ -7,7 +7,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -18,6 +18,8 @@ import zmq
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
+from tensorrt_llm.executor.utils import create_mpi_comm_session, get_spawn_proxy_process_env
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
@@ -30,6 +32,15 @@ POLL_TIMEOUT = 0.01
 AWAIT_TIMEOUT = 0.05
 THREAD_TIMEOUT = 5.0
 WORKER_TIMEOUT = 2.0
+
+# MGMN mode: interval (seconds) between worker-death polls in the client's
+# steady-state loop.
+MGMN_ERROR_POLL_INTERVAL = 1.0
+# MGMN mode: default process-group timeout (seconds) so collectives whose
+# peers died abort (with TORCH_NCCL_ASYNC_ERROR_HANDLING) instead of blocking
+# forever, while staying generous enough for slow model-load barriers.
+# Overridable per run via the TLLM_VG_MGMN_PG_TIMEOUT_SEC env var.
+MGMN_PG_TIMEOUT_SEC = 1800
 
 # Default cap on the size of the iteration-stats snapshot buffer used by the
 # /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
@@ -496,19 +507,36 @@ def run_diffusion_worker(
     resp_hmac_key: Optional[bytes] = None,
     local_rank: Optional[int] = None,
     in_client_process: bool = False,
+    disable_mpi_env: bool = True,
+    reraise: bool = False,
+    pg_timeout: Optional[timedelta] = None,
 ):
     """Entry point for worker process.
 
     ``in_client_process``: True only when this worker runs inside the client
     process. Declared by the launch site — never derive it from the
     environment here, the env writes below make every worker look external.
+
+    ``disable_mpi_env``: when True, sets ``TLLM_DISABLE_MPI=1`` so shared
+    TRT-LLM helpers resolve ranks via torch.distributed instead of MPI.
+    MGMN workers pass False: they run inside persistent MPI rank processes
+    where that env write would corrupt rank resolution for anything sharing
+    the process.
+
+    ``reraise``: when True, fatal errors propagate to the caller instead of
+    being swallowed after logging. MGMN passes True so the leader's task
+    future carries the exception and worker death reaches the client.
+
+    ``pg_timeout``: explicit ``torch.distributed`` process-group timeout;
+    ``None`` keeps the PyTorch default.
     """
     try:
         # Set log level before any other work so loading logs are visible
         logger.set_level(log_level)
 
         # Setup distributed env — use PyTorch distributed, not MPI
-        os.environ["TLLM_DISABLE_MPI"] = "1"
+        if disable_mpi_env:
+            os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["RANK"] = str(rank)
@@ -552,6 +580,7 @@ def run_diffusion_worker(
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
             init_method="env://",
+            timeout=pg_timeout,
             world_size=world_size,
             rank=rank,
             device_id=torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else None,
@@ -574,6 +603,104 @@ def run_diffusion_worker(
     except Exception as e:
         logger.error(f"Worker failed: {e}")
         traceback.print_exc()
+        if reraise:
+            raise
+
+
+def run_diffusion_worker_mgmn(
+    world_size: int,
+    request_queue_addr: str,
+    response_queue_addr: str,
+    visual_gen_args: "VisualGenArgs",
+    req_hmac_key: Optional[bytes] = None,
+    resp_hmac_key: Optional[bytes] = None,
+    log_level: str = "info",
+):
+    """Entry point for MGMN (``trtllm-llmapi-launch``) workers.
+
+    Dispatched once via ``MpiSession.submit`` and executed on every
+    pre-spawned MPI rank: ranks >= 1 inside the launcher's persistent
+    ``mgmn_worker_node`` processes, rank 0 inside the MGMN leader process on
+    the client's node. Rank/topology discovery uses raw mpi4py rather than
+    the ``_utils`` helpers, which honor ``TLLM_DISABLE_MPI`` and would
+    silently return wrong values if that env leaked into the persistent rank
+    process.
+    """
+    # Set log level before any other work so the MGMN preamble is visible.
+    logger.set_level(log_level)
+
+    # Never trust inherited state: a leaked TLLM_DISABLE_MPI=1 (from the user
+    # environment or a previous task in this persistent rank process) would
+    # corrupt rank resolution for any MPI-gated helper sharing the process.
+    os.environ.pop("TLLM_DISABLE_MPI", None)
+
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    if comm.Get_size() != world_size:
+        raise RuntimeError(
+            f"MPI world size ({comm.Get_size()}) does not match "
+            f"parallel_config.n_workers ({world_size}). Launch exactly "
+            f"n_workers MPI ranks under trtllm-llmapi-launch."
+        )
+    local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    local_rank = local_comm.Get_rank()
+
+    # Deterministic, launcher-agnostic node id consumed by
+    # mapping._get_host_id via GROUP_RANK: the first-occurrence index of this
+    # rank's processor name among the unique names. Identical on every rank
+    # because the allgather result is.
+    names = comm.allgather(MPI.Get_processor_name())
+    host_id = sorted(set(names), key=names.index).index(names[rank])
+    os.environ["GROUP_RANK"] = str(host_id)
+
+    # torch rendezvous: rank-0-authoritative, agreed over an UNCONDITIONAL
+    # bcast. Every rank participates regardless of its own env, so a
+    # MASTER_ADDR/MASTER_PORT present on only some ranks can neither diverge
+    # the collective nor fork the value; rank 0's env override wins. The
+    # address is by construction resolved on (and reachable as) the rank-0
+    # worker's host, and the port is bound-tested on that same host.
+    root_addr = (os.environ.get("MASTER_ADDR") or socket.getfqdn()) if rank == 0 else None
+    master_addr = comm.bcast(root_addr, root=0)
+    root_port = (int(os.environ.get("MASTER_PORT") or find_free_port())) if rank == 0 else None
+    master_port = comm.bcast(root_port, root=0)
+
+    # Surviving ranks must not block forever in collectives whose peers died:
+    # abort NCCL collectives on async errors, paired with the bounded
+    # process-group timeout passed below. TLLM_VG_MGMN_PG_TIMEOUT_SEC
+    # overrides the default (fault-injection tests use a short value).
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    pg_timeout = timedelta(
+        seconds=int(os.environ.get("TLLM_VG_MGMN_PG_TIMEOUT_SEC", str(MGMN_PG_TIMEOUT_SEC)))
+    )
+
+    logger.info(
+        f"MGMN worker rank {rank}/{world_size} (local_rank {local_rank}, "
+        f"host_id {host_id}): rendezvous {master_addr}:{master_port}"
+    )
+
+    run_diffusion_worker(
+        rank=rank,
+        world_size=world_size,
+        master_addr=master_addr,
+        master_port=master_port,
+        request_queue_addr=request_queue_addr if rank == 0 else None,
+        response_queue_addr=response_queue_addr if rank == 0 else None,
+        visual_gen_args=visual_gen_args,
+        log_level=log_level,
+        req_hmac_key=req_hmac_key if rank == 0 else None,
+        resp_hmac_key=resp_hmac_key if rank == 0 else None,
+        local_rank=local_rank,
+        disable_mpi_env=False,
+        # reraise routes a fatal error into the leader's task future, which
+        # forwards it to the client as RemoteWorkerDeath. A rank that dies
+        # while its peers sit in a collective surfaces only after pg_timeout
+        # aborts those peers (the leader's task wrapper waits on every rank),
+        # so death-signal latency is bounded by pg_timeout.
+        reraise=True,
+        pg_timeout=pg_timeout,
+    )
 
 
 class DiffusionRemoteClient:
@@ -584,7 +711,7 @@ class DiffusionRemoteClient:
     entry point is :class:`tensorrt_llm.visual_gen.VisualGen`, which resolves
     every request's seed before reaching :meth:`enqueue_requests`.
 
-    Supports two launch modes:
+    Supports three launch modes:
 
     **Single-node (default)**
         ``VisualGen`` is called from an ordinary Python script.
@@ -602,6 +729,15 @@ class DiffusionRemoteClient:
         - Rank > 0: handled by ``VisualGen.__init__`` before this class is
           instantiated — they call ``run_diffusion_worker`` directly and exit
           via ``sys.exit(0)``.  These ranks never reach ``DiffusionRemoteClient``.
+
+    **MGMN (``trtllm-llmapi-launch``)**
+        The program is wrapped by ``trtllm-llmapi-launch`` under an MPI
+        launcher (``mpirun`` / ``srun --mpi=pmix``); user code runs only in
+        rank 0's wrapped program. The client dispatches
+        ``run_diffusion_worker_mgmn`` to every pre-spawned MPI rank through
+        the launcher's MPI session. The rank-0 worker lives inside the MGMN
+        leader process on this same node, so the ZMQ handoff stays
+        node-local, exactly like single-node mode.
     """
 
     def __init__(
@@ -611,14 +747,44 @@ class DiffusionRemoteClient:
         self.args = args
         self.n_workers = args.parallel_config.n_workers
 
-        # --- Detect external launcher (torchrun / srun) ---
-        ext = _detect_external_launch()
+        # --- Detect launch mode ---
+        # MGMN detection runs before the external-launch check:
+        # trtllm-llmapi-launch strips SLURM_*/OMPI_* from the wrapped program
+        # but not a stale RANK/WORLD_SIZE pair, which
+        # _detect_external_launch() would misread as a torchrun launch.
+        # VisualGen.__init__ applies the same MGMN-first ordering.
+        self._mgmn_mode = get_spawn_proxy_process_env()
+        self.mpi_session = None
+        self._worker_error: Optional[BaseException] = None
+        # Set once the workers' READY handshake arrives; _send_shutdown only
+        # sends the shutdown sentinel to workers that completed it.
+        self._workers_ready = False
+
+        if self._mgmn_mode:
+            mpi_world_size = get_mpi_world_size()
+            if mpi_world_size != self.n_workers:
+                raise ValueError(
+                    f"MGMN launcher world size ({mpi_world_size}) does not match "
+                    f"n_workers ({self.n_workers}). Launch exactly n_workers MPI ranks, "
+                    f"e.g. `mpirun -n {self.n_workers} trtllm-llmapi-launch <program>` or "
+                    f"`srun --mpi=pmix --ntasks={self.n_workers} ... "
+                    f"trtllm-llmapi-launch <program>`."
+                )
+            ext = None
+        else:
+            ext = _detect_external_launch()
 
         if ext is None:
-            # Single-node: coordinator spawns all workers locally
-            # Setup distributed env
-            self.master_addr = "127.0.0.1"
-            self.master_port = find_free_port()
+            # Single-node & MGMN: the client binds its ZMQ server sockets
+            # locally. In MGMN mode the only worker-side ZMQ consumer is the
+            # rank-0 worker inside the MGMN leader process on this same node,
+            # so any locally-valid IP is reachable.
+            if not self._mgmn_mode:
+                # Single-node: the coordinator picks the torch rendezvous.
+                # MGMN workers resolve theirs on the rank-0 worker's host
+                # instead (see run_diffusion_worker_mgmn).
+                self.master_addr = "127.0.0.1"
+                self.master_port = find_free_port()
 
             # Setup IPC addresses
             self.host_ip = get_ip_address()
@@ -655,6 +821,10 @@ class DiffusionRemoteClient:
         # full PipelineOutput tensor does not pin in completed_responses for
         # the process lifetime.
         self._abandoned_request_ids: Set[int] = set()
+        # Request ids dispatched to the workers but not yet completed. Only
+        # touched on the background thread's event loop; consumed by
+        # _fail_pending_requests to unblock in-flight callers on worker death.
+        self._inflight_request_ids: Set[int] = set()
 
         # Iteration-stats tracker — populated on lifecycle events (enqueue,
         # request started, response received) and drained by
@@ -686,7 +856,33 @@ class DiffusionRemoteClient:
         self.worker_processes = []
         self._ext_worker_thread: Optional[threading.Thread] = None
 
-        if ext is None:
+        if self._mgmn_mode:
+            # MGMN: dispatch one task executed on every pre-spawned MPI rank.
+            # submit() is fire-and-forget (returns no futures); readiness is
+            # signaled by the READY handshake and worker death is forwarded
+            # by the leader as RemoteWorkerDeath (see
+            # _check_mgmn_worker_error). The session wraps a single ZMQ PAIR
+            # socket that is not thread-safe, so the session is created and
+            # accessed (this submit and the watchdog polls in _serve_forever)
+            # only on the background event-loop thread; this thread blocks on
+            # the dispatch result before proceeding.
+            logger.info(f"DiffusionClient: Dispatching {self.n_workers} MGMN workers")
+
+            async def _dispatch_mgmn_workers():
+                self.mpi_session = create_mpi_comm_session(self.n_workers)
+                self.mpi_session.submit(
+                    run_diffusion_worker_mgmn,
+                    world_size=self.n_workers,
+                    request_queue_addr=self.req_addr_connect,
+                    response_queue_addr=self.resp_addr_connect,
+                    visual_gen_args=self.args,
+                    req_hmac_key=self.req_hmac_key,
+                    resp_hmac_key=self.resp_hmac_key,
+                    log_level=logger.level,
+                )
+
+            asyncio.run_coroutine_threadsafe(_dispatch_mgmn_workers(), self._event_loop).result()
+        elif ext is None:
             logger.info(f"DiffusionClient: Launching {self.n_workers} workers")
             ctx = mp.get_context("spawn")
             for rank in range(self.n_workers):
@@ -742,6 +938,8 @@ class DiffusionRemoteClient:
 
     def enqueue_requests(self, requests: List[DiffusionRequest]) -> List[int]:
         """Enqueue requests and return their IDs."""
+        if self._worker_error is not None:
+            raise RuntimeError("DiffusionClient: workers are dead") from self._worker_error
         req_ids = []
         for req in requests:
             self.pending_requests.put(req)
@@ -832,7 +1030,20 @@ class DiffusionRemoteClient:
             return False
 
     def _send_shutdown(self):
-        """Send shutdown signal."""
+        """Send the shutdown sentinel to the rank-0 worker.
+
+        The sentinel is skipped when the workers died or never completed the
+        READY handshake: the rank-0 PULL side may never connect, and a PUSH
+        send with no peer blocks forever, stranding the background thread and
+        its socket.
+        """
+        if self._worker_error is not None or not self._workers_ready:
+            logger.info(
+                "DiffusionClient: Skipping shutdown sentinel "
+                f"(worker_error={self._worker_error!r}, workers_ready={self._workers_ready})"
+            )
+            self._close_socket(self.requests_ipc)
+            return
         logger.info("DiffusionClient: Sending shutdown signal")
         if self.requests_ipc:
             self.requests_ipc.put(None)
@@ -847,8 +1058,23 @@ class DiffusionRemoteClient:
                 self.shutdown_event.set()
                 return
 
+            if self._worker_error is not None:
+                # Workers are dead — fail the request instead of sending it
+                # into a queue whose consumers are gone. Catches requests
+                # that raced past the enqueue_requests guard.
+                asyncio.run_coroutine_threadsafe(
+                    self._store_response(
+                        DiffusionResponse(
+                            request_id=req.request_id, error_msg=str(self._worker_error)
+                        )
+                    ),
+                    self._event_loop,
+                )
+                return
+
             logger.info(f"DiffusionClient: Sending request {req.request_id}")
             self.requests_ipc.put(req)
+            self._inflight_request_ids.add(req.request_id)
             # Once the request has been handed to the workers it becomes the
             # in-flight ("active") request from the client's perspective.
             self._iter_stats.record_request_started(req.request_id, self.pending_requests.qsize())
@@ -884,6 +1110,7 @@ class DiffusionRemoteClient:
         late-arriving responses for timed-out requests do not leak into
         ``completed_responses`` for the process lifetime.
         """
+        self._inflight_request_ids.discard(response.request_id)
         async with self.lock:
             if response.request_id in self._abandoned_request_ids:
                 self._abandoned_request_ids.discard(response.request_id)
@@ -936,6 +1163,46 @@ class DiffusionRemoteClient:
             self.completed_responses.pop(request_id, None)
             self._abandoned_request_ids.add(request_id)
 
+    def _check_mgmn_worker_error(self) -> Optional[BaseException]:
+        """Poll the MGMN MPI session for a forwarded worker death.
+
+        ``RemoteMpiCommSessionClient.submit`` returns no futures, so worker
+        exceptions reach the client only as ``RemoteWorkerDeath`` messages
+        forwarded by the leader over the session's control socket. Sticky:
+        once an error is observed it stays on ``self._worker_error``. Returns
+        ``None`` outside MGMN mode.
+        """
+        if self._worker_error is not None:
+            return self._worker_error
+        check = getattr(self.mpi_session, "check_worker_error", None)
+        if check is None:
+            return None
+        try:
+            error = check()
+        except Exception as exc:  # noqa: BLE001 - the watchdog must not die
+            logger.debug(f"DiffusionClient: check_worker_error failed (ignored): {exc!r}")
+            return None
+        if error is not None:
+            logger.error(f"DiffusionClient: MGMN worker death reported: {error!r}")
+            self._worker_error = error
+        return error
+
+    async def _fail_pending_requests(self, error: BaseException):
+        """Unblock every queued and in-flight request with an error response."""
+        failed_ids = set(self._inflight_request_ids)
+        while True:
+            try:
+                req = self.pending_requests.get_nowait()
+            except queue.Empty:
+                break
+            if req is None:
+                # Preserve the shutdown sentinel for _process_requests.
+                self.pending_requests.put(None)
+                break
+            failed_ids.add(req.request_id)
+        for req_id in failed_ids:
+            await self._store_response(DiffusionResponse(request_id=req_id, error_msg=str(error)))
+
     def _cleanup_ipc(self):
         """Cleanup IPC."""
         logger.info("DiffusionClient: Cleaning up IPC")
@@ -969,9 +1236,25 @@ class DiffusionRemoteClient:
         if not self._init_ipc():
             return
 
+        last_error_poll = time.time()
         while not self.shutdown_event.is_set():
             self._process_requests()
             self._process_responses()
+            # MGMN watchdog: poll the session for a forwarded worker death
+            # and fail pending requests fast instead of blocking forever on a
+            # response queue whose producers are gone. One-shot transition:
+            # _worker_error is sticky and enqueue_requests rejects new work
+            # once it is set. The loop keeps running so callers can still
+            # collect the error responses and shut down cleanly.
+            if (
+                self.mpi_session is not None
+                and self._worker_error is None
+                and time.time() - last_error_poll >= MGMN_ERROR_POLL_INTERVAL
+            ):
+                last_error_poll = time.time()
+                error = self._check_mgmn_worker_error()
+                if error is not None:
+                    await self._fail_pending_requests(error)
             await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
 
         self._cleanup_ipc()
@@ -1004,6 +1287,15 @@ class DiffusionRemoteClient:
         if self._ext_worker_thread is not None and self._ext_worker_thread.is_alive():
             self._ext_worker_thread.join(timeout=WORKER_TIMEOUT)
 
+        # MGMN: the pre-spawned MPI session is owned by the launcher and
+        # shared process-wide; RemoteMpiCommSessionClient.shutdown() is a
+        # documented no-op that never touches the session socket, so calling
+        # it here (off the event-loop thread that owns all session I/O) is
+        # safe. Invoked to honor the MpiSession contract; the watchdog stops
+        # with the background thread joined above.
+        if self.mpi_session is not None:
+            self.mpi_session.shutdown()
+
     def _wait_ready(self):
         """Wait for workers to be ready (sync wrapper for async operation)."""
         logger.info("DiffusionClient: Waiting for workers")
@@ -1029,6 +1321,7 @@ class DiffusionRemoteClient:
             async with self.lock:
                 if -1 in self.completed_responses:
                     ready_resp = self.completed_responses.pop(-1)
+                    self._workers_ready = True
                     # Extract pipeline metadata from the READY payload.
                     payload = ready_resp.output
                     if isinstance(payload, dict):
@@ -1047,6 +1340,12 @@ class DiffusionRemoteClient:
             )
             if worker_dead or ext_dead:
                 raise RuntimeError("DiffusionClient: Worker died during initialization")
+
+            mgmn_error = self._check_mgmn_worker_error()
+            if mgmn_error is not None:
+                raise RuntimeError(
+                    "DiffusionClient: MGMN worker died during initialization"
+                ) from mgmn_error
 
             now = time.time()
             if now - last_log_time >= log_interval:

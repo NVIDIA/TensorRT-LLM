@@ -21,6 +21,9 @@
 #   Step 2 (foreground): Wait for the server to become healthy on the rank-0
 #                        node, then run the benchmark client against it.
 #
+# This script uses the external-launch (SPMD) mode: every srun task runs
+# trtllm-serve with explicit MASTER_ADDR/MASTER_PORT.
+#
 # WHAT TO MODIFY:
 # 1. SLURM Parameters (lines above):
 #    - Replace <account> with your SLURM account name
