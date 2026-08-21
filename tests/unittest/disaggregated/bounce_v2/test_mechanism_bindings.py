@@ -715,3 +715,159 @@ class TestSubmitScatterRuns:
             pool.submit_scatter_runs(region.data_ptr(), 4 * KIB, np.zeros(35, dtype=np.uint8))
         with pytest.raises(ValueError):
             pool.submit_scatter_runs(region.data_ptr(), 4 * KIB, np.zeros(37, dtype=np.uint8))
+
+
+# --------------------------------------------------------------------------------------------
+# 9. register_plan / launch_chunk (per-request plan handle)
+# --------------------------------------------------------------------------------------------
+def _launch_retry(pool, poller, handle, chunk_idx, staging_base, got, deadline_s: float = 30.0):
+    """launch_chunk with a bounded BUSY-retry loop (mirrors _submit_retry)."""
+    deadline = time.monotonic() + deadline_s
+    while True:
+        cid = pool.launch_chunk(handle, chunk_idx, staging_base)
+        if cid != tab.BatchedCopyPool.BUSY:
+            return cid
+        assert time.monotonic() < deadline, "pool stayed BUSY past the deadline"
+        _collect(poller, 50, got)
+
+
+@pytest.mark.skipif(
+    not hasattr(tab.BatchedCopyPool, "register_plan"),
+    reason="installed transfer-agent binding predates BatchedCopyPool.register_plan",
+)
+class TestPlanHandle:
+    def test_launch_chunk_matches_submit_copy_expansion_byte_exact(self, pool, poller):
+        """P1a: launching from the registered plan == the classic expansion.
+
+        The SAME real plan (built by build_plan, marshalled once via
+        flat_gather/register_plan) gathers each chunk to staging A through
+        launch_chunk (scalar args) and to staging B through the classic
+        submit_copy per-desc expansion: both stagings must be byte-identical
+        and match a CPU reference.
+        """
+        from tensorrt_llm._torch.disaggregation.bounce_v2.plan import build_plan
+
+        n_desc, desc_bytes = 40, 4 * KIB  # 160 KiB over 64 KiB chunks -> 3 chunks
+        spread = n_desc * (desc_bytes + 160) + 256
+        src = _rand_bytes(spread, seed=4501)
+        torch.cuda.synchronize()
+        offs = [3 + i * (desc_bytes + 160) for i in range(n_desc)]
+        src_ptrs = _u64([src.data_ptr() + o for o in offs])
+        dst_ptrs = _u64([0x9000_0000 + i * desc_bytes for i in range(n_desc)])  # gather-unused
+        sizes = _u64([desc_bytes] * n_desc)
+        plan = build_plan(
+            src_ptrs, dst_ptrs, sizes, max_chunk_bytes=64 * KIB, max_descs_per_chunk=4096
+        )
+        assert plan.num_chunks == 3
+
+        g_srcs, g_offsets, g_sizes, g_starts = plan.flat_gather()
+        handle = pool.register_plan(g_srcs, g_offsets, g_sizes, g_starts)
+        try:
+            for c, chunk in enumerate(plan.chunks):
+                stage_a = torch.zeros(chunk.packed_bytes, dtype=torch.uint8, device="cuda")
+                stage_b = torch.zeros(chunk.packed_bytes, dtype=torch.uint8, device="cuda")
+                torch.cuda.synchronize()
+                got: dict[int, tuple[int, int]] = {}
+                cid_a = _launch_retry(pool, poller, handle, c, stage_a.data_ptr(), got)
+                cid_b = _submit_retry(
+                    pool,
+                    poller,
+                    chunk.src_ptrs,
+                    (np.uint64(stage_b.data_ptr()) + chunk.bounce_offsets).astype(np.uint64),
+                    chunk.sizes,
+                    got,
+                )
+                rows = _drain_ids(poller, [cid_a, cid_b], got=got)
+                assert rows[cid_a] == (tab.CompletionPoller.KIND_EVENT, 1)
+                assert rows[cid_b] == (tab.CompletionPoller.KIND_EVENT, 1)
+                torch.cuda.synchronize()
+                assert torch.equal(stage_a, stage_b), f"chunk {c}: plan-handle gather differs"
+                # CPU reference for one desc of the chunk (spot check).
+                d0 = int(chunk.bounce_offsets[0])
+                s0 = int(chunk.src_ptrs[0]) - src.data_ptr()
+                assert torch.equal(
+                    stage_a[d0 : d0 + desc_bytes].cpu(), src[s0 : s0 + desc_bytes].cpu()
+                )
+        finally:
+            pool.release_plan(handle)
+
+    def test_boundary_validation_raises(self, pool):
+        """P1b: malformed chunk boundaries are rejected at registration."""
+        n = 4
+        srcs = _u64([0x9000_0000 + i * KIB for i in range(n)])
+        offsets = _u64([i * KIB for i in range(n)])
+        sizes = _u32([KIB] * n)
+        for bad_starts in (
+            [0, 3, 2, 4],  # non-monotonic
+            [1, 4],  # first boundary != 0
+            [0, 3],  # last boundary != n_descs
+        ):
+            with pytest.raises(ValueError):
+                pool.register_plan(srcs, offsets, sizes, _u64(bad_starts))
+        # Per-chunk desc count above max_plan_entries (fixture pool: 4096).
+        big = int(pool.max_plan_entries) + 1
+        with pytest.raises(ValueError):
+            pool.register_plan(
+                _u64(np.zeros(big)), _u64(np.zeros(big)), _u32(np.zeros(big)), _u64([0, big])
+            )
+
+    def test_release_idempotent_and_launch_after_release_raises(self, pool, poller):
+        """P1c/P1d: release_plan is idempotent; a later launch_chunk raises.
+
+        The ValueError is the deterministic terminal the reactor's
+        launch-error path relies on for a launch racing the failure-side
+        release.
+        """
+        buf = torch.zeros(8 * KIB, dtype=torch.uint8, device="cuda")
+        stage = torch.zeros(4 * KIB, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        handle = pool.register_plan(
+            _u64([buf.data_ptr()]), _u64([0]), _u32([4 * KIB]), _u64([0, 1])
+        )
+        got: dict[int, tuple[int, int]] = {}
+        cid = _launch_retry(pool, poller, handle, 0, stage.data_ptr(), got)
+        assert _drain_ids(poller, [cid], got=got)[cid] == (tab.CompletionPoller.KIND_EVENT, 1)
+        # Chunk index out of range on a LIVE handle also raises.
+        with pytest.raises(ValueError):
+            pool.launch_chunk(handle, 1, stage.data_ptr())
+        pool.release_plan(handle)
+        pool.release_plan(handle)  # idempotent: no error
+        with pytest.raises(ValueError):
+            pool.launch_chunk(handle, 0, stage.data_ptr())
+        torch.cuda.synchronize()
+
+    def test_busy_when_contexts_exhausted_then_retry(self):
+        """P1e: BUSY with every context taken; the same launch retries clean.
+
+        A slow-sweep poller pins the single context in flight past the BUSY
+        probe (recycling only happens on the poll sweep).
+        """
+        poller = tab.CompletionPoller(poll_interval_us=200_000)
+        try:
+            pool = tab.BatchedCopyPool(
+                num_streams=1, max_plan_entries=4096, device_id=DEVICE, poller=poller
+            )
+            src = _rand_bytes(4 * KIB, seed=4502)
+            stage = torch.zeros(4 * KIB, dtype=torch.uint8, device="cuda")
+            buf = torch.zeros(8 * MIB, dtype=torch.uint8, device="cuda")
+            torch.cuda.synchronize()
+            handle = pool.register_plan(
+                _u64([src.data_ptr()]), _u64([0]), _u32([4 * KIB]), _u64([0, 1])
+            )
+            occupier = pool.submit_copy(
+                _u64([buf.data_ptr()]), _u64([buf.data_ptr() + 4 * MIB]), _u32([4 * MIB])
+            )
+            assert occupier != tab.BatchedCopyPool.BUSY
+            assert pool.launch_chunk(handle, 0, stage.data_ptr()) == tab.BatchedCopyPool.BUSY
+
+            _drain_ids(poller, [occupier])  # sweep recycles the context
+            cid = pool.launch_chunk(handle, 0, stage.data_ptr())
+            assert cid != tab.BatchedCopyPool.BUSY
+            kind, ok = _drain_ids(poller, [cid])[cid]
+            assert (kind, ok) == (tab.CompletionPoller.KIND_EVENT, 1)
+            torch.cuda.synchronize()
+            assert torch.equal(stage, src)
+            pool.release_plan(handle)
+            del pool
+        finally:
+            poller.shutdown()

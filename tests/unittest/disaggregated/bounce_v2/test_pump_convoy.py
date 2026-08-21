@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GPU-free tests for the anti-convoy reactor restructure (GB200 round 41).
+"""GPU-free tests for the anti-convoy reactor restructure.
 
 Pins the new machinery introduced by the no-C++-under-``_req_mu`` rewrite:
 
@@ -74,6 +74,7 @@ from tensorrt_llm._torch.disaggregation.bounce_v2 import codec  # noqa: E402
 from tensorrt_llm._torch.disaggregation.bounce_v2 import reactor as reactor_mod  # noqa: E402
 from tensorrt_llm._torch.disaggregation.bounce_v2.plan import SCATTER_RUN_DTYPE  # noqa: E402
 from tensorrt_llm._torch.disaggregation.bounce_v2.reactor import (  # noqa: E402
+    FAIL_GATHER,
     FAIL_PEER_DROPPED,
     BounceReactor,
 )
@@ -146,40 +147,16 @@ class SinkFakeCopyPool(FakeCopyPool):
             return [c for c in self.sink_calls if c[3] is not None and c[3] >= 0]
 
 
-class ChainFakePoller(FakePoller):
-    """FakePoller + reserve/cancel: engages the reactor's two-phase chain.
-
-    ``reserve_chain`` deterministically maps copy_id -> copy_id + 50_000 and
-    never declines; ``cancel_chain`` records calls and returns ``cancel_rc``.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.cancels: list[int] = []
-        self.cancel_rc = 0  # CANCEL_TERMINAL
-
-    def reserve_chain(self, copy_id: int) -> int:
-        return int(copy_id) + 50_000
-
-    def cancel_chain(self, reserved_id: int) -> int:
-        self.cancels.append(int(reserved_id))
-        return self.cancel_rc
-
-
 class GatedOpAgent(FakeXferAgent):
-    """FakeXferAgent gating ONE C++ entry point (fulfill / arm / post).
+    """FakeXferAgent gating the classic post entry point.
 
-    The gated method blocks on ``hold`` after setting ``entered``, then
-    returns ``release_rc`` (fulfill/arm) or posts classically (post): the
-    deterministic mid-EXECUTE window for the busy_op failure tests. Exposing
-    ``fulfill_chain_1to1`` only matters when the poller also carries
-    reserve/cancel (the reactor requires all three for two-phase mode).
+    ``post_transfer_1to1`` blocks on ``hold`` after setting ``entered``: the
+    deterministic mid-EXECUTE window for the busy_op failure tests.
     """
 
-    def __init__(self, gate: str, release_rc: int | None = None) -> None:
+    def __init__(self, gate: str = "post") -> None:
         super().__init__()
         self.gate = gate
-        self.release_rc = release_rc
         self.entered = threading.Event()
         self.hold = threading.Event()
 
@@ -187,20 +164,123 @@ class GatedOpAgent(FakeXferAgent):
         self.entered.set()
         assert self.hold.wait(timeout=30), "test bug: the agent gate was never released"
 
-    def fulfill_chain_1to1(self, reserved_id, *args) -> int:
-        if self.gate == "fulfill":
-            self._wait_gate()
-        return int(self.release_rc)
-
-    def post_transfer_1to1_on_event(self, copy_id, *args) -> int:
-        if self.gate == "arm":
-            self._wait_gate()
-        return int(self.release_rc)
-
     def post_transfer_1to1(self, *args) -> int:
         if self.gate == "post":
             self._wait_gate()
         return super().post_transfer_1to1(*args)
+
+
+class PlanFakeCopyPool(FakeCopyPool):
+    """FakeCopyPool + register_plan/launch_chunk/release_plan.
+
+    Engages the reactor's per-request plan-handle path without a GPU.
+    ``release_plan`` records EVERY call (the exactly-once spy) and is
+    idempotent; a launch on a released handle raises ValueError, exactly
+    like the binding's deterministic launch-racing-release terminal.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.plans: dict[int, tuple] = {}
+        self.releases: list[int] = []
+        #: Every accepted plain launch: (handle, chunk_idx, staging_base, cid).
+        self.launches: list[tuple[int, int, int, int]] = []
+        self._next_handle = 7_000
+
+    def register_plan(self, srcs, offsets, sizes, starts) -> int:
+        with self._mu:
+            handle = self._next_handle
+            self._next_handle += 1
+            self.plans[handle] = (
+                np.array(srcs),
+                np.array(offsets),
+                np.array(sizes),
+                np.array(starts),
+            )
+            return handle
+
+    def release_plan(self, handle) -> None:
+        with self._mu:
+            self.releases.append(int(handle))
+            self.plans.pop(int(handle), None)  # idempotent
+
+    def launch_chunk(self, handle, chunk_idx, staging_base) -> int:
+        with self._mu:
+            if int(handle) not in self.plans:
+                raise ValueError("launch_chunk: unknown plan handle")
+            if self.busy:
+                return self.BUSY
+            cid = self._next_cid
+            self._next_cid += 1
+            self.launches.append((int(handle), int(chunk_idx), int(staging_base), cid))
+            return cid
+
+
+class GatedPlanPool(PlanFakeCopyPool):
+    """PlanFakeCopyPool whose launch_chunk BLOCKS on a gate.
+
+    The gate sits BEFORE the handle check, so a release_plan during the gate
+    makes the resumed launch raise ValueError — the binding's deterministic
+    terminal for a launch racing the failure-side release.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.hold = threading.Event()
+
+    def launch_chunk(self, handle, chunk_idx, staging_base) -> int:
+        self.entered.set()
+        assert self.hold.wait(timeout=30), "test bug: the plan-pool gate was never released"
+        return super().launch_chunk(handle, chunk_idx, staging_base)
+
+
+class PlanChainAgent(FakeXferAgent):
+    """FakeXferAgent + launch_chunk_chained (snapshot semantics).
+
+    Allocates the copy id from the pool fake and reserves cid + 50_000; the
+    optional gate holds the call open AFTER the ids are decided (the C++
+    contract's "pinned plan snapshot": a release_plan during the call does
+    not fail it). One terminal row per chained chunk, under the reserved id.
+    """
+
+    RESERVED_DELTA = 50_000
+
+    def __init__(self, gated: bool = False) -> None:
+        super().__init__()
+        self.gated = gated
+        self.entered = threading.Event()
+        self.hold = threading.Event()
+        #: Every chained launch: (handle, chunk_idx, staging_base, dst_ptr,
+        #: nbytes, cid, reserved_id).
+        self.chained: list[tuple] = []
+
+    def launch_chunk_chained(
+        self, pool, handle, chunk_idx, staging_base, dst_ptr, nbytes, _sd, _dd, _peer, _poller
+    ):
+        with pool._mu:
+            if int(handle) not in pool.plans:
+                raise ValueError("launch_chunk_chained: unknown plan handle")
+            if pool.busy:
+                return (pool.BUSY, -1)
+            cid = pool._next_cid
+            pool._next_cid += 1
+            reserved = cid + self.RESERVED_DELTA
+            self.chained.append(
+                (
+                    int(handle),
+                    int(chunk_idx),
+                    int(staging_base),
+                    int(dst_ptr),
+                    int(nbytes),
+                    cid,
+                    reserved,
+                )
+            )
+        if self.gated:
+            self.entered.set()
+            assert self.hold.wait(timeout=30), "test bug: the chained gate was never released"
+        return (cid, reserved)
 
 
 @pytest.fixture
@@ -248,10 +328,10 @@ def make_reactor():
     yield _make
     for box in reversed(boxes):
         # A still-gated fake would wedge the joining pump/reactor thread.
-        if isinstance(box.pool, GatedCopyPool):
-            box.pool.hold.set()
-        if isinstance(box.agent, GatedOpAgent):
-            box.agent.hold.set()
+        for obj in (box.pool, box.agent):
+            hold = getattr(obj, "hold", None)
+            if hold is not None:
+                hold.set()
         box.reactor.shutdown()
 
 
@@ -868,50 +948,6 @@ def _fail_mid_op_and_settle(box, peer: RawPeer, fut, rid: int, req, terminal_id_
 
 
 class TestFailDuringBusyOp:
-    @pytest.mark.parametrize("release_rc", [1, 0], ids=["armed", "declined"])
-    def test_fail_mid_fulfill_releases_once_and_defers_cancel(
-        self, make_reactor, raw_peers, release_rc
-    ):
-        """T7-fulfill: fail while fulfill_chain_1to1 is mid-execution.
-
-        Whether the fulfill lands ARMED (write posts; terminal row after the
-        write) or DECLINED (terminal row already pending for the reserved
-        id), the reserved id is routed as the orphan write and settles the
-        deferred cancel; cancel_chain is never called for a mid-fulfill
-        chunk (its reservation is already being consumed).
-        """
-        poller = ChainFakePoller()
-        agent = GatedOpAgent("fulfill", release_rc=release_rc)
-        box = make_reactor("fulfillbusy", poller=poller, agent=agent, enable_cpp_chain=True)
-        peer = raw_peers(box.reactor.endpoint, "rx")
-        assert box.reactor.add_peer(peer.name, peer.endpoint)
-
-        fut, rid, req, cid = _stage_gated_op(box, peer, gathered_first=False)
-        assert req.posted[0].reserved, "the launch never took a chain reservation"
-        reserved = cid + 50_000  # ChainFakePoller's deterministic mapping
-        _fail_mid_op_and_settle(box, peer, fut, rid, req, lambda: reserved)
-        assert poller.cancels == [], "cancel_chain called for a mid-fulfill chunk"
-
-    @pytest.mark.parametrize("release_rc", [88_888, -1], ids=["armed", "raced"])
-    def test_fail_mid_arm_releases_once_and_defers_cancel(
-        self, make_reactor, raw_peers, release_rc
-    ):
-        """T7-arm: fail while post_transfer_1to1_on_event is mid-execution.
-
-        An arm that succeeds routes its fresh reserved id as the orphan
-        write; an arm that LOST the race routes the original copy_id the
-        same way (its gather row settles the deferred cancel).
-        """
-        agent = GatedOpAgent("arm", release_rc=release_rc)
-        box = make_reactor("armbusy", agent=agent, enable_cpp_chain=True)  # one-shot mode
-        assert box.reactor._reserve_fn is None and box.reactor._chain_fn is not None
-        peer = raw_peers(box.reactor.endpoint, "rx")
-        assert box.reactor.add_peer(peer.name, peer.endpoint)
-
-        fut, rid, req, cid = _stage_gated_op(box, peer, gathered_first=False)
-        terminal = release_rc if release_rc >= 0 else cid
-        _fail_mid_op_and_settle(box, peer, fut, rid, req, lambda: terminal)
-
     def test_fail_mid_post_releases_once_and_defers_cancel(self, make_reactor, raw_peers):
         """T7-post: fail while the classic post_transfer_1to1 is mid-execution.
 
@@ -920,7 +956,7 @@ class TestFailDuringBusyOp:
         the region and lets the deferred cancel out.
         """
         agent = GatedOpAgent("post")
-        box = make_reactor("postbusy", agent=agent)  # chain off: classic path
+        box = make_reactor("postbusy", agent=agent)  # fake pool: classic post path
         peer = raw_peers(box.reactor.endpoint, "rx")
         assert box.reactor.add_peer(peer.name, peer.endpoint)
 
@@ -967,7 +1003,7 @@ class TestPumpOwnershipBackstop:
         invariant the ``owned`` flag now guarantees.)
         """
         agent = GatedOpAgent("post")
-        box = make_reactor("ownstomp", agent=agent)  # chain off: classic post path
+        box = make_reactor("ownstomp", agent=agent)  # fake pool: classic post path
         peer = raw_peers(box.reactor.endpoint, "rx")
         assert box.reactor.add_peer(peer.name, peer.endpoint)
 
@@ -1005,4 +1041,247 @@ class TestPumpOwnershipBackstop:
         assert fut.result(timeout=10).ok is True
         # THE spy count: exactly one RDMA post for the one chunk, ever.
         assert len(box.agent.posts) == 1, "duplicate RDMA post for a single chunk"
+        assert box.reactor.alive()
+
+
+# --------------------------------------------------------------------------------------------
+# Per-request plan handle — fallback, chained rows, release
+# --------------------------------------------------------------------------------------------
+class TestPlanHandleFakes:
+    def test_fallback_without_register_plan_uses_numpy_gather(self, make_reactor, raw_peers):
+        """P4: a pool WITHOUT register_plan keeps the numpy gather path.
+
+        The reactor detects the missing capability per instance: the request
+        carries the -1 plan-handle sentinel and ``submit_copy`` receives the
+        exact per-desc gather expansion (srcs, region_base + bounce_offsets,
+        sizes); the transfer then completes normally.
+        """
+        box = make_reactor("planless")  # plain FakeCopyPool: no register_plan
+        assert box.reactor._register_plan_fn is None
+        peer = raw_peers(box.reactor.endpoint, "rx")
+        assert box.reactor.add_peer(peer.name, peer.endpoint)
+
+        fut = _submit(box, peer.name, n_desc=16)  # eager launch on this thread
+        rid, chunk_sizes = _recv_want(peer)
+        req = box.reactor._requests[rid]
+        assert req.plan_handle == -1, "plan handle taken despite the missing binding"
+        chunk = req.plan.chunks[0]
+        srcs, dsts, sizes, cid = box.pool.calls[0]
+        region_base = BASE + req.posted[0].local_offset
+        assert np.array_equal(srcs, chunk.src_ptrs), "fallback gather srcs differ from the plan"
+        assert np.array_equal(dsts, np.uint64(region_base) + chunk.bounce_offsets)
+        assert np.array_equal(sizes, chunk.sizes)
+
+        box.poller.complete(cid, ok=True)
+        credits = _grant_all(peer, rid, chunk_sizes)
+        _wait_until(lambda: len(box.agent.posts) == 1, 10.0, "the RDMA write to be posted")
+        box.poller.complete_xfer(box.agent.posts[0][4], ok=True)
+        got = peer.recv(10.0)
+        assert got is not None and got[1].msg_type == codec.BounceMsgType.DATA
+        _ack(peer, rid, 0, credits[0].region_handle)
+        assert fut.result(timeout=10).ok is True
+
+    def test_chained_launch_one_row_and_release_on_completion(self, make_reactor, raw_peers):
+        """P5-happy: a credited launch chains and releases the plan on ACK.
+
+        Eager gather off -> the launch waits for its credit and goes through
+        launch_chunk_chained (right handle/dst/bytes; tx_chained_launches
+        bumps); the chunk's ONE row is the reserved xfer id; completing the
+        request releases the plan handle exactly once.
+        """
+        pool, agent = PlanFakeCopyPool(), PlanChainAgent()
+        box = make_reactor("planok", pool=pool, agent=agent, enable_eager_gather=False)
+        peer = raw_peers(box.reactor.endpoint, "rx")
+        assert box.reactor.add_peer(peer.name, peer.endpoint)
+        capacity = box.sched.arena_capacity
+
+        fut = _submit(box, peer.name, n_desc=16)
+        rid, chunk_sizes = _recv_want(peer)
+        req = box.reactor._requests[rid]
+        handle = req.plan_handle
+        assert handle >= 0 and handle in pool.plans
+        assert pool.launches == [] and agent.chained == []  # nothing before the credit
+
+        credits = _grant_all(peer, rid, chunk_sizes)
+        _wait_until(lambda: len(agent.chained) == 1, 10.0, "the credited chained launch")
+        c_handle, c_idx, _base, c_dst, c_bytes, _cid, reserved = agent.chained[0]
+        assert (c_handle, c_idx, c_dst, c_bytes) == (handle, 0, credits[0].addr, CHUNK)
+        assert box.reactor.stats().get("tx_chained_launches", 0) == 1
+        assert pool.launches == [], "a chained chunk also took a plain launch"
+
+        box.poller.complete_xfer(reserved, ok=True)  # the ONE terminal row
+        got = peer.recv(10.0)
+        assert got is not None and got[1].msg_type == codec.BounceMsgType.DATA
+        _ack(peer, rid, 0, credits[0].region_handle)
+        assert fut.result(timeout=10).ok is True
+        _wait_until(lambda: pool.releases == [handle], 10.0, "the ACK-complete plan release")
+        _wait_until(lambda: box.sched.free_bytes() == capacity, 10.0, "the region recycle")
+        s = box.reactor.stats()
+        assert s["tx_xfer_events"] == 1 and s["tx_acked_chunks"] == 1
+        assert s.get("tx_gather_events", 0) == 0  # the gather row was consumed in C++
+        assert box.reactor.alive()
+
+    def test_chained_gather_failure_row_maps_to_fail_gather(self, make_reactor, raw_peers):
+        """P5/P3-fake: a (reserved, KIND_EVENT, 0) row means the gather died.
+
+        The GPU suite cannot inject a real gather fault (it would poison the
+        CUDA context — see the note in test_event_chain.py), so the row
+        mapping is pinned here: the request fails FAIL_GATHER, the region is
+        fully conserved, the plan handle is released exactly once, and the
+        reactor stays alive.
+        """
+        pool, agent = PlanFakeCopyPool(), PlanChainAgent()
+        box = make_reactor("plangfail", pool=pool, agent=agent, enable_eager_gather=False)
+        peer = raw_peers(box.reactor.endpoint, "rx")
+        assert box.reactor.add_peer(peer.name, peer.endpoint)
+        capacity = box.sched.arena_capacity
+
+        fut = _submit(box, peer.name, n_desc=16)
+        rid, chunk_sizes = _recv_want(peer)
+        handle = box.reactor._requests[rid].plan_handle
+        _grant_all(peer, rid, chunk_sizes)
+        _wait_until(lambda: len(agent.chained) == 1, 10.0, "the credited chained launch")
+        reserved = agent.chained[0][6]
+
+        box.poller.complete(reserved, ok=False)  # KIND_EVENT: the gather failed in C++
+        res = fut.result(timeout=10)
+        assert res.ok is False
+        assert res.reason == FAIL_GATHER, f"gather-stage row misattributed: {res.reason}"
+        _wait_until(lambda: box.sched.free_bytes() == capacity, 10.0, "the region release")
+        assert pool.releases == [handle], "plan handle not released exactly once on failure"
+        _assert_cancel(peer, rid)  # write never posted -> the cancel goes out now
+        assert not box.reactor._unrouted
+        assert box.reactor.alive()
+
+    def test_fail_between_launches_releases_plan_exactly_once(self, make_reactor, raw_peers):
+        """P5a: forget_peer between launches -> ONE release_plan, ever.
+
+        Two eagerly-launched (uncredited -> plain launch_chunk) chunks are
+        GATHERING when the peer is forgotten: the fail path releases the plan
+        handle exactly once, the orphaned gather rows recycle both regions,
+        and the shutdown failAll must NOT release the handle again.
+        """
+        pool = PlanFakeCopyPool()
+        box = make_reactor("planfail", pool=pool)  # plain agent: no chaining
+        peer = raw_peers(box.reactor.endpoint, "rx")
+        assert box.reactor.add_peer(peer.name, peer.endpoint)
+        capacity = box.sched.arena_capacity
+
+        fut = _submit(box, peer.name, n_desc=32)  # two 64 KiB chunks, both eager
+        rid, _chunk_sizes = _recv_want(peer)
+        handle = box.reactor._requests[rid].plan_handle
+        assert handle >= 0
+        assert len(pool.launches) == 2, "eager launches did not go through launch_chunk"
+        assert [launched[0] for launched in pool.launches] == [handle, handle]
+
+        box.reactor.forget_peer(peer.name)
+        res = fut.result(timeout=10)
+        assert res.ok is False and res.reason == FAIL_PEER_DROPPED
+        _wait_until(lambda: pool.releases == [handle], 10.0, "the failure-side plan release")
+
+        for _h, _ci, _base, cid in pool.launches:  # the orphaned gather rows
+            box.poller.complete(cid, ok=True)
+        _wait_until(lambda: box.sched.free_bytes() == capacity, 10.0, "both regions to recycle")
+        assert box.reactor.alive()
+        box.reactor.shutdown()  # failAll must not double-release (handle latched)
+        assert pool.releases == [handle], "release_plan called more than once"
+
+    def test_fail_mid_chained_launch_defers_cancel_and_releases_once(self, make_reactor, raw_peers):
+        """P5b: fail while a CHAINED launch is mid-execution.
+
+        busy_op == "launch_chained" counts as a deferred write (the C++ side
+        may already be posting the RDMA write): the cancel-WANT is held back,
+        the plan is released exactly once at the fail, the record phase
+        routes the reserved id as the orphan write, and its terminal row
+        recycles the region and lets the cancel out.
+        """
+        pool, agent = PlanFakeCopyPool(), PlanChainAgent(gated=True)
+        box = make_reactor("planchainbusy", pool=pool, agent=agent, enable_eager_gather=False)
+        peer = raw_peers(box.reactor.endpoint, "rx")
+        assert box.reactor.add_peer(peer.name, peer.endpoint)
+        capacity = box.sched.arena_capacity
+
+        fut = _submit(box, peer.name, n_desc=16)
+        rid, chunk_sizes = _recv_want(peer)
+        req = box.reactor._requests[rid]
+        handle = req.plan_handle
+        _grant_all(peer, rid, chunk_sizes)
+        assert agent.entered.wait(timeout=10), "the gated chained launch was never entered"
+
+        # _fail_request's documented any-thread contract (the reactor itself
+        # is blocked inside the gated chained call).
+        box.reactor._fail_request(rid, req, FAIL_PEER_DROPPED)
+        res = fut.result(timeout=10)
+        assert res.ok is False and res.reason == FAIL_PEER_DROPPED
+        assert box.reactor._pending_cancels.get(rid) == peer.name, "chained busy not deferred"
+        assert box.sched.local_held_count() == 1
+        assert pool.releases == [handle], "plan not released exactly once at the fail"
+        assert peer.recv(NEGATIVE_WAIT_S) is None, "cancel sent while the chained launch ran"
+
+        agent.hold.set()
+        reserved = agent.chained[0][6]
+        _wait_until(
+            lambda: reserved in box.reactor._completions,
+            timeout_s=10.0,
+            what="the record phase to register the orphan route for the reserved id",
+        )
+        box.poller.complete_xfer(reserved, ok=False)  # the guaranteed terminal row
+        _wait_until(
+            lambda: box.sched.free_bytes() == capacity and box.sched.local_held_count() == 0,
+            timeout_s=10.0,
+            what="the orphan terminal row to release the region",
+        )
+        _assert_cancel(peer, rid)
+        assert pool.releases == [handle]  # still exactly once
+        with box.reactor._req_mu:
+            assert not box.reactor._unrouted
+            assert not box.reactor._orphan_writes
+            assert not box.reactor._pending_cancels
+        assert box.reactor.alive()
+
+    def test_launch_after_release_valueerror_lands_in_error_path(self, make_reactor, raw_peers):
+        """P5c: a launch racing the failure-side release raises ValueError.
+
+        The gate holds the plain launch open while forget_peer fails the
+        request and releases the plan; the resumed launch then raises
+        (unknown handle) and the launch-error path recycles the staging
+        region immediately — no completion id ever exists, nothing leaks,
+        the reactor stays alive.
+        """
+        pool = GatedPlanPool()
+        box = make_reactor("planrace", pool=pool)
+        peer = raw_peers(box.reactor.endpoint, "rx")
+        assert box.reactor.add_peer(peer.name, peer.endpoint)
+        _pin_pump_to_submitter(box)
+        capacity = box.sched.arena_capacity
+
+        t, result = _submit_on_thread(box, peer.name, n_desc=16)
+        assert pool.entered.wait(timeout=10), "the eager launch never reached the gate"
+        rid, _chunk_sizes = _recv_want(peer)
+        handle = box.reactor._requests[rid].plan_handle
+
+        box.reactor.forget_peer(peer.name)
+        _wait_until(lambda: rid not in box.reactor._requests, 10.0, "the fail path to run")
+        _wait_until(lambda: pool.releases == [handle], 10.0, "the failure-side plan release")
+        assert box.sched.local_held_count() == 1  # the busy launch still holds its region
+        # A plain busy launch is NOT a deferred write: no cancel is held back
+        # (the cancel itself is dropped by design — forget_peer removed the
+        # route before the reclaim ran).
+        assert rid not in box.reactor._pending_cancels
+
+        pool.hold.set()  # the resumed launch now raises ValueError (plan gone)
+        t.join(timeout=10)
+        assert not t.is_alive()
+        res = result.future.result(timeout=10)
+        assert res.ok is False and res.reason == FAIL_PEER_DROPPED
+        _wait_until(
+            lambda: box.sched.free_bytes() == capacity and box.sched.local_held_count() == 0,
+            timeout_s=10.0,
+            what="the launch-error path to recycle the staged region",
+        )
+        assert pool.launches == [], "the raced launch still allocated a completion id"
+        with box.reactor._req_mu:
+            assert not box.reactor._completions
+        time.sleep(0.1)  # no late double-release may push past capacity
+        assert box.sched.free_bytes() == capacity
         assert box.reactor.alive()

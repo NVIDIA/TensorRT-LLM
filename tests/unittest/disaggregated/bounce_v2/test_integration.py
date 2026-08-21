@@ -49,7 +49,6 @@ tab = pytest.importorskip(
 from tensorrt_llm._torch.disaggregation.bounce_v2.codec import BOUNCE_VERSION  # noqa: E402
 from tensorrt_llm._torch.disaggregation.bounce_v2.config import BounceV2Config  # noqa: E402
 from tensorrt_llm._torch.disaggregation.bounce_v2.engine import (  # noqa: E402
-    BOUNCE_V2_CPP_CHAIN_ENV,
     BOUNCE_V2_ENV,
     BounceEngine,
     NoBounceEngine,
@@ -117,11 +116,6 @@ class TestEnvGate:
         if free < 4 * GIB:
             pytest.skip("factory uses the default 2 GiB arena; not enough free VRAM")
         monkeypatch.setenv(BOUNCE_V2_ENV, value)
-        # This test asserts the BASELINE factory output, so pin the
-        # experimental gate off regardless of the outer environment (the
-        # suite is also run under TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN=1 smoke
-        # sweeps).
-        monkeypatch.delenv(BOUNCE_V2_CPP_CHAIN_ENV, raising=False)
         name, raw_agent = agent
         eng = create_bounce_v2_engine(raw_agent, DEVICE, name)
         try:
