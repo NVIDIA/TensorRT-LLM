@@ -7,16 +7,19 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import modelexpress.load_strategy as load_strategy
 import pytest
 from _source_identity_fakes import make_identity
-from modelexpress.engines import trtllm
-from modelexpress.load_strategy import rdma_strategy
 
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
 )
+
+pytest.importorskip("modelexpress")
+
+import modelexpress.load_strategy as load_strategy  # noqa: E402
+from modelexpress.engines import trtllm  # noqa: E402
+from modelexpress.load_strategy import rdma_strategy  # noqa: E402
 
 
 def _identity(*, transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1):
