@@ -93,10 +93,12 @@ moonshotai/Kimi-K2.5:
 # GB300; single-run reference (lm-eval stderr +/-1.16 at n=900). A score at or
 # below the K2.5 floor above with clean logs signals the kimi_k3_mmmu
 # extractor silently falling back (truncated CoT) — a harness failure, not a
-# model regression.
+# model regression. No quant_algo key: the checkpoint's quantization lives in
+# the nested text_config.quantization_config (compressed-tensors), which the
+# LLM-args layer does not surface — the reference matcher sees
+# quant_algo=None.
 moonshotai/Kimi-K3:
-  - quant_algo: W4A16_MXFP4
-    accuracy: 84.89
+  - accuracy: 84.89
 # Step-3.7-Flash multimodal (PerceptionEncoder vision tower + MoE text decoder).
 # Reasoning model: <think>...</think> traces are stripped before MMMU answer
 # extraction (see test_llm_api_pytorch_multimodal.py::TestStep3_7). FP8 measured
