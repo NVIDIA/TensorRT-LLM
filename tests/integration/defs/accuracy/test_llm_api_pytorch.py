@@ -7795,22 +7795,32 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["default", "nvfp4"])
     @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("use_msa", [False, True])
-    def test_nvfp4(self, use_msa, eval_mode):
+    def test_nvfp4(self, use_msa, eval_mode, kv_dtype):
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
-        # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
-        # Triton path keeps the KV cache in BF16.
+        # (MIXED_PRECISION checkpoint). At the default KV dtype the MSA path
+        # runs an FP8 KV cache and the Triton path keeps it in BF16.
         # eval_mode selects the accuracy protocol: "default" = completion-format
         # MMLU + GSM8K; "inferencemax" = chat-format GSM8K matching the public
         # InferenceMAX benchmark (needs a 16k context for thinking output).
+        # kv_dtype="nvfp4" is the hybrid cache: the sparse layers' main K/V are
+        # NVFP4 and the dense layers stay FP8. Only the MSA kernels read it.
+        nvfp4_kv = kv_dtype == "nvfp4"
+        if nvfp4_kv and not use_msa:
+            pytest.skip("The NVFP4 KV cache is only read by the MSA kernels")
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         inferencemax = eval_mode == "inferencemax"
+        if use_msa:
+            cache_dtype = "nvfp4" if nvfp4_kv else "fp8"
+        else:
+            cache_dtype = "auto"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
-                                        dtype="fp8" if use_msa else "auto",
+                                        dtype=cache_dtype,
                                         use_kv_cache_manager_v2=use_msa)
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton",
@@ -7841,6 +7851,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  max_batch_size=max_batch_size,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            if nvfp4_kv:
+                assert (llm.args.quant_config.kv_cache_quant_algo ==
+                        QuantAlgo.NVFP4)
             if inferencemax:
                 task = GSM8KInferenceMax(model_name)
                 task.evaluate(llm)
