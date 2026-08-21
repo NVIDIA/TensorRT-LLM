@@ -7606,9 +7606,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Host-only guard — no device sync. The op signature and output
             # contract are unchanged (unordered int32 indices, -1 pad only
             # for degenerate rows).
-            if _is_tiered_topk_supported(logits, pre_idx, seq_lens,
-                                         output_indices, top_k, next_n,
-                                         compress_ratio, order_row, counters):
+            if (seed_thr is None and cand_vals is None and xstate is None
+                    and block_max is None and _is_tiered_topk_supported(
+                        logits, pre_idx, seq_lens, output_indices, top_k,
+                        next_n, compress_ratio, order_row, counters)):
                 _tiered_topk(logits, pre_idx, seq_lens, output_indices, top_k,
                              next_n, compress_ratio)
                 return
