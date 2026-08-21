@@ -101,7 +101,6 @@ attention precision, and Skip Softmax settings.
 | Item | Setting |
 | :--- | :--- |
 | Checkpoint | [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) BF16 weights with ModelOpt-generated Skip Softmax metadata for both transformers |
-| TensorRT-LLM | 1.3.0rc19 |
 | Accelerator | NVIDIA B200 |
 | Generated video | 1280×720, 81 frames at 16 FPS |
 | Denoising | 50 steps; guidance 5.0 for the high-noise expert and 4.0 for the low-noise expert; maximum text sequence length 512 |
@@ -235,6 +234,8 @@ quantization chooses the broad quality band; SAGE and Skip Softmax then recover 
 band.
 
 ## Reproduction
+
+The steps below target TensorRT-LLM 1.3.0rc24.
 
 The [Wan 2.2 Skip Softmax example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/skip_softmax/wan2.2-t2v-a14b)
 contains the two ModelOpt calibration overlays and the VisualGen configuration for the 1.40×
