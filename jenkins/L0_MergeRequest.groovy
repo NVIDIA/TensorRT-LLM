@@ -635,7 +635,9 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
             pageId += 1
             def rawDataJson = pipeline.sh(
                 script: """
-                    curl --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
+                    curl --silent --fail \
+                         --retry 3 --retry-delay 5 --retry-all-errors \
+                         --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
                          --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
                 """,
                 returnStdout: true
@@ -745,6 +747,7 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
     } catch (Exception e) {
         pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
         globalVars[CACHED_CHANGED_FILE_LIST] = []
+        globalVars["CHANGED_FILE_LIST_FETCH_FAILED"] = true
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
 }
@@ -1249,6 +1252,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
+        if (globalVars["CHANGED_FILE_LIST_FETCH_FAILED"]) {
+            pipeline.echo("GitHub API failed. Conservatively enabling multi-GPU tests.")
+            return true
+        }
         return false
     }
 
