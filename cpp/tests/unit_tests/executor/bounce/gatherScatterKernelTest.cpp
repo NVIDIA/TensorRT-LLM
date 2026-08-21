@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include "bounceTestUtils.h"
+
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/GatherScatterKernel.h"
 
 #include <gtest/gtest.h>
@@ -30,13 +32,11 @@ namespace b = tensorrt_llm::executor::kv_cache::bounce;
 
 #define CUDA_OK(call) ASSERT_EQ((call), cudaSuccess) << "CUDA call failed: " #call
 
+using bounce_test::alignUp;
+using bounce_test::hasCuda;
+
 namespace
 {
-std::uint64_t alignUp(std::uint64_t value, std::uint64_t align)
-{
-    return (value + align - 1) / align * align;
-}
-
 // Distinct per-(buffer,byte) pattern so any mis-routing/overlap is caught.
 unsigned char pattern(std::size_t buf, std::size_t idx)
 {
@@ -46,9 +46,7 @@ unsigned char pattern(std::size_t buf, std::size_t idx)
 
 TEST(GatherScatterKernel, ZeroBuffersIsNoop)
 {
-    int devs = 0;
-    CUDA_OK(cudaGetDeviceCount(&devs));
-    if (devs == 0)
+    if (!hasCuda())
     {
         GTEST_SKIP() << "no CUDA device";
     }
@@ -68,9 +66,7 @@ namespace
 // memory.
 void runRoundTrip(bool mappedPlan)
 {
-    int devs = 0;
-    CUDA_OK(cudaGetDeviceCount(&devs));
-    if (devs == 0)
+    if (!hasCuda())
     {
         GTEST_SKIP() << "no CUDA device";
     }

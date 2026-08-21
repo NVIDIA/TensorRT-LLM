@@ -67,7 +67,7 @@ struct Grant
 /// the GPU buffer).
 ///
 /// TERMINOLOGY: the string identifying a client is an opaque **flow id** ("peerName<sep>rid"), NOT
-/// an agent name (cf. `peer` in ControlChannel/TransferEngine). reclaimByPrefix() is the only
+/// an agent name (cf. `peer` in ControlChannel/BounceTransport). reclaimByPrefix() is the only
 /// peer-level op. The local sender shares this same arena via acquireLocal() (gather staging).
 ///
 /// Each event method mutates state and returns the GRANTs the caller should now send.
@@ -207,7 +207,12 @@ private:
         std::chrono::steady_clock::time_point lastProgress;
     };
 
-    std::vector<Grant> schedule();              // grant while the arena has room and eligible flows exist
+    std::vector<Grant> schedule(); // grant while the arena has room and eligible flows exist
+    // Book one issued grant (shared by schedule()'s drain branch and round-robin sweep): pop the
+    // flow's head chunk, hold `offset`, renew the lease, append the Grant, and advance the cursor
+    // past ring slot `ringIdx`. Caller must hold mMu and have alloc'd `offset` for the head chunk.
+    void issueGrant(
+        std::string const& flow, FlowState& st, std::size_t ringIdx, std::uint64_t offset, std::vector<Grant>& grants);
     void maybeActivateDrain();                  // age a repeatedly bypassed flow into receiver drain mode
     void ensureInRing(std::string const& flow); // add flow to the round-robin ring if absent
     void dropFromRing(std::string const& flow); // remove flow from the round-robin ring

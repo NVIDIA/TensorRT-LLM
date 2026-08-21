@@ -30,7 +30,6 @@
 #include <cuda.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <ifaddrs.h>
 #include <limits>
 #include <mutex>
 #include <netdb.h>

@@ -62,12 +62,10 @@ class BounceTransferPlan
 public:
     /// @param maxChunkSizeBytes Per-chunk byte cap (one transfer writes at most this many bytes).
     /// @param maxDescsPerChunk Upper bound on descriptors per chunk (bounds scatter-plan size).
-    /// @param mergeScatterRuns Coalesce the scatter view into runs (default). false creates one
-    /// count==1 run per descriptor and is intended only for control-plane debugging.
     /// Throws (TLLM_CHECK) on src/dst count, length, or device-id mismatch, or when a single desc is
     /// larger than maxChunkSizeBytes.
     [[nodiscard]] static BounceTransferPlan build(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
-        std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk, bool mergeScatterRuns = true);
+        std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk);
 
     [[nodiscard]] std::vector<BounceChunk> const& chunks() const noexcept
     {

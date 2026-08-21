@@ -295,12 +295,8 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
         // Immediate free (no quarantine) is safe HERE because a cancel is sender-initiated: the
         // sender defers it until its last in-flight RDMA write reached a terminal state
         // (mPendingCancel / drainOrphanLocal), so nothing can still be writing these regions.
-        std::vector<std::uint64_t> deferred;
-        mCtx.sendGrants(mCtx.scheduler.reclaimFlow(key, scatteringRegions(), deferred));
-        for (auto off : deferred)
-        {
-            mScattering[off] = true;
-        }
+        reclaimAndFlagDeferred(
+            [&](auto const& busy, auto& deferred) { return mCtx.scheduler.reclaimFlow(key, busy, deferred); });
         return;
     }
     if (!reversePathReady)
@@ -399,6 +395,18 @@ std::unordered_set<std::uint64_t> BounceReceiver::scatteringRegions() const
     return busy;
 }
 
+void BounceReceiver::reclaimAndFlagDeferred(
+    std::function<std::vector<Grant>(std::unordered_set<std::uint64_t> const&, std::vector<std::uint64_t>&)> const&
+        reclaim)
+{
+    std::vector<std::uint64_t> deferred;
+    mCtx.sendGrants(reclaim(scatteringRegions(), deferred));
+    for (auto off : deferred)
+    {
+        mScattering[off] = true;
+    }
+}
+
 bool BounceReceiver::drainScatterDone()
 {
     std::deque<ScatterDone> done;
@@ -410,7 +418,6 @@ bool BounceReceiver::drainScatterDone()
     {
         return false;
     }
-    bool const didWork = true;
     // Bookkeeping only (the ACK itself was sent by the worker): region frees + re-grants.
     BounceNvtxScope drainScope(kNvtxDoneDrain, "doneDrain n=%zu", done.size());
     for (auto& d : done)
@@ -435,7 +442,7 @@ bool BounceReceiver::drainScatterDone()
             mCtx.sendGrants(mCtx.scheduler.onScatterDone(d.key, d.offset));
         }
     }
-    return didWork;
+    return true;
 }
 
 void BounceReceiver::forget(std::string const& peer)
@@ -467,13 +474,12 @@ void BounceReceiver::forget(std::string const& peer)
     //     receiver-initiated (invalidateRemoteAgent), so — unlike an explicit cancel — no
     //     sender-side drain guarantees those writes ended, and a one-sided write cannot be aborted.
     //     quarantineFor > 0 keeps them out of the arena until checkTimeouts()'s reapQuarantine.
-    std::vector<std::uint64_t> deferred;
-    mCtx.sendGrants(mCtx.scheduler.reclaimByPrefix(
-        peer + kSep, scatteringRegions(), deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs))));
-    for (auto off : deferred)
-    {
-        mScattering[off] = true;
-    }
+    reclaimAndFlagDeferred(
+        [&](auto const& busy, auto& deferred)
+        {
+            return mCtx.scheduler.reclaimByPrefix(
+                peer + kSep, busy, deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)));
+        });
 }
 
 void BounceReceiver::checkTimeouts()
@@ -521,13 +527,12 @@ void BounceReceiver::checkTimeouts()
             "(regions quarantined for %d ms before reuse)",
             mCtx.selfName.c_str(), mCtx.cfg.receiverFlowTimeoutMs, peer.c_str(), static_cast<unsigned long long>(rid),
             mCtx.cfg.quarantineMs);
-        std::vector<std::uint64_t> deferred;
-        mCtx.sendGrants(mCtx.scheduler.reclaimFlow(
-            flow, scatteringRegions(), deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs))));
-        for (auto off : deferred)
-        {
-            mScattering[off] = true;
-        }
+        reclaimAndFlagDeferred(
+            [&](auto const& busy, auto& deferred)
+            {
+                return mCtx.scheduler.reclaimFlow(
+                    flow, busy, deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)));
+            });
     }
 }
 
@@ -820,6 +825,28 @@ void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, st
     pumpRequest(h.requestId, req);
 }
 
+bool BounceSender::abandonOnCreditMispair(
+    std::uint64_t rid, Request& req, std::uint32_t chunkIdx, std::uint64_t packedBytes, std::uint32_t creditLen)
+{
+    // Credits pair with chunks by FIFO order, and the receiver sizes each granted region to
+    // chunkBytes[chunkIdx] in WANT, so packedBytes always fits when the channel honors its FIFO
+    // contract. A malformed or misordered GRANT would make us RDMA-write packedBytes into a smaller
+    // region, overflowing into an adjacent flow's region on the peer. Detect that protocol violation
+    // and abandon the flow (it then fails via checkTimeouts) rather than corrupt the peer.
+    if (packedBytes <= creditLen)
+    {
+        return false;
+    }
+    TLLM_LOG_WARNING(
+        "BounceTransport(%s): rid=%llu chunk=%u packedBytes=%zu > granted region len=%u (GRANT "
+        "mispair/reorder); abandoning flow",
+        mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx, static_cast<std::size_t>(packedBytes),
+        static_cast<unsigned int>(creditLen));
+    req.abandonReason = BounceFailReason::kProtocolError;
+    req.pendingCredits.clear();
+    return true;
+}
+
 void BounceSender::attachCredits(std::uint64_t rid, Request& req)
 {
     // Credits pair with chunks strictly in order (the receiver serves the WANT size list FIFO), so
@@ -850,18 +877,8 @@ void BounceSender::attachCredits(std::uint64_t rid, Request& req)
             continue;
         }
         auto const& chunk = req.plan.chunks()[target->chunkIdx];
-        // Same mispair guard as pumpRequest: a credit smaller than the chunk would make the RDMA
-        // write overflow the granted region into an adjacent flow's region on the peer. Abandon the
-        // flow (fails via checkTimeouts) rather than corrupt.
-        if (chunk.packedBytes > credit.len)
+        if (abandonOnCreditMispair(rid, req, target->chunkIdx, chunk.packedBytes, credit.len))
         {
-            TLLM_LOG_WARNING(
-                "BounceTransport(%s): rid=%llu chunk=%u packedBytes=%zu > granted region len=%u (GRANT "
-                "mispair/reorder); abandoning flow",
-                mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), target->chunkIdx,
-                static_cast<std::size_t>(chunk.packedBytes), static_cast<unsigned int>(credit.len));
-            req.abandonReason = BounceFailReason::kProtocolError;
-            req.pendingCredits.clear();
             return;
         }
         target->remoteHandle = credit.regionHandle;
@@ -906,21 +923,9 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
                 break; // cap eager gathers by this request's configured in-flight chunk limit
             }
         }
-        // Defensive pairing check BEFORE committing resources. Credits pair with chunks by FIFO
-        // order, and the receiver sizes each granted region to chunkBytes[chunkIdx] in WANT, so
-        // packedBytes always fits when the channel honors its FIFO contract. A malformed or
-        // misordered GRANT would make us RDMA-write packedBytes into a smaller region, overflowing
-        // into an adjacent flow's region on the peer. Detect that protocol violation and abandon the
-        // flow (it then fails via checkTimeouts) rather than corrupt the peer.
-        if (haveCredit && chunk.packedBytes > req.pendingCredits.front().len)
+        // Defensive pairing check BEFORE committing resources (see abandonOnCreditMispair).
+        if (haveCredit && abandonOnCreditMispair(rid, req, chunkIdx, chunk.packedBytes, req.pendingCredits.front().len))
         {
-            TLLM_LOG_WARNING(
-                "BounceTransport(%s): rid=%llu chunk=%u packedBytes=%zu > granted region len=%u (GRANT "
-                "mispair/reorder); abandoning flow",
-                mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx,
-                static_cast<std::size_t>(chunk.packedBytes), static_cast<unsigned int>(req.pendingCredits.front().len));
-            req.abandonReason = BounceFailReason::kProtocolError;
-            req.pendingCredits.clear();
             break;
         }
         // Non-blocking: borrow an exec context (cheap to return), then a gather-staging region sized
@@ -986,7 +991,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             appendSplitInto(bufs, idx, chunk.srcPtrs[i], regionBase + chunk.bounceOffsets[i], chunk.sizes[i],
                 splitBudget(idx, nDesc - 1 - i, maxEntries));
         }
-        // gather into the region (cfg knobs select the H2D-vs-zero-copy arg path + custom-vs-cub copy)
+        // gather into the region (cfg.useZeroCopyArguments selects the H2D-vs-zero-copy plan-argument path)
         cudaError_t const gatherErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
         // Record an event for gather completion and DEFER the write. The gather must finish before
         // NIXL reads the region, but on a shared GPU the gather can be delayed behind model kernels
@@ -1389,7 +1394,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
         bounceRangeEnd(p.nvtxAckWait);
         if (p.state == PostState::Writing)
         {
-            mOrphanLocal.push_back(OrphanLocal{std::move(p.xfer), p.localOffset, req.peer, rid});
+            mOrphanLocal.push_back(OrphanLocal{std::move(p.xfer), p.localOffset, rid});
             deferredWrite = true;
             continue; // do NOT release xfer or recycle the region yet
         }
@@ -1647,17 +1652,19 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     // sides advertise; each side already clamped its own value to its usable arena capacity, so
     // equality also guarantees our chunks always fit the peer's arena and its scatter scratch
     // (sized for its own maxChunkSizeBytes). Local-only knobs (worker/stream counts, timeouts,
-    // copy backends, granularity, arena size) intentionally do NOT have to match.
+    // the zero-copy-argument path, granularity, arena size) intentionally do NOT have to match.
     if (handshake.wireVersion != kBounceVersion || handshake.controlKind != localControlKind
         || handshake.maxChunkSizeBytes != mCtx.cfg.maxChunkSizeBytes)
     {
         TLLM_LOG_WARNING(
             "BounceTransport(%s): peer %s bounce handshake incompatible (wireVersion %u vs %u, controlKind "
-            "%u vs %u, maxChunkSizeBytes %llu vs %zu) -> bounce disabled for this peer (NIXL fallback)",
+            "%u vs %u, maxChunkSizeBytes %llu vs %zu, peer arenaUsableCapacityBytes %llu vs %zu) -> bounce "
+            "disabled for this peer (NIXL fallback)",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned>(handshake.wireVersion),
             static_cast<unsigned>(kBounceVersion), static_cast<unsigned>(handshake.controlKind),
             static_cast<unsigned>(localControlKind), static_cast<unsigned long long>(handshake.maxChunkSizeBytes),
-            static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes));
+            static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes),
+            static_cast<unsigned long long>(handshake.arenaUsableCapacityBytes), mCtx.scheduler.arenaCapacity());
         return false;
     }
     if (!mCtx.channel->addPeer(peer, handshake.endpoint))

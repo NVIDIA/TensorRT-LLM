@@ -298,7 +298,14 @@ TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
     auto const data = b::encodeData(rid, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, {run});
     sender.sendTo("dupDataReceiver", data);
     sender.sendTo("dupDataReceiver", data);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // FIFO sentinel instead of a sleep: the reactor is a single FIFO consumer, so a GRANT for a
+    // fresh rid sent after both DATA messages proves it already consumed them (the second region is
+    // free under capRegions(2), so the sentinel WANT is grantable while rid=17 holds its region).
+    constexpr std::uint64_t sentinelRid = 18;
+    sender.sendTo("dupDataReceiver", b::encodeWant(sentinelRid, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> sentinelCredits;
+    ASSERT_TRUE(waitGrant(sender, sentinelRid, std::chrono::seconds(5), sentinelCredits))
+        << "sentinel WANT never granted; DATA messages may not have reached the reactor";
     for (auto* ctx : heldExecContexts)
     {
         receiver->exec->release(ctx);
@@ -763,8 +770,6 @@ TEST(BounceTransportFailure, ConcurrentMultiThreadedSubmit)
         GTEST_SKIP() << "no CUDA device";
     auto c = cfg(/*timeoutMs=*/10000);
     c.maxInflightChunksPerRequest = 4;
-    c.arenaAllocationGranularityBytes = 256;
-    c.arenaSizeBytes = 1ULL << 20;
     std::size_t const maxDescs = std::max<std::size_t>(1024ULL, c.maxChunkSizeBytes / 256ULL);
 
     auto A = bounce_test::makeNode("cmtA", c, maxDescs);

@@ -43,7 +43,7 @@ enum class BounceMsgType : std::uint16_t
 
 #pragma pack(push, 1)
 
-/// Fixed 44-byte header prefixing every message. Field meaning is per-type (documented at each
+/// Fixed 40-byte header prefixing every message. Field meaning is per-type (documented at each
 /// encode function); unused fields are 0.
 struct BounceMsgHeader
 {
@@ -57,7 +57,6 @@ struct BounceMsgHeader
     std::uint32_t numChunks;    // DATA/ACK
     std::uint32_t count;        // number of trailing entries (credits / chunk sizes / scatter)
     std::uint32_t payloadBytes; // bytes of trailing payload
-    std::uint32_t aux;          // WANT: numChunks; 0 elsewhere
 };
 
 /// Credit = permission to RDMA-write one chunk into a receiver arena allocation. `addr` is its
@@ -92,7 +91,7 @@ struct BounceScatterRun
 
 #pragma pack(pop)
 
-static_assert(sizeof(BounceMsgHeader) == 44, "BounceMsgHeader must be 44 bytes");
+static_assert(sizeof(BounceMsgHeader) == 40, "BounceMsgHeader must be 40 bytes");
 static_assert(sizeof(BounceCreditEntry) == 24, "BounceCreditEntry must be 24 bytes");
 static_assert(sizeof(BounceScatterRun) == 36, "BounceScatterRun must be 36 bytes");
 
@@ -124,10 +123,6 @@ inline constexpr std::uint16_t kBounceVersion = 2U;
 [[nodiscard]] std::string encodeAck(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle);
 
 // ---- decode ----
-/// Lightweight prefix check: does `blob` start with the bounce magic? (Lets a shared channel
-/// distinguish bounce control traffic from other notifications.)
-[[nodiscard]] bool hasBounceMagic(std::string const& blob);
-
 /// Decode the fixed header. Returns false on short blob, bad magic, or version mismatch.
 [[nodiscard]] bool decodeHeader(std::string const& blob, BounceMsgHeader& outHeader);
 
@@ -166,8 +161,9 @@ enum class BounceControlKind : std::uint8_t
 /// engaging bounce toward us: incompatible (or absent) handshake -> that peer transparently uses
 /// the standard per-desc NIXL path instead of waiting for requestTimeoutMs.
 /// Compatibility is strict equality of wireVersion, controlKind and effective maxChunkSizeBytes.
-/// Worker/stream counts, timeouts, copy backends, allocation granularity and configured arena size
-/// are local settings and are not compared. The usable arena capacity is carried for diagnostics.
+/// Worker/stream counts, timeouts, the zero-copy-argument path, allocation granularity and
+/// configured arena size are local settings and are not compared. The usable arena capacity is
+/// carried for diagnostics.
 struct BounceHandshake
 {
     std::uint16_t wireVersion{kBounceVersion};              // control-message codec version; must match exactly

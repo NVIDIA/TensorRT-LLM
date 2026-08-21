@@ -89,16 +89,15 @@ public:
 
     [[nodiscard]] bool isFabric() const noexcept
     {
-        return mIsFabric;
+        return mFabric != nullptr;
     }
 
 private:
     int mDeviceId{0};
     std::size_t mBytes{0};
     void* mBase{nullptr}; // the registered RDMA src/dst buffer (offset 0)
-    // Non-null (and mIsFabric=true) on MNNVL when fabric-backed; else null and mBase is cudaMalloc'd.
+    // Non-null on MNNVL when fabric-backed; else null and mBase is cudaMalloc'd.
     std::unique_ptr<tensorrt_llm::batch_manager::kv_cache_manager::FabricMemory> mFabric;
-    bool mIsFabric{false};
 };
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

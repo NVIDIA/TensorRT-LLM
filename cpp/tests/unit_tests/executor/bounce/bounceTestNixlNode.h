@@ -23,6 +23,8 @@
 // bounceTransportTest, bounceTransportFailureTest, and bounceAgentE2ETest so they share one NIXL
 // setup (no per-file copy, and no LocalCopy loopback fake — the data plane is always real NIXL).
 
+#include "bounceTestUtils.h"
+
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceArena.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
@@ -46,17 +48,6 @@ namespace bounce_test
 
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
 namespace kvc = tensorrt_llm::executor::kv_cache;
-
-inline bool hasCuda()
-{
-    int n = 0;
-    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
-}
-
-inline std::uint64_t alignUp(std::uint64_t v, std::uint64_t a)
-{
-    return (v + a - 1) / a * a;
-}
 
 // A `seed`-distinct byte pattern so concurrent transfers can't masquerade as each other.
 inline unsigned char patSeed(std::uint32_t seed, std::size_t d, std::size_t i)

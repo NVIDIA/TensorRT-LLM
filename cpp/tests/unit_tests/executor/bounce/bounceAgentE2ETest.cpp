@@ -122,6 +122,21 @@ kvc::BaseAgentConfig makeBounceConfig(
     }
     return cfg;
 }
+
+// Construct a NixlTransferAgent, returning nullptr (with the failure reason in skipMsg) when the
+// NIXL agent/backend is unavailable — callers GTEST_SKIP on nullptr, mirroring makeNode().
+std::unique_ptr<kvc::NixlTransferAgent> tryMakeAgent(kvc::BaseAgentConfig cfg, std::string& skipMsg)
+{
+    try
+    {
+        return std::make_unique<kvc::NixlTransferAgent>(std::move(cfg));
+    }
+    catch (std::exception const& e)
+    {
+        skipMsg = e.what();
+        return nullptr;
+    }
+}
 } // namespace
 
 // BaseAgentConfig::agentBufferSizeMb (from CacheTransceiverConfig's agent_buffer_size_mb) is the
@@ -159,18 +174,13 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    std::unique_ptr<kvc::NixlTransferAgent> a;
-    std::unique_ptr<kvc::NixlTransferAgent> b;
-    try
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeBounceConfig("bAgentA", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"), skipMsg);
+    auto b = a ? tryMakeAgent(makeBounceConfig("bAgentB", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"), skipMsg)
+               : nullptr;
+    if (!a || !b)
     {
-        a = std::make_unique<kvc::NixlTransferAgent>(
-            makeBounceConfig("bAgentA", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"));
-        b = std::make_unique<kvc::NixlTransferAgent>(
-            makeBounceConfig("bAgentB", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"));
-    }
-    catch (std::exception const& e)
-    {
-        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
     }
 
     // Connect exactly as production disagg does (tensorrt_llm/_torch/disaggregation/native/transfer.py):
@@ -217,16 +227,12 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
         return cfg;
     };
 
-    std::unique_ptr<kvc::NixlTransferAgent> a;
-    std::unique_ptr<kvc::NixlTransferAgent> b;
-    try
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeCapConfig("capAgentA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeCapConfig("capAgentB"), skipMsg) : nullptr;
+    if (!a || !b)
     {
-        a = std::make_unique<kvc::NixlTransferAgent>(makeCapConfig("capAgentA"));
-        b = std::make_unique<kvc::NixlTransferAgent>(makeCapConfig("capAgentB"));
-    }
-    catch (std::exception const& e)
-    {
-        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
     }
 
     // 2.5 MiB: above the effective (buddy) 2 MiB cap, below the configured 3 MiB cap.
@@ -261,16 +267,12 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    std::unique_ptr<kvc::NixlTransferAgent> a;
-    std::unique_ptr<kvc::NixlTransferAgent> b;
-    try
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeBounceConfig("cAgentA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeBounceConfig("cAgentB"), skipMsg) : nullptr;
+    if (!a || !b)
     {
-        a = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cAgentA"));
-        b = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cAgentB"));
-    }
-    catch (std::exception const& e)
-    {
-        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
     }
 
     // One-directional bootstrap, exactly like transfer.py: only the sender (A) loads the receiver
@@ -315,16 +317,12 @@ TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-    std::unique_ptr<kvc::NixlTransferAgent> a;
-    std::unique_ptr<kvc::NixlTransferAgent> b;
-    try
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeBounceConfig("biAgentA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeBounceConfig("biAgentB"), skipMsg) : nullptr;
+    if (!a || !b)
     {
-        a = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("biAgentA"));
-        b = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("biAgentB"));
-    }
-    catch (std::exception const& e)
-    {
-        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
     }
 
     // Both agents send, so both load the other's AgentDesc (each direction's WANT self-bootstraps
@@ -374,20 +372,21 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     constexpr int kSenders = 3; // total agents = 1 receiver + 3 senders
     std::string const recvName = "mnAgentR";
 
-    std::unique_ptr<kvc::NixlTransferAgent> recv;
+    std::string skipMsg;
+    auto recv = tryMakeAgent(makeBounceConfig(recvName), skipMsg);
     std::vector<std::unique_ptr<kvc::NixlTransferAgent>> senders;
-    try
+    for (int i = 1; recv && i <= kSenders; ++i)
     {
-        recv = std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig(recvName));
-        for (int i = 1; i <= kSenders; ++i)
+        auto s = tryMakeAgent(makeBounceConfig("mnAgentS" + std::to_string(i)), skipMsg);
+        if (!s)
         {
-            senders.push_back(
-                std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("mnAgentS" + std::to_string(i))));
+            break;
         }
+        senders.push_back(std::move(s));
     }
-    catch (std::exception const& e)
+    if (!recv || senders.size() != static_cast<std::size_t>(kSenders))
     {
-        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
     }
 
     // One-directional wiring: each sender loads the receiver; the receiver loads NOBODY. The

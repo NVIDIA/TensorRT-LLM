@@ -31,6 +31,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -122,7 +123,7 @@ struct BounceResult
     BounceFailReason reason{BounceFailReason::kNone};
 };
 
-/// Shared dependencies used by both roles. Holds the injected channel/engine/arena/exec (borrowed,
+/// Shared dependencies used by both roles. Holds the injected channel/agent/arena/exec (borrowed,
 /// not owned), the one CreditScheduler that carves the shared arena for both roles, and
 /// sendGrants(). Owned by value by BounceTransport and referenced by the sender and receiver.
 /// Individual mutable collaborators provide their own synchronization; the immutable arena lookup
@@ -222,6 +223,12 @@ private:
     /// The set of incoming regions currently scattering — the `busy` set passed to the scheduler's
     /// reclaim calls so a region a worker is still reading is deferred, not re-granted.
     std::unordered_set<std::uint64_t> scatteringRegions() const;
+    /// Shared reclaim bookkeeping (cancel / peer loss / lease expiry): run `reclaim` with the
+    /// currently-scattering regions as the busy set, send the resulting grants, and flag every
+    /// deferred region orphaned in mScattering so drainScatterDone frees it on completion.
+    void reclaimAndFlagDeferred(
+        std::function<std::vector<Grant>(std::unordered_set<std::uint64_t> const&, std::vector<std::uint64_t>&)> const&
+            reclaim);
     void scatterWorkerLoop();
 
     BounceContext& mCtx;
@@ -280,9 +287,10 @@ public:
     void checkTimeouts();
     /// A peer is gone: fail any in-flight request targeting it so its wait() returns.
     void forget(std::string const& peer);
-    /// Shutdown: fail every still-pending request and invoke the transfer engine's bounded
-    /// cancel/release operation for active writes. Does not recycle regions or send new grants.
-    /// Called after the IO/workers are joined and local CUDA work has been synced.
+    /// Shutdown: fail every still-pending request and release each active write's TransferStatus
+    /// handle (a bounded cancel/release, with one retry pass over any release that failed). Does
+    /// not recycle regions or send new grants. Called after the IO/workers are joined and local
+    /// CUDA work has been synced.
     void failAll();
 
     /// True while a local gather region is held or an orphan-local write is in flight (drives the IO
@@ -376,10 +384,15 @@ private:
     {
         std::unique_ptr<TransferStatus> xfer;
         std::uint64_t offset{};
-        std::string peer{};
         std::uint64_t rid{};
     };
 
+    /// GRANT-mispair guard shared by attachCredits()/pumpRequest(): a credit smaller than its chunk
+    /// would make the RDMA write overflow the granted region into an adjacent flow's region on the
+    /// peer. On a mispair it abandons the flow (kProtocolError; the request then fails via
+    /// checkTimeouts) and returns true — the caller stops consuming credits. Caller MUST hold mReqMu.
+    [[nodiscard]] bool abandonOnCreditMispair(
+        std::uint64_t rid, Request& req, std::uint32_t chunkIdx, std::uint64_t packedBytes, std::uint32_t creditLen);
     /// Attach parked credits to already-posted chunks (eager gather posted them credit-less), in
     /// strict chunk order, promoting their staging regions out of the eager budget. Also flags the
     /// protocol anomalies (credit/chunk size mispair -> abandon flow; over-grant -> drop extras).
@@ -419,9 +432,9 @@ class BounceTransport
 public:
     /// @param arena ONE shared data buffer serving BOTH roles: receiver (remote senders' RDMA-write
     /// targets, granted as variable regions by the scheduler) and sender (local gather staging, via
-    /// acquireLocal). It must already be registered with `engine` by the caller (or be a no-op
-    /// engine). @param exec the gather/scatter execution contexts (streams/scratch) borrowed for the
-    /// duration of one kernel. `channel`/`engine`/`arena`/`exec` are borrowed for the transport's
+    /// acquireLocal). The caller must already have NIXL-registered it with `agent`.
+    /// @param exec the gather/scatter execution contexts (streams/scratch) borrowed for the
+    /// duration of one kernel. `channel`/`agent`/`arena`/`exec` are borrowed for the transport's
     /// lifetime. (Most disagg agents are sender-only OR receiver-only, so a single arena avoids
     /// wasting a second one.)
     BounceTransport(std::string selfName, BounceConfig cfg, int deviceId, ControlChannel* channel,
@@ -465,14 +478,6 @@ public:
         TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
     {
         return mSender.submit(srcDescs, dstDescs, peer);
-    }
-
-    /// The largest single region a fully-drained arena can grant (buddy-rounded usable capacity).
-    /// Advertised in the capability handshake for diagnostics. maxChunkSizeBytes() is clamped to
-    /// this value before the handshake is generated.
-    [[nodiscard]] std::size_t arenaCapacity() const
-    {
-        return mCtx.scheduler.arenaCapacity();
     }
 
     /// This side's EFFECTIVE per-chunk cap: cfg.maxChunkSizeBytes AFTER the constructor's clamp to
