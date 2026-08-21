@@ -764,3 +764,41 @@ def test_selfsampling_warmup_band_enumeration_bounded():
         row_stride=(msl // 4 + 255) // 256 * 256,
     )
     assert len(ss_host._VARLEN_WARMUP_DONE) == before + 1
+
+
+def test_selfsampling_varlen_heterogeneous_lengths_main():
+    """Row-independence contract at throughput scale on the streaming main
+    family: rows are naturally independent tasks — per-row data AND length
+    (random kv_lens spanning long / mid / short / n<=k / zero-window rows in
+    one 304-row batch, MTP row windows via next_n=4). Every row must match
+    its own per-prefix torch.topk value multiset; short rows must be
+    identity + (-1) tail; zero-window rows all -1."""
+    k, msl_c, cr, nn = 1024, 65536, 4, 4
+    batch = 76
+    rows = batch * nn  # 304 -> route_streaming main family
+    torch.manual_seed(5)
+    lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
+    kv = torch.randint(1, msl_c * cr, (batch,), dtype=torch.int32, device=_DEV)
+    kv[0] = msl_c * cr  # full length
+    kv[1] = 900  # short (n <= k)
+    kv[2] = nn - 1  # zero-window (every row of the request empty)
+    kv[3] = k * cr + nn  # just above the short path
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
+    torch.cuda.synchronize()
+    kl = kv.tolist()
+    for r in range(rows):
+        n_r = max(kl[r // nn] - nn + (r % nn) + 1, 0) // cr
+        n_r = min(n_r, msl_c)
+        if n_r <= 0:
+            assert (out[r] == -1).all(), f"row {r}: zero-window must be all -1"
+            continue
+        if n_r <= k:
+            want = list(range(n_r)) + [-1] * (k - n_r)
+            assert out[r].tolist() == want, f"row {r}: short path identity+pad"
+            continue
+        row = lg[r].float()[:n_r]
+        ref_v = torch.topk(row, k).values.sort().values
+        got = row[out[r].long()].sort().values
+        assert torch.equal(got, ref_v), f"row {r}: value multiset mismatch (n={n_r})"
