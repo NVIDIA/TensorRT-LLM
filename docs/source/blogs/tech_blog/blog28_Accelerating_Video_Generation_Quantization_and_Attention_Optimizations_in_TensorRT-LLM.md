@@ -37,7 +37,7 @@ up more visual quality than the application can tolerate.
 - [Conclusion](#conclusion)
 - [References](#references)
 
-## Quantization
+## GEMM Quantization
 
 Linear-layer quantization reduces the precision of eligible weights and activations so their GEMMs
 can use higher-throughput Tensor Core paths. The available and upcoming VisualGen paths differ in
@@ -248,15 +248,72 @@ export EXAMPLE_DIR="$TRTLLM_ROOT/examples/visual_gen/skip_softmax/wan2.2-t2v-a14
 python "$EXAMPLE_DIR/apply_calibration.py" --model-dir "$MODEL_DIR"
 ```
 
-The helper adds only the calibrated Skip Softmax metadata. The packaged `visual_gen.yaml` then
-selects dynamic NVFP4 linear-layer quantization, SAGE attention, `target_sparsity=0.65`, and
-`disabled_until_timestep=0.86`.
+The helper adds only calibrated Skip Softmax metadata to the checkpoint; it does not quantize GEMM
+weights. Runtime choices are centralized in `visual_gen.yaml`.
 
-### Configuration details
+### VisualGen configuration
 
-VisualGen selects a quantized-attention recipe through
-`attention_config.quant_attention_config`. QK16PV8 and SAGE occupy the same field, but use
-different backends and scaling layouts:
+The relevant part of the packaged YAML reproduces the 1.40× NVFP4 + SAGE + Skip Softmax
+configuration:
+
+```yaml
+quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+
+attention_config:
+  backend: TRTLLM
+  quant_attention_config:
+    qk_dtype: int8
+    v_dtype: fp8
+    q_block_size: 1
+    k_block_size: 16
+    v_block_size: 1
+  sparse_attention_config:
+    algorithm: skip_softmax
+    target_sparsity: 0.65
+    disabled_until_timestep: 0.86
+
+torch_compile_config:
+  enable: true
+  enable_autotune: false
+
+cuda_graph_config:
+  enable: false
+```
+
+The `quant_config` block selects the linear-layer GEMM path. All three choices start from the same
+public BF16 checkpoint. For BF16 GEMMs, omit the block or set it to `null`:
+
+```yaml
+quant_config: null
+```
+
+For dynamic FP8 blockwise GEMMs, use:
+
+```yaml
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+```
+
+For dynamic NVFP4 GEMMs, retain the packaged setting:
+
+```yaml
+quant_config:
+  quant_algo: NVFP4
+  dynamic: true
+```
+
+BF16 leaves eligible linear-layer weights and activations unquantized. With `dynamic: true`, the
+FP8 blockwise and NVFP4 paths quantize eligible BF16 weights while loading the checkpoint and
+quantize activations as the model runs. FP8 blockwise uses 128×128 weight blocks and 1×128
+activation blocks; NVFP4 uses 16-element blocks. These are dynamic conversions, not ModelOpt
+static GEMM-quantized checkpoints.
+
+The `quant_attention_config` block selects SAGE attention independently of GEMM precision. Remove
+that block to keep attention unquantized while retaining the `TRTLLM` backend and Skip Softmax.
+QK16PV8 and SAGE occupy the same field, but use different backends and scaling layouts:
 
 | Recipe | Backend | Q/K precision | V precision | Q/K/V block sizes | Combines with Skip Softmax |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -267,11 +324,11 @@ The current QK16PV8 kernel targets Blackwell `sm_100a` and `sm_103a` with head d
 current SAGE path requires Blackwell `sm_100`. Skip Softmax also uses the `TRTLLM` backend, which
 is why it composes with SAGE but not the `CUTEDSL` QK16PV8 path.
 
-For Skip Softmax, `target_sparsity` is converted to a threshold through each transformer's
-calibration formula; achieved sparsity can therefore vary by layer and timestep.
-`disabled_until_timestep` controls when skipping begins as denoising descends from near 1 to 0: a
-lower value keeps more early steps dense. Calibration also supplies an `ignore` list for layers
-that should stay dense.
+The `sparse_attention_config` block controls Skip Softmax. `target_sparsity` is converted to a
+threshold through each transformer's calibration formula, so achieved sparsity can vary by layer
+and timestep. `disabled_until_timestep` controls when skipping begins as denoising descends from
+near 1 to 0: a lower value keeps more early steps dense. Calibration also supplies an `ignore`
+list for layers that should stay dense.
 
 Start `trtllm-serve` with the packaged configuration:
 
