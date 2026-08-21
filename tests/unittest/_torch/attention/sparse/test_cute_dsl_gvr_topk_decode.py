@@ -1171,6 +1171,455 @@ def test_cute_dsl_gvr_topk_decode_launch_autoconfig(dtype, top_k, N, batch_size,
     _assert_index_sets_equal_tie_aware(out, out_sec, logits)
 
 
+# ===========================================================================
+# Degenerate preIdx states (P1r data reseed).
+#
+# The stock seed path derives the P2 refine bracket from the preIdx gather;
+# its exactness invariant (count(>= gather min) >= K) holds only when the
+# preIdx row carries K DISTINCT in-range positions. Production-reachable
+# violations: the first decode step of a request feeds the zero-init
+# prev_topk feedback buffer (all-duplicate index 0); a reused batch slot can
+# carry stale indices past the new row's N_eff (all-invalid); FP4-quantized
+# logits can tie the whole gather (zero-width bracket). The old degenerate
+# shortcut emitted identity indices [0, K) — NOT the top-K on real data.
+# P1r rebuilds the bracket from the row itself, so all cases must pass the
+# strict multiset check.
+# ===========================================================================
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [
+        (torch.bfloat16, 512),
+        (torch.float32, 2048),
+    ],
+)
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+@pytest.mark.parametrize("pre_mode", ["zero", "dup", "oob"])
+@pytest.mark.parametrize("data_mode", ["random", "all_tied", "tie_flood"])
+def test_cute_dsl_gvr_topk_decode_degenerate_preidx(
+    dtype, top_k, compress_ratio, pre_mode, data_mode, tie_aware_check
+):
+    """Degenerate preIdx rows must still produce an exact top-K."""
+    N = 4096
+    num_rows = 4
+    torch.manual_seed(3)
+    torch.cuda.manual_seed(3)
+    if data_mode == "random":
+        logits = (torch.randn(num_rows, N, device="cuda") * 2.0).to(dtype)
+    elif data_mode == "all_tied":
+        # rescue re-degenerates (row min == max) -> identity output, which
+        # is exact here because every value is identical
+        logits = torch.full((num_rows, N), 5.0, device="cuda", dtype=dtype)
+    else:  # tie_flood: kth sits inside a large tie class (within kC —
+        # count(>= tie value) must stay under the candidate capacity; the
+        # beyond-kC flood is a known pre-existing limitation, see the
+        # xfail test below)
+        logits = (torch.rand(num_rows, N, device="cuda") * 0.5).to(dtype)
+        # tie class sized to 1.5*K so the case stays a genuine flood for
+        # every top_k parametrization (2*K would cover the whole row at
+        # top_k=2048/N=4096 and collapse into all_tied) while
+        # count(>= 1.0) = 1.75*K stays inside the candidate capacity
+        tie_n = top_k + top_k // 2
+        for r in range(num_rows):
+            perm = torch.randperm(N, device="cuda")
+            logits[r, perm[:tie_n]] = 1.0
+            logits[r, perm[tie_n : tie_n + top_k // 4]] = 2.0
+
+    if pre_mode == "zero":
+        pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")
+    elif pre_mode == "dup":
+        pre_idx = torch.full((num_rows, top_k), 37, dtype=torch.int32, device="cuda")
+    else:  # oob: every slot past N_eff (stale-slot state, pcnt == 0)
+        pre_idx = torch.full((num_rows, top_k), N + 7, dtype=torch.int32, device="cuda")
+
+    seq_lens = torch.full((num_rows,), N * compress_ratio, dtype=torch.int32, device="cuda")
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=1,
+        compress_ratio=compress_ratio,
+    )
+    torch.cuda.synchronize()
+    _gvr_check(
+        tie_aware_check, out_indices, logits, seq_lens, top_k, 1, compress_ratio=compress_ratio
+    )
+
+
+@skip_not_sm100
+def test_cute_dsl_gvr_topk_decode_degenerate_preidx_cs4(tie_aware_check):
+    """cs>1 rows run the rescue per-CTA (redundant full-row scan) — the
+    cluster path must stay exact for the zero-init cold-start state too."""
+    N = 65536
+    top_k = 512
+    num_rows = 2
+    torch.manual_seed(5)
+    logits = (torch.randn(num_rows, N, device="cuda") * 2.0).to(torch.bfloat16)
+    pre_idx = torch.zeros(num_rows, top_k, dtype=torch.int32, device="cuda")
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=1,
+        compress_ratio=1,
+        cluster_size=4,
+    )
+    torch.cuda.synchronize()
+    _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, 1, compress_ratio=1)
+
+
+@skip_not_sm100
+@pytest.mark.xfail(
+    reason="known pre-existing limitation (upstream lineage, reproduces on "
+    "the PR-tip kernel unmodified): when the kth tie class alone exceeds "
+    "the candidate capacity kC, no threshold lands in [K, kC]; the selected "
+    "VALUE multiset is still exact but the index list can contain "
+    "duplicate / unwritten (-1) slots. Requires >kC exactly-equal scores "
+    "at the boundary — unreachable for real FP4 indexer logits observed "
+    "so far. Tracked as a follow-up; independent of the P1r rescue.",
+    strict=False,
+)
+def test_cute_dsl_gvr_topk_decode_tie_flood_beyond_capacity(tie_aware_check):
+    N = 4096
+    top_k = 512
+    num_rows = 4
+    torch.manual_seed(3)
+    torch.cuda.manual_seed(3)
+    logits = torch.ones(num_rows, N, device="cuda", dtype=torch.bfloat16)
+    for r in range(num_rows):
+        hot = torch.randperm(N, device="cuda")[: top_k // 4]
+        logits[r, hot] = 2.0
+    # healthiest possible pre (true previous top-k) — the flood defect is
+    # independent of preIdx quality
+    pre_idx = torch.topk(logits.float(), top_k, dim=-1).indices.int().contiguous()
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=1,
+        compress_ratio=1,
+    )
+    torch.cuda.synchronize()
+    _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, 1, compress_ratio=1)
+
+
+# ---------------------------------------------------------------------------
+# Emission-assisted (ext) tiers: packed seed row / candidate list / block max.
+# Inputs emulate the indexer epilogue host-side against the layout contracts
+# in ``gvr_emission`` (segments at bases 0 / LIST_SEG_A / 2*LIST_SEG_A, packed row
+# = lines at [0..2] + exact counts at [3..5] + skip pass count at [6]).
+# ---------------------------------------------------------------------------
+
+_FLT_MAX = 3.4028234663852886e38
+
+
+def _lines_at_counts(logits_f32, n_eff, targets):
+    """Per-row threshold lines placed at exact counts (descending targets
+    -> ascending line values). count(logits >= line[j]) == targets[j]."""
+    num_rows = logits_f32.shape[0]
+    lines = torch.empty((num_rows, len(targets)), dtype=torch.float32, device=logits_f32.device)
+    for r in range(num_rows):
+        ne = int(n_eff[r])
+        row = logits_f32[r, :ne]
+        for j, c in enumerate(targets):
+            c = min(int(c), ne)
+            lines[r, j] = torch.kthvalue(row, ne - c + 1).values
+    return lines
+
+
+def _pack_seed_row(logits_f32, n_eff, lines, block_max=None):
+    """[rows, 8] fp32 packed seed row: lines + exact counts (+ skip count)."""
+    num_rows, N = logits_f32.shape
+    pos = torch.arange(N, device=logits_f32.device)[None, :]
+    valid = pos < n_eff[:, None]
+    counts = torch.stack(
+        [((logits_f32 >= lines[:, j : j + 1]) & valid).sum(-1) for j in range(3)], 1
+    ).int()
+    pack = torch.zeros((num_rows, 8), dtype=torch.float32, device=logits_f32.device)
+    pack[:, 0:3] = lines
+    pack[:, 3:6] = counts.float()
+    if block_max is not None:
+        pack[:, 6] = (block_max >= lines[:, 0:1]).sum(dim=1).float()
+    return pack.contiguous()
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("mode", ["band", "fat", "miss", "inf"])
+def test_cute_dsl_gvr_topk_decode_ext_counts(top_k, mode, tie_aware_check):
+    """Packed seed row ([rows, 8]: lines + exact counts) consumption.
+
+    band: one line's count sits inside the admission band (direct path).
+    fat:  every count overshoots the candidate capacity -> full fallback.
+    miss: lines above the row max (count 0) -> seed rejected.
+    inf:  non-finite lines (production cold start) -> validity guard.
+    """
+    N, batch = 131072, 4
+    logits, pre_idx, seq_lens = _make_inputs(batch, N, top_k, torch.float32, 1, seed=7, varlen=True)
+    n_eff = seq_lens.to(device=logits.device, dtype=torch.long)
+    if mode == "band":
+        lines = _lines_at_counts(logits, n_eff, (4 * top_k, 2 * top_k, top_k + top_k // 4))
+    elif mode == "fat":
+        lines = _lines_at_counts(logits, n_eff, (32768, 24576, 16384))
+    elif mode == "miss":
+        pos = torch.arange(N, device=logits.device)[None, :]
+        rowmax = torch.where(pos < n_eff[:, None], logits, float("-inf")).amax(-1)
+        lines = rowmax[:, None] + torch.tensor([1.0, 2.0, 3.0], device=logits.device)
+    else:
+        lines = torch.full((batch, 3), float("inf"), device=logits.device)
+    seed_row = _pack_seed_row(logits, n_eff, lines)
+    xstate = torch.zeros((batch, 8), dtype=torch.float32, device=logits.device)
+    out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        cluster_size=1,
+        seed_thr=seed_row,
+        xstate=xstate,
+    )
+    torch.cuda.synchronize()
+    _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, 1)
+    if mode == "band":
+        # the closed loop must republish valid state for the next step
+        assert bool((xstate[:, 0] > 0).all().item())
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("mode", ["hit", "pads", "hist", "void", "bucketed", "starved"])
+def test_cute_dsl_gvr_topk_decode_ext_list(mode, tie_aware_check):
+    """Candidate-list tier at the production geometry (accept_cap =
+    LIST_SEG_A, width = LIST_WIDTH).
+
+    hit:      parked lines (production shape), claimed inside [K+64, B*]
+              -> line cut, single mapped load.
+    pads:     same + interleaved idx=-1 window sentinels (claimed counts
+              them; the K+64 slack absorbs them).
+    hist:     claimed past B* but list complete -> clamped-histogram
+              fallback over segment C.
+    void:     collection overflows LIST_CAP_C -> void=1 -> full scan.
+    bucketed: three live lines spread across segments A/B/C, cut at the
+              tightest line inside the band.
+    starved:  fewer than K real candidates, but sentinel pads lift the
+              claim into the admission band -> the line-cut copy must
+              re-measure and demote (exactness regression).
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import (
+        LIST_CAP_C,
+        LIST_PARK_LINE,
+        LIST_SEG_A,
+        LIST_WIDTH,
+    )
+
+    top_k, N, batch = 512, 131072, 2
+    logits, pre_idx, seq_lens = _make_inputs(
+        batch, N, top_k, torch.float32, 1, seed=11, varlen=True
+    )
+    dev = logits.device
+    n_eff = seq_lens.to(device=dev, dtype=torch.long)
+    if mode == "bucketed":
+        lines = _lines_at_counts(logits, n_eff, (20000, 4000, 600))
+    else:
+        n0 = {"hit": 4096, "pads": 4096, "hist": 12000, "void": 30000, "starved": 400}[mode]
+        l0 = _lines_at_counts(logits, n_eff, (n0,))
+        lines = torch.cat(
+            [l0, torch.full_like(l0, LIST_PARK_LINE), torch.full_like(l0, 2 * LIST_PARK_LINE)], 1
+        )
+    seed_row = _pack_seed_row(logits, n_eff, lines)
+    cand_vals = torch.full((batch, LIST_WIDTH), float("-inf"), dtype=torch.float32, device=dev)
+    cand_idx = torch.full((batch, LIST_WIDTH), -1, dtype=torch.int32, device=dev)
+    cand_ctl = torch.zeros((batch, 4), dtype=torch.int32, device=dev)
+    pads = {"pads": 64, "starved": 200}.get(mode, 0)
+    for r in range(batch):
+        ne = int(n_eff[r])
+        row = logits[r, :ne]
+        hits = torch.nonzero(row >= lines[r, 0], as_tuple=False).flatten()
+        cand_ctl[r, 2] = int((row >= lines[r, 1]).sum())
+        cand_ctl[r, 3] = int((row >= lines[r, 2]).sum())
+        # emission order is value-blind: shuffle, then classify by the
+        # tightest line passed; a full segment spills to the looser one
+        perm = hits[torch.randperm(hits.numel(), device=dev)]
+        v = row[perm]
+        seg = torch.where(v >= lines[r, 2], 0, torch.where(v >= lines[r, 1], 1, 2))
+        in_a = seg == 0
+        ord_a = torch.cumsum(in_a.int(), 0)
+        stay_a = in_a & (ord_a <= LIST_SEG_A)
+        in_b = (seg == 1) | (in_a & ~stay_a)
+        ord_b = torch.cumsum(in_b.int(), 0)
+        stay_b = in_b & (ord_b <= LIST_SEG_A)
+        in_c = (seg == 2) | (in_b & ~stay_b)
+        ord_c = torch.cumsum(in_c.int(), 0)
+        stay_c = in_c & (ord_c <= LIST_CAP_C - pads)
+        slot = torch.full_like(seg, -1)
+        slot[stay_a] = ord_a[stay_a] - 1
+        slot[stay_b] = LIST_SEG_A + (ord_b[stay_b] - 1)
+        slot[stay_c] = 2 * LIST_SEG_A + (ord_c[stay_c] - 1)
+        if pads:
+            # sentinels displace C entries later in emission order: the
+            # kept ordinals shift by how many sentinels landed before them
+            pad_slots = torch.randperm(int(stay_c.sum()) + pads, device=dev)[:pads]
+            keep = slot[stay_c] - 2 * LIST_SEG_A
+            shift = (pad_slots[None, :] <= keep[:, None]).sum(-1)
+            slot[stay_c] = 2 * LIST_SEG_A + keep + shift
+        live = slot >= 0
+        cand_vals[r, slot[live].long()] = v[live]
+        cand_idx[r, slot[live].long()] = perm[live].int()
+        cand_ctl[r, 0] = int(hits.numel()) + pads
+        cand_ctl[r, 1] = 1 if int(in_c.sum()) > LIST_CAP_C - pads else 0
+    out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        cluster_size=1,
+        seed_thr=seed_row,
+        cand_vals=cand_vals,
+        cand_idx=cand_idx,
+        cand_ctl=cand_ctl,
+        accept_cap=LIST_SEG_A,
+        num_threads=512,
+    )
+    torch.cuda.synchronize()
+    _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, 1)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("tail_mode", ["exact", "pad_inf"])
+def test_cute_dsl_gvr_topk_decode_ext_block_max(tail_mode, tie_aware_check):
+    """32-grain positional upper-bound records + packed seed row.
+
+    The skip walk may only skip units whose bound clears no line, so it
+    must be exact under both legal tail bounds: the tight max over valid
+    positions and the worst legal inflation (+FLT_MAX on a partially
+    valid record).
+    """
+    top_k, N, batch = 1024, 262144, 2
+    seq_lens = torch.tensor([N, N - 37], dtype=torch.int32, device="cuda")
+    logits, pre_idx, seq_lens = _make_inputs(
+        batch, N, top_k, torch.float32, 1, seed=13, seq_lens=seq_lens
+    )
+    dev = logits.device
+    n_eff = seq_lens.to(device=dev, dtype=torch.long)
+    pos = torch.arange(N, device=dev)[None, :]
+    masked = torch.where(pos < n_eff[:, None], logits, float("-inf"))
+    records = masked.view(batch, N // 32, 32).amax(-1)
+    if tail_mode == "pad_inf":
+        rec_start = torch.arange(N // 32, device=dev)[None, :] * 32
+        partial = (rec_start < n_eff[:, None]) & (rec_start + 32 > n_eff[:, None])
+        records = torch.where(partial, torch.full_like(records, _FLT_MAX), records)
+    records = records.contiguous()
+    lines = _lines_at_counts(logits, n_eff, (4 * top_k, 2 * top_k, top_k + top_k // 4))
+    seed_row = _pack_seed_row(logits, n_eff, lines, block_max=records)
+    out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        cluster_size=1,
+        seed_thr=seed_row,
+        block_max=records,
+    )
+    torch.cuda.synchronize()
+    _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, 1)
+
+
+def _emulate_emission(logits, n_eff, st, tier, top_k):
+    """Host-side stand-in for the indexer epilogue: fill the packed-row
+    counts (and the candidate list on the list tier) against the CURRENT
+    seed lines, exactly as the production emitter would."""
+    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import LIST_CAP_C, LIST_SEG_A
+
+    batch, N = logits.shape
+    dev = logits.device
+    lines = st.seed_row[:batch, 0:3]
+    pos = torch.arange(N, device=dev)[None, :]
+    valid = pos < n_eff[:, None]
+    finite = torch.isfinite(lines[:, 0])
+    counts = torch.stack(
+        [((logits >= lines[:, j : j + 1]) & valid).sum(-1) for j in range(3)], 1
+    ).float()
+    st.seed_row[:batch, 3:6] = torch.where(finite[:, None], counts, torch.zeros_like(counts))
+    if tier == "list" and st.cand_vals is not None:
+        st.cand_vals[:batch].fill_(float("-inf"))
+        st.cand_idx[:batch].fill_(-1)
+        st.cand_ctl[:batch].zero_()
+        for r in range(batch):
+            if not bool(finite[r]):
+                continue
+            ne = int(n_eff[r])
+            row = logits[r, :ne]
+            hits = torch.nonzero(row >= lines[r, 0], as_tuple=False).flatten()
+            cnt = int(hits.numel())
+            nwr = min(cnt, LIST_CAP_C)
+            base = 2 * LIST_SEG_A
+            st.cand_idx[r, base : base + nwr] = hits[:nwr].int()
+            st.cand_vals[r, base : base + nwr] = row[hits[:nwr]]
+            st.cand_ctl[r, 0] = cnt
+            st.cand_ctl[r, 1] = 1 if cnt > LIST_CAP_C else 0
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "tier_shape", [("list", 2, 131072), ("counts", 8, 131072), ("rungs", 1, 32768)]
+)
+def test_cute_dsl_gvr_topk_decode_ext_closed_loop(tier_shape, tie_aware_check):
+    """Chained multi-step closed loop: kernel xstate publish ->
+    update_seed_rows -> next step's emission and admission.
+
+    Step 2's logits shift the k-th value far beyond any fixed guard
+    width, so line placement must come from the fitted slope; every step
+    must stay exact regardless of which internal path admission picks.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.gvr_emission import GvrEmissionState
+
+    want_tier, batch, N = tier_shape
+    top_k = 512
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    logits0, pre_idx, seq_lens = _make_inputs(
+        batch, N, top_k, torch.float32, 1, seed=17, varlen=False
+    )
+    dev = logits0.device
+    n_eff = seq_lens.to(device=dev, dtype=torch.long)
+    st = GvrEmissionState(max_rows=batch, top_k=top_k, device=dev, enable_list_tier=True)
+    # k-th drift per step: step1 -> step2 rises by ~0.05 (>> any fixed
+    # guard), step3 falls back near step1's level
+    shifts = (0.0, 0.05, -0.03)
+    for step, shift in enumerate(shifts):
+        logits = (logits0 + shift).contiguous()
+        tier, route = st.plan(batch, N, num_sms, compress_ratio=1)
+        assert tier == want_tier
+        st.update_seed_rows(batch, tier)
+        _emulate_emission(logits, n_eff, st, tier, top_k)
+        pre = torch.topk(logits.float(), top_k, dim=-1).indices.int().contiguous()
+        out_indices = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+        kw = st.topk_ext_kwargs(route, batch, None)
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            logits, pre, seq_lens, out_indices, top_k=top_k, **kw
+        )
+        torch.cuda.synchronize()
+        _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, 1)
+        assert bool((st.xstate[:batch, 0] > 0).all().item()), f"step {step}: publish missing"
+
+
 @skip_not_sm100
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_cute_dsl_gvr_topk_decode_p4_exact_tail_16bit(dtype):

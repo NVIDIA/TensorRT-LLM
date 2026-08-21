@@ -692,6 +692,16 @@ class Indexer(nn.Module):
         self.use_cute_dsl_paged_mqa_logits = (
             sparse_params.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
         )
+        # GVR emission-assisted decode (opt-in, experimental): the FP4 indexer
+        # epilogue emits candidates for the top-k (see gvr_emission / gvr_routing).
+        self.use_gvr_emission = (
+            os.environ.get("TRTLLM_GVR_EMISSION", "0") == "1"
+            and self.use_cute_dsl_topk
+            and self.use_cute_dsl_paged_mqa_logits
+            and self.use_fp4
+        )
+        self._gvr_emission = None  # lazy GvrEmissionState (first decode step)
+        self._gvr_route = None
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
         self._enable_heuristic_topk = (
@@ -1371,6 +1381,24 @@ class Indexer(nn.Module):
             max_seq_len,
         )
 
+    def _ensure_gvr_emission(self, metadata: DSAtrtllmAttentionMetadata, device: torch.device):
+        """Lazy per-layer GVR ext state (see gvr_emission.GvrEmissionState)."""
+        if self._gvr_emission is None:
+            from ..gvr_emission import LIST_EMIT_MIN_N, GvrEmissionState
+
+            # get_indexer_max_seq_len already returns the compressed length
+            n_comp = metadata.get_indexer_max_seq_len()
+            self._gvr_emission = GvrEmissionState(
+                max_rows=metadata.max_num_sequences,
+                top_k=self.index_topk,
+                device=device,
+                # the list tier is only reachable at n_comp >= LIST_EMIT_MIN_N;
+                # skip its large candidate buffers when the engine's static
+                # length cannot get there
+                enable_list_tier=n_comp >= LIST_EMIT_MIN_N,
+            )
+        return self._gvr_emission
+
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -1618,14 +1646,29 @@ class Indexer(nn.Module):
         # bottom of the decode block): new gens from finishing prefill
         # append after currently-active gens, i.e., slots
         # [num_generations : num_generations + num_contexts].
-        if self._enable_heuristic_topk and has_prefill and not metadata.skip_indexer_for_ctx_reqs:
-            local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+        if (
+            has_prefill
+            and not metadata.skip_indexer_for_ctx_reqs
+            and (self._enable_heuristic_topk or self.use_gvr_emission)
+        ):
             ctx_seq_lens = metadata.seq_lens[:num_contexts]
             # Per-sequence last context-token offset (exclusive cumsum minus 1).
             last_ctx_idx = (torch.cumsum(ctx_seq_lens, dim=0) - 1).to(dtype=torch.long)
-            metadata.heuristic_prev_topk[
-                local_layer, num_generations : num_generations + num_contexts
-            ].copy_(topk_indices_buffer[last_ctx_idx, :])
+            last_ctx_topk = topk_indices_buffer[last_ctx_idx, :]
+            if self._enable_heuristic_topk:
+                local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+                metadata.heuristic_prev_topk[
+                    local_layer, num_generations : num_generations + num_contexts
+                ].copy_(last_ctx_topk)
+            if self.use_gvr_emission:
+                # Ext state is positional like heuristic_prev_topk (no churn
+                # signal exists to key on): zeroed xstate cold-starts new gens
+                # onto the stock path; stale rows after churn only mis-place
+                # lines - counts are re-measured in-kernel, so exactness holds.
+                st = self._ensure_gvr_emission(metadata, topk_indices_buffer.device)
+                new_gens = slice(num_generations, num_generations + num_contexts)
+                st.prev_topk[new_gens].copy_(last_ctx_topk[:, : st.prev_topk.shape[1]])
+                st.xstate[new_gens].zero_()
 
         reuse_topk = (
             self.mtp_index_share
@@ -1639,6 +1682,7 @@ class Indexer(nn.Module):
                 metadata.shared_topk_indices[:num_generations, :]
             )
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
+            gvr_step_ok = False
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
             max_decode_len = gen_seq_lens.max().item()
@@ -1741,6 +1785,43 @@ class Indexer(nn.Module):
                         dsl_block_table = metadata.block_table_expanded[:exp_B]
                         dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
 
+                    gvr_emit_kwargs = {}
+                    # one step gate shared with the consume branch below:
+                    # emitting for a step the top-k cannot consume only
+                    # churns the closed-loop state
+                    gvr_step_ok = (
+                        self.use_gvr_emission
+                        and use_custom_topk
+                        and next_n == 1
+                        and not dsl_atom_split
+                        and num_gen_tokens <= 256
+                    )
+                    if gvr_step_ok:
+                        st = self._ensure_gvr_emission(metadata, q_fp8.device)
+                        # indexer_max_seq_len is already the compressed length
+                        # (get_indexer_max_seq_len divides); do not divide again.
+                        # routing N is the ENGINE-STATIC max (graph capture
+                        # bakes the tier in); short live rows in a long-max
+                        # engine run assist machinery the planner would refuse
+                        # at their true length - exactness holds via the
+                        # in-kernel guards, the tax is routed pessimistically
+                        emit_tier, self._gvr_route = st.plan(
+                            batch_size,
+                            indexer_max_seq_len,
+                            torch.cuda.get_device_properties(q_fp8.device).multi_processor_count,
+                            compress_ratio=max(self.compress_ratio, 1),
+                        )
+                        if emit_tier in ("counts", "list", "rungs"):
+                            st.update_seed_rows(batch_size, emit_tier)
+                        if emit_tier in ("counts", "list"):
+                            gvr_emit_kwargs = st.indexer_emit_kwargs(emit_tier, batch_size)
+                        if self._gvr_route.attach_block_max or emit_tier in (
+                            "counts",
+                            "list",
+                        ):
+                            gvr_emit_kwargs["block_max_out"] = st.ensure_block_max(
+                                indexer_max_seq_len
+                            )[:batch_size]
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q,
                         decode_q_scale,
@@ -1750,6 +1831,7 @@ class Indexer(nn.Module):
                         dsl_block_table,
                         dsl_schedule_meta,
                         indexer_max_seq_len,
+                        **gvr_emit_kwargs,
                     )
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
@@ -1819,7 +1901,46 @@ class Indexer(nn.Module):
                     if not metadata.use_cute_dsl_topk:
                         heuristic_scratch = metadata.heuristic_scratch_values[:num_gen_tokens]
 
-                if self.use_cute_dsl_topk and self._enable_heuristic_topk:
+                # tier "none" (see gvr_routing) falls through to the stock
+                # branch; the untouched ext state reads as a cold start there.
+                if (
+                    self.use_gvr_emission
+                    and gvr_step_ok
+                    and self._gvr_emission is not None
+                    and self._gvr_route is not None
+                    and self._gvr_route.tier != "none"
+                ):
+                    # emission-assisted GVR: consume what the indexer epilogue
+                    # emitted this step (seed row / list / block_max per route)
+                    st = self._gvr_emission
+                    out_slice = topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :]
+                    # GVR op takes RAW-domain seq_lens (kernel ceil-divides by
+                    # compress_ratio); on the DSL path the live compressed lens
+                    # are gen_indexer_kv_lens_cuda_runtime, kv_lens_cuda_2d is 0.
+                    if self.compress_ratio > 1:
+                        gvr_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+                        assert gvr_lens is not None
+                        seq_1d = gvr_lens.reshape(-1)[:num_gen_tokens] * self.compress_ratio
+                    else:
+                        seq_1d = gen_kv_lens_cuda.reshape(-1)[:num_gen_tokens]
+                    ext_kw = st.topk_ext_kwargs(
+                        self._gvr_route,
+                        num_gen_tokens,
+                        st.block_max[:num_gen_tokens] if st.block_max is not None else None,
+                    )
+                    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+                        logits_decode,
+                        st.prev_topk[:num_gen_tokens],
+                        seq_1d.contiguous(),
+                        out_slice,
+                        self.index_topk,
+                        next_n,
+                        self.compress_ratio,
+                        max_seq_len=indexer_max_seq_len,
+                        **ext_kw,
+                    )
+                    st.prev_topk[:num_gen_tokens].copy_(out_slice)
+                elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                         logits_decode,
                         pre_idx,
@@ -1832,9 +1953,23 @@ class Indexer(nn.Module):
                         order_row=metadata.kv_lens_row_reorder,
                     )
                 elif self.use_cute_dsl_topk and (self.compress_ratio == 1 or next_n == 1):
+                    # latent-bug fix: the op takes 1-D request-level lens, but
+                    # context_lens is the 2-D kv_lens_cuda_2d slice; on the
+                    # FP4-DSL path the live compressed lens are
+                    # gen_indexer_kv_lens_cuda_runtime
+                    if self.compress_ratio > 1:
+                        radix_lens = (
+                            metadata.gen_indexer_kv_lens_cuda_runtime
+                            if self.use_cute_dsl_paged_mqa_logits
+                            and metadata.gen_indexer_kv_lens_cuda_runtime is not None
+                            else context_lens
+                        )
+                        radix_lens = radix_lens.reshape(-1)
+                    else:
+                        radix_lens = gen_kv_lens_cuda
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
                         logits_decode,
-                        context_lens if self.compress_ratio > 1 else gen_kv_lens_cuda,
+                        radix_lens,
                         topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
                         self.index_topk,
                         next_n,
