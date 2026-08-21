@@ -32,6 +32,7 @@ from .cute_dsl import (
 from .flash_attn4 import FlashAttn4Attention
 from .interface import AttentionBackend, AttentionTensorLayout
 from .parallel import Attention2DAttention, RingAttention, UlyssesAttention, wrap_parallel_attention
+from .te import TEAttention
 from .trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from .utils import create_attention, get_visual_gen_attention_backend
 from .vanilla import VanillaAttention
@@ -45,6 +46,7 @@ __all__ = [
     "CuTeDSLAttention",
     "VSAAttention",
     "FlashAttn4Attention",
+    "TEAttention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
     "UlyssesAttention",
