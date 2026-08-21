@@ -85,11 +85,11 @@ also called BLASST, keeps the QK calculation but rejects score blocks sufficient
 running maximum. Rejected blocks skip exponentiation and the corresponding value accumulation;
 the sparsity pattern is determined dynamically rather than stored with the model.
 
-[Two controls shape the tradeoff](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#skip-softmax-attention):
-how aggressively to skip and how far into denoising to begin.
+Two controls shape the tradeoff: how aggressively to skip and how far into denoising to begin.
 Calibration also protects sensitive layers by leaving them on dense attention. Together, these
 controls turn Skip Softmax into a final tuning knob after linear-layer and attention quantization
-have established the main operating point.
+have established the main operating point. For configuration details, see
+[Skip Softmax Attention](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#skip-softmax-attention).
 
 ## Results
 
