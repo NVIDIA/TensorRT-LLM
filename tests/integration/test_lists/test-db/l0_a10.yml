@@ -18,6 +18,7 @@ l0_a10:
   - unittest/_torch/sampler/test_penalties.py
   - unittest/_torch/test_tensor_lru_cache.py
   - unittest/_torch/test_torch_multi_arange.py
+  - unittest/_torch/test_fused_relu2.py
   - unittest/utils/test_util.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
