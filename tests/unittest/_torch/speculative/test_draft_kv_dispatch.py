@@ -39,7 +39,7 @@ class _SharedTargetWithView:
 
     _view = object()
 
-    def get_draft_subpage_view(self):
+    def get_draft_kv_cache_view(self):
         return self._view
 
 
@@ -58,7 +58,7 @@ def test_registered_separate_manager_wins():
     assert resolve_draft_kv_cache_manager(resources) is separate
 
 
-def test_shared_manager_falls_back_to_subpage_view():
+def test_shared_manager_falls_back_to_draft_view():
     target = _SharedTargetWithView()
     resources = _FakeResources({ResourceManagerType.KV_CACHE_MANAGER: target})
     assert resolve_draft_kv_cache_manager(resources) is target._view
@@ -74,7 +74,7 @@ def test_no_target_manager_resolves_to_none():
 
 
 class _BrokenViewTarget:
-    def get_draft_subpage_view(self):
+    def get_draft_kv_cache_view(self):
         raise AttributeError("max_blocks_per_seq")
 
 

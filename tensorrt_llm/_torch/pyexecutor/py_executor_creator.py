@@ -513,8 +513,8 @@ def create_py_executor(
 
         # WAR for https://nvbugs/5807902: disable the separate draft KV cache
         # in disaggregated mode. MiniMax-M3 also uses the unified target cache
-        # in every supported one-model configuration; its P32 sub-page view
-        # bridges the P128 target pages required by the MSA kernels.
+        # in every supported one-model configuration; its native P128 view maps
+        # the dense draft K/V pages inside M3's non-uniform mega-slot.
         if (cache_transceiver_config is not None
                 or is_minimax_m3(m3_sparse_config)):
             spec_config._allow_separate_draft_kv_cache = False
