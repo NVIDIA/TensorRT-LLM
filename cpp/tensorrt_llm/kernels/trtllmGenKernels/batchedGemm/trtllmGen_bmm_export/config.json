@@ -1154,24 +1154,6 @@
                     128,
                     "107a"
                 ]
-            ],
-            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB": [
-                [
-                    64,
-                    64,
-                    64,
-                    512,
-                    4,
-                    "8x4"
-                ],
-                [
-                    128,
-                    128,
-                    128,
-                    256,
-                    6,
-                    "128x4"
-                ]
             ]
         },
         {
@@ -1233,16 +1215,6 @@
                 [
                     128,
                     "107a"
-                ]
-            ],
-            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutA": [
-                [
-                    128,
-                    128,
-                    128,
-                    256,
-                    6,
-                    "128x4"
                 ]
             ]
         },
