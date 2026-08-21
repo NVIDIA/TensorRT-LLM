@@ -166,14 +166,26 @@ def run_msa_paged_gqa(
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
     sm_scale = (head_dim**-0.5) / float(attn.q_scaling)
 
-    # Query tokens and batch rows the ported kernels own; (num_tokens, batch)
-    # of them on a pure-decode step, the trailing generation slice on a mixed
-    # one. gen_tok0 is 0 whenever nothing is ported.
-    gen_tok0, gen_row0, gen_row1, decode_query_len = msa_decode_span_bounds(metadata, num_tokens)
+    # Query tokens [gen_tok0, gen_tok1) and batch rows [gen_row0, gen_row1) the
+    # ported kernels own: the whole batch on a pure-decode step, the trailing
+    # generation slice on a mixed one, and nothing when none is ported.
+    gen_tok0, gen_tok1, gen_row0, gen_row1, decode_query_len = msa_decode_span_bounds(
+        metadata, num_tokens
+    )
     # Leading query tokens fmha_sm100 must still run: the whole batch until a
     # ported kernel takes the generation slice, then the context prefix alone.
     fmha_tokens = num_tokens
     ported = msa_ported_decode_active(metadata)
+    # The span ends where q does, being the whole token axis minus the context
+    # prefix. A longer q carries a token pad that the dispatch clips off (see
+    # _dispatch_attention_over_live_tokens in modeling_minimaxm3), so one here
+    # means a token index no longer names a request.
+    if ported and gen_tok1 != num_tokens:
+        raise RuntimeError(
+            f"MiniMax-M3 paged GQA got {num_tokens} query tokens for a span "
+            f"ending at token {gen_tok1}. Every token past the span belongs to "
+            "no request; see msa_decode_span_bounds."
+        )
 
     # A statically preplanned MSA call is faster for a full pure-decode sparse
     # batch while accepting production's strided Q and distinct per-token
