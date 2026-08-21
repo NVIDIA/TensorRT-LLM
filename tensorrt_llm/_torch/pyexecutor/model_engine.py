@@ -84,7 +84,7 @@ from ..utils import (get_model_extra_attrs,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from .config_utils import is_mla
+from .config_utils import is_kimi_linear, is_mla
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
@@ -3216,6 +3216,15 @@ class PyTorchModelEngine(ModelEngine):
             # object if it changes.
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
+
+        if is_kimi_linear(config):
+            if metadata_cls is not TrtllmAttentionMetadata:
+                raise ValueError(
+                    "Kimi K3 requires the TRTLLM attention backend")
+            from ..modules.kimi_kda.kimi_k3_mamba_metadata import \
+                KimiK3AttentionMetadata
+
+            metadata_cls = KimiK3AttentionMetadata
 
         self.attn_metadata = metadata_cls(
             max_num_requests=self.batch_size,

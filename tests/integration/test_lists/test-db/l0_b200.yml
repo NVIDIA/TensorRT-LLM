@@ -97,6 +97,7 @@ l0_b200:
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
