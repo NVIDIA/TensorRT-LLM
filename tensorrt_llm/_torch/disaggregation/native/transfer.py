@@ -2477,8 +2477,9 @@ class TransferWorkerConfig:
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
     # Transfer-agent staging-buffer (bounce v2) arena size in MiB; 0 disables the
-    # fast path. Mutually exclusive with `bounce` above (enforced upstream by
-    # CacheTransceiverConfig validation).
+    # fast path. Derived upstream from CacheTransceiverConfig: it equals
+    # kv_cache_bounce_size_mb when agent_bounce_buffer_enable is set (in which
+    # case `bounce` above is off) and 0 otherwise.
     agent_buffer_size_mb: int = 0
     # Expert bounce knobs (TRTLLM_NIXL_BOUNCE_* names without the prefix and the
     # trailing _BYTES, lowercased); dict > env > default. Ignored when

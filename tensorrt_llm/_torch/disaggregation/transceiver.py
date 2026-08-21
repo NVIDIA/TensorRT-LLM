@@ -126,13 +126,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tx_timeout_s=sender_wait_slice_s,
                 tx_overall_timeout_s=transfer_timeout_s,
                 rx_timeout_s=transfer_timeout_s,
-                # Size 0 turns bounce off; the per-transfer size gates are internal (tuned via
-                # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
-                bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
-                # Transfer-agent staging-buffer (bounce v2); mutually exclusive with `bounce`
-                # (enforced by CacheTransceiverConfig validation).
-                agent_buffer_size_mb=cache_transceiver_config.agent_buffer_size_mb,
+                # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
+                # routes it to exactly one implementation: the Python bounce below (per-region,
+                # size 0 = off; the per-transfer size gates are internal, tuned via env:
+                # TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
+                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads) or the C++
+                # transfer-agent staging arena (bounce v2, one shared arena).
+                bounce=bounce_config_from_size(
+                    0
+                    if cache_transceiver_config.agent_bounce_buffer_enable
+                    else cache_transceiver_config.kv_cache_bounce_size_mb
+                ),
+                agent_buffer_size_mb=(
+                    cache_transceiver_config.kv_cache_bounce_size_mb
+                    if cache_transceiver_config.agent_bounce_buffer_enable
+                    else 0
+                ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
             )
         )

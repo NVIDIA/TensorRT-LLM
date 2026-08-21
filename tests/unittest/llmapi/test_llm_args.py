@@ -2601,31 +2601,35 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens_in_buffer == 1024
         assert config.kv_transfer_poll_interval_ms == 5000
 
-        # The bounce on/off switch defaults to off (0), accepts a positive size, and rejects
-        # negatives at the Pydantic boundary (ge=0). It is a Python-only field consumed directly by
-        # the v2 transceiver, so it is intentionally not part of _to_pybind().
+        # The shared bounce capacity defaults to off (0), accepts a positive size, and rejects
+        # negatives at the Pydantic boundary (ge=0).
         assert config.kv_cache_bounce_size_mb == 0
         assert CacheTransceiverConfig(
             kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
-        # agent_buffer_size_mb defaults to off (0), accepts a positive size, rejects negatives, and
-        # is mutually exclusive with the Python-transceiver bounce (kv_cache_bounce_size_mb).
-        assert config.agent_buffer_size_mb == 0
+        # agent_bounce_buffer_enable defaults to the Python implementation (False); enabling the
+        # C++ transfer-agent implementation with a zero capacity is a contradiction.
+        assert config.agent_bounce_buffer_enable is False
         assert config.agent_bounce_params is None
         assert CacheTransceiverConfig(
-            agent_buffer_size_mb=512).agent_buffer_size_mb == 512
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
-            CacheTransceiverConfig(agent_buffer_size_mb=-1)
-        # An explicit 0 is a valid combination with the Python bounce.
-        assert CacheTransceiverConfig(
-            agent_buffer_size_mb=0,
-            kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
+            kv_cache_bounce_size_mb=512,
+            agent_bounce_buffer_enable=True).agent_bounce_buffer_enable is True
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="mutually exclusive"):
-            CacheTransceiverConfig(agent_buffer_size_mb=512,
-                                   kv_cache_bounce_size_mb=384)
+                           match="kv_cache_bounce_size_mb is 0"):
+            CacheTransceiverConfig(agent_bounce_buffer_enable=True)
+
+        # _to_pybind routes the shared capacity to the C++ agent arena only when the agent
+        # implementation is selected. backend must be set: from_string(None) is a pre-existing
+        # _to_pybind limit.
+        assert CacheTransceiverConfig(backend="NIXL",
+                                      kv_cache_bounce_size_mb=384,
+                                      agent_bounce_buffer_enable=True
+                                      )._to_pybind().agent_buffer_size_mb == 384
+        assert CacheTransceiverConfig(
+            backend="NIXL",
+            kv_cache_bounce_size_mb=384)._to_pybind().agent_buffer_size_mb == 0
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -2636,7 +2640,8 @@ class TestStrictBaseModelArbitraryArgs:
     def test_cache_transceiver_config_agent_bounce_params(self):
         """agent_bounce_params coercion, key/consistency validation, pybind passthrough."""
         # Values are coerced to strings (YAML often yields ints/bools).
-        config = CacheTransceiverConfig(agent_buffer_size_mb=512,
+        config = CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                                        agent_bounce_buffer_enable=True,
                                         agent_bounce_params={
                                             "max_chunk_size": 4096,
                                             "enable_eager_gather": False
@@ -2646,11 +2651,12 @@ class TestStrictBaseModelArbitraryArgs:
             "enable_eager_gather": "False"
         }
 
-        # Params without an arena size are a contradiction: they would be silently
-        # ignored, so validation rejects them outright.
+        # Params without the C++ agent implementation are a contradiction: they
+        # would be silently ignored, so validation rejects them outright.
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="requires agent_buffer_size_mb"):
+                           match="agent_bounce_buffer_enable"):
             CacheTransceiverConfig(
+                kv_cache_bounce_size_mb=512,
                 agent_bounce_params={"copy_stream_count": "2"})
 
         # Unknown keys (here the env-var-style typo WITH the trailing _bytes) are
@@ -2658,19 +2664,23 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
                            match="max_chunk_size_bytes.*min_descriptor_count"):
             CacheTransceiverConfig(
-                agent_buffer_size_mb=512,
+                kv_cache_bounce_size_mb=512,
+                agent_bounce_buffer_enable=True,
                 agent_bounce_params={"max_chunk_size_bytes": "4096"})
 
         # Non-dict input fails cleanly in the coercion validator, not with a bare
         # AttributeError.
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
                            match="must be a dict"):
-            CacheTransceiverConfig(agent_buffer_size_mb=512,
+            CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                                   agent_bounce_buffer_enable=True,
                                    agent_bounce_params="max_chunk_size=4096")
 
-        # _to_pybind passes the new fields through (params default to an empty dict).
+        # _to_pybind converts the shared capacity into the C++ agent arena size and
+        # passes the params through (defaulting to an empty dict).
         pybind_config = CacheTransceiverConfig(backend="NIXL",
-                                               agent_buffer_size_mb=512,
+                                               kv_cache_bounce_size_mb=512,
+                                               agent_bounce_buffer_enable=True,
                                                agent_bounce_params={
                                                    "max_chunk_size": "4096"
                                                })._to_pybind()

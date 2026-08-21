@@ -110,8 +110,9 @@ class NixlTransferAgent(BaseTransferAgent):
         """
         if agent_buffer_size_mb > 0:
             logger.warning(
-                "agent_buffer_size_mb is not supported by the Python nixl-library agent; "
-                "ignoring it (and any agent_bounce_params)"
+                "The transfer-agent bounce buffer (agent_bounce_buffer_enable) is not "
+                "supported by the Python nixl-library agent; ignoring the arena size "
+                "(and any agent_bounce_params)"
             )
         if (rank is None) != (world_size is None):
             raise ValueError("rank and world_size must be specified together")
