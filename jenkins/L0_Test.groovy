@@ -390,6 +390,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
+        def hasMockResult = false
 
         pipeline.stage('Submit Test Result') {
             sh "mkdir -p ${stageName}"
@@ -467,7 +468,41 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             }
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
+
+            // Generate Stage Failed mock result if no real results exist locally.
+            // This could mean either: 1) Slurm job failed to generate results, or
+            // 2) Results exist but download failed.
+            // generateStageFailTestResultXml returns null if any results*.xml already exists.
+            // Skip for interrupted stages and perf-only stages (no JUnit XML expected).
+            if (stageIsInterrupted) {
+                echo "Stage is interrupted, skip generating Stage Failed mock test result."
+            } else if (downloadPerfResultSucceed && !downloadResultSucceed && !hasTimeoutTest) {
+                echo "Performance results retrieved but no JUnit XML expected; skip generating Stage Failed mock test result."
+            } else {
+                def stageXml = generateStageFailTestResultXml(
+                    stageName,
+                    "Stage Failed or Results Download Failed",
+                    "Slurm job may have failed, or results exist on ${nodeName} but could not be retrieved. Check Slurm job logs for details.",
+                    "results*.xml"
+                )
+                if (stageXml != null) {
+                    sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
+                    hasMockResult = true
+                    echo "WARNING: No result files were retrieved. This could indicate either a test failure or a download failure."
+                }
+            }
+
+            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed || hasMockResult) {
+                // When reporting is suppressed (retryable failure with retry pending),
+                // rename result XMLs so the parent pipeline's junit() glob does not
+                // pick them up from the uploaded archive.
+                if (suppressTestReporting) {
+                    sh """
+                        cd ${stageName} && for f in results*.xml; do
+                            [ -e "\$f" ] && mv "\$f" "superseded-\$f"
+                        done || true
+                    """
+                }
                 // On retry attempts, rename freshly-downloaded result XMLs so that
                 // (a) the tar for this attempt is distinguishable from prior attempts
                 //     already uploaded to Artifactory, and
@@ -498,7 +533,8 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             }
         }
 
-        if ((hasTimeoutTest || downloadResultSucceed) && !suppressTestReporting) {
+        // Report results via junit when we have any (real or mock) and reporting is not suppressed.
+        if ((hasTimeoutTest || downloadResultSucceed || hasMockResult) && !suppressTestReporting) {
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
         } else if (suppressTestReporting) {
             echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
