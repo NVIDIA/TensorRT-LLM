@@ -914,6 +914,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             to_process, cancelled, failed, completed
         )
 
+        # CANCELLED/ERROR are logical terminal states; a fabric write may still
+        # be reading the request's pages. Retire only after every rank reports
+        # that its physical writers have quiesced.
+        locally_quiesced = [
+            rid
+            for rid in cancelled + failed
+            if not self._send_sessions[rid].has_transferring_tasks()
+        ]
+        quiesced = set(self._ctx_consensus(locally_quiesced))
+        cancelled = [rid for rid in cancelled if rid in quiesced]
+        failed = [rid for rid in failed if rid in quiesced]
+
         for rid in cancelled:
             self._retire_send_session(rid)
 
