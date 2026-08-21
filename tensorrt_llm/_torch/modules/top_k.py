@@ -67,8 +67,8 @@ class TopK(nn.Module):
         sequence_lengths: torch.Tensor | None = None,
         scan_lengths: torch.Tensor | None = None,
         next_n: int = 1,
-        gvr_prior_indices: torch.Tensor | None = None,
-        gvr_row_order: torch.Tensor | None = None,
+        max_seq_len: int | None = None,
+        gvr_ext_kwargs: dict[str, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         """Write prefill or decode Top-K indices into ``output_indices``.
 
@@ -81,12 +81,12 @@ class TopK(nn.Module):
             sequence_lengths: Per-request logical KV lengths for decode.
             scan_lengths: Per-request score-column lengths for decode.
             next_n: Number of decode rows per request.
-            gvr_prior_indices: Required for GVR decode. Int32 tensor with shape
-                ``[num_requests, top_k]`` on ``scores.device`` containing the
-                previous selection. The caller owns its write-back lifecycle.
-            gvr_row_order: Optional int32 tensor with shape ``[num_requests]``
-                on ``scores.device``. It contains a reusable request ordering
-                prepared once for the current forward step.
+            max_seq_len: Maximum decode score width used for GVR kernel tuning.
+            gvr_ext_kwargs: GVR-only keyword arguments. ``gvr_prior_indices``
+                is the required caller-owned int32 previous selection with
+                shape ``[num_requests, top_k]`` on ``scores.device``.
+                ``gvr_row_order`` is an optional int32 request ordering with
+                shape ``[num_requests]`` on the same device.
 
         Returns:
             ``output_indices`` after the selected implementation writes it.
@@ -102,8 +102,8 @@ class TopK(nn.Module):
             scan_lengths,
             output_indices,
             next_n,
-            gvr_prior_indices,
-            gvr_row_order,
+            max_seq_len,
+            gvr_ext_kwargs,
         )
 
     def _forward_prefill(
@@ -140,8 +140,8 @@ class TopK(nn.Module):
         scan_lengths: torch.Tensor,
         output_indices: torch.Tensor,
         next_n: int,
-        gvr_prior_indices: torch.Tensor | None,
-        gvr_row_order: torch.Tensor | None,
+        max_seq_len: int | None,
+        gvr_ext_kwargs: dict[str, torch.Tensor | None] | None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
@@ -152,8 +152,8 @@ class TopK(nn.Module):
                 sequence_lengths,
                 output_indices,
                 next_n,
-                gvr_prior_indices,
-                gvr_row_order,
+                max_seq_len=max_seq_len,
+                **(gvr_ext_kwargs or {}),
             )
 
         return self._forward_decode_radix(
@@ -253,8 +253,9 @@ class TopK(nn.Module):
         sequence_lengths: torch.Tensor,
         output_indices: torch.Tensor,
         next_n: int,
-        gvr_prior_indices: torch.Tensor | None,
-        gvr_row_order: torch.Tensor | None,
+        max_seq_len: int | None,
+        gvr_prior_indices: torch.Tensor | None = None,
+        gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert gvr_prior_indices is not None
         if self.decode_implementation == TopKImplementation.CUDA_GVR:
@@ -278,6 +279,7 @@ class TopK(nn.Module):
                 radix_aux_logits=radix_values,
             )
         else:
+            assert max_seq_len is not None
             torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                 scores,
                 gvr_prior_indices,
@@ -286,7 +288,7 @@ class TopK(nn.Module):
                 self.top_k,
                 next_n=next_n,
                 compress_ratio=self.compress_ratio,
-                max_seq_len=scores.shape[1],
+                max_seq_len=max_seq_len,
                 order_row=gvr_row_order,
             )
         return output_indices

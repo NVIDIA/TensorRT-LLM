@@ -157,7 +157,8 @@ def test_gvr_uses_caller_prior_state(monkeypatch) -> None:
         sequence_lengths=logical_lengths,
         scan_lengths=scan_lengths,
         next_n=1,
-        gvr_prior_indices=prior_indices,
+        max_seq_len=16,
+        gvr_ext_kwargs={"gvr_prior_indices": prior_indices},
     )
 
     args, kwargs = gvr.call_args
@@ -169,7 +170,7 @@ def test_gvr_uses_caller_prior_state(monkeypatch) -> None:
     assert kwargs == {
         "next_n": 1,
         "compress_ratio": 4,
-        "max_seq_len": 8,
+        "max_seq_len": 16,
         "order_row": None,
     }
     assert prior_indices.tolist() == [[0, 0]]
@@ -190,8 +191,11 @@ def test_gvr_uses_caller_prepared_row_order(monkeypatch) -> None:
         sequence_lengths=lengths,
         scan_lengths=lengths,
         next_n=next_n,
-        gvr_prior_indices=torch.zeros(lengths.shape[0], 2, dtype=torch.int32),
-        gvr_row_order=row_order,
+        max_seq_len=8,
+        gvr_ext_kwargs={
+            "gvr_prior_indices": torch.zeros(lengths.shape[0], 2, dtype=torch.int32),
+            "gvr_row_order": row_order,
+        },
     )
 
     assert gvr.call_args.kwargs["order_row"] is row_order
@@ -281,7 +285,7 @@ def test_cuda_gvr_reserves_workspace_during_capture(monkeypatch) -> None:
         is_prefill=False,
         sequence_lengths=lengths,
         scan_lengths=lengths,
-        gvr_prior_indices=prior_indices,
+        gvr_ext_kwargs={"gvr_prior_indices": prior_indices},
     )
 
     assert buffers.get_buffer.call_args_list == [

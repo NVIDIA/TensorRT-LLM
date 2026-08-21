@@ -1712,8 +1712,14 @@ class Indexer(nn.Module):
             scan_lengths = metadata.gen_indexer_kv_lens_cuda_runtime
             assert scan_lengths is not None
 
-            # Paged MQA logits allocate their score width at
-            # indexer_max_seq_len, so TopK's CuTe GVR tuning key is stable.
+            gvr_ext_kwargs = (
+                {
+                    "gvr_prior_indices": gvr_prior_indices[:num_generations],
+                    "gvr_row_order": metadata.kv_lens_row_reorder,
+                }
+                if gvr_prior_indices is not None
+                else None
+            )
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
@@ -1721,10 +1727,8 @@ class Indexer(nn.Module):
                 sequence_lengths=gen_kv_lens_cuda,
                 scan_lengths=scan_lengths,
                 next_n=next_n,
-                gvr_prior_indices=(
-                    gvr_prior_indices[:num_generations] if gvr_prior_indices is not None else None
-                ),
-                gvr_row_order=metadata.kv_lens_row_reorder,
+                max_seq_len=indexer_max_seq_len,
+                gvr_ext_kwargs=gvr_ext_kwargs,
             )
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
