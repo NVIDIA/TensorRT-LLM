@@ -38,7 +38,7 @@ try:
     from _visual_gen_dist_utils import spawn_with_retry
 
     from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig
+    from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, TorchCompileConfig
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -74,11 +74,11 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def _distributed_worker(rank, world_size, backend, test_fn, port):
+def _distributed_worker(rank, world_size, backend, test_fn, port, fn_args):
     """Worker function that runs in each process. Module-level for pickling."""
     try:
         init_distributed_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
+        test_fn(rank, world_size, *fn_args)
     except Exception as e:
         print(f"Rank {rank} failed with error: {e}")
         raise
@@ -86,7 +86,12 @@ def _distributed_worker(rank, world_size, backend, test_fn, port):
         cleanup_distributed()
 
 
-def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
+def run_test_in_distributed(
+    world_size: int,
+    test_fn: Callable,
+    *fn_args,
+    use_cuda: bool = True,
+):
     """Run a test function in a distributed environment."""
     if not MODULES_AVAILABLE:
         pytest.skip("Required modules not available")
@@ -98,7 +103,7 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,
-            args=(world_size, backend, test_fn, port),
+            args=(world_size, backend, test_fn, port, fn_args),
             nprocs=world_size,
             join=True,
         )
@@ -145,7 +150,12 @@ _FLUX2_TEST_CONFIG = dict(
 )
 
 
-def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
+def _make_model_config(
+    pretrained_dict,
+    ulysses_size=1,
+    backend="VANILLA",
+    async_ulysses=False,
+):
     """Create DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(**pretrained_dict)
     if ulysses_size > 1 and dist.is_initialized():
@@ -163,6 +173,10 @@ def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
+        parallel=ParallelConfig(
+            ulysses_size=ulysses_size,
+            async_ulysses=async_ulysses,
+        ),
         attention_metadata_state=(
             create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
         ),
@@ -188,6 +202,37 @@ def _stabilize_model_weights(model):
             else:
                 # Bias/1D params: small values
                 p.data.uniform_(-0.01, 0.01)
+
+
+def _pack_async_state_for_sync(async_state, sync_state_keys):
+    """Translate separate async Q/K/V weights to the sync fused-QKV layout."""
+    packed_state = {}
+    for key in sync_state_keys:
+        if key in async_state:
+            packed_state[key] = async_state[key]
+        elif key.endswith(".qkv_proj.weight"):
+            prefix = key[: -len(".qkv_proj.weight")]
+            packed_state[key] = torch.cat(
+                [
+                    async_state[f"{prefix}.to_q.weight"],
+                    async_state[f"{prefix}.to_k.weight"],
+                    async_state[f"{prefix}.to_v.weight"],
+                ],
+                dim=0,
+            )
+        elif key.endswith(".qkv_proj.bias"):
+            prefix = key[: -len(".qkv_proj.bias")]
+            packed_state[key] = torch.cat(
+                [
+                    async_state[f"{prefix}.to_q.bias"],
+                    async_state[f"{prefix}.to_k.bias"],
+                    async_state[f"{prefix}.to_v.bias"],
+                ],
+                dim=0,
+            )
+        else:
+            raise KeyError(f"sync key {key!r} is missing from the async state")
+    return packed_state
 
 
 # =============================================================================
@@ -309,6 +354,99 @@ def _logic_flux1_ulysses_vs_single_gpu(rank, world_size):
         rtol=1e-2,
         atol=1e-2,
         msg=f"Rank {rank}: FLUX.1 Ulysses output differs from single-GPU reference",
+    )
+
+
+def _logic_flux1_async_vs_sync_parity(rank, world_size, backend):
+    """FLUX.1 async Ulysses matches the existing synchronous Ulysses path."""
+    from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import FluxTransformer2DModel
+
+    device = torch.device(f"cuda:{rank}")
+    compute_dtype = torch.bfloat16
+
+    torch.manual_seed(123)
+    async_config = _make_model_config(
+        _FLUX1_TEST_CONFIG,
+        ulysses_size=world_size,
+        backend=backend,
+        async_ulysses=True,
+    )
+    async_model = FluxTransformer2DModel(async_config).to(device).to(compute_dtype)
+    _stabilize_model_weights(async_model)
+    async_state = async_model.state_dict()
+
+    torch.manual_seed(123)
+    sync_config = _make_model_config(
+        _FLUX1_TEST_CONFIG,
+        ulysses_size=world_size,
+        backend=backend,
+        async_ulysses=False,
+    )
+    sync_model = FluxTransformer2DModel(sync_config).to(device).to(compute_dtype)
+    sync_model.load_state_dict(
+        _pack_async_state_for_sync(async_state, sync_model.state_dict().keys())
+    )
+
+    async_attn = async_model.single_transformer_blocks[0].attn
+    sync_attn = sync_model.single_transformer_blocks[0].attn
+    assert async_attn._use_async_ulysses is True, "async model did not enable async Ulysses"
+    assert sync_attn._use_async_ulysses is False, "sync model unexpectedly enabled async Ulysses"
+    assert async_attn.qkv_mode != sync_attn.qkv_mode, (
+        "test bug: async and sync models use the same QKV projection layout"
+    )
+
+    batch = 1
+    img_seq = 16
+    txt_seq = 8
+    torch.manual_seed(456)
+    hidden_states = torch.randn(batch, img_seq, 64, device=device, dtype=compute_dtype) * 0.1
+    encoder_hidden_states = (
+        torch.randn(batch, txt_seq, 256, device=device, dtype=compute_dtype) * 0.1
+    )
+    pooled_projections = torch.randn(batch, 128, device=device, dtype=compute_dtype) * 0.1
+    timestep = torch.tensor([0.5], device=device, dtype=compute_dtype)
+    img_ids = torch.randn(img_seq, 3, device=device)
+    txt_ids = torch.randn(txt_seq, 3, device=device)
+
+    with torch.no_grad():
+        sync_output = sync_model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            pooled_projections=pooled_projections,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+        )
+        async_output = async_model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            pooled_projections=pooled_projections,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+        )
+
+    assert sync_output["sample"].shape == async_output["sample"].shape, (
+        f"Rank {rank}: output shape mismatch"
+    )
+    assert not torch.isnan(async_output["sample"]).any(), f"Rank {rank}: NaN in async output"
+    assert not torch.isinf(async_output["sample"]).any(), f"Rank {rank}: Inf in async output"
+
+    diff = (async_output["sample"].float() - sync_output["sample"].float()).abs()
+    ref = sync_output["sample"].float().abs()
+    print(
+        f"\n[FLUX.1 rank={rank} backend={backend}] "
+        f"max_abs_diff={diff.max().item():.3e} "
+        f"max_rel_diff={(diff / ref.clamp(min=1e-6)).max().item():.3e} "
+        f"sync_abs_max={ref.max().item():.3e}"
+    )
+
+    torch.testing.assert_close(
+        async_output["sample"],
+        sync_output["sample"],
+        rtol=1e-3,
+        atol=1e-3,
+        msg=f"Rank {rank}: FLUX.1 async-Ulysses output differs from sync Ulysses",
     )
 
 
@@ -514,6 +652,15 @@ class TestFlux1Ulysses:
     def test_flux1_ulysses_vs_single_gpu(self):
         """FLUX.1 Ulysses 2-GPU output matches single-GPU reference."""
         run_test_in_distributed(world_size=2, test_fn=_logic_flux1_ulysses_vs_single_gpu)
+
+    @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+    def test_flux1_async_vs_sync_parity(self, backend):
+        """FLUX.1 async Ulysses matches synchronous Ulysses at size 2."""
+        run_test_in_distributed(
+            2,
+            _logic_flux1_async_vs_sync_parity,
+            backend,
+        )
 
 
 class TestFlux2Ulysses:

@@ -16,6 +16,7 @@ Note: With random weights, attention can produce NaN due to numerical instabilit
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -25,9 +26,10 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
 
 
 class TestFluxAttentionBackend(unittest.TestCase):
@@ -44,6 +46,27 @@ class TestFluxAttentionBackend(unittest.TestCase):
             attention=AttentionConfig(backend=backend),
         )
 
+    def _create_async_config(
+        self, ulysses_size: int, async_ulysses: bool = True
+    ) -> DiffusionModelConfig:
+        """Create an async-Ulysses config without initializing distributed state."""
+        visual_gen_mapping = VisualGenMapping(
+            world_size=ulysses_size,
+            rank=0,
+            ulysses_size=ulysses_size,
+        )
+        return DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(),
+            quant_config=QuantConfig(),
+            mapping=visual_gen_mapping.to_llm_mapping(),
+            attention=AttentionConfig(backend="VANILLA"),
+            visual_gen_mapping=visual_gen_mapping,
+            parallel=ParallelConfig(
+                ulysses_size=ulysses_size,
+                async_ulysses=async_ulysses,
+            ),
+        )
+
     def test_fused_qk_norm_rope_enabled_only_for_tp1(self) -> None:
         """Test FLUX enables fused QK-norm + RoPE only when TP=1."""
         from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
@@ -57,6 +80,43 @@ class TestFluxAttentionBackend(unittest.TestCase):
                     config=self._create_config("VANILLA", tp_size=tp_size),
                 )
                 self.assertEqual(attn.fuse_qk_norm_rope, expected)
+
+    def test_async_ulysses_enabled_only_for_validated_sizes(self) -> None:
+        """Test FLUX async Ulysses uses only the validated sizes 2 and 4."""
+        from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
+        from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode
+
+        with patch(
+            "tensorrt_llm._torch.visual_gen.modules.attention.wrap_parallel_attention",
+            side_effect=lambda attention, **_: attention,
+        ) as wrap_attention:
+            for ulysses_size, expected in ((1, False), (2, True), (4, True), (8, False)):
+                with self.subTest(ulysses_size=ulysses_size):
+                    attn = FluxJointAttention(
+                        hidden_size=512,
+                        num_attention_heads=8,
+                        head_dim=64,
+                        pre_only=True,
+                        config=self._create_async_config(
+                            ulysses_size, async_ulysses=ulysses_size > 1
+                        ),
+                    )
+                    self.assertEqual(attn._use_async_ulysses, expected)
+                    expected_mode = QKVMode.SEPARATE_QKV if expected else QKVMode.FUSE_QKV
+                    self.assertEqual(attn.qkv_mode, expected_mode)
+                    self.assertEqual(wrap_attention.call_args.kwargs["async_ulysses"], expected)
+
+            with self.subTest("dual_stream"):
+                attn = FluxJointAttention(
+                    hidden_size=512,
+                    num_attention_heads=8,
+                    head_dim=64,
+                    added_kv_proj_dim=512,
+                    config=self._create_async_config(2),
+                )
+                self.assertFalse(attn._use_async_ulysses)
+                self.assertEqual(attn.qkv_mode, QKVMode.FUSE_QKV)
+                self.assertFalse(wrap_attention.call_args.kwargs["async_ulysses"])
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_vanilla_backend_sanity(self):
