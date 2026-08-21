@@ -25,6 +25,7 @@ import torch
 from fastapi import UploadFile
 from PIL import Image
 
+from tensorrt_llm.serve import visual_gen_utils
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.serve.visual_gen_utils import (
     _merge_extra_params,
@@ -1311,10 +1312,10 @@ class TestSafeLocalFileRead:
             _safe_read_local_file(str(tmp_path / "nope.png"))
 
 
-class TestReferencePathCanBeDisabled:
+class TestLocalMediaPathCanBeDisallowed:
     """``format='path'`` reads server-side files, so a deployment can refuse it.
 
-    Enabled by default: a co-located client naming a shared path is a real
+    Allowed by default: a co-located client naming a shared path is a real
     setup, and the code cannot tell that deployment from an untrusted one.
     """
 
@@ -1325,20 +1326,20 @@ class TestReferencePathCanBeDisabled:
         )
 
     def test_path_is_accepted_by_default(self, monkeypatch):
-        monkeypatch.delenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", raising=False)
+        monkeypatch.delenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", raising=False)
         params = parse_visual_gen_params(self._request(), _StubVisualGen())
 
         assert params.image_reference[0].format == "path"
 
-    def test_path_is_refused_when_disabled(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "1")
+    def test_path_is_refused_when_disallowed(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
 
-        with pytest.raises(ValueError, match="is disabled on this server"):
+        with pytest.raises(ValueError, match="is disallowed on this server"):
             parse_visual_gen_params(self._request(), _StubVisualGen())
 
-    def test_disabling_path_leaves_the_other_formats_alone(self, monkeypatch):
+    def test_disallowing_path_leaves_the_other_formats_alone(self, monkeypatch):
         """The gate is about reading server-side files, not about references."""
-        monkeypatch.setenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "1")
+        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
 
         params = parse_visual_gen_params(
             self._request(fmt="base64", content="aGk="), _StubVisualGen()
@@ -1346,20 +1347,24 @@ class TestReferencePathCanBeDisabled:
 
         assert params.image_reference[0].format == "base64"
 
-    def test_an_unrecognized_value_warns_and_stays_enabled(self, monkeypatch, caplog):
-        """Treating a typo as "on" would silently break working deployments;
-        treating it as "off" silently is worse, hence the warning."""
-        monkeypatch.setenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "true")
+    def test_an_unrecognized_value_warns_and_stays_allowed(self, monkeypatch):
+        """Silently reading a typo as "1" would break working deployments, and
+        silently reading it as "0" would leave one that believes it is locked
+        down wide open. Neither is safe to do quietly."""
+        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "true")
+        warnings: list[str] = []
+        monkeypatch.setattr(visual_gen_utils.logger, "warning", warnings.append)
 
         params = parse_visual_gen_params(self._request(), _StubVisualGen())
 
         assert params.image_reference[0].format == "path"
+        assert any("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH" in w for w in warnings)
 
     def test_the_deprecated_field_is_gated_too(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISABLE_REFERENCE_FORMAT_PATH", "1")
+        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
         request = VideoGenerationRequest(
             prompt="x", input_reference="/tmp/ref.png", input_reference_format="path"
         )
 
-        with pytest.raises(ValueError, match="is disabled on this server"):
+        with pytest.raises(ValueError, match="is disallowed on this server"):
             parse_visual_gen_params(request, _StubVisualGen())

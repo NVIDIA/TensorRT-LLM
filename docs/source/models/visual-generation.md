@@ -125,7 +125,7 @@ Conditioning references are supplied through the typed, per-modality fields `ima
 
 | `format` | Content | Notes |
 |---|---|---|
-| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. The file must be a regular file and must exist; it is read once on the coordinator and is never modified or deleted. Over HTTP this reads a file on the *server*, so it is only meaningful for a co-located client and can be turned off with `TRTLLM_DISABLE_REFERENCE_FORMAT_PATH=1`; the Python API is unaffected. |
+| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. The file must be a regular file and must exist; it is read once on the coordinator and is never modified or deleted. Over HTTP this reads a file on the *server*, so it is only meaningful for a co-located client and can be turned off with `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`; the Python API is unaffected. |
 | `url` | An `http(s)` URL | Fetched on the coordinator through the SSRF-guarded loader. |
 | `base64` | Base64 text | A `data:` URI is also accepted. |
 | `bytes` | Raw `bytes` | Python API only. Rejected over JSON (HTTP 422) — send `base64` or upload the file via multipart. |
