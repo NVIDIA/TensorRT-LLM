@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 from unittest import mock
 
 import pytest
@@ -6950,6 +6951,139 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
         self._run_nvfp4_4gpus_eplb(eplb_config, moe_backend, mocker)
+
+    # ------------------------------------------------------------------
+    # FP8 block-scale tests (DeepGEMM backend, Blackwell only)
+    # ------------------------------------------------------------------
+    # Qwen3.5-397B-A17B-FP8 uses FP8 block-scale weights (weight_block_size
+    # [128,128]).  CUTLASS FP8 block-scale MoE is Hopper-only; on Blackwell
+    # (SM100/103) the only supported path is DeepGEMM, which also carries the
+    # online EPLB support status (EplbSupportStatus.SUPPORTED).
+    #
+    # FP8 weights are ~89 GB/rank at TP=4 (vs ~36 GB for NVFP4), so we use a
+    # tighter KV cache fraction and a smaller max_batch_size than the NVFP4
+    # tests to leave GPU memory headroom for EPLB redundant-slot allocations
+    # and the DeepGEMM workspace.
+
+    def _run_fp8_deepgemm_4gpus_eplb(self, eplb_config, mocker):
+        """Run a GSM8K accuracy smoke on 4xGPU with FP8 DeepGEMM EPLB config.
+
+        Uses attention-DP (ADP4) topology because the FP8 block-scale MoE path
+        requires per-rank token metadata from all DP ranks, and ADP provides
+        that natively.  CUDA graphs are enabled with a small max_batch_size=16
+        to bound capture memory while still exercising the graph-bypass path
+        that online EPLB lifecycle forwards trigger.
+        """
+        model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-FP8"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        # FP8 block-scale weights need more GPU memory than NVFP4; keep the KV
+        # cache fraction conservative.  No fp8 KV here to avoid accumulating
+        # two sources of quantization error in a single accuracy test.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(max_batch_size=16,
+                                            enable_padding=True)
+        moe_config = MoeConfig(backend="DEEPGEMM", load_balancer=eplb_config)
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=4,
+                 max_num_tokens=8192,
+                 max_batch_size=16,
+                 moe_expert_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 moe_config=moe_config,
+                 enable_attention_dp=True,
+                 cuda_graph_config=cuda_graph_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @pytest.mark.skip_less_device(4)
+    def test_fp8_deepgemm_4gpus_static_eplb(self, mocker):
+        """Static EPLB smoke: FP8 DeepGEMM column-major weight registration.
+
+        Validates that column-major FP8 block-scale tensors survive weight
+        registration without triggering the is_contiguous() assertion that
+        existed before this fix.
+
+        Reads num_experts and num_hidden_layers from the model config so the
+        test stays correct if a future checkpoint revision changes these values.
+        Initial assignments use a round-robin modular scheme (slot j on layer i
+        maps to expert (i+j) % num_experts), which distributes load evenly
+        across all EP ranks.  layer_updates_per_iter=0 disables background
+        migration so the test covers only static placement + routing.
+        """
+        model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-FP8"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        with open(f"{model_path}/config.json") as f:
+            model_cfg = json.load(f)
+        # Qwen3.5-397B HF config nests model fields under "text_config".
+        text_cfg = model_cfg.get("text_config", model_cfg)
+        num_experts = text_cfg.get("num_experts", model_cfg.get("num_experts"))
+        num_hidden_layers = text_cfg.get("num_hidden_layers",
+                                         model_cfg.get("num_hidden_layers"))
+        ep_size = 4
+        # 16 redundant expert slots per EP rank: each rank holds
+        # num_experts/ep_size + 16 slots, so migration has headroom without
+        # doubling the per-rank storage.
+        num_slots = num_experts + 16 * ep_size
+        # Qwen3.5-397B places a MoE block in every decoder layer (no
+        # first_k_dense_replace prefix of dense-MLP layers), so all
+        # num_hidden_layers layers need initial assignments.
+        initial_global_assignments = {
+            i: [(i + j) % num_experts for j in range(num_slots)]
+            for i in range(num_hidden_layers)
+        }
+        eplb_config = MoeLoadBalancerConfig(
+            num_slots=num_slots,
+            initial_global_assignments=initial_global_assignments,
+            layer_updates_per_iter=0)
+        self._run_fp8_deepgemm_4gpus_eplb(eplb_config, mocker)
+
+    @pytest.mark.skip_less_device(4)
+    def test_fp8_deepgemm_4gpus_online_eplb(self, mocker):
+        """Online EPLB end-to-end smoke with FP8 DeepGEMM.
+
+        This is the primary validation target for the dynamic EPLB work:
+        - DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm now carries
+          EplbSupportStatus.SUPPORTED, so the online path is no longer
+          silently suppressed.
+        - Column-major FP8 block-scale tensors pass weight registration via
+          storage_offset()==0 and the flat byte-blob migration path.
+        - _MoeLoadBalancerRuntimeState gates lifecycle hooks so stable forwards
+          skip stat/migration bookkeeping without triggering func_called_count
+          assertion failures.
+        - model_engine.py checks requires_eager_forward() before each
+          maybe_get_cuda_graph() call, so lifecycle forwards run eager while
+          stable forwards replay the CUDA graph.
+
+        Uses layer_updates_per_iter=2 so that background migration runs across
+        two MoE layer groups per EPLB iteration, exercising the update→drain
+        cadence within a single test run.
+
+        TRTLLM_EPLB_SHM_DIR is set to a temporary directory so that host
+        weight staging uses file-backed shared memory instead of /dev/shm.
+        FP8 block-scale weights for Qwen3.5-397B-A17B are large enough that
+        /dev/shm may be exhausted on nodes with the default 64 GB allocation.
+        """
+        # Qwen3.5-397B-A17B has 512 routed experts (confirmed in config.json).
+        num_experts = 512
+        ep_size = 4
+        # 16 redundant slots per rank gives each EP rank 144 slots for 128
+        # experts, providing migration headroom without inflating memory.
+        num_slots = num_experts + 16 * ep_size
+        eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
+                                            layer_updates_per_iter=2)
+        with tempfile.TemporaryDirectory() as shm_dir:
+            mocker.patch.dict(os.environ, {"TRTLLM_EPLB_SHM_DIR": shm_dir})
+            self._run_fp8_deepgemm_4gpus_eplb(eplb_config, mocker)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
