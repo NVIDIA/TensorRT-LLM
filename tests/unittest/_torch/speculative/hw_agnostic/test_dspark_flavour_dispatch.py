@@ -16,8 +16,10 @@
 
 ``DSpark`` ships in two flavours -- embedded in the target checkpoint
 (DeepSeek-V4-Pro's ``mtp.*``) or standalone with its own checkpoint -- and one
-builder picks between them, then picks the standalone backbone by the draft
-checkpoint's ``model_type``.
+builder picks between them on deployment form alone. There is no second
+dispatch on ``model_type``: the standalone drafter's backbone is resolved one
+layer down by the model registry, and the block decode's GQA precondition is
+what rejects a backbone it cannot express.
 
 The DFlash half matters just as much: DFlash no longer implements the DSpark
 head set, so a drafter that declares it must be refused rather than served
@@ -48,7 +50,7 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 
 _DSV4_SENTINEL = object()
-_QWEN3_SENTINEL = object()
+_GQA_SENTINEL = object()
 _DFLASH_SENTINEL = object()
 _LAGUNA_SENTINEL = object()
 
@@ -94,11 +96,7 @@ def _configs(
 def stub_dspark(monkeypatch):
     """Replace the DSpark drafter classes with sentinel-returning stubs."""
     monkeypatch.setattr(modeling_dspark, "DSv4DSparkForCausalLM", lambda *a, **k: _DSV4_SENTINEL)
-    monkeypatch.setattr(
-        modeling_dspark,
-        "_DSPARK_DRAFTERS_BY_MODEL_TYPE",
-        {"qwen3": lambda *a, **k: _QWEN3_SENTINEL},
-    )
+    monkeypatch.setattr(modeling_dspark, "GQADSparkForCausalLM", lambda *a, **k: _GQA_SENTINEL)
     monkeypatch.setattr(modeling_dspark, "validate_dspark_eplb_layer_base", lambda *a, **k: None)
 
 
@@ -115,12 +113,15 @@ def stub_dflash(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_standalone_qwen3_drafter_selects_qwen3_dspark(monkeypatch, stub_dspark):
-    model_config, draft_config = _configs(model_type="qwen3", embedded=False)
+@pytest.mark.parametrize("model_type", ["qwen3", "llama", "gpt_oss"])
+def test_standalone_drafter_selects_gqa_dspark(monkeypatch, stub_dspark, model_type):
+    # No per-model_type table: every GQA backbone the registry can build gets
+    # the same drafter class. A new GQA family must not need an entry here.
+    model_config, draft_config = _configs(model_type=model_type, embedded=False)
 
     built = modeling_dspark._build_dspark_draft(model_config, draft_config, None, None)
 
-    assert built is _QWEN3_SENTINEL
+    assert built is _GQA_SENTINEL
 
 
 def test_embedded_draft_selects_dsv4_dspark(monkeypatch, stub_dspark):
@@ -132,15 +133,40 @@ def test_embedded_draft_selects_dsv4_dspark(monkeypatch, stub_dspark):
     assert built is _DSV4_SENTINEL
 
 
-def test_unknown_standalone_model_type_lists_supported(monkeypatch, stub_dspark):
-    model_config, draft_config = _configs(model_type="llama", embedded=False)
+def test_non_gqa_backbone_is_rejected_at_construction():
+    # The builder no longer whitelists model_type; the block decode's GQA
+    # precondition is what rejects an MLA-shaped drafter, and it must do so at
+    # construction rather than deep inside _build_fused_kv_buffers.
+    from types import SimpleNamespace
 
-    with pytest.raises(NotImplementedError) as excinfo:
-        modeling_dspark._build_dspark_draft(model_config, draft_config, None, None)
+    drafter = modeling_dflash.DFlashForCausalLM.__new__(modeling_dflash.DFlashForCausalLM)
+    drafter.model = SimpleNamespace(
+        layers=[SimpleNamespace(self_attn=SimpleNamespace())]  # no qkv_proj -> MLA-like
+    )
+    drafter.config = SimpleNamespace()
 
-    message = str(excinfo.value)
-    assert "llama" in message
-    assert "qwen3" in message, "the error must list the supported draft model_type values"
+    with pytest.raises(ValueError) as excinfo:
+        drafter._validate_gqa_shape()
+
+    assert "qkv_proj" in str(excinfo.value)
+
+
+def test_layers_with_mismatched_kv_heads_are_rejected():
+    from types import SimpleNamespace
+
+    def _layer(nkv):
+        return SimpleNamespace(
+            self_attn=SimpleNamespace(qkv_proj=object(), num_key_value_heads=nkv)
+        )
+
+    drafter = modeling_dflash.DFlashForCausalLM.__new__(modeling_dflash.DFlashForCausalLM)
+    drafter.model = SimpleNamespace(layers=[_layer(8), _layer(8), _layer(4)])
+    drafter.config = SimpleNamespace()
+
+    with pytest.raises(ValueError) as excinfo:
+        drafter._validate_gqa_shape()
+
+    assert "[2]" in str(excinfo.value)
 
 
 def test_standalone_drafter_receives_the_attention_backend(monkeypatch, stub_dspark):
@@ -148,9 +174,9 @@ def test_standalone_drafter_receives_the_attention_backend(monkeypatch, stub_dsp
 
     def _capture(draft_config, *, dflash_attention_backend):
         seen["backend"] = dflash_attention_backend
-        return _QWEN3_SENTINEL
+        return _GQA_SENTINEL
 
-    monkeypatch.setattr(modeling_dspark, "_DSPARK_DRAFTERS_BY_MODEL_TYPE", {"qwen3": _capture})
+    monkeypatch.setattr(modeling_dspark, "GQADSparkForCausalLM", _capture)
     model_config, draft_config = _configs(attention_backend="TRTLLM")
 
     modeling_dspark._build_dspark_draft(model_config, draft_config, None, None)
@@ -188,24 +214,6 @@ def test_dflash_refuses_a_top_level_spelling_dspark_drafter(stub_dflash):
             "block_size": 7,
         },
     )
-
-    with pytest.raises(ValueError, match="DSpark"):
-        modeling_dflash._build_dflash_draft(model_config, draft_config, None, None)
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("markov_rank", 256),
-        ("use_confidence_head", True),
-        ("shift_label", True),
-        ("projector_type", "dspark"),
-    ],
-)
-def test_any_single_dspark_field_is_enough_to_refuse(stub_dflash, field, value):
-    # Each field alone means the drafter was trained under the DSpark
-    # convention; serving it as plain DFlash degrades it silently.
-    model_config, draft_config = _configs(dflash_config={"mask_token_id": 7, field: value})
 
     with pytest.raises(ValueError, match="DSpark"):
         modeling_dflash._build_dflash_draft(model_config, draft_config, None, None)
