@@ -38,3 +38,10 @@ nvidia/MiniMax-M3-NVFP4:
     threshold: 94.0
     reference_note: "published vLLM B200 FP4 Eagle3 mean 95.49 [95.15-96.06]
       n=8, inferencex.semianalysis.com, 2026-07"
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    spec_dec_algo: Eagle3
+    accuracy: 95.49
+    threshold: 94.0
+    reference_note: "published vLLM B200 FP4 Eagle3 mean 95.49 [95.15-96.06]
+      n=8, inferencex.semianalysis.com, 2026-07"
