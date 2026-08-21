@@ -55,10 +55,6 @@ void initBounceV2Bindings(nb::module_& m, nb::class_<kvc::NixlTransferAgent, kvc
         .def(nb::init<std::uint32_t>(), nb::arg("poll_interval_us") = 50, nb::call_guard<nb::gil_scoped_release>())
         .def_ro_static("KIND_EVENT", &CompletionPoller::kKindEvent)
         .def_ro_static("KIND_XFER", &CompletionPoller::kKindXfer)
-        .def("set_wakeup_fd", &CompletionPoller::setWakeupFd, nb::arg("fd"), nb::call_guard<nb::gil_scoped_release>(),
-            "Completion wakeup fd: publishing (or retiring) completions writes one 8-byte token "
-            "(uint64 1 — eventfd- and pipe-compatible) to fd, non-blocking, errors ignored. Pass "
-            "-1 to clear; after that returns no thread writes the old fd, so it may be closed.")
         .def(
             "drain",
             [](CompletionPoller& self, int timeoutMs)

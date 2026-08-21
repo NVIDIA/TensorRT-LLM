@@ -12,16 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GPU tests for the event-driven reactor fd (completion wakeup fd).
+"""GPU tests for the per-request plan handle + chained credited launches.
 
-Default-on when the compiled poller exposes
-``set_wakeup_fd`` and the fd setup succeeds): the reactor parks in a
-deadline-driven poll (up to 100 ms) instead of the legacy fixed 1 ms tick and
-is woken by an fd token on every C++ publish/retire and every cross-thread
-Python command. Pins: the mode engages with the real bindings, wakes are
-fd-delivered (``reactor_wake_fd`` counter), the idle timeout is not pinned at
-1 ms, and shutdown closes the fds behind the ``set_wakeup_fd(-1)`` fence even
-with copies in flight.
+Pins the C++ gather->RDMA chain end to end with the real bindings: credited
+launches go through ``launch_chunk_chained`` (ONE completion row per chunk
+under the reserved xfer id, zero gather rows reaching Python), plan handles
+are released on every terminal path, and the exactly-once ledger balances.
 
 Same skip guards as test_mechanism_bindings.py; shares its helpers/fixtures
 pattern with test_reactor_engine.py (imported as a sibling test module).
@@ -29,8 +25,6 @@ pattern with test_reactor_engine.py (imported as a sibling test module).
 
 from __future__ import annotations
 
-import os
-import time
 import uuid
 from types import SimpleNamespace
 
@@ -38,13 +32,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
-    pytest.skip(
-        "bounce_v2 event-driven reactor tests require a CUDA device", allow_module_level=True
-    )
+    pytest.skip("bounce_v2 chained-launch tests require a CUDA device", allow_module_level=True)
 
 tab = pytest.importorskip(
     "tensorrt_llm.tensorrt_llm_transfer_agent_binding",
-    reason="bounce_v2 event-driven reactor tests require the compiled tensorrt_llm wheel",
+    reason="bounce_v2 chained-launch tests require the compiled tensorrt_llm wheel",
 )
 
 from test_reactor_engine import (  # noqa: E402  (sibling test module)
@@ -52,19 +44,13 @@ from test_reactor_engine import (  # noqa: E402  (sibling test module)
     KIB,
     MIB,
     WAIT_CAP_MS,
-    FakePeer,
     _assert_landed,
     _cfg,
-    _forged_handshake,
     _scattered_case,
     _wait_until,
 )
 
 from tensorrt_llm._torch.disaggregation.bounce_v2.engine import BounceEngine  # noqa: E402
-from tensorrt_llm._torch.disaggregation.bounce_v2.reactor import (  # noqa: E402
-    _POLL_MS,
-    FAIL_SHUTDOWN,
-)
 
 # See the identical marker in test_reactor_engine.py: engines are created
 # inside the test body, so their threads are still alive when pytest-threadleak
@@ -101,20 +87,6 @@ def make_engine():
         box.agent.shutdown()
 
 
-@pytest.fixture
-def fake_peers():
-    peers: list[FakePeer] = []
-
-    def _make(target_endpoint: str, tag: str = "fake") -> FakePeer:
-        peer = FakePeer(target_endpoint, tag)
-        peers.append(peer)
-        return peer
-
-    yield _make
-    for peer in peers:
-        peer.close()
-
-
 def _pair(make_engine, **cfg_kw):
     src = make_engine("src", **cfg_kw)
     dst = make_engine("dst", **cfg_kw)
@@ -125,79 +97,6 @@ def _pair(make_engine, **cfg_kw):
 
 def _stats(box) -> dict[str, int]:
     return box.engine._reactor.stats()
-
-
-# --------------------------------------------------------------------------------------------
-# Feature A: event-driven reactor (completion wakeup fd)
-# --------------------------------------------------------------------------------------------
-class TestEventDrivenReactor:
-    def test_wakeup_fd_mode_engaged_and_not_spinning(self, make_engine):
-        """A1: with the real bindings the fd path engages and drives wakes.
-
-        The reactor exposes the mode as a live ``_wakeup_rfd``; after a real
-        transfer the ``reactor_wake_fd`` counter shows fd-delivered wakes
-        (every C++ publish writes a token), and the idle poll timeout is
-        deadline-driven — well above the legacy fixed 1 ms tick.
-        """
-        src, dst = _pair(make_engine)
-        for box in (src, dst):
-            assert box.engine._reactor._wakeup_rfd is not None, (
-                "event-driven mode did not engage with the compiled poller"
-            )
-
-        case = _scattered_case(n_desc=64, desc_bytes=4 * KIB, seed=901)
-        status = src.engine.submit(case.src_ptrs, case.dst_ptrs, case.sizes, DEVICE, dst.name)
-        assert status.wait(WAIT_CAP_MS), status.last_status_str()
-        _assert_landed(case)
-
-        # Completion publishes wrote tokens -> at least one poll returned
-        # fd-ready (not by timeout) on the sender.
-        _wait_until(
-            lambda: _stats(src).get("reactor_wake_fd", 0) > 0,
-            timeout_s=10.0,
-            what="an fd-delivered reactor wake to be counted",
-        )
-        # Deadline-driven idle timeout: sampled over ~150 ms it must exceed
-        # the 1 ms legacy tick (with request_timeout=30 s the sender sweep
-        # bounds it at 100 ms; right after a sweep the full window is open).
-        samples = []
-        for _ in range(30):
-            samples.append(src.engine._reactor._poll_timeout_ms())
-            time.sleep(0.005)
-        assert max(samples) > 5 * _POLL_MS, (
-            f"idle poll timeout pinned near the legacy tick: samples={samples}"
-        )
-
-    def test_shutdown_with_inflight_closes_fds_no_crash(self, make_engine, fake_peers):
-        """A3: teardown with the fd path active and work in flight.
-
-        Submit against a silent peer (gathers in flight, future
-        pending), then shut the engine down: no raise, the future resolves
-        FAIL_SHUTDOWN, and both wakeup fds are closed behind the
-        ``set_wakeup_fd(-1)`` fence — the poller's own shutdown (which
-        publishes terminal rows AFTER the fence) must not touch them.
-        """
-        eng = make_engine("tx", request_timeout_ms=0)
-        reactor = eng.engine._reactor
-        rfd, wfd = reactor._wakeup_rfd, reactor._wakeup_wfd
-        assert rfd is not None and wfd is not None
-        silent = fake_peers(eng.engine._reactor.endpoint, "silent")
-        blob = _forged_handshake(eng.engine._cfg.max_chunk_size_bytes, silent.endpoint)
-        assert eng.engine.add_peer(silent.name, blob)
-
-        case = _scattered_case(n_desc=64, desc_bytes=64 * KIB, seed=902)
-        status = eng.engine.submit(case.src_ptrs, case.dst_ptrs, case.sizes, DEVICE, silent.name)
-        assert not status.is_completed()
-
-        eng.engine.shutdown()  # idempotent with the fixture teardown
-        assert status.wait(WAIT_CAP_MS) is False
-        assert status.last_status_str() == FAIL_SHUTDOWN
-        assert reactor._wakeup_rfd is None and reactor._wakeup_wfd is None
-        for fd in {rfd, wfd}:
-            with pytest.raises(OSError):
-                os.fstat(fd)
-        # A late Python-side wake after teardown is a silent no-op.
-        reactor._wake()
 
 
 # --------------------------------------------------------------------------------------------

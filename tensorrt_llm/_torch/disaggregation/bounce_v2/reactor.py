@@ -78,25 +78,19 @@ THREADING CONTRACT (every cross-thread interaction):
     additionally poll ``alive()`` so even a hard thread death cannot hang a
     ``wait()`` (design risk #2).
 
-BLOCKING POINT: exactly one — ``zmq.Poller.poll`` over the ROUTER plus (when
-available) the completion WAKEUP FD, when a tick found no work (GIL
-released). With a compiled poller exposing ``set_wakeup_fd`` the loop is
-EVENT-DRIVEN: every C++ completion publish/retire and every cross-thread
-command (``forget_peer``, ``shutdown``) writes one token to the fd, so the
-poll wakes immediately, and the timeout is deadline-driven — the earliest of
-the sender no-progress sweep, the receiver lease sweep, and the stats log,
-clamped to [1 ms, 100 ms] (the 100 ms cap is the lost-wakeup safety net; a
-non-empty scatter backlog keeps the 1 ms floor because its retry is
-pool-capacity-driven, not fd-signalled from Python's side). Without the fd
-(pure-python poller, old binding, or fd setup failure) the loop keeps the
-classic fixed 1 ms tick — the fd path is a strict enhancement, never a
-dependency. Completions are still drained non-blockingly via
-``CompletionPoller.drain(0)`` each tick; no other sleeps exist in the loop.
+BLOCKING POINT: exactly one — ``zmq.Poller.poll`` over the ROUTER with a
+fixed 1 ms timeout, when a tick found no work (GIL released). Completions
+are drained non-blockingly via ``CompletionPoller.drain(0)`` each tick; no
+other sleeps exist in the loop. There is DELIBERATELY no event-driven
+completion wakeup (no fd signalled from the C++ poll thread): waking
+the reactor per completion adds a GIL acquisition per wake that contends
+with the inline-executing submit threads, and measurements showed it
+regresses the median transfer latency versus simply batching all pending
+completions on the next 1 ms tick.
 """
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from collections import deque
@@ -147,15 +141,11 @@ __all__ = [
 
 #: Separates peer name from request id in a flow key (same as the C++ kSep).
 _FLOW_SEP = "\x1f"
-#: Reactor idle-poll floor (the design's 1 ms tick; also the LEGACY fixed
-#: tick when the completion wakeup fd is unavailable).
+#: Reactor idle tick (the design's fixed 1 ms poll timeout). Deliberately a
+#: constant, not a knob: 1 ms bounds the completion-batching latency; a
+#: 2-3 ms tick would trade a little tail latency for fewer reactor GIL
+#: acquisitions if that trade is ever wanted.
 _POLL_MS = 1
-#: Idle-poll cap in event-driven mode: the safety net for a lost wakeup (a
-#: full eventfd counter / pipe, or a bug) — never a steady-state latency term.
-_POLL_MAX_MS = 100
-#: The wakeup token: an eventfd REQUIRES an 8-byte little-endian nonzero
-#: counter increment; a pipe simply carries the same 8 bytes.
-_WAKE_TOKEN = (1).to_bytes(8, "little")
 #: Max ROUTER messages handled per tick (batching bound; keeps one giant
 #: burst from starving completion handling within a tick).
 _MAX_MSGS_PER_TICK = 512
@@ -411,46 +401,6 @@ class BounceReactor:
         self._zpoller = zmq.Poller()
         self._zpoller.register(self._router, zmq.POLLIN)
 
-        # --- completion wakeup fd (event-driven ticks; see module docstring
-        # BLOCKING POINT). Best-effort: any setup failure keeps the legacy
-        # 1 ms tick. The reactor owns the fd pair; _wake_mu serializes writers
-        # against the close in shutdown(). ---
-        self._wake_mu = threading.Lock()
-        self._wakeup_rfd: Optional[int] = None
-        self._wakeup_wfd: Optional[int] = None
-        set_wakeup_fd = getattr(poller, "set_wakeup_fd", None)
-        if set_wakeup_fd is not None:
-            rfd = wfd = None
-            try:
-                if hasattr(os, "eventfd"):  # Linux, Python >= 3.10: one fd, 8-byte counter
-                    rfd = wfd = os.eventfd(0, os.EFD_NONBLOCK)
-                else:
-                    rfd, wfd = os.pipe()
-                    os.set_blocking(rfd, False)
-                    os.set_blocking(wfd, False)
-                self._zpoller.register(rfd, zmq.POLLIN)
-                set_wakeup_fd(wfd)
-                self._wakeup_rfd = rfd
-                self._wakeup_wfd = wfd
-            except OSError as e:
-                logger.warning(
-                    f"bounce_v2({self_name}): completion wakeup fd setup failed ({e}); "
-                    f"keeping the legacy 1 ms reactor tick"
-                )
-                if rfd is not None:
-                    # set_wakeup_fd may have failed AFTER the zmq register:
-                    # drop the registration before closing so the poller can
-                    # never poll a closed fd.
-                    try:
-                        self._zpoller.unregister(rfd)
-                    except KeyError:
-                        pass
-                for fd in {rfd, wfd} - {None}:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-
         self._ch_mu = threading.Lock()
         self._dealers: dict[str, zmq.Socket] = {}
 
@@ -534,13 +484,11 @@ class BounceReactor:
             return
         self._next_stats_log = now + _STATS_LOG_S
         snap = self.stats()
-        # The reactor_wake_* counters advance on every idle deadline poll, so
-        # they alone must not count as "changed" (a fully idle reactor would
-        # log forever); they still appear in the line once real work moves.
-        comparable = {k: v for k, v in snap.items() if not k.startswith("reactor_wake_")}
-        if not comparable or comparable == self._last_stats_snapshot:
+        # Idle silence: an idle reactor (no counter moved since the last log)
+        # must not emit a line every _STATS_LOG_S.
+        if not snap or snap == self._last_stats_snapshot:
             return
-        self._last_stats_snapshot = comparable
+        self._last_stats_snapshot = snap
         line = " ".join(f"{k}={v}" for k, v in sorted(snap.items()))
         logger.info(f"bounce_v2({self._self_name}): stats {line}")
 
@@ -604,7 +552,6 @@ class BounceReactor:
             victim_rids = [rid for rid, req in self._requests.items() if req.peer == peer]
         with self._cmd_mu:
             self._cmds.append(("forget_peer", peer, victim_rids))
-        self._wake()
 
     def submit(
         self,
@@ -694,16 +641,14 @@ class BounceReactor:
         if self._stop.is_set():
             self._thread.join(timeout=5)
             return
-        self._stop.set()
-        self._wake()  # cut the (<= _POLL_MAX_MS) poll short instead of riding it out
+        self._stop.set()  # the reactor observes this within one 1 ms tick
         self._thread.join(timeout=5)
         self._maybe_log_stats(force=True)
         if self._thread.is_alive():
             # Wedged reactor: libzmq sockets are NOT thread-safe, and the
             # stuck thread may still be inside a ROUTER poll/recv. Closing
             # the sockets (or term'ing the context) under it can segfault —
-            # LEAK them instead (the wakeup fds too: the thread may be inside
-            # a poll over the read end); still fail every pending future.
+            # LEAK them instead; still fail every pending future.
             logger.warning(
                 f"bounce_v2({self._self_name}): reactor did not join within 5 s; "
                 f"leaking its ZMQ sockets/context (closing under a live thread "
@@ -712,24 +657,6 @@ class BounceReactor:
             self._fail_all(FAIL_SHUTDOWN)
             return
         self._fail_all(FAIL_SHUTDOWN)
-        # Close the wakeup fds only AFTER (a) the poller stops writing them —
-        # set_wakeup_fd(-1) synchronizes under the poller's mutex, so no C++
-        # write can straddle it — and (b) _wake_mu excludes any in-flight
-        # Python writer (forget_peer/shutdown from another thread). The
-        # reactor thread (the only reader) is already joined.
-        if self._wakeup_rfd is not None:
-            set_wakeup_fd = getattr(self._poller, "set_wakeup_fd", None)
-            if set_wakeup_fd is not None:
-                set_wakeup_fd(-1)
-            with self._wake_mu:
-                rfd, wfd = self._wakeup_rfd, self._wakeup_wfd
-                self._wakeup_rfd = None
-                self._wakeup_wfd = None
-            for fd in {rfd, wfd} - {None}:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
         with self._ch_mu:
             for dealer in self._dealers.values():
                 dealer.close(linger=0)
@@ -747,12 +674,6 @@ class BounceReactor:
                 self._set_device()
             while not self._stop.is_set():
                 self._heartbeat = time.monotonic()
-                # Drain the wakeup fd FIRST (level semantics): a token written
-                # after this read but before the drains below leaves the fd
-                # readable, so the next poll returns immediately — a wakeup is
-                # never lost, at worst it costs one extra tick.
-                if self._wakeup_rfd is not None:
-                    self._drain_wakeup_fd()
                 did_work = self._drain_commands()
                 did_work |= self._drain_router()
                 did_work |= self._drain_completions()
@@ -764,62 +685,15 @@ class BounceReactor:
                 self._flush_acks()
                 self._maybe_log_stats()
                 if not did_work:
-                    # The ONE blocking point (GIL released): the ROUTER plus
-                    # the wakeup fd, for the deadline-driven timeout (legacy
-                    # fixed 1 ms without the fd). Completions ride the wakeup
-                    # fd (or the timeout) via the non-blocking drain above.
-                    ready = self._zpoller.poll(self._poll_timeout_ms())
-                    if self._wakeup_rfd is not None:
-                        if any(sock == self._wakeup_rfd for sock, _ in ready):
-                            self._bump("reactor_wake_fd")
-                        elif not ready:
-                            self._bump("reactor_wake_deadline")
+                    # The ONE blocking point (GIL released): the ROUTER, on
+                    # the fixed 1 ms tick. Completions ride the timeout via
+                    # the non-blocking drain above (deliberate — see the
+                    # module docstring BLOCKING POINT).
+                    self._zpoller.poll(_POLL_MS)
         except Exception as e:  # thread exception boundary (mirrors ioLoop's)
             logger.error(f"bounce_v2({self._self_name}): reactor crashed: {e}", exc_info=True)
             self._dead = True
             self._fail_all(FAIL_REACTOR_DEAD)
-
-    def _wake(self) -> None:
-        """Write one wakeup token (any thread; no-op without the fd). Never
-        blocks: EAGAIN means the fd is already level-ready."""
-        with self._wake_mu:
-            if self._wakeup_wfd is None:
-                return
-            try:
-                os.write(self._wakeup_wfd, _WAKE_TOKEN)
-            except BlockingIOError:
-                pass
-
-    def _drain_wakeup_fd(self) -> None:
-        """Drain the wakeup fd fully (reactor thread only). One read empties
-        an eventfd (the kernel returns-and-resets the whole counter); pipes
-        loop until EAGAIN. A racing extra token is harmless (see _run)."""
-        try:
-            while os.read(self._wakeup_rfd, 4096):
-                pass
-        except BlockingIOError:
-            pass
-
-    def _poll_timeout_ms(self) -> int:
-        """Poll timeout for an idle tick. Legacy fixed 1 ms tick without the
-        wakeup fd; otherwise deadline-driven: sleep until the earliest timed
-        obligation, in [1 ms, _POLL_MAX_MS]. The scatter backlog keeps the
-        1 ms floor — its retry waits on copy-pool capacity, which only the
-        poller's retire-wakeup covers when the compiled pool is in use, so
-        the short tick stays as the universal backstop."""
-        if self._wakeup_rfd is None:
-            return _POLL_MS
-        if self._scatter_backlog:
-            return _POLL_MS
-        now = time.monotonic()
-        deadline = now + _POLL_MAX_MS / 1000.0
-        if self._cfg.request_timeout_ms > 0:
-            # Only meaningful when timeouts are on: _check_sender_timeouts
-            # never advances _next_sender_sweep otherwise (a stale past value
-            # would pin the loop to the 1 ms floor).
-            deadline = min(deadline, self._next_sender_sweep)
-        deadline = min(deadline, self._next_lease_sweep, self._next_stats_log)
-        return max(_POLL_MS, min(_POLL_MAX_MS, int((deadline - now) * 1000.0) + 1))
 
     def _drain_commands(self) -> bool:
         with self._cmd_mu:
@@ -1715,10 +1589,8 @@ class BounceReactor:
         _resolve(future, BounceResult(False, reason))
         # This may run on a SUBMIT thread (mispair / gather-launch failure at
         # submit time): the regions released above can unblock another request
-        # parked on arena capacity, so wake the reactor's pump now instead of
-        # riding out the (<= _POLL_MAX_MS) deadline poll. No-op without the fd
-        # or from the reactor thread itself (one extra drained token).
-        self._wake()
+        # parked on arena capacity — the reactor's per-tick
+        # _drain_pending_posts picks that up within one 1 ms tick.
 
     def _on_orphan_xfer_done(self, local_offset: int, rid: int) -> None:
         """A failed request's in-flight write reached a terminal state: its

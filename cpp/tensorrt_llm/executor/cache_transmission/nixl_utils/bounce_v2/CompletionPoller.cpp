@@ -24,8 +24,6 @@
 #include <chrono>
 #include <exception>
 
-#include <unistd.h>
-
 namespace tensorrt_llm::executor::kv_cache::bounce_v2
 {
 
@@ -83,7 +81,6 @@ std::uint64_t CompletionPoller::registerEvent(
             onTerminal();
         }
         mCv.notify_all();
-        signalWakeupLocked();
         return id;
     }
     EventEntry entry{id, event, std::move(onTerminal)};
@@ -97,28 +94,6 @@ std::uint64_t CompletionPoller::registerEvent(
     }
     mEvents.push_back(std::move(entry));
     return id;
-}
-
-void CompletionPoller::setWakeupFd(int fd) noexcept
-{
-    // Under mMu, like every write: after this returns with -1, no thread can still write the old
-    // fd — the owner may close it.
-    std::lock_guard<std::mutex> lk(mMu);
-    mWakeupFd = fd;
-}
-
-void CompletionPoller::signalWakeupLocked() noexcept
-{
-    if (mWakeupFd < 0)
-    {
-        return;
-    }
-    // One 8-byte token: an eventfd REQUIRES 8 bytes, and a pipe simply carries them. Non-blocking
-    // best-effort — EAGAIN (saturated counter / full pipe) means the fd is already level-ready,
-    // and any other error is covered by the reader's bounded poll timeout.
-    std::uint64_t const token = 1;
-    ssize_t const rc = ::write(mWakeupFd, &token, sizeof(token));
-    static_cast<void>(rc);
 }
 
 std::int64_t CompletionPoller::fulfillChain(std::uint64_t reservedId, ChainPoster poster)
@@ -177,7 +152,6 @@ std::uint64_t CompletionPoller::registerXfer(std::unique_ptr<TransferStatus> sta
         releaseXferLocked(entry);
         mDone.push_back(Completion{id, kKindXfer, 0});
         mCv.notify_all();
-        signalWakeupLocked();
         return id;
     }
     mXfers.push_back(XferEntry{id, std::move(status)});
@@ -279,7 +253,6 @@ void CompletionPoller::shutdown() noexcept
     }
     mXfers.clear();
     mCv.notify_all();
-    signalWakeupLocked();
 }
 
 void CompletionPoller::releaseXferLocked(XferEntry& entry)
@@ -308,7 +281,6 @@ void CompletionPoller::releaseXferLocked(XferEntry& entry)
 bool CompletionPoller::pollOnceLocked(std::vector<PendingChain>& chainsOut)
 {
     bool published = false;
-    bool retired = false; // ANY entry going terminal frees a resource -> worth a wakeup token
 
     // CUDA events: cudaSuccess => done, cudaErrorNotReady => keep polling, anything else => failure.
     for (auto it = mEvents.begin(); it != mEvents.end();)
@@ -327,7 +299,6 @@ bool CompletionPoller::pollOnceLocked(std::vector<PendingChain>& chainsOut)
         {
             it->onTerminal();
         }
-        retired = true;
         if (it->chainId != 0)
         {
             if (st == cudaSuccess)
@@ -384,17 +355,9 @@ bool CompletionPoller::pollOnceLocked(std::vector<PendingChain>& chainsOut)
         releaseXferLocked(*it);
         mDone.push_back(Completion{it->id, kKindXfer, state == TransferState::kSUCCESS ? 1 : 0});
         published = true;
-        retired = true;
         it = mXfers.erase(it);
     }
 
-    if (retired)
-    {
-        // Signal even when nothing was PUBLISHED (chained/reserved gathers): the retirement freed
-        // a copy-stream context, and a reactor parked on pool capacity must retry now, not at its
-        // fallback deadline.
-        signalWakeupLocked();
-    }
     return published;
 }
 
@@ -419,7 +382,6 @@ void CompletionPoller::executeChains(std::vector<PendingChain>& chains)
         {
             mDone.push_back(Completion{chain.id, kKindXfer, 0});
             mCv.notify_all();
-            signalWakeupLocked();
             continue;
         }
         if (mStop.load(std::memory_order_acquire))
@@ -430,7 +392,6 @@ void CompletionPoller::executeChains(std::vector<PendingChain>& chains)
             releaseXferLocked(entry);
             mDone.push_back(Completion{chain.id, kKindXfer, 0});
             mCv.notify_all();
-            signalWakeupLocked();
             continue;
         }
         mXfers.push_back(XferEntry{chain.id, std::move(status)});

@@ -20,7 +20,8 @@ with the hybrid design's defaults (design doc Section 4.1; the 32 MiB chunk
 default matches the C++ bounce v2 per product decision): 32 MiB max
 chunk, 2 GiB arena, 1 MiB granularity, 8 in-flight chunks per request. The
 scatter-worker knob is dropped — the hybrid has no scatter worker threads
-(scatter completion is event-driven through the C++ completion poller).
+(scatter completions are reported through the C++ completion poller and
+drained by the reactor on its 1 ms tick).
 
 The C++ ``useZeroCopyArguments`` knob is intentionally absent: the copy-plan
 staging choice belongs to the bound batched-copy op, which owns the

@@ -48,11 +48,6 @@ namespace tensorrt_llm::executor::kv_cache::bounce_v2
 // Threading: registerEvent/registerXfer are safe from any thread; drain() is intended for the
 // single Python reactor thread but is also thread-safe. shutdown() is idempotent; pending entries
 // are terminated with ok=0 so no drain() caller waits forever.
-//
-// Wakeup fd (setWakeupFd): publishing/retiring completions additionally writes one token to an
-// owner-provided fd so an external poll loop (the Python reactor's zmq poll) wakes immediately
-// instead of riding a fixed tick. Strictly best-effort: no fd, full fd, or a failed write only
-// falls back to the reader's own bounded timeout.
 // ============================================================================
 class CompletionPoller
 {
@@ -122,15 +117,6 @@ public:
     /// Every outcome preserves exactly ONE terminal row per reserved id. Thread-safe.
     [[nodiscard]] std::int64_t fulfillChain(std::uint64_t reservedId, ChainPoster poster);
 
-    /// Completion wakeup fd (Feature: event-driven Python reactor): whenever completions are
-    /// PUBLISHED, or a tracked entry is retired (freeing a copy-stream context), one 8-byte token
-    /// (uint64 1 — valid for both an eventfd and a pipe) is written non-blockingly to `fd`.
-    /// EAGAIN/errors are ignored: the fd is level-ready already, and a lost token is covered by
-    /// the reader's bounded poll timeout. Set -1 to clear. The write and this setter both run
-    /// under the internal mutex, so after setWakeupFd(-1) returns no thread writes the old fd —
-    /// the owner may then close it safely.
-    void setWakeupFd(int fd) noexcept;
-
     /// Return (and clear) ALL pending completions, blocking up to `timeoutMs` for the first one
     /// (0 = non-blocking; may return empty). Never blocks after shutdown().
     [[nodiscard]] std::vector<Completion> drain(int timeoutMs);
@@ -190,19 +176,16 @@ private:
     void executeChains(std::vector<PendingChain>& chains);
     /// Release a terminal xfer handle; retire it for a dtor retry if release fails. Under mMu.
     void releaseXferLocked(XferEntry& entry);
-    /// Write one wakeup token to mWakeupFd (non-blocking, errors ignored). Under mMu.
-    void signalWakeupLocked() noexcept;
 
     std::uint32_t const mPollIntervalUs;
 
     std::mutex mMu; // guards mEvents / mXfers / mDone / mRetired / mChainsInFlight /
-                    // mGatherDoneChains / mWakeupFd
+                    // mGatherDoneChains
     std::condition_variable mCv;
     std::vector<EventEntry> mEvents;
     // Reserved chain ids whose gather event completed OK before fulfillChain arrived (nothing
     // published for them yet; fulfillChain posts inline, shutdown terminates them).
     std::vector<std::uint64_t> mGatherDoneChains;
-    int mWakeupFd{-1};
     // Chain posters currently executing OUTSIDE mMu on the poll thread (incremented under mMu when
     // pollOnceLocked hands a chain out, decremented under mMu as executeChains finishes each one).
     // unregisterEvents waits for zero so event owners can tear down safely.

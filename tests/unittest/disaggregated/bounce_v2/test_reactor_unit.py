@@ -26,11 +26,6 @@ Round-3 regression tests:
     trusting a watchdog verdict, and fails a wait against a WEDGED (alive but
     heartbeat-stale) reactor with ``FAIL_REACTOR_STALLED``.
 
-Plus the Python-side wiring of the event-driven wakeup fd (Feature A; see
-TestEventDrivenWakeup): fd-mode engagement via a set_wakeup_fd-capable fake,
-cross-thread wake latency, the shutdown close fence, and the legacy-tick
-fallback for pollers without the fd hook.
-
 The reactor's mechanism dependencies (batched copy pool, completion poller,
 RDMA transfer agent) are replaced by in-process fakes, so no CUDA device and
 no compiled transfer-agent binding are needed — only an importable
@@ -41,7 +36,6 @@ never inherits that module's CUDA skip).
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 import uuid
@@ -62,8 +56,6 @@ from tensorrt_llm._torch.disaggregation.bounce_v2.plan import SCATTER_RUN_DTYPE 
 from tensorrt_llm._torch.disaggregation.bounce_v2.reactor import (  # noqa: E402
     _KIND_EVENT,
     _KIND_XFER,
-    _POLL_MAX_MS,
-    _POLL_MS,
     FAIL_GATHER,
     FAIL_REACTOR_STALLED,
     FAIL_WRITE,
@@ -199,22 +191,6 @@ class FakePoller:
         if not rows:
             return np.empty((0, 3), dtype=np.int64)
         return np.asarray(rows, dtype=np.int64)
-
-
-class FdFakePoller(FakePoller):
-    """FakePoller + ``set_wakeup_fd``: engages the reactor's event-driven mode.
-
-    Only records the handed-over fd (the real C++ poller writes tokens on
-    publish/retire; here the only token producers are the reactor's own
-    Python-side ``_wake()`` writers — exactly the path these tests pin).
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.wakeup_fds: list[int] = []
-
-    def set_wakeup_fd(self, fd: int) -> None:
-        self.wakeup_fds.append(int(fd))
 
 
 class FakeXferAgent:
@@ -750,103 +726,3 @@ class TestWaitWatchdog:
         finally:
             timer.cancel()
         assert status.last_status_str() == "SUCCESS"
-
-
-# --------------------------------------------------------------------------------------------
-# Feature A: event-driven wakeup fd (Python-side wiring; GPU-free)
-# --------------------------------------------------------------------------------------------
-class TestEventDrivenWakeup:
-    def test_capable_poller_engages_deadline_mode(self, make_reactor):
-        """A poller exposing set_wakeup_fd flips the reactor to fd mode.
-
-        The write end is handed to the poller, the read end is live, and the
-        idle poll timeout becomes deadline-driven — with all timed work far
-        away it settles at the _POLL_MAX_MS lost-wakeup safety cap, not the
-        legacy 1 ms tick.
-        """
-        box = make_reactor("fdmode", poller_cls=FdFakePoller)
-        assert box.reactor._wakeup_rfd is not None
-        assert box.poller.wakeup_fds == [box.reactor._wakeup_wfd]
-        _wait_until(
-            lambda: box.reactor._poll_timeout_ms() == _POLL_MAX_MS,
-            timeout_s=5.0,
-            what="the idle poll timeout to reach the deadline cap",
-        )
-
-    def test_cross_thread_command_wakes_idle_reactor_fast(self, make_reactor):
-        """A2: an fd token, not the deadline poll, delivers cross-thread work.
-
-        Against an IDLE fd-mode reactor whose poll timeout sits at the 100 ms
-        cap, a cross-thread forget_peer must be picked up in a few
-        milliseconds (generous 50 ms CI bound; riding the deadline out would
-        average ~50 ms and routinely exceed it), and every wake must be
-        counted as fd-delivered (reactor_wake_fd), never as a timeout.
-        """
-        box = make_reactor("fdwake", poller_cls=FdFakePoller)
-        _wait_until(
-            lambda: box.reactor._poll_timeout_ms() == _POLL_MAX_MS,
-            timeout_s=5.0,
-            what="the reactor to reach its idle deadline poll",
-        )
-        wake0 = box.reactor.stats().get("reactor_wake_fd", 0)
-        for i in range(5):
-            time.sleep(0.02)  # let the reactor park inside the deadline poll
-            t0 = time.monotonic()
-            box.reactor.forget_peer(f"ghost_{i}")
-            _wait_until(
-                lambda: not box.reactor._cmds,
-                timeout_s=5.0,
-                what=f"trial {i}: the cross-thread command to be picked up",
-            )
-            elapsed = time.monotonic() - t0
-            assert elapsed < 0.05, (
-                f"trial {i}: cross-thread command took {elapsed * 1000:.1f} ms — "
-                f"it rode the deadline poll (fallback), not the fd wake"
-            )
-        _wait_until(
-            lambda: box.reactor.stats().get("reactor_wake_fd", 0) >= wake0 + 5,
-            timeout_s=5.0,
-            what="every cross-thread wake to be counted as fd-delivered",
-        )
-
-    def test_shutdown_closes_wakeup_fds_behind_the_fence(self, make_reactor):
-        """A3: shutdown clears the poller fd FIRST, then closes both ends.
-
-        set_wakeup_fd(-1) (the close fence) must reach the poller before the
-        fds are closed; afterwards both fds are really closed, a late
-        Python-side _wake() is a silent no-op, and no fd leaks.
-        """
-        fd0 = len(os.listdir("/proc/self/fd"))
-        box = make_reactor("fdclose", poller_cls=FdFakePoller)
-        rfd, wfd = box.reactor._wakeup_rfd, box.reactor._wakeup_wfd
-        assert rfd is not None and wfd is not None
-
-        box.reactor.shutdown()
-        assert box.poller.wakeup_fds[-1] == -1, "shutdown never fenced the poller off the fd"
-        assert box.reactor._wakeup_rfd is None and box.reactor._wakeup_wfd is None
-        for fd in {rfd, wfd}:  # a set: eventfd mode uses ONE fd for both ends
-            with pytest.raises(OSError):
-                os.fstat(fd)
-        box.reactor._wake()  # late writer after the close: silent no-op
-        assert len(os.listdir("/proc/self/fd")) == fd0, "reactor teardown leaked an fd"
-
-    def test_fallback_poller_without_wakeup_keeps_legacy_tick(self, make_reactor):
-        """A4: no set_wakeup_fd -> legacy fixed 1 ms tick, fully functional.
-
-        The reactor reports legacy mode (no wakeup fd, fixed _POLL_MS
-        timeout), cross-thread commands still land via the tick, and the
-        wake counters never appear.
-        """
-        box = make_reactor("legacy")  # plain FakePoller: no set_wakeup_fd
-        assert box.reactor._wakeup_rfd is None
-        assert box.reactor._poll_timeout_ms() == _POLL_MS
-        box.reactor.forget_peer("ghost")
-        _wait_until(
-            lambda: not box.reactor._cmds,
-            timeout_s=5.0,
-            what="the legacy tick to pick up the cross-thread command",
-        )
-        time.sleep(0.05)  # a few legacy ticks
-        stats = box.reactor.stats()
-        assert "reactor_wake_fd" not in stats
-        assert "reactor_wake_deadline" not in stats
