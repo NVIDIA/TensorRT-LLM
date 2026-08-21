@@ -169,13 +169,29 @@ class InklingTritonAttention(TrtllmAttention):
         cu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
         cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
         max_seqlen = max(seq_lens)
-        # NOTE: this attends only to the tokens of THIS call --
-        # inkling_prefill_attention takes no paged-KV argument, so a context
-        # request carrying cached history would silently drop it. Chunked prefill
-        # and block reuse are refused by
-        # reject_unsupported_inkling_kv_cache_features for that reason.
+        # One prefill path, always over the pages. A request carrying cached
+        # history -- a later chunk, or a reused prefix -- attends to tokens it
+        # did not bring with it, and the write above has already put this
+        # chunk's K/V in the same pages, so no gather is needed.
+        max_total = max(int(c) + int(sl) for c, sl in zip(num_cached, seq_lens))
+        max_pages = (max_total + page_size - 1) // page_size
+        page_table = build_page_table(block_ids, max_pages, device)
+        num_cached_dev = torch.tensor(
+            [int(c) for c in num_cached], dtype=torch.int32, device=device
+        )
         return inkling_prefill_attention(
-            q, k, v, cu, max_seqlen, self.sm_scale, rel_logits, self.rel_extent, self.window_left
+            q,
+            k_cache,
+            v_cache,
+            cu,
+            num_cached_dev,
+            page_table,
+            page_size,
+            max_seqlen,
+            self.sm_scale,
+            rel_logits,
+            self.rel_extent,
+            self.window_left,
         )
 
     def _run_generation(

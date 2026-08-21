@@ -89,6 +89,21 @@ def is_hybrid_linear(config):
         is_kimi_linear(config)
 
 
+# Added for Inkling KV cache block reuse: a reuse hit can only land where a
+# snapshot exists, so the chunking policy has to be able to end an iteration
+# there. Consumed by py_executor_creator to select FORCE_CHUNK.
+def needs_block_aligned_context_chunks(config) -> bool:
+    """True for models that snapshot per-request recurrent state for reuse.
+
+    Named for the property, not the model family: a reuse hit can only land
+    where a snapshot exists, and only the chunking policy decides where
+    iterations -- and therefore snapshots -- may end. Inkling qualifies without
+    being a Mamba model, so it is not folded into ``is_hybrid_linear``, which
+    would also route it through Mamba conv-state layouts it cannot satisfy.
+    """
+    return is_hybrid_linear(config) or is_inkling(config)
+
+
 def is_kimi_linear(config):
     """True for Kimi K3 ("kimi_linear") hybrid KDA + MLA text models.
 
@@ -170,55 +185,66 @@ def reject_unsupported_inkling_kv_cache_features(
         config,
         *,
         enable_block_reuse: bool,
-        enable_chunked_prefill: bool,
-        enable_cache_transceiver: bool = False):
+        enable_cache_transceiver: bool = False,
+        periodic_snapshot_interval: int = 0):
     """Refuse the features Inkling's context path cannot serve correctly.
 
-    Block reuse and chunked prefill both leave a context request with cached
-    history, and Inkling drops it twice over: ``inkling_prefill_attention`` takes
-    no paged-KV argument and attends only to the tokens of its own call, and the
-    four short-conv windows per layer are per-request state outside the KV cache
-    that no context request declares. Disaggregated serving fails a third way --
-    it moves a request without its conv windows at all.
+    Block reuse leaves a context request with a reused prefix whose conv window
+    it never computed, and disaggregated serving moves a request without its
+    conv windows at all. Neither raises on its own; both emit wrong logits
+    silently, which is why they are refused here.
 
-    None of the three raises on its own; they emit wrong logits silently, which
-    is why they are refused here. Supporting them is a feature, not a fix: it
-    needs a chunked-context prefill path carrying ``rel_logits`` and the sliding
-    window across the boundary, and only then the conv-state plumbing.
+    Block reuse is refused only when no snapshot policy is configured:
+    ``periodic_snapshot_interval`` commits the conv window with the block at
+    each snapshot ordinal, which is what gives a prefix hit a window to restore.
+    Disaggregated serving stays refused: the conv windows are V2 SSM-layer
+    memory, but the transfer path finds state pools by manager class, and
+    Inkling's is not the Mamba one, so they would never be described to it.
+    Neither raises on its own; both emit wrong logits silently.
+
+    Chunked prefill is no longer refused: ``_run_context`` routes a request with
+    cached history to the one prefill kernel, which reads the
+    pages back at absolute positions, and ``has_initial_state`` is derived from
+    ``num_cached_tokens_per_seq``.
     """
     if not is_inkling(config):
         return
-    if enable_block_reuse:
+    if enable_block_reuse and not periodic_snapshot_interval:
         raise NotImplementedError(
-            "Inkling does not support KV cache block reuse. A reused prefix "
-            "leaves a context request with cached history, and Inkling ignores "
-            "it twice over: the prefill attention "
-            "(inkling_prefill_attention) has no paged-KV path and attends only "
-            "to the new tokens, and the four short-conv windows per layer are "
-            "per-request state outside the KV cache, absent from the reuse key "
-            "and never restored. The result is silently wrong output, not a "
-            "cache miss. Set kv_cache_config.enable_block_reuse=False (the "
-            "Inkling model default) to run Inkling.")
-    if enable_chunked_prefill:
-        raise NotImplementedError(
-            "Inkling does not support chunked prefill. The second and later "
-            "chunks of a prompt drop all preceding context: the prefill "
-            "attention (inkling_prefill_attention) has no paged-KV path, so it "
-            "attends only to the chunk's own tokens, and the short-conv window "
-            "carried from the preceding chunk is never declared via "
-            "has_initial_state and so never consumed. Supporting it needs a "
-            "chunked-context attention path, not just the conv fix. Set "
-            "enable_chunked_prefill=False to run Inkling.")
+            "Inkling does not support KV cache block reuse. The four "
+            "short-conv windows per layer are per-request state outside the KV "
+            "cache; on a prefix hit there is no window to restore, because the "
+            "convs consume activations that a reused prefix never computed. "
+            "The result is silently wrong output, not a cache miss. Set "
+            "kv_cache_config.enable_block_reuse=False (the Inkling model "
+            "default), or configure a snapshot policy by setting "
+            "kv_cache_config.mamba_state_config.periodic_snapshot_interval to "
+            "a positive number of tokens, which puts the window in the block "
+            "lifecycle and makes the hit servable.")
+    if enable_block_reuse and periodic_snapshot_interval:
+        # Said at startup because the manager's equivalent warning needs a
+        # multimodal request to arrive, and rides on the same probe as the rule
+        # it describes -- if that breaks, the warning goes quiet with it.
+        logger.warning(
+            "Inkling: KV cache block reuse is enabled, and applies to text "
+            "prompts only. A request carrying image, video or audio input gets "
+            "a private chain in the reuse tree and never reuses, because "
+            "Inkling produces no multimodal content hashes and a prefix matched "
+            "on placeholder token ids alone would serve one item's KV for "
+            "another's. Such requests still run, uncached.")
     if enable_cache_transceiver:
         # The C++ route is already refused in _util.py for every V2 manager, but
         # KvCacheTransceiverV2 is not: it would move the paged KV and leave the
         # conv windows behind, so the decode instance convolves against zeros.
         raise NotImplementedError(
-            "Inkling does not support disaggregated serving. The four "
-            "short-conv windows per layer are per-request state outside the "
-            "paged KV cache (InklingConvStateCache), so they are not part of "
-            "any cache transfer; the generation instance would resume from a "
-            "zeroed window and silently emit wrong output. Unset "
+            "Inkling does not support disaggregated serving. Its four "
+            "short-conv windows per layer are per-request recurrent state, "
+            "held as KV cache manager V2 SSM layers -- but the cache-transfer "
+            "path enumerates state pools by cache-manager class, and "
+            "InklingHybridCacheManager is not MambaHybridCacheManagerV2, so "
+            "they are described to it as ordinary paged attention memory. The "
+            "generation instance would resume from a window that was never "
+            "transferred and silently emit wrong output. Unset "
             "cache_transceiver_config to run Inkling.")
 
 

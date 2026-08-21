@@ -51,118 +51,6 @@ _NEG = tl.constexpr(-1.0e30)
 # K/V are read from the packed extend tensors directly.
 # ---------------------------------------------------------------------------
 @triton.jit
-def _inkling_prefill_kernel(
-    Q,
-    K,
-    V,
-    Out,
-    RelLogits,
-    cu_seqlens,
-    sm_scale,
-    stride_qt,
-    stride_qh,
-    stride_kt,
-    stride_kh,
-    stride_vt,
-    stride_vh,
-    stride_ot,
-    stride_oh,
-    stride_rt,
-    stride_rh,
-    kv_group_num,
-    rel_extent: tl.constexpr,
-    HAS_REL: tl.constexpr,
-    WINDOW_LEFT: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    Lk: tl.constexpr,
-):
-    cur_seq = tl.program_id(0)
-    cur_head = tl.program_id(1)
-    cur_block_m = tl.program_id(2)
-    cur_kv_head = cur_head // kv_group_num
-
-    seq_start = tl.load(cu_seqlens + cur_seq)
-    seq_len = tl.load(cu_seqlens + cur_seq + 1) - seq_start
-
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    mask_d = offs_d < Lk
-
-    q_pos = cur_block_m * BLOCK_M + offs_m  # [BLOCK_M], position within sequence
-    mask_m = q_pos < seq_len
-
-    q_ptrs = (seq_start + q_pos)[:, None] * stride_qt + cur_head * stride_qh + offs_d[None, :]
-    q = tl.load(Q + q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-    e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
-
-    # Causal: query block cur_block_m only attends to keys <= its last row.
-    end_n = tl.minimum(seq_len, (cur_block_m + 1) * BLOCK_M)
-    # Sliding window: skip whole key tiles older than the window low bound.
-    if WINDOW_LEFT >= 0:
-        lo = cur_block_m * BLOCK_M - WINDOW_LEFT
-        if lo < 0:
-            lo = 0
-        lo = (lo // BLOCK_N) * BLOCK_N
-    else:
-        lo = 0
-
-    for start_n in range(lo, end_n, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        k_pos = start_n + offs_n  # [BLOCK_N]
-        mask_n = k_pos < seq_len
-
-        k_ptrs = (
-            (seq_start + k_pos)[None, :] * stride_kt + cur_kv_head * stride_kh + offs_d[:, None]
-        )
-        k = tl.load(K + k_ptrs, mask=mask_n[None, :] & mask_d[:, None], other=0.0)
-        qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale  # [BLOCK_M, BLOCK_N]
-
-        if HAS_REL:
-            rel_dist = q_pos[:, None] - k_pos[None, :]
-            rel_idx = tl.minimum(tl.maximum(rel_dist, 0), rel_extent - 1)
-            rel_ptrs = (seq_start + q_pos)[:, None] * stride_rt + cur_head * stride_rh + rel_idx
-            rel_valid = (rel_dist >= 0) & (rel_dist < rel_extent)
-            bias = tl.load(
-                RelLogits + rel_ptrs, mask=mask_m[:, None] & mask_n[None, :] & rel_valid, other=0.0
-            )
-            qk += bias
-
-        valid = mask_m[:, None] & mask_n[None, :] & (q_pos[:, None] >= k_pos[None, :])
-        if WINDOW_LEFT >= 0:
-            valid &= (q_pos[:, None] - k_pos[None, :]) <= WINDOW_LEFT
-        qk = tl.where(valid, qk, _NEG)
-
-        row_max = tl.max(qk, 1)
-        n_e_max = tl.maximum(e_max, row_max)
-        re_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
-        e_sum = e_sum * re_scale + tl.sum(p, 1)
-
-        v_ptrs = (
-            (seq_start + k_pos)[:, None] * stride_vt + cur_kv_head * stride_vh + offs_d[None, :]
-        )
-        v = tl.load(V + v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-        acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
-        e_max = n_e_max
-
-    acc = acc / e_sum[:, None]
-    o_ptrs = (seq_start + q_pos)[:, None] * stride_ot + cur_head * stride_oh + offs_d[None, :]
-    tl.store(Out + o_ptrs, acc.to(Out.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
-
-
-# ---------------------------------------------------------------------------
-# Decode (generation) kernel: one query token per request, paged KV read,
-# causal + optional window, optional relative-bias score_mod. CUDA-graph safe:
-# static grid (batch, num_heads); seq lengths and the page table are read from
-# GPU tensors, no host sync.
-# ---------------------------------------------------------------------------
-@triton.jit
 def _inkling_decode_kernel(
     Q,
     K_Cache,
@@ -290,93 +178,6 @@ def _inkling_decode_kernel(
 # ---------------------------------------------------------------------------
 def _block_dmodel(head_dim: int) -> int:
     return triton.next_power_of_2(head_dim)
-
-
-def inkling_prefill_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    sm_scale: float,
-    rel_logits: Optional[torch.Tensor] = None,
-    rel_extent: int = 0,
-    window_left: int = -1,
-) -> torch.Tensor:
-    """Context-phase attention over packed varlen Q/K/V.
-
-    Args:
-        q: ``[total_tokens, num_heads, head_dim]``
-        k, v: ``[total_tokens, num_kv_heads, head_dim]``
-        cu_seqlens: ``[batch + 1]`` int32 cumulative token counts.
-        max_seqlen: max per-request length (host int; used for the grid).
-        sm_scale: softmax scale (``1 / head_dim`` for Inkling).
-        rel_logits: ``[total_tokens, num_heads, rel_extent]`` fp32 aux bias, or
-            None to skip the score_mod.
-        rel_extent: relative-bias extent (profile width).
-        window_left: sliding-window radius (inclusive), -1 to disable.
-
-    Returns ``[total_tokens, num_heads, head_dim]`` in q's dtype.
-    """
-    # The kernels index head_dim with an implicit stride-1 last axis, so the
-    # inputs must be contiguous. ``v`` in particular arrives non-contiguous: it
-    # keeps the fused-qkv row stride, having skipped ``apply_qk_norm``'s reshape.
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    _total_tokens, num_heads, head_dim = q.shape
-    num_kv_heads = k.shape[1]
-    # The kernel maps a query head to its KV head as ``cur_head // kv_group_num``;
-    # a non-divisible pair would silently mis-map instead of failing.
-    assert num_heads % num_kv_heads == 0, (num_heads, num_kv_heads)
-    kv_group_num = num_heads // num_kv_heads
-    o = torch.empty_like(q)
-
-    has_rel = rel_logits is not None
-    if has_rel:
-        assert rel_logits.is_contiguous() and rel_logits.shape[-1] == rel_extent
-        r_st, r_sh = rel_logits.stride(0), rel_logits.stride(1)
-        rel_arg = rel_logits
-    else:
-        r_st = r_sh = 0
-        rel_arg = q  # unused placeholder pointer
-
-    BLOCK_DMODEL = _block_dmodel(head_dim)
-    BLOCK_M = 64
-    BLOCK_N = 64
-    batch = cu_seqlens.shape[0] - 1
-    grid = (batch, num_heads, triton.cdiv(max_seqlen, BLOCK_M))
-
-    _inkling_prefill_kernel[grid](
-        q,
-        k,
-        v,
-        o,
-        rel_arg,
-        cu_seqlens,
-        sm_scale,
-        q.stride(0),
-        q.stride(1),
-        k.stride(0),
-        k.stride(1),
-        v.stride(0),
-        v.stride(1),
-        o.stride(0),
-        o.stride(1),
-        r_st,
-        r_sh,
-        kv_group_num,
-        rel_extent=rel_extent if has_rel else 1,
-        HAS_REL=has_rel,
-        WINDOW_LEFT=window_left,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        Lk=head_dim,
-        num_warps=4,
-        num_stages=2,
-    )
-    return o
 
 
 def inkling_decode_attention(
@@ -521,3 +322,249 @@ def write_kv_cache_hnd(
             new_v[written : written + take].transpose(0, 1).to(v_cache.dtype)
         )
         written += take
+
+
+# ---------------------------------------------------------------------------
+# Chunked-context prefill kernel: BLOCK_M query tiling like the prefill kernel,
+# paged KV reads like the decode kernel, and absolute positions so a query can
+# attend to history it did not bring with it.
+#
+# This is the path for any context request with cached history -- a later
+# chunk of a chunked prefill, or a chunk sitting on a reused prefix. It needs
+# no gather: InklingAttention._run_context writes this call's new K/V into the
+# pages *before* attention, so prefix and new tokens are both already there and
+# the kernel can read every key from the page table.
+#
+# Positions are absolute over the whole prompt (``num_cached + q_pos``), which
+# is what makes the causal mask, the sliding window and the relative-bias
+# distance come out right across a chunk boundary. ``rel_logits`` stays indexed
+# by the PACKED query row: it is built per query token from that token's own
+# hidden state, and only new tokens are queries.
+# ---------------------------------------------------------------------------
+# One prefill kernel, always over the paged cache. A packed variant used to sit
+# beside it for the all-fresh case, on the theory that page indirection is worth
+# avoiding there; measured at the serving level that cost did not show up above
+# the baseline's own spread, and the second kernel cost a path that had to be
+# proven bit-identical to the first.
+@triton.jit
+def _inkling_prefill_kernel(
+    Q,
+    K_Cache,
+    V_Cache,
+    Out,
+    RelLogits,
+    cu_seqlens,
+    num_cached,
+    page_table,
+    sm_scale,
+    stride_qt,
+    stride_qh,
+    stride_kp,
+    stride_kh,
+    stride_kt,
+    stride_vp,
+    stride_vh,
+    stride_vt,
+    stride_ot,
+    stride_oh,
+    stride_rt,
+    stride_rh,
+    stride_ptb,
+    kv_group_num,
+    page_size: tl.constexpr,
+    rel_extent: tl.constexpr,
+    HAS_REL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    Lk: tl.constexpr,
+):
+    cur_seq = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    cur_block_m = tl.program_id(2)
+    cur_kv_head = cur_head // kv_group_num
+
+    seq_start = tl.load(cu_seqlens + cur_seq)
+    new_len = tl.load(cu_seqlens + cur_seq + 1) - seq_start
+    cached = tl.load(num_cached + cur_seq)
+    total_len = cached + new_len
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    mask_d = offs_d < Lk
+
+    q_pos = cur_block_m * BLOCK_M + offs_m  # position within THIS chunk
+    mask_m = q_pos < new_len
+    q_abs = cached + q_pos  # position within the whole prompt
+
+    q_ptrs = (seq_start + q_pos)[:, None] * stride_qt + cur_head * stride_qh + offs_d[None, :]
+    q = tl.load(Q + q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # Causal in ABSOLUTE space: the last query row of this tile is
+    # cached + (cur_block_m + 1) * BLOCK_M - 1, so keys stop one past it.
+    end_n = tl.minimum(total_len, cached + (cur_block_m + 1) * BLOCK_M)
+    if WINDOW_LEFT >= 0:
+        lo = cached + cur_block_m * BLOCK_M - WINDOW_LEFT
+        if lo < 0:
+            lo = 0
+        lo = (lo // BLOCK_N) * BLOCK_N
+    else:
+        lo = 0
+
+    for start_n in range(lo, end_n, BLOCK_N):
+        k_pos = start_n + offs_n  # ABSOLUTE key positions
+        mask_n = k_pos < total_len
+
+        page_local = k_pos // page_size
+        tok_in_page = k_pos % page_size
+        page_id = tl.load(page_table + cur_seq * stride_ptb + page_local, mask=mask_n, other=0).to(
+            tl.int64
+        )
+
+        # [BLOCK_DMODEL, BLOCK_N] for tl.dot, matching the packed prefill kernel.
+        k_ptrs = (
+            page_id[None, :] * stride_kp
+            + cur_kv_head * stride_kh
+            + tok_in_page[None, :] * stride_kt
+            + offs_d[:, None]
+        )
+        k = tl.load(K_Cache + k_ptrs, mask=mask_n[None, :] & mask_d[:, None], other=0.0)
+        qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale  # [BLOCK_M, BLOCK_N]
+
+        if HAS_REL:
+            rel_dist = q_abs[:, None] - k_pos[None, :]
+            rel_idx = tl.minimum(tl.maximum(rel_dist, 0), rel_extent - 1)
+            # Row is the PACKED query index: rel_logits covers new tokens only.
+            rel_ptrs = (seq_start + q_pos)[:, None] * stride_rt + cur_head * stride_rh + rel_idx
+            rel_valid = (rel_dist >= 0) & (rel_dist < rel_extent)
+            bias = tl.load(
+                RelLogits + rel_ptrs, mask=mask_m[:, None] & mask_n[None, :] & rel_valid, other=0.0
+            )
+            qk += bias
+
+        valid = mask_m[:, None] & mask_n[None, :] & (q_abs[:, None] >= k_pos[None, :])
+        if WINDOW_LEFT >= 0:
+            valid &= (q_abs[:, None] - k_pos[None, :]) <= WINDOW_LEFT
+        qk = tl.where(valid, qk, _NEG)
+
+        row_max = tl.max(qk, 1)
+        n_e_max = tl.maximum(e_max, row_max)
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        e_sum = e_sum * re_scale + tl.sum(p, 1)
+
+        v_ptrs = (
+            page_id[:, None] * stride_vp
+            + cur_kv_head * stride_vh
+            + tok_in_page[:, None] * stride_vt
+            + offs_d[None, :]
+        )
+        v = tl.load(V_Cache + v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+        acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
+        e_max = n_e_max
+
+    acc = acc / e_sum[:, None]
+    o_ptrs = (seq_start + q_pos)[:, None] * stride_ot + cur_head * stride_oh + offs_d[None, :]
+    tl.store(Out + o_ptrs, acc.to(Out.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
+
+
+def inkling_prefill_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_cached: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    max_seqlen: int,
+    sm_scale: float,
+    rel_logits: Optional[torch.Tensor] = None,
+    rel_extent: int = 0,
+    window_left: int = -1,
+) -> torch.Tensor:
+    """Context-phase attention for requests that carry cached history.
+
+    Same contract as :func:`inkling_prefill_attention`, except that K/V come
+    from the paged cache rather than a packed tensor, and each request declares
+    how many of its tokens are already there.
+
+    Args:
+        q: ``[total_new_tokens, num_heads, head_dim]`` -- the chunk's queries.
+        k_cache, v_cache: ``[num_pages, num_kv_heads, page_size, head_dim]``
+            HND pools. The caller must have written this chunk's K/V already.
+        cu_seqlens: ``[batch + 1]`` int32 cumulative NEW token counts.
+        num_cached: ``[batch]`` int32 tokens already in the cache per request.
+            All-zero is legal and must reproduce the packed kernel exactly.
+        page_table: ``[batch, max_pages]`` int32 physical page ids.
+        page_size: tokens per page.
+        max_seqlen: max NEW tokens for one request (host int; grid only).
+        rel_logits: ``[total_new_tokens, num_heads, rel_extent]`` fp32, indexed
+            by the packed query row, or None.
+        window_left: sliding-window radius (inclusive), -1 to disable.
+
+    Returns ``[total_new_tokens, num_heads, head_dim]`` in q's dtype.
+    """
+    q = q.contiguous()
+    _total_tokens, num_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[1]
+    assert num_heads % num_kv_heads == 0, (num_heads, num_kv_heads)
+    kv_group_num = num_heads // num_kv_heads
+    o = torch.empty_like(q)
+
+    has_rel = rel_logits is not None
+    if has_rel:
+        assert rel_logits.is_contiguous() and rel_logits.shape[-1] == rel_extent
+        r_st, r_sh = rel_logits.stride(0), rel_logits.stride(1)
+        rel_arg = rel_logits
+    else:
+        r_st = r_sh = 0
+        rel_arg = q  # unused placeholder pointer
+
+    BLOCK_DMODEL = _block_dmodel(head_dim)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    batch = cu_seqlens.shape[0] - 1
+    grid = (batch, num_heads, triton.cdiv(max_seqlen, BLOCK_M))
+
+    _inkling_prefill_kernel[grid](
+        q,
+        k_cache,
+        v_cache,
+        o,
+        rel_arg,
+        cu_seqlens,
+        num_cached,
+        page_table,
+        sm_scale,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        o.stride(0),
+        o.stride(1),
+        r_st,
+        r_sh,
+        page_table.stride(0),
+        kv_group_num,
+        page_size=page_size,
+        rel_extent=rel_extent if has_rel else 1,
+        HAS_REL=has_rel,
+        WINDOW_LEFT=window_left,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        Lk=head_dim,
+        num_warps=4,
+        num_stages=2,
+    )
+    return o

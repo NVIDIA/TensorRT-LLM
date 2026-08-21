@@ -39,20 +39,20 @@ InklingConvState = namedtuple("InklingConvState", ["k", "v", "attn", "mlp"])
 
 
 class InklingRole:
-    """V2 pool roles for the four short convolutions of a decoder layer.
+    """V2 pool role for a decoder layer's short-conv state.
 
-    Four roles despite only two widths: k/v and attn/mlp merely happen to pair up
-    in size today, and V2 coalesces same-sized buffers on its own.
+    One role, not four: the four convolutions share a window length, so they are
+    one buffer per layer holding ``[k | v | attn | mlp]`` along the channel axis.
+    That is also the shape a state transfer wants -- one pool with the section
+    widths beside it, as Mamba stores ``[x | B | C]``.
     """
 
-    CONV_K = DataRole("inkling_conv_k")
-    CONV_V = DataRole("inkling_conv_v")
-    CONV_ATTN = DataRole("inkling_conv_attn")
-    CONV_MLP = DataRole("inkling_conv_mlp")
+    CONV_STATE = DataRole("inkling_conv")
 
 
-# Order matches InklingConvState's fields so the two can be zipped.
-CONV_ROLES = (InklingRole.CONV_K, InklingRole.CONV_V, InklingRole.CONV_ATTN, InklingRole.CONV_MLP)
+CONV_ROLE = InklingRole.CONV_STATE
+# Section order within the buffer; matches InklingConvState's fields.
+CONV_SECTIONS = ("k", "v", "attn", "mlp")
 
 
 class InklingConvStateCache:
@@ -90,6 +90,7 @@ class InklingConvStateCache:
         reserve_attention_dp_slot: bool = False,
         max_draft_len: int = 0,
         allocate: Optional[Callable[[int, object, List[int]], torch.Tensor]] = None,
+        resolve_slot: Optional[Callable[[int], Optional[int]]] = None,
     ):
         # Accept either the text config or the top-level multimodal one.
         config = getattr(pretrained_config, "text_config", pretrained_config)
@@ -118,23 +119,30 @@ class InklingConvStateCache:
                 return torch.zeros(num_slots, *state_shape, device=device, dtype=dtype)
 
         self._layers: List[InklingConvState] = []
+        self._section_channels: List[List[int]] = []
         for i in range(config.num_hidden_layers):
             kv_dim = (config.layer_num_kv_heads(i) * config.layer_head_dim(i)) // tp_size
             hidden = config.hidden_size
-            bufs = [
-                allocate(i, role, [channels, kwin])
-                for role, channels in zip(CONV_ROLES, (kv_dim, kv_dim, hidden, hidden))
-            ]
-            for buf in bufs:
-                if buf.shape[0] < num_slots:
-                    raise RuntimeError(
-                        f"Inkling conv pool layer {i}: allocator returned "
-                        f"{buf.shape[0]} slots but the pool needs {num_slots} "
-                        f"({num_request_slots} request + reserved). The V2 SSM "
-                        "layer was sized from a different slot count than "
-                        "InklingConvStateCache assumes."
-                    )
-            self._layers.append(InklingConvState(*(b[:num_slots] for b in bufs)))
+            sections = [kv_dim, kv_dim, hidden, hidden]
+            self._section_channels.append(sections)
+            buf = allocate(i, CONV_ROLE, [sum(sections), kwin])
+            if buf.shape[0] < num_slots:
+                raise RuntimeError(
+                    f"Inkling conv pool layer {i}: allocator returned "
+                    f"{buf.shape[0]} slots but the pool needs {num_slots} "
+                    f"({num_request_slots} request + reserved). The V2 SSM "
+                    "layer was sized from a different slot count than "
+                    "InklingConvStateCache assumes."
+                )
+            buf = buf[:num_slots]
+            # Views, not copies: the causal_conv1d ops read conv_state's
+            # strides off the tensor, so a section need not be contiguous.
+            offsets = [0]
+            for width in sections:
+                offsets.append(offsets[-1] + width)
+            self._layers.append(
+                InklingConvState(*(buf[:, a:b, :] for a, b in zip(offsets, offsets[1:])))
+            )
         # Refreshed in place per forward so a captured graph aliases it and every
         # replay sees the current batch. Indexed by batch position, not by slot.
         self.state_indices = torch.arange(num_slots, dtype=torch.int32, device=device)
@@ -142,12 +150,24 @@ class InklingConvStateCache:
         self.state_indices_cpu = torch.zeros(
             num_slots, dtype=torch.int32, pin_memory=prefer_pinned()
         )
+        # Set by the cache manager to V2's slot for the request; see slots_for.
+        self._resolve_slot = resolve_slot
         self._slot_of = {}
         self._free = list(range(num_request_slots - 1, -1, -1))
 
     def conv_state_bytes(self) -> int:
         """Total device bytes this pool holds. Reported by the cache manager."""
         return sum(t.numel() * t.element_size() for st in self._layers for t in st)
+
+    def section_bytes(self, layer_idx: int) -> List[int]:
+        """Per-slot bytes of each section, in ``CONV_SECTIONS`` order.
+
+        What a state transfer needs to split one slot at its semantic
+        boundaries when the two sides disagree on TP -- the k/v sections are
+        sharded, the residual-stream ones are not.
+        """
+        itemsize = self._layers[layer_idx].k.element_size()
+        return [width * self.kwin * itemsize for width in self._section_channels[layer_idx]]
 
     def layer_state(self, layer_idx: int) -> InklingConvState:
         """The four short-conv state buffers for ``layer_idx`` (pool views)."""
@@ -169,15 +189,31 @@ class InklingConvStateCache:
         return None
 
     def slots_for(self, request_ids: List[int]) -> List[int]:
-        """Map request ids to their (stable) pool rows, allocating new ones.
+        """Map request ids to their pool rows.
 
-        Fresh requests get a zero-initialised row; existing ones keep theirs so
-        their conv windows persist across decode steps. Padding sentinels and the
-        attention-DP dummy alias their reserved rows. Raises on exhaustion rather
-        than handing out a row another request is still carrying state in.
+        With a ``resolve_slot`` callback the row is V2's, and this class
+        allocates nothing: V2 restores a snapshot into the slot IT assigned, so
+        a second numbering over the same buffer would have the kernels read a
+        row nobody restored. Without the callback (standalone use, unit tests)
+        a private free list is self-consistent, since nothing else touches the
+        pool with reuse off.
         """
         slots = []
         for r in request_ids:
+            if self._resolve_slot is not None:
+                slot = self._resolve_slot(r)
+                if slot is None:
+                    slot = self._reserved_slot_for(r)
+                if slot is None:
+                    raise RuntimeError(
+                        f"Inkling short-conv pool: request {r} has no V2 "
+                        "recurrent-state slot and is not a padding sentinel. "
+                        "Every resident sequence gets one when its KV cache is "
+                        "created; reaching here means the request was never "
+                        "added to the cache manager."
+                    )
+                slots.append(slot)
+                continue
             slot = self._slot_of.get(r)
             if slot is None:
                 slot = self._reserved_slot_for(r)
@@ -191,6 +227,8 @@ class InklingConvStateCache:
                         )
                     slot = self._free.pop()
                 self._slot_of[r] = slot
+                # Only the private path zeroes: a V2 slot may hold a window V2
+                # just restored into it, and zeroing would throw that away.
                 for st in self._layers:
                     for t in st:
                         t[slot].zero_()
@@ -224,6 +262,21 @@ class InklingConvStateCache:
             # hand a real request a row the next padding batch overwrites.
             if slot is not None and slot < self.num_request_slots:
                 self._free.append(slot)
+
+
+# ---- chunked prefill: declare the window a preceding chunk left behind ------
+def _context_num_cached(attn_metadata, num_contexts):
+    """Per-context-request cached token counts, or None when unavailable.
+
+    None on the cache-free unit-test path, which callers read as "all fresh".
+    """
+    params = getattr(attn_metadata, "kv_cache_params", None)
+    if params is None:
+        return None
+    per_seq = getattr(params, "num_cached_tokens_per_seq", None)
+    if per_seq is None:
+        return None
+    return [int(c) for c in per_seq[:num_contexts]]
 
 
 @dataclass
@@ -264,12 +317,16 @@ class InklingConvRuntime:
             cu = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
             cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
             query_start_loc = cu
-            # Fresh prefill carries no prior conv window -- correct only because
-            # KV block reuse and chunked prefill are refused by
-            # reject_unsupported_inkling_kv_cache_features. Deriving this from
-            # num_cached_tokens_per_seq is not enough on its own: _run_context
-            # attends only to its own call's tokens.
-            has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
+            # The window a preceding chunk left in the pool row is consumed
+            # only if declared. Sufficient only because the prefill kernel also
+            # reads the cached KV back; alone it would be the subtler bug.
+            cached = _context_num_cached(attn_metadata, num_contexts)
+            if cached is None:
+                has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
+            else:
+                has_initial_state = torch.tensor(
+                    [c > 0 for c in cached], dtype=torch.bool, device=device
+                )
         return cls(
             num_ctx_tokens=sum(attn_metadata.seq_lens.tolist()[:num_contexts]),
             ctx_indices=state_indices[:num_contexts] if num_contexts else None,

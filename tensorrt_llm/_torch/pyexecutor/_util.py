@@ -624,16 +624,15 @@ class KvCacheCreator:
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
         # Checked here because this is the one place that sees the resolved
-        # kv_cache_config -- model defaults already deep-merged with the user's
-        # settings -- alongside llm_args.
+        # kv_cache_config -- model defaults already deep-merged with the user's.
         reject_unsupported_inkling_kv_cache_features(
             model_config.pretrained_config,
             enable_block_reuse=kv_cache_config.enable_block_reuse,
-            enable_chunked_prefill=bool(
-                getattr(self._llm_args, "enable_chunked_prefill", False)),
             enable_cache_transceiver=(self._cache_transceiver_config is not None
                                       and self._cache_transceiver_config.backend
-                                      is not None))
+                                      is not None),
+            periodic_snapshot_interval=(
+                kv_cache_config.mamba_state_config.periodic_snapshot_interval))
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,

@@ -127,33 +127,6 @@ def test_model_defaults_pin_v2_and_disable_block_reuse():
 # and InklingConvRuntime seeds every context request with
 # has_initial_state=False. Neither raises on its own -- both emit wrong logits.
 # ---------------------------------------------------------------------------
-def test_block_reuse_is_rejected_not_merely_defaulted_off():
-    """An explicit enable_block_reuse=True wins the deep-merge over the model
-    default, so the default alone cannot be the guarantee."""
-    from tensorrt_llm._torch.pyexecutor.config_utils import (
-        reject_unsupported_inkling_kv_cache_features,
-    )
-
-    with pytest.raises(NotImplementedError, match="block reuse"):
-        reject_unsupported_inkling_kv_cache_features(
-            InklingConfig(), enable_block_reuse=True, enable_chunked_prefill=False
-        )
-
-
-def test_chunked_prefill_is_rejected():
-    """slots_for keeps a request's pool row across chunks and causal_conv1d_fn
-    does write the trailing window into it, but a second chunk still declares
-    has_initial_state=False, so the carried window is never consumed."""
-    from tensorrt_llm._torch.pyexecutor.config_utils import (
-        reject_unsupported_inkling_kv_cache_features,
-    )
-
-    with pytest.raises(NotImplementedError, match="chunked prefill"):
-        reject_unsupported_inkling_kv_cache_features(
-            InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=True
-        )
-
-
 def test_disaggregated_serving_is_rejected():
     """The C++ transceiver route is already refused for every V2 manager, but
     the Python one (KvCacheTransceiverV2) is not. It would move the paged KV and
@@ -167,27 +140,22 @@ def test_disaggregated_serving_is_rejected():
         reject_unsupported_inkling_kv_cache_features(
             InklingConfig(),
             enable_block_reuse=False,
-            enable_chunked_prefill=False,
             enable_cache_transceiver=True,
         )
 
     # Default off: an aggregate deployment pays nothing.
-    reject_unsupported_inkling_kv_cache_features(
-        InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=False
-    )
+    reject_unsupported_inkling_kv_cache_features(InklingConfig(), enable_block_reuse=False)
 
 
 def test_the_supported_configuration_is_accepted():
-    """Both off -- what every Inkling accuracy run measured -- must stay silent,
-    including on the text sub-config the KV cache is sized from."""
+    """The default configuration must stay silent, including on the text
+    sub-config the KV cache is sized from."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         reject_unsupported_inkling_kv_cache_features,
     )
 
     for cfg in (InklingConfig(), InklingTextConfig()):
-        reject_unsupported_inkling_kv_cache_features(
-            cfg, enable_block_reuse=False, enable_chunked_prefill=False
-        )
+        reject_unsupported_inkling_kv_cache_features(cfg, enable_block_reuse=False)
 
 
 def test_the_rejection_is_scoped_to_inkling():
@@ -198,31 +166,381 @@ def test_the_rejection_is_scoped_to_inkling():
     )
 
     not_inkling = SimpleNamespace(model_type="llama")
-    reject_unsupported_inkling_kv_cache_features(
-        not_inkling, enable_block_reuse=True, enable_chunked_prefill=True
-    )
+    reject_unsupported_inkling_kv_cache_features(not_inkling, enable_block_reuse=True)
 
 
-def test_the_rejection_names_both_features_separately():
-    """Two independent causes; a user who hits both must not have to re-run to
-    discover the second. Block reuse is reported first because it is the one a
-    user can hit without asking for it (the framework default is True)."""
+def test_block_reuse_is_rejected_without_a_snapshot_policy():
+    """An explicit enable_block_reuse=True wins the deep-merge over the model
+    default, so the default alone cannot be the guarantee. Without a snapshot
+    policy a prefix hit still has no conv window to restore."""
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         reject_unsupported_inkling_kv_cache_features,
     )
 
-    with pytest.raises(NotImplementedError) as first:
-        reject_unsupported_inkling_kv_cache_features(
-            InklingConfig(), enable_block_reuse=True, enable_chunked_prefill=True
-        )
-    assert "block reuse" in str(first.value)
-    assert "enable_block_reuse=False" in str(first.value)
+    with pytest.raises(NotImplementedError, match="block reuse"):
+        reject_unsupported_inkling_kv_cache_features(InklingConfig(), enable_block_reuse=True)
 
-    with pytest.raises(NotImplementedError) as second:
-        reject_unsupported_inkling_kv_cache_features(
-            InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=True
+
+def test_block_reuse_is_allowed_once_snapshots_are_configured():
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    reject_unsupported_inkling_kv_cache_features(
+        InklingConfig(), enable_block_reuse=True, periodic_snapshot_interval=256
+    )
+
+
+def _warnings_from_guard(**kwargs):
+    """Run the guard and return what it warned.
+
+    Captured off tensorrt_llm's logger, not with caplog: that logger sets
+    propagate=False, so a caplog assertion would pass while asserting nothing.
+    """
+    from tensorrt_llm._torch.pyexecutor import config_utils
+
+    said = []
+    with mock.patch.object(config_utils.logger, "warning", said.append):
+        config_utils.reject_unsupported_inkling_kv_cache_features(InklingConfig(), **kwargs)
+    return " ".join(said)
+
+
+def test_enabling_reuse_warns_that_it_is_text_only():
+    """The manager's per-request warning needs a multimodal request to arrive,
+    and rides on the same probe as the rule it describes."""
+    assert "text prompts only" in _warnings_from_guard(
+        enable_block_reuse=True, periodic_snapshot_interval=256
+    )
+
+
+def test_no_text_only_warning_when_reuse_is_off():
+    """The negative control. A warning on every deployment, including the ones
+    that never asked for reuse, is a warning operators learn to skip."""
+    assert "text prompts only" not in _warnings_from_guard(enable_block_reuse=False)
+
+
+def test_the_multimodal_probe_field_still_exists():
+    """The guard reaches py_multimodal_data through getattr, so the NAME is the
+    contract: a rename makes every multimodal request look like a text one and
+    silently restores the defect, with nothing else failing."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+
+    assert "py_multimodal_data" in inspect.getsource(LlmRequest.__init__)
+
+
+def test_inkling_needs_block_aligned_chunks_without_being_hybrid_linear():
+    """Folding Inkling into is_hybrid_linear would also route it through
+    extract_mamba_kv_cache_params and the Mamba conv-state layouts, neither of
+    which it can satisfy. The predicate names the property instead."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        is_hybrid_linear,
+        needs_block_aligned_context_chunks,
+    )
+
+    cfg = InklingConfig()
+    assert needs_block_aligned_context_chunks(cfg)
+    assert not is_hybrid_linear(cfg)
+
+
+# Snapshot points: where a window may be captured, so where a hit may land.
+
+
+def _snapshot_manager(interval, reuse=True):
+    """A stub: the method reads two attributes and writes one field per
+    request, so a real manager would test the framework, not this policy."""
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
+        InklingHybridCacheManager,
+    )
+
+    mgr = object.__new__(InklingHybridCacheManager)
+    mgr.enable_block_reuse = reuse
+    mgr._kv_cache_config = SimpleNamespace(
+        mamba_state_config=SimpleNamespace(periodic_snapshot_interval=interval)
+    )
+    return mgr
+
+
+def _snapshot_reqs(*prompt_lens):
+    return [SimpleNamespace(prompt_len=n, expect_snapshot_points=None) for n in prompt_lens]
+
+
+def test_snapshot_points_land_on_multiples_of_the_interval():
+    reqs = _snapshot_reqs(700)
+    _snapshot_manager(256).prepare_expect_snapshot_points(reqs)
+    assert reqs[0].expect_snapshot_points == [256, 512]
+
+
+def test_a_snapshot_point_never_exceeds_the_prompt():
+    """Past prompt_len there is no prefix to key a snapshot by, and the
+    scheduler would be asked to end a chunk beyond the request."""
+    reqs = _snapshot_reqs(100, 256, 512)
+    _snapshot_manager(256).prepare_expect_snapshot_points(reqs)
+    assert reqs[0].expect_snapshot_points == []
+    assert reqs[1].expect_snapshot_points == [256]
+    assert reqs[2].expect_snapshot_points == [256, 512]
+
+
+@pytest.mark.parametrize("interval,reuse", [(256, False), (0, True)])
+def test_no_snapshot_points_when_reuse_cannot_run(interval, reuse):
+    """The field is still assigned: the scheduler reads it unconditionally, and
+    a leftover list from a previous batch would force chunk boundaries for a
+    feature that is not running."""
+    reqs = _snapshot_reqs(700)
+    _snapshot_manager(interval, reuse=reuse).prepare_expect_snapshot_points(reqs)
+    assert reqs[0].expect_snapshot_points == []
+
+
+def _manager_with_caches(caches):
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
+        InklingHybridCacheManager,
+    )
+
+    mgr = object.__new__(InklingHybridCacheManager)
+    mgr.kv_cache_map = caches
+    mgr._conv_layer_group_id = 4
+    return mgr
+
+
+def test_the_conv_slot_comes_from_v2_not_a_private_counter():
+    """V2 restores a hit into the slot it assigned, so the pool must be indexed
+    its way; a second numbering reads a row nobody restored."""
+    seen = []
+
+    class _Cache:
+        def get_ssm_block_base_index(self, group_id):
+            seen.append(group_id)
+            return 3
+
+    assert _manager_with_caches({7: _Cache()})._conv_slot_for_request(7) == 3
+    assert seen == [4], "the conv layer group id must be the one queried"
+
+
+def test_a_request_without_a_v2_slot_falls_back():
+    """Padding sentinels have no cache entry, and V2 reports a negative index
+    for a non-resident request; both must read as "no slot"."""
+
+    class _NoBlock:
+        def get_ssm_block_base_index(self, group_id):
+            return -1
+
+    mgr = _manager_with_caches({9: _NoBlock()})
+    assert mgr._conv_slot_for_request(9) is None
+    assert mgr._conv_slot_for_request(12345) is None
+
+
+def test_the_pool_allocates_nothing_when_v2_resolves_slots():
+    """The private free list must not run in parallel with V2's allocation:
+    whichever row it handed out would be the wrong one."""
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.conv_state import (
+        InklingConvStateCache,
+    )
+
+    cache = object.__new__(InklingConvStateCache)
+    cache._resolve_slot = {5: 2, 6: 0}.get
+    cache._free = []  # empty: the private path would raise if it ran
+    cache._slot_of = {}
+    cache._padding_slot = 8
+    cache._attention_dp_dummy_slot = None
+    cache._max_draft_len = 0
+    cache.num_request_slots = 8
+
+    assert cache.slots_for([5, 6, 5]) == [2, 0, 2]
+    assert cache._slot_of == {}, "nothing may be recorded in the private map"
+
+
+def test_py_executor_finds_the_snapshot_hook_by_name():
+    """py_executor reaches this through hasattr, so the NAME is the contract --
+    a rename would silently stop forcing chunk boundaries rather than fail."""
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
+        InklingHybridCacheManager,
+    )
+
+    assert hasattr(InklingHybridCacheManager, "prepare_expect_snapshot_points")
+
+
+def test_the_snapshot_commit_methods_override_the_base():
+    """The base commits as prefill advances and never sets history_length,
+    which the SSM commit path asserts on. These overrides are what maintain
+    that contract."""
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
+        InklingHybridCacheManager,
+    )
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+    for name in ("try_commit_blocks", "update_context_resources"):
+        assert getattr(InklingHybridCacheManager, name) is not getattr(KVCacheManagerV2, name), (
+            f"{name} no longer overrides the base"
         )
-    assert "enable_chunked_prefill=False" in str(second.value)
+    assert hasattr(InklingHybridCacheManager, "_mark_context_position_as_history")
+
+
+def test_the_snapshot_commit_methods_match_mambas():
+    """A copy of MambaHybridCacheManagerV2's, so it can drift. Compared as
+    ASTs: the two files use different formatters, and the error strings name
+    the model."""
+    import ast
+    import textwrap
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
+        InklingHybridCacheManager,
+    )
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2
+
+    def body(cls, name):
+        fn = ast.parse(textwrap.dedent(inspect.getsource(getattr(cls, name)))).body[0]
+        stmts = fn.body
+        if (
+            stmts
+            and isinstance(stmts[0], ast.Expr)
+            and isinstance(stmts[0].value, ast.Constant)
+            and isinstance(stmts[0].value.value, str)
+        ):
+            stmts = stmts[1:]
+        module = ast.Module(body=stmts, type_ignores=[])
+        for node in ast.walk(module):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                node.value = "<msg>"
+        return ast.dump(module)
+
+    for name in (
+        "try_commit_blocks",
+        "update_context_resources",
+        "_mark_context_position_as_history",
+    ):
+        assert body(InklingHybridCacheManager, name) == body(MambaHybridCacheManagerV2, name), (
+            f"{name} has drifted from the Mamba copy it was taken from"
+        )
+
+
+# Multimodal requests must not share the radix tree: their image spans carry no
+# content digest, measured as MMMU 81.3% -> 31.3% over the same 32 items.
+
+
+def _reuse_manager(reuse=True):
+    from tensorrt_llm._torch.attention_backend.sparse.inkling.cache_manager import (
+        InklingHybridCacheManager,
+    )
+
+    mgr = object.__new__(InklingHybridCacheManager)
+    mgr.enable_block_reuse = reuse
+    mgr._warned_multimodal_reuse = False
+    return mgr
+
+
+def _mm_request(hashes=None, mm_data=None, request_id=7):
+    return SimpleNamespace(
+        multimodal_hashes=hashes, py_multimodal_data=mm_data, request_id=request_id
+    )
+
+
+@pytest.fixture
+def passthrough_base(monkeypatch):
+    """Make the base augmentation the identity, so what these assert on is the
+    Inkling override alone rather than the multimodal rewrite underneath it."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+    monkeypatch.setattr(
+        KVCacheManagerV2,
+        "_augment_tokens_for_block_reuse",
+        lambda self, tokens, req, start=0, end=None: list(tokens),
+    )
+
+
+def test_multimodal_request_without_digests_gets_a_private_chain(passthrough_base):
+    tokens = [1, 2, 3, 4]
+    out = _reuse_manager()._augment_tokens_for_block_reuse(
+        tokens, _mm_request(mm_data={"image": object()})
+    )
+
+    assert isinstance(out[0], bytes), "position 0 must stop matching real ids"
+    assert out[1:] == tokens[1:], "only the first key token is salted"
+
+
+def test_two_multimodal_requests_do_not_match_each_other(passthrough_base):
+    """The failure this prevents is one image being served another's KV, so it
+    is not enough that the chain is private -- two requests must differ."""
+    mgr = _reuse_manager()
+    first = mgr._augment_tokens_for_block_reuse(
+        [1, 2, 3], _mm_request(mm_data={"image": object()}, request_id=1)
+    )
+    second = mgr._augment_tokens_for_block_reuse(
+        [1, 2, 3], _mm_request(mm_data={"image": object()}, request_id=2)
+    )
+
+    assert first[0] != second[0]
+    # ...and a continuation chunk of the SAME request keys the same way, or the
+    # request could not reuse its own committed blocks.
+    again = mgr._augment_tokens_for_block_reuse(
+        [1, 2, 3], _mm_request(mm_data={"image": object()}, request_id=1)
+    )
+    assert again[0] == first[0]
+
+
+def test_text_requests_keep_reuse(passthrough_base):
+    """The negative control. Text is the path the end-to-end runs measured as
+    good, and a salt applied there would silently switch the feature off."""
+    tokens = [1, 2, 3]
+    assert _reuse_manager()._augment_tokens_for_block_reuse(tokens, _mm_request()) == tokens
+
+
+def test_multimodal_request_with_digests_is_left_to_the_base(passthrough_base):
+    """Once hashes exist the base rewrite distinguishes items by content, which
+    is strictly better than no reuse -- so the override must step aside."""
+    tokens = [1, 2, 3]
+    assert (
+        _reuse_manager()._augment_tokens_for_block_reuse(
+            tokens, _mm_request(hashes=[[1, 2, 3, 4]], mm_data={"image": object()})
+        )
+        == tokens
+    )
+
+
+def test_continuation_chunks_are_not_salted(passthrough_base):
+    """The radix tree chains a block's key through its parent, so salting a
+    later chunk would only change keys the first chunk already committed."""
+    tokens = [5, 6, 7]
+    assert (
+        _reuse_manager()._augment_tokens_for_block_reuse(
+            tokens, _mm_request(mm_data={"image": object()}), start=256
+        )
+        == tokens
+    )
+
+
+def test_nothing_is_salted_when_reuse_is_off(passthrough_base):
+    tokens = [1, 2, 3]
+    assert (
+        _reuse_manager(reuse=False)._augment_tokens_for_block_reuse(
+            tokens, _mm_request(mm_data={"image": object()})
+        )
+        == tokens
+    )
+
+
+def test_the_prefill_path_always_reads_the_pages():
+    """One prefill kernel, and it takes the page table. A packed variant beside
+    it would mean proving the two agree bit-for-bit at num_cached == 0."""
+    import inspect
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import kernels
+
+    params = inspect.signature(kernels.inkling_prefill_attention).parameters
+    for name in ("k_cache", "v_cache", "num_cached", "page_table", "page_size"):
+        assert name in params, f"prefill entry lost its paged argument {name}"
+    assert not hasattr(kernels, "inkling_chunked_prefill_attention"), (
+        "the second prefill kernel is gone; nothing should re-export it"
+    )
+
+
+def test_chunked_prefill_is_supported_and_no_longer_refused():
+    """The raise came out once the feature was validated: bit-identical to
+    one-shot prefill at the layer level, 63 GPU parity tests, and GSM8K over the
+    full 1319 questions at -0.08 pt with exact McNemar p=1.000."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    reject_unsupported_inkling_kv_cache_features(InklingConfig(), enable_block_reuse=False)
 
 
 def test_text_geometry():
@@ -1595,16 +1913,20 @@ def test_build_cache_config_appends_ssm_layers_for_the_conv_state(monkeypatch):
     assert [int(layer.layer_id) for layer in out.layers] == [0, 1, 2, 3]
     assert mgr._conv_layer_id(0) == 2 and mgr._conv_layer_id(1) == 3
 
-    # Four roles per layer, sized per request (not per block): channels * kwin.
+    # One buffer per layer holding [k | v | attn | mlp], sized per request (not
+    # per block): summed channels * kwin. One pool is what a state transfer
+    # wants -- the section widths travel beside it, as Mamba's [x | B | C] do.
     ssm = out.layers[2]
-    assert [b.role for b in ssm.buffers] == list(cm.CONV_ROLES)
+    assert [b.role for b in ssm.buffers] == [cm.CONV_ROLE]
     itemsize = torch.empty((), dtype=torch.bfloat16).element_size()
-    assert [b.size for b in ssm.buffers] == [
+    sections = [
         8 * 3 * itemsize,  # k, kv_dim
         8 * 3 * itemsize,  # v, kv_dim
         8 * 3 * itemsize,  # attn, hidden
         8 * 3 * itemsize,  # mlp, hidden
     ]
+    assert [b.size for b in ssm.buffers] == [sum(sections)]
+    assert mgr._conv_section_bytes(0) == sections
     # SsmLayerConfig forbids a per-block override -- these are not paged.
     assert all(b.tokens_per_block_override is None for b in ssm.buffers)
 
