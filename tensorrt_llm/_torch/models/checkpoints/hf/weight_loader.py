@@ -293,13 +293,31 @@ class HfWeightLoader(BaseWeightLoader):
         self._lazy_handles = handles
         logger.info(f"Lazily opened {len(weight_files)} safetensors files "
                     f"({len(weights)} tensors) from {checkpoint_dir}")
-        return ConsumableWeightsDict(weights)
+        lazy_weights = ConsumableWeightsDict(weights)
+        # A lazy slice does not carry the file it came from, and a model that
+        # wants to re-open shards itself (Kimi K3 streams rank-local experts
+        # per shard file, precisely to avoid holding this mapping open) has no
+        # other reliable source: transformers no longer sets
+        # ``PretrainedConfig._name_or_path``.
+        lazy_weights.checkpoint_dir = checkpoint_dir
+        return lazy_weights
 
     def load_weights(self,
                      checkpoint_dir: str,
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
+        """Load model weights keyed by checkpoint tensor name.
+
+        Kimi K3 checkpoint is opened lazily as HF SafeTensors to avoid materializing any part of the checkpoint
+        in CPU memory.
+        Other models' checkpoints may be prefetched in parallel to warm up the OS file cache if
+        the CPU memory is large enough, before their tensors are loaded via mmap.
+        when `_WEIGHT_CACHE_ENV` is on, other models can also use a CPU weight cache to accelerate repeated
+        loading under the same process.
+
+        Returns a `ConsumableWeightsDict` mapping checkpoint tensor names to tensors.
+        """
         if self._is_kimi_k3_checkpoint(checkpoint_dir):
             return self._load_lazy_safetensors(checkpoint_dir, use_consolidated)
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
@@ -386,7 +404,7 @@ class HfWeightLoader(BaseWeightLoader):
         return ConsumableWeightsDict(weights)
 
     @staticmethod
-    def _load_safetensors_file(file):
+    def _load_safetensors_file(file: str) -> dict[str, torch.Tensor]:
         logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 

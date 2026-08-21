@@ -13,15 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU LTX-2 text-to-video with audio.
-# Shared by offline examples (--visual_gen_args) and trtllm-serve.
-quant_config:
-  quant_algo: FP8_BLOCK_SCALES
-  dynamic: true
-attention_config:
-  backend: VANILLA
-parallel_config:
-  cfg_size: 1
-  ulysses_size: 1
-cuda_graph_config:
-  enable: false
+from .pipeline_glm_image import GlmImagePipeline
+from .transformer_glm_image import GlmImageAttention, GlmImageTransformer2DModel
+
+__all__ = ["GlmImageAttention", "GlmImagePipeline", "GlmImageTransformer2DModel"]

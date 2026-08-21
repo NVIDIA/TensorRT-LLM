@@ -155,6 +155,12 @@ def DISABLE_CBTS = "disable_cbts"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
+// Rollout switch for pre-merge Tier 2 coverage-based narrowing. Keep collection
+// enabled above while this remains off so a later pilot allowlist has fresh data.
+@Field
+def ENABLE_CBTS_COVERAGE_TIER = false
+@Field
+def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -362,6 +368,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     // Coverage runs only on the official post-merge pipeline.
     testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
+    testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
@@ -543,7 +550,7 @@ def launchReleaseCheck(pipeline, globalVars)
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
-    def image = "urm.nvidia.com/docker/golang:1.22"
+    def image = "urm.nvidia.com/docker/golang:1.23"
     stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
@@ -846,8 +853,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Shadow audit: download the latest merged touch DB and log its health + HEAD coverage gap (diagnostic only).
-        _cbtsCoverageAudit(pipeline)
+        // Download the touch DB only when Tier 2 is enabled. Tier 1 rules still
+        // run while the coverage tier is disabled during the initial rollout.
+        def coverageDb = _cbtsCoverageDb(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -872,10 +880,11 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
 
-        def output = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json",
-            returnStdout: true,
-        )
+        def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
+        if (coverageDb) {
+            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
+        }
+        def output = sh(script: mainCmd, returnStdout: true)
 
         def result = _cbtsParseSelectionResult(output)
         if (result.scope == null) {
@@ -917,30 +926,45 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Download the latest merged touch DB and run coverage_audit.py on it; best-effort, never changes the CBTS decision.
+// Resolve the optional Tier 2 input behind an explicit rollout gate. Keeping
+// this separate makes the follow-up pilot allowlist a small policy change.
+def _cbtsCoverageDb(pipeline)
+{
+    if (!ENABLE_CBTS_COVERAGE_TIER) {
+        pipeline.echo("CBTS: coverage tier disabled — running Tier 1 only")
+        return null
+    }
+    return _cbtsCoverageAudit(pipeline)
+}
+
+// Fetch the touch DB and audit it; artifact.py's {path, meta} verbatim, or null on failure.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
-        def covDir = "${LLM_ROOT}/cbts_cov"
-        def url = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-url || true",
-            returnStdout: true,
-        ).trim()
-        if (!url) {
-            pipeline.echo("CBTS audit: no coverage DB artifact found — skipping")
-            return
+        // artifact.py resolves, downloads and unpacks; paths come back
+        // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
+        // The checked-out revision is the PR head; its merge base is what drift is measured against.
+        def prHead = env.gitlabMergeRequestLastCommit ?: ""
+        def readyJson = ""
+        withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
+            readyJson = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                returnStdout: true,
+            ).trim()
         }
-        sh "mkdir -p ${covDir}"
-        // wget the tarball (retrying) and extract the sqlite.
-        trtllm_utils.llmExecStepWithRetry(pipeline, script:
-            "wget -nv '${url}' -O ${covDir}/cbts_pystart_report.tar.gz && " +
-            "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
-        sh "python3 ${LLM_ROOT}/jenkins/scripts/cbts/tools/coverage_audit.py " +
-           "--db ${covDir}/cbts_touchmap.sqlite"
+        if (!readyJson) {
+            pipeline.echo("CBTS audit: no coverage DB could be prepared — skipping Tier 2")
+            return null
+        }
+        def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
+        return ready
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
+        return null
     }
 }
 
@@ -1033,7 +1057,58 @@ def _cbtsParseSelectionResult(String text)
         // Explicit null check preserves `false`; default True is safe.
         sanity_required: data.sanity_required != null ? data.sanity_required : true,
         perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
+        // Coverage tier omits multi-GPU stages; L0_Test re-adds them under this flag.
+        enable_multi_gpu: data.enable_multi_gpu ?: false,
     ]
+}
+
+// Returns true when the PR touches any file that requires @NVIDIA/trt-llm-oss-compliance review
+// (mirrors the patterns in .github/CODEOWNERS under "OSS Compliance & Legal").
+def getOssComplianceFileChanged(pipeline, globalVars)
+{
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (isOfficialPostMergeJob) {
+        pipeline.echo("OSS compliance check: skipped (post-merge).")
+        return false
+    }
+
+    // Exact file matches
+    def exactFiles = [
+        "LICENSE",
+        "setup.py",
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "cpp/CMakeLists.txt",
+        "cpp/conanfile.py",
+        ".github/CODEOWNERS",
+        "jenkins/license_cpp.json",
+        "tensorrt_llm/usage/llm_args_golden_manifest.json",
+    ] as Set
+
+    // Prefix matches (directory trees and glob-style prefixes from CODEOWNERS)
+    def prefixes = [
+        "ATTRIBUTIONS-",
+        "cpp/cmake/",
+        "3rdparty/",
+        "triton_kernels/",
+        "docker/common/",
+        "tensorrt_llm/usage/",
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    def matched = changedFileList.find { file ->
+        exactFiles.contains(file) || prefixes.any { prefix -> file.startsWith(prefix) }
+    }
+    if (matched) {
+        pipeline.echo("OSS compliance file changed: ${matched}")
+        return true
+    }
+    return false
 }
 
 def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
@@ -1627,6 +1702,60 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
                 launchReleaseCheck(this, globalVars)
+            }
+        },
+        "OSS-Compliance-Check": {
+            script {
+                stage("[OSS-Compliance-Check] Run") {
+                    if (!testFilter[(OSS_COMPLIANCE_FILE_CHANGED)]) {
+                        echo "Skipping OSS Compliance Check: no OSS compliance-related files changed."
+                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                        return
+                    }
+                    if (GEN_POST_MERGE_BUILDS_ONLY) {
+                        echo "Skipping OSS Compliance Check (GenPostMergeBuilds mode: builds only)"
+                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                        return
+                    }
+                    def ref = env.gitlabBranch ?: "main"
+                    def repoUrlKey = "tensorrt_llm_github_sync"
+                    withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+                        if (env.gitlabSourceRepoHttpUrl == DEFAULT_LLM_REPO) {
+                            repoUrlKey = "tensorrt_llm_internal"
+                        }
+                    }
+                    echo "Triggering OSS Compliance (PLC) scan for ref: ${ref}"
+                    try {
+                        def params = [
+                            string(name: 'ref', value: env.gitlabCommit),
+                            string(name: 'repoUrlKey', value: repoUrlKey),
+                            string(name: 'forkOwner', value: ''),
+                            string(name: 'postMergePipelineName', value: ''),
+                            string(name: 'postMergeBuildNumber', value: ''),
+                            string(name: 'scanMode', value: 'pre_merge'),
+                            string(name: 'runSourceCodeScanning', value: 'true'),
+                            string(name: 'runContainerScanning', value: 'false'),
+                            string(name: 'runSonarQube', value: 'false'),
+                        ]
+                        def logger = new Logger(pipeline)
+                        def handle = build(
+                            job: "/LLM/helpers/PLCScanningSetup",
+                            parameters: params,
+                            propagate: false
+                        )
+                        if (handle.result == "UNSTABLE") {
+                            logger.log("OSS Compliance Check downstream job is UNSTABLE, ignoring")
+                        } else if (handle.result != "SUCCESS") {
+                            error "Downstream job did not succeed"
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        catchError(buildResult: 'Failure', stageResult: 'Failure') {
+                            error "OSS Compliance Check failed: ${e.getMessage()}, please rerun."
+                        }
+                    }
+                }
             }
         },
         "x86_64-Linux": {
