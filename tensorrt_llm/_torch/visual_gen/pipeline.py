@@ -31,7 +31,7 @@ from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.visual_gen.params import Role
+from tensorrt_llm.visual_gen.params import MediaRole
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
@@ -75,7 +75,7 @@ class ExtraParamSchema(StrictBaseModel):
 class RoleSpec(StrictBaseModel):
     """One accepted role for a reference modality, with its count bounds."""
 
-    role: Role = Field(description="Role of the reference input.")
+    role: MediaRole = Field(description="Role of the reference input.")
     min: int = Field(default=1, description="Minimum count for this role.")
     max: Optional[int] = Field(
         default=1, description="Maximum count for this role (None = unbounded)."

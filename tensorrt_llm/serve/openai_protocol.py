@@ -58,7 +58,7 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.media.reference import ContentFormat, Role
+from tensorrt_llm.media.reference import ContentFormat, MediaRole
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
@@ -2033,10 +2033,11 @@ class MediaReferenceItem(OpenAIBaseModel):
         "also accepted). ``bytes`` cannot be carried in JSON — upload the file "
         "as multipart/form-data instead. Distinct from the top-level "
         "``format``, which selects the *output* encoding."))
-    role: Optional[Role] = Field(
+    role: Optional[MediaRole] = Field(
         default=None,
-        description="Reference role. Required only when the model has more than "
-        "one required role for the modality; otherwise inferred.",
+        description="Which conditioning slot this reference fills. Required only "
+        "when the target model accepts this modality in more than one slot; omit "
+        "it when the model leaves no ambiguity.",
     )
 
     @field_validator("format")
