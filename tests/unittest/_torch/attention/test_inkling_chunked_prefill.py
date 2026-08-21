@@ -32,7 +32,6 @@ pytest.importorskip("triton")
 
 from tensorrt_llm._torch.attention_backend.sparse.inkling.kernels import (  # noqa: E402
     build_page_table,
-    inkling_chunked_prefill_attention,
     inkling_prefill_attention,
     write_kv_cache_hnd,
 )
@@ -81,7 +80,7 @@ def _run_chunk(q, k, v, rel, num_cached, k_cache, v_cache, block_ids, window):
     max_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
     # build_page_table writes len(blocks) entries into a row of width max_pages.
     page_table = build_page_table([block_ids[:max_pages]], max_pages, "cuda")
-    return inkling_chunked_prefill_attention(
+    return inkling_prefill_attention(
         q,
         k_cache,
         v_cache,
@@ -98,18 +97,16 @@ def _run_chunk(q, k, v, rel, num_cached, k_cache, v_cache, block_ids, window):
 
 
 def _packed(q, k, v, rel, window):
-    cu = torch.tensor([0, q.shape[0]], dtype=torch.int32, device="cuda")
-    return inkling_prefill_attention(
-        q,
-        k,
-        v,
-        cu,
-        q.shape[0],
-        HEAD_DIM**-1.0,
-        rel,
-        REL_EXTENT if rel is not None else 0,
-        window,
-    )
+    """The one-shot reference: the whole prompt in a single call, nothing cached.
+
+    This used to be a second, packed kernel. With one prefill kernel the
+    reference is that kernel run over a fresh cache at num_cached == 0, which is
+    what "splitting must not change the answer" is measured against.
+    """
+    total_len = q.shape[0]
+    num_pages = (total_len + PAGE_SIZE - 1) // PAGE_SIZE + 1
+    k_cache, v_cache = _empty_cache(num_pages, k.shape[1])
+    return _run_chunk(q, k, v, rel, 0, k_cache, v_cache, list(range(num_pages)), window)
 
 
 def _assert_close(got, want, what, rtol=2e-2, atol=2e-2):
@@ -323,15 +320,15 @@ def test_declaring_no_initial_state_on_a_later_chunk_is_visibly_wrong():
     )
 
 
-def test_the_package_re_exports_the_chunked_entry_point():
+def test_the_package_re_exports_the_prefill_entry_point():
     """modeling_inkling imports from the PACKAGE, not from .kernels. The tests
     above import from ``...inkling.kernels`` directly, so the whole suite passed
     once while the model itself could not import the entry point.
     """
     import tensorrt_llm._torch.attention_backend.sparse.inkling as pkg
 
-    assert hasattr(pkg, "inkling_chunked_prefill_attention")
-    assert "inkling_chunked_prefill_attention" in pkg.__all__
+    assert hasattr(pkg, "inkling_prefill_attention")
+    assert "inkling_prefill_attention" in pkg.__all__
 
 
 # The gap the rest of this file leaves open: every test above hands the kernel
@@ -401,7 +398,7 @@ def test_a_contiguous_page_assumption_would_be_caught():
     nc = torch.tensor([split], dtype=torch.int32, device="cuda")
     max_pages = (total_len + PAGE_SIZE - 1) // PAGE_SIZE
     wrong_table = build_page_table([list(range(max_pages))], max_pages, "cuda")
-    wrong = inkling_chunked_prefill_attention(
+    wrong = inkling_prefill_attention(
         q[split:],
         k_cache,
         v_cache,

@@ -521,6 +521,23 @@ def test_nothing_is_salted_when_reuse_is_off(passthrough_base):
     )
 
 
+def test_the_prefill_path_always_reads_the_pages():
+    """One prefill kernel, and it takes the page table. A packed variant used to
+    sit beside it for all-fresh requests, which meant proving the two agreed
+    bit-for-bit at num_cached == 0 forever; the serving-level cost of dropping
+    it did not show up above the baseline's own spread."""
+    import inspect
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import kernels
+
+    params = inspect.signature(kernels.inkling_prefill_attention).parameters
+    for name in ("k_cache", "v_cache", "num_cached", "page_table", "page_size"):
+        assert name in params, f"prefill entry lost its paged argument {name}"
+    assert not hasattr(kernels, "inkling_chunked_prefill_attention"), (
+        "the second prefill kernel is gone; nothing should re-export it"
+    )
+
+
 def test_chunked_prefill_is_supported_and_no_longer_refused():
     """The raise came out once the feature was validated: bit-identical to
     one-shot prefill at the layer level, 63 GPU parity tests, and GSM8K over the
@@ -530,34 +547,6 @@ def test_chunked_prefill_is_supported_and_no_longer_refused():
     )
 
     reject_unsupported_inkling_kv_cache_features(InklingConfig(), enable_block_reuse=False)
-
-
-def test_the_routing_predicate_picks_the_kernel_by_cached_tokens(monkeypatch):
-    """One request with history switches the whole batch, since the batch runs
-    one kernel. The int() coercion is load-bearing: num_cached arrives as a
-    tensor or numpy ints, not python ints."""
-    import torch
-
-    from tensorrt_llm._torch.attention_backend.sparse.inkling.backend import _needs_chunked_context
-
-    monkeypatch.delenv("INKLING_FORCE_CHUNKED_ATTN", raising=False)
-    assert _needs_chunked_context([0, 0, 0]) is False
-    assert _needs_chunked_context([]) is False
-    assert _needs_chunked_context([0, 7, 0]) is True
-    assert _needs_chunked_context(torch.tensor([0, 0])) is False
-    assert _needs_chunked_context(torch.tensor([0, 3])) is True
-
-
-def test_the_force_knob_is_off_by_default_and_test_only(monkeypatch):
-    """It must flip the route, and only when set to exactly 1 -- an unset or
-    stale value must not silently change the production path."""
-    from tensorrt_llm._torch.attention_backend.sparse.inkling.backend import _needs_chunked_context
-
-    monkeypatch.setenv("INKLING_FORCE_CHUNKED_ATTN", "1")
-    assert _needs_chunked_context([0, 0]) is True
-    for value in ("0", "", "true", "yes"):
-        monkeypatch.setenv("INKLING_FORCE_CHUNKED_ATTN", value)
-        assert _needs_chunked_context([0, 0]) is False, value
 
 
 def test_text_geometry():

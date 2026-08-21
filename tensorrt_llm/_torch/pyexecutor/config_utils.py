@@ -203,7 +203,7 @@ def reject_unsupported_inkling_kv_cache_features(
     Neither raises on its own; both emit wrong logits silently.
 
     Chunked prefill is no longer refused: ``_run_context`` routes a request with
-    cached history to ``inkling_chunked_prefill_attention``, which reads the
+    cached history to the one prefill kernel, which reads the
     pages back at absolute positions, and ``has_initial_state`` is derived from
     ``num_cached_tokens_per_seq``.
     """
