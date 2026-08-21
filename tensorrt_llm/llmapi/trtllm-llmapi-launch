@@ -23,6 +23,81 @@ function mpi_world_size {
     fi
 }
 
+# NUMA binding for MGMN worker processes (opt-in via TLLM_NUMA_BIND).
+#
+# On multi-socket hosts (e.g. GB200/GB300 NVL72, Vera+Rubin) the worker must
+# be pinned to the CPUs and memory of the NUMA node its GPU is attached to
+# *before* the process allocates anything: binding later (see
+# llmapi/utils.py::configure_cpu_affinity) cannot relocate pages that were
+# already first-touched on the wrong socket, and threads created before the
+# late binding keep an unconstrained CPU mask. Wrapping the exec with
+# numactl binds the whole process tree from birth.
+#
+#   TLLM_NUMA_BIND=1            auto-detect the GPU's NUMA node via sysfs
+#   TLLM_NUMA_BIND_NODES=a,b,.. explicit NUMA node per node-local rank
+#                               (overrides auto-detection)
+#   unset / other               no binding (default)
+#
+# Pair with TLLM_NUMA_AWARE_WORKER_AFFINITY=0 so configure_cpu_affinity()
+# leaves the external binding in place at engine setup.
+#
+# Fails open: any probe failure logs a warning and runs unbound.
+numa_bind_prefix=()
+function maybe_setup_numa_bind {
+    [ "${TLLM_NUMA_BIND:-0}" = "1" ] || return 0
+    if ! command -v numactl >/dev/null 2>&1; then
+        log_stderr "TLLM_NUMA_BIND: numactl not available, running unbound"
+        return 0
+    fi
+    local local_rank=${SLURM_LOCALID:-${OMPI_COMM_WORLD_LOCAL_RANK:-${MPI_LOCALRANKID:-0}}}
+    local numa_node=""
+    if [ -n "$TLLM_NUMA_BIND_NODES" ]; then
+        IFS=',' read -ra nodes <<< "$TLLM_NUMA_BIND_NODES"
+        numa_node=${nodes[$(( local_rank % ${#nodes[@]} ))]}
+    else
+        # Map node-local rank -> physical GPU (through CUDA_VISIBLE_DEVICES
+        # if set, mirroring base_worker's device_id = rank % device_count),
+        # then GPU PCI address -> NUMA node via sysfs.
+        local phys
+        if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+            IFS=',' read -ra cvd <<< "$CUDA_VISIBLE_DEVICES"
+            phys=${cvd[$(( local_rank % ${#cvd[@]} ))]}
+        else
+            local ngpu
+            ngpu=$(nvidia-smi -L 2>/dev/null | wc -l)
+            if [ "${ngpu:-0}" -eq 0 ]; then
+                log_stderr "TLLM_NUMA_BIND: cannot enumerate GPUs, running unbound"
+                return 0
+            fi
+            phys=$(( local_rank % ngpu ))
+        fi
+        local bdf
+        bdf=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$phys" 2>/dev/null | tr -d ' ' | tr 'A-F' 'a-f')
+        # nvidia-smi reports an 8-hex-digit PCI domain (00000000:19:00.0);
+        # sysfs uses 4 (0000:19:00.0).
+        bdf=${bdf/#0000/}
+        numa_node=$(cat "/sys/bus/pci/devices/${bdf}/numa_node" 2>/dev/null)
+    fi
+    if [ -z "$numa_node" ] || [ "$numa_node" -lt 0 ] 2>/dev/null || \
+       [ ! -d "/sys/devices/system/node/node${numa_node}" ]; then
+        log_stderr "TLLM_NUMA_BIND: no usable NUMA node for local rank ${local_rank} (got '${numa_node}'), running unbound"
+        return 0
+    fi
+    # Probe with progressively weaker policies (containers may lack the
+    # capability for set_mempolicy).
+    local candidate
+    for candidate in "--cpunodebind=${numa_node} --membind=${numa_node}" \
+                     "--cpunodebind=${numa_node}"; do
+        if numactl ${candidate} true 2>/dev/null; then
+            numa_bind_prefix=(numactl ${candidate})
+            log_stderr "TLLM_NUMA_BIND: local rank ${local_rank} -> ${numa_bind_prefix[*]}"
+            return 0
+        fi
+    done
+    log_stderr "TLLM_NUMA_BIND: numactl probe failed for node ${numa_node}, running unbound"
+}
+maybe_setup_numa_bind
+
 function maybe_export_free_tcp_addr_for_spawn_proxy_process {
     # use user specified address if provided
     if [ -n "$TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR" ]; then
@@ -109,7 +184,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 
     log_stderr "Rank${mpi_rank} run mgmn leader node with mpi_world_size: $(mpi_world_size) ..."
     log_stderr "Rank0 host: $HOSTNAME"
-    python3 -m tensorrt_llm.llmapi.mgmn_leader_node
+    "${numa_bind_prefix[@]}" python3 -m tensorrt_llm.llmapi.mgmn_leader_node
     mgmn_leader_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN leader node exit code: $mgmn_leader_node_exit_code"
 
@@ -130,7 +205,7 @@ else
     set +e
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
-    python3 -m tensorrt_llm.llmapi.mgmn_worker_node
+    "${numa_bind_prefix[@]}" python3 -m tensorrt_llm.llmapi.mgmn_worker_node
     mgmn_worker_node_exit_code=$?
     log_stderr "Rank${mpi_rank} MGMN worker node exit code: $mgmn_worker_node_exit_code"
 
