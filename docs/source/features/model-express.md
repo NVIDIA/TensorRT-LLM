@@ -66,10 +66,10 @@ DP, multi-node transfer, and speculative decoding require separate
 qualification rows. Each profile also pins its qualified RoPE realization:
 Llama and Qwen2 require the default fused RoPE path, so unfused RoPE requires
 separate qualification for them, while Qwen3 fuses RoPE into the QK-norm
-kernel and therefore requires realized `rope_fusion=False`. The profiles do
-not constrain MoE-only backend and mapping settings because these dense roots
-do not consume them. `SourceIdentity` still requires donor and receiver
-configurations to match.
+kernel and therefore requires `rope_fusion=False` in the realized
+configuration. The profiles do not constrain MoE-only backend and mapping
+settings because these dense roots do not consume them. `SourceIdentity`
+still requires donor and receiver configurations to match.
 
 ### Adding a Model Family
 
