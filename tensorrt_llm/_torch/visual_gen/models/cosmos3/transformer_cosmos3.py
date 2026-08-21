@@ -513,6 +513,13 @@ class Cosmos3CrossAttention(Attention):
         if model_config.attention.backend == "TRTLLM":
             # TRTLLM backend is not supported for Cosmos3CrossAttention
             model_config.attention.backend = "VANILLA"
+            # Warn once per (module class, requested, resolved) triple so the
+            # fallback is visible without per-module-instance log spam.
+            logger.warning_once(
+                f"{type(self).__name__}: requested attention backend {original_backend} is not "
+                f"supported for Cosmos3 cross-attention; falling back to VANILLA.",
+                key=(type(self).__name__, original_backend, "VANILLA"),
+            )
 
         super().__init__(
             hidden_size=hidden_size,
