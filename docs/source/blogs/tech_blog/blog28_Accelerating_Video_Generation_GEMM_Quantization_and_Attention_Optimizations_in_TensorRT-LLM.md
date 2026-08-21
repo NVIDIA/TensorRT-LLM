@@ -57,9 +57,8 @@ apply model-aware choices such as calibrated scales and keeping sensitive layers
 precision. At the same target format, these algorithmic choices generally preserve accuracy
 better than quantizing every eligible layer dynamically at load time. This distinction describes
 how weights are prepared; activations are quantized as the model runs. The FP8 blockwise and
-NVFP4 results below dynamically quantize eligible BF16 weights at load time. The ModelOpt
-metadata stored with the checkpoint calibrates Skip Softmax; it does not prequantize those
-weights. NVFP4 pushes precision lower for more throughput.
+NVFP4 results below dynamically quantize eligible BF16 weights at load time. NVFP4 pushes
+precision lower for more throughput.
 
 ## Attention Optimizations
 
