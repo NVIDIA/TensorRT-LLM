@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Set up error handling
 set -xEeuo pipefail
@@ -79,30 +93,44 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
+# Use unified run_tests.py for test execution, rerun, and result merging
+runTestsScript="$llmSrcNode/jenkins/scripts/run_tests.py"
+
+# Build the run_tests.py arguments array for proper quoting
+runTestsArgs=(
+    python3 "$runTestsScript"
+    --render
+    --test-db-list "$testListPathNode"
+    --splits "${testSplits:-1}"
+    --group "${testGroup:-1}"
+    --pytest-base-cmd "$pytestCommand"
+    --stage-name "$stageName"
+    --output-dir "$jobWorkspace"
+    --working-dir "$llmSrcNode/tests/integration/defs"
+    --fail-signatures "${failSignaturesList:-}"
+    --max-rerun-tests 5
+)
+if [ -n "${testDurationsPath:-}" ]; then
+    runTestsArgs+=(--durations-path "$testDurationsPath")
+fi
+if [ "$perfMode" = "true" ]; then
+    runTestsArgs+=(--perf-mode)
+fi
+
+# For multi-node runs, wrap run_tests.py with the MPI launcher so that
+# worker nodes stay alive across all pytest invocations (regular, isolated,
+# rerun).  The launcher ensures rank 0 executes run_tests.py while workers
+# run mgmn_worker_node for the entire duration.
+if [ -n "${pytestUtil:-}" ] && [ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]; then
+    echo "Multi-node mode: wrapping run_tests.py with $pytestUtil"
+    "$pytestUtil" "${runTestsArgs[@]}"
+else
+    "${runTestsArgs[@]}"
+fi
 pytest_exit_code=$?
-echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
+echo "Rank${SLURM_PROCID} run_tests.py finished execution with exit code $pytest_exit_code"
 python3 "$llmSrcNode/tests/test_common/s3_output.py" \
     --drain-spool "$jobWorkspace" || true
-
-# DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
-# Remove this after the issue is resolved
-if [ $pytest_exit_code -eq 4 ]; then
-    echo "DEBUG: Pytest failed with usage error (exit code 4)"
-    echo "DEBUG: Directory state at $(pwd):"
-    ls -l
-    echo "DEBUG: Directory state at $llmSrcNode/tests/integration/defs:"
-    ls -l $llmSrcNode/tests/integration/defs
-
-    echo "DEBUG: conftest.py content:"
-    md5sum $llmSrcNode/tests/integration/defs/conftest.py
-
-    echo "DEBUG: pytest.ini content:"
-    md5sum $llmSrcNode/tests/integration/defs/pytest.ini
-
-    echo "DEBUG: Check importability of conftest.py"
-    python3 -c "import sys; sys.path.insert(0, '.'); import conftest; print('DEBUG: conftest imported successfully')"
-fi
 
 if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
     # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.

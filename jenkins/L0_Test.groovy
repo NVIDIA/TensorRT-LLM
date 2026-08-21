@@ -409,6 +409,14 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
             downloadResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
 
+            // Also download the merged rerun report XML when run_tests.py emits it.
+            // The collectTestResults "Rerun Report" stage globs '*/rerun_results.xml' across
+            // every stage tarball, and the glob above (results*.xml) does NOT match
+            // 'rerun_results.xml'. Without this extra scp, sbatch-based stages drop out of
+            // the cross-stage rerun report.
+            def rerunResultsPath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/rerun_results.xml"
+            Utils.exec(pipeline, script: scpFromRemoteCmd(remote, rerunResultsPath, "${stageName}/"), returnStatus: true, numRetries: 1)
+
             // Download perf test results
             def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
             def folderListOutput = Utils.exec(
@@ -1636,7 +1644,10 @@ def getPytestBaseCommandLine(
         testCmdLine += ["--run-ray"]
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
-    testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
+    testCmdLine += ["--unittest-markexpr=\"${unittestMarkExpr}\""]
+    if (ENABLE_UPLOAD_TEST_RESULTS) {
+        testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
+    }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -1882,25 +1893,24 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 )
 
                 // Generate Pytest command
+                // NOTE: the launcher (trtllm-llmapi-launch) is NOT included in
+                // pytestCommand.  For multi-node, slurm_run.sh wraps run_tests.py
+                // itself with the launcher so that MPI worker nodes stay alive
+                // across all pytest invocations (regular, isolated, rerun).
                 String pytestUtil = ""
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
                 def uploadPath = "${env.JOB_NAME}/${env.BUILD_NUMBER}"
 
-                def clusterDurationsArgsNode = []
+                def clusterDurationsPathNode = ""
                 if (useClusterDurations) {
                     def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
-                    def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
-                    clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                    clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
                 }
-                def extraArgs = [
-                    "--test-list=$testListPathNode",
-                    "--splitting-algorithm least_duration",
-                    "--splits $splits",
-                    "--group $splitId",
-                    *clusterDurationsArgsNode,
-                ]
+                // test-list/splits/group/durations are now handled by run_tests.py;
+                // only pass S3 upload args as part of the pytest base command.
+                def extraArgs = []
                 if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
                     extraArgs += [
                         "--capture=fd",
@@ -1915,9 +1925,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     perfMode,
                     jobWorkspace,
                     "$jobWorkspace/.coveragerc",
-                    pytestUtil,
-                    extraArgs,
+                    "",  // pytestUtil excluded — launcher wraps run_tests.py instead
+                    extraArgs,  // test-list/splits/group handled by run_tests.py
                 ).join(" ")
+                def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE
@@ -2071,6 +2082,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
+                // Escape pytestCommand for embedding inside bash double-quoted export.
+                // --unittest-markexpr="not cpu_only" contains inner double quotes that
+                // would prematurely close the outer "..." and cause an export error.
+                def safePytestCmd = pytestCommand
+                    .replace('\\', '\\\\')
+                    .replace('"', '\\"')
+
                 def scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
@@ -2092,8 +2110,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export stageName=$stageName
                     export perfMode=$perfMode
                     export resourcePathNode=$resourcePathNode
-                    export pytestCommand="$pytestCommand"
+                    export pytestCommand="$safePytestCmd"
                     export coverageConfigFile="$coverageConfigFile"
+                    export testListPathNode="$testListPathNode"
+                    export testSplits="$splits"
+                    export testGroup="$splitId"
+                    export failSignaturesList="$failSignaturesList"
+                    export pytestUtil="$pytestUtil"
+                    export testDurationsPath="$clusterDurationsPathNode"
                     export HF_TOKEN=$HF_TOKEN
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
@@ -4814,23 +4838,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
     stage ("[${stageName}] Run Pytest")
     {
-        def noRegularTests = false
-        def noIsolateTests = false
-        def rerunFailed = false
-
         // When useClusterDurations is set, use a per-cluster durations file keyed on
         // partition.clusterName (e.g. "oci-hsg", "dlcluster").  This lets each cluster
         // build its own timing baseline so sharding is not skewed by timings collected
         // on different hardware.  Falls back to the shared .test_durations when unset.
-        def clusterDurationsArgs = []
-        def clusterDurationsPath = ""
         String clusterNameForDurations = null
+        def clusterDurationsPath = ""
         if (useClusterDurations) {
             def partition = SlurmConfig.resolvePlatform(platform)
             def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
             clusterNameForDurations = clusterKey
             clusterDurationsPath = "${llmSrc}/tests/integration/defs/.test_durations_${clusterKey}"
-            clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
         }
 
         def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
@@ -4842,9 +4860,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (testFilter[(REUSE_TEST)] != false) {
             reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt", postTag)
         }
-
-        // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode, clusterDurationsPath)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -4874,10 +4889,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
         def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
 
-        // Some clusters do not allow dmesg -C so we add || true
-        // Temporarily disable to reduce the log size
-        // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
-        def extraArgs = [*clusterDurationsArgs]
+        // clusterDurationsArgs removed — --durations-path is now passed directly to run_tests.py.
+        // Only S3 upload args remain in extraArgs for the pytest base command.
+        def extraArgs = []
         if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
             extraArgs += [
                 "--capture=fd",
@@ -4893,15 +4907,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "${WORKSPACE}/${stageName}",
             coverageConfigFile,
             "",  // pytestUtil
-            extraArgs,  // extraArgs
+            extraArgs,  // S3 upload args; test-list/durations handled by run_tests.py
             containerPortStart,
             containerPortNum
         )
-
-        // Only add --test-list if there are regular tests to run
-        if (preprocessedLists.regularCount > 0) {
-            pytestCommand += ["--test-list=${preprocessedLists.regular}"]
-        }
 
         def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
         def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
@@ -4917,67 +4926,39 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
-                try {
-                    try {
-                        if (preprocessedLists.regularCount > 0) {
-                            sh """
-                                rm -rf ${stageName}/ && \
-                                cd ${llmSrc}/tests/integration/defs && \
-                                ${pytestCommand.join(" ")}
-                            """
-                        } else {
-                            echo "No regular tests to run for stage ${stageName}"
-                            noRegularTests = true
-                            sh "mkdir -p ${stageName}"
-                            // Create an empty results.xml file for consistency
-                            sh """
-                                echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
-                                echo '<testsuites>' >> ${stageName}/results.xml
-                                echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
-                                echo '</testsuite>' >> ${stageName}/results.xml
-                                echo '</testsuites>' >> ${stageName}/results.xml
-                            """
-                        }
-                    } catch (InterruptedException e) {
-                        throw e
-                    } catch (Exception e) {
-                        def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
-                        if (isRerunFailed) {
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Regular tests failed after rerun attempt"
-                            }
-                            rerunFailed = true
-                        } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
-                            // Rerun passed but the first run had a timeout: mark this
-                            // stage FAILURE so "[${stageName}] Run Pytest" turns red,
-                            // not just the enclosing parent stage.
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Some tests terminated unexpectedly, please check the test report."
-                            }
-                        }
-                    }
 
-                    // Run the isolated tests if exists
-                    if (preprocessedLists.isolateCount > 0) {
-                        stage ("[${stageName}] Run Pytest (Isolated)") {
-                            echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                            rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
-                        }
-                    } else {
-                        echo "No isolated tests to run for stage ${stageName}"
-                        noIsolateTests = true
-                    }
+                // Build fail signatures list for rerun eligibility
+                def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
-                    if (noRegularTests && noIsolateTests) {
-                        error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
-                    }
-                } finally {
-                    if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
-                        sh """
-                            python3 ${llmSrc}/tests/test_common/s3_output.py \
-                                --drain-spool "${WORKSPACE}/${stageName}" || true
-                        """
-                    }
+                // Use unified run_tests.py for render + regular + isolated + rerun + merge.
+                // catchError lets execution continue to the report-upload and timeout-XML steps
+                // below even when run_tests.py exits non-zero (test failures), preserving the
+                // same behaviour as main where those steps ran inside a catch block before the
+                // terminal error.
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    sh """
+                        rm -rf ${stageName}/ && \
+                        cd ${llmSrc}/tests/integration/defs && \
+                        python3 ${llmSrc}/jenkins/scripts/run_tests.py \
+                            --render \
+                            --test-db-list ${testDBList} \
+                            --splits ${splits} \
+                            --group ${splitId} \
+                            ${perfMode ? '--perf-mode' : ''} \
+                            --pytest-base-cmd '${pytestCommand.join(" ")}' \
+                            --stage-name ${stageName} \
+                            --output-dir ${WORKSPACE}/${stageName} \
+                            --working-dir ${llmSrc}/tests/integration/defs \
+                            --fail-signatures '${failSignaturesList}' \
+                            --max-rerun-tests 5 \
+                            ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
+                    """
+                }
+                if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
+                    sh """
+                        python3 ${llmSrc}/tests/test_common/s3_output.py \
+                            --drain-spool "${WORKSPACE}/${stageName}" || true
+                    """
                 }
             }
 
@@ -4991,15 +4972,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        // Generate comprehensive rerun report if any reruns occurred
-        stage ("Generate Report") {
-            timeout(time: 15, unit: 'MINUTES'){
-                generateRerunReport(stageName, llmSrc)
-            }
-        }
-
-        if (rerunFailed) {
-            error "Some tests still failed after rerun attempts, please check the test report."
+        // Upload rerun report if generated by run_tests.py
+        if (fileExists("${WORKSPACE}/${stageName}/rerun_results.html")) {
+            trtllm_utils.uploadArtifacts(
+                "${WORKSPACE}/${stageName}/rerun_results.html",
+                "${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
+            )
+            echo "Test rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/rerun_reports/${stageName}_rerun_results.html"
         }
 
         if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
