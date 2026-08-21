@@ -299,6 +299,7 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
 class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
+    MTP_MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-26B-A4B-it-assistant"
     EXTRA_EVALUATOR_KWARGS = {
         "chat_template_kwargs": {"enable_thinking": False},
     }
@@ -323,6 +324,14 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
             max_batch_size=16,
             kv_cache_config=self.kv_cache_config,
             enable_chunked_prefill=True,
+            # Shared-KV MTP overlap can expose too few FlashInfer pages and cause an illegal access
+            # in `AppendPagedKVCache`. Re-enable this after the overlap-MTP KV accounting fix lands.
+            disable_overlap_scheduler=True,
+            speculative_config=MTPDecodingConfig(
+                max_draft_len=3,
+                mtp_eagle_one_model=True,
+                speculative_model=self.MTP_MODEL_PATH,
+            ),
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
@@ -545,6 +554,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
         preserve_caller_max_tokens=True,
     )
 
+    @pytest.mark.timeout(7200)
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(183000)
@@ -605,6 +615,9 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
             kv_cache_config=kv_cache_config,
             enable_chunked_prefill=True,
             max_num_tokens=max_num_tokens,
+            # Size the independent encoder budget for MMMU multi-image requests, whose aggregate
+            # resident encoder output can exceed the model's largest individual image.
+            encoder_max_num_tokens=32_768,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)

@@ -16,7 +16,7 @@
 import os
 import weakref
 from abc import abstractmethod
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union, final
 
 import torch
@@ -89,22 +89,6 @@ class MoEWeightLoadingMode(Enum):
     FUSED_GATE_UP_PROJ = 1
     # Custom W4A8 weights from examples/quantization/quantize_mixed_precision_moe.py
     W4A8_CUSTOM = 2
-
-
-# The type of alltoall method
-class AlltoallMethodType(IntEnum):
-    # Not available
-    NotEnabled = 0
-    # NVLink One-Sided
-    NVLinkOneSided = 1
-    # NVLink Two-Sided
-    NVLinkTwoSided = 2
-    # DeepEP intranode or internode: CUDA Graphs are supported, IBGDA is required by internode
-    DeepEP = 3
-    # DeepEP low latency: CUDA Graphs are supported, IBGDA is required
-    DeepEPLowLatency = 4
-    # NCCL EP: Low-latency expert parallelism via NCCL EP library
-    NcclEP = 5
 
 
 class MoESchedulerKind(Enum):
