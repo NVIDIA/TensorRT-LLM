@@ -175,11 +175,7 @@ def run_msa_paged_gqa(
     )
     ported = msa_ported_decode_active(metadata)
     nvfp4_predicate = getattr(kv_cache_manager, "is_nvfp4_layer", None)
-    layer_uses_nvfp4 = (
-        bool(nvfp4_predicate(layer_idx))
-        if nvfp4_predicate is not None
-        else bool(getattr(metadata, "_msa_main_kv_is_nvfp4", lambda: False)())
-    )
+    layer_uses_nvfp4 = nvfp4_predicate is not None and bool(nvfp4_predicate(layer_idx))
     if layer_uses_nvfp4:
         if kv_scale_orig_quant is None or kv_scale_quant_orig is None:
             raise RuntimeError(

@@ -1221,7 +1221,6 @@ def _nvfp4_dispatch_fixture(
     metadata = SimpleNamespace(
         kv_cache_manager=manager,
         _msa_prewritten_layer=3,
-        _msa_main_kv_is_nvfp4=lambda: True,
         msa_decode_query_len=decode_query_len,
         msa_decode_span=span,
         msa_block_table=torch.zeros(batch, 4, dtype=torch.int32),

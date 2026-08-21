@@ -916,31 +916,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
         return flat, scale
 
-    def get_kv_scale_subpage_pool(
-        self, layer_idx: int, kv_layout: str = "HND"
-    ) -> Tuple[torch.Tensor, int]:
-        """Return the flat NVFP4 scale pool paired with ``get_kv_subpage_pool``.
-
-        The returned factor must match the packed-data factor so one K/V block
-        table addresses both pools. Token-size subdivision, when needed by the
-        Eagle draft view, is expressed by that view's expanded block table.
-        """
-        addr_key, torch_dtype, num_slots, scale, page_shape = self._kv_scale_slot_geometry(
-            layer_idx, kv_layout
-        )
-        _data_addr, _data_dtype, data_slots, data_scale, _data_shape = self._kv_slot_geometry(
-            layer_idx, kv_layout
-        )
-        assert (num_slots, scale) == (data_slots, data_scale), (
-            "MiniMaxM3 NVFP4 data and scale pools require identical page-index "
-            f"geometry; data={(data_slots, data_scale)} scale={(num_slots, scale)}."
-        )
-        num_subpages = (num_slots - 1) * scale + 2
-        flat = convert_to_torch_tensor(
-            TensorWrapper(addr_key, torch_dtype, [num_subpages, *page_shape])
-        )
-        return flat, scale
-
     def _kv_pool_mapping_offset(self, layer_id, layer_group_id, key_base_addr) -> int:
         """Pool-mapping offset from the layer's physical position in its pool.
 
