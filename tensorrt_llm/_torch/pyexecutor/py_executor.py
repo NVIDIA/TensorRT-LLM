@@ -3814,8 +3814,18 @@ class PyExecutor:
                 and not self._is_disagg_gen_only_no_context_benchmark()):
             return
 
-        local_need_gen_check = (uses_async_gen_transfer and local_needs_progress
-                                and wait_for_disagg_gen_transfer_progress)
+        # An in-flight receive must vote too, not just admission-budget
+        # pressure. The context wait is a no-op for a receive-only worker:
+        # check_context_transfer_status() returns on `not
+        # _ever_had_send_session` *above* its poll, so it never sleeps. Such a
+        # worker would spin the scheduler loop and starve the GIL from the
+        # transfer threads that alone finish the receive it is waiting on,
+        # whereas the generation wait does reach its poll interval.
+        local_need_gen_check = (
+            uses_async_gen_transfer and local_needs_progress
+            and (wait_for_disagg_gen_transfer_progress
+                 or any(req.is_disagg_generation_transmission_in_progress
+                        for req in self.active_requests)))
 
         any_need_gen_check = self._sync_disagg_gen_status_entry(
             local_need_gen_check)
@@ -3823,7 +3833,8 @@ class PyExecutor:
             if local_need_gen_check:
                 logger.debug(
                     "Waiting for generation KV cache transfer progress to "
-                    "free disagg admission budget")
+                    "complete an in-flight receive or free disagg admission "
+                    "budget")
             self._check_disagg_gen_cache_transfer_status(1)
             return
 
@@ -6858,6 +6869,38 @@ class PyExecutor:
                             requests=error_requests,
                             charge_budget=False)
 
+    # How much of kv_transfer_timeout_ms a context send may spend waiting for
+    # its generation peer to ask for the data before the deadline stops being
+    # rebased.  The peer arrives late for a structural reason (generation
+    # max_batch_size below the offered concurrency), so the wait must be
+    # tolerated -- but a peer that never asks has to stay reclaimable, since
+    # this deadline is the only path that ends such a transfer.  3x covers the
+    # measured peer-wait spread on the 8K/512 stress run (max 182.7s) and lands
+    # at the disaggregated router's own req_timeout_secs=180 default, past
+    # which no peer will ask.
+    _CTX_PEER_WAIT_TIMEOUT_MULTIPLIER = 3
+
+    def _context_transfer_peer_wait_is_within_ceiling(
+            self, req: LlmRequest, current_time: float,
+            ceiling_ms: float) -> bool:
+        """Whether a context send may keep rebasing its transfer deadline.
+
+        The clock is stamped when the send session is created, but the write
+        only starts once the peer requests the data, so charging the peer wait
+        to the transfer times out transfers that never got to run.  The local
+        stamps are checked first: the transceiver query walks per-request peer
+        bookkeeping under a lock, and a request past the ceiling cannot be
+        rebased regardless of what it reports.
+        """
+        if req.py_kv_transfer_peer_wait_start is None:
+            return False
+        peer_wait_ms = (current_time -
+                        req.py_kv_transfer_peer_wait_start) * 1000
+        if peer_wait_ms > ceiling_ms:
+            return False
+        return self.kv_cache_transceiver.context_transfer_is_waiting_for_peer(
+            req)
+
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
@@ -6866,8 +6909,10 @@ class PyExecutor:
         if timeout_ms is None:
             return
 
+        current_time = time.monotonic()
+        peer_wait_ceiling_ms = timeout_ms * self._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER
+
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
-            current_time = time.monotonic()
             if req.py_kv_transfer_start_time is None:
                 return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
@@ -6882,6 +6927,10 @@ class PyExecutor:
                 req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
+            if self._context_transfer_peer_wait_is_within_ceiling(
+                    req, current_time, peer_wait_ceiling_ms):
+                req.py_kv_transfer_start_time = current_time
+                continue
             flag_if_kv_transfer_timed_out(req, "context")
 
         for req in self.active_requests:
@@ -7335,6 +7384,7 @@ class PyExecutor:
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
                 req.py_kv_transfer_start_time = None
+                req.py_kv_transfer_peer_wait_start = None
                 req.py_kv_transfer_timed_out = False
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
@@ -7579,7 +7629,9 @@ class PyExecutor:
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-                        req.py_kv_transfer_start_time = time.monotonic()
+                        transfer_start = time.monotonic()
+                        req.py_kv_transfer_start_time = transfer_start
+                        req.py_kv_transfer_peer_wait_start = transfer_start
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -7679,6 +7731,7 @@ class PyExecutor:
                 # cancellation is disabled: a queued transfer that can be
                 # cancelled is immediately released from the async manager.
                 request.py_kv_transfer_start_time = None
+                request.py_kv_transfer_peer_wait_start = None
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
                 self._end_transfer_and_maybe_terminate(request)
 

@@ -971,6 +971,7 @@ class TestDisaggTransferIdleProgress:
 
     def test_polls_generation_transfer_when_admission_blocked(self):
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
@@ -988,6 +989,7 @@ class TestDisaggTransferIdleProgress:
 
     def test_peer_rank_enters_bounded_progress_poll(self):
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
         executor.dist.allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
@@ -1007,6 +1009,7 @@ class TestDisaggTransferIdleProgress:
 
     def test_falls_back_to_context_transfer_when_not_generation_blocked(self):
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
@@ -1022,11 +1025,40 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
+    @pytest.mark.parametrize("in_flight", [True, False])
+    def test_inflight_gen_receive_routes_idle_wait_to_generation(self, in_flight):
+        """An in-flight receive alone must select the generation wait.
+
+        The context wait never sleeps for a receive-only worker, so routing
+        there would spin and starve the transfer threads finishing the receive.
+        """
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=in_flight)]
+        executor.dist = Mock(tp_size=1)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        if in_flight:
+            executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+            executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        else:
+            executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+            executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+
     def test_gen_only_no_context_benchmark_polls_context_when_idle(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
         executor.dist.allreduce.return_value = 0
         executor.dist.tp_allreduce.return_value = 1
@@ -1167,6 +1199,7 @@ class TestDisaggTransferIdleProgress:
 
     def test_peer_cp_rank_enters_context_progress_poll(self):
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
         executor.dist.allreduce.return_value = 0
         executor.dist.tp_cp_allgather.return_value = [0, 1, 0, 0]
@@ -1184,6 +1217,89 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
         executor.dist.tp_cp_allgather.assert_called_once_with(0)
+
+
+class TestContextKvTransferTimeoutClock:
+    """The context transfer deadline must measure the transfer, not the peer wait."""
+
+    TIMEOUT_MS = 60000
+
+    @classmethod
+    def _make_executor(cls, waiting_for_peer, elapsed_s, peer_wait_elapsed_s=None):
+        executor = object.__new__(PyExecutor)
+        started = time.monotonic() - elapsed_s
+        peer_wait_start = (
+            started if peer_wait_elapsed_s is None else time.monotonic() - peer_wait_elapsed_s
+        )
+        req = types.SimpleNamespace(
+            py_request_id=7,
+            py_kv_transfer_start_time=started,
+            py_kv_transfer_peer_wait_start=peer_wait_start,
+            py_kv_transfer_timed_out=False,
+            is_disagg_generation_transmission_in_progress=False,
+        )
+        executor.kv_cache_transceiver = Mock(
+            kv_transfer_timeout_ms=cls.TIMEOUT_MS,
+            **{"context_transfer_is_waiting_for_peer.return_value": waiting_for_peer},
+        )
+        executor.async_transfer_manager = Mock(**{"requests_in_transfer.return_value": {7: req}})
+        executor.active_requests = []
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        return executor, req
+
+    def test_peer_wait_does_not_trip_the_deadline(self):
+        executor, req = self._make_executor(waiting_for_peer=True, elapsed_s=120)
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert not req.py_kv_transfer_timed_out
+        # Rebased, so the next check starts from the moment the write can begin.
+        assert (time.monotonic() - req.py_kv_transfer_start_time) < 1
+
+    def test_stalled_transfer_still_trips_the_deadline(self):
+        """Rebasing must not become a way to never time out."""
+        executor, req = self._make_executor(waiting_for_peer=False, elapsed_s=120)
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert req.py_kv_transfer_timed_out
+
+    def test_transfer_inside_budget_is_not_flagged(self):
+        executor, req = self._make_executor(waiting_for_peer=False, elapsed_s=5)
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert not req.py_kv_transfer_timed_out
+
+    def test_peer_that_never_asks_eventually_times_out(self):
+        """A peer that never sends REQUEST_DATA must stay reclaimable.
+
+        This deadline is the only path that ends such a transfer, so an
+        unbounded rebase would pin its KV pages for the process lifetime.
+        """
+        ceiling_ms = self.TIMEOUT_MS * PyExecutor._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER
+        executor, req = self._make_executor(
+            waiting_for_peer=True,
+            elapsed_s=120,
+            peer_wait_elapsed_s=ceiling_ms / 1000 + 1,
+        )
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert req.py_kv_transfer_timed_out
+
+    def test_peer_wait_rebases_repeatedly_below_the_ceiling(self):
+        """Repeated checks while waiting must not accumulate toward the deadline."""
+        executor, req = self._make_executor(
+            waiting_for_peer=True, elapsed_s=120, peer_wait_elapsed_s=30
+        )
+
+        for _ in range(5):
+            PyExecutor._check_kv_transfer_timeout(executor)
+            assert not req.py_kv_transfer_timed_out
+
+        # The peer-wait origin is never rebased, so the ceiling still applies.
+        assert (time.monotonic() - req.py_kv_transfer_peer_wait_start) >= 30
 
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
