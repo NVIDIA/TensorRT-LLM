@@ -19,8 +19,11 @@ import os
 import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import (
-    MODEL_TYPE_TO_REASONING_PARSER, NemotronV3ReasoningParser,
-    ReasoningParserFactory, resolve_auto_reasoning_parser)
+    MODEL_TYPE_TO_REASONING_PARSER,
+    NemotronV3ReasoningParser,
+    ReasoningParserFactory,
+    resolve_auto_reasoning_parser,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -242,8 +245,9 @@ def test_kimi_k2_reasoning_parser_stream(delta_texts: list, content: list,
         result = reasoning_parser.parse_delta(delta_text)
         assert result.content == content[i], \
             f"Step {i}: delta={delta_text!r}, expected content={content[i]!r}, got {result.content!r}"
-        assert result.reasoning_content == reasoning_context[i], \
-            f"Step {i}: delta={delta_text!r}, expected reasoning={reasoning_context[i]!r}, got {result.reasoning_content!r}"
+        assert result.reasoning_content == reasoning_context[i], (
+            f"Step {i}: delta={delta_text!r}, expected reasoning="
+            f"{reasoning_context[i]!r}, got {result.reasoning_content!r}")
 
 
 @pytest.mark.parametrize(
@@ -315,8 +319,9 @@ def test_interleaved_thinking_stream(parser_name: str, delta_texts: list,
         result = reasoning_parser.parse_delta(delta_text)
         assert result.content == content[i], \
             f"Step {i}: delta={delta_text!r}, expected content={content[i]!r}, got {result.content!r}"
-        assert result.reasoning_content == reasoning_context[i], \
-            f"Step {i}: delta={delta_text!r}, expected reasoning={reasoning_context[i]!r}, got {result.reasoning_content!r}"
+        assert result.reasoning_content == reasoning_context[i], (
+            f"Step {i}: delta={delta_text!r}, expected reasoning="
+            f"{reasoning_context[i]!r}, got {result.reasoning_content!r}")
 
 
 @pytest.mark.parametrize(("text", "content", "reasoning_context"), [
@@ -825,12 +830,26 @@ def _write_tokenizer_config(model_dir: str, chat_template: str):
         json.dump({"chat_template": chat_template}, f)
 
 
-# Hybrid Qwen3: chat template contains "enable_thinking" → use "qwen3" parser
+# Hybrid Qwen3 (e.g. Qwen3-235B-A22B): chat template contains "enable_thinking"
+# and only special-cases the explicit "false" override, injecting a matched
+# `<think>\n\n</think>\n\n` pair. Left unset (the default), nothing is
+# injected and the model opens/closes `<think>` itself → use "qwen3" parser.
 _HYBRID_TEMPLATE = (
-    "{%- if enable_thinking is not defined %}{% set enable_thinking = true %}"
-    "{% endif %}{%- if add_generation_prompt %}{%- if enable_thinking %}"
-    "{{- '<|im_start|>assistant\\n<think>\\n' }}{%- else %}"
-    "{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}"
+    "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}"
+    "{%- if enable_thinking is defined and enable_thinking is false %}"
+    "{{- '<think>\\n\\n</think>\\n\\n' }}"
+    "{%- endif %}{%- endif %}")
+
+# Hybrid Qwen3.5-style: same "enable_thinking is false" override as above,
+# but with an `else` branch that unconditionally prefills a bare, unmatched
+# `<think>\n` when the flag is left unset (the default) → model output starts
+# already inside the reasoning span, so this needs a `reasoning_at_start=True`
+# parser ("qwen3_5") instead of "qwen3" (NVIDIA/TensorRT-LLM#18083).
+_HYBRID_PREFILLS_THINK_TEMPLATE = (
+    "{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}"
+    "{%- if enable_thinking is defined and enable_thinking is false %}"
+    "{{- '<think>\\n\\n</think>\\n\\n' }}"
+    "{%- else %}{{- '<think>\\n' }}"
     "{%- endif %}{%- endif %}")
 
 # Forced-thinking Qwen3: no "enable_thinking" but has "<think>" → "deepseek-r1"
@@ -853,6 +872,23 @@ def test_auto_detect_qwen3_hybrid(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "qwen3"
+
+
+def test_auto_detect_qwen3_hybrid_prefills_think_by_default(tmp_path):
+    """Hybrid Qwen3.5-style model whose template prefills '<think>' by default.
+
+    → 'qwen3_5' parser (reasoning_at_start=True), not 'qwen3'
+    (reasoning_at_start=False), since model output already starts inside the
+    reasoning span with no opening tag to search for
+    (NVIDIA/TensorRT-LLM#18083).
+    """
+    model_dir = str(tmp_path / "Qwen3.5-397B-A17B")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "qwen3_5_moe")
+    _write_tokenizer_config(model_dir, _HYBRID_PREFILLS_THINK_TEMPLATE)
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "qwen3_5"
 
 
 def test_auto_detect_qwen3_forced_thinking(tmp_path):
@@ -1190,8 +1226,9 @@ def test_kimi_k3_reasoning_parser_stream(delta_texts: list, content: list,
         result = parser.parse_delta(delta_text)
         assert result.content == content[i], \
             f"Step {i}: delta={delta_text!r}, expected content={content[i]!r}, got {result.content!r}"
-        assert result.reasoning_content == reasoning_content[i], \
-            f"Step {i}: delta={delta_text!r}, expected reasoning={reasoning_content[i]!r}, got {result.reasoning_content!r}"
+        assert result.reasoning_content == reasoning_content[i], (
+            f"Step {i}: delta={delta_text!r}, expected reasoning="
+            f"{reasoning_content[i]!r}, got {result.reasoning_content!r}")
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 3, 7])
