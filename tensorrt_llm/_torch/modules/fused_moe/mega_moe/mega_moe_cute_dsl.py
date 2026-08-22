@@ -138,7 +138,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
     by ``kernel_fc12.py``, and the async-copy helpers used by
     ``dispatch_kernel.py``. PR
     https://github.com/NVIDIA/TensorRT-LLM/pull/14354 pins
-    ``nvidia-cutlass-dsl[cu13]==4.6.1``; version 4.5.0 was the first release
+    ``nvidia-cutlass-dsl[cu13]==4.6.2``; version 4.5.0 was the first release
     that shipped all of them, and older wheels return ``(False, reason)``.
 
     Returns ``(True, None)`` on success or ``(False, reason)`` with an
