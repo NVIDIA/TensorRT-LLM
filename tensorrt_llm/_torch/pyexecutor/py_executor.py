@@ -8723,6 +8723,37 @@ class PyExecutor:
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
 
+    def recompute_active_requests(self) -> None:
+        """Discard live request caches so they are rebuilt with current weights.
+
+        This method is intended to run inside :meth:`control_action` after a
+        non-draining weight update. A prefix-cache reset alone is insufficient:
+        active requests still own KV and recurrent-state caches computed with
+        the previous weights, and completing those requests can register stale
+        blocks in the reuse pool after the reset.
+
+        Preserve already generated tokens by pausing each request. The normal
+        scheduler then treats those tokens as context and prefills them again
+        before decoding resumes.
+        """
+        print(
+            "TRTLLM_RECOMPUTE_ACTIVE_REQUESTS_CALLED "
+            f"active_requests={len(self.active_requests)}",
+            flush=True,
+        )
+        # The overlap loop can have one completed GPU batch whose sampled tokens
+        # have not yet been applied to the requests. Consume it before freeing
+        # its cache resources or the loop would later access released entries.
+        self._consume_previous_batch_for_rebalance()
+
+        requests_to_recompute = list(self.active_requests)
+        self._terminate_requests(requests_to_recompute)
+        self._pause_requests(requests_to_recompute)
+
+        # free_resources() may register old-weight blocks for reuse. Clear the
+        # reuse tree only after every active request has released its caches.
+        self.reset_prefix_cache()
+
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
             failed_requests: Optional[List[Tuple[int, str]]]):
