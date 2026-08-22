@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import KeysView
 from dataclasses import dataclass
@@ -177,9 +178,12 @@ class BaseReasoningParser(ABC):
         raise NotImplementedError
 
     def finish(self) -> ReasoningParserResult:
-        """Called when the stream ends. Subclasses may override to flush
-        buffered state or reclassify accumulated content. The default
-        implementation returns an empty result."""
+        """Called when the stream ends.
+
+        Subclasses may override to flush buffered state or reclassify
+        accumulated content. The default implementation returns an empty
+        result.
+        """
         return ReasoningParserResult()
 
 
@@ -210,9 +214,9 @@ class IdentityReasoningParser(BaseReasoningParser):
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
-    """
-    Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
-    Since the latest official tokenizer_config.json initially adds "<think>\\n" at the end of the prompt
+    r"""Reasoning parser for DeepSeek-R1. Reasoning format: <think>(.*)</think>.
+
+    Since the latest official tokenizer_config.json initially adds "<think>\n" at the end of the prompt
     (https://huggingface.co/deepseek-ai/DeepSeek-R1/blob/main/tokenizer_config.json),
     treat all the text before the </think> tag as `reasoning_content` and the text after as `content`.
     """
@@ -463,13 +467,58 @@ _QWEN3_MODEL_TYPES = frozenset({
 })
 
 
+# Matches a hybrid Qwen3-family template whose *default* (i.e.
+# `enable_thinking` left unset) branch prefills a bare, unmatched `<think>`
+# opening marker into the generation prompt.
+#
+# Both the classic Qwen3 hybrid template and the Qwen3.5 hybrid template
+# special-case only the explicit `enable_thinking is false` branch, which
+# injects a self-closed pair: `<think>\n\n</think>\n\n`. They differ in what
+# happens otherwise (undefined, or explicitly true):
+# - Classic Qwen3 has no `else`: nothing is injected, so the model opens and
+#   closes `<think>` itself. Model output starts at the very beginning of the
+#   assistant turn, which is exactly what `reasoning_at_start=False` expects.
+# - Qwen3.5 adds an `else` branch that unconditionally injects the bare
+#   opening `{{- '<think>\n' }}` with no matching close. Model output then
+#   starts *inside* the reasoning span, which needs `reasoning_at_start=True`.
+#
+# Whitespace in the template source (indentation, `{%- ... -%}` chomp
+# markers) is irrelevant to Jinja's rendered output, so it is stripped before
+# matching. The two `.{0,N}` gaps tolerate the operand order of the `is
+# defined and ... is false` conjunction and minor spacing around the tags.
+_QWEN3_PREFILLS_THINK_BY_DEFAULT_RE = re.compile(
+    r"enable_thinking.{0,80}isfalse.{0,150}?else-?%\}\{\{-?(['\"])<think>\\n\1"
+)
+
+
+def _qwen3_prefills_think_by_default(chat_template: str) -> bool:
+    """Whether a hybrid Qwen3-family template prefills `<think>` by default.
+
+    See `_QWEN3_PREFILLS_THINK_BY_DEFAULT_RE` for the reasoning behind the
+    pattern. This can only be answered by inspecting the template source
+    itself: auto-selection runs once at server startup from the raw
+    tokenizer_config.json, before any prompt is rendered, so there is no
+    rendered generation prompt available yet to reuse the tail-inspection
+    approach `ReasoningParserFactory.resolve_prefilled_thinking` uses at
+    request time.
+    """
+    collapsed = re.sub(r"\s+", "", chat_template)
+    return bool(_QWEN3_PREFILLS_THINK_BY_DEFAULT_RE.search(collapsed))
+
+
 def _resolve_qwen3_reasoning_parser(model: str) -> Optional[str]:
     """Distinguish Qwen3 hybrid / forced-thinking / forced-non-thinking models.
 
-    The Qwen3 family has three reasoning variants with different chat templates:
-    - **Hybrid** (e.g. Qwen3-235B-A22B): the template contains an
-      ``enable_thinking`` flag that lets users toggle ``<think>`` on/off.
-      → use the ``"qwen3"`` reasoning parser.
+    The Qwen3 family has reasoning variants with different chat templates:
+    - **Hybrid, model decides** (e.g. Qwen3-235B-A22B): the template contains
+      an ``enable_thinking`` flag that lets users toggle ``<think>`` on/off,
+      and leaves the marker for the model to emit when the flag is unset.
+      → use the ``"qwen3"`` reasoning parser (``reasoning_at_start=False``).
+    - **Hybrid, prefilled by default** (e.g. Qwen3.5): also has an
+      ``enable_thinking`` toggle, but its default (flag unset) branch
+      prefills a bare ``<think>`` into the generation prompt, so model output
+      already starts inside the reasoning span.
+      → use the ``"qwen3_5"`` parser (``reasoning_at_start=True``).
     - **Forced-thinking** (e.g. Qwen3-235B-A22B-Thinking-2507): the template
       always injects ``<think>`` in the generation prompt without any toggle.
       → use the ``"deepseek-r1"`` parser (``reasoning_at_start=True``).
@@ -494,7 +543,16 @@ def _resolve_qwen3_reasoning_parser(model: str) -> Optional[str]:
     chat_template = tokenizer_config.get("chat_template", "")
 
     if "enable_thinking" in chat_template:
-        # Hybrid model: has enable_thinking toggle.
+        if _qwen3_prefills_think_by_default(chat_template):
+            # Hybrid model whose default branch prefills <think>: model
+            # output has no opening tag to search for (NVIDIA/TensorRT-LLM#18083).
+            logger.info(
+                "Detected hybrid Qwen3 model whose chat template prefills "
+                "'<think>' by default (no enable_thinking override). Using "
+                "'qwen3_5' reasoning parser.", )
+            return "qwen3_5"
+        # Hybrid model: has enable_thinking toggle, model opens/closes
+        # <think> itself when the flag is left unset.
         return "qwen3"
 
     if "<think>" in chat_template:
@@ -576,11 +634,13 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
 
     def _maybe_swap_content(
             self, result: ReasoningParserResult) -> ReasoningParserResult:
-        """When force_nonempty_content is set and content is empty, move
-        reasoning_content into content so the response always has content.
+        """Move reasoning_content into content when content would be empty.
 
-        Whitespace-only content (e.g. a newline after the closing think tag) is
-        treated as empty so the swap still runs (NVBug 6060281)."""
+        Only applies when force_nonempty_content is set, so the response
+        always has content. Whitespace-only content (e.g. a newline after the
+        closing think tag) is treated as empty so the swap still runs
+        (NVBug 6060281).
+        """
         content = result.content or ""
         if self._force_nonempty_content and not content.strip(
         ) and result.reasoning_content:
@@ -589,15 +649,16 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return result
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        """Wraps the parent parse_delta to also treat `<tool_call>` as an
-        implicit end-of-reasoning marker.  When the model omits `</think>`
-        before generating a tool call, the tag would otherwise be absorbed
-        into reasoning_content and the downstream tool parser would never
-        see it (NVBug 6082303).
+        """Wrap the parent parse_delta to treat `<tool_call>` as an implicit end-of-reasoning marker too.
+
+        When the model omits `</think>` before generating a tool call, the
+        tag would otherwise be absorbed into reasoning_content and the
+        downstream tool parser would never see it (NVBug 6082303).
 
         `<tool_call>` is a special token that always arrives as a single
         atomic delta, so we only need to check `delta_text` (not the
-        parent's internal buffer)."""
+        parent's internal buffer).
+        """
         if (self.in_reasoning and self._tool_call_start in delta_text
                 and self.reasoning_end not in self._buffer):
             remaining = self._buffer
@@ -633,7 +694,8 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         as reasoning_content since we are still in reasoning mode.
 
         If the closing tag was already found (or reasoning was never
-        entered), flushes any remaining buffer as content."""
+        entered), flushes any remaining buffer as content.
+        """
         if self.in_reasoning and not self._found_closing_tag:
             remaining = self._buffer
             self._buffer = ""
