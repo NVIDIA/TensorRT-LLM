@@ -1249,3 +1249,81 @@ def test_auto_detect_kimi_k3(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "kimi_k3"
+
+
+# MiniMax-M3 reasoning parser tests.
+#
+# M3's non-thinking template emits a bare `</mm:think>` sentinel with no
+# opening tag, so streaming must mirror parse() and strip the sentinel
+# rather than leak it into the first content delta.
+MM3_START, MM3_END = "<mm:think>", "</mm:think>"
+
+
+@pytest.mark.parametrize(
+    "delta_texts",
+    [
+        # (a) Bare sentinel delivered in a single chunk.
+        [f"{MM3_END} visible"],
+        # (b) Sentinel split across chunks mid-tag.
+        ["</mm:", "think>", " visible"],
+        # (c) Sentinel arrives complete, then content in a later chunk.
+        [MM3_END, " visible"],
+        # (d) Standard <mm:think>...</mm:think> shape still flows through
+        # the inherited parser (regression guard).
+        [f"{MM3_START}reasoning{MM3_END}content"],
+        # (e) Standard shape split across chunks (regression guard).
+        [MM3_START, "reasoning", MM3_END, "content"],
+        # (f) Bare sentinel streamed one character at a time, stressing
+        # every partial-delimiter hold position.
+        list(f"{MM3_END} visible"),
+    ],
+)
+def test_minimax_m3_stream_matches_parse(delta_texts):
+    """Streaming parse_delta + finish must equal non-streaming parse."""
+    text = "".join(delta_texts)
+    expected = ReasoningParserFactory.create_reasoning_parser(
+        "minimax_m3").parse(text)
+
+    parser = ReasoningParserFactory.create_reasoning_parser("minimax_m3")
+    content, reasoning = "", ""
+    for chunk in delta_texts:
+        result = parser.parse_delta(chunk)
+        content += result.content
+        reasoning += result.reasoning_content
+    tail = parser.finish()
+    content += tail.content
+    reasoning += tail.reasoning_content
+
+    assert content == expected.content, (
+        f"chunks={delta_texts!r} expected content={expected.content!r} "
+        f"got {content!r}")
+    assert reasoning == expected.reasoning_content, (
+        f"chunks={delta_texts!r} expected reasoning="
+        f"{expected.reasoning_content!r} got {reasoning!r}")
+
+
+@pytest.mark.parametrize(
+    ("delta_texts", "content", "reasoning"),
+    [
+        # Bare sentinel: content is what follows, reasoning is empty.
+        ([f"{MM3_END} visible"], " visible", ""),
+        (["</mm:", "think>", " visible"], " visible", ""),
+        ([MM3_END, " visible"], " visible", ""),
+        # Standard shape: reasoning then content.
+        ([f"{MM3_START}reasoning{MM3_END}content"], "content", "reasoning"),
+    ],
+)
+def test_minimax_m3_bare_sentinel_strips_tag(delta_texts, content, reasoning):
+    """Pin the exact streamed values for the bare-sentinel bug."""
+    parser = ReasoningParserFactory.create_reasoning_parser("minimax_m3")
+    streamed_content, streamed_reasoning = "", ""
+    for chunk in delta_texts:
+        result = parser.parse_delta(chunk)
+        streamed_content += result.content
+        streamed_reasoning += result.reasoning_content
+    tail = parser.finish()
+    streamed_content += tail.content
+    streamed_reasoning += tail.reasoning_content
+
+    assert streamed_content == content
+    assert streamed_reasoning == reasoning
