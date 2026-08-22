@@ -145,6 +145,7 @@ def _run_forward(
     height=HEIGHT,
     width=WIDTH,
     guidance_scale=GUIDANCE_SCALE,
+    frame_rate=FRAME_RATE,
     **extra,
 ):
     return pipeline.forward(
@@ -156,7 +157,7 @@ def _run_forward(
         num_inference_steps=NUM_STEPS,
         guidance_scale=guidance_scale,
         seed=SEED,
-        frame_rate=FRAME_RATE,
+        frame_rate=frame_rate,
         use_guardrails=False,
         **extra,
     )
@@ -1413,7 +1414,7 @@ class TestCosmos3Action:
 
     def test_inverse_dynamics_rejects_short_video(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
-        with pytest.raises(ValueError, match="requires at least"):
+        with pytest.raises(ValueError, match=r"requires \d+ frames at"):
             _run_forward(
                 cosmos3_pipeline,
                 image=None,
@@ -1425,6 +1426,26 @@ class TestCosmos3Action:
                 domain_name="bridge_orig_lerobot",
                 raw_action_dim=self.RAW_ACTION_DIM,
                 action_chunk_size=NUM_FRAMES,
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+            )
+
+    def test_inverse_dynamics_thins_to_the_requested_rate(self, cosmos3_pipeline):
+        """A 24 fps reference asked for at 5 fps keeps every 5th frame, so the
+        window widens accordingly and the 9-frame fixture comes up short."""
+        _require_action_pipeline(cosmos3_pipeline)
+        with pytest.raises(ValueError, match=r"thinned by 5 \(41 source frames needed\)"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=None,
+                height=self.ACTION_HEIGHT,
+                width=self.ACTION_WIDTH,
+                num_frames=NUM_FRAMES,
+                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                frame_rate=5.0,
+                action_mode="inverse_dynamics",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+                action_chunk_size=NUM_FRAMES - 1,
                 video=_V2V_FIXTURE_MP4.read_bytes(),
             )
 
