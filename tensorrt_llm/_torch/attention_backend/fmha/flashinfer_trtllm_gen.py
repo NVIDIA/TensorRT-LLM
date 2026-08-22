@@ -58,6 +58,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -422,18 +423,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_processor_count: Optional[int] = None
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
-    def _get_total_num_blocks(self, meta: "TrtllmAttentionMetadata") -> int:
-        kv_cache_manager = meta.kv_cache_manager
-        if kv_cache_manager is not None:
-            get_page_index_upper_bound = getattr(
-                getattr(kv_cache_manager, "impl", None), "get_page_index_upper_bound", None
-            )
-            # KVCacheManagerV2 exposes this implementation-only API and reports an
-            # already-flattened page-index bound, unlike the legacy logical block count.
-            if get_page_index_upper_bound is not None:
-                return int(kv_cache_manager.blocks_in_primary_pool)
-        return super()._get_total_num_blocks(meta)
-
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
         if not IS_FLASHINFER_AVAILABLE:
@@ -576,6 +565,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> bool:
         supported, reason = self._is_supported_with_reason(
             q,
@@ -584,9 +575,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             self.attn,
             metadata,
             forward_args,
+            phase=phase,
         )
         if not supported:
-            logger.debug(f"FlashInfer trtllm-gen fmha library does not support {reason}")
+            logger.debug(f"FlashInfer trtllm-gen fmha library does not support request: {reason}")
         return supported
 
     def _is_supported_with_reason(
@@ -597,8 +589,22 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attn: "TrtllmAttention",
         meta: "TrtllmAttentionMetadata",
         fwd: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> Tuple[bool, str]:
         is_mla_enable = attn.is_mla_enable
+        if phase is None:
+            has_context_phase = fwd.attention_input_type != AttentionInputType.generation_only
+            has_generation_phase = fwd.attention_input_type != AttentionInputType.context_only
+        elif phase == FmhaPhase.CONTEXT:
+            has_context_phase = True
+            has_generation_phase = False
+        elif phase == FmhaPhase.GENERATION:
+            has_context_phase = False
+            has_generation_phase = True
+        else:
+            return False, f"invalid FMHA phase: {phase}."
+
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
@@ -627,8 +633,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "relative attention bias."
         if meta.use_spec_decoding and meta.is_spec_dec_tree:
             return False, "spec-dec tree/custom masks."
-        if is_mla_enable and fwd.attention_input_type != AttentionInputType.generation_only:
-            return False, "MLA with non-generation-only attention."
+        if is_mla_enable and has_context_phase:
+            return False, "MLA context attention."
 
         if meta.kv_cache_block_offsets is None:
             return False, "non-paged KV cache; paged KV cache is required."
@@ -648,9 +654,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if tokens_per_block is None:
             tokens_per_block = 0
 
-        attn_input_type = fwd.attention_input_type
-        has_context_phase = attn_input_type != AttentionInputType.generation_only
-        has_generation_phase = attn_input_type != AttentionInputType.context_only
         q_dtype = q.dtype
         o_dtype = output.dtype
 
@@ -763,20 +766,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             device_index = torch.cuda.current_device()
         return self._get_multi_processor_count_for_device(device_index)
 
-    def get_fp8_context_fmha(
+    def _use_fp8_context_fmha(
         self,
-        q: torch.Tensor,
         output: torch.Tensor,
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        is_gen_only: bool,
+        attention_input_type: AttentionInputType,
     ) -> bool:
         kv_cache_quant_mode = QuantMode(self.attn.quant_mode)
         return (
             output.dtype == torch.float8_e4m3fn
             or output.dtype == torch.uint8
             or kv_cache_quant_mode.has_fp4_kv_cache()
-            or (kv_cache_quant_mode.has_fp8_kv_cache() and not is_gen_only)
+            or (
+                kv_cache_quant_mode.has_fp8_kv_cache()
+                and attention_input_type != AttentionInputType.generation_only
+            )
         )
 
     def prepare_workspace(
@@ -824,7 +827,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         output = forward_args.output
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires output.")
-        fp8_context_fmha = self.get_fp8_context_fmha(q, output, metadata, forward_args, is_gen_only)
+        fp8_context_fmha = self._use_fp8_context_fmha(output, attention_input_type)
 
         workspace_max_tokens = max(num_tokens, metadata.max_context_length)
         workspace_max_gen_tokens = max(num_gen_tokens, metadata.max_num_requests)
@@ -899,6 +902,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         rope_params = attn.rope_params
         bmm1_scale_static = self._get_bmm1_scale(attn)
         attention_chunk_size = self._get_attention_chunk_size(attn)
+        output = fwd.output
+        fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         (
             q_processed,
             kv_pool,
@@ -948,7 +953,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale_static,  # bmm1_scale
             1.0,  # bmm2_scale
             attention_chunk_size,  # attention_chunk_size
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             meta.use_paged_context_fmha,  # paged_context_fmha
             attn.is_mla_enable,  # is_mla_enable
             self._multi_processor_count,  # multi_processor_count
@@ -962,7 +967,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
         if has_fp4_kv and kv_scale_pool is None:
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or params.fp8_context_fmha:
+        if has_fp4_kv or fp8_context_fmha:
             q_processed = (
                 q_processed.view(torch.uint8)
                 .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
@@ -970,9 +975,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 .view(params.num_tokens, attn.num_heads, attn.head_dim)
             )
         ctx_bmm1_scale = bmm1_scale_static
-        if params.fp8_context_fmha and bmm1_scale is not None:
+        if fp8_context_fmha and bmm1_scale is not None:
             ctx_bmm1_scale = bmm1_scale.narrow(0, 0, 1)
-        ctx_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
+        ctx_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
         causal = (
             False
             if params.is_cross
@@ -1038,7 +1043,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             rope_params.max_positions,  # rotary_embedding_max_positions
             attn.position_embedding_type,  # position_embedding_type
             bmm1_scale_static,  # bmm1_scale
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             meta.use_paged_context_fmha,  # paged_context_fmha
             attn.is_mla_enable,  # is_mla_enable
             attention_chunk_size,  # attention_chunk_size
@@ -1055,6 +1060,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         rope_params = attn.rope_params
         bmm1_scale_static = self._get_bmm1_scale(attn)
         attention_chunk_size = self._get_attention_chunk_size(attn)
+        output = fwd.output
+        fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         batch_beam = params.num_requests * meta.beam_width
         (
             q_processed,
@@ -1105,7 +1112,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             attn.position_embedding_type,  # position_embedding_type
             bmm1_scale_static,  # bmm1_scale
             1.0,  # bmm2_scale
-            params.fp8_context_fmha,  # fp8_context_fmha
+            fp8_context_fmha,  # fp8_context_fmha
             attn.predicted_tokens_per_seq,  # predicted_tokens_per_seq
             attention_chunk_size,  # attention_chunk_size
             self._multi_processor_count,  # multi_processor_count
@@ -1122,7 +1129,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
         if has_fp4_kv and kv_scale_pool is None:
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or params.fp8_context_fmha:
+        if has_fp4_kv or fp8_context_fmha:
             q_processed = (
                 q_processed.view(torch.uint8)
                 .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
@@ -1130,9 +1137,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 .view(params.num_tokens, attn.num_heads, attn.head_dim)
             )
         gen_bmm1_scale = (
-            bmm1_scale if params.fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
+            bmm1_scale if fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
         )
-        gen_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
+        gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
 
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,
