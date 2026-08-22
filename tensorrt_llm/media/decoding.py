@@ -27,6 +27,7 @@ CPU-only host must never load the driver-linked extension.
 
 import functools
 import math
+from typing import NamedTuple
 
 import torch
 
@@ -105,6 +106,59 @@ def resize_center_crop_uint8(frames: torch.Tensor, target_h: int, target_w: int)
     top = max((resize_h - target_h) // 2, 0)
     x = x[:, :, top : top + target_h, left : left + target_w]
     return x.round_().clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+
+
+class VideoStreamInfo(NamedTuple):
+    """What a container header reports about its video stream."""
+
+    height: int
+    width: int
+    frame_rate: float | None  # None when the header reports nothing usable
+
+
+def video_stream_info(data: bytes) -> VideoStreamInfo | None:
+    """Read a clip's dimensions and frame rate from its container header.
+
+    Demuxing is CPU-side FFmpeg inside PyNvVideoCodec, so this costs no GPU and
+    decodes no frame — everything here comes straight off the header, in one
+    open, so a caller wanting both does not pay for two.
+
+    The dimensions are the *coded* ones. A container may additionally carry a
+    display matrix (a phone shooting portrait usually records landscape frames
+    plus a 90-degree rotation); the demuxer does not expose it and the decode
+    path does not apply it, so a clip carrying that metadata decodes
+    pixel-identically to the same clip without it. Coded dimensions therefore
+    describe the frames a caller actually receives, which is what a caller
+    sizing its output against them needs.
+
+    Returns ``None`` when the header cannot be read or reports no usable
+    dimensions, leaving the caller on its own defaults: this is a convenience
+    probe, and a genuinely unreadable stream still fails with a proper error at
+    decode.
+    """
+    try:
+        import PyNvVideoCodec as nvc
+    except ImportError:
+        return None
+
+    position = 0
+
+    def _read(buf: bytearray) -> int:
+        nonlocal position
+        chunk = data[position : position + len(buf)]
+        buf[: len(chunk)] = chunk
+        position += len(chunk)
+        return len(chunk)
+
+    try:
+        demuxer = nvc.CreateDemuxer(_read)
+        height, width = int(demuxer.Height()), int(demuxer.Width())
+        frame_rate = float(demuxer.FrameRate())
+    except nvc.PyNvVCException:
+        return None
+    if height <= 0 or width <= 0:
+        return None
+    return VideoStreamInfo(height, width, frame_rate if frame_rate > 0 else None)
 
 
 def decode_video_reference_window(
