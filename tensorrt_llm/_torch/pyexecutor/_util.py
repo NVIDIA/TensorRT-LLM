@@ -1469,15 +1469,15 @@ class KvCacheCreator:
         if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
-            # pool_ratio describes one manager's pool-group layout. The
+            # pool_ratio describes one manager's layer-group layout. The
             # target hybrid manager may have separate recurrent-state and
-            # attention groups, while a non-VSWA draft manager has one
-            # attention group. Reusing the target's ratios fails its arity
+            # attention layer groups, while a non-VSWA draft manager has one
+            # attention layer group. Reusing the target's ratios fails its arity
             # check.
             logger.info(
                 "Normalizing the separate one-model draft KV cache pool_ratio "
                 f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
-                "pool group.")
+                "layer group.")
             draft_kv_config.pool_ratio = [1.0]
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(

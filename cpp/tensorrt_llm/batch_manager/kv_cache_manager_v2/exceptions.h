@@ -19,35 +19,66 @@
 
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
+#include "tensorrt_llm/common/logger.h"
+
 #include <cuda.h>
+#include <exception>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+template <typename F>
+void terminateOnException(char const* context, F&& func) noexcept
+{
+    try
+    {
+        std::forward<F>(func)();
+    }
+    catch (std::exception const& error)
+    {
+        TLLM_LOG_ERROR("%s: %s", context, error.what());
+        std::terminate();
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("%s: unknown error", context);
+        std::terminate();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Exception hierarchy (mirrors _exceptions.py)
 // ---------------------------------------------------------------------------
 
-// Not enough cache capacity to satisfy an allocation request.
-class OutOfPagesError : public std::runtime_error
+// A retryable failure to obtain cache capacity. OutOfPagesError describes
+// exhausted cache slots, while OutOfMemoryError describes allocation failure
+// in an underlying memory tier.
+class CacheCapacityError : public std::runtime_error
 {
 public:
-    explicit OutOfPagesError(std::string const& msg = "Out of pages")
+    explicit CacheCapacityError(std::string const& msg = "Cache capacity exhausted")
         : std::runtime_error(msg)
     {
     }
 };
 
-// A cache-capacity failure caused by an underlying memory tier. Keeping this
-// under OutOfPagesError lets admission callers handle every retryable capacity
-// failure through the same path while preserving the more specific OOM type.
-class OutOfMemoryError : public OutOfPagesError
+class OutOfPagesError : public CacheCapacityError
+{
+public:
+    explicit OutOfPagesError(std::string const& msg = "Out of pages")
+        : CacheCapacityError(msg)
+    {
+    }
+};
+
+class OutOfMemoryError : public CacheCapacityError
 {
 public:
     explicit OutOfMemoryError(std::string const& msg = "Out of memory")
-        : OutOfPagesError(msg)
+        : CacheCapacityError(msg)
     {
     }
 };

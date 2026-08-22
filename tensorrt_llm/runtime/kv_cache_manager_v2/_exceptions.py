@@ -16,11 +16,15 @@
 import cuda.bindings.driver as drv
 
 
-class OutOfPagesError(Exception):
+class CacheCapacityError(Exception):
     pass
 
 
-class OutOfMemoryError(OutOfPagesError):
+class OutOfPagesError(CacheCapacityError):
+    pass
+
+
+class OutOfMemoryError(CacheCapacityError):
     pass
 
 

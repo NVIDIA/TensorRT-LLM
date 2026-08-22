@@ -224,6 +224,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
         self._gen_to_complete_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
+
         # Opt-in (default off): on the disagg generation server, schedule
         # just-arrived generation-only requests (first token not yet emitted)
         # ahead of older in-flight decodes to reduce TTFT under budget
@@ -299,6 +300,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
+
         # Opt-in: prioritize disagg-gen first-token requests (see __init__).
         # py_decoding_iter == 0 covers DISAGG_GENERATION_INIT /
         # TRANS_IN_PROGRESS / TRANS_COMPLETE. A stable sort keeps FIFO arrival

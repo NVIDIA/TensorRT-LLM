@@ -42,7 +42,7 @@ from .._common import (
     TokenIdExt,
 )
 from .._copy_engine import CopyTask, batched_copy
-from .._exceptions import LogicError, OutOfPagesError
+from .._exceptions import CacheCapacityError, LogicError, OutOfPagesError
 from .._life_cycle_registry import (
     AttnLifeCycle,
     LayerGroupId,
@@ -1293,7 +1293,7 @@ class _KVCache:
                 self._record_migrated_slots,
                 self._record_dropped_pages,
             )
-        except OutOfPagesError:
+        except CacheCapacityError:
             for page in reversed(gpu_pages_to_protect):
                 storage.schedule_for_eviction(page)
             return False
