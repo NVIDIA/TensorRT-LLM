@@ -118,6 +118,14 @@ class KimiK2ToolParser(BaseToolParser):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # This increment may hold ordinary text ahead of the tool call. Hand that
+        # text back as content and keep only the markup in the buffer, otherwise
+        # it is consumed along with the tool call and never reaches the client.
+        normal_text, current_text = self._split_leading_normal_text(
+            current_text, [self.bot_token, self.tool_call_start_token]
+        )
+        self._buffer = current_text
+
         calls: list[ToolCallItem] = []
         try:
             match = self.stream_tool_call_portion_regex.search(current_text)
@@ -128,7 +136,7 @@ class KimiK2ToolParser(BaseToolParser):
                 m = self.tool_call_id_regex.match(function_id)
                 if not m:
                     logger.warning("Unexpected tool_call_id format: %s", function_id)
-                    return StreamingParseResult(normal_text="", calls=calls)
+                    return StreamingParseResult(normal_text=normal_text, calls=calls)
                 function_name = m.group("name")
 
                 # Initialize state if this is the first tool call
@@ -191,7 +199,7 @@ class KimiK2ToolParser(BaseToolParser):
                         else:
                             self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(normal_text=normal_text, calls=calls)
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
@@ -199,11 +207,11 @@ class KimiK2ToolParser(BaseToolParser):
                     except json.JSONDecodeError:
                         pass
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""

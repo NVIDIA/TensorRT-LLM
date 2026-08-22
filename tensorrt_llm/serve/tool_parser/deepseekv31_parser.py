@@ -121,6 +121,14 @@ class DeepSeekV31Parser(BaseToolParser):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # This increment may hold ordinary text ahead of the tool call. Hand that
+        # text back as content and keep only the markup in the buffer, otherwise
+        # it is consumed along with the tool call and never reaches the client.
+        normal_text, current_text = self._split_leading_normal_text(
+            current_text, [self.bot_token, "<｜tool▁call▁begin｜>"]
+        )
+        self._buffer = current_text
+
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
