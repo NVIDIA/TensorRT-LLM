@@ -196,6 +196,8 @@ def TARGET_BRANCH = "target_branch"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def CHANGED_FILE_LIST_FETCH_FAILED = "changed_file_list_fetch_failed"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -204,6 +206,7 @@ def globalVars = [
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
+    (CHANGED_FILE_LIST_FETCH_FAILED): false,
 ]
 if (runMode == "nightly_release") {
     globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
@@ -635,7 +638,10 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
             pageId += 1
             def rawDataJson = pipeline.sh(
                 script: """
-                    curl --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
+                    curl --silent --fail \
+                         --connect-timeout 10 --max-time 60 \
+                         --retry 3 --retry-delay 5 --retry-all-errors --retry-max-time 120 \
+                         --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
                          --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
                 """,
                 returnStdout: true
@@ -745,6 +751,7 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
     } catch (Exception e) {
         pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
         globalVars[CACHED_CHANGED_FILE_LIST] = []
+        globalVars[CHANGED_FILE_LIST_FETCH_FAILED] = true
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
 }
@@ -1094,6 +1101,10 @@ def getOssComplianceFileChanged(pipeline, globalVars)
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
+        if (globalVars[CHANGED_FILE_LIST_FETCH_FAILED]) {
+            pipeline.echo("Changed-file retrieval failed. Conservatively enabling OSS compliance check.")
+            return true
+        }
         return false
     }
 
@@ -1249,6 +1260,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
+        if (globalVars[CHANGED_FILE_LIST_FETCH_FAILED]) {
+            pipeline.echo("Changed-file retrieval failed. Conservatively enabling multi-GPU tests.")
+            return true
+        }
         return false
     }
 
