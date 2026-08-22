@@ -1108,7 +1108,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
                 raise
-        self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()
@@ -2252,14 +2251,21 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
 
-        if not kv_cache.is_active:
-            if not kv_cache.resume(self._stream.cuda_stream):
-                return False
-            self._restore_page_index_bufs(req.py_request_id, kv_cache)
+        try:
+            if not kv_cache.is_active:
+                if not kv_cache.resume(self._stream.cuda_stream):
+                    return False
+                self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
-        draft_len = self._effective_draft_len(req)
-        self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+            draft_len = self._effective_draft_len(req)
+            self._allocated_draft_lens[req.py_request_id] = draft_len
+            return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        except KVCacheOutOfMemoryError:
+            # Allocation pressure is part of the scheduler's normal control
+            # flow. Let it suspend victims and retry instead of
+            # terminating the executor event loop.
+            logger.debug(f"KV cache allocation ran out of memory for request {req.py_request_id}")
+            return False
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
@@ -2502,7 +2508,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
+        """Suspend a request so the cache manager can reclaim or migrate its pages."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()

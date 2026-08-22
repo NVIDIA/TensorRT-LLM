@@ -17,7 +17,7 @@ import time
 import types
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 import torch
@@ -2832,6 +2832,63 @@ class TestPendingTransferResponseFlush:
         # One completed idle pass plus the clean-exit drain, not two flushes
         # during the idle pass itself.
         assert executor._flush_pending_transfer_responses.call_count == 2
+
+    def test_overlap_v2_recompute_pause_orders_release_and_reset(self, monkeypatch):
+        """Release through an event before reuse, then reset after sampling."""
+        executor = self._make_executor_loop_stub()
+        executor._is_kv_manager_v2 = True
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        previous_request = Mock(py_request_id=8)
+        previous_requests = Mock()
+        previous_requests.all_requests.return_value = [previous_request]
+        previous_sample_state = Mock()
+        executor.previous_batch = types.SimpleNamespace(
+            sample_state=previous_sample_state,
+            scheduled_requests=previous_requests,
+        )
+        executor.active_requests = [previous_request]
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[],
+            paused_requests=[],
+            recompute_paused_requests=[previous_request],
+            generation_requests=[],
+        )
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        lifecycle = Mock()
+        executor._update_requests = lifecycle.update_requests
+        executor._process_previous_batch = lifecycle.process_previous_batch
+        executor._terminate_recompute_paused_requests = lifecycle.terminate_recompute
+        executor._pause_recompute_paused_requests = lifecycle.pause_recompute
+        executor._can_queue = Mock(return_value=(False, False))
+        executor.kv_connector_manager = None
+        executor._revert_gen_alloc = Mock()
+        executor._finalize_adp_dummy_allocation = Mock()
+        executor.kv_cache_transceiver = None
+        executor._send_kv_async = Mock()
+        executor.enable_early_first_token_response = False
+        executor.speculation_gate = None
+        executor.drafter = None
+        executor._enqueue_responses = Mock()
+        executor._commit_kv_cache_stats = Mock()
+        executor.perf_manager = Mock()
+        executor._handle_kv_transfer_timeouts_synced = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor._kv_connector_terminate_requests = Mock()
+        executor.iter_counter = 0
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        assert lifecycle.mock_calls == [
+            call.terminate_recompute(scheduled_batch),
+            call.update_requests(previous_sample_state),
+            call.pause_recompute(scheduled_batch),
+            call.process_previous_batch(),
+        ]
 
     def test_overlap_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
         """The overlap loop must not drop a buffered response on clean exit."""

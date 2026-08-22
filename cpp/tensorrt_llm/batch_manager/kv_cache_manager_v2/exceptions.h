@@ -53,11 +53,32 @@ void terminateOnException(char const* context, F&& func) noexcept
 // Exception hierarchy (mirrors _exceptions.py)
 // ---------------------------------------------------------------------------
 
-class OutOfMemoryError : public std::runtime_error
+// A retryable failure to obtain cache capacity. OutOfPagesError describes
+// exhausted cache slots, while OutOfMemoryError describes allocation failure
+// in an underlying memory tier.
+class CacheCapacityError : public std::runtime_error
+{
+public:
+    explicit CacheCapacityError(std::string const& msg = "Cache capacity exhausted")
+        : std::runtime_error(msg)
+    {
+    }
+};
+
+class OutOfPagesError : public CacheCapacityError
+{
+public:
+    explicit OutOfPagesError(std::string const& msg = "Out of pages")
+        : CacheCapacityError(msg)
+    {
+    }
+};
+
+class OutOfMemoryError : public CacheCapacityError
 {
 public:
     explicit OutOfMemoryError(std::string const& msg = "Out of memory")
-        : std::runtime_error(msg)
+        : CacheCapacityError(msg)
     {
     }
 };
@@ -139,16 +160,6 @@ class ResourceBusyError : public std::runtime_error
 {
 public:
     explicit ResourceBusyError(std::string const& msg = "Resource is busy")
-        : std::runtime_error(msg)
-    {
-    }
-};
-
-// Not enough free pages to satisfy an allocation request.
-class OutOfPagesError : public std::runtime_error
-{
-public:
-    explicit OutOfPagesError(std::string const& msg = "Out of pages")
         : std::runtime_error(msg)
     {
     }

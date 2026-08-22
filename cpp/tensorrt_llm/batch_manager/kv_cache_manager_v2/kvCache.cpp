@@ -191,6 +191,23 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
     return result;
 }
 
+void KvCache::_releaseActivePageLocks()
+{
+    // The caller owns a recordEventScope so every unlocked page observes all
+    // prior work on this cache's CUDA stream.
+    auto const ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    for (auto const& activePage : _activePages())
+    {
+        auto& blockPage = (activePage.lcId != ssmLcId)
+            ? mBlocks[activePage.ordinal].pages[activePage.beamIdx][activePage.lcId]
+            : mSsmBlocks[activePage.beamIdx][activePage.lcId];
+        auto& lock = std::get<SharedPageLock>(blockPage);
+        auto holder = lock.page()->hold();
+        lock.unlock();
+        blockPage = std::move(holder);
+    }
+}
+
 SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const
 {
     bool const isSsm = ordinal == kBadBlockOrdinal;
@@ -256,14 +273,6 @@ bool KvCache::resume(std::optional<CUstream> stream)
     TLLM_CHECK_DEBUG_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
-    // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
-    float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
-    if (utilization > mManager->config().maxUtilForResume)
-    {
-        return false;
-    }
-
     auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
@@ -296,24 +305,91 @@ bool KvCache::resume(std::optional<CUstream> stream)
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
         numSlotsNeeded[lc] += std::max(0, scratchDeltaCounts[lc]);
 
+    // This projected per-pool requirement replaces the old gate on current
+    // utilization. A request with no cost in a pressured pool must not be
+    // rejected because another pool happens to be full.
+    TypedVec<PoolGroupIndex, SlotCount> additionalRequiredSlots(storageMgr.numPoolGroups(), 0);
+    TypedVec<PoolGroupIndex, SlotCount> freeSlotRequirements(storageMgr.numPoolGroups(), 0);
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+    {
+        auto const pgIdx = storageMgr.getPoolGroupIndex(lc);
+        additionalRequiredSlots[pgIdx] += numSlotsNeeded[lc];
+        freeSlotRequirements[pgIdx] += numSlotsNeeded[lc];
+    }
+
+    std::unordered_set<Page*> countedPages;
+    std::vector<SharedPtr<Page>> gpuPagesToProtect;
+    for (auto const& activePage : _activePages())
+    {
+        auto const page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
+        if (!page || page->status() == PageStatus::LOCKED || !countedPages.insert(page.get()).second)
+        {
+            continue;
+        }
+        // A held GPU page that is not on the eviction queue is already
+        // included in stats.unavailable(). Only migration from a colder tier
+        // or locking a currently evictable GPU page increases that count.
+        auto const pgIdx = storageMgr.getPoolGroupIndex(activePage.lcId);
+        if (page->cacheLevel != kHotLevel)
+        {
+            additionalRequiredSlots[pgIdx] += 1;
+            freeSlotRequirements[pgIdx] += 1;
+        }
+        else if (page->scheduledForEviction())
+        {
+            additionalRequiredSlots[pgIdx] += 1;
+            gpuPagesToProtect.push_back(page);
+        }
+    }
+
+    // SSM state has a fixed one-slot working set and needs no decode-growth
+    // headroom. Attention keeps the configured limit, including any pool
+    // group it shares with SSM.
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storageMgr.numPoolGroups(); ++pgIdx)
+    {
+        auto const stats = storageMgr.getStatistics(kHotLevel, pgIdx);
+        auto const projectedUnavailable = stats.unavailable() + additionalRequiredSlots[pgIdx];
+        double const maxUtilForResume
+            = storageMgr.poolGroupNeedsResumeHeadroom(pgIdx) ? mManager->config().maxUtilForResume : 1.0;
+        auto const limit = static_cast<double>(stats.total) * maxUtilForResume;
+        if (additionalRequiredSlots[pgIdx] > 0 && static_cast<double>(projectedUnavailable) > limit)
+        {
+            return false;
+        }
+    }
+
+    MigrationRecorder const migrationRecorder
+        = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+              CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+    DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+    { _recordDroppedPages(pages, cacheLevel); };
+
+    // Keep this cache's GPU pages out of the eviction candidates while
+    // reserving every slot needed for allocation and lower-tier migration.
+    // Manager access is serialized, so the prepared slots remain available
+    // until newGpuSlots() and activate() consume them below.
+    for (auto const& page : gpuPagesToProtect)
+    {
+        storageMgr.excludeFromEviction(*page);
+    }
+    try
+    {
+        storageMgr.prepareFreeSlots(kHotLevel, freeSlotRequirements, migrationRecorder, dropRecorder);
+    }
+    catch (CacheCapacityError const&)
+    {
+        for (auto it = gpuPagesToProtect.rbegin(); it != gpuPagesToProtect.rend(); ++it)
+        {
+            storageMgr.scheduleForEviction(**it);
+        }
+        return false;
+    }
+
     // Only allocate if any slots are needed.
     bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
     if (anyNeeded)
     {
-        TypedVec<LifeCycleId, std::vector<Slot>> tmpSlots;
-        try
-        {
-            MigrationRecorder const migrationRecorder
-                = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
-                      CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
-            DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
-            { _recordDroppedPages(pages, cacheLevel); };
-            tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
-        }
-        catch (OutOfPagesError const&)
-        {
-            return false;
-        }
+        auto tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
 
         // Separate deferred vs scratch slots, and collect scratch ready events.
         std::vector<CachedCudaEvent const*> scratchReadyEvents;
@@ -347,22 +423,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), scratchReadyEvents);
     }
 
-    try
-    {
-        activate();
-    }
-    catch (OutOfPagesError const&)
-    {
-        // Release pre-allocated deferred slots on failure.
-        for (LifeCycleId lc{0}; lc < numLc; ++lc)
-        {
-            if (deferredSlots[lc].has_value())
-                storageMgr.releaseSlot(lc, kHotLevel, std::move(*deferredSlots[lc]));
-        }
-        // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
-        // a recordEventScope, matching Python behavior.
-        return false;
-    }
+    activate();
 
     // Deferred copy: for partial blocks and SSM, copy from now-locked source pages
     // to pre-allocated GPU slots, then unlock sources and replace with new pages.
@@ -456,6 +517,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             newPage->setSlot(newSlot);
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
+            deferredSlots[lcIdx].reset();
         }
 
         // Clear treeBlock for partial last block (mirrors Python: partial block is uncommitted).
@@ -521,19 +583,10 @@ void KvCache::suspend()
     // SharedPageLock destructors inside the scope use finishEvent() to synchronize.
     {
         auto scope = recordEventScope();
-        auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
-
-        // Convert SharedPageLocks → PageHolders for active (non-stale) pages only.
-        // Mirrors Python: for ordinal, beam_idx, lc_idx in self._active_pages()
-        for (auto const& ap : _activePages())
-        {
-            auto& bp = (ap.lcId != ssmLcId) ? mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId]
-                                            : mSsmBlocks[ap.beamIdx][ap.lcId];
-            // expect_type(_SharedPageLock, beam_block[lc_idx]) → std::get raises on wrong type
-            auto& lock = std::get<SharedPageLock>(bp);
-            auto holder = lock.page()->hold();
-            bp = std::move(holder); // ~SharedPageLock calls unlock() → notifyFinish(finishEvent())
-        }
+        // Releasing the final lock registers held pages with StorageManager's
+        // eviction controller. StorageManager alone decides whether pressure
+        // requires migrating them to the next cache tier.
+        _releaseActivePageLocks();
         // Free scratch slots inside scope — unlock() needs finishEvent().
         // Mirrors Python: _free_scratch_slots() inside `with self._record_event()`.
         _freeScratchSlots();

@@ -784,13 +784,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     m.attr("NDEBUG") = nb::bool_(!kv::gDebug);
 
     // ---- Exceptions --------------------------------------------------------
-    static nb::object sOutOfMemoryError = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError");
+    static nb::object sCacheCapacityError = nb::exception<kv::CacheCapacityError>(m, "CacheCapacityError");
+    static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError", sCacheCapacityError);
+    static nb::object sOutOfMemoryError
+        = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError", sCacheCapacityError);
     static nb::object sHostOOMError = nb::exception<kv::HostOOMError>(m, "HostOOMError", sOutOfMemoryError);
     static nb::object sDiskOOMError = nb::exception<kv::DiskOOMError>(m, "DiskOOMError", sOutOfMemoryError);
     static nb::object sCuOOMError = nb::exception<kv::CuOOMError>(m, "CuOOMError", sOutOfMemoryError);
     static nb::object sLogicError = nb::exception<kv::LogicError>(m, "LogicError");
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
-    static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();

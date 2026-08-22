@@ -248,6 +248,7 @@ public:
 
     PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const;
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
+    bool poolGroupNeedsResumeHeadroom(PoolGroupIndex pgIdx) const;
     PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;
     PoolIndex numPools(PoolGroupIndex pgIdx) const;
 

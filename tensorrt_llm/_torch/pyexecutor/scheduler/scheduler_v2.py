@@ -274,8 +274,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         scheduled_ctx: RequestList = []
         scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
+        # Ordinary evictions keep cache state under manager ownership.
+        # Recompute-paused requests are reported separately because their
+        # request-owned resources must be released by the executor.
         evicted: RequestList = []
         recompute_paused: RequestList = []
+        cache_admission_blocked = False
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
@@ -328,8 +332,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # empty and context requests with a different adapter could be
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
+        has_pending_completions = False
         for req in requests_list:
             if req.state_value == self._gen_to_complete_state_value:
+                has_pending_completions = True
                 budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
@@ -406,7 +412,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
-                action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
+                (
+                    action,
+                    tokens,
+                    scheduled_beam_width,
+                    req_it_end,
+                    request_cache_blocked,
+                ) = self._try_schedule_generation(
                     req,
                     budget,
                     requests_list,
@@ -417,7 +429,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                     recompute_paused,
                     inflight_request_ids,
                     scheduled_beam_width,
+                    has_pending_completions,
                 )
+                cache_admission_blocked = cache_admission_blocked or request_cache_blocked
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -457,7 +471,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # KV cache pages will ever be freed — the scheduler will spin
         # forever. This typically happens when the KV cache pool is exhausted
         # and no secondary cache tier is available for suspend/resume.
-        if not scheduled_gen and not scheduled_ctx:
+        if not scheduled_gen and not scheduled_ctx and cache_admission_blocked:
             num_gen_candidates = sum(
                 1
                 for r in active_requests
@@ -470,6 +484,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and not evicted
                 and not recompute_paused
                 and not inflight_request_ids
+                and not has_pending_completions
             ):
                 raise RuntimeError(
                     f"V2 scheduler deadlock: {num_gen_candidates} generation "
@@ -597,7 +612,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
-            self._suspend_request(req)
+            self._evict_request(req)
             return cross_action, 0, False
 
         return ScheduleAction.SCHEDULED, req_tokens, False
@@ -666,8 +681,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         if chunk_size <= 0:
             # TODO: consider suspending first-chunk KVCache to release
             # GPU pages. Currently we skip without suspend to avoid
-            # pathological suspend/resume cycles. suspend_request is
-            # only called from eviction (_try_evict_for_gen).
+            # pathological suspend/resume cycles. Cache eviction is only
+            # used after a request has acquired resources that must be released.
             return ScheduleAction.SKIP, 0, False
 
         chunk_size = self._align_chunk_to_mm_block(
@@ -699,7 +714,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
-            self._suspend_request(req)
+            self._evict_request(req)
             return cross_action, 0, False
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
@@ -956,7 +971,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         target_capacity = req_tokens + cross_kv_cache_manager.num_extra_kv_tokens
         if not kv_cache.resize(max(kv_cache.capacity, target_capacity)):
             if req.is_first_context_chunk:
-                kv_cache.suspend()
+                cross_kv_cache_manager.suspend_request(req)
             return False
 
         return True
@@ -973,28 +988,43 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_paused: RequestList,
         inflight_request_ids: set[int],
         scheduled_beam_width: int,
-    ) -> tuple[ScheduleAction, int, int, int]:
+        has_pending_completions: bool,
+    ) -> tuple[ScheduleAction, int, int, int, bool]:
         """Try to schedule a generation request.
 
-        Returns ``(action, tokens, scheduled_beam_width, req_it_end)``.
+        Returns ``(action, tokens, scheduled_beam_width, req_it_end,
+        cache_blocked)``.
         *tokens* is meaningful only when *action* is ``SCHEDULED``.
+        *cache_blocked* distinguishes a terminal cache-admission failure from
+        an ordinary token-budget or in-flight deferral.
         """
         beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
         req_tokens = beam_width + get_draft_token_length(req)
 
         if not budget.can_fit_tokens(req_tokens):
-            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end, False
 
         if scheduled_beam_width == 0:
             scheduled_beam_width = beam_width
         elif scheduled_beam_width != beam_width:
-            return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
+            return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end, False
 
-        success = self.kv_cache_manager.try_allocate_generation(req)
+        success = self._try_allocate_generation(req)
+
+        # A completing request is guaranteed to release its resources after
+        # this scheduling pass. Avoid moving or discarding another request's
+        # state immediately before that release becomes visible.
+        if not success and has_pending_completions:
+            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end, False
 
         if not success:
             req_it_end, success = self._try_evict_for_gen(
-                req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
+                req,
+                requests_list,
+                req_it,
+                req_it_end,
+                evicted,
+                inflight_request_ids,
             )
 
         if not success:
@@ -1010,23 +1040,59 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         if success:
-            return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
+            return (
+                ScheduleAction.SCHEDULED,
+                req_tokens,
+                scheduled_beam_width,
+                req_it_end,
+                False,
+            )
 
-        # Self-eviction: suspend this gen request to free its
-        # GPU pages so other requests can resume().
-        # Skip if already suspended — suspending again is a no-op
-        # that frees no pages.
         if self.kv_cache_manager.is_request_active(req.py_request_id):
             logger.debug(
-                f"[V2Scheduler] Self-evicting request {req.py_request_id} "
-                f"(state={req.state.name}) to free GPU pages"
+                f"[V2Scheduler] Evicting blocked request {req.py_request_id} "
+                f"(state={req.state.name}) while preserving its cache"
             )
-            self._suspend_request(req)
+            self._evict_request(req)
             evicted.append(req)
+        elif self.enable_recompute_pause and self._is_recompute_pause_candidate(
+            req, inflight_request_ids
+        ):
+            # The request was evicted in an earlier scheduling pass. Its cache
+            # has therefore already had a chance to remain on GPU or migrate
+            # to a colder tier. If resume still fails, release it and let the
+            # executor reset it for recomputation.
+            logger.debug(
+                f"[V2Scheduler] Releasing cache for blocked request {req.py_request_id} "
+                f"for recomputation after preserved eviction could not make progress"
+            )
+            self._recompute_pause_request(req)
+            recompute_paused.append(req)
+            recompute_pause_state.victim_indices.add(req_it)
+            recompute_pause_state.frontier = min(recompute_pause_state.frontier, req_it)
 
-        return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+        return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end, True
 
     # ---- Eviction ----
+
+    def _try_allocate_generation(self, req: LlmRequest) -> bool:
+        """Resume cross KV transactionally before growing the self cache."""
+        cross_kv_cache_manager = self.cross_kv_cache_manager
+        cross_cache_resumed = False
+        if cross_kv_cache_manager is not None and not cross_kv_cache_manager.is_request_active(
+            req.py_request_id
+        ):
+            if not cross_kv_cache_manager.resume_request(req):
+                return False
+            cross_cache_resumed = True
+
+        success = False
+        try:
+            success = self.kv_cache_manager.try_allocate_generation(req)
+            return success
+        finally:
+            if not success and cross_cache_resumed and cross_kv_cache_manager is not None:
+                cross_kv_cache_manager.suspend_request(req)
 
     @staticmethod
     def _is_started_request(req: LlmRequest) -> bool:
@@ -1037,8 +1103,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             req.is_context_init_state and not req.is_first_context_chunk
         ) or req.is_generation_in_progress_state
 
-    def _suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache in both main and draft managers.
+    def _evict_request(self, req: LlmRequest) -> None:
+        """Evict a request while preserving its cache when possible.
+
+        The scheduler does not select a physical cache tier. Suspending the
+        request releases its page locks; the cache manager decides whether
+        allocation pressure leaves those pages on GPU or migrates them to a
+        lower tier. Self, draft, and cross caches move through the same logical
+        request lifecycle; generation admission resumes cross KV before the
+        request can enter a forward batch.
 
         TODO: Also release PEFT resources (mark_request_done) for the
         suspended request so the C++ PeftCacheManager can evict its
@@ -1050,19 +1123,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.suspend_request(req)
+        if self.cross_kv_cache_manager is not None:
+            self.cross_kv_cache_manager.suspend_request(req)
 
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
 
     def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
-        """A started request whose KV cache is still active on GPU.
+        """Return whether a started request can be safely evicted.
 
-        Already-suspended requests are not useful eviction victims
-        because suspending them again is a no-op that frees no pages.
+        An already-suspended cache is not useful in the preserve-first phase:
+        suspending it again cannot expose additional pages to reclamation.
         """
-        if req.request_id in inflight_request_ids:
-            return False
         if not self._is_started_request(req):
+            return False
+        if req.request_id in inflight_request_ids:
             return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
@@ -1087,23 +1162,31 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.kv_cache_manager.free_resources(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.free_resources(req)
+        if self.cross_kv_cache_manager is not None:
+            self.cross_kv_cache_manager.free_resources(req)
 
     def _try_evict_for_gen(
-        self, req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
-    ):
-        """Evict started requests from active_requests tail to make room.
+        self,
+        req: LlmRequest,
+        requests_list: RequestList,
+        req_it: int,
+        req_it_end: int,
+        evicted: RequestList,
+        inflight_request_ids: set[int],
+    ) -> tuple[int, bool]:
+        """Evict tail requests until generation admission can make progress.
 
-        Search backwards from req_it_end
-        for evictable requests (started AND KV cache active on GPU),
-        suspend them to free pages, then retry allocation.
+        First suspend safe tail requests and retry allocation after each one.
+        Suspending only releases page locks; cache placement and lower-tier
+        migration remain cache-manager decisions. Destructive release is a
+        separate release-for-recompute phase.
 
         Victims are always at indices >= req_it (not yet processed by the
         main loop), so they are never in scheduled_ctx/scheduled_gen and
         no token budget reclaim is needed.
 
-        Returns (new_req_it_end, success) tuple. new_req_it_end is always
-        updated to reflect evicted victims (even on failure) so the caller
-        can skip already-evicted requests.
+        Returns ``(new_req_it_end, success)``. ``new_req_it_end`` skips every
+        request evicted during this scheduling pass.
         """
         while req_it_end > req_it:
             victim_idx = None
@@ -1118,13 +1201,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             victim = requests_list[victim_idx]
             logger.debug(
                 f"[V2Scheduler] Evicting request {victim.py_request_id} "
-                f"(state={victim.state.name}) to free pages for request {req.py_request_id}"
+                f"(state={victim.state.name}) while preserving its cache before "
+                f"retrying request {req.py_request_id}"
             )
-            self._suspend_request(victim)
+            self._evict_request(victim)
             evicted.append(victim)
             req_it_end = victim_idx
 
-            if self.kv_cache_manager.try_allocate_generation(req):
+            if self._try_allocate_generation(req):
                 return req_it_end, True
 
         return req_it_end, False
@@ -1140,13 +1224,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_paused: RequestList,
         inflight_request_ids: set[int],
     ) -> tuple[int, bool]:
-        """Use destructive recompute pause when ordinary suspend is insufficient.
+        """Use main's recompute-pause fallback after preserved eviction fails.
 
-        The recompute frontier is independent from the ordinary-eviction frontier.
-        This keeps previously-suspended started requests visible even when ordinary
-        eviction skips over them and shrinks its frontier to an earlier victim.
-        Recompute pause does not shrink the ordinary scheduling frontier; exact
-        victim indices prevent destructively-freed requests from being revisited.
+        The scheduler does not inspect the physical cache topology. Every
+        candidate first goes through manager-owned eviction; if allocation
+        still fails, this fallback releases one safe request for recomputation.
         """
         if not self.enable_recompute_pause:
             return req_it_end, False
@@ -1157,14 +1239,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if i in recompute_pause_state.victim_indices:
                     continue
                 candidate = requests_list[i]
-                was_evicted = any(evicted_req is candidate for evicted_req in evicted)
-                if (
-                    self.kv_cache_manager.can_evict or not was_evicted
-                ) and self._is_recompute_pause_candidate(candidate, inflight_request_ids):
+                if self._is_recompute_pause_candidate(candidate, inflight_request_ids):
                     victim_idx = i
                     break
 
-            if victim_idx is None and self.kv_cache_manager.can_evict:
+            if victim_idx is None:
                 victim = next(
                     (
                         candidate
@@ -1178,10 +1257,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 victim_idx = next(
                     i for i, candidate in enumerate(requests_list) if candidate is victim
                 )
-            elif victim_idx is not None:
-                victim = requests_list[victim_idx]
             else:
-                break
+                victim = requests_list[victim_idx]
 
             evicted_victim_pos = next(
                 (i for i, candidate in enumerate(evicted) if candidate is victim), None
@@ -1189,24 +1266,27 @@ class KVCacheV2Scheduler(RequestScheduler):
             if evicted_victim_pos is not None:
                 evicted.pop(evicted_victim_pos)
             logger.debug(
-                f"[V2Scheduler] Recompute-pausing request {victim.py_request_id} "
-                f"to free pages for request {req.py_request_id}"
+                f"[V2Scheduler] Releasing cache for request {victim.py_request_id} "
+                f"for recomputation to admit request {req.py_request_id}"
             )
             self._recompute_pause_request(victim)
             recompute_paused.append(victim)
             recompute_pause_state.victim_indices.add(victim_idx)
             recompute_pause_state.frontier = min(recompute_pause_state.frontier, victim_idx)
 
-            # Retry immediately: full teardown can make the allocation fit even
-            # for an already-suspended victim. If it still fails, use any
-            # secondary-tier capacity just released to ordinary-suspend another
-            # active victim.
-            success = self.kv_cache_manager.try_allocate_generation(req)
-            if not success and self.kv_cache_manager.can_evict:
+            # Releasing a preserved request can also free room in a lower tier,
+            # so give another active request the ordinary eviction path before
+            # selecting another recompute victim.
+            success = self._try_allocate_generation(req)
+            if not success:
                 req_it_end, success = self._try_evict_for_gen(
-                    req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
+                    req,
+                    requests_list,
+                    req_it,
+                    req_it_end,
+                    evicted,
+                    inflight_request_ids,
                 )
-
             if success:
                 return req_it_end, True
 

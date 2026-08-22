@@ -5183,6 +5183,10 @@ class PyExecutor:
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if self._is_kv_manager_v2:
+                    # Closing a V2 cache records the previous forward stream's
+                    # completion event on every released slot. A new owner
+                    # waits on that event, matching V1's overlap ordering
+                    # without exposing physical cache ownership to scheduler.
                     self._terminate_recompute_paused_requests(scheduled_batch)
                 else:
                     self._terminate_requests(scheduled_batch.paused_requests)

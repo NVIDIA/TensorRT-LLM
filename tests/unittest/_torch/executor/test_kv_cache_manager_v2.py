@@ -36,11 +36,38 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     HostCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
+    OutOfMemoryError,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+def test_generation_oom_is_reported_as_allocation_failure() -> None:
+    class ConcreteOOMError(OutOfMemoryError):
+        pass
+
+    manager = object.__new__(KVCacheManagerV2)
+    kv_cache = Mock(is_active=True, capacity=7)
+    kv_cache.resize.side_effect = ConcreteOOMError("CUDA out of memory")
+    manager.kv_cache_map = {11: kv_cache}
+    manager._allocated_draft_lens = {}
+    manager._effective_draft_len = lambda _req: 0
+    request = SimpleNamespace(py_request_id=11)
+
+    assert not manager.try_allocate_generation(request)
+
+
+def test_suspend_delegates_cache_placement_to_manager() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    kv_cache = Mock(is_active=True)
+    manager.kv_cache_map = {12: kv_cache}
+    request = SimpleNamespace(py_request_id=12)
+
+    manager.suspend_request(request)
+
+    kv_cache.suspend.assert_called_once_with()
 
 
 class _CacheTierInitError(Exception):
@@ -277,9 +304,9 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
         )
 
 
-def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:
+def test_disk_secondary_tier_is_configured(tmp_path) -> None:
     impl = Mock()
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
+    _, impl_constructor = _make_manager_for_cache_tier_test(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
             host_cache_size=0,
@@ -289,7 +316,6 @@ def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:
         [impl],
     )
 
-    assert manager.can_evict
     assert impl_constructor.call_count == 1
     cache_tiers = impl_constructor.call_args.args[0].cache_tiers
     assert [type(tier) for tier in cache_tiers] == [
@@ -311,16 +337,12 @@ def test_disk_init_failure_does_not_use_host_fallback(tmp_path) -> None:
         )
 
 
-@pytest.mark.parametrize(
-    ("add_secondary_gpu_tier", "expected_can_evict"),
-    [(False, False), (True, True)],
-)
-def test_host_init_fallback_recomputes_eviction_capability(
+@pytest.mark.parametrize("add_secondary_gpu_tier", [False, True])
+def test_host_init_fallback_preserves_secondary_gpu_tier(
     add_secondary_gpu_tier: bool,
-    expected_can_evict: bool,
 ) -> None:
     impl = Mock()
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
+    _, impl_constructor = _make_manager_for_cache_tier_test(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
             host_cache_size=16 << 20,
@@ -329,7 +351,6 @@ def test_host_init_fallback_recomputes_eviction_capability(
         add_secondary_gpu_tier=add_secondary_gpu_tier,
     )
 
-    assert manager.can_evict is expected_can_evict
     assert impl_constructor.call_count == 2
     initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
     fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
@@ -340,7 +361,7 @@ def test_host_init_fallback_recomputes_eviction_capability(
 
 def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
     impl = Mock()
-    manager, impl_constructor = _make_manager_for_cache_tier_test(
+    _, impl_constructor = _make_manager_for_cache_tier_test(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
             host_cache_size=16 << 20,
@@ -350,7 +371,6 @@ def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
         [_CacheTierInitError("host tier init failed"), impl],
     )
 
-    assert manager.can_evict
     assert impl_constructor.call_count == 2
     initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
     fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers

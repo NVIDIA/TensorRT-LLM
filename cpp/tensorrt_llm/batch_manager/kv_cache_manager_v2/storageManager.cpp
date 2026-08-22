@@ -284,9 +284,9 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota));
     size_t const gpuGranularity = mGpuPhysMemAllocator->physMemSize();
 
-    // Constraints are hot-level feasibility floors. They are scaled by
-    // 1/maxUtilForResume because KvCache::resume rejects a pool group above that
-    // utilization. Other levels need only the structural one-slot floor.
+    // Constraints are hot-level feasibility floors. Pools containing attention reserve the headroom enforced by
+    // KvCache::resume, while pure SSM pools use their full capacity. Other levels need only a structural one-slot
+    // floor.
     mMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
@@ -1377,6 +1377,18 @@ PoolGroupIndex StorageManager::getPoolGroupIndex(LifeCycleId lc) const
     return getPoolGroupIndex(kHotLevel, lc);
 }
 
+bool StorageManager::poolGroupNeedsResumeHeadroom(PoolGroupIndex pgIdx) const
+{
+    for (auto const& [lifeCycle, value] : mLifeCycles)
+    {
+        if (std::holds_alternative<AttnLifeCycle>(value) && getPoolGroupIndex(kHotLevel, lifeCycle) == pgIdx)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 PoolIndex StorageManager::numPools(CacheLevel level, PoolGroupIndex pgIdx) const
 {
     return mLevels.at(level).storage->numPools(pgIdx);
@@ -1730,8 +1742,8 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsFromConstraints(std
     int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
 {
     TLLM_CHECK_WITH_INFO(maxUtilForResume > 0.0F && maxUtilForResume <= 1.0F, "max_util_for_resume must be in (0, 1]");
-    // All returned elements are positive. Constraint-derived floors include headroom
-    // for the utilization gate checked by KvCache::resume.
+    // All returned elements are positive. Constraint-derived lifecycle weights include headroom only when the
+    // corresponding hot pool group is subject to the utilization gate checked by KvCache::resume.
     TypedVec<LifeCycleId, SlotCount> maxSlots(numLifeCycles(), 0);
 
     auto swaFloorBlocks = [tokensPerBlock](AttnLifeCycle const& lc) -> int
@@ -1771,8 +1783,10 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsFromConstraints(std
         auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
         for (LifeCycleId lifeCycle{0}; lifeCycle < slots.size(); ++lifeCycle)
         {
-            auto const scaledSlots = static_cast<SlotCount>(
-                std::ceil(static_cast<double>(slots[lifeCycle]) / static_cast<double>(maxUtilForResume)));
+            auto const poolGroup = getPoolGroupIndex(kHotLevel, lifeCycle);
+            double const utilizationLimit = poolGroupNeedsResumeHeadroom(poolGroup) ? maxUtilForResume : 1.0;
+            auto const scaledSlots
+                = static_cast<SlotCount>(std::ceil(static_cast<double>(slots[lifeCycle]) / utilizationLimit));
             maxSlots[lifeCycle] = std::max(maxSlots[lifeCycle], scaledSlots);
         }
     }
@@ -1795,8 +1809,9 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupMinSlotsFrom
         auto const slots = computePoolGroupSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
         for (PoolGroupIndex poolGroup{0}; poolGroup < slots.size(); ++poolGroup)
         {
-            auto const scaledSlots = static_cast<SlotCount>(
-                std::ceil(static_cast<double>(slots[poolGroup]) / static_cast<double>(maxUtilForResume)));
+            double const utilizationLimit = poolGroupNeedsResumeHeadroom(poolGroup) ? maxUtilForResume : 1.0;
+            auto const scaledSlots
+                = static_cast<SlotCount>(std::ceil(static_cast<double>(slots[poolGroup]) / utilizationLimit));
             maxSlots[poolGroup] = std::max(maxSlots[poolGroup], scaledSlots);
         }
     }
