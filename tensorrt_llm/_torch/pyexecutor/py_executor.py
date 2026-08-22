@@ -586,6 +586,7 @@ class PyExecutor:
             dwdp_manager: Optional[DwdpManager] = None,
             enable_kv_pool_rebalance: bool = False):
         super(PyExecutor, self).__init__()
+        self._metrics: dict[str, float | dict[str, float]] = {}
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
         # Store the execution stream for decoder/model forward operations.
@@ -1146,6 +1147,11 @@ class PyExecutor:
 
         if start_worker:
             self.start_worker()
+
+    @property
+    def metrics(self) -> dict[str, float | dict[str, float]]:
+        """Return executor construction and model-engine startup metrics."""
+        return self._metrics
 
     def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:

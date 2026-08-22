@@ -34,6 +34,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ..attention_backend.interface import AttentionRuntimeFeatures
 from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
+from ..models.modeling_utils import timing_metric
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
@@ -99,6 +100,31 @@ class _ExecutorMemoryMonitor:
         "Model",
         ExecutorMemoryType.MODEL_ENGINE_DRAFT:
         "Draft model for speculative decoding",
+    }
+
+    creation_stage_metric_names = {
+        ExecutorMemoryType.SAMPLER:
+        "sampler_creation_seconds",
+        ExecutorMemoryType.DRAFTER:
+        "speculative_drafter_creation_seconds",
+        ExecutorMemoryType.GUIDED_DECODER:
+        "guided_decoder_creation_seconds",
+        ExecutorMemoryType.SPEC_RESOURCES:
+        "speculative_decoding_resource_manager_creation_seconds",
+        ExecutorMemoryType.INIT_KV_CACHE:
+        "initial_kv_cache_creation_seconds",
+        ExecutorMemoryType.INIT_EXTRA_RESOURCES:
+        "initial_py_executor_creation_seconds_for_kv_cache_estimation",
+        ExecutorMemoryType.MODEL_EXTRA:
+        "kv_cache_capacity_configuration_seconds",
+        ExecutorMemoryType.EXTRA_RESOURCES:
+        "final_py_executor_creation_seconds",
+        ExecutorMemoryType.KV_CACHE:
+        "final_kv_cache_creation_seconds",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN:
+        "model_engine_creation_seconds",
+        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
+        "draft_model_engine_creation_seconds",
     }
 
     # Suggestion to reduce component memory usage
@@ -334,6 +360,21 @@ def log_memory_usage(stage: str):
     )
 
 
+def _move_model_engine_metrics(
+        py_executor: PyExecutor,
+        model_engine: PyTorchModelEngine,
+        stage: str,
+        draft_model_engine: Optional[PyTorchModelEngine] = None) -> None:
+    """Move model-engine metrics into the executor under a startup stage."""
+    py_executor.metrics[f"{stage}_model_engine"] = dict(model_engine.metrics)
+    model_engine.metrics.clear()
+
+    if draft_model_engine is not None:
+        py_executor.metrics[f"{stage}_draft_model_engine"] = dict(
+            draft_model_engine.metrics)
+        draft_model_engine.metrics.clear()
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
@@ -361,10 +402,36 @@ def create_py_executor(
     Returns:
         A fully initialized PyExecutor instance.
     """
+    creation_metrics: dict[str, float] = {}
+    with timing_metric("total_executor_creation_seconds", creation_metrics):
+        py_executor = _create_py_executor(
+            llm_args=llm_args,
+            creation_metrics=creation_metrics,
+            checkpoint_dir=checkpoint_dir,
+            tokenizer=tokenizer,
+            profiling_stage_data=profiling_stage_data,
+            resource_governor_queue=resource_governor_queue,
+        )
+    py_executor.metrics.update(creation_metrics)
+    return py_executor
+
+
+def _create_py_executor(
+    llm_args: TorchLlmArgs,
+    creation_metrics: dict[str, float],
+    checkpoint_dir: Optional[str] = None,
+    tokenizer: Optional[TokenizerBase] = None,
+    profiling_stage_data: Optional[dict] = None,
+    resource_governor_queue=None,
+) -> PyExecutor:
+    """Create and initialize a PyExecutor while recording scoped metrics."""
+    initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
-    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
-        llm_args, checkpoint_dir)
+    with timing_metric("config_and_checkpoint_loader_initialization_seconds",
+                       creation_metrics):
+        llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+            llm_args, checkpoint_dir)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -574,8 +641,12 @@ def create_py_executor(
 
     @contextmanager
     def allocation_scope(current_stage: ExecutorMemoryType):
-        with mem_monitor.observe_creation_stage(current_stage):
-            stage = current_stage.value
+        stage = current_stage.value
+        metric_name = mem_monitor.creation_stage_metric_names[current_stage]
+        with timing_metric(
+                metric_name,
+                creation_metrics), mem_monitor.observe_creation_stage(
+                    current_stage):
             if not enable_sleep or stage.startswith("_no_capture"):
                 yield
             else:
@@ -1051,6 +1122,9 @@ def create_py_executor(
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
+        _move_model_engine_metrics(py_executor, model_engine, "initial",
+                                   draft_model_engine)
+        initial_model_engine_metrics = dict(py_executor.metrics)
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
 
@@ -1125,6 +1199,11 @@ def create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    py_executor.start_worker()
+    with timing_metric("worker_start_seconds", creation_metrics):
+        py_executor.start_worker()
+
+    py_executor.metrics.update(initial_model_engine_metrics)
+    _move_model_engine_metrics(py_executor, model_engine, "final",
+                               draft_model_engine)
 
     return py_executor
