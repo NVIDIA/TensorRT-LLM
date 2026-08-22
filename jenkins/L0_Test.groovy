@@ -1469,7 +1469,19 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     try {
                         cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
                     } catch (Exception e) {
-                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                        // A "Clean Up Slurm Resource" failure is teardown of a SLURM
+                        // allocation in a finally block, never a product-test result, so it
+                        // is retryable infra by construction. Throw it typed (chaining the
+                        // cause) instead of error(...): error(...) flattens the exception to
+                        // a bare string, dropping the cause chain and the ssh transport
+                        // signature, which is how a cleanup ssh drop (exit 255) reaches
+                        // FailureClassifier as an unmatched UserFailure and fail-fast-kills
+                        // sibling stages. A typed throw still de-interrupts into a retryable
+                        // throw for the retry(3) workaround, and keeps any pod-death signal
+                        // in the cause chain for isDispatcherPodFailure() upstream.
+                        throw new InfraFailure(
+                            "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                            e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
                     }
                 }
             }
@@ -2529,7 +2541,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     try {
                         cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
                     } catch (Exception e) {
-                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                        // A "Clean Up Slurm Resource" failure is teardown of a SLURM
+                        // allocation in a finally block, never a product-test result, so it
+                        // is retryable infra by construction. Throw it typed (chaining the
+                        // cause) instead of error(...): error(...) flattens the exception to
+                        // a bare string, dropping the cause chain and the ssh transport
+                        // signature, which is how a cleanup ssh drop (exit 255) reaches
+                        // FailureClassifier as an unmatched UserFailure and fail-fast-kills
+                        // sibling stages. A typed throw still de-interrupts into a retryable
+                        // throw for the retry(3) workaround, and keeps any pod-death signal
+                        // in the cause chain for isDispatcherPodFailure() upstream.
+                        throw new InfraFailure(
+                            "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                            e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
                     }
                 }
             }
