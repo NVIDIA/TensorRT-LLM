@@ -234,6 +234,13 @@ class WorkerCommIpcAddrs(NamedTuple):
     # these lanes; result_queue_addr then aliases lane 0 (the launcher).
     frontend_result_queue_addrs: Optional[list[tuple[str,
                                                      Optional[bytes]]]] = None
+    # Worker -> proxy ack channel for synchronous control requests
+    # (currently: StartProfileRequest, StopProfileRequest). Lets the
+    # HTTP /start_profile and /stop_profile handlers wait for the worker
+    # to actually finish processing the request before returning, so the
+    # documented "trace is on disk by the time /stop_profile returns
+    # 200" contract holds in the IPC-proxy deployment too.
+    profile_ack_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
 
 
 # Multi-frontend client_id namespacing: a FRONTEND_ID_BITS-wide frontend id
