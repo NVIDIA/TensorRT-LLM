@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -22,6 +37,26 @@ from tensorrt_llm.mapping import Mapping
 
 # Setup NEED_SETUP_CACHE_CLASSES_MAPPING to an empty dict for modeling_nemotron_nas.py
 transformers.generation.utils.NEED_SETUP_CACHE_CLASSES_MAPPING = dict()
+
+
+def instantiate_variable_cache(cache_cls: type, **kwargs: Any) -> Any:
+    """Instantiate the checkpoint's remote ``VariableCache``.
+
+    Its ``__init__`` assigns ``self.max_batch_size`` and ``self.max_cache_len``,
+    which ``transformers>=5`` exposes as read-only properties on ``Cache``, so the
+    assignments raise ``AttributeError``. Shadowing those names with plain class
+    attributes on a subclass makes them writable instance attributes again, and
+    is a no-op on ``transformers`` versions that never defined the properties.
+    """
+    shadowed = {
+        name: None
+        for name in ("max_batch_size", "max_cache_len")
+        if isinstance(getattr(cache_cls, name, None), property)
+    }
+    if shadowed:
+        cache_cls = type(f"Compat{cache_cls.__name__}", (cache_cls, ), shadowed)
+    return cache_cls(**kwargs)
+
 
 NEMOTRON_NAS_MINI_CONFIG = {
     "architectures": ["DeciLMForCausalLM"],
@@ -360,7 +395,6 @@ class TestNemotronNAS(unittest.TestCase):
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     @torch.no_grad()
-    @unittest.skip("https://nvbugspro.nvidia.com/bug/5439817")
     def test_nemotron_nas_allclose_to_hf(self, scenario: Scenario) -> None:
         """
         Compare output to HF
@@ -465,9 +499,10 @@ class TestNemotronNAS(unittest.TestCase):
         position_ids = [torch.arange(0, input_ids.size(-1))]
         position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
         # And, lastly, this is the simplest way of creating a Cache that `hf_nemotron_nas` will accept
-        past_key_values = VariableCache(config=nemotron_nas_config,
-                                        dtype=dtype,
-                                        batch_size=1)
+        past_key_values = instantiate_variable_cache(VariableCache,
+                                                     config=nemotron_nas_config,
+                                                     dtype=dtype,
+                                                     batch_size=1)
         with torch.inference_mode():
             attn_metadata.prepare()
             logits = nemotron_nas.forward(input_ids=input_ids,
