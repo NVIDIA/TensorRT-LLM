@@ -1,7 +1,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
 import json
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
@@ -300,6 +300,17 @@ class BaseToolParser(ABC):
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
         return True
+
+    def build_strict_structural_tag_format(
+            self, tools: List[Tool]) -> Optional[Dict[str, Any]]:
+        """Build a complete structural-tag format for strict-tool decoding.
+
+        Override on parsers whose wire format cannot be expressed through
+        the `structure_info` begin/end/trigger triples (e.g. kimi_k3's
+        XTML call tags). Returns the xgrammar structural-tag format dict,
+        or None to fall back to the `structure_info` path.
+        """
+        return None
 
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
