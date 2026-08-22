@@ -20,6 +20,7 @@ set(SRCS
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
     utils/speculativeChoicesUtils.cpp
+    locality_domain/locality_domain_utils.cpp
     bufferManager.cpp
     cudaMemPool.cpp
     decodingLayerWorkspace.cpp
@@ -75,6 +76,8 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
+
+target_link_libraries(runtime_src PUBLIC ${CUDA_NVML_LIB})
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 

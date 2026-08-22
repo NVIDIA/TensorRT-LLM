@@ -36,6 +36,7 @@
 #include "tensorrt_llm/runtime/iGptDecoderBatched.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
+#include "tensorrt_llm/runtime/locality_domain/locality_domain_utils.h"
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/mcastGPUBuffer.h"
@@ -53,6 +54,7 @@
 #include <nanobind/stl/bind_vector.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/trampoline.h>
@@ -343,6 +345,108 @@ void initBindings(nb::module_& m)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
         .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+
+    // LOCALITY_DOMAIN Localization Handle bindings
+    nb::class_<tensorrt_llm::locality_domain::LocalizationHandle>(m, "LocalizationHandle")
+        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
+        .def("supports_localization", &tensorrt_llm::locality_domain::LocalizationHandle::supportsLocalization,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("supports_memory_localization",
+            &tensorrt_llm::locality_domain::LocalizationHandle::supportsMemoryLocalization,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("supports_compute_localization",
+            &tensorrt_llm::locality_domain::LocalizationHandle::supportsComputeLocalization,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "locality_domain_malloc",
+            [](tensorrt_llm::locality_domain::LocalizationHandle& self, size_t size, int localityDomainId) -> uintptr_t
+            {
+                void* ptr = nullptr;
+                self.localityDomainMalloc(&ptr, size, localityDomainId);
+                return reinterpret_cast<uintptr_t>(ptr);
+            },
+            nb::arg("size"), nb::arg("locality_domain_id"),
+            "Allocate LOCALITY_DOMAIN localized memory and return pointer as integer address",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "locality_domain_free",
+            [](tensorrt_llm::locality_domain::LocalizationHandle& self, uintptr_t ptr)
+            { self.localityDomainFree(reinterpret_cast<void*>(ptr)); },
+            nb::arg("ptr"), "Free LOCALITY_DOMAIN localized memory from integer address",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "create_localized_allocation_handle",
+            [](tensorrt_llm::locality_domain::LocalizationHandle& self, size_t size, int localityDomainId,
+                unsigned int requestedHandleTypes, bool gpuDirectRDMACapable,
+                std::optional<unsigned int> usage) -> uintptr_t
+            {
+                CUmemGenericAllocationHandle const handle = usage.has_value()
+                    ? self.createLocalizedAllocationHandle(
+                        size, localityDomainId, requestedHandleTypes, gpuDirectRDMACapable, *usage)
+                    : self.createLocalizedAllocationHandle(
+                        size, localityDomainId, requestedHandleTypes, gpuDirectRDMACapable);
+                return static_cast<uintptr_t>(handle);
+            },
+            nb::arg("size"), nb::arg("locality_domain_id"), nb::arg("requested_handle_types"),
+            nb::arg("gpu_direct_rdma_capable"), nb::arg("usage") = nb::none(),
+            "Create LOCALITY_DOMAIN localized generic allocation handle and return it as an integer",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "try_create_localized_allocation_handle",
+            [](tensorrt_llm::locality_domain::LocalizationHandle& self, size_t size, int localityDomainId,
+                unsigned int requestedHandleTypes, bool gpuDirectRDMACapable,
+                unsigned int usage) -> std::pair<int, uintptr_t>
+            {
+                CUmemGenericAllocationHandle handle{};
+                CUresult const result = self.tryCreateLocalizedAllocationHandle(
+                    &handle, size, localityDomainId, requestedHandleTypes, gpuDirectRDMACapable, usage);
+                return {static_cast<int>(result), static_cast<uintptr_t>(handle)};
+            },
+            nb::arg("size"), nb::arg("locality_domain_id"), nb::arg("requested_handle_types"),
+            nb::arg("gpu_direct_rdma_capable"), nb::arg("usage"),
+            "Try to create a localized allocation and return (CUresult, handle)",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_localized_allocation_granularity",
+            &tensorrt_llm::locality_domain::LocalizationHandle::getLocalizedAllocationGranularity,
+            nb::arg("locality_domain_id"), nb::arg("requested_handle_types"), nb::arg("gpu_direct_rdma_capable"),
+            nb::arg("usage"), "Get minimum allocation granularity for a localized VMM allocation",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "try_get_localized_allocation_granularity",
+            [](tensorrt_llm::locality_domain::LocalizationHandle& self, int localityDomainId,
+                unsigned int requestedHandleTypes, bool gpuDirectRDMACapable,
+                unsigned int usage) -> std::pair<int, size_t>
+            {
+                size_t granularity{};
+                CUresult const result = self.tryGetLocalizedAllocationGranularity(
+                    &granularity, localityDomainId, requestedHandleTypes, gpuDirectRDMACapable, usage);
+                return {static_cast<int>(result), granularity};
+            },
+            nb::arg("locality_domain_id"), nb::arg("requested_handle_types"), nb::arg("gpu_direct_rdma_capable"),
+            nb::arg("usage"), "Try to get localized VMM granularity and return (CUresult, granularity)",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "create_localized_stream",
+            [](tensorrt_llm::locality_domain::LocalizationHandle& self, int localityDomainId) -> uintptr_t
+            {
+                CUstream stream = self.createLocalizedStream(localityDomainId);
+                return reinterpret_cast<uintptr_t>(stream);
+            },
+            nb::arg("locality_domain_id"),
+            "Get a process-lifetime cached LOCALITY_DOMAIN localized stream as an integer address; callers must not "
+            "destroy it",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_locality_domain_compute_sm_counts",
+            &tensorrt_llm::locality_domain::LocalizationHandle::getLocalityDomainComputeSmCounts,
+            nb::arg("locality_domain_id"),
+            "Get (localized partition SM count, full-device SM count), or (0, 0) when unavailable",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_reserved_remainder_stream",
+            [](tensorrt_llm::locality_domain::LocalizationHandle& self) -> uintptr_t
+            { return reinterpret_cast<uintptr_t>(self.getReservedRemainderStream()); },
+            "Get the borrowed process-lifetime remainder Green Context stream, or 0 when unavailable",
+            nb::call_guard<nb::gil_scoped_release>());
 
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);

@@ -126,6 +126,7 @@ add_library(
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
   customMoeRoutingOp.cpp
+  localityDomainAllocator.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
@@ -174,7 +175,8 @@ endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
-  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB})
+  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
+                                          CUDA::nvml)
 endif()
 
 if(NOT WIN32)
