@@ -104,6 +104,12 @@ def test_v2v_multipart_payload(tmp_path: Path) -> None:
     assert json.loads(fields["extra_params"]) == extra_params
 
 
+def test_transfer_multipart_payload(tmp_path: Path) -> None:
+    fields = _multipart_fields(tmp_path, {"extra_params": {"edge": True}})
+
+    assert json.loads(fields["extra_params"]) == {"edge": True}
+
+
 def test_ti2av_multipart_payload(tmp_path: Path) -> None:
     fields = _multipart_fields(
         tmp_path,
@@ -139,6 +145,61 @@ def test_malformed_extra_body(raw_value: str) -> None:
         benchmark._parse_extra_body(raw_value)
 
 
+def test_prepare_transfer_derives_edge_from_input_reference(tmp_path: Path) -> None:
+    input_reference = tmp_path / "source.mp4"
+    input_reference.write_bytes(b"source video")
+
+    extra_body = benchmark._prepare_transfer_extra_body(
+        extra_body={"extra_params": {"control_guidance": 1.25}},
+        input_reference=str(input_reference),
+        transfer_hint="edge",
+        control_reference=None,
+    )
+
+    assert extra_body == {
+        "extra_params": {
+            "control_guidance": 1.25,
+            "edge": True,
+        }
+    }
+
+
+def test_prepare_transfer_embeds_precomputed_control(tmp_path: Path) -> None:
+    control_reference = tmp_path / "depth.mp4"
+    control_reference.write_bytes(b"precomputed depth control")
+
+    extra_body = benchmark._prepare_transfer_extra_body(
+        extra_body=None,
+        input_reference=None,
+        transfer_hint="depth",
+        control_reference=str(control_reference),
+    )
+
+    encoded_control = extra_body["extra_params"]["depth"]["control"]
+    assert base64.b64decode(encoded_control, validate=True) == b"precomputed depth control"
+
+
+@pytest.mark.parametrize("transfer_hint", ["depth", "seg", "wsm"])
+def test_prepare_transfer_requires_precomputed_control(transfer_hint: str) -> None:
+    with pytest.raises(ValueError, match="requires --control-reference"):
+        benchmark._prepare_transfer_extra_body(
+            extra_body=None,
+            input_reference="source.mp4",
+            transfer_hint=transfer_hint,
+            control_reference=None,
+        )
+
+
+def test_prepare_transfer_rejects_duplicate_hint() -> None:
+    with pytest.raises(ValueError, match="conflicts"):
+        benchmark._prepare_transfer_extra_body(
+            extra_body={"extra_params": {"edge": True}},
+            input_reference="source.mp4",
+            transfer_hint="edge",
+            control_reference=None,
+        )
+
+
 def test_input_reference_rejects_image_backend(tmp_path: Path) -> None:
     input_reference = tmp_path / "input.png"
     input_reference.write_bytes(b"image")
@@ -163,6 +224,18 @@ def test_known_non_audio_checkpoint_rejected(monkeypatch: pytest.MonkeyPatch) ->
             input_reference=None,
             extra_body={"format": "mp4", "extra_params": {"enable_audio": True}},
             require_audio=True,
+        )
+
+
+def test_cosmos3_edge_transfer_rejected() -> None:
+    with pytest.raises(ValueError, match="does not support Transfer"):
+        benchmark._validate_request_configuration(
+            backend="openai-videos",
+            model_id="nvidia/Cosmos3-Edge",
+            input_reference="source.mp4",
+            extra_body={"extra_params": {"edge": True}},
+            require_audio=False,
+            transfer_hint="edge",
         )
 
 
@@ -524,6 +597,50 @@ def test_shell_argument_construction_with_spaces_and_json(tmp_path: Path) -> Non
     }
 
 
+def test_shell_transfer_derives_edge_from_input_video(tmp_path: Path) -> None:
+    input_reference = tmp_path / "source video.mp4"
+    input_reference.write_bytes(b"source video")
+    result = _run_shell(
+        tmp_path,
+        script_name="benchmark_visual_gen_client.sh",
+        MODE="transfer",
+        TRANSFER_HINT="edge",
+        INPUT_REFERENCE=str(input_reference),
+        EXTRA_PARAMS='{"emphasize_control_in_prompt": false}',
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--transfer-hint edge" in result.stdout
+    assert "source\\ video.mp4" in result.stdout
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["mode"] == "transfer"
+    assert metadata["transfer_hint"] == "edge"
+    assert metadata["input_reference"] == "source video.mp4"
+    assert metadata["control_reference"] is None
+
+
+def test_shell_transfer_accepts_precomputed_control(tmp_path: Path) -> None:
+    control_reference = tmp_path / "depth control.mp4"
+    control_reference.write_bytes(b"depth control")
+    result = _run_shell(
+        tmp_path,
+        script_name="benchmark_visual_gen_client.sh",
+        MODE="transfer",
+        TRANSFER_HINT="depth",
+        CONTROL_REFERENCE=str(control_reference),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--transfer-hint depth" in result.stdout
+    assert "--control-reference" in result.stdout
+    assert "depth\\ control.mp4" in result.stdout
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["mode"] == "transfer"
+    assert metadata["transfer_hint"] == "depth"
+    assert metadata["input_reference"] is None
+    assert metadata["control_reference"] == "depth control.mp4"
+
+
 def test_shell_enables_client_media_retention(tmp_path: Path) -> None:
     result = _run_shell(
         tmp_path,
@@ -717,6 +834,15 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         ({"MODE": "i2v"}, "requires INPUT_REFERENCE"),
         ({"MODE": "v2v"}, "requires INPUT_REFERENCE"),
         ({"MODE": "ti2av"}, "requires INPUT_REFERENCE"),
+        ({"MODE": "transfer"}, "requires TRANSFER_HINT"),
+        (
+            {"MODE": "transfer", "TRANSFER_HINT": "depth"},
+            "requires CONTROL_REFERENCE",
+        ),
+        (
+            {"MODE": "t2v", "TRANSFER_HINT": "edge"},
+            "TRANSFER_HINT requires MODE=transfer",
+        ),
         (
             {"MODE": "t2i", "BACKEND": "openai-videos"},
             "requires BACKEND=openai-images",

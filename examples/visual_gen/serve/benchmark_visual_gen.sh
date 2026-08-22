@@ -12,6 +12,8 @@ MODE=${MODE:-t2v}
 MODEL=${MODEL:-nvidia/Cosmos3-Nano}
 # Use ${VAR-default}, not ${VAR:-default}: an explicitly empty config is valid.
 SERVER_CONFIG=${SERVER_CONFIG-"${PROJECT_ROOT}/examples/visual_gen/configs/cosmos3-nano-1gpu.yaml"}
+TRANSFER_HINT=${TRANSFER_HINT-}
+CONTROL_REFERENCE=${CONTROL_REFERENCE-}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8000}
 PYTHON_BIN=${PYTHON_BIN:-python3}
@@ -54,6 +56,7 @@ if [ ! -x "$CLIENT_SCRIPT" ]; then
 fi
 
 export MODE MODEL SERVER_CONFIG HOST PORT PYTHON_BIN DRY_RUN RESULT_DIR SERVER_LOG_PATH
+export TRANSFER_HINT CONTROL_REFERENCE
 
 echo "VisualGen Serving Benchmark (server + client)"
 echo "Result directory: ${RESULT_DIR}"
