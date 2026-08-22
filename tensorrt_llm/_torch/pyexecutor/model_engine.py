@@ -431,7 +431,6 @@ class PyTorchModelEngine(ModelEngine):
                 llm_args.checkpoint_loader,
                 llm_args.checkpoint_format,
                 mx_config=llm_args.mx_config,
-                mx_model_name=llm_args.model,
             )
 
         self.mapping = mapping

@@ -207,6 +207,30 @@ def _llama_alias_state(model):
     }
 
 
+def _mx_canonical_parameter_catalog(model: nn.Module):
+    """Mirror MX's canonical TRT-LLM parameter view without importing MX."""
+    catalog = {}
+    seen_storages = set()
+    runtime_alias_components = {"next_attn", "next_layer_layernorm"}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        storage = (
+            parameter.device.type,
+            parameter.device.index,
+            parameter.data_ptr(),
+        )
+        if runtime_alias_components.intersection(name.split(".")):
+            continue
+        if storage in seen_storages:
+            continue
+        seen_storages.add(storage)
+        catalog[name] = (
+            parameter.data_ptr(),
+            tuple(parameter.shape),
+            parameter.dtype,
+        )
+    return catalog
+
+
 def _llama_input_embeddings(model: nn.Module) -> torch.Tensor:
     input_ids = torch.tensor(
         [0, 1, 2],
@@ -433,13 +457,10 @@ def test_construct_checkpoint_loader_passes_mx_config():
         None,
         "MX",
         mx_config=mx_config,
-        mx_model_name="Qwen/Qwen2.5-7B-Instruct",
     )
 
     assert isinstance(checkpoint_loader, MXCheckpointLoader)
     assert checkpoint_loader.mx_server_url == "http://mx:8001"
-    assert checkpoint_loader.query_timeout_s == 17
-    assert checkpoint_loader.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
 
 def _format_documented_values(
@@ -543,6 +564,15 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert kwargs["mapping"] is loader.mapping
     assert kwargs["model"] is model
     assert kwargs["source_identity"] is loader._source_identity
+    assert (
+        kwargs["model_config"]
+        is model_loader_mod.AutoModelForCausalLM.from_config.call_args.args[0]
+    )
+    assert kwargs["load_config"] is loader.llm_args
+    assert (
+        kwargs["post_transform_protocol_version"]
+        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+    )
     assert kwargs["allow_post_transform_weights"] is True
     assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
     assert loader._call_load_weights.call_count == 0
@@ -564,6 +594,73 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(
     assert model._weights_transformed is False
     assert model.linear._weights_transformed is False
     assert events == ["post_load_weights", "load_weights"]
+
+
+def test_cleanup_releases_active_checkpoint_loader(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.is_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+
+    loader.load("/ckpt", checkpoint_loader)
+    loader.cleanup()
+
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._checkpoint_loader is None
+
+
+def test_cleanup_swallows_checkpoint_loader_failure(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    cleanup_error = RuntimeError("cleanup failed")
+    checkpoint_loader.cleanup.side_effect = cleanup_error
+    loader._checkpoint_loader = checkpoint_loader
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
+
+    loader.cleanup()
+
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._checkpoint_loader is None
+    warning.assert_called_once_with(
+        f"Failed to clean up checkpoint loader {checkpoint_loader!r}: {cleanup_error!r}"
+    )
+
+
+def test_cleanup_continues_after_gms_failure(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    gms_backend = MagicMock(name="gms_backend")
+    cleanup_error = RuntimeError("gms cleanup failed")
+    gms_backend.cleanup.side_effect = cleanup_error
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    loader._gms_backend = gms_backend
+    loader._checkpoint_loader = checkpoint_loader
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
+
+    loader.cleanup()
+
+    gms_backend.cleanup.assert_called_once_with()
+    checkpoint_loader.cleanup.assert_called_once_with()
+    assert loader._gms_backend is None
+    assert loader._checkpoint_loader is None
+    warning.assert_called_once_with(
+        f"Failed to clean up GMS backend {gms_backend!r}: {cleanup_error!r}"
+    )
+
+
+def test_config_failure_retains_checkpoint_loader_for_cleanup(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    loader._load_and_validate_config.side_effect = RuntimeError("config failed")
+
+    with pytest.raises(RuntimeError, match="config failed"):
+        loader.load("/ckpt", checkpoint_loader)
+
+    assert loader._checkpoint_loader is checkpoint_loader
+    loader.cleanup()
+    checkpoint_loader.cleanup.assert_called_once_with()
 
 
 @pytest.mark.cpu_only
@@ -668,6 +765,15 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     loader._call_load_weights.assert_not_called()
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
+    assert (
+        kwargs["model_config"]
+        is model_loader_mod.AutoModelForCausalLM.from_config.call_args.args[0]
+    )
+    assert kwargs["load_config"] is loader.llm_args
+    assert (
+        kwargs["post_transform_protocol_version"]
+        == ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION
+    )
     assert callable(kwargs["prepare_post_transform_receiver"])
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
@@ -1001,6 +1107,25 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     )
 
     assert decision.qualified
+
+
+def test_staged_llama_finalization_preserves_mx_tensor_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _tiny_llama_model(monkeypatch)
+
+    # MX discovers and registers tensors after receiver alias preparation.
+    ModelLoader._setup_aliases(model)
+    registered_catalog = _mx_canonical_parameter_catalog(model)
+
+    # This is the receiver-side finalization sequence after RDMA completes.
+    ModelLoader._setup_aliases(model)
+    ModelLoader._mark_weights_transformed(model)
+    ModelLoader._walk_cache_state(model)
+    published_catalog = _mx_canonical_parameter_catalog(model)
+
+    assert registered_catalog
+    assert published_catalog == registered_catalog
 
 
 @pytest.mark.cpu_only
