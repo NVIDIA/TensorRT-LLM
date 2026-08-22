@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Set up error handling
 set -xEeuo pipefail
@@ -56,6 +70,11 @@ env | sort
 
 echo "Full Command: $pytestCommand"
 
+# Multiple srun steps may run concurrently in disaggregated performance
+# stages. Preserve this step identifier before the test environment removes
+# Slurm variables, so rank-local artifacts cannot collide between steps.
+slurm_step_id="${SLURM_STEP_ID:-0}"
+
 # For single-node test runs or disaggregated benchmark/server runs, clear all
 # environment variables related to Slurm and MPI. This prevents test processes
 # (e.g., pytest) from incorrectly initializing MPI when running under a
@@ -72,6 +91,43 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
+# Paths used for timeout classification.  All ranks share $jobWorkspace via
+# NFS, so each rank can write there and uploadResults() can collect the
+# completed records from the login node without any extra copy step.
+#
+# A pytest-timeout kill can happen on ANY rank in a multi-node distributed
+# run, not just rank 0 -- so every rank captures its own log and classifies
+# it independently. Each rank writes to its OWN per-rank JSONL
+# (timeout_data_step${slurm_step_id}_rank${SLURM_PROCID}.jsonl) rather than
+# the shared timeout_data.jsonl: multiple ranks appending concurrently to one
+# file over NFS is not safe (a >PIPE_BUF snippet write is not guaranteed
+# atomic), so concurrent writes are avoided entirely.
+# After the Slurm job finishes, uploadResults() downloads every rank file and
+# generate_timeout_xml.py merges them while it creates results-timeout.xml.
+# The full pytest log is transient, so keep it on the worker node rather than
+# streaming it to the shared workspace.
+PYTEST_LOG="/tmp/pytest_output_job${SLURM_JOB_ID:-unknown}_step${slurm_step_id}_rank${SLURM_PROCID}.log"
+TIMEOUT_DATA_RANK="${jobWorkspace}/timeout_data_step${slurm_step_id}_rank${SLURM_PROCID}.jsonl"
+UNFINISHED_FILE="${jobWorkspace}/unfinished_test.txt"
+CLASSIFY_SCRIPT="${llmSrcNode}/jenkins/scripts/classify_timeout.py"
+
+# The normal post-processing path removes this node-local log explicitly.
+# Keep an EXIT trap as well so normal early exits do not leave it behind.
+cleanup_pytest_log() {
+    rm -f "${PYTEST_LOG}" || true
+}
+
+cleanup_and_exit() {
+    cleanup_pytest_log
+    trap - EXIT
+    exit "$1"
+}
+
+trap cleanup_pytest_log EXIT
+trap 'cleanup_and_exit 129' HUP
+trap 'cleanup_and_exit 130' INT
+trap 'cleanup_and_exit 143' TERM
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
@@ -79,11 +135,29 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
-pytest_exit_code=$?
+# Every rank captures its own stdout+stderr via tee for post-run timeout
+# classification.
+export TRTLLM_TIMEOUT_DATA_FILE="${TIMEOUT_DATA_RANK}"
+if eval "$pytestCommand" 2>&1 | tee "${PYTEST_LOG}"; then
+    pytest_exit_code=0
+else
+    pytest_exit_code=${PIPESTATUS[0]}
+fi
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 python3 "$llmSrcNode/tests/test_common/s3_output.py" \
     --drain-spool "$jobWorkspace" || true
+
+# Every rank scans its own captured log for pytest-timeout banners and
+# writes records to its own per-rank JSONL. All steps are best-effort: a
+# classify failure must not change pytest_exit_code.
+python3 "${CLASSIFY_SCRIPT}" \
+    --log        "${PYTEST_LOG}" \
+    --out        "${TIMEOUT_DATA_RANK}" \
+    --unfinished "${UNFINISHED_FILE}" || \
+    echo "WARNING: slurm_run.sh: classify_timeout.py failed for rank" \
+         "${SLURM_PROCID}; timed-out tests in this invocation may be" \
+         "reported as 'unknown' instead of 'pytest_timeout'." >&2
+cleanup_pytest_log
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved
