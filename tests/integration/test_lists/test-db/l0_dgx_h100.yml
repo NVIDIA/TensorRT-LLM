@@ -46,6 +46,7 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[no_block_reuse]
   - unittest/llmapi/apps/test_disagg_serving_perf_metrics.py
   - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
+  - disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_physical_ownership_phase1[TinyLlama-1.1B-Chat-v1.0]
   # llmapi
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_gen_only_spec_dec
   # ------------- Model specific tests ---------------

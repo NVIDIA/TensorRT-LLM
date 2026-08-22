@@ -25,6 +25,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
@@ -33,7 +34,10 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 
 @dataclass
@@ -123,6 +127,144 @@ class _FakeClock:
     def advance(self, elapsed_s: Optional[float]) -> None:
         assert elapsed_s is not None
         self.now_s += elapsed_s
+
+
+def _phase1_mapping() -> SimpleNamespace:
+    return SimpleNamespace(
+        tp_size=1,
+        pp_size=1,
+        cp_size=1,
+        dp_size=1,
+        enable_attention_dp=False,
+        dwdp_enabled=False,
+        dwdp_size=0,
+    )
+
+
+def _phase1_v1_manager() -> KVCacheManager:
+    manager = object.__new__(KVCacheManager)
+    manager.max_draft_len = 0
+    manager.is_draft = False
+    manager.is_linear_attention = False
+    manager.kv_connector_manager = None
+    manager.blocks_per_window = {}
+    return manager
+
+
+def _phase1_config() -> SimpleNamespace:
+    return SimpleNamespace(kv_cache_bounce_size_mb=0)
+
+
+@pytest.mark.parametrize(
+    ("ownership", "no_retry", "expected"),
+    [(False, False, False), (False, True, False), (True, False, None), (True, True, True)],
+    ids=["legacy", "no-retry-only", "invalid-owned-retry", "qualified"],
+)
+def test_phase1_flag_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    ownership: bool,
+    no_retry: bool,
+    expected: bool | None,
+) -> None:
+    monkeypatch.setenv(transceiver_mod._PHYSICAL_OWNERSHIP_ENV, str(int(ownership)))
+    monkeypatch.setenv(transceiver_mod._DISAGG_NO_RETRY_ENV, str(int(no_retry)))
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_LAYERWISE", raising=False)
+
+    if expected is None:
+        with pytest.raises(ValueError, match=transceiver_mod._DISAGG_NO_RETRY_ENV):
+            KvCacheTransceiverV2._supports_phase1_physical_ownership(
+                _phase1_mapping(), _phase1_v1_manager(), _phase1_config()
+            )
+    else:
+        assert (
+            KvCacheTransceiverV2._supports_phase1_physical_ownership(
+                _phase1_mapping(), _phase1_v1_manager(), _phase1_config()
+            )
+            is expected
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "error_match"),
+    [
+        ("tp", "tp_size=2"),
+        ("pp", "pp_size=2"),
+        ("cp", "cp_size=2"),
+        ("dp", "dp_size=2"),
+        ("adp", "attention_dp"),
+        ("dwdp", "dwdp_size=2"),
+        ("bounce", "kv_cache_bounce_size_mb=1"),
+        ("sync", "synchronous_transfer"),
+        ("layerwise", "layerwise_transfer"),
+        ("draft", "draft_tokens"),
+        ("connector", "kv_connector_manager"),
+        ("linear", "linear_attention"),
+        ("offload", "host_kv_cache_offload"),
+        ("not-v1", "requires V1"),
+        ("mamba", "SeparateMambaManager"),
+    ],
+)
+def test_phase1_rejects_out_of_scope_runtime_cells(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    error_match: str,
+) -> None:
+    monkeypatch.setenv(transceiver_mod._PHYSICAL_OWNERSHIP_ENV, "1")
+    monkeypatch.setenv(transceiver_mod._DISAGG_NO_RETRY_ENV, "1")
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_LAYERWISE", raising=False)
+    mapping = _phase1_mapping()
+    manager = _phase1_v1_manager()
+    manager_for_validation: object = manager
+    config = _phase1_config()
+    mamba_manager = None
+    if case in {"tp", "pp", "cp", "dp"}:
+        setattr(mapping, f"{case}_size", 2)
+    elif case == "adp":
+        mapping.enable_attention_dp = True
+    elif case == "dwdp":
+        mapping.dwdp_enabled = True
+        mapping.dwdp_size = 2
+    elif case == "bounce":
+        config.kv_cache_bounce_size_mb = 1
+    elif case == "sync":
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    elif case == "layerwise":
+        monkeypatch.setenv("TRTLLM_DISAGG_LAYERWISE", "1")
+    elif case == "draft":
+        manager.max_draft_len = 1
+    elif case == "connector":
+        manager.kv_connector_manager = object()
+    elif case == "linear":
+        manager.is_linear_attention = True
+    elif case == "offload":
+        manager.blocks_per_window = {128: (10, 1)}
+    elif case == "not-v1":
+        manager_for_validation = SimpleNamespace()
+    else:
+
+        class SeparateMambaManager:
+            pass
+
+        mamba_manager = SeparateMambaManager()
+
+    with pytest.raises(ValueError, match=error_match):
+        KvCacheTransceiverV2._supports_phase1_physical_ownership(
+            mapping, manager_for_validation, config, mamba_manager
+        )
+
+
+def test_physical_ownership_factory_gate_rejects_disabled_or_non_python_nixl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP", "1")
+    with pytest.raises(ValueError, match="requires an enabled Python/NIXL"):
+        create_kv_cache_transceiver(None, None, None, None, None)
+
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
+    with pytest.raises(ValueError, match="supported only with"):
+        create_kv_cache_transceiver(None, None, None, None, config)
 
 
 def _make_transceiver(

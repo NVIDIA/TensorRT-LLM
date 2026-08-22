@@ -49,6 +49,8 @@ from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve.openai_disagg_server import \
+    _validate_physical_ownership_preflight
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -1895,6 +1897,12 @@ def disaggregated(
     # (c) url absent, num_workers==1 -> single self-contained server.
     num_workers = disagg_cfg.num_workers
     coordinator_url = disagg_cfg.disagg_coordinator_url
+
+    # Constructor-level validation is too late for fleet modes: those branches
+    # spawn child processes before constructing OpenAIDisaggServer. Keep the
+    # constructor guard for programmatic callers and repeat it here before any
+    # topology-specific process or coordinator setup.
+    _validate_physical_ownership_preflight(disagg_cfg, coordinator_url)
 
     # Only topology (c) below binds the public socket in this process. The fleet
     # paths hand the port to N SO_REUSEPORT workers, which with port 0 would each
