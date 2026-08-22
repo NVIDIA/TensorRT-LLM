@@ -61,6 +61,29 @@ def _ulysses_post_unscatter(q_5d, k_5d, v_5d, *, is_hnd):
     return torch.ops.trtllm.ulysses_post_unscatter_qkv(q_5d, k_5d, v_5d, layout)
 
 
+def _all_to_all_5d_raw(
+    input: torch.Tensor,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Packed QKV A2A without the final Python unscatter.
+
+    Input is [B, S/P, 3, H, D]. Output is the raw receive buffer
+    [P, B, S/P, 3, H/P, D], ready for the native packed post-unscatter op.
+    """
+    world_size = torch.distributed.get_world_size(group=process_group)
+    if world_size == 1:
+        return input.unsqueeze(0)
+
+    batch, seq, qkv_count, heads, head_dim = input.shape
+    sharded_heads = heads // world_size
+    inp = input.reshape(batch, seq, qkv_count, world_size, sharded_heads, head_dim)
+    inp = inp.permute(3, 0, 1, 2, 4, 5).contiguous()
+
+    out_flat = torch.empty_like(inp.flatten())
+    torch.distributed.all_to_all_single(out_flat, inp.flatten(), group=process_group)
+    return out_flat.view_as(inp)
+
+
 class UlyssesAttention(AttentionBackend):
     """
     Ulysses Sequence Parallelism wrapper.
@@ -156,8 +179,34 @@ class UlyssesAttention(AttentionBackend):
             )
 
         if self.inner_backend.support_fused_qkv():
-            return self._forward_fused(q, k, v, **kwargs)
-        return self._forward_unfused(q, k, v, **kwargs)
+            out = self._forward_fused(q, k, v, **kwargs)
+        elif self._supports_packed_self_attention(q, k, v, kwargs):
+            out = self._forward_packed_self_attention(q, k, v, **kwargs)
+        else:
+            out = self._forward_unfused(q, k, v, **kwargs)
+        return out
+
+    def _supports_packed_self_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kwargs: Dict,
+    ) -> bool:
+        # self.world_size is the Ulysses process-group size here, not the
+        # global distributed world size.
+        if self.world_size <= 1:
+            return False
+        if self.inner_backend.preferred_layout not in (
+            AttentionTensorLayout.HND,
+            AttentionTensorLayout.NHD,
+        ):
+            return False
+        if q.shape != k.shape or q.shape != v.shape:
+            return False
+        if q.dtype != torch.bfloat16 or q.shape[-1] % 8 != 0:
+            return False
+        return kwargs.get("gate_compress") is None and kwargs.get("gate_fine") is None
 
     def _forward_fused(
         self,
@@ -195,6 +244,28 @@ class UlyssesAttention(AttentionBackend):
             kwargs["gate_fine"] = gate_fine
 
         output = self.inner_backend.forward(q=qkv, k=None, v=None, **kwargs)
+
+        return self._output_a2a(output, batch_size, seq_len)
+
+    def _forward_packed_self_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_size = q.shape[0]
+        qkv = torch.stack([q, k, v], dim=2)
+        qkv_5d = _all_to_all_5d_raw(qkv, self.process_group)
+        is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
+        q, k, v = torch.ops.trtllm.ulysses_packed_qkv_post_unscatter(qkv_5d, 0 if is_hnd else 1)
+
+        seq_len = q.shape[2] if is_hnd else q.shape[1]
+        kwargs["batch_size"] = batch_size
+        kwargs["seq_len"] = seq_len
+        kwargs["seq_len_kv"] = seq_len
+
+        output = self.inner_backend.forward(q=q, k=k, v=v, **kwargs)
 
         return self._output_a2a(output, batch_size, seq_len)
 
@@ -344,7 +415,7 @@ class UlyssesAttention(AttentionBackend):
         # only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16
+        use_fused_post_unscatter = self.world_size > 1 and q_5d.dtype == torch.bfloat16
         if use_fused_post_unscatter:
             q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q

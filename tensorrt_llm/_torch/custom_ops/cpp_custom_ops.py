@@ -1235,6 +1235,17 @@ def _register_fake():
 
         return (_mk(q_in), _mk(k_in), _mk(v_in))
 
+    @torch.library.register_fake("trtllm::ulysses_packed_qkv_post_unscatter")
+    def _(qkv_in, layout=0):
+        P, B, Sp, qkv_count, H, D = qkv_in.shape
+        assert qkv_count == 3
+
+        def _mk():
+            base = qkv_in.new_empty((B, P * Sp, H, D))
+            return base.transpose(1, 2) if layout == 0 else base
+
+        return (_mk(), _mk(), _mk())
+
     @torch.library.register_fake("trtllm::helix_post_process")
     def _(gathered_o, gathered_stats, scale):
         return gathered_o.new_empty(*gathered_o.shape[1:])
