@@ -75,6 +75,7 @@ static constexpr SizeType32 kSWAExtraBlock = 1;
 class KVCacheBlock;
 class BlockManager;
 class KVCacheManager;
+class KvCacheTransferLease;
 class KVCacheTransferManager;
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -1213,6 +1214,12 @@ public:
     void onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
+    //! \brief Pin block IDs and make sure they are resident in primary memory for cache transfer.
+    //! \return Pair of block IDs that were pinned and whether any onboard copies were issued.
+    [[nodiscard]] std::pair<std::vector<KVCacheBlock::IdType>, bool> pinAndOnboardBlocksById(
+        std::vector<KVCacheBlock::IdType> const& blockIds,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
+
     //! \brief Bring block from primary to secondary memory.
     //! \details Does nothing if block is already in secondary memory.
     void offloadBlock(BlockPtr const& block, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
@@ -1229,6 +1236,9 @@ public:
 
     //! \brief Sync internal streams used by transfer manager with buffer manager stream
     void syncTransferManagerWithBufferManager();
+
+    //! \brief Make a formatter buffer-manager stream wait for scheduled onboard work.
+    void syncOnboardTransferManagerToBufferManager(runtime::BufferManager const& bufferManager);
 
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
@@ -1365,11 +1375,20 @@ private:
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
     //! \param wantPlaceholder If true, return a pre-allocated placeholder block instead of a normal block
+    //! \param countAllocationStats If true, update request-allocation counters for the returned block
     [[nodiscard]] BlockPtr getFreeBlock(GenerationRequest& sequence,
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
-        bool wantPlaceholder = false);
+        bool wantPlaceholder = false, bool countAllocationStats = true);
+
+    [[nodiscard]] BlockPtr getFreeBlock(std::optional<LlmRequest::RequestIdType> requestId,
+        executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
+        std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
+        bool wantPlaceholder = false, bool countAllocationStats = true);
+
+    void unpinBlocksByIdNoLock(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     //! \brief Calls KVCacheBlock::freeLeafBlock to remove block from search tree.
     void freeLeafBlock(BlockPtr const& block);
@@ -1601,6 +1620,14 @@ public:
     void pinBlocks(GenerationRequest& sequence);
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
+
+    //! \brief Unpin window-qualified block IDs across one or more window managers.
+    void unpinBlocksById(std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow);
+
+    //! \brief Pin block IDs and make sure they are primary-resident for cache transfer formatting.
+    [[nodiscard]] KvCacheTransferLease prepareBlocksForTransfer(
+        std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1915,6 +1942,9 @@ public:
     //! \brief Sync internal streams used by transfer manager with buffer manager stream
     void syncTransferManagerWithBufferManager();
 
+    //! \brief Make a formatter buffer-manager stream wait for scheduled onboard work.
+    void syncOnboardTransferManagerToBufferManager(runtime::BufferManager const& bufferManager);
+
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
@@ -2011,6 +2041,42 @@ private:
     SizeType32 mIndexerKCacheIndexHeadDim{0};
     bool mIndexerKCacheUseFp4{false};
     std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
+};
+
+class KvCacheTransferLease
+{
+public:
+    KvCacheTransferLease() = default;
+    KvCacheTransferLease(BlockManager& blockManager,
+        std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> blockIdsPerWindow, bool issuedOnboardCopies);
+    ~KvCacheTransferLease();
+
+    KvCacheTransferLease(KvCacheTransferLease const&) = delete;
+    KvCacheTransferLease& operator=(KvCacheTransferLease const&) = delete;
+    KvCacheTransferLease(KvCacheTransferLease&& other) noexcept;
+    KvCacheTransferLease& operator=(KvCacheTransferLease&& other) noexcept;
+
+    [[nodiscard]] std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const&
+    blockIdsPerWindow() const noexcept
+    {
+        return mBlockIdsPerWindow;
+    }
+
+    [[nodiscard]] bool issuedOnboardCopies() const noexcept
+    {
+        return mIssuedOnboardCopies;
+    }
+
+    //! \brief Make the formatter stream wait on pending onboard copies before transfer formatting reads them.
+    void syncReadyForFormat(runtime::BufferManager const& bufferManager);
+
+    //! \brief Release transfer pins before the lease object is destroyed.
+    void release();
+
+private:
+    BlockManager* mBlockManager{nullptr};
+    std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> mBlockIdsPerWindow;
+    bool mIssuedOnboardCopies{false};
 };
 
 struct OffsetTableDimensions
@@ -2274,6 +2340,12 @@ public:
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
+
+    //! \brief Pin block IDs and make sure they are primary-resident for cache transfer formatting.
+    [[nodiscard]] virtual KvCacheTransferLease prepareBlocksForTransfer(
+        std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "")
+        = 0;
 
     /// @brief Release cached blocks for a token sequence beyond a given prefix length.
     /// @param targetTokens The full token sequence whose cached blocks are walked.
@@ -2634,6 +2706,12 @@ public:
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
+
+    //! \brief Pin block IDs and make sure they are primary-resident for cache transfer formatting.
+    [[nodiscard]] KvCacheTransferLease prepareBlocksForTransfer(
+        std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
+        std::string const& directory = "") override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
