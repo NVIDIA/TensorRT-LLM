@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,7 @@
 #
 # This module provides functions to query the OpenSearch database for passed
 # test results from previous pipeline runs. It retrieves test names that have
-# passed for a given commit ID and stage name, which can be reused to skip
+# passed for a given commit ID and one or more exact stage names, which can be reused to skip
 # redundant test execution in subsequent runs.
 #
 # Main functionality:
@@ -36,13 +36,14 @@ import sys
 from open_search_db import OpenSearchDB
 
 
-def queryJobEvents(commitID="", stageName="", onlySuccess=True):
+def queryJobEvents(commitID="", stageName="", onlySuccess=True, stageNames=None):
     """Query OpenSearch database for job events with pagination.
 
     Args:
         commitID: Git commit SHA to filter by (optional)
-        stageName: Stage name to filter by (optional)
+        stageName: Backward-compatible single exact stage name (optional)
         onlySuccess: If True, only return PASSED tests (default: True)
+        stageNames: Exact stage names to filter by (optional)
 
     Returns:
         List of all matching test result records
@@ -50,8 +51,17 @@ def queryJobEvents(commitID="", stageName="", onlySuccess=True):
     mustConditions = []
     if commitID:
         mustConditions.append({"term": {"s_trigger_mr_commit": commitID}})
-    if stageName:
-        mustConditions.append({"term": {"s_stage_name": stageName}})
+    if stageNames is None:
+        stageNames = [stageName] if stageName else []
+    if stageNames:
+        mustConditions.append(
+            {
+                "bool": {
+                    "minimum_should_match": 1,
+                    "should": [{"term": {"s_stage_name": stageName}} for stageName in stageNames],
+                }
+            }
+        )
     if onlySuccess:
         mustConditions.append({"term": {"s_status": "PASSED"}})
 
@@ -103,8 +113,13 @@ def writeTestListToFile(testList, fileName):
             f.write(test + "\n")
 
 
-def getPassedTestList(commitID, stageName, outputFile):
-    hits = queryJobEvents(commitID=commitID, stageName=stageName, onlySuccess=True)
+def getPassedTestList(commitID, stageName, outputFile, stageNames=None):
+    hits = queryJobEvents(
+        commitID=commitID,
+        stageName=stageName,
+        onlySuccess=True,
+        stageNames=stageNames,
+    )
     # Use set to automatically remove duplicates
     testSet = set()
     for hit in hits:
@@ -116,9 +131,17 @@ def getPassedTestList(commitID, stageName, outputFile):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--commit-id", required=True, help="Commit ID")
-    parser.add_argument("--stage-name", required=True, help="Stage Name")
+    parser.add_argument(
+        "--stage-name",
+        action="append",
+        required=True,
+        help="Exact stage name to query; repeat for equivalent stage names",
+    )
     parser.add_argument("--output-file", required=True, help="Output File")
     args = parser.parse_args(sys.argv[1:])
     getPassedTestList(
-        commitID=args.commit_id, stageName=args.stage_name, outputFile=args.output_file
+        commitID=args.commit_id,
+        stageName="",
+        outputFile=args.output_file,
+        stageNames=args.stage_name,
     )

@@ -2783,6 +2783,34 @@ def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
+// CBTS stages are narrowed executions of their base stages. Their test results
+// are compatible at testcase granularity, but only base-stage results are safe
+// to use for skipping an entire CBTS stage.
+String getBaseStageName(String stageName) {
+    if (stageName.endsWith(CBTS_STAGE_SUFFIX)) {
+        return stageName.substring(0, stageName.length() - CBTS_STAGE_SUFFIX.length())
+    }
+    return stageName
+}
+
+// Return the exact OpenSearch stage names whose passed testcases are reusable
+// for the current stage. A full stage and its CBTS variant are the same logical
+// stage, but no other suffixes are treated as aliases.
+List<String> getTestReuseStageNames(String stageName) {
+    def baseStageName = getBaseStageName(stageName)
+    return [baseStageName, baseStageName + CBTS_STAGE_SUFFIX].unique()
+}
+
+boolean shouldReuseStage(String stageName, List reuseStageList) {
+    if (stageName in reuseStageList) {
+        return true
+    }
+    if (stageName.endsWith(CBTS_STAGE_SUFFIX)) {
+        return getBaseStageName(stageName) in reuseStageList
+    }
+    return false
+}
+
 // Test filter flags
 // Multi-GPU stages matching any entry here run inside the single-GPU job
 // instead of waiting for the separate multi-GPU dispatch (which requires
@@ -4462,12 +4490,16 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         sh "mkdir -p ${workDir}"
 
         // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
-        //    for this commit + stage.
+        //    for this commit + logical stage. CBTS and full-stage results are
+        //    merged because each result represents an individual testcase.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
+        def stageNameArgs = getTestReuseStageNames(stageName).collect { reuseStageName ->
+            "--stage-name '${reuseStageName}'"
+        }.join(' ')
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
-            --stage-name ${stageName} \
+            ${stageNameArgs} \
             --output-file ${passedTestListFile}
         """
         if (fileExists(passedTestListFile)) {
@@ -6706,7 +6738,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         stageInfraScope[key] = stageOpts.slurmDispatcher ? InfraFailure.SLURM : InfraFailure.K8S
         [key, {
         stage(key) {
-            if (key in testFilter[REUSE_STAGE_LIST]) {
+            if (shouldReuseStage(key, testFilter[REUSE_STAGE_LIST])) {
                 stage("Skip - Reused") {
                     echo "Skip - Passed in the previous pipelines."
                 }
