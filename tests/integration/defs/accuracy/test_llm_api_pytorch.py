@@ -44,9 +44,9 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..conftest import (check_device_contain, get_device_count,
                         get_mpi_world_size, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
-                        skip_no_mxfp4_swizzle, skip_post_blackwell,
-                        skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray)
+                        skip_no_mxfp4_swizzle, skip_no_sm120,
+                        skip_post_blackwell, skip_post_hopper, skip_pre_ada,
+                        skip_pre_blackwell, skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2, assert_acceptance_length)
@@ -6703,16 +6703,10 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
     )
     GSM8K_MAX_OUTPUT_LEN = 512
 
-    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTEDSL"])
-    def test_nvfp4(self, moe_backend, mocker):
-        # Qwen3.6-35B-A3B NVFP4 MoE checkpoint. The TRTLLM-Gen / CuteDSL NVFP4
-        # MoE backends only support the SM100 family (B200/B300); RTX 6000
-        # (SM120) uses a different MoE path, so restrict this test to SM100/103.
-        if get_sm_version() not in (100, 103):
-            pytest.skip("Qwen3.6-35B-A3B NVFP4 MoE test runs on SM100/103 only")
-
-        if not os.path.exists(self.MODEL_PATH):
-            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
+    def _run_gsm8k(self, model_path, moe_backend, chunked_prefill, mocker):
+        """Run single-GPU GSM8K on an NVFP4 checkpoint."""
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
@@ -6720,7 +6714,7 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                                             max_batch_size=128)
         moe_config = MoeConfig(backend=moe_backend)
 
-        with LLM(self.MODEL_PATH,
+        with LLM(model_path,
                  trust_remote_code=True,
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
@@ -6728,12 +6722,25 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                  max_batch_size=128,
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
+                 enable_chunked_prefill=chunked_prefill,
                  moe_config=moe_config) as llm:
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTEDSL"])
+    def test_nvfp4(self, moe_backend, mocker):
+        # TRTLLM-Gen / CuteDSL NVFP4 MoE backends only support SM100/103 family
+        if get_sm_version() not in (100, 103):
+            pytest.skip("Qwen3.6-35B-A3B NVFP4 MoE test runs on SM100/103 only")
+
+        self._run_gsm8k(self.MODEL_PATH, moe_backend, False, mocker)
+
+    @skip_no_sm120
+    def test_nvfp4_w4a16(self, mocker):
+        self._run_gsm8k(self.MODEL_PATH, "CUTEDSL", True, mocker)
 
     @pytest.mark.parametrize("dflash_attention_backend", ["VANILLA", "TRTLLM"])
     def test_nvfp4_dflash(self, mocker, dflash_attention_backend):
