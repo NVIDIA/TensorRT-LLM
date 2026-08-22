@@ -5526,7 +5526,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "encoder's GPU memory (enlarging the KV cache pool) for workloads "
         "that never send image/video/audio inputs; such requests are "
         "rejected. Only takes effect for model implementations that support "
-        "it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. "
+        "it (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL family); a "
+        "no-op otherwise. "
         "Defaults to False.",
         status="prototype")
 
@@ -5691,6 +5692,16 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
+        return self
+
+    @model_validator(mode="after")
+    def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
+        if (self.disable_mm_encoder
+                and self.multimodal_config.encoder_cache_max_bytes != 0):
+            logger.info(
+                "Setting multimodal_config.encoder_cache_max_bytes to 0 "
+                "because disable_mm_encoder=True.")
+            self.multimodal_config.encoder_cache_max_bytes = 0
         return self
 
     @model_validator(mode="after")
