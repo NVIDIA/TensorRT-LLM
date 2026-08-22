@@ -4,6 +4,7 @@
 import dataclasses
 import datetime
 import functools
+import math
 import os
 import sys
 import threading
@@ -123,6 +124,41 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
 # Environment variable to control the benchmark disagg fill target.
 BENCHMARK_REQ_QUEUES_SIZE_ENV_VAR_NAME = "TLLM_BENCHMARK_REQ_QUEUES_SIZE"
+
+# How long the benchmark-disagg fill gate may retry without making ANY
+# transfer progress before the rank gives up. Generous by default: a fill that
+# is merely slow keeps resetting the clock, so this only fires on a fill that
+# is not advancing at all. 0 disables the bound.
+BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME = "TRTLLM_BENCHMARK_DISAGG_FILL_STALL_SEC"
+_BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC = 600.0
+
+
+def _fill_stall_timeout_sec() -> float:
+    """Resolve the fill-gate stall bound; malformed values fall back."""
+    raw = os.environ.get(BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME)
+    if raw is None:
+        return _BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            f"Invalid {BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME}={raw!r}; "
+            f"using {_BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC:.0f}s")
+        return _BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC
+    if not math.isfinite(value):
+        # float() accepts "nan" and "inf", and both break the bound in
+        # opposite directions. Every nan comparison is False, so `nan <= 0`
+        # does not disable it and `stalled_for < nan` does not defer it --
+        # control falls straight through to the raise, firing on the second
+        # consecutive stalled call (~0.1s) instead of after the window. inf
+        # is the mirror: `stalled_for < inf` is always True, so the bound
+        # never fires and is silently equivalent to 0. Reject both.
+        logger.warning(
+            f"Non-finite {BENCHMARK_DISAGG_FILL_STALL_ENV_VAR_NAME}={raw!r}; "
+            f"using {_BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC:.0f}s")
+        return _BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC
+    return value
+
 
 # Environment variable to control which ranks print step logging.
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
@@ -848,6 +884,10 @@ class PyExecutor:
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
         self._configure_benchmark_req_queues_size()
+        # Deadline state for the benchmark-disagg fill gate's retry loop.
+        # None means "not currently stalled"; progress resets it.
+        self._benchmark_fill_stall_since: Optional[float] = None
+        self._benchmark_fill_stall_timeout_sec = _fill_stall_timeout_sec()
 
         # Sample-state relay mode. "1": a background thread relays them,
         # overlapping with forward, but it needs the GIL and can be starved
@@ -4194,11 +4234,54 @@ class PyExecutor:
             if can_forward:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
+                self._benchmark_fill_stall_since = None
             elif not sync_transfer_made_progress:
                 time.sleep(0.1)
             if not can_forward:
+                self._fail_if_fill_gate_stalled(sync_transfer_made_progress)
                 return can_forward, True
         return can_forward, False
+
+    def _fail_if_fill_gate_stalled(self, made_progress: bool) -> None:
+        """Give the fill gate's retry loop a deadline.
+
+        The retry is otherwise unbounded, and it is invisible while it spins:
+        the ``continue`` it drives sits before ``iter_counter += 1``, so the
+        iteration counter freezes while wall-clock advances. Archived wedges
+        show exactly that -- tens of thousands of byte-identical iteration
+        lines at ``host_step_time`` ~110 ms, which is this function's own
+        ``time.sleep(0.1)`` seen from outside.
+
+        Progress resets the clock, so a slow-but-advancing fill is never
+        killed; only a fill that makes no progress at all for the whole
+        window is. ``TRTLLM_BENCHMARK_DISAGG_FILL_STALL_SEC=0`` disables the
+        bound entirely.
+
+        Raising here surfaces the stall through the executor loop's normal
+        error path rather than adding a second one, and the rank that raises
+        names itself in the message.
+        """
+        if made_progress:
+            self._benchmark_fill_stall_since = None
+            return
+        timeout_s = self._benchmark_fill_stall_timeout_sec
+        if timeout_s <= 0:
+            return
+        now = time.monotonic()
+        if self._benchmark_fill_stall_since is None:
+            self._benchmark_fill_stall_since = now
+            return
+        stalled_for = now - self._benchmark_fill_stall_since
+        if stalled_for < timeout_s:
+            return
+        self._benchmark_fill_stall_since = None
+        raise RuntimeError(
+            f"Benchmark disagg fill gate made no progress for "
+            f"{stalled_for:.0f}s on rank {self.dist.rank} "
+            f"(TRTLLM_BENCHMARK_DISAGG_FILL_STALL_SEC="
+            f"{timeout_s:.0f}). The KV transfers this gate waits on are not "
+            f"completing; the loop would otherwise retry forever without "
+            f"advancing iter_counter.")
 
     @nvtx_range("_handle_disagg_cache_errors_synced")
     def _handle_disagg_cache_errors_synced(self):
