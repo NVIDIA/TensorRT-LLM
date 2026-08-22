@@ -34,6 +34,49 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 from tensorrt_llm.logger import logger
 
+# --- LTX-2.3 detection (added for LTX23Pipeline) ----------------------------
+# LTX-2.3 text-projection signature. All keys must match and cross_attention_adaln
+# must be True. LTX-2 has none of these keys.
+_LTX23_TEXT_CONFIG = {
+    "caption_proj_before_connector": True,
+    "caption_projection_first_linear": False,
+    "caption_projection_second_linear": False,
+    "caption_proj_input_norm": False,
+}
+
+
+def _detect_native_ltx_pipeline(config: dict) -> str:
+    """Return 'LTX2Pipeline' or 'LTX23Pipeline' from native safetensors config."""
+    transformer = config.get("transformer", {})
+    expected = set(_LTX23_TEXT_CONFIG)
+    present = expected.intersection(transformer)
+
+    if not present:
+        if transformer.get("cross_attention_adaln", False):
+            raise ValueError(
+                "Ambiguous LTX checkpoint: cross_attention_adaln=True without "
+                "the LTX-2.3 text-projection configuration."
+            )
+        return "LTX2Pipeline"
+
+    missing = expected - set(transformer)
+    mismatched = {
+        k: transformer[k]
+        for k, v in _LTX23_TEXT_CONFIG.items()
+        if k in transformer and transformer[k] != v
+    }
+    if missing or mismatched:
+        raise ValueError(
+            "Unsupported/partial LTX text-projection config: "
+            f"missing={sorted(missing)}, mismatched={mismatched}"
+        )
+    if transformer.get("cross_attention_adaln") is not True:
+        raise ValueError("LTX-2.3 text projection found without cross_attention_adaln=True.")
+    return "LTX23Pipeline"
+
+
+# --- end LTX-2.3 detection ---------------------------------------------------
+
 if TYPE_CHECKING:
     from .config import DiffusionPipelineConfig
     from .pipeline import BasePipeline
@@ -232,10 +275,11 @@ class AutoPipeline:
             return None
 
         if "transformer" in config and ("vae" in config or "audio_vae" in config):
+            detected = _detect_native_ltx_pipeline(config)
             logger.info(
-                "AutoPipeline: Detected LTX-2 native checkpoint "
+                f"AutoPipeline: Detected {detected} native checkpoint "
                 f"(safetensors metadata) at {checkpoint_dir}"
             )
-            return "LTX2Pipeline"
+            return detected
 
         return None
