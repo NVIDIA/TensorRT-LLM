@@ -3034,6 +3034,90 @@ class TestPoolsideV1ToolParserFactory:
         assert resolve_auto_tool_parser(str(model_dir)) == "poolside_v1"
 
 
+class TestQwen35ModelTypeToolParserMapping:
+    r"""Issue #18084: qwen3_5/qwen3_5_moe must map to a parser matching the template.
+
+    The qwen3_5 / qwen3_5_moe chat template emits the XML-ish tool-call
+    format:
+
+        <tool_call><function=name><parameter=k>v</parameter></function></tool_call>
+
+    Previously both model types mapped to the `qwen3` parser, which only
+    understands the JSON form (`<tool_call>\n{"name":...}\n</tool_call>`, or
+    the bare-JSON fallback from NVBug 6240584). Since the template never
+    emits that JSON form for these model types, the `qwen3` parser silently
+    extracts zero tool calls. `qwen3_coder` parses the XML-ish form
+    correctly on the same model/build (per the issue report), so the fix is
+    to remap `qwen3_5` / `qwen3_5_moe` to `qwen3_coder`.
+    """
+
+    # Sample of the XML-ish format from the issue report.
+    XML_TOOL_CALL_TEXT = ("<tool_call>\n"
+                          "<function=get_weather>\n"
+                          "<parameter=location>NYC</parameter>\n"
+                          "</function>\n"
+                          "</tool_call>")
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    def test_auto_selected_parser_parses_template_xml_tool_call_format(
+            self, model_type, sample_tools):
+        """The auto-selected parser must parse the template's XML-ish format.
+
+        Checks that the parser auto-selected for qwen3_5/qwen3_5_moe can
+        parse the XML-ish `<function=...><parameter=...>` format emitted by
+        the qwen3_5 chat template.
+
+        Before the fix, `MODEL_TYPE_TO_TOOL_PARSER[model_type]` resolves to
+        `qwen3`, whose JSON-only parser extracts zero calls from this text
+        -- reproducing the "0 of 4 tool calls parsed" behavior from the
+        issue. After the fix it resolves to `qwen3_coder`, which parses it
+        correctly.
+        """
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
+            MODEL_TYPE_TO_TOOL_PARSER, ToolParserFactory)
+
+        parser_name = MODEL_TYPE_TO_TOOL_PARSER[model_type]
+        parser = ToolParserFactory.create_tool_parser(parser_name)
+
+        result = parser.detect_and_parse(self.XML_TOOL_CALL_TEXT, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    def test_model_type_maps_to_qwen3_coder(self, model_type):
+        """Issue #18084 fix: qwen3_5/qwen3_5_moe should resolve to qwen3_coder.
+
+        `qwen3_coder` understands the XML-ish tool-call format the qwen3_5
+        chat template emits (verified against the issue's 4-of-4-parsed
+        report with `--tool_parser qwen3_coder`).
+        """
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            MODEL_TYPE_TO_TOOL_PARSER
+        assert MODEL_TYPE_TO_TOOL_PARSER[model_type] == "qwen3_coder"
+
+    def test_auto_detect_qwen3_5(self, tmp_path):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            resolve_auto_tool_parser
+        model_dir = tmp_path / "Qwen3.6"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5"}))
+
+        assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
+
+    def test_auto_detect_qwen3_5_moe(self, tmp_path):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            resolve_auto_tool_parser
+        model_dir = tmp_path / "Qwen3.6-MoE"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "qwen3_5_moe"}))
+
+        assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
+
+
 # ============================================================================
 # Integration Tests
 # ============================================================================
