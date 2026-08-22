@@ -194,7 +194,6 @@ full:GB200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_b
 full:GB200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[use_msa=False] SKIP (https://nvbugs/6479471)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=False] SKIP (https://nvbugs/6479471)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_block_reuse[ADP4] SKIP (https://nvbugs/6474894)
-full:GB200/accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM] SKIP (https://nvbugs/6525898)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format SKIP (https://nvbugs/6525059)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True] SKIP (https://nvbugs/5929339)
 full:GB200/accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8_moe_dflash SKIP (https://nvbugs/6316985)
