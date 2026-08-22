@@ -250,7 +250,7 @@ class PerfMetricsManager:
         # - py_decoding_iter == 1 and not yet marked complete: last/only chunk
         # - Gen-only requests (disagg gen server) are never ctx
         is_ctx = (
-            not request.is_generation_only_request()
+            not request.is_generation_only_request
             and not perf.ctx_chunks_complete
             and request.py_decoding_iter <= 1
         )

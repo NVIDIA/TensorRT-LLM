@@ -13,6 +13,7 @@ from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
                                           CacheTransceiverConfig)
 from tensorrt_llm.mapping import Mapping
 
+from .kv_cache_manager_v2 import KVCacheManagerV2
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
@@ -203,6 +204,26 @@ def create_kv_cache_transceiver(
         raise ValueError(
             "MambaHybridCacheManagerV2 requires transceiver_runtime='PYTHON' "
             "with backend='NIXL'; it cannot use the C++ transceiver.")
+
+    # The same applies to KVCacheManagerV2 itself, not only to its hybrid
+    # subclass: its `impl` is the Python V2 core's KVCacheManager, and
+    # CacheTransceiverCpp is bound to BaseKVCacheManager. Without this check the
+    # combination reaches BindKvCacheTransceiver and dies on a nanobind
+    # signature mismatch that names neither the manager nor the way out.
+    #
+    # Note `transceiver_runtime` defaults to "auto", which is resolved from the
+    # *model's* preference (llm_utils._resolve_transceiver_runtime_auto) and
+    # knows nothing about which cache manager will be built -- so most models
+    # land here rather than on the Python transceiver.
+    if isinstance(kv_cache_manager,
+                  KVCacheManagerV2) and not use_python_transceiver:
+        raise ValueError(
+            "KVCacheManagerV2 requires transceiver_runtime='PYTHON' with "
+            "backend='NIXL' for disaggregated serving; it cannot use the C++ "
+            "transceiver, which is bound to the V1 BaseKVCacheManager. Either "
+            "set cache_transceiver_config.transceiver_runtime='PYTHON' and "
+            "backend='NIXL', or select the V1 manager with "
+            "kv_cache_config.use_kv_cache_manager_v2=False.")
 
     if use_python_transceiver:
         if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):

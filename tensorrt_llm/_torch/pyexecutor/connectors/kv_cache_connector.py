@@ -54,6 +54,7 @@ from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from ..resource_manager import KVCacheManager
+    from .kv_cache_layout import KvCacheLayout
 
 
 # Used to store data for a single inflight request.
@@ -85,6 +86,11 @@ class RequestData:
     # remote object id) MUST mix cache_salt into their identifiers,
     # otherwise blocks from a different salt could be incorrectly reused.
     cache_salt: Optional[str] = None
+    # New page slot indices keyed by layer group, populated under
+    # KVCacheManagerV2. Blocks with no page in a group -- the sliding-window
+    # case -- appear as BAD_PAGE_INDEX in place, keeping ordinals stable.
+    # Empty under the V1 manager, whose block IDs are a single flat space.
+    new_block_ids_by_layer_group: Dict[int, List[int]] = field(default_factory=dict)
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -134,6 +140,30 @@ class KvCacheConnectorWorker(ABC):
         Args:
             kv_cache_tensor: The contiguous KV cache tensor.
         """
+
+    def register_kv_cache_layout(self, layout: "KvCacheLayout") -> None:
+        """
+        Register the KV cache pools described by ``layout``.
+
+        Called instead of ``register_kv_caches`` when the KV cache manager is
+        ``KVCacheManagerV2``, whose memory cannot be expressed as a single
+        tensor: there is one slot address space per pool and one page-index
+        space per layer group.
+
+        The bytes for page slot ``i`` of a region live at
+        ``region.base + region.stride * i`` for ``region.size`` bytes, or
+        equivalently at ``region.as_tensor()[i]``. Page indices arriving in
+        ``RequestData.new_block_ids`` are scoped to a layer group and index the
+        regions of that group.
+
+        Args:
+            layout: Description of the KV cache pools; see ``KvCacheLayout``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement register_kv_cache_layout, so it "
+            "cannot run against KVCacheManagerV2. Implement it, or select the V1 KV "
+            "cache manager with kv_cache_config.use_kv_cache_manager_v2=False."
+        )
 
     @abstractmethod
     def start_load_kv(self, stream: torch.cuda.Stream):
@@ -255,6 +285,30 @@ class KvCacheConnectorScheduler(ABC):
             block_ids: The KV cacheblock IDs that were allocated.
         """
 
+    def cancel_load(self, request: LlmRequest, start: int, end: int):
+        """
+        Called when the runtime will not consume KV that was offered by
+        ``get_num_new_matched_tokens`` for prompt tokens ``[start, end)``.
+
+        Offsets are absolute prompt positions, on the same scale as
+        ``num_computed_tokens``. This is raised when the local cache overtook
+        part or all of an offer while the request was waiting to be scheduled,
+        or when the runtime could not allocate pages to cover it.
+
+        Best-effort: release any ownership taken in
+        ``get_num_new_matched_tokens`` for that range. For a synchronous load
+        nothing has been transferred yet, so this is exact. For an
+        asynchronous load the transfer necessarily began inside
+        ``get_num_new_matched_tokens`` (see ``take_scheduled_requests_pending_load``),
+        so it may already be in flight and cancelling is genuinely lossy.
+
+        Args:
+            request: The request whose offer is being handed back.
+            start: First prompt position that will not be consumed.
+            end: One past the last prompt position that will not be consumed.
+        """
+        return
+
     def wait_for_initialization(self):
         """
         Some connectors need to wait for some resources to be initialized.
@@ -316,21 +370,49 @@ class AsyncRequests:
 class KvCacheConnectorSchedulerOutputRequest:
     def __init__(self):
         self.block_ids = []
+        self.block_ids_by_layer_group: Dict[int, List[int]] = {}
         self.tokens = []
 
     def update_and_build_data(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
-        block_ids = kv_cache_manager.get_cache_indices(req)
+        from ..kv_cache_manager_v2 import KVCacheManagerV2
+
+        is_v2 = isinstance(kv_cache_manager, KVCacheManagerV2)
         tokens = req.get_tokens(0)
 
-        # Commit hashes for any blocks that have become full since the last call
-        # and read back the full cumulative chain. The C++ side sets each block's
-        # mBlockKey/mHash on first call, so subsequent calls become pure lookups.
-        block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+        new_block_ids_by_layer_group: Dict[int, List[int]] = {}
+        if is_v2:
+            # Block hashes and retention priorities have no V2 accessor yet, so
+            # they are reported empty rather than guessed at.
+            block_hashes = []
+            indices_by_group = kv_cache_manager.get_page_indices_by_layer_group(req)
+            for layer_group_id, indices in indices_by_group.items():
+                seen = self.block_ids_by_layer_group.setdefault(layer_group_id, [])
+                new_ids = indices[len(seen) :]
+                seen.extend(new_ids)
+                new_block_ids_by_layer_group[layer_group_id] = new_ids
+            # With a single layer group -- every non-VSWA, non-hybrid model --
+            # ``new_block_ids`` carries that group's indices so connectors that
+            # do not reason about layer groups keep working. With several groups
+            # it is left empty and ``new_block_ids_by_layer_group`` is the only
+            # correct source.
+            new_block_ids = (
+                next(iter(new_block_ids_by_layer_group.values()))
+                if len(new_block_ids_by_layer_group) == 1
+                else []
+            )
+            self.block_ids.extend(new_block_ids)
+        else:
+            block_ids = kv_cache_manager.get_cache_indices(req)
 
-        new_block_ids = block_ids[len(self.block_ids) :]
+            # Commit hashes for any blocks that have become full since the last call
+            # and read back the full cumulative chain. The C++ side sets each block's
+            # mBlockKey/mHash on first call, so subsequent calls become pure lookups.
+            block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+
+            new_block_ids = block_ids[len(self.block_ids) :]
+            self.block_ids.extend(new_block_ids)
+
         new_tokens = tokens[len(self.tokens) :]
-
-        self.block_ids.extend(new_block_ids)
         self.tokens.extend(new_tokens)
 
         if req.state in (
@@ -346,9 +428,13 @@ class KvCacheConnectorSchedulerOutputRequest:
             )  # Specdec with draft tokens is not supported yet.
 
         # Get retention priority for each new block only if retention config is provided
-        # (for priority-based offload filtering)
+        # (for priority-based offload filtering). Priorities stay None on
+        # KVCacheManagerV2: it does not implement `KvCacheRetentionConfig` at
+        # all -- its per-page priority comes from `custom_priority_callback`,
+        # which KVCacheManagerV2 never overrides -- so every page carries the
+        # default and reporting it would misdescribe what the user asked for.
         priorities = None
-        if req.kv_cache_retention_config is not None:
+        if not is_v2 and req.kv_cache_retention_config is not None:
             priorities = [
                 kv_cache_manager.get_priority_by_block_id(block_id) for block_id in new_block_ids
             ]
@@ -362,6 +448,7 @@ class KvCacheConnectorSchedulerOutputRequest:
             block_hashes=block_hashes,
             priorities=priorities,
             cache_salt=req.cache_salt,
+            new_block_ids_by_layer_group=new_block_ids_by_layer_group,
         )
 
 
@@ -463,7 +550,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             res = None
         return mpi_broadcast(res, root=0)
 
-    def get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
+    def query_num_new_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Tuple[int, bool]:
+        """Ask the connector how much of the prompt it can serve. No side effects.
+
+        This is the half of ``get_num_new_matched_tokens`` that must run at most
+        once per request, because the connector ABC promises exactly one query
+        per request and connectors take ownership of remote blocks in it.
+        Callers that cannot commit to consuming the answer in the same iteration
+        (KVCacheManagerV2, whose scheduling pass is speculative) query here and
+        commit later via ``commit_new_matched_tokens``.
+        """
         if request.is_generation_only_request:
             raise RuntimeError("Connector API is not supported for generation-only requests!")
 
@@ -474,6 +572,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if num_tokens == 0 and load_kv_async:
             raise RuntimeError("load_kv_async must be False when num_tokens is 0!")
 
+        return num_tokens, load_kv_async
+
+    def commit_new_matched_tokens(
+        self, request: LlmRequest, num_tokens: int, load_kv_async: bool
+    ) -> None:
+        """Register the runtime's side of an answered query.
+
+        Must run in the iteration the request is actually scheduled:
+        ``external_loads`` is consumed and cleared by every
+        ``build_scheduler_output``, and ``new_async_requests.loading`` is read
+        by that same call to suppress the request's ``RequestData``.
+        """
         # TODO(jthomson04): This part is a bit ugly.
         # When the connector indicates that a request will be loaded
         # asynchronously, we need to suspend its execution. This is
@@ -488,7 +598,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         request.py_num_connector_matched_tokens = num_tokens
 
+    def get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
+        """Query and commit in one step.
+
+        This is the V1 entry point, called from C++ while the block manager
+        holds the radix-tree mutex, so the local match and the query are atomic
+        with respect to the tree and the answer can be committed immediately.
+        """
+        num_tokens, load_kv_async = self.query_num_new_matched_tokens(request, num_computed_tokens)
+        self.commit_new_matched_tokens(request, num_tokens, load_kv_async)
         return num_tokens
+
+    def cancel_load(self, request: LlmRequest, start: int, end: int) -> None:
+        if self.scheduler is not None:
+            self.scheduler.cancel_load(request, start, end)
 
     def should_add_sequence(self, request: LlmRequest) -> bool:
         req_id = request.request_id

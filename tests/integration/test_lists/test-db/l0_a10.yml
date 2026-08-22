@@ -31,6 +31,7 @@ l0_a10:
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
+  - unittest/_torch/executor/test_kv_cache_layout.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/modules/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
@@ -118,25 +119,59 @@ l0_a10:
   # usage telemetry
   - unittest/llmapi/test_llm_telemetry.py::TestTelemetryPyTorchBackend
   - unittest/llmapi/test_llm_telemetry.py::TestTelemetryArchitectureExtraction
-  - llmapi/test_llm_api_connector.py::test_connector_simple[True]
-  - llmapi/test_llm_api_connector.py::test_connector_simple[False]
-  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[True]
-  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[False]
-  - llmapi/test_llm_api_connector.py::test_connector_async_save[True]
-  - llmapi/test_llm_api_connector.py::test_connector_async_save[False]
-  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[True]
-  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[False]
-  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[True]
-  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[False]
-  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[False]
-  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[True]
-  - llmapi/test_llm_api_connector.py::test_connector_multi_request
-  - llmapi/test_llm_api_connector.py::test_connector_priorities
-  - llmapi/test_llm_api_connector.py::test_connector_priorities_default
-  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[host_offloading]
-  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[beam_search]
-  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[attention_dp]
-  - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache
+  # KV connector. The suite is parametrized over the KV cache manager and both
+  # halves are gated: the connector is supported on KVCacheManagerV2, so a V2
+  # regression has to be a merge-gate failure rather than something found later
+  # by hand. test_connector_runs_on_kv_cache_manager_v2 is what makes the V2
+  # entries meaningful -- the creator silently falls back to the V1 manager for
+  # combinations it cannot serve, so without it every V2 id below could pass
+  # while running V1. test_connector_priorities[kv_cache_manager_v2] is
+  # xfail(strict=True) in the suite, not omitted here, so the retention gap
+  # stays counted.
+  - llmapi/test_llm_api_connector.py::test_v2_connector_contract_does_not_reuse_the_v1_methods
+  - llmapi/test_llm_api_connector.py::test_connector_runs_on_kv_cache_manager_v2
+  - llmapi/test_llm_api_connector.py::test_connector_simple[kv_cache_manager_v1-True]
+  - llmapi/test_llm_api_connector.py::test_connector_simple[kv_cache_manager_v1-False]
+  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[kv_cache_manager_v1-True]
+  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[kv_cache_manager_v1-False]
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[kv_cache_manager_v1-True]
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[kv_cache_manager_v1-False]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[kv_cache_manager_v1-True]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[kv_cache_manager_v1-False]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[kv_cache_manager_v1-True]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[kv_cache_manager_v1-False]
+  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[kv_cache_manager_v1-False]
+  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[kv_cache_manager_v1-True]
+  - llmapi/test_llm_api_connector.py::test_connector_multi_request[kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v1-host_offloading]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v1-beam_search]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v1-attention_dp]
+  - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache[kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_simple[kv_cache_manager_v2-True]
+  - llmapi/test_llm_api_connector.py::test_connector_simple[kv_cache_manager_v2-False]
+  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[kv_cache_manager_v2-True]
+  - llmapi/test_llm_api_connector.py::test_connector_async_onboard[kv_cache_manager_v2-False]
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[kv_cache_manager_v2-True]
+  - llmapi/test_llm_api_connector.py::test_connector_async_save[kv_cache_manager_v2-False]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[kv_cache_manager_v2-True]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output[kv_cache_manager_v2-False]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[kv_cache_manager_v2-True]
+  - llmapi/test_llm_api_connector.py::test_connector_scheduler_output_chunked_context[kv_cache_manager_v2-False]
+  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[kv_cache_manager_v2-False]
+  - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[kv_cache_manager_v2-True]
+  - llmapi/test_llm_api_connector.py::test_connector_multi_request[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-host_offloading]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-beam_search]
+  - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-attention_dp]
+  - llmapi/test_llm_api_connector.py::test_connector_e2e_persistent_cache[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_uniform_sliding_window[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_sliding_window_prefix_is_backed_by_history[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v2]
   # third-party policy checks CPU-only
   - thirdparty/test_cmake_third_party.py::test_cmake_listfiles
   - thirdparty/test_git_modules.py::test_gitmodules
