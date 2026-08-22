@@ -1333,6 +1333,24 @@ class PyTorchModelEngine(ModelEngine):
 
         return wrapper
 
+    def _helix_safe_warmup_configs(self, configs: List[Tuple[int, int]],
+                                   kv_cache_manager) -> List[Tuple[int, int]]:
+        """Floor context-shaped warmup lengths under helix.
+
+        The round-robin context partition gives rank r the blocks
+        [r::cp_size]; a context warmup shorter than cp_size*tokens_per_block
+        leaves some ranks with zero KV, which fails MLA TMA descriptor
+        creation. Skipping the warmup instead is not safe: the first real
+        request would drive Triton autotuning, whose repeated candidate
+        launches re-apply in-place recurrent-state updates.
+        """
+        if not self.mapping.has_cp_helix() or kv_cache_manager is None:
+            return configs
+        # +1 keeps the length non-aligned (the Kimi KDA prefill warmup needs
+        # a non-aligned length to enter the pure K123 path).
+        floor = self.mapping.cp_size * kv_cache_manager.tokens_per_block + 1
+        return [(t if g > 0 else max(t, floor), g) for (t, g) in configs]
+
     def _get_max_shape_warmup_requests(
             self, resource_manager: ResourceManager) -> List[Tuple[int, int]]:
         """
@@ -1355,6 +1373,9 @@ class PyTorchModelEngine(ModelEngine):
             (max_batch_size, max_batch_size),  # max_batch_size, pure generation
         ]
 
+        warmup_requests_configs = self._helix_safe_warmup_configs(
+            warmup_requests_configs, kv_cache_manager)
+
         return warmup_requests_configs
 
     def _get_full_general_warmup_requests(
@@ -1375,6 +1396,10 @@ class PyTorchModelEngine(ModelEngine):
         # 1-token first to capture the 0→1 transition graph; max-shape next to seed
         # triton autotuning with the largest inputs; 2-token last for the small-ctx path.
         warmup_configs = one_token_configs + max_configs + small_ctx_configs
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        warmup_configs = self._helix_safe_warmup_configs(
+            warmup_configs, kv_cache_manager)
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
 
@@ -1823,7 +1848,10 @@ class PyTorchModelEngine(ModelEngine):
 
         model_type = getattr(self.model.model_config.pretrained_config,
                              "model_type", None)
-        if can_run_general_warmup and model_type in ("kimi_k3", "kimi_linear"):
+        # Not gated on can_run_general_warmup: Kimi always uses a
+        # MambaHybridCacheManager, which forces that gate False, yet the KDA
+        # pure-K123 prefill warmup is still required.
+        if model_type in ("kimi_k3", "kimi_linear"):
             # Kimi's one-token context takes the NT < 4 FLA fallback and does
             # not compile the optimized single-sequence K123 variant. A
             # non-aligned five-chunk context enters the pure K123 path.
@@ -1843,6 +1871,11 @@ class PyTorchModelEngine(ModelEngine):
                 "Skipped TRTLLM-Gen flashinfer_trtllm_gen FMHA lib JIT warmup When enable cute_dsl_mla FMHA lib"
             )
 
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        warmup_requests_configs = self._helix_safe_warmup_configs(
+            warmup_requests_configs, kv_cache_manager)
+
         for num_tokens, num_gen_requests in warmup_requests_configs:
             warmup_request = self._create_warmup_request(
                 resource_manager,
@@ -1851,6 +1884,15 @@ class PyTorchModelEngine(ModelEngine):
 
             with self.no_cuda_graph(), self._release_batch_context(
                     warmup_request, resource_manager) as batch:
+                if batch is None and self.mapping.has_cp_helix():
+                    # The helix floor may exceed tiny token/KV budgets; a
+                    # skipped warmup leaves Triton autotuning to the first
+                    # real request.
+                    logger.warning(
+                        f"Helix: skipping attention warmup shape "
+                        f"(num_tokens={num_tokens}, "
+                        f"num_gen_requests={num_gen_requests}); it does not "
+                        f"fit the token/KV budgets.")
                 if batch is None and self.mapping.tp_size <= 1:
                     continue  # Not enough KV cache space (single rank, safe to skip)
                 self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
