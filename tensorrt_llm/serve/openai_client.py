@@ -162,7 +162,8 @@ class OpenAIHttpClient(OpenAIClient):
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
             max_field_size=_PERF_METRICS_HEADER_BUDGET_BYTES,
         )
-        self._max_retries = max_retries
+        self._no_retry = os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
+        self._max_retries = 0 if self._no_retry else max_retries
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
@@ -231,7 +232,7 @@ class OpenAIHttpClient(OpenAIClient):
         # so the conditional raise inside the except block can actually decide
         # to keep retrying.  Non-transient errors still raise on the first
         # attempt that reaches self._max_retries.
-        _TRANSIENT_TCP_BUDGET = 5
+        _TRANSIENT_TCP_BUDGET = 0 if self._no_retry else 5
         loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
         for attempt in range(loop_max):
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
