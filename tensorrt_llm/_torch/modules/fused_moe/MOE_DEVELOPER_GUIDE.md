@@ -164,6 +164,16 @@ Still on old path (standalone, with embedded communication):
 
 Communication strategies are auto-selected at runtime by `CommunicationFactory` based on hardware and configuration. Skipped for `FUSED_COMM` backends. See `communication_factory.py` for selection logic and `base.py` for the `Communication` ABC.
 
+Communication strategies whose native workspace must participate in executor
+sleep/wakeup implement the runtime-checkable `CheckpointableCommunication`
+protocol from `communication/base.py`. The public
+`checkpoint_resource_key()` identifies wrappers that share one underlying
+workspace so the executor invokes `checkpoint_prepare()` and
+`checkpoint_restore()` once per resource. Discovery must use this protocol;
+do not add concrete strategy checks or inspect private workspace attributes.
+The executor request queue owns the persistent admission state around the
+checkpoint operation and reopens admission only after a complete wakeup.
+
 ### MegaMoE (`fused_moe/mega_moe/`)
 
 | File | Role |
@@ -428,7 +438,7 @@ When adding new components, use these reference implementations:
 | New `EXTERNAL_COMM` Backend | `fused_moe_cutlass.py` (`CutlassFusedMoE`) | `capabilities`, `can_implement`, `run_moe`, `create_weights`, `load_weights`; then add the class to `moe_resolution.BACKEND_CANDIDATES`. Add a fixed `descriptor.identity` only for a one-implementation leaf class |
 | New `FUSED_COMM` Backend | `mega_moe/mega_moe_deepgemm.py` (`MegaMoEDeepGemm`), `mega_moe/mega_moe_cute_dsl.py` (`MegaMoECuteDsl`) | Same as above + override `scheduler_kind = MoESchedulerKind.FUSED_COMM` and `validate_configurable_moe` for backend-specific constraints. For NVFP4 CuteDSL specifically, mirror the `MegaMoECuteDsl` pattern: capability probe for the CUDA 13 Cutlass DSL runtime, JSON-friendly tactic dict, lazy kernel import via `cute_dsl_kernels/mega_moe_nvfp4/import_kernel()`, and `quantize_input` that short-circuits zero-token input. |
 | New Quantization Method | `quantization.py` → `FP8QDQFusedMoEMethod` | Subclass `FusedMoEMethod`, implement quant/dequant ops |
-| New Communication Strategy | `communication/nvlink_one_sided.py` (`NVLinkOneSided`) | Subclass `Communication`, implement `prepare_dispatch`, `dispatch`, `combine` |
+| New Communication Strategy | `communication/nvlink_one_sided.py` (`NVLinkOneSided`) | Subclass `Communication`, implement `prepare_dispatch`, `dispatch`, `combine`; also implement `CheckpointableCommunication` when native workspace mappings must follow executor sleep/wakeup |
 | New Scheduler | `moe_scheduler.py` (`ExternalCommMoEScheduler` / `FusedCommMoEScheduler`) | Subclass `MoEScheduler`, implement `forward`; add new `MoESchedulerKind` value and wire into `create_moe_scheduler` factory |
 | Backend Tests | `test_moe_backend.py` | Follow existing parametrize patterns |
 | Integration Tests | `test_moe_module.py` | Test Backend × Communication × EPLB combinations |

@@ -50,9 +50,11 @@ import atexit
 import os
 import pickle
 import sys
+import threading
 import traceback
 from dataclasses import dataclass
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Set, Tuple
 from unittest.mock import MagicMock
 
@@ -62,7 +64,8 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm as tllm
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+import tensorrt_llm._mnnvl_utils as mnnvl
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
 )
@@ -2559,6 +2562,367 @@ def _run_rank_mask_one_rank_masked_test(
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
 
+def _exercise_mnnvl_checkpoint_graph_replay(
+    config: CommTestConfig, rank: int, communication
+) -> bool:
+    worker_inputs = _prepare_worker_inputs(rank, config)
+    _, local_slot_start, local_slot_end = _compute_ep_partition(
+        config.num_experts, config.ep_size, rank
+    )
+
+    def forward() -> torch.Tensor:
+        dispatch_outputs = _run_worker_dispatch(communication, worker_inputs, config)
+        received_hidden_states = _to_bf16(
+            dispatch_outputs.recv_hs,
+            dispatch_outputs.recv_sf,
+            worker_inputs.global_scale,
+            config.quant_mode,
+        )
+        moe_output = simple_moe(
+            received_hidden_states,
+            dispatch_outputs.recv_slots,
+            dispatch_outputs.recv_scales,
+            local_slot_start,
+            local_slot_end,
+        )
+        return communication.combine(
+            moe_output,
+            all_rank_max_num_tokens=max(config.all_num_tokens),
+        )
+
+    with torch.inference_mode():
+        forward()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = forward()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+        stable_addresses = (communication.mnnvl_mem.ptr, communication.workspace.data_ptr())
+
+        def allocations_are_mapped() -> bool:
+            return communication.mnnvl_mem.mapped
+
+    else:
+        stable_addresses = (
+            communication.alltoall_workspace.data_ptr(),
+            communication.alltoall_prepare_workspace.data_ptr(),
+        )
+
+        def allocations_are_mapped() -> bool:
+            return all(
+                workspace is None or workspace.mapped
+                for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+            )
+
+        def any_allocation_is_mapped() -> bool:
+            return any(
+                workspace is not None and workspace.mapped
+                for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+            )
+
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+
+        def any_allocation_is_mapped() -> bool:
+            return communication.mnnvl_mem.mapped
+
+    for cycle in range(3):
+        free_before_prepare = torch.cuda.mem_get_info()[0]
+        communication.checkpoint_prepare()
+        assert not any_allocation_is_mapped()
+        fresh_comm = MPI.COMM_WORLD.Split(0, rank)
+        communication.checkpoint_restore(fresh_comm)
+        assert allocations_are_mapped()
+        memory_drift_bytes = free_before_prepare - torch.cuda.mem_get_info()[0]
+        assert memory_drift_bytes <= 64 * 1024**2
+
+        if config.comm_type == COMM_NVLINK_ONE_SIDED:
+            restored_addresses = (
+                communication.mnnvl_mem.ptr,
+                communication.workspace.data_ptr(),
+            )
+        else:
+            restored_addresses = (
+                communication.alltoall_workspace.data_ptr(),
+                communication.alltoall_prepare_workspace.data_ptr(),
+            )
+        assert restored_addresses == stable_addresses
+
+        with torch.inference_mode():
+            worker_inputs.hs.add_(cycle + 1)
+            expected = forward().clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_output, expected)
+
+    return True
+
+
+def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
+    """Exercise stable-VA checkpoint cycles through a captured MoE communication graph."""
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(
+        rank=rank,
+        tp_size=config.ep_size,
+        moe_ep_size=config.ep_size,
+        world_size=config.ep_size,
+    )
+    communication = create_comm_object(config.comm_type, mapping, config)
+    try:
+        return _exercise_mnnvl_checkpoint_graph_replay(config, rank, communication)
+    finally:
+        if hasattr(communication, "destroy"):
+            communication.destroy()
+
+
+def _mnnvl_workspace_is_mapped(communication) -> bool:
+    if isinstance(communication, NVLinkOneSided):
+        return communication.mnnvl_mem.mapped
+    workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+    assert any(workspace is not None for workspace in workspaces)
+    return all(workspace is None or workspace.mapped for workspace in workspaces)
+
+
+def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool:
+    """Join the production engine coordinator, listener, and native resource hooks."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm.executor.base_worker import BaseWorker
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+    rank = tllm.mpi_rank()
+    world_size = config.ep_size
+    torch.cuda.set_device(rank)
+    assert MPI.Query_thread() >= MPI.THREAD_MULTIPLE
+
+    mapping = Mapping(
+        rank=rank,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+        world_size=world_size,
+    )
+    communication = create_comm_object(config.comm_type, mapping, config)
+    sleep_wakeup_comm = MPI.COMM_WORLD.Dup()
+    control_comm = MPI.COMM_WORLD.Dup()
+
+    class _Model:
+        def modules(self):
+            return [SimpleNamespace(comm=communication)]
+
+    executor = object.__new__(PyExecutor)
+    executor._sleep_wakeup_comm = sleep_wakeup_comm
+    executor._sleep_wakeup_lock = threading.Lock()
+    executor._sleep_wakeup_listener_thread = None
+    executor.control_request_barrier = threading.Event()
+    executor.control_action_done = threading.Event()
+    executor._active_control_id = None
+    executor.device_id = rank
+    executor.dist = SimpleNamespace(rank=rank, world_size=world_size)
+    executor.model_engine = SimpleNamespace(model=_Model())
+    executor.draft_model_engine = None
+
+    class _ControlRequestQueue:
+        def enqueue_control_request(self, *, drain, control_id):
+            assert drain
+            control_comm.bcast(control_id, root=0)
+            executor._active_control_id = control_id
+            executor.control_action_done.clear()
+            executor.control_request_barrier.set()
+
+    executor.executor_request_queue = _ControlRequestQueue()
+    retained_objects = getattr(sys, "_trtllm_mnnvl_coordination_test_objects", None)
+    if retained_objects is None:
+        retained_objects = []
+        setattr(sys, "_trtllm_mnnvl_coordination_test_objects", retained_objects)
+    retained_objects.append((communication, sleep_wakeup_comm, control_comm, executor))
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker._backend = "pytorch"
+    worker.rank = rank
+    worker.engine = executor
+    worker.llm_args = SimpleNamespace(
+        parallel_config=SimpleNamespace(world_size=world_size),
+        sleep_config=object(),
+    )
+
+    listener = None
+    listener_shutdown = False
+    try:
+        initial_error = None
+        try:
+            assert executor._has_mnnvl_checkpoint_resources([ExecutorMemoryType.MODEL_ENGINE_MAIN])
+            assert _mnnvl_workspace_is_mapped(communication)
+        except Exception as error:
+            initial_error = f"rank {rank}: {error}"
+        initial_errors = MPI.COMM_WORLD.allgather(initial_error)
+        assert not any(initial_errors), initial_errors
+
+        if rank != 0:
+            listener = threading.Thread(
+                target=executor._sleep_wakeup_listener_loop,
+                name=f"mnnvl-checkpoint-listener-{rank}",
+                daemon=True,
+            )
+            executor._sleep_wakeup_listener_thread = listener
+            listener.start()
+
+        MPI.COMM_WORLD.Barrier()
+        expected_mapped_states = (False, True)
+        if rank == 0:
+            for action, expected_mapped in zip(("sleep", "wakeup"), expected_mapped_states):
+                action_error = None
+                try:
+                    worker._multi_rank_sleep_wakeup(action, [ExecutorMemoryType.MODEL_ENGINE_MAIN])
+                except Exception as error:
+                    action_error = error
+                control_comm.bcast(action_error is None, root=0)
+                if action_error is not None:
+                    raise action_error
+
+                local_state_error = None
+                try:
+                    assert _mnnvl_workspace_is_mapped(communication) is expected_mapped
+                except Exception as error:
+                    local_state_error = f"rank {rank}: {error}"
+                state_errors = control_comm.allgather(local_state_error)
+                assert not any(state_errors), state_errors
+            executor._shutdown_sleep_wakeup_listeners()
+            listener_shutdown = True
+        else:
+            # This is the only emulated production piece: the regular request
+            # broadcaster delivers the control sentinel to the executor loop.
+            # The real listener and its dedicated communicator remain under test.
+            for expected_mapped in expected_mapped_states:
+                control_id = control_comm.bcast(None, root=0)
+                executor._active_control_id = control_id
+                executor.control_action_done.clear()
+                executor.control_request_barrier.set()
+                action_completed = executor.control_action_done.wait(timeout=60.0)
+                executor.control_action_done.clear()
+                executor._active_control_id = None
+                action_succeeded = control_comm.bcast(None, root=0)
+                if not action_succeeded:
+                    break
+
+                local_state_error = None
+                try:
+                    assert action_completed, "listener did not release the control request"
+                    assert _mnnvl_workspace_is_mapped(communication) is expected_mapped
+                except Exception as error:
+                    local_state_error = f"rank {rank}: {error}"
+                state_errors = control_comm.allgather(local_state_error)
+                assert not any(state_errors), state_errors
+            assert listener is not None
+            listener.join(timeout=60.0)
+            assert not listener.is_alive()
+        return True
+    finally:
+        if rank == 0 and not listener_shutdown:
+            executor._shutdown_sleep_wakeup_listeners()
+        if listener is not None and listener.is_alive():
+            listener.join(timeout=1.0)
+        # The process-global retention list keeps the duplicated communicators,
+        # executor shell, and native resource alive until MPI_Finalize. Freeing
+        # or destroying any of them while a failed peer listener still owns a
+        # request can hide the original failure with a hang/crash.
+
+
+class _FailureInjectionMnnvlMemory(MnnvlMemory):
+    pass
+
+
+def _worker_mnnvl_checkpoint_failure_injection(_unused=None) -> bool:
+    """Prove local CUDA failures do not strand peers in checkpoint collectives."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    rank = tllm.mpi_rank()
+    comm = MPI.COMM_WORLD.Split(0, rank)
+    comm_size = comm.Get_size()
+    obj = _FailureInjectionMnnvlMemory.__new__(_FailureInjectionMnnvlMemory)
+    obj.ptr = 1032
+    obj.mapping = SimpleNamespace(rank=rank)
+
+    def install_record(state, handles):
+        record = mnnvl._MnnvlAllocationRecord(
+            comm=comm,
+            comm_size=comm_size,
+            comm_rank=rank,
+            comm_membership=tuple(range(comm_size)),
+            aligned_size=64,
+            mem_handles=handles,
+            start_address=1000,
+            rank_stride=256,
+            address_offset=32,
+            state=state,
+        )
+        _FailureInjectionMnnvlMemory.allocated_map = {obj.ptr: record}
+        return record
+
+    prepare_record = install_record(
+        mnnvl._MnnvlAllocationState.MAPPED,
+        list(range(1, comm_size + 1)),
+    )
+    unmap = Mock()
+    if rank == 0:
+        unmap.side_effect = [
+            None,
+            RuntimeError("injected partial unmap failure"),
+            *([None] * (comm_size - 2)),
+        ]
+    with (
+        patch.object(mnnvl.torch.cuda, "synchronize"),
+        patch.object(mnnvl.cuda, "cuMemUnmap", unmap),
+        patch.object(mnnvl.cuda, "cuMemRelease", return_value=None),
+        patch.object(mnnvl, "_check_cu_result", side_effect=lambda result: result),
+    ):
+        prepare_error = None
+        try:
+            obj.checkpoint_prepare()
+        except RuntimeError as error:
+            prepare_error = str(error)
+
+    prepare_errors = comm.allgather(prepare_error)
+    assert "injected partial unmap failure" in prepare_errors[0]
+    assert all(error is None for error in prepare_errors[1:])
+    assert prepare_record.state is (
+        mnnvl._MnnvlAllocationState.BROKEN if rank == 0 else mnnvl._MnnvlAllocationState.UNMAPPED
+    )
+
+    restore_record = install_record(
+        mnnvl._MnnvlAllocationState.UNMAPPED,
+        [None] * comm_size,
+    )
+    create_and_map = Mock(
+        side_effect=(RuntimeError("injected remap failure") if rank == 0 else None),
+        return_value=list(range(11, 11 + comm_size)),
+    )
+    with (
+        patch.object(mnnvl.torch.cuda, "synchronize"),
+        patch.object(mnnvl.cuda, "cuMemUnmap", return_value=None),
+        patch.object(mnnvl.cuda, "cuMemRelease", return_value=None),
+        patch.object(mnnvl, "_check_cu_result", side_effect=lambda result: result),
+        patch.object(
+            _FailureInjectionMnnvlMemory,
+            "_create_and_map_handles",
+            create_and_map,
+        ),
+    ):
+        restore_error = None
+        try:
+            obj.checkpoint_restore(comm)
+        except RuntimeError as error:
+            restore_error = str(error)
+
+    restore_errors = comm.allgather(restore_error)
+    assert all("injected remap failure" in error for error in restore_errors)
+    assert restore_record.state is mnnvl._MnnvlAllocationState.BROKEN
+    _FailureInjectionMnnvlMemory.allocated_map = {}
+    del obj.ptr
+    return True
+
+
 # ============================================================================
 # Test Class
 # ============================================================================
@@ -2623,6 +2987,77 @@ class TestMoEComm:
     def test_nccl_ep_cuda_graph_replay_uses_updated_routing(self, mpi_pool_executor) -> None:
         """Verify LL CUDA graph replay reads routing written after capture."""
         _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+    @pytest.mark.parametrize(
+        "comm_type",
+        [COMM_NVLINK_ONE_SIDED, COMM_NVLINK_TWO_SIDED],
+    )
+    def test_mnnvl_checkpoint_preserves_moe_graph_addresses(
+        self,
+        mpi_pool_executor,
+        comm_type: str,
+    ) -> None:
+        """Verify repeated checkpoint cycles preserve MoE graph pointers and outputs."""
+        config = CommTestConfig(
+            comm_type=comm_type,
+            ep_size=mpi_pool_executor.num_workers,
+            num_experts=32,
+            top_k=2,
+            hidden_size=128,
+            all_num_tokens=[8] * mpi_pool_executor.num_workers,
+        )
+        skip_reason = _get_skip_reason(config)
+        if skip_reason:
+            pytest.skip(skip_reason)
+        results = mpi_pool_executor.map(
+            _worker_mnnvl_checkpoint_graph_replay,
+            [config] * config.ep_size,
+        )
+        assert all(results)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+    @pytest.mark.parametrize(
+        "comm_type",
+        [COMM_NVLINK_ONE_SIDED, COMM_NVLINK_TWO_SIDED],
+    )
+    def test_mnnvl_engine_checkpoint_coordination(
+        self,
+        mpi_pool_executor,
+        comm_type: str,
+    ) -> None:
+        """Exercise BaseWorker and PyExecutor around native MNNVL checkpoint hooks."""
+        config = CommTestConfig(
+            comm_type=comm_type,
+            ep_size=mpi_pool_executor.num_workers,
+            num_experts=32,
+            top_k=2,
+            hidden_size=128,
+            all_num_tokens=[8] * mpi_pool_executor.num_workers,
+        )
+        skip_reason = _get_skip_reason(config)
+        if skip_reason:
+            pytest.skip(skip_reason)
+        results = mpi_pool_executor.map(
+            _worker_mnnvl_engine_checkpoint_coordination,
+            [config] * config.ep_size,
+        )
+        assert all(results)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+    def test_mnnvl_checkpoint_failure_is_collective_and_bounded(
+        self,
+        mpi_pool_executor,
+    ) -> None:
+        """A single-rank unmap or remap failure must return on every rank."""
+        results = mpi_pool_executor.map(
+            _worker_mnnvl_checkpoint_failure_injection,
+            [None] * mpi_pool_executor.num_workers,
+        )
+        assert all(results)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
