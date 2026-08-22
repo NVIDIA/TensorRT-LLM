@@ -222,6 +222,9 @@ class DeepSeekR1Parser(BaseReasoningParser):
                  reasoning_at_start: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
         super().__init__(chat_template_kwargs=chat_template_kwargs)
+        if isinstance(chat_template_kwargs, dict):
+            reasoning_at_start = chat_template_kwargs.get(
+                "enable_thinking", reasoning_at_start)
         self.reasoning_start = "<think>"
         self.reasoning_end = "</think>"
         self.reasoning_at_start = reasoning_at_start
