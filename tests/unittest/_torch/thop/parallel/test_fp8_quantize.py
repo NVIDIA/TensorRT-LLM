@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,8 +20,9 @@ from parameterized import parameterized
 from utils.util import (getSMVersion, isSM100Family,
                         skip_pre_blackwell_unittest, unittest_name_func)
 
-from tensorrt_llm.quantization.utils.fp8_utils import \
-    per_token_quant_and_transform
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    align, ceil_div, per_token_quant_and_transform,
+    silu_and_mul_masked_post_quant_fwd)
 
 
 def _dequant_fp8(input, scale, transpose_scale, block_m, block_n):
@@ -371,6 +372,105 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
         atol=1e-10,
         rtol=0.01,
         msg=f"UE8M0 decoded scales mismatch for shape ({m}, {k})")
+
+
+@pytest.mark.skipif(
+    getSMVersion() < 89,
+    reason="Needs FP8 E4M3 support",
+)
+def test_fp8_quantize_ue8m0_under_torch_compile():
+    """`per_token_quant_and_transform` has to compile under TorchInductor.
+
+    Inductor binds the host-side Python `float` args (`fp8_max` / `fp8_min`) as
+    fp64 scalars. Unpinned, that promotes `output_s` to float64 and the UE8M0
+    exponent `bitcast` to int32 fails to compile ("Cannot bitcast data-type of
+    size 64 to data-type of size 32"). The kernel pins both bounds to float32.
+
+    On the validated torch/Inductor builds, these scalars are bound as fp64: the
+    generated kernel signature emits `'fp8_max': 'fp64'` on torch 2.11 (sm_120)
+    and torch 2.12 (sm_121), both with triton 3.6.0. This guard ensures the
+    kernel remains valid when Inductor uses that scalar specialization.
+
+    `fullgraph=True` keeps a future graph break from turning this into a silent
+    pass that never reaches Inductor.
+    """
+    torch.random.manual_seed(42)
+    input_tensor = torch.randn((512, 5376), device="cuda", dtype=torch.bfloat16)
+
+    eager_fp8, eager_scale = per_token_quant_and_transform(input_tensor.clone())
+    compiled_quantize = torch.compile(per_token_quant_and_transform,
+                                      dynamic=True,
+                                      fullgraph=True)
+    compiled_fp8, compiled_scale = compiled_quantize(input_tensor.clone())
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(compiled_fp8.float(),
+                               eager_fp8.float(),
+                               atol=0,
+                               rtol=0)
+    torch.testing.assert_close(compiled_scale, eager_scale, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    getSMVersion() < 89,
+    reason="Needs FP8 E4M3 support",
+)
+@pytest.mark.parametrize("swiglu_limit", [None, 7.0],
+                         ids=["no_swiglu_limit", "swiglu_limit"])
+def test_silu_and_mul_ue8m0_under_torch_compile(swiglu_limit):
+    """Same fp64-promotion guard for `silu_and_mul_masked_post_quant_fwd`.
+
+    This is the activation path DeepSeek-style FP8 block-scale MoE takes, and it
+    carries the same unpinned-scalar shape as `per_token_quant_and_transform`.
+    Both `swiglu_limit` settings are covered because the limit is another
+    host-side Python float baked in as a constexpr.
+    """
+    torch.random.manual_seed(42)
+    num_experts, num_tokens, k = 2, 16, 512
+    quant_group_size = 128
+
+    m_padded = align(num_tokens, 4)
+    scale_k_padded = align(ceil_div(k, quant_group_size), 4)
+
+    # input is [experts, m, 2k] (gate | up), matching the MoE caller.
+    input_tensor = torch.randn((num_experts, num_tokens, 2 * k),
+                               device="cuda",
+                               dtype=torch.bfloat16)
+    masked_m = torch.full((num_experts, ),
+                          num_tokens,
+                          device="cuda",
+                          dtype=torch.int32)
+
+    def run():
+        # zeros, not empty: capacity can exceed the live token count, so
+        # untouched padding would otherwise hold nondeterministic garbage and
+        # make the eager/compiled comparison meaningless.
+        output = torch.zeros((num_experts, num_tokens, k),
+                             device="cuda",
+                             dtype=torch.float8_e4m3fn)
+        output_scale = torch.zeros((num_experts, scale_k_padded // 4, m_padded),
+                                   device="cuda",
+                                   dtype=torch.int32)
+        silu_and_mul_masked_post_quant_fwd(output=output,
+                                           output_scale=output_scale,
+                                           input=input_tensor,
+                                           quant_group_size=quant_group_size,
+                                           masked_m=masked_m,
+                                           scale_ue8m0=True,
+                                           swiglu_limit=swiglu_limit)
+        return output, output_scale
+
+    eager_fp8, eager_scale = run()
+    compiled_fp8, compiled_scale = torch.compile(run,
+                                                 dynamic=True,
+                                                 fullgraph=True)()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(compiled_fp8.float(),
+                               eager_fp8.float(),
+                               atol=0,
+                               rtol=0)
+    torch.testing.assert_close(compiled_scale, eager_scale, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Optional, Tuple
 
 import torch
@@ -380,6 +395,10 @@ def _silu_and_mul_post_quant_kernel(
 
     token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
 
+    # Inductor binds Python float scalars as fp64; pin to fp32 so output_s stays
+    # 32-bit for the UE8M0 exponent bitcast below.
+    fp8_max = tl.cast(fp8_max, dtype=tl.float32)
+    fp8_min = tl.cast(fp8_min, dtype=tl.float32)
     stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
     stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
     stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
@@ -428,6 +447,10 @@ def _silu_and_mul_post_quant_kernel(
                 output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
             output_q = tl.clamp(gate_up / output_s, fp8_min,
                                 fp8_max).to(output_ptr.dtype.element_ty)
+            # The bitcast needs a 32-bit source. A no-op once the scalars above
+            # are pinned, but it keeps the requirement on the line that depends
+            # on it, so a future fp64 float arg here cannot silently break it.
+            output_s = output_s.to(tl.float32)
             output_s_int32 += ((output_s.to(tl.int32, bitcast=True) >> 23) <<
                                (8 * pack_index))
             tl.store(
@@ -556,6 +579,10 @@ def _per_token_quant_and_transform_kernel(
 
     block_num_per_expert = tl.num_programs(1)
 
+    # Inductor binds Python float scalars as fp64; pin to fp32 so output_s stays
+    # 32-bit for the UE8M0 exponent bitcast below.
+    fp8_max = tl.cast(fp8_max, dtype=tl.float32)
+    fp8_min = tl.cast(fp8_min, dtype=tl.float32)
     stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
     stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
     stride_output_scale_0 = tl.cast(stride_output_scale_0, dtype=tl.int64)
@@ -591,6 +618,10 @@ def _per_token_quant_and_transform_kernel(
                 output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
             output_q = tl.clamp(act / output_s, fp8_min,
                                 fp8_max).to(output_ptr.dtype.element_ty)
+            # The bitcast needs a 32-bit source. A no-op once the scalars above
+            # are pinned, but it keeps the requirement on the line that depends
+            # on it, so a future fp64 float arg here cannot silently break it.
+            output_s = output_s.to(tl.float32)
             output_s_int32 += ((output_s.to(tl.int32, bitcast=True) >> 23) <<
                                (8 * pack_index))
             tl.store(
