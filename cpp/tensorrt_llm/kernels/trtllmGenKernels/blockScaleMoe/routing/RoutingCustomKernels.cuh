@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Custom routing: entry point, kernel definitions, and launch wrappers.
+// Custom routing implementation included by the per-family translation units.
 //
 // Kernel inventory:
 //   1. routingIndicesBlockKernel      — single-block fused kernel (≤4 tokens)
@@ -35,6 +35,21 @@ namespace moe::dev::routing
 {
 namespace routingCustom
 {
+
+#if (defined(TRTLLM_ROUTING_CUSTOM_BLOCK_GROUP) + defined(TRTLLM_ROUTING_CUSTOM_CLUSTER_SMALL)                         \
+    + defined(TRTLLM_ROUTING_CUSTOM_CLUSTER_LARGE) + defined(TRTLLM_ROUTING_CUSTOM_ENTRY))                             \
+    != 1
+#error "Define exactly one TRTLLM_ROUTING_CUSTOM_* translation-unit selector"
+#endif
+
+void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+void launchClusterKernelBlockDim256(Data const& data, void* stream);
+void launchClusterKernelBlockDim512(Data const& data, void* stream);
+void launchClusterKernelBlockDim1024(Data const& data, void* stream);
+void launchClusterKernel(Data const& data, void* stream);
+void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist, void* stream);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Dual warp-level exclusive prefix scan over NumExpertWarps * 32 values.
@@ -383,12 +398,14 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 #endif
 }
 
+#if defined(TRTLLM_ROUTING_CUSTOM_BLOCK_GROUP)
 void launchBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream)
 {
     LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesBlockKernel, 1, numThreadsHist,
         /*smemSize=*/0, // No dynamic smem
         stream);
 }
+#endif // defined(TRTLLM_ROUTING_CUSTOM_BLOCK_GROUP)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -782,12 +799,14 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     }
 }
 
+#if defined(TRTLLM_ROUTING_CUSTOM_BLOCK_GROUP)
 void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream)
 {
     LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesCoopBlockKernel, 1, numThreadsHist,
         /*smemSize=*/0, // No dynamic smem
         stream);
 }
+#endif // defined(TRTLLM_ROUTING_CUSTOM_BLOCK_GROUP)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -1093,6 +1112,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params)
 #endif
 }
 
+#if defined(TRTLLM_ROUTING_CUSTOM_BLOCK_GROUP)
 void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream)
 {
     int32_t const maxExperts = queryDispatchedMaxExperts(data);
@@ -1103,6 +1123,7 @@ void launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 
     LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesDynBlockKernel, 1, threads, smemSize, stream);
 }
+#endif // defined(TRTLLM_ROUTING_CUSTOM_BLOCK_GROUP)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -1322,21 +1343,23 @@ void launchClusterKernelForBlockDim(Data const& data, void* stream)
         { launchClusterKernelForPolicy<ClusterBlockDim, decltype(preProc), decltype(postProc)>(data, stream); });
 }
 
-void launchClusterKernel(Data const& data, void* stream)
+#if defined(TRTLLM_ROUTING_CUSTOM_CLUSTER_SMALL)
+void launchClusterKernelBlockDim256(Data const& data, void* stream)
 {
-    // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
-    // Use them only where the requested token count fits; otherwise keep the original 1024-thread launch.
-    if (data.mNumTokens <= MaxNumTokensClusterScores256)
-    {
-        launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
-        return;
-    }
-    if (data.mNumTokens <= MaxNumTokensClusterScores512)
-    {
-        launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
-        return;
-    }
+    launchClusterKernelForBlockDim<ClusterBlockDim256>(data, stream);
+}
+#endif // defined(TRTLLM_ROUTING_CUSTOM_CLUSTER_SMALL)
 
+#if defined(TRTLLM_ROUTING_CUSTOM_CLUSTER_SMALL)
+void launchClusterKernelBlockDim512(Data const& data, void* stream)
+{
+    launchClusterKernelForBlockDim<ClusterBlockDim512>(data, stream);
+}
+#endif // defined(TRTLLM_ROUTING_CUSTOM_CLUSTER_SMALL)
+
+#if defined(TRTLLM_ROUTING_CUSTOM_CLUSTER_LARGE)
+void launchClusterKernelBlockDim1024(Data const& data, void* stream)
+{
     bool const useNoOpSoftmaxScores = data.mPtrScores != nullptr && data.mPreprocessType == RoutingPreprocessType::None
         && data.mPostprocessType == RoutingPostprocessType::Softmax;
     if (useNoOpSoftmaxScores)
@@ -1349,6 +1372,26 @@ void launchClusterKernel(Data const& data, void* stream)
         /*smemSize=*/0, // No dynamic smem
         stream);
 }
+#endif // defined(TRTLLM_ROUTING_CUSTOM_CLUSTER_LARGE)
+
+#if defined(TRTLLM_ROUTING_CUSTOM_ENTRY)
+void launchClusterKernel(Data const& data, void* stream)
+{
+    // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
+    // Use them only where the requested token count fits; otherwise keep the original 1024-thread launch.
+    if (data.mNumTokens <= MaxNumTokensClusterScores256)
+    {
+        launchClusterKernelBlockDim256(data, stream);
+        return;
+    }
+    if (data.mNumTokens <= MaxNumTokensClusterScores512)
+    {
+        launchClusterKernelBlockDim512(data, stream);
+        return;
+    }
+    launchClusterKernelBlockDim1024(data, stream);
+}
+#endif // defined(TRTLLM_ROUTING_CUSTOM_ENTRY)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -1481,7 +1524,8 @@ __global__ void __launch_bounds__(HistogramScoresKernelConfig<typename KernelPar
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
-static void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist, void* stream)
+#if defined(TRTLLM_ROUTING_CUSTOM_ENTRY)
+void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist, void* stream)
 {
     dispatchRoutingPolicy(data,
         [&](auto preProc, auto postProc)
@@ -1508,6 +1552,7 @@ static void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks,
             }
         });
 }
+#endif // defined(TRTLLM_ROUTING_CUSTOM_ENTRY)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -1515,6 +1560,7 @@ static void launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks,
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if defined(TRTLLM_ROUTING_CUSTOM_ENTRY)
 void launchCoopKernel(Data const& data, int numBlocksCoop, uint32_t numThreadsHist, void* stream)
 {
     if (data.mNumExperts <= NumExperts128Experts)
@@ -1759,6 +1805,8 @@ void run(Data const& data, void* stream)
         }
     }
 }
+
+#endif // defined(TRTLLM_ROUTING_CUSTOM_ENTRY)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
