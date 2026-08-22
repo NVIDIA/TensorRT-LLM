@@ -696,7 +696,8 @@ void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, Cac
 }
 
 void KvCache::_recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdinal blockEnd,
-    TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration)
+    TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration,
+    bool excludedIsScratch)
 {
     if (!_shouldRecordStats() || blockBegin >= blockEnd)
     {
@@ -720,11 +721,30 @@ void KvCache::_recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdi
             changed |= mPendingStats.recordAllocationRange(
                 lifeCycle, secondBegin, blockEnd, mBeamWidth.value(), !countAsGeneration, countAsGeneration);
         }
+        if (excludedIsScratch)
+        {
+            // The piece dropped between the two recorded outer ranges is exactly the scratch
+            // block count for this lifecycle.
+            _recordScratchIterationStats(
+                lifeCycle, intersect(excluded, HalfOpenRange<BlockOrdinal>{blockBegin, blockEnd}).length());
+        }
     }
     if (changed)
     {
         mManager->markStatsDirty(id);
     }
+}
+
+void KvCache::_recordScratchIterationStats(LifeCycleId lifeCycle, int64_t numBlocks)
+{
+    if (numBlocks <= 0)
+    {
+        return;
+    }
+    KVCacheIterationStatsDelta iterationStats;
+    iterationStats.iterScratchBlocks = numBlocks;
+    iterationStats.iterScratchSlotsInUse = static_cast<int64_t>(mScratchSlots[lifeCycle].size());
+    _recordDirectIterationStats(lifeCycle, iterationStats);
 }
 
 void KvCache::_subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd)
@@ -1133,7 +1153,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
         // Scratch and stale blocks do not consume per-request KV pages, so exclude them from allocation stats.
         auto const& excludedRanges = enableScratch ? scratchRanges : staleRanges;
-        _recordResizePendingAllocations(oldNumBlocks, newNumBlocks, excludedRanges, recordGenerationAllocStats);
+        _recordResizePendingAllocations(
+            oldNumBlocks, newNumBlocks, excludedRanges, recordGenerationAllocStats, enableScratch);
 
         // Resize page index buffers.
         TLLM_CHECK_DEBUG(std::all_of(mBasePageIndices.begin(), mBasePageIndices.end(),

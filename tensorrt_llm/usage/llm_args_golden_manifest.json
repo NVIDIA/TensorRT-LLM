@@ -766,8 +766,10 @@
       "path": "kv_cache_config.enable_partial_reuse"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
+      "allowed_values": [
+        "auto"
+      ],
+      "annotation": "Union[bool, Literal['auto']]",
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.enable_swa_scratch_reuse"
