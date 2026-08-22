@@ -31,6 +31,24 @@ from .openai_protocol import (ChatCompletionMessageParam,
 # yapf: enable
 
 
+def _get_named_tool_choice(tool_choice: Any) -> str | None:
+    """Return the function name if tool_choice selects a specific function.
+
+    Accepts either a ``ChatCompletionNamedToolChoiceParam`` (Pydantic model,
+    accessed via ``.function.name``) or the equivalent dict form
+    ``{"type": "function", "function": {"name": ...}}``. Returns ``None`` for
+    string-valued or missing tool_choice.
+    """
+    if tool_choice is None or isinstance(tool_choice, str):
+        return None
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") != "function":
+            return None
+        return tool_choice.get("function", {}).get("name")
+    func = getattr(tool_choice, "function", None)
+    return getattr(func, "name", None) if func is not None else None
+
+
 def _check_channel_valid(generated_channels: List[str], channel: str) -> bool:
 
     if len(generated_channels) == 0 or generated_channels[-1] != channel:
@@ -55,7 +73,7 @@ class HarmonyStreamState:
                  request_id: str,
                  encoding,
                  available_tools: list[dict[str, Any]] | None = None,
-                 tool_choice: str | None = None):
+                 tool_choice: Any = None):
         self.request_id = request_id
         self.encoding = encoding
         self.parser = StreamableParser(encoding, role=Role.ASSISTANT)
@@ -64,12 +82,17 @@ class HarmonyStreamState:
         self.available_tools = set()
         self.should_filter_tools = False  # Track if we should filter tools
 
+        forced_name = _get_named_tool_choice(tool_choice)
         if tool_choice == "none":
             # tool_choice="none" means suppress ALL tool calls, regardless of available_tools
             self.should_filter_tools = True
             self.available_tools = set()  # Empty set means no tools are allowed
+        elif forced_name is not None:
+            # Named-function tool_choice: allow only the requested function.
+            self.should_filter_tools = True
+            self.available_tools = {forced_name}
         elif available_tools is not None:
-            # Normal case: filter based on available tools
+            # Normal case ("auto" or "required"): filter based on available tools
             self.should_filter_tools = True
             self.available_tools = {
                 tool.get("function", {}).get("name", "") if tool.get(
@@ -692,7 +715,7 @@ class HarmonyAdapter:
             openai_messages: list[ChatCompletionMessageParam],
             available_tools: list[dict[str, Any]] | None = None,
             reasoning_effort: ReasoningEffort | None = None,
-            tool_choice: str | None = None) -> list[int]:
+            tool_choice: Any = None) -> list[int]:
         """
         Convert OpenAI API chat messages to Harmony token sequence.
 
@@ -700,7 +723,10 @@ class HarmonyAdapter:
             openai_messages: List of OpenAI chat messages
             available_tools: Optional list of available tools
             explicit_reasoning_effort: Optional explicit reasoning effort that takes precedence over system message parsing
-            tool_choice: Optional tool choice ("auto", "none", etc.)
+            tool_choice: Optional tool choice. Accepts the strings
+                ``"auto"``, ``"none"``, ``"required"``, or a named-function
+                object (``{"type": "function", "function": {"name": ...}}``
+                or its Pydantic equivalent).
 
         Reasoning effort precedence:
         1. explicit_reasoning_effort parameter (highest priority)
@@ -710,7 +736,9 @@ class HarmonyAdapter:
         Tool choice behavior:
         - "auto" (default): Model decides whether to use tools based on available_tools
         - "none": Tools are completely removed before sending to model
-        - Any other value: Falls back to "auto" behavior
+        - "required": Model is instructed to always emit at least one tool call
+        - named function: Only the selected function is exposed and the model
+          is instructed to call it
 
         Format notes:
         1. Both header orders are supported:
@@ -754,10 +782,18 @@ class HarmonyAdapter:
                 return tokens
 
             # Handle tool_choice parameter
+            forced_tool_name = _get_named_tool_choice(tool_choice)
+            require_tool_call = tool_choice == "required"
             if tool_choice == "none":
                 # Don't pass any tools to harmony model - model won't see any tool definitions
                 available_tools = None
-            # For "auto" or any other value, use normal behavior (pass tools as-is)
+            elif forced_tool_name is not None and available_tools is not None:
+                # Restrict the exposed tool set to the specifically selected function.
+                available_tools = [
+                    tool for tool in available_tools
+                    if tool.get("function", {}).get("name") == forced_tool_name
+                ]
+            # For "auto" or "required", use normal behavior (pass tools as-is)
 
             # Extract available external tool names
             external_tools = set()
@@ -773,6 +809,15 @@ class HarmonyAdapter:
             # Collect system instructions from OpenAI messages
             system_instructions: list[str] = []
             dev_instructions: list[str] = []
+            if forced_tool_name is not None:
+                dev_instructions.append(
+                    "You must call the function "
+                    f"`{forced_tool_name}` exactly once and provide arguments "
+                    "matching its declared JSON schema.")
+            elif require_tool_call:
+                dev_instructions.append(
+                    "You must call one of the provided functions in your "
+                    "response. Do not answer without invoking a function.")
             conversation_messages: list[ChatCompletionMessageParam] = [
             ]  # Store user/assistant/tool messages
             tool_call_map = {}  # Map tool_call_id to function name
@@ -886,7 +931,7 @@ class HarmonyAdapter:
             openai_messages: list[ChatCompletionMessageParam],
             available_tools: list[dict[str, Any]] | None = None,
             reasoning_effort: ReasoningEffort | None = None,
-            tool_choice: str | None = None) -> str:
+            tool_choice: Any = None) -> str:
         """
         Convert OpenAI API chat messages to Harmony prompt string.
         """
@@ -1059,11 +1104,11 @@ class HarmonyAdapter:
 
         return clean_tokens
 
-    def harmony_output_to_openai(
-            self,
-            harmony_output_tokens: list[int],
-            available_tools: list[dict[str, Any]] | None = None,
-            tool_choice: str | None = None) -> dict[str, Any]:
+    def harmony_output_to_openai(self,
+                                 harmony_output_tokens: list[int],
+                                 available_tools: list[dict[str, Any]]
+                                 | None = None,
+                                 tool_choice: Any = None) -> dict[str, Any]:
         """
         Parse Harmony model output tokens and convert to OpenAI API response format. Non-streaming.
         Returns a single message dict.
@@ -1082,10 +1127,15 @@ class HarmonyAdapter:
         external_tools = set()
         should_filter_external_tools = False
 
+        forced_name = _get_named_tool_choice(tool_choice)
         if tool_choice == "none":
             # tool_choice="none" means suppress ALL tool calls, regardless of available_tools
             should_filter_external_tools = True
             external_tools = set()  # Empty set means no tools are allowed
+        elif forced_name is not None:
+            # Only the specifically-requested function is allowed downstream.
+            should_filter_external_tools = True
+            external_tools = {forced_name}
         elif available_tools is not None:
             # Normal case: filter based on available tools
             should_filter_external_tools = True
@@ -1230,7 +1280,7 @@ class HarmonyAdapter:
             self,
             tokens: list[int],
             available_tools: list[dict[str, Any]] | None = None,
-            tool_choice: str | None = None) -> list[dict[str, Any]]:
+            tool_choice: Any = None) -> list[dict[str, Any]]:
         """
         Convert harmony tokens to OpenAI streaming deltas. DEPRECATED - Use stateful streaming instead.
 
@@ -1349,7 +1399,7 @@ class HarmonyAdapter:
             request_id: str,
             tokens: list[int],
             available_tools: list[dict[str, Any]] | None = None,
-            tool_choice: str | None = None) -> list[dict[str, Any]]:
+            tool_choice: Any = None) -> list[dict[str, Any]]:
         """
         Process tokens using stateful parsing.
 
@@ -1390,7 +1440,7 @@ class HarmonyAdapter:
             request_id: str,
             tokens: list[int],
             available_tools: list[dict[str, Any]] | None = None,
-            tool_choice: str | None = None) -> list[Message]:
+            tool_choice: Any = None) -> list[Message]:
         """
         Process tokens using stateful parsing.
 
@@ -1427,7 +1477,7 @@ class HarmonyAdapter:
             tokens: list[int],
             available_tools: list[dict[str, Any]] | None = None,
             model_name: str = "harmony-model",
-            tool_choice: str | None = None,
+            tool_choice: Any = None,
             stream_response_id: str | None = None,
             stream_created: int | None = None) -> Tuple[list[str], bool]:
         """
@@ -1555,11 +1605,10 @@ class HarmonyAdapter:
 
         return responses, False
 
-    def create_stream_state(
-            self,
-            request_id: str,
-            available_tools: list[dict[str, Any]] | None = None,
-            tool_choice: str | None = None) -> HarmonyStreamState:
+    def create_stream_state(self,
+                            request_id: str,
+                            available_tools: list[dict[str, Any]] | None = None,
+                            tool_choice: Any = None) -> HarmonyStreamState:
         """
         Create a stateful harmony stream parser for a request.
         This maintains state across multiple token batches for proper streaming.
@@ -1656,7 +1705,7 @@ def _create_stream_response(
 
 
 def handle_streaming_response(tools: List[ChatCompletionToolsParam],
-                              tool_choice: str,
+                              tool_choice: Any,
                               result: GenerationResult,
                               model: str,
                               request_id: str,
@@ -1799,7 +1848,7 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
 
 
 def handle_non_streaming_response(tools: List[ChatCompletionToolsParam],
-                                  tool_choice: str,
+                                  tool_choice: Any,
                                   outputs: List,
                                   model: str,
                                   num_prompt_tokens: int,
