@@ -1189,7 +1189,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
-        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse and max_beam_width == 1
+        self.enable_partial_reuse = self._resolve_enable_partial_reuse(kv_cache_config)
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
         enable_conversation_manager = (
             self.enable_block_reuse
@@ -1785,6 +1785,19 @@ class KVCacheManagerV2(BaseResourceManager):
             non_blocking=True,
         )
 
+    def _resolve_enable_partial_reuse(self, kv_cache_config: KvCacheConfig) -> bool:
+        """Whether partial (sub-block) prefix matching may be enabled.
+
+        Beam search turns off ``enable_partial_commit``, so nobody publishes a
+        finalized prompt tail; matching against one would only find blocks that
+        can never appear. Keep the two flags in lockstep.
+
+        ``_build_base_config`` runs before ``self.enable_partial_reuse`` is
+        assigned, so both callers go through this helper instead of repeating
+        the expression.
+        """
+        return kv_cache_config.enable_partial_reuse and self.max_beam_width == 1
+
     def _build_base_config(
         self,
         kv_cache_config: KvCacheConfig,
@@ -1804,6 +1817,11 @@ class KVCacheManagerV2(BaseResourceManager):
             # They should not count toward the scratch range.
             scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
 
+        # KVCacheDesc has no beam dimension, so the descs below model beam
+        # width 1. Beam search only replicates blocks from the prompt tail
+        # onward, and a uniform factor would cancel out in the normalized pool
+        # ratio anyway, so the residual skew is not worth guessing at here.
+        # Set kv_cache_config.pool_ratio explicitly if the split needs tuning.
         typical_step = None
         constraints = []
         if kv_cache_config.pool_ratio is None:
@@ -1912,8 +1930,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
-        enable_partial_reuse = kv_cache_config.enable_partial_reuse and self.max_beam_width == 1
-
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
@@ -1921,7 +1937,7 @@ class KVCacheManagerV2(BaseResourceManager):
             typical_step=typical_step,
             constraints=constraints,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
-            enable_partial_reuse=enable_partial_reuse,
+            enable_partial_reuse=self._resolve_enable_partial_reuse(kv_cache_config),
             enable_partial_commit=self.max_beam_width == 1,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
@@ -3441,9 +3457,9 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is not None:
-            for i in range(int(kv_cache.beam_width)):
+            for beam_idx in range(int(kv_cache.beam_width)):
                 for pool_idx in range(self.num_pools):
-                    kv_cache.set_base_page_index_buf(i, pool_idx, None)
+                    kv_cache.set_base_page_index_buf(BeamIndex(beam_idx), pool_idx, None)
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
