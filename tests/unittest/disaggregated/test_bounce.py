@@ -36,7 +36,7 @@ from tensorrt_llm._torch.disaggregation.native.bounce import core as bcore
 try:
     from tensorrt_llm._torch.disaggregation.native.bounce import buffer as bbuf
     from tensorrt_llm._torch.disaggregation.native.bounce import impl as btr
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import mamba_payload_bytes
 
     _HAVE_TRANSPORT = True
 except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
@@ -685,6 +685,12 @@ def _k3_page_table() -> KVCachePageTable:
     (kv_extractor.py, both ``build_page_table`` and ``_build_page_table_v2``,
     append it after every attention group).
     """
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        MapperKind,
+    )
+
     attn = AttentionLayerGroup(
         pool_group_idx=0,
         kv_head_num_per_rank=1,
@@ -692,18 +698,47 @@ def _k3_page_table() -> KVCachePageTable:
         local_layers=[LocalLayer(i, i) for i in range(24)],
         pool_views=[PoolView(pool_idx=0, buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE))],
     )
+    sorted_lids = list(range(_K3_KDA_LAYERS))
+    local_layers = [
+        LocalLayer(local_layer_id=i, global_layer_id=gl)
+        for i, gl in enumerate(range(24, 24 + _K3_KDA_LAYERS))
+    ]
+    conv_pool = PhysicalPool(0x200000, _K3_CONV_SLOT_BYTES, 8)
+    ssm_pool = PhysicalPool(0x300000, _K3_SSM_SLOT_BYTES, 8)
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, _K3_CONV_SLOT_BYTES) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=_K3_CONV_SLOT_BYTES,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, _K3_SSM_SLOT_BYTES) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=_K3_SSM_SLOT_BYTES,
+        ),
+    ]
     mamba = MambaLayerGroup(
-        pool_group_idx=1,  # dangling by construction: mamba pools live on the LG itself
-        mamba_layer_offsets={gl: i for i, gl in enumerate(range(24, 24 + _K3_KDA_LAYERS))},
-        conv_states=PhysicalPool(0x200000, _K3_CONV_SLOT_BYTES, 8),
-        ssm_states=PhysicalPool(0x300000, _K3_SSM_SLOT_BYTES, 8),
+        pool_group_idx=1,
+        local_layers=local_layers,
+        pool_views=pool_views,
         conv_section_bytes=[_K3_CONV_SLOT_BYTES // 3] * 3,
         ssm_bytes_per_head=_K3_SSM_SLOT_BYTES // 4,
     )
     return KVCachePageTable(
         tokens_per_block=32,
         layer_groups=[attn, mamba],
-        pool_groups=[PhysicalPoolGroup(pools=[PhysicalPool(0x100000, _K3_MLA_BLOCK_BYTES, 128)])],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[PhysicalPool(0x100000, _K3_MLA_BLOCK_BYTES, 128)]),
+            PhysicalPoolGroup(pools=[conv_pool, ssm_pool]),
+        ],
     )
 
 
@@ -735,11 +770,11 @@ class TestHybridK3Bounce:
         # the region covers the MLA KV blocks plus the appended KDA state
         assert t._recv_alloc.reserved_sizes == [67 * _K3_MLA_BLOCK_BYTES + _K3_KDA_PAYLOAD_BYTES]
 
-    def test_reserve_nonempty_group_with_unknown_size_still_falls_back(self, monkeypatch):
-        # Safety direction of the gate is preserved: a group that HAS blocks but no known slot
-        # size (None placeholder) still disables bounce for the request.
+    def test_reserve_nonempty_slot_group_with_unknown_size_skipped(self, monkeypatch):
+        # Non-attention groups (STATE-based) carry a slot index but their bytes
+        # are in extra_bytes — bounce skips them rather than rejecting.
         t = _make_transport(monkeypatch, block_bytes_per_group=[_K3_MLA_BLOCK_BYTES, None])
-        assert t.reserve(_recv_req([2, 1]), num_writers=1) is False
+        assert t.reserve(_recv_req([2, 1]), num_writers=1) is True
 
     def test_reserve_extra_bytes_counts_toward_min_bytes(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_bytes=1000)
@@ -764,37 +799,34 @@ class TestHybridK3Bounce:
         # per-rank number derived from K3's KDA geometry (constants above) exactly.
         pt = _k3_page_table()
         ri = _k3_rank_info()
-        got = MambaPolicy.payload_bytes(
+        got = mamba_payload_bytes(
             sender_page_table=pt, receiver_page_table=pt, dst_slot=3, sender_ri=ri, receiver_ri=ri
         )
         assert got == _K3_KDA_PAYLOAD_BYTES
 
-    def test_mamba_payload_bytes_matches_collect_frags(self):
-        # payload_bytes mirrors the sender's collect_frags call: same sizes, slot-independent.
+    def test_mamba_payload_bytes_slot_independent(self):
+        # payload_bytes is slot-independent: different slots produce the same total.
         pt = _k3_page_table()
         ri = _k3_rank_info()
-        _, _, sizes = MambaPolicy.collect_frags(
-            self_page_table=pt, peer_page_table=pt, src_slot=5, dst_slot=3, self_ri=ri, peer_ri=ri
-        )
-        got = MambaPolicy.payload_bytes(
+        got_3 = mamba_payload_bytes(
             sender_page_table=pt, receiver_page_table=pt, dst_slot=3, sender_ri=ri, receiver_ri=ri
         )
-        assert got == sum(sizes) > 0
+        got_5 = mamba_payload_bytes(
+            sender_page_table=pt, receiver_page_table=pt, dst_slot=5, sender_ri=ri, receiver_ri=ri
+        )
+        assert got_3 == got_5 > 0
 
     def test_mamba_payload_bytes_zero_without_slot_or_group(self):
         pt = _k3_page_table()
         ri = _k3_rank_info()
-        assert MambaPolicy.payload_bytes(pt, pt, dst_slot=None, sender_ri=ri, receiver_ri=ri) == 0
+        assert mamba_payload_bytes(pt, pt, dst_slot=None, sender_ri=ri, receiver_ri=ri) == 0
         pure_attn = KVCachePageTable(
             tokens_per_block=32,
             layer_groups=[pt.layer_groups[0]],
             pool_groups=pt.pool_groups,
         )
         assert (
-            MambaPolicy.payload_bytes(
-                pure_attn, pure_attn, dst_slot=3, sender_ri=ri, receiver_ri=ri
-            )
-            == 0
+            mamba_payload_bytes(pure_attn, pure_attn, dst_slot=3, sender_ri=ri, receiver_ri=ri) == 0
         )
 
 

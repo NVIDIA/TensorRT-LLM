@@ -245,16 +245,16 @@ class VmmBounceTransport(BounceTransport):
         total = 0
         for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
             if int(block_ids.size) == 0:
-                # Nothing to transfer for this group. Hybrid models (Kimi K3: KDA + MLA) always
-                # carry a trailing empty entry for the mamba layer group — its state is not paged
-                # and rides extra_bytes instead — so an empty group must not disable bounce.
                 continue
-            known = g < len(self._block_bytes_per_group) and self._block_bytes_per_group[g]
-            if not known:
+            if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(
                     f"layer group {g} has blocks but no known slot size",
                     warn_key="kv-bounce-unknown-slot-size",
                 )
+            if not self._block_bytes_per_group[g]:
+                # This group holds recurrent state (mamba/KDA), not paged KV blocks;
+                # its size is accounted for by extra_bytes below, not per-block math.
+                continue
             total += int(block_ids.size) * self._block_bytes_per_group[g]
         if extra_bytes > 0 and num_writers > 1:
             # Each fan-in writer appends its own recurrent-state fragments, whose sizes may differ
@@ -600,13 +600,13 @@ def block_bytes_per_group(page_table: KVCachePageTable) -> list[int | None]:
     only once. Non-attention groups retain a ``None`` placeholder so the result
     remains aligned with receive-request layer-group indices.
     """
-    from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
+    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
     assert page_table is not None
     out: list[int | None] = []
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if not isinstance(lg, AttentionLayerGroup):
+        if lg.kind != CacheKind.PAGED:
             out.append(None)
             continue
         pool_indices = {pool_view.pool_idx for pool_view in lg.pool_views}
