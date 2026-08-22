@@ -4742,7 +4742,8 @@ class GvrClusKernel:
                 TGT2 = cutlass.Int32(cutlass.Float32(k) * smp16f * rn_)
                 if TGT2 < cutlass.Int32(1):
                     TGT2 = cutlass.Int32(1)
-                Q = (n4v + cutlass.Int32(CS - 1)) >> cutlass.Int32(self.lcs)
+                # NB: the Q launch slot is dead in this family (no in-kernel
+                # consumer); chunk ownership derives from n4/STEPC below.
             if short != cutlass.Int32(0):
                 if rank == cutlass.Int32(0):
                     if tidx < kq:
@@ -5632,6 +5633,8 @@ def run__clus(logits, pre_idx, n: int, out):
     """torch-facing single-call entry: routes (b, n, k) through ct_dispatch,
     asserts the shape lands on gvr_clus, launches the matching variant.
     gvr_clus takes NO workspace (spec §4c)."""
+    import torch  # debug-entry only: module stays torch-free at import
+
     try:
         from . import gvr_topk_decode_self_sampling_host as ct_dispatch
     except ImportError:
@@ -5668,6 +5671,8 @@ def run_manual(logits, pre_idx, n: int, out, tpl, rt):
     """Manual-lattice entry for route()-unreachable (U, CS) members: launches
     tpl with caller-supplied runtime scalars (must be route()-consistent for
     the same CS; U only changes the chunk geometry)."""
+    import torch  # debug-entry only: module stays torch-free at import
+
     fn = get_compiled__clus(tuple(tpl), scap=rt["SCAP"], cmp_=rt["CMP"])
     dkv = torch.zeros(1, dtype=torch.int32, device=logits.device)  # dead varlen slot
     fn(

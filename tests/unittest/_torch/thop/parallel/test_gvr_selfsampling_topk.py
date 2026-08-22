@@ -751,9 +751,7 @@ def test_selfsampling_varlen_reg_parity_and_oracle():
         msl = msl_c * cr
         lg = torch.randn(rows, npad, dtype=torch.float32, device=_DEV)
         pre = torch.randint(0, msl_c, (batch, k), dtype=torch.int32, device=_DEV)
-        kv = torch.tensor(
-            [msl, max((k - 3) * cr, nn), nn - 1], dtype=torch.int32, device=_DEV
-        )
+        kv = torch.tensor([msl, max((k - 3) * cr, nn), nn - 1], dtype=torch.int32, device=_DEV)
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ref = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, pre, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
