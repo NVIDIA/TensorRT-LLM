@@ -2303,10 +2303,18 @@ class KVCacheManagerV2(BaseResourceManager):
         return full * phys + min(max(rem - self._helix_cp_rank * phys, 0), phys)
 
     def _set_helix_rank_fields(self, req: LlmRequest) -> None:
-        """Derive the per-rank helix fields from the global position."""
-        # The scheduler can run before py_decoding_iter is seeded; treating
-        # the first read as decode step 1 mirrors V1.
-        pos = req.total_input_len_cp + max(1, req.py_decoding_iter) - 1
+        """Derive the per-rank helix fields from the global position.
+
+        The decode-step index is manager-owned (committed in
+        ``try_allocate_generation`` on successful resize) rather than derived
+        from ``py_decoding_iter``: the sampler advances that counter after
+        scheduling under the overlap loop, so a schedule-time read is one
+        step behind and would repeat the first decode position, overwriting
+        the first generated token's KV. Assumes one new token per step
+        (draft-token modes are rejected under helix).
+        """
+        step = req.py_helix_decode_group_index + 1
+        pos = req.total_input_len_cp + step - 1
         owner = (pos // self.tokens_per_block) % self._helix_cp_size
         active = owner == self._helix_cp_rank
         req.py_helix_is_inactive_rank = not active
@@ -2338,9 +2346,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
         draft_len = self._effective_draft_len(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
-        if self._has_cp_helix and not req.is_dummy_request:
+        is_helix_req = self._has_cp_helix and not req.is_dummy_request
+        if is_helix_req:
             self._set_helix_rank_fields(req)
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        if not kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity)):
+            return False
+        if is_helix_req:
+            # Commit only on success so a same-pass retry recomputes the
+            # same step instead of skipping one.
+            req.py_helix_decode_group_index += 1
+        return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
@@ -2358,6 +2373,9 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
+        if self._has_cp_helix and not req.is_dummy_request and req.py_helix_decode_group_index > 0:
+            # The forward pass for this step is skipped; give the step back.
+            req.py_helix_decode_group_index -= 1
         draft_len = self._allocated_draft_lens.pop(
             req.py_request_id, self._effective_draft_len(req)
         )

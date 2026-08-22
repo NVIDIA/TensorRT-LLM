@@ -1082,9 +1082,10 @@ class KvCacheCreator:
     def _configure_helix_kv_cache_capacity(self) -> None:
         """Set the helix KV quota without profiling (not CP-aware).
 
-        Explicit quotas pass through; otherwise V1-style fraction sizing.
-        Quotas are GLOBAL tokens (rank-local budget x cp_size); the manager
-        min-syncs across ranks.
+        Explicit quotas pass through; otherwise fraction sizing sets
+        ``max_gpu_total_bytes`` (a rank-local byte cap the manager consumes
+        as-is). Setting ``max_tokens`` here would overshoot the fraction:
+        the manager inflates that knob by 1 / max_util_for_resume.
         """
         if (self._kv_cache_config.max_tokens is not None
                 and self._kv_cache_config.max_tokens <= 0):
@@ -1098,13 +1099,8 @@ class KvCacheCreator:
             return
         fraction = self._kv_cache_config.free_gpu_memory_fraction
         free_mem, _total = torch.cuda.mem_get_info()
-        cost = self._get_kv_size_per_token()
-        # Floor to whole physical pages: a ledger block allocates one full
-        # page on every CP rank, so a partial trailing page is never usable.
-        local_tokens = (int(cost.tokens_for_budget(int(free_mem * fraction))) //
-                        self._tokens_per_block * self._tokens_per_block)
-        max_tokens = local_tokens * self._mapping.cp_size
-        if max_tokens <= 0:
+        budget_bytes = int(free_mem * fraction)
+        if budget_bytes <= 0:
             raise ValueError(
                 "Helix CP: fraction-based KV sizing found no usable free "
                 "memory; set kv_cache_config.max_tokens or "
@@ -1112,10 +1108,11 @@ class KvCacheCreator:
         logger.warning(
             "Helix CP: capacity profiling is unsupported; sizing the KV "
             f"cache as fraction {fraction} of free memory -> "
-            f"max_tokens={max_tokens} global tokens (super-block ledger). "
+            f"max_gpu_total_bytes={budget_bytes} (rank-local byte cap; the "
+            "manager min-syncs across ranks and converts to global tokens). "
             "Set kv_cache_config.max_tokens or max_gpu_total_bytes to "
             "override.")
-        self._kv_cache_config.max_tokens = max_tokens
+        self._kv_cache_config.max_gpu_total_bytes = budget_bytes
 
     def configure_kv_cache_capacity(self,
                                     py_executor: PyExecutor = None) -> None:
@@ -1128,6 +1125,13 @@ class KvCacheCreator:
 
         # TODO: support CP by generating dummy requests for it.
         if mapping.cp_config.get('cp_type') == CpType.HELIX:
+            if not self._is_kv_cache_manager_v2:
+                # The helix sizing below emits V2 ledger (global) quotas;
+                # V1 reads max_tokens as rank-local. Reject explicitly.
+                raise NotImplementedError(
+                    "TRTLLM_SKIP_KV_CACHE_ESTIMATION with helix CP requires "
+                    "the V2 KV cache manager "
+                    "(kv_cache_config.use_kv_cache_manager_v2=True).")
             self._configure_helix_kv_cache_capacity()
             return
         assert 'cp_type' not in mapping.cp_config

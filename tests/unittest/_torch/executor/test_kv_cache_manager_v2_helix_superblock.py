@@ -17,8 +17,9 @@
 Design under test: the request ledger runs in GLOBAL tokens with one ledger
 block spanning ``cp_size`` physical pages (one per CP rank); the per-rank
 view (owner of this step's token, tokens held by this rank) is a closed-form
-function of the global position, so every rank's ledger advances identically
-and no rotation state exists.
+function of the global position. The decode-step index feeding that position
+is manager-owned (``py_helix_decode_group_index``), immune to when the
+sampler advances ``py_decoding_iter``.
 """
 
 import math
@@ -59,22 +60,22 @@ def test_helix_local_len_matches_brute_force() -> None:
 
 
 def test_set_helix_rank_fields_cross_rank_consistency() -> None:
-    """For any (prompt_len, decoding_iter): exactly one active rank, the
+    """For any (prompt_len, decode step): exactly one active rank, the
     per-rank seqlens sum to the global in-flight length, and past_seen
     (= seqlen - 0/1 per the model_engine convention) sums to the global
     already-cached length."""
     cp_size, phys = 4, 4
     for total_input in (1, 5, 16, 17, 63):
-        for decoding_iter in (0, 1, 2, 7, 40):  # 0 exercises the max(1,...) clamp
+        for group_index in (0, 1, 2, 7, 40):  # committed schedules so far
             fields = []
             for r in range(cp_size):
                 req = SimpleNamespace(
                     total_input_len_cp=total_input,
-                    py_decoding_iter=decoding_iter,
+                    py_helix_decode_group_index=group_index,
                 )
                 KVCacheManagerV2._set_helix_rank_fields(_mgr(r, cp_size, phys), req)
                 fields.append(req)
-            pos = total_input + max(1, decoding_iter) - 1
+            pos = total_input + group_index
             active = [r for r in range(cp_size) if not fields[r].py_helix_is_inactive_rank]
             assert active == [(pos // phys) % cp_size]
             assert sum(f.seqlen_this_rank_cp for f in fields) == pos + 1
@@ -93,7 +94,7 @@ def test_ledger_is_rank_invariant() -> None:
     do. Verify the derivation never touches ledger quantities by checking
     the same request object gives identical (owner-adjusted) views."""
     cp_size, phys = 8, 32
-    req_proto = dict(total_input_len_cp=1000, py_decoding_iter=17)
+    req_proto = dict(total_input_len_cp=1000, py_helix_decode_group_index=17)
     lens = []
     for r in range(cp_size):
         req = SimpleNamespace(**req_proto)
@@ -102,6 +103,65 @@ def test_ledger_is_rank_invariant() -> None:
     # Ledger-side numbers (global position, page count) are identical on
     # every rank; per-rank lens differ by at most one physical page.
     assert max(lens) - min(lens) <= phys
+
+
+def test_ledger_position_immune_to_sampler_timing() -> None:
+    """Regression for the overlap-scheduler phase skew: the ledger position
+    must be L, L+1, L+2, ... no matter when the sampler advances
+    py_decoding_iter (the overlap loop updates it after scheduling; a stale
+    read would repeat the first position and overwrite that token's KV)."""
+    cp_size, phys, total_input = 4, 4, 17
+    n_steps = 3 * cp_size * phys  # cross several ownership rotations
+
+    for sampler_timing in ("overlap", "non_overlap"):
+        req = SimpleNamespace(
+            total_input_len_cp=total_input,
+            py_decoding_iter=0,  # disagg-gen seeding happens after scheduling
+            py_helix_decode_group_index=0,
+        )
+        mgrs = [_mgr(r, cp_size, phys) for r in range(cp_size)]
+        positions = []
+        for step in range(1, n_steps + 1):
+            if sampler_timing == "non_overlap":
+                req.py_decoding_iter = step  # sampler already advanced
+            per_rank = []
+            for r in range(cp_size):
+                view = SimpleNamespace(**vars(req))
+                KVCacheManagerV2._set_helix_rank_fields(mgrs[r], view)
+                per_rank.append(view)
+            # Commit, mirroring try_allocate_generation's success path.
+            req.py_helix_decode_group_index += 1
+            if sampler_timing == "overlap":
+                req.py_decoding_iter = step  # sampler advances only now
+
+            pos = total_input + step - 1
+            active = [r for r in range(cp_size) if not per_rank[r].py_helix_is_inactive_rank]
+            assert active == [(pos // phys) % cp_size]
+            # In-flight convention: seqlens sum to pos + 1 (never repeats,
+            # so no write offset can collide with the previous step's).
+            assert sum(f.seqlen_this_rank_cp for f in per_rank) == pos + 1
+            positions.append(pos)
+        assert positions == [total_input + n for n in range(n_steps)]
+
+
+def test_decode_step_derivation_is_idempotent() -> None:
+    """A failed try_allocate (counter not committed) followed by a retry in
+    the same scheduling pass must derive the SAME fields; a revert (skipped
+    forward) must give the step back."""
+    m = _mgr(cp_rank=1, cp_size=4, phys=4)
+    req = SimpleNamespace(
+        total_input_len_cp=10,
+        py_helix_decode_group_index=5,
+    )
+    KVCacheManagerV2._set_helix_rank_fields(m, req)
+    first = (req.py_helix_is_inactive_rank, req.seqlen_this_rank_cp)
+    KVCacheManagerV2._set_helix_rank_fields(m, req)  # retry, no commit
+    assert (req.py_helix_is_inactive_rank, req.seqlen_this_rank_cp) == first
+    # Commit then revert restores the same derivation.
+    req.py_helix_decode_group_index += 1
+    req.py_helix_decode_group_index -= 1
+    KVCacheManagerV2._set_helix_rank_fields(m, req)
+    assert (req.py_helix_is_inactive_rank, req.seqlen_this_rank_cp) == first
 
 
 def test_quota_converters_scale_by_cp() -> None:
@@ -176,24 +236,21 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
     assert resizes == [(100, 54)]
 
 
-def test_helix_quota_fallback_emits_global_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Creator fallback: the rank-local byte budget buys N physical tokens,
-    floored to whole pages, i.e. (N // page) * page * cp_size global
-    (super-block ledger) tokens."""
+def test_helix_quota_fallback_sets_rank_local_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fraction sizing must set max_gpu_total_bytes (rank-local byte cap),
+    not max_tokens, which the manager inflates by 1/max_util_for_resume."""
     import torch
 
-    from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 
     def creator(max_gpu_total_bytes, max_tokens):
         return SimpleNamespace(
             _mapping=SimpleNamespace(cp_size=4),
-            _tokens_per_block=32,
             _kv_cache_config=SimpleNamespace(
                 max_gpu_total_bytes=max_gpu_total_bytes,
                 max_tokens=max_tokens,
                 free_gpu_memory_fraction=0.5,
             ),
-            _get_kv_size_per_token=lambda: CacheCost(slope=1000, intercept=8000),
         )
 
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (1_000_000, 2_000_000))
@@ -206,16 +263,31 @@ def test_helix_quota_fallback_emits_global_tokens(monkeypatch: pytest.MonkeyPatc
     # by fraction sizing.
     with pytest.raises(ValueError, match="must be positive"):
         KvCacheCreator._configure_helix_kv_cache_capacity(creator(0, 0))
-    # No quota: (1e6 * 0.5 - 8000) // 1000 = 492 physical tokens, floored to
-    # whole 32-token pages = 480 (a ledger block needs one full page on
-    # every rank) -> 1920 global.
+    # No quota: the rank-local byte budget (free * fraction) lands on
+    # max_gpu_total_bytes verbatim; max_tokens stays unset.
     c = creator(0, None)
     assert KvCacheCreator._configure_helix_kv_cache_capacity(c) is None
-    assert c._kv_cache_config.max_tokens == 480 * 4
+    assert c._kv_cache_config.max_gpu_total_bytes == 500_000
+    assert c._kv_cache_config.max_tokens is None
     # Degenerate free memory: actionable error instead of a deep assert.
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 2_000_000))
     with pytest.raises(ValueError, match="free memory"):
         KvCacheCreator._configure_helix_kv_cache_capacity(creator(0, None))
+
+
+def test_v1_helix_capacity_config_rejected() -> None:
+    """configure_kv_cache_capacity emits V2 super-block-ledger coordinates
+    under helix; V1 interprets max_tokens as rank-local. The V1 + helix
+    combination must be rejected loudly, not silently mis-sized."""
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm.mapping import CpType
+
+    c = SimpleNamespace(
+        _mapping=SimpleNamespace(cp_config={"cp_type": CpType.HELIX}),
+        _is_kv_cache_manager_v2=False,
+    )
+    with pytest.raises(NotImplementedError, match="V2 KV cache manager"):
+        KvCacheCreator.configure_kv_cache_capacity(c)
 
 
 def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
