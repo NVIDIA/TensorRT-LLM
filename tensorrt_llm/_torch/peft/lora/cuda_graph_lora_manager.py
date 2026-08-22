@@ -228,3 +228,12 @@ class CudaGraphLoraManager:
         }
 
         return lora_params
+
+    def prepare_base_only_batch(
+        self,
+        peft_cache_manager: Optional[PeftCacheManager],
+    ) -> None:
+        """Maintain PEFT cache state for a base-only CUDA graph iteration."""
+        if peft_cache_manager is not None:
+            peft_cache_manager.get_and_reset_batch_peft_table()
+            self.adapter_slot_manager.remove_evicted_slots_in_cpp(peft_cache_manager)
