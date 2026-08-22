@@ -573,8 +573,8 @@ class WanBlock(nn.Module):
             _x_2d = x.reshape(-1, x.shape[-1])
             norm_x = apply_fused_layernorm_affine_quant(
                 _x_2d,
-                self.norm2.weight.to(x.dtype),
-                self.norm2.bias.to(x.dtype),
+                self.norm2.weight,
+                self.norm2.bias,
                 self._norm2_fp4_scale,
                 eps=self.norm2.variance_epsilon,
             )
