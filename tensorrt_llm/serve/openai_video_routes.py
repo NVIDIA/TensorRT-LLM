@@ -168,7 +168,17 @@ class _VideoRoutesMixin:
                 )
                 if request.response_format == "b64_json":
                     return _b64_json_video_response(video_id, request.format, target)
-                return FileResponse(str(target), media_type=media_type, filename=target.name)
+                # Report engine timings the same way the encoder path does.
+                # A tensor request is the one a measurement harness makes --
+                # it wants the raw frames *and* how long denoising took -- so
+                # dropping the headers here is what forces such a client to
+                # either re-time over HTTP or ask for a lossy format.
+                return FileResponse(
+                    str(target),
+                    media_type=media_type,
+                    filename=target.name,
+                    headers=build_visual_gen_timing_headers(output.metrics),
+                )
 
             # Encoder formats: one file per item; ship the first item as
             # the route's primary download (OpenAI sync video API does
