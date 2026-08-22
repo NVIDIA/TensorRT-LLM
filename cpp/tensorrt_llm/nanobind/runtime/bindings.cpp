@@ -322,7 +322,20 @@ void initBindings(nb::module_& m)
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_prepare", &tensorrt_llm::runtime::McastGPUBuffer::checkpointPrepare,
+            "Internal, experimental hook; the caller must establish engine-wide quiescence before invoking it.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_restore", &tensorrt_llm::runtime::McastGPUBuffer::checkpointRestore,
+            nb::arg("mpi_comm_fortran_handle"),
+            "Internal, experimental hook; the restored communicator must have the original ordered membership and "
+            "the engine must remain quiescent. A successful restore retains an owned communicator duplicate.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("checkpoint_restore_complete", &tensorrt_llm::runtime::McastGPUBuffer::checkpointRestoreComplete,
+            nb::arg("local_protocol_reset_succeeded"),
+            "Collectively publish or abort a pending internal MNNVL restore after protocol reset.",
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("is_mapped", &tensorrt_llm::runtime::McastGPUBuffer::isMapped);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
