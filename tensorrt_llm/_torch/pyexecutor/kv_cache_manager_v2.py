@@ -799,6 +799,7 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
         is_estimating_kv_cache: bool = False,
+        cold_page_codec_provider=None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1091,8 +1092,26 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
+        def create_impl(cache_config):
+            manager_kwargs = {}
+            if cold_page_codec_provider is not None:
+                manager_kwargs["cold_page_codec"] = (
+                    cold_page_codec_provider.create_cold_page_codec(
+                        cache_config,
+                        runtime_dtype=self.dtype,
+                        pp_layers=self.pp_layers,
+                        num_kv_heads_per_layer=self.num_kv_heads_per_layer,
+                        head_dim_per_layer=self.head_dim_per_layer,
+                    )
+                )
+            return KVCacheManagerPy(
+                cache_config,
+                event_manager=self.event_manager,
+                **manager_kwargs,
+            )
+
         try:
-            self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
+            self.impl = create_impl(config)
         except (CuError, KVCacheOutOfMemoryError):
             if has_host_cache_tier:
                 logger.warning(
@@ -1105,7 +1124,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 ]
                 config = replace(config, cache_tiers=cache_tiers_without_host)
                 self.kv_cache_manager_py_config = config
-                self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
+                self.impl = create_impl(config)
             else:
                 raise
         self.can_evict = len(config.cache_tiers) > 1
