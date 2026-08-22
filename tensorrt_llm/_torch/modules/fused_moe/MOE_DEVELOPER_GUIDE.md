@@ -138,7 +138,8 @@ Still on old path (standalone, with embedded communication):
 | `impl_contract.py` | Selection vocabulary — `MoEProblem`, `MoEDeployment`, `MoEEnvironment`, `MoEEligibility`, `MoERejectReason`, `MoEResolutionReport` |
 | `impl_environment.py` | The only place that probes the machine (SM, optional wheels, env flags) and freezes the result |
 | `impl_identity.py` | `MoEImplId` / `MoEImplDescriptor` / registry — the stable one-id-per-leaf-class mechanism used after an implementation migrates |
-| `interface.py` | Base class `MoE` and enums (`MoEWeightLoadingMode`, `MoESchedulerKind`) |
+| `interface.py` | Complete-layer base `MoE` and enums (`MoEWeightLoadingMode`, `MoESchedulerKind`) |
+| `impl_base.py` | Execution-unit base `MoEImplBase` — weights + `run_moe`, no `forward` |
 | `quantization.py` | Quantization method implementations (`FusedMoEMethod` subclasses: weight creation, loading, quant/dequant ops per quant mode) |
 | `routing.py` | Routing methods (`TopKRouting`, etc.) |
 | `moe_load_balancer.py` | EPLB implementation |
@@ -433,7 +434,7 @@ When adding new components, use these reference implementations:
 | Backend Tests | `test_moe_backend.py` | Follow existing parametrize patterns |
 | Integration Tests | `test_moe_module.py` | Test Backend × Communication × EPLB combinations |
 
-**Note on backend inheritance:** New backends should inherit from `MoE` (in `interface.py`), NOT from `CutlassFusedMoE`. Current backends inherit from `CutlassFusedMoE` as a historical shortcut to reuse infrastructure (load balancer, weight management, TP/EP). This will be refactored — a dedicated `MoEBackend` interface will be extracted. `MegaMoEDeepGemm` and `DenseGEMMFusedMoE` already inherit directly from `MoE`.
+**Note on backend inheritance:** New execution-unit backends should inherit from `MoEImplBase` (in `impl_base.py`), NOT from `CutlassFusedMoE` and NOT from `MoE`. `MoE` is the complete-layer type (`ConfigurableMoE`, `TritonFusedMoE`). Four current backends still subclass `CutlassFusedMoE` as a historical shortcut; that concrete inheritance is broken in each backend's own follow-up item, not here. `MegaMoEDeepGemm` and `DenseGEMMFusedMoE` inherit `MoEImplBase` directly.
 
 ## Anti-Patterns
 

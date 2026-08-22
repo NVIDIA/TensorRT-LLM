@@ -93,6 +93,7 @@ from ....custom_ops.cute_dsl_megamoe_custom_op import megamoe_activation_sf_byte
 from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
+from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -101,7 +102,7 @@ from ..impl_contract import (
     MoERunContext,
 )
 from ..impl_environment import MoEDep
-from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode, _reject
+from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
 
@@ -321,7 +322,7 @@ class _MegaMoeBuffers:
 # ---------------------------------------------------------------------------
 
 
-class MegaMoECuteDsl(MoE):
+class MegaMoECuteDsl(MoEImplBase):
     """MoE backend wrapping the ported MegaMoE CuteDSL NVFP4 fused kernel.
 
     Capability gate (``can_implement``): SM100 family + NVFP4 +
@@ -478,7 +479,9 @@ class MegaMoECuteDsl(MoE):
         # uniformity but ignored: FUSED_COMM kernels must not use the chunk
         # overlap stream because launch order must be lockstep across EP.
         del aux_stream_dict
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,

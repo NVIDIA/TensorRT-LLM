@@ -35,6 +35,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType
+from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -43,7 +44,7 @@ from ..impl_contract import (
     MoERunContext,
 )
 from ..impl_environment import MoEDep
-from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode, _reject
+from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from ..quantization import W4A8MXFP4MXFP8MegaMoEDeepGemmMethod, _import_deep_gemm
 from ..routing import BaseMoeRoutingMethod
 
@@ -134,7 +135,7 @@ def _assert_num_slots_divisible_by_ep(num_slots: int, ep_size: int) -> None:
         )
 
 
-class MegaMoEDeepGemm(MoE):
+class MegaMoEDeepGemm(MoEImplBase):
     """MoE backend wrapping DeepGEMM's fused ``fp8_fp4_mega_moe`` kernel."""
 
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
@@ -265,7 +266,9 @@ class MegaMoEDeepGemm(MoE):
         situ_linear_beta: Optional[float] = None,
         **kwargs,
     ) -> None:
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
