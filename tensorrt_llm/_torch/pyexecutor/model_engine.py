@@ -2684,9 +2684,8 @@ class PyTorchModelEngine(ModelEngine):
             ResourceManagerType.CROSS_KV_CACHE_MANAGER)
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
-        try:
-            yield batch
-        finally:
+
+        def free_batch_resources() -> None:
             if batch is not None and kv_cache_manager is not None:
                 for req in batch.all_requests():
                     kv_cache_manager.free_resources(req)
@@ -2696,6 +2695,24 @@ class PyTorchModelEngine(ModelEngine):
                         cross_kv_cache_manager.free_resources(req)
                     if spec_resource_manager is not None:
                         spec_resource_manager.free_resources(req)
+
+        try:
+            yield batch
+        except BaseException:
+            # Freeing issues GPU work, so it raises again whenever the failure
+            # being unwound already left the CUDA context in a sticky error
+            # state. Letting that secondary error escape from a `finally` would
+            # *replace* the primary one, blaming the cache manager for a fault
+            # that actually happened in the model forward.
+            try:
+                free_batch_resources()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Failed to free warmup batch resources while unwinding: {e}"
+                )
+            raise
+        else:
+            free_batch_resources()
 
     def _get_num_extra_decoding_steps(self) -> int:
         """Determines extra decoding steps needed for fused drafting loops."""
