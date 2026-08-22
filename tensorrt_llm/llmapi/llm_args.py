@@ -1613,10 +1613,6 @@ class CpConfig(StrictBaseModel):
         description=
         "FIFO version for alltoall communication. Used in HELIX parallelism. Defaults to 2."
     )
-    cp_anchor_size: Optional[int] = Field(
-        default=None, description="Anchor size for STAR attention.")
-    block_size: Optional[int] = Field(
-        default=None, description="Block size for STAR attention.")
 
     @field_validator("cp_type", mode="before")
     @classmethod
@@ -5317,8 +5313,7 @@ class TorchLlmArgs(BaseLlmArgs):
         status="beta",
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
-        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER",
-                                             "FLASHINFER_STAR_ATTENTION"))
+        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
 
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,

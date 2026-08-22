@@ -33,9 +33,6 @@ def get_attention_backend(
         if sparse_params is not None:
             return get_flashinfer_sparse_attn_attention_backend(sparse_params)
         return FlashInferAttention
-    elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
-        from .star_flashinfer import StarAttention
-        return StarAttention
 
     logger.warning("Falling back to TRTLLM attention backend")
     return TrtllmAttention

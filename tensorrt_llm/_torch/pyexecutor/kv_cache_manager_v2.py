@@ -80,7 +80,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to_torch
 from ...logger import logger
-from ...mapping import CpType, Mapping
+from ...mapping import Mapping
 from ..utils import maybe_compile
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -809,9 +809,6 @@ class KVCacheManagerV2(BaseResourceManager):
             "kv_connector_manager is not supported for KVCacheManagerV2"
         )
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
-        assert not (mapping.cp_config.get("cp_type") == CpType.STAR), (
-            "Star attention is not supported for KVCacheManagerV2"
-        )
 
         self.kv_cache_type = kv_cache_type
         self.pp_layers, self.num_layers = get_pp_layers(

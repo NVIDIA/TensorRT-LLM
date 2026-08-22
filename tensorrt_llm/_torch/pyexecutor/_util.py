@@ -39,7 +39,7 @@ from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm._torch.peft.lora.manager import load_torch_lora
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
@@ -635,16 +635,12 @@ class KvCacheCreator:
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+            sparse_attn_config = model_config.sparse_attention_config
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
-            sparse_attn_config = model_config.sparse_attention_config
-            if (sparse_attn_config is not None
-                    and sparse_attn_config.algorithm == "dsa"
-                    and self._mapping.cp_config.get("cp_type") == CpType.STAR):
-                incompat.append("STAR context parallelism")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Never silently replace a sparse V2 manager with V1. Some
@@ -3256,9 +3252,6 @@ def instantiate_sampler(
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
-    if mapping.cp_config.get('cp_type') == CpType.STAR:
-        assert llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
