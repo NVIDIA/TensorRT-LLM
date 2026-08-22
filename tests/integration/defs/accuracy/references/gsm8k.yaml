@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 meta-llama/Llama-3.1-8B-Instruct:
   - accuracy: 74.20
   - spec_dec_algo: NGram
@@ -285,6 +287,17 @@ moonshotai/Kimi-K2.5:
     accuracy: 93.06
   - quant_algo: NVFP4
     accuracy: 93.06
+# Kimi K3 (KimiLinear KDA/MLA hybrid + latent MoE): bf16 with MXFP4-packed
+# routed experts. Measured 96.51/96.44 (flexible/strict) at the K3 enablement
+# commit, DEP16 on 16 GB300s (examples/kimi_k3/README.md expected scores).
+# No quant_algo key: the checkpoint's quantization lives in the nested
+# text_config.quantization_config (compressed-tensors), which the LLM-args
+# layer does not surface — the reference matcher sees quant_algo=None.
+moonshotai/Kimi-K3:
+  - accuracy: 96.5
+  # SA spec dec is lossless; scores match the baseline within noise.
+  - spec_dec_algo: SA
+    accuracy: 96.5
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57
   - quant_algo: FP8
