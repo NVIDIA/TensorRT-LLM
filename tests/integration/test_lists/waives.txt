@@ -372,7 +372,6 @@ unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:1
 unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor" SKIP (https://nvbugs/6619882)
 unittest/_torch/sampler/test_beam_search.py::test_beam_search_e2e[multi_process-TRTLLMSampler-cuda_graph_and_overlap-None-1-1-True-True-False] SKIP (https://nvbugs/6463819)
 unittest/_torch/sampler/test_trtllm_sampler.py::test_trtllm_sampler_best_of_with_logprobs SKIP (https://nvbugs/6487837)
-unittest/_torch/speculative/hw_agnostic/test_advanced_sampling_mode.py::test_no_topk_matches_full[0.9] SKIP (https://nvbugs/6550099)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[False] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[True] SKIP (https://nvbugs/6535767)
 unittest/_torch/speculative/hw_agnostic/test_ngram.py::test_llama_ngram[True-True-TRTLLM] SKIP (https://nvbugs/6507102)

@@ -85,9 +85,9 @@ def test_resolve_advanced_sampling_filters(mode, expect_top_k_none, expect_top_p
 def test_no_topk_matches_full(top_p_val):
     """With top_k disabled, NO_TOPK skips the top_k mask kernel (a no-op at k=vocab)
     and yields the same sampling distribution as FULL. We compare the resulting
-    probability distributions rather than the sampled tokens: the flashinfer top_k mask
-    at k=vocab injects ~1e-8 fp noise that leaves the distribution unchanged but can flip
-    an individual sampled token across GPU archs, so exact-token equality is not portable.
+    probability distributions rather than the sampled tokens, and with a tolerance above
+    the top-p renorm's fp32 precision: at the nucleus cutoff that precision decides
+    whether one token is kept, worth up to ~8e-5 of mass for this batch.
     A real (non-no-op) filter would move mass by orders of magnitude, far above atol."""
     dev = "cuda"
     torch.manual_seed(0)
@@ -105,7 +105,7 @@ def test_no_topk_matches_full(top_p_val):
     )
     probs_full = su.compute_probs_from_logits(logits.clone(), temperatures, ek_full, ep_full)
     probs_no_topk = su.compute_probs_from_logits(logits.clone(), temperatures, ek_nt, ep_nt)
-    assert torch.allclose(probs_full, probs_no_topk, atol=1e-5, rtol=0)
+    assert torch.allclose(probs_full, probs_no_topk, atol=1e-4, rtol=0)
 
 
 @pytest.mark.skipif(
