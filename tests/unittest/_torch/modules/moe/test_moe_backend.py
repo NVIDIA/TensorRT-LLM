@@ -652,14 +652,19 @@ def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
     assert situ_linear_beta is None
 
 
-def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
+@pytest.mark.parametrize(
+    "moe_cls",
+    [MegaMoEDeepGemm, MegaMoECuteDsl],
+    ids=["deepgemm", "cutedsl"],
+)
+def test_create_moe_forwards_megamoe_activation_options(monkeypatch, moe_cls):
     create_moe_module = importlib.import_module("tensorrt_llm._torch.modules.fused_moe.create_moe")
     configurable_moe = MagicMock(return_value=object())
     monkeypatch.setattr(create_moe_module, "ConfigurableMoE", configurable_moe)
     monkeypatch.setattr(
         create_moe_module,
         "resolve_moe_cls",
-        MagicMock(return_value=MegaMoEDeepGemm),
+        MagicMock(return_value=moe_cls),
     )
 
     result = create_moe_module.create_moe(
