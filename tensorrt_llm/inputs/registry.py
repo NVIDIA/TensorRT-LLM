@@ -1274,7 +1274,7 @@ def maybe_compute_mm_embed_cumsum(
     # `multimodal_hashing_process` already setdefault()ed the cumsum (without
     # this flag) leaves scheduler_v2 reading mm_bidirectional_blocks=None and
     # silently skipping align — which then trips
-    # get_flashinfer_attention_mask's `cached_token_lens == 0` assert on
+    # get_attention_mask's `cached_token_lens == 0` assert on
     # 26B/31B once an image block is split across chunks. Gemma4 sets this
     # per-instance from text_config.use_bidirectional_attention.
     mm_data.setdefault(

@@ -300,31 +300,41 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
-`FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
-the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
-runtime path. These are not separate attention backends.
+libraries. `TritonCustomMaskFmha` provides Triton context attention for custom
+masks, `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+`FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into the
+`TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention` runtime
+path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
-or `TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_trtllm_gen` to force the fallback
-path. Each FMHA library exposes `is_available()` for module/static environment
-checks and `is_supported()` for per-forward request checks.
+`triton_custom_mask,cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`;
+use `TLLM_FMHA_LIBS=fallback` to force the fallback path. Each FMHA library
+exposes `is_available()` for module/static environment checks and
+`is_supported()` for per-forward request checks.
+For mixed non-MLA batches, the dispatcher checks each active phase independently
+with `is_supported(..., phase=...)`; a phased library accepts only phases backed
+by its corresponding `run_*()` entry point.
 
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
-- `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
-  requests and dispatches them to phase-specific hooks.
+- `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
+  context/generation and MHA/MLA entry points.
+- `fmha/combined.py` composes different context and generation implementations
+  for non-MLA mixed batches.
+- `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
+  Custom-mask data applies to context requests; for mixed batches,
+  `TrtllmAttention` can pair it with a later causal-generation provider through
+  `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
-Use `PhasedFmha` for libraries that need separate context/generation or MHA/MLA
-entry points. Use `Fmha` directly for libraries that already own the full
-request shape.
+Use `PhasedFmha` for libraries that implement one or more phase-specific entry
+points. Use `Fmha` directly for libraries that already own the full request
+shape.
 
 #### 3.2.3 MLA cached-context semantics
 

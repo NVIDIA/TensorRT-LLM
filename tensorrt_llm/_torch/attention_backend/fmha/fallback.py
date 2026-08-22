@@ -17,10 +17,13 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    CustomAttentionMask,
+)
 from tensorrt_llm.bindings.internal import thop
 
-from .interface import Fmha
+from .interface import Fmha, FmhaPhase
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
@@ -48,6 +51,19 @@ _THOP_LITERALS: dict = {}
 
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
+
+    def is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
+    ) -> bool:
+        del q, k, v, metadata, phase
+        return forward_args.attention_mask != CustomAttentionMask.CUSTOM
 
     def forward(
         self,
