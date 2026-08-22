@@ -17,6 +17,8 @@
 - ``torch.ops.trtllm.indexer_k_cache_gather_op``
 - ``torch.ops.trtllm.indexer_k_cache_scatter_op``
 - ``torch.ops.trtllm.convert_req_index_to_global``
+- ``torch.ops.trtllm.nvfp4_mla_kv_cache_gather``
+- ``torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather``
 - ``torch.ops.trtllm.fused_cat_fp4``
 - ``torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell``
 """
@@ -41,6 +43,182 @@ except ImportError:
 HEAD_DIM = 128
 SCALE_BYTES = 4
 BYTES_PER_TOKEN = HEAD_DIM + SCALE_BYTES
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("global_dequant_scale_value", [0.25, 1.0])
+def test_nvfp4_mla_kv_cache_gather(global_dequant_scale_value):
+    """Gather physical NVFP4 rows and remap them into an FP8 scratch."""
+    num_pool_tokens = 4
+    head_dim = 32
+    packed_head_dim = head_dim // 2
+    scales_per_token = head_dim // 16
+
+    nibble_pairs = torch.arange(packed_head_dim, dtype=torch.uint8, device="cuda")
+    packed_row = ((nibble_pairs * 2 + 1) << 4) | (nibble_pairs * 2)
+    data_pool = packed_row.repeat(num_pool_tokens, 1).contiguous()
+    scale_pool = torch.full(
+        (num_pool_tokens, scales_per_token),
+        2.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+
+    host_pool_pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
+    host_pool_pointers[0, 0, 0] = data_pool.data_ptr()
+    host_pool_pointers[0, 0, 1] = scale_pool.data_ptr()
+    host_pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+    global_indices = torch.tensor([[2, 0, -1], [3, 1, 2]], dtype=torch.int32, device="cuda")
+    output = torch.empty(
+        (*global_indices.shape, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    compact_indices = torch.empty_like(global_indices)
+    global_dequant_scale = torch.tensor(
+        [global_dequant_scale_value], dtype=torch.float32, device="cuda"
+    )
+
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
+        host_pool_pointers,
+        host_pool_mapping,
+        global_indices,
+        output,
+        compact_indices,
+        global_dequant_scale,
+        0,
+        0,
+        num_pool_tokens,
+    )
+
+    expected_indices = torch.tensor([[0, 1, -1], [3, 4, 5]], dtype=torch.int32, device="cuda")
+    assert torch.equal(compact_indices, expected_indices)
+
+    e2m1 = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device="cuda",
+    )
+    unpacked_codes = torch.stack((packed_row & 0xF, packed_row >> 4), dim=-1).flatten().long()
+    expected_row = (e2m1[unpacked_codes] * 2.0 * global_dequant_scale_value).to(torch.float8_e4m3fn)
+    valid = global_indices >= 0
+    assert torch.equal(output[valid], expected_row.expand(output[valid].shape[0], -1))
+
+
+@skip_pre_blackwell
+def test_nvfp4_mla_kv_cache_gather_rope_residual():
+    """Add the second NVFP4 quantization level only for the 64 RoPE dimensions."""
+    num_pool_tokens = 2
+    head_dim = 576
+    residual_dim = 64
+    residual_start = head_dim - residual_dim
+    data_bytes_per_token = (head_dim + residual_dim) // 2
+    scales_per_token = (head_dim + residual_dim) // 16
+
+    data_pool = torch.full(
+        (num_pool_tokens, data_bytes_per_token), 0x22, dtype=torch.uint8, device="cuda"
+    )
+    for group in range(residual_dim // 16):
+        group_offset = residual_start // 2 + group * 16
+        data_pool[:, group_offset + 8 : group_offset + 16] = 0x11
+    scale_pool = torch.full(
+        (num_pool_tokens, scales_per_token),
+        2.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    for group in range(residual_dim // 16):
+        scale_pool[:, residual_start // 16 + group * 2 + 1] = 0.5
+
+    host_pool_pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
+    host_pool_pointers[0, 0, 0] = data_pool.data_ptr()
+    host_pool_pointers[0, 0, 1] = scale_pool.data_ptr()
+    host_pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+    global_indices = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
+    output = torch.empty((1, 2, head_dim), dtype=torch.float8_e4m3fn, device="cuda")
+    compact_indices = torch.empty_like(global_indices)
+    global_dequant_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+    torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
+        host_pool_pointers,
+        host_pool_mapping,
+        global_indices,
+        output,
+        compact_indices,
+        global_dequant_scale,
+        0,
+        residual_dim,
+        num_pool_tokens,
+    )
+
+    assert torch.equal(compact_indices, torch.tensor([[0, 1]], dtype=torch.int32, device="cuda"))
+    expected = torch.full((head_dim,), 0.5, dtype=torch.float8_e4m3fn, device="cuda")
+    expected[residual_start:] = 0.5625
+    assert torch.equal(output[0, 0], expected)
+    assert torch.equal(output[0, 1], expected)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("head_dim", [32, 576])
+def test_nvfp4_mla_context_kv_cache_gather(head_dim):
+    """Compact selected context rows without host-side unique or synchronization."""
+    num_pool_tokens = 4
+    packed_head_dim = head_dim // 2
+    scales_per_token = head_dim // 16
+
+    row_codes = torch.arange(1, num_pool_tokens + 1, dtype=torch.uint8, device="cuda")
+    packed_codes = row_codes | (row_codes << 4)
+    data_pool = packed_codes[:, None].expand(-1, packed_head_dim).contiguous()
+    scale_pool = torch.full(
+        (num_pool_tokens, scales_per_token),
+        2.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    host_pool_pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
+    host_pool_pointers[0, 0, 0] = data_pool.data_ptr()
+    host_pool_pointers[0, 0, 1] = scale_pool.data_ptr()
+    host_pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+
+    local_topk = torch.tensor([[0, 1, -1], [1, 0, 7]], dtype=torch.int32, device="cuda")
+    query_req_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor([[0], [1]], dtype=torch.int32, device="cuda")
+    cu_kv_lengths = torch.tensor([0, 2, 4], dtype=torch.int64, device="cuda")
+    output = torch.empty(
+        (num_pool_tokens, 1, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    compact_indices = torch.empty_like(local_topk)
+    global_dequant_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+    torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather(
+        host_pool_pointers,
+        host_pool_mapping,
+        local_topk,
+        query_req_indices,
+        block_table,
+        cu_kv_lengths,
+        output,
+        compact_indices,
+        global_dequant_scale,
+        0,
+        num_pool_tokens,
+        2,
+        2,
+        0,
+        0,
+        num_pool_tokens,
+    )
+
+    expected_indices = torch.tensor([[0, 1, -1], [3, 2, -1]], dtype=torch.int32, device="cuda")
+    assert torch.equal(compact_indices, expected_indices)
+    e2m1 = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device="cuda",
+    )
+    expected = (e2m1[row_codes.long()] * 2.0 * 0.25).to(torch.float8_e4m3fn)
+    for row in range(num_pool_tokens):
+        assert torch.equal(output[row, 0], expected[row].expand(head_dim))
 
 
 # ===================================================================

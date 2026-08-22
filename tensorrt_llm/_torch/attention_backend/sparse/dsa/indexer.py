@@ -133,7 +133,7 @@ def _compute_slot_mappings(
     tokens_per_block: int,
     quant_block_size: int,
     data_bytes_per_token: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Compute flat byte indices for FP8/FP4 data and scales from global token positions.
 
     Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid

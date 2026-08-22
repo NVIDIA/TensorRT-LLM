@@ -1414,14 +1414,14 @@ class MLA(nn.Module):
         cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
         cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=q.device)
         fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=q.device)
-        has_fp8_kv_cache = (
-            self.mqa.has_fp8_kv_cache if hasattr(self.mqa, "has_fp8_kv_cache") else False
+        use_fp8_mla = getattr(self.mqa, "has_fp8_kv_cache", False) or getattr(
+            self.mqa, "has_fp4_kv_cache", False
         )
 
         mla_bmm1_scale = None
         mla_bmm2_scale = None
         quant_q_buffer = None
-        if has_fp8_kv_cache:
+        if use_fp8_mla:
             mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=q.device)
             mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=q.device)
             quant_q_buffer = torch.empty(
@@ -1471,7 +1471,7 @@ class MLA(nn.Module):
                         quant_q_buffer,
                     )
 
-            rope_stream = self.aux_stream if not has_fp8_kv_cache else None
+            rope_stream = self.aux_stream if not use_fp8_mla else None
             if self.k_b_proj_trans.dtype == torch.bfloat16:
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
@@ -1593,6 +1593,7 @@ class MLA(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
+        q_rope_applied = kwargs.pop("q_rope_applied", False)
 
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1643,7 +1644,7 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self.apply_rotary_emb:
+            if self.apply_rotary_emb or q_rope_applied:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
                 [

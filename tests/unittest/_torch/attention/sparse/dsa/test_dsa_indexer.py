@@ -53,6 +53,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa.module import forward_context_sparse_attn
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
@@ -379,6 +380,117 @@ def test_shared_topk_lifecycle():
     assert metadata.shared_topk_indices is buffer
 
 
+def test_nvfp4_context_topk_uses_device_compaction_path():
+    topk_indices = torch.tensor(
+        [[3, 2, -1], [1, 0, 5]],
+        dtype=torch.int32,
+    )
+    cache_manager = SimpleNamespace(
+        dtype=DataType.NVFP4,
+        head_dim=576,
+        mla_kv_cache_residual_dim=64,
+        get_primary_pool_page_index_params=Mock(return_value=(2, 1)),
+    )
+    metadata = SimpleNamespace(
+        num_ctx_tokens=2,
+        num_tokens=2,
+        num_generations=0,
+        num_contexts=2,
+        shared_topk_indices=None,
+        in_mtp_draft_loop=False,
+        kv_cache_manager=cache_manager,
+        host_kv_cache_pool_pointers=torch.zeros((1, 2, 2), dtype=torch.int64),
+        host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32),
+        num_ctx_mla_kv_tokens=8,
+        _cached_num_pool_tokens=128,
+        _cached_tokens_per_block=64,
+        _cached_req_idx_ctx=torch.tensor([0, 1], dtype=torch.int32),
+        _cached_block_table_ctx=torch.tensor([[0], [1]], dtype=torch.int32),
+        ctx_kv_indptr=torch.tensor([0, 4, 8], dtype=torch.int64),
+        _ensure_pool_view_cached=Mock(),
+        nvfp4_mla_context_fp8_scratch=None,
+    )
+    backend = SimpleNamespace(
+        indexer=SimpleNamespace(
+            forward_from_projected=Mock(return_value=topk_indices),
+        ),
+        get_local_layer_idx=Mock(return_value=0),
+        kv_scale_quant_orig=torch.ones(1, dtype=torch.float32),
+    )
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
+    )
+
+    expected = torch.tensor(
+        [[3, 2, -1], [5, 4, -1]],
+        dtype=torch.int32,
+    )
+
+    def _gather(*args):
+        args[7].copy_(expected)
+
+    with patch(
+        "torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather",
+        side_effect=_gather,
+        create=True,
+    ) as gather:
+        compact_indices, _ = DSATrtllmAttention.sparse_attn_predict(
+            backend,
+            torch.empty((2, 1)),
+            None,
+            metadata,
+            forward_args,
+        )
+
+    torch.testing.assert_close(compact_indices, expected)
+    gather.assert_called_once()
+    assert gather.call_args.args[2] is topk_indices
+    scratch = gather.call_args.args[6]
+    assert scratch.shape == (8, 1, cache_manager.head_dim)
+    assert scratch.dtype == torch.float8_e4m3fn
+    assert gather.call_args.args[11] == 64
+    assert gather.call_args.args[12] == 128
+    assert gather.call_args.args[13] == 1
+    assert gather.call_args.args[14] == 64
+    assert metadata.nvfp4_mla_context_fp8_scratch is scratch
+    assert forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr == scratch.data_ptr()
+
+
+def test_nvfp4_context_appends_before_attention():
+    output = torch.empty((2, 4))
+    latent_cache = torch.empty((2, 8))
+    mla = SimpleNamespace(
+        mqa=SimpleNamespace(
+            has_fp4_kv_cache=True,
+            mla_rope_append_paged_kv_assign_q=Mock(),
+        ),
+        forward_absorption_context=Mock(return_value=output),
+    )
+    q = torch.empty((2, 4))
+    compressed_kv = torch.empty((2, 4))
+    k_pe = torch.empty((2, 4))
+    metadata = SimpleNamespace()
+
+    result = forward_context_sparse_attn(
+        mla,
+        q,
+        compressed_kv,
+        k_pe,
+        metadata,
+        output,
+        latent_cache,
+        indexer_intermediates=[],
+    )
+
+    assert result is output
+    mla.mqa.mla_rope_append_paged_kv_assign_q.assert_called_once_with(
+        q, latent_cache, metadata, is_generation=False
+    )
+    assert mla.forward_absorption_context.call_args.kwargs["latent_cache"] is None
+    assert mla.forward_absorption_context.call_args.kwargs["q_rope_applied"] is True
+
+
 def test_indexer_post_load_weights_caches_fused_weight():
     indexer = Indexer.__new__(Indexer)
     torch.nn.Module.__init__(indexer)
@@ -536,6 +648,23 @@ def test_transform_local_topk_uses_v2_page_mapping():
 
     torch.testing.assert_close(actual, expected_indices)
     convert.assert_called_once_with(req_idx, block_table, topk_indices, 4, 1, 12, 1)
+
+
+def test_dsa_cache_manager_v2_allocates_rope_residual_storage():
+    cache_manager = object.__new__(DSACacheManagerV2)
+    cache_manager.dtype = DataType.NVFP4
+    cache_manager.kv_factor = 1
+    cache_manager.num_kv_heads_per_layer = [1]
+    cache_manager.head_dim_per_layer = [576]
+    cache_manager.mla_kv_cache_residual_dim = 64
+    cache_manager.indexer_k_cache_local_layer_mask = [False]
+    cache_manager.index_head_dim = 128
+    cache_manager.quant_block_size = 128
+    cache_manager.use_fp4 = False
+
+    assert cache_manager.get_layer_bytes_per_token(0, Role.KEY) == 320
+    assert cache_manager.get_layer_bytes_per_token(0, Role.KEY_BLOCK_SCALE) == 40
+    assert cache_manager.get_layer_bytes_per_token(0, Role.ALL) == 360
 
 
 def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
