@@ -28,6 +28,15 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 
+namespace bounce
+{
+// Pimpl holding the bounce v2 transport + its arena/exec pool/control channel. The full definition
+// lives in the .cpp: the real one under TLLM_BOUNCE_V2 (set when libzmq is found, independent of
+// ENABLE_UCX), an empty struct otherwise; the member below is always present so the
+// NixlTransferAgent layout is identical across all translation units.
+struct NixlBounceState;
+} // namespace bounce
+
 struct NixlHelper
 {
     [[nodiscard]] static nixl_mem_t convert(MemoryType type);
@@ -57,7 +66,7 @@ public:
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
     [[nodiscard]] int getLastStatus() const noexcept;
-    [[nodiscard]] std::string getLastStatusStr() const;
+    [[nodiscard]] std::string getLastStatusStr() const override;
 
     [[nodiscard]] bool release() override;
 
@@ -72,7 +81,9 @@ private:
     mutable std::mutex mHandleMutex;
 };
 
-class NixlTransferAgent final : public BaseTransferAgent
+// Not `final`: the low-level virtuals below (postXferRequest / registerRegionImpl) are the
+// fault-injection seam — bounce failure tests subclass this agent and override them.
+class NixlTransferAgent : public BaseTransferAgent
 {
 public:
     NixlTransferAgent(BaseAgentConfig const& config);
@@ -93,10 +104,22 @@ public:
 
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
 
-    [[nodiscard]] nixlAgent* getRawAgent() const noexcept
-    {
-        return mRawAgent.get();
-    }
+    // ---- Low-level transfer primitives (below the VMM splitter) -------------------------------
+    // submitTransferRequests() = bounce fork + VMM split/coalesce + postXferRequest(). The bounce
+    // transport calls these directly: its remote address comes from a credit (already final, no
+    // VMM resolution) and its per-chunk cadence cannot afford the full public path. Virtual so
+    // bounce failure tests can inject deterministic transfer faults.
+
+    /// Post one transfer whose descriptors are already FINAL device addresses (no VMM splitting,
+    /// no bounce fork). Returns nullptr on submission failure (logged) instead of aborting.
+    /// Takes no agent lock: safe from the bounce IO thread, which is joined before agent teardown.
+    [[nodiscard]] virtual std::unique_ptr<TransferStatus> postXferRequest(TransferOp op, TransferDescs const& srcDescs,
+        TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage);
+
+    /// Register/deregister one raw device range with NIXL, WITHOUT the VMM split or the AgentDesc
+    /// VRAM-region bookkeeping (the bounce arena must not enter the splitter's region maps).
+    [[nodiscard]] virtual bool registerRegionImpl(void* base, std::size_t bytes, int deviceId);
+    virtual void deregisterRegionImpl(void* base, std::size_t bytes, int deviceId);
 
     nixl_opt_args_t* getExtraParams() noexcept
     {
@@ -113,7 +136,23 @@ public:
 
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
+    /// Whether the bounce v2 transport is active on this agent (built + enabled + init succeeded).
+    /// Programmatic alternative to grepping logs (deployment checks and tests).
+    [[nodiscard]] bool isBounceEnabled() const noexcept
+    {
+        return mBounce != nullptr;
+    }
+
+    /// Number of transfer requests routed to the bounce fast path so far.
+    [[nodiscard]] std::uint64_t getBounceSubmitCount() const noexcept
+    {
+        return mBounceSubmitCount.load(std::memory_order_relaxed);
+    }
+
 private:
+    /// Counts requests admitted by shouldUseBounce (see getBounceSubmitCount).
+    std::atomic<std::uint64_t> mBounceSubmitCount{0};
+
     // shared_ptr so outstanding NixlTransferStatus (via weak_ptr) can detect agent reset.
     std::shared_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};
@@ -135,6 +174,21 @@ private:
     /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
     /// Per-agent maps because different remote agents may have overlapping virtual addresses.
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
+
+    /// Bounce v2 transport (opt-in via CacheTransceiverConfig.agent_bounce_buffer_enable +
+    /// kv_cache_bounce_size_mb). Null unless
+    /// enabled & built; when null the agent behaves exactly as before. See the design overview at
+    /// the top of bounce/BounceTransport.h.
+    std::unique_ptr<bounce::NixlBounceState> mBounce;
+
+    /// Lazily create the bounce transport (ctor, before any metadata exchange) when enabled.
+    /// @param agentBufferSizeMb arena size in MiB from BaseAgentConfig; 0 keeps bounce disabled.
+    /// @param bounceParams expert knobs from BaseAgentConfig, layered over the
+    /// TRTLLM_NIXL_BOUNCE_* env fallback (dict > env > default).
+    void maybeInitBounce(
+        std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams);
+    /// Heuristic gate: is this request eligible for the bounce fast path?
+    [[nodiscard]] bool shouldUseBounce(TransferRequest const& request) const;
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent

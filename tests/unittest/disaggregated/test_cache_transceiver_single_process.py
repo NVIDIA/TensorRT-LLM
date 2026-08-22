@@ -21,6 +21,8 @@ TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 """
 
 import os
+import subprocess
+import sys
 import threading
 import uuid
 from types import SimpleNamespace
@@ -981,6 +983,7 @@ def run_transfer_test(
     request_lengths: Optional[List[int]] = None,
     enable_indexer_k_cache: bool = False,
     indexer_k_cache_layer_mask: list[bool] | None = None,
+    expect_cpp_bounce: bool = False,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2."""
     if request_lengths is None:
@@ -1024,6 +1027,18 @@ def run_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
+        # Keep the Python-native bounce layer disabled by default (size 0).
+        # Dedicated C++ bounce coverage enables the NIXL agent's bounce v2 via
+        # agent_bounce_buffer_enable + kv_cache_bounce_size_mb plus
+        # agent_bounce_params, which exercises the config plumbing end-to-end.
+        kv_cache_bounce_size_mb=64 if expect_cpp_bounce else 0,
+        agent_bounce_buffer_enable=expect_cpp_bounce,
+        agent_bounce_params={
+            "min_descriptor_count": "1",
+            "max_average_descriptor_size": "1MB",
+        }
+        if expect_cpp_bounce
+        else None,
     )
     ctx_tcs = create_instance_transceivers(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
@@ -1156,6 +1171,22 @@ def run_transfer_test(
                 gen_request_ids=gen_request_ids,
                 num_layers=num_layers,
             )
+
+        # Programmatic bounce check (no log parsing): every agent must have the C++
+        # bounce v2 transport active, and at least one transfer must have been routed
+        # through it (only KV senders submit WRITEs, so we assert on the total).
+        if expect_cpp_bounce:
+            # The shared capacity must be routed to exactly one implementation: with
+            # agent_bounce_buffer_enable the Python-native bounce stays off.
+            assert all(tc._transfer_worker._config.bounce is None for tc in ctx_tcs + gen_tcs), (
+                "Python-native bounce must stay disabled when the C++ agent bounce is selected"
+            )
+            agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
+            assert all(getattr(agent, "bounce_enabled", False) for agent in agents), (
+                "C++ bounce v2 transport is not active on every NIXL agent"
+            )
+            total_bounce_submits = sum(agent.bounce_submit_count for agent in agents)
+            assert total_bounce_submits > 0, "no transfer was routed through the bounce fast path"
 
         # 9. Cleanup
         if use_v2:
@@ -1545,6 +1576,104 @@ def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
         enable_indexer_k_cache=True,
         indexer_k_cache_layer_mask=[False, False, True, True],
     )
+
+
+_NIXL_BOUNCE_SUBPROCESS_ENV = "TRTLLM_TEST_NIXL_BOUNCE_SUBPROCESS"
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize(
+    (
+        "ctx_tp",
+        "ctx_pp",
+        "gen_tp",
+        "gen_pp",
+        "is_mla",
+        "use_v2",
+        "enable_indexer_k_cache",
+    ),
+    [
+        pytest.param(1, 1, 1, 1, False, True, False, id="v2_mha"),
+        pytest.param(2, 1, 2, 1, True, True, False, id="v2_mla_tp2"),
+        pytest.param(1, 1, 1, 1, True, False, True, id="v1_dsa_indexer"),
+        pytest.param(2, 1, 1, 2, False, True, False, id="v2_ctx_tp2_gen_pp2"),
+    ],
+)
+def test_python_nixl_cache_transceiver_uses_cpp_bounce(
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    is_mla: bool,
+    use_v2: bool,
+    enable_indexer_k_cache: bool,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Exercise C++ bounce v2 through representative Python NIXL transceiver paths."""
+    # BindingsNixlTransferStatus.last_status_str() resolves this exact attribute on the C++
+    # status; if the binding name drifts, failure details silently degrade to "<unavailable>".
+    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferStatus
+
+    assert hasattr(TransferStatus, "get_last_status_str")
+
+    if os.environ.get(_NIXL_BOUNCE_SUBPROCESS_ENV) == "1":
+        run_transfer_test(
+            ctx_tp=ctx_tp,
+            ctx_pp=ctx_pp,
+            gen_tp=gen_tp,
+            gen_pp=gen_pp,
+            ctx_enable_dp=False,
+            gen_enable_dp=False,
+            is_mla=is_mla,
+            use_v2=use_v2,
+            request_lengths=[30, 60],
+            enable_indexer_k_cache=enable_indexer_k_cache,
+            expect_cpp_bounce=True,
+        )
+        return
+
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("TRTLLM_NIXL_BOUNCE_"):
+            del env[name]
+    env.update(
+        {
+            _NIXL_BOUNCE_SUBPROCESS_ENV: "1",
+            "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+            # Bounce is enabled (agent_bounce_buffer_enable + kv_cache_bounce_size_mb)
+            # and tuned (expert knobs) via CacheTransceiverConfig / agent_bounce_params inside
+            # run_transfer_test — no TRTLLM_NIXL_BOUNCE_* environment variables —
+            # covering the config path end-to-end.
+            # Pin the transport deterministically: the child would otherwise inherit
+            # developer/CI UCX settings (an injected UCX_NET_DEVICES or differing
+            # UCX_TLS can fail the transfer or oversubscribe CPUs).
+            "UCX_TLS": "^ib,gdr_copy",
+            "TRTLLM_NIXL_NUM_THREADS": "1",
+        }
+    )
+    # Deliberately NOT setting TLLM_LOG_LEVEL_BY_MODULE: bounce engagement is verified
+    # programmatically inside the child (agent.bounce_enabled / bounce_submit_count),
+    # and a non-empty per-module level map can hang the child at exit (static-destruction
+    # order: CudaMemPool's deleter logs through an already-destroyed Logger module map).
+    env.pop("TLLM_LOG_LEVEL_BY_MODULE", None)
+    env.pop("UCX_NET_DEVICES", None)
+    # Do not override TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY: the test must
+    # exercise the production default, including automatic cudaMalloc fallback
+    # on devices without fabric-memory support.
+    env.pop("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", None)
+
+    node_id = f"{__file__}::{request.node.name}"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-s", "-q", node_id],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    # A skipped child exits successfully too; require the selected bounce case to run.
+    assert "1 passed" in output, f"Child pytest did not run the bounce case:\n{output}"
 
 
 if __name__ == "__main__":

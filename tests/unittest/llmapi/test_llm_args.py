@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import re
 import tempfile
 from collections import defaultdict
 from dataclasses import is_dataclass
@@ -2600,20 +2601,113 @@ class TestStrictBaseModelArbitraryArgs:
         assert config.max_tokens_in_buffer == 1024
         assert config.kv_transfer_poll_interval_ms == 5000
 
-        # The bounce on/off switch defaults to off (0), accepts a positive size, and rejects
-        # negatives at the Pydantic boundary (ge=0). It is a Python-only field consumed directly by
-        # the v2 transceiver, so it is intentionally not part of _to_pybind().
+        # The shared bounce capacity defaults to off (0), accepts a positive size, and rejects
+        # negatives at the Pydantic boundary (ge=0).
         assert config.kv_cache_bounce_size_mb == 0
         assert CacheTransceiverConfig(
             kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
+        # agent_bounce_buffer_enable defaults to the Python implementation (False); enabling the
+        # C++ transfer-agent implementation with a zero capacity is a contradiction.
+        assert config.agent_bounce_buffer_enable is False
+        assert config.agent_bounce_params is None
+        assert CacheTransceiverConfig(
+            kv_cache_bounce_size_mb=512,
+            agent_bounce_buffer_enable=True).agent_bounce_buffer_enable is True
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+                           match="kv_cache_bounce_size_mb is 0"):
+            CacheTransceiverConfig(agent_bounce_buffer_enable=True)
+
+        # _to_pybind routes the shared capacity to the C++ agent arena only when the agent
+        # implementation is selected. backend must be set: from_string(None) is a pre-existing
+        # _to_pybind limit.
+        assert CacheTransceiverConfig(backend="NIXL",
+                                      kv_cache_bounce_size_mb=384,
+                                      agent_bounce_buffer_enable=True
+                                      )._to_pybind().agent_buffer_size_mb == 384
+        assert CacheTransceiverConfig(
+            backend="NIXL",
+            kv_cache_bounce_size_mb=384)._to_pybind().agent_buffer_size_mb == 0
+
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
             CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
+
+    def test_cache_transceiver_config_agent_bounce_params(self):
+        """agent_bounce_params coercion, key/consistency validation, pybind passthrough."""
+        # Values are coerced to strings (YAML often yields ints/bools).
+        config = CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                                        agent_bounce_buffer_enable=True,
+                                        agent_bounce_params={
+                                            "max_chunk_size": 4096,
+                                            "enable_eager_gather": False
+                                        })
+        assert config.agent_bounce_params == {
+            "max_chunk_size": "4096",
+            "enable_eager_gather": "False"
+        }
+
+        # Params without the C++ agent implementation are a contradiction: they
+        # would be silently ignored, so validation rejects them outright.
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+                           match="agent_bounce_buffer_enable"):
+            CacheTransceiverConfig(
+                kv_cache_bounce_size_mb=512,
+                agent_bounce_params={"copy_stream_count": "2"})
+
+        # Unknown keys (here the env-var-style typo WITH the trailing _bytes) are
+        # rejected, and the message lists every valid key (spot-check one).
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+                           match="max_chunk_size_bytes.*min_descriptor_count"):
+            CacheTransceiverConfig(
+                kv_cache_bounce_size_mb=512,
+                agent_bounce_buffer_enable=True,
+                agent_bounce_params={"max_chunk_size_bytes": "4096"})
+
+        # Non-dict input fails cleanly in the coercion validator, not with a bare
+        # AttributeError.
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+                           match="must be a dict"):
+            CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                                   agent_bounce_buffer_enable=True,
+                                   agent_bounce_params="max_chunk_size=4096")
+
+        # _to_pybind converts the shared capacity into the C++ agent arena size and
+        # passes the params through (defaulting to an empty dict).
+        pybind_config = CacheTransceiverConfig(backend="NIXL",
+                                               kv_cache_bounce_size_mb=512,
+                                               agent_bounce_buffer_enable=True,
+                                               agent_bounce_params={
+                                                   "max_chunk_size": "4096"
+                                               })._to_pybind()
+        assert pybind_config.agent_buffer_size_mb == 512
+        assert pybind_config.agent_bounce_params == {"max_chunk_size": "4096"}
+        # backend must be set: from_string(None) is a pre-existing _to_pybind limit.
+        assert CacheTransceiverConfig(
+            backend="NIXL")._to_pybind().agent_bounce_params == {}
+
+    def test_agent_bounce_param_keys_match_cpp_env_knobs(self):
+        """AGENT_BOUNCE_PARAM_KEYS must mirror kEnvKnobs in BounceConfig.h (parsed here)."""
+        from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
+            AGENT_BOUNCE_PARAM_KEYS
+        bounce_config_h = (Path(__file__).resolve().parents[3] /
+                           "cpp/tensorrt_llm/executor/cache_transmission/"
+                           "nixl_utils/bounce/BounceConfig.h")
+        if not bounce_config_h.is_file():
+            pytest.skip("C++ sources not present (wheel-only checkout)")
+        cpp_keys = set(
+            re.findall(r'\{"([a-z0-9_]+)",\s*"TRTLLM_NIXL_BOUNCE_',
+                       bounce_config_h.read_text()))
+        assert cpp_keys, "failed to parse kEnvKnobs from BounceConfig.h"
+        python_keys = set(AGENT_BOUNCE_PARAM_KEYS)
+        assert python_keys == cpp_keys, (
+            f"agent_bounce_params allowlist drifted from kEnvKnobs: "
+            f"only in Python: {sorted(python_keys - cpp_keys)}, "
+            f"only in C++: {sorted(cpp_keys - python_keys)}")
 
     def test_torch_compile_config_arbitrary_args(self):
         """Test that TorchCompileConfig rejects arbitrary arguments."""

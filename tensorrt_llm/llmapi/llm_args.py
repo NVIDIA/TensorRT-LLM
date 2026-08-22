@@ -3283,11 +3283,14 @@ class PybindMirror(ABC):
         return ins
 
     @staticmethod
-    def mirror_pybind_fields(pybind_class):
+    def mirror_pybind_fields(pybind_class, excluded_fields=None):
         """Class decorator that ensures Python class fields mirror those of a C++ class.
 
         Args:
             pybind_class: The C++ class whose fields should be mirrored
+            excluded_fields: Optional set of C++ field names exempt from the
+                mirror check, for internal pipeline values that the Python
+                class derives from other fields instead of exposing directly
 
         Returns:
             A decorator function that validates field mirroring
@@ -3301,6 +3304,8 @@ class PybindMirror(ABC):
 
             # Check if all C++ fields exist in the Python class
             for field in cpp_fields:
+                if excluded_fields and field in excluded_fields:
+                    continue
                 if field not in python_fields:
                     raise ValueError(
                         f"Field {field} is not mirrored in Python class {cls.__name__} from C++ class {pybind_class.__name__}. Please update the class."
@@ -4295,7 +4300,11 @@ _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
 )
 
 
-@PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
+# agent_buffer_size_mb is exempt from the mirror check: the C++ config keeps it
+# as the internal pipeline value (agent arena MiB), which _to_pybind derives
+# from kv_cache_bounce_size_mb + agent_bounce_buffer_enable.
+@PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig,
+                                   excluded_fields={"agent_buffer_size_mb"})
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """Configuration for the cache transceiver."""
 
@@ -4346,8 +4355,69 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
-    )
+        "Capacity in MiB of the native-disagg KV-cache bounce buffer, which "
+        "coalesces a request's scattered per-block KV for a single multi-rail "
+        "NIXL write. The size doubles as the on/off switch: 0 (default) keeps "
+        "the per-block path, >0 enables bounce at that capacity. With the "
+        "default Python implementation it is per-region (one buffer for send, "
+        "one for recv); with agent_bounce_buffer_enable it is one shared "
+        "arena. The Python implementation requires the Python (v2) "
+        "transceiver runtime; on the C++ transceiver path the size is ignored "
+        "unless agent_bounce_buffer_enable is set.")
+
+    agent_bounce_buffer_enable: bool = Field(
+        default=False,
+        description=
+        "Use the C++ transfer-agent bounce implementation instead of the "
+        "Python one. kv_cache_bounce_size_mb is then a single arena shared by "
+        "send and recv (about half the memory footprint of the Python "
+        "per-region pair for the same number). Configure the context and "
+        "generation instances consistently.")
+
+    agent_bounce_params: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=
+        "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see "
+        "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
+        "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
+        "Precedence: this dict > environment variable > built-in default. "
+        "Requires agent_bounce_buffer_enable.")
+
+    @field_validator('agent_bounce_params', mode='before')
+    @classmethod
+    def coerce_agent_bounce_params_to_str(cls, v):
+        """Coerce agent_bounce_params values to strings (YAML often yields ints/bools)."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"agent_bounce_params must be a dict of str to str, got "
+                f"{type(v).__name__}")
+        return {str(k): str(val) for k, val in v.items()}
+
+    @model_validator(mode='after')
+    def validate_bounce_config(self) -> 'CacheTransceiverConfig':
+        if self.agent_bounce_buffer_enable and self.kv_cache_bounce_size_mb == 0:
+            raise ValueError(
+                "agent_bounce_buffer_enable selects the C++ transfer-agent "
+                "bounce implementation, but kv_cache_bounce_size_mb is 0 "
+                "(bounce disabled); set a positive capacity.")
+        if self.agent_bounce_params:
+            if not self.agent_bounce_buffer_enable:
+                raise ValueError(
+                    "agent_bounce_params only applies to the C++ transfer-agent "
+                    "bounce implementation; set agent_bounce_buffer_enable=True "
+                    "or drop the params.")
+            # Lazy: importing tensorrt_llm._torch at module scope is circular.
+            from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
+                AGENT_BOUNCE_PARAM_KEYS
+            unknown = sorted(
+                set(self.agent_bounce_params) - AGENT_BOUNCE_PARAM_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown agent_bounce_params key(s) {unknown}; valid keys "
+                    f"are {sorted(AGENT_BOUNCE_PARAM_KEYS)}.")
+        return self
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
@@ -4370,7 +4440,11 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
             kv_transfer_sender_future_timeout_ms=self.
             kv_transfer_sender_future_timeout_ms,
-            kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms)
+            kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms,
+            # The C++ side keeps a single knob: the agent arena MiB (0 = off).
+            agent_buffer_size_mb=(self.kv_cache_bounce_size_mb
+                                  if self.agent_bounce_buffer_enable else 0),
+            agent_bounce_params=self.agent_bounce_params or {})
 
 
 @dataclass
