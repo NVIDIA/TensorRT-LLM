@@ -243,6 +243,7 @@ else:
 # Utility functions
 # ---------------------------------------------------------------------------
 if TRTLLM_AVAILABLE:
+    from tensorrt_llm._torch.flashinfer_utils import is_pdl_enabled
     from tensorrt_llm._torch.utils import make_weak_ref
     from tensorrt_llm._utils import (
         get_free_port,
@@ -254,6 +255,8 @@ if TRTLLM_AVAILABLE:
         str_dtype_to_torch,
     )
 else:
+    from .utils.logger import ad_logger
+
     # -- get_free_port --
     def get_free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -263,8 +266,37 @@ else:
     # -- get_sm_version --
     @lru_cache(maxsize=1)
     def get_sm_version() -> int:
+        if not torch.cuda.is_available():
+            return -1
         prop = torch.cuda.get_device_properties(0)
         return prop.major * 10 + prop.minor
+
+    # -- is_pdl_enabled --
+    def is_pdl_enabled() -> bool:
+        """Return whether PDL is requested and supported by the current GPU."""
+        env_value = os.environ.get("TRTLLM_ENABLE_PDL")
+        if env_value not in (None, "1"):
+            return False
+
+        sm_version = get_sm_version()
+        enabled = sm_version >= 90
+        if not getattr(is_pdl_enabled, "_printed", False):
+            if enabled:
+                ad_logger.info("PDL enabled")
+            elif env_value == "1":
+                detected_device = "no CUDA GPU" if sm_version < 0 else f"SM{sm_version}"
+                ad_logger.warning(
+                    "TRTLLM_ENABLE_PDL=1 requires SM90 or newer, "
+                    f"but detected {detected_device}. PDL will be disabled. "
+                    "Unset TRTLLM_ENABLE_PDL to use the architecture-aware "
+                    "default, or set it to 0."
+                )
+            elif sm_version < 0:
+                ad_logger.info("PDL disabled: no CUDA GPU is available")
+            else:
+                ad_logger.info(f"PDL disabled on SM{sm_version}: requires SM90 or newer")
+            setattr(is_pdl_enabled, "_printed", True)
+        return enabled
 
     # -- is_sm_100f --
     @lru_cache(maxsize=1)
