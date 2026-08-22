@@ -197,6 +197,74 @@ class TestNormalizePathUsage:
         assert "p.relative_to(repo_root)" not in source
 
 
+class TestNormalizePathCrossPlatform:
+    """Regression tests for https://github.com/NVIDIA/TensorRT-LLM/issues/17743.
+
+    On Windows, ``Path.relative_to()`` returns a ``WindowsPath`` whose
+    ``str()`` joins components with backslashes, while
+    ``ruff-legacy-baseline.json`` always stores forward-slash keys. If
+    ``normalize_path`` ever goes back to ``str(p.relative_to(repo_root))``
+    instead of ``.as_posix()``, every baseline lookup on Windows misses and
+    every legacy violation is (wrongly) reported as a new regression.
+
+    We can't run on an actual Windows host here, so this test fakes the
+    object returned by ``relative_to()`` to reproduce the exact
+    str()-vs-as_posix() split that WindowsPath exhibits, without touching
+    real platform separators. This exercises the real `normalize_path`
+    function body -- it fails today (backslash string returned) and passes
+    once `normalize_path` is fixed to call `.as_posix()`.
+    """
+
+    def test_normalize_path_uses_as_posix_not_str(self, mod, monkeypatch):
+        """normalize_path must not pick up backslash separators from a WindowsPath-like relative_to() result."""
+        repo_root = mod.Path("/repo")
+        windows_style_abs = "/repo/tensorrt_llm/serve/tool_parser/base_tool_parser.py"
+
+        class FakeWindowsRelativePath:
+            """Mimics the str()/as_posix() split of a real WindowsPath."""
+
+            def __str__(self):
+                return "tensorrt_llm\\serve\\tool_parser\\base_tool_parser.py"
+
+            def as_posix(self):
+                return "tensorrt_llm/serve/tool_parser/base_tool_parser.py"
+
+        class FakeAbsPath:
+            """Mimics an absolute WindowsPath just enough for normalize_path."""
+
+            def is_absolute(self):
+                return True
+
+            def relative_to(self, root):
+                assert root == repo_root
+                return FakeWindowsRelativePath()
+
+        real_path_cls = mod.Path
+
+        def fake_path_ctor(arg):
+            if arg == windows_style_abs:
+                return FakeAbsPath()
+            return real_path_cls(arg)
+
+        monkeypatch.setattr(mod, "Path", fake_path_ctor)
+
+        result = mod.normalize_path(windows_style_abs, repo_root)
+
+        assert result == "tensorrt_llm/serve/tool_parser/base_tool_parser.py"
+        assert "\\" not in result
+
+    def test_normalize_path_matches_baseline_key_style(self, mod, tmp_path):
+        """Sanity check on the real (POSIX) code path: the normalized key must be forward-slash."""
+        repo_root = tmp_path
+        nested = tmp_path / "tensorrt_llm" / "serve" / "tool_parser"
+        nested.mkdir(parents=True)
+        abs_path = str(nested / "base_tool_parser.py")
+
+        result = mod.normalize_path(abs_path, repo_root)
+
+        assert result == "tensorrt_llm/serve/tool_parser/base_tool_parser.py"
+
+
 # ==========================================================================
 # Migrated from test_generate_legacy_lint_config.py
 # ==========================================================================

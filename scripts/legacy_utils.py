@@ -122,14 +122,22 @@ def hash_files(paths: list[Path]) -> dict[Path, str]:
 
 
 def normalize_path(filepath: str, repo_root: Path) -> str:
-    """Normalize an absolute path to repo-relative."""
+    """Normalize an absolute path to a repo-relative POSIX-style path.
+
+    Always returns forward-slash paths (via ``as_posix()``) so the result
+    matches the forward-slash keys stored in ruff-legacy-baseline.json,
+    regardless of the host platform's path separator. On Windows,
+    ``Path.relative_to()`` returns a WindowsPath whose ``str()`` would use
+    backslashes and therefore never match the baseline; ``as_posix()`` is a
+    no-op on POSIX systems where it already matches ``str()``.
+    """
     p = Path(filepath)
     if p.is_absolute():
         try:
-            return str(p.relative_to(repo_root))
+            return p.relative_to(repo_root).as_posix()
         except ValueError:
-            return str(p)
-    return str(p)
+            return p.as_posix()
+    return p.as_posix()
 
 
 def count_violations(violations: list[dict], repo_root: Path) -> dict[str, dict[str, int]]:
