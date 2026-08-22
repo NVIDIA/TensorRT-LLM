@@ -938,6 +938,7 @@ class MiniMaxM3SparseRuntimeBackend(AttentionBackend[AttentionMetadata]):
             sparse_params=sparse_params,
             **kwargs,
         )
+        self.sparse_params = sparse_params
         self.m3_config = MiniMaxM3SparseConfig.from_sparse_params(
             sparse_params,
             num_q_heads=num_heads,

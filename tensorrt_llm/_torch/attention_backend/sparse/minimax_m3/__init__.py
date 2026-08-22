@@ -53,9 +53,11 @@ from .triton_backend import (  # noqa: F401
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
+from .vanilla_backend import MiniMaxM3VanillaAttention
 
 __all__ = [
     "MiniMaxM3KVCacheManagerV2",
     "MiniMaxM3MsaSparseAttention",
     "MiniMaxM3SparseRuntimeBackend",
+    "MiniMaxM3VanillaAttention",
 ]
