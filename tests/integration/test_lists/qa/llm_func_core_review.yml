@@ -1,0 +1,541 @@
+version: 0.0.1
+llm_func_core_review:
+
+# ==========================================================================
+# T0  no compute_capability floor
+# ==========================================================================
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- LGAI-EXAONE/EXAONE-4.5-33B
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget]
+  # ---- Qwen/Qwen2-7B-Instruct
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
+  # ---- Qwen/Qwen2-VL-7B-Instruct
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_VL_7B::test_auto_dtype
+  # ---- Qwen/Qwen2.5-VL-7B-Instruct
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype
+  # ---- Qwen/Qwen3-VL-30B-A3B-Instruct
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL_MOE::test_auto_dtype
+  # ---- Qwen/Qwen3.5-35B-A3B
+  # registry-above-bucket | resolved=default-1gpu | l0=1 | registry_ws=2
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS]
+  # registry-above-bucket | resolved=default-1gpu | l0=1 | registry_ws=2
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-TRTLLM]
+  # registry-above-bucket | resolved=default-1gpu | l0=1 | registry_ws=2
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp
+  # ---- Qwen3/Qwen3-4B
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_4B::test_eagle3
+  # ---- Qwen3/Qwen3-8B
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=False-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=False]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=False-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4 | registry_ws=1
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[GSM8K]
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4 | registry_ws=1
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[MMLU]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_auto_dtype_beam_search[enable_cuda_graph=False-enable_padding=False-disable_overlap_scheduler=False-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_auto_dtype_beam_search[enable_cuda_graph=False-enable_padding=False-disable_overlap_scheduler=True-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_auto_dtype_beam_search[enable_cuda_graph=True-enable_padding=False-disable_overlap_scheduler=False-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_auto_dtype_beam_search[enable_cuda_graph=True-enable_padding=False-disable_overlap_scheduler=True-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_auto_dtype_beam_search[enable_cuda_graph=True-enable_padding=True-disable_overlap_scheduler=False-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_auto_dtype_beam_search[enable_cuda_graph=True-enable_padding=True-disable_overlap_scheduler=False-sampler_async_worker=True]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_auto_dtype_beam_search[enable_cuda_graph=True-enable_padding=True-disable_overlap_scheduler=True-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_rejection_dynamic_tree_smoke[dynamic_tree]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_rejection_dynamic_tree_smoke[no_dynamic_tree]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_gather_generation_logits_cuda_graph
+  # ---- meta-llama/Llama-3.2-3B
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype
+  # ---- mistralai/Ministral-8B-Instruct-2410
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=2
+  - accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
+  # ---- nvidia/Nemotron-3-Nano
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_auto_dtype
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- TestLlmDefaultBackend
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_default
+  # ---- TestModelRegistryAccuracy
+  # signal-below-l0 | resolved=ad-model-registry | l0=4
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[google_gemma-3-1b-it-False]
+  # signal-below-l0 | resolved=ad-model-registry | l0=4
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.1-8B-Instruct-False]
+  # ---- disaggregated/test_aiperf_gate.py
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_all_cancelled_fails
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_corrupt_export_fails
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_empty_export_fails
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_gate_disabled_paths_not_affected
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_incomplete_accounting_fails
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_missing_export_raises
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_single_truncated_line_tolerated
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_aiperf_gate.py::test_was_cancelled_metadata_fallback
+  # ---- disaggregated/test_disaggregated.py
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=2
+  - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_disaggregated.py::test_disaggregated_sa_python[TinyLlama-1.1B-Chat-v1.0]
+  # ---- disaggregated/test_workers.py
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - disaggregated/test_workers.py::test_workers_conditional_disaggregation_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
+  # ---- test_e2e.py
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - test_e2e.py::test_openai_kv_cache_contamination
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - test_e2e.py::test_qwen_e2e_cpprunner_large_new_tokens[Qwen3/Qwen3-0.6B-Qwen3/Qwen3-0.6B]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - test_e2e.py::test_trtllm_multimodal_benchmark_serving
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+  tests:
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- TestModelRegistryAccuracy
+  # signal-below-l0 | resolved=ad-model-registry | l0=4
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Ministral-8B-Instruct-2410-False]
+  # signal-below-l0 | resolved=ad-model-registry | l0=4
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-FP8-True]
+  # signal-below-l0 | resolved=ad-model-registry | l0=4
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-NVFP4-True]
+  # ---- disaggregated/test_ad_disagg.py
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_ad_disagg.py::test_async_generation_matches_aggregate
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_ad_disagg.py::test_async_generation_no_overlap_matches_aggregate
+  # ---- disaggregated/test_ad_disagg_trtllm_serve.py
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion
+  # ---- disaggregated/test_auto_scaling.py
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_minimal_instances[http-round_robin]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-kv_cache_aware]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_service_discovery[http-round_robin]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-load_balancing]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
+  # ---- disaggregated/test_disaggregated.py
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[TinyLlama-1.1B-Chat-v1.0]
+
+# 8 GPUs on ONE node. Excluded from multi-node allocations (GB200/GB300 satisfy 8 as 2 nodes x 4).
+- condition:
+    terms:
+      placement: single_node
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+  tests:
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- disaggregated/test_disaggregated.py
+  # contradiction-exceeds-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
+
+# PLACEMENT UNDECLARED: needs skip_less_device(8) or skip_less_mpi_world_size(8) before this can be scheduled.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  # placement-unknown-at-8 | resolved=marker/param/guard | l0=8 | registry_ws=1
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=4]
+  # placement-unknown-at-8 | resolved=marker/param/guard | l0=8 | registry_ws=1
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=2-ctx_pp=4]
+  # placement-unknown-at-8 | resolved=marker/param/guard | l0=8 | registry_ws=1
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=4]
+  # placement-unknown-at-8 | resolved=marker/param/guard | l0=8 | registry_ws=1
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=4]
+  # placement-unknown-at-8 | resolved=marker/param/guard | l0=8 | registry_ws=1
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp2pp2]
+  # placement-unknown-at-8 | resolved=marker/param/guard | l0=8 | registry_ws=1
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2]
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- TestModelRegistryAccuracy
+  # placement-unknown-at-8 | resolved=ad-model-registry | l0=8
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[deepseek-ai_DeepSeek-R1-0528-True]
+  # placement-unknown-at-8 | resolved=ad-model-registry | l0=8
+  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_DeepSeek-R1-0528-NVFP4-v2-True]
+
+# ==========================================================================
+# T1  compute_capability >= 8.9  (Ada and above)
+# ==========================================================================
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+      compute_capability:
+        gte: 8.9
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- mistralai/Ministral-8B-Instruct-2410
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=2
+  - accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
+
+# PLACEMENT UNDECLARED: needs skip_less_device(8) or skip_less_mpi_world_size(8) before this can be scheduled.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+      compute_capability:
+        gte: 8.9
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- nvidia/Nemotron-3-Nano
+  # placement-unknown-at-8 | resolved=marker/param/guard | l0=8
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=8]
+
+# ==========================================================================
+# T2  compute_capability >= 9.0  (Hopper and above)
+# ==========================================================================
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+      compute_capability:
+        gte: 9.0
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- ByteDance-Seed/Seed-OSS-36B-Instruct
+  # registry-above-bucket | resolved=default-1gpu | l0=1 | registry_ws=4
+  - accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
+  # ---- Qwen/Qwen3.5-27B
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_27B_VL::test_auto_dtype
+  # ---- Qwen/Qwen3.5-35B-A3B
+  # registry-above-bucket | resolved=default-1gpu | l0=1 | registry_ws=2
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=2
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8_moe_dflash
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=2
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_auto_dtype
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=2
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_fp8_prequantized
+  # ---- TestGPTOSS
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu_piecewise_cuda_graph
+  # ---- deepseek-ai/DeepSeek-V3-Lite
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True-enable_chunked_prefill=True-v2_kv_cache=False]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True-enable_chunked_prefill=True-v2_kv_cache=True]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_mtp_sa_global_pool
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=0]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=2]
+  # ---- google/gemma-3-1b-it
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_guided_decoding_vswa_reuse[xgrammar]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_vswa_reuse
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=False-eagle3_one_model=False-overlap_scheduler=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa_global_pool
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[enable_cuda_graph=False-enable_padding=False-disable_overlap_scheduler=False-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[enable_cuda_graph=False-enable_padding=False-disable_overlap_scheduler=True-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[enable_cuda_graph=True-enable_padding=False-disable_overlap_scheduler=False-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[enable_cuda_graph=True-enable_padding=False-disable_overlap_scheduler=True-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[enable_cuda_graph=True-enable_padding=True-disable_overlap_scheduler=False-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[enable_cuda_graph=True-enable_padding=True-disable_overlap_scheduler=False-sampler_async_worker=True]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_beam_search[enable_cuda_graph=True-enable_padding=True-disable_overlap_scheduler=True-sampler_async_worker=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_llm_sampler
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=False]
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_ngram
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa_global_pool
+  # ---- meta-llama/Llama-3.2-3B
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_fp8_prequantized
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- disaggregated/test_disaggregated.py
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance[DeepSeek-V3-Lite-bf16]
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional[DeepSeek-V3-Lite-bf16]
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional_v2[DeepSeek-V3-Lite-bf16]
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_empty_batch[DeepSeek-V3-Lite-bf16]
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
+  # ---- disaggregated/test_workers.py
+  # default-contradicted-by-l0 | resolved=default-1gpu | l0=4
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
+  # ---- test_e2e.py
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+      compute_capability:
+        gte: 9.0
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- Qwen3/Qwen3-8B
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_kv_cache_v1
+  # ---- deepseek-ai/DeepSeek-V3-Lite
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0]
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2]
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- disaggregated/test_ad_disagg.py
+  # signal-below-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+      compute_capability:
+        gte: 9.0
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- nvidia/Nemotron-Super-V3
+  # signal-below-l0 | resolved=marker/param/guard | l0=8
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_marlin_adp_4gpus[mtp_nextn=3]
+
+# 8 GPUs on ONE node. Excluded from multi-node allocations (GB200/GB300 satisfy 8 as 2 nodes x 4).
+- condition:
+    terms:
+      placement: single_node
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+      compute_capability:
+        gte: 9.0
+  tests:
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- disaggregated/test_disaggregated.py
+  # contradiction-exceeds-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
+  # contradiction-exceeds-l0 | resolved=marker/param/guard | l0=4
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
+
+# ==========================================================================
+# T3  compute_capability >= 10.0 (Blackwell and above)
+# ==========================================================================
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+      compute_capability:
+        gte: 10.0
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- Qwen/Qwen3.6-35B-A3B
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[CUTEDSL]
+  # ---- TestGPTOSS
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-fp8]
+  # ---- deepseek-ai/DeepSeek-V3-Lite
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_bmm[cuda_graph=False]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_bmm[cuda_graph=True]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm[cuda_graph=False]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm[cuda_graph=True]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_nvfp4[fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_nvfp4[fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_dynamic_draft_len
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_eagle_dynamic_draft_len
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_sa_dynamic_draft_len
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False-v2_kv_cache=False]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True-v2_kv_cache=False]
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_batch_waiting[batch_wait_timeout_iters=10-batch_wait_max_tokens_ratio=1.0-mtp_nextn=0-fp8kv=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True-v2_kv_cache=True]
+  # ---- meta-llama/Llama-3.1-8B-Instruct
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dflash_dynamic_draft_len
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3_sa_dynamic_draft_len
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_dynamic_draft_len
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa_dynamic_draft_len
+  # no-signal-no-corroboration | resolved=default-1gpu | registry_ws=1
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_suffix_automaton_dynamic_draft_len
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- disaggregated/test_disaggregated.py
+  # no-signal-no-corroboration | resolved=default-1gpu
+  - disaggregated/test_disaggregated.py::test_disaggregated_mamba_bs1_concurrency2
+
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+      compute_capability:
+        gte: 10.0
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- MiniMaxAI/MiniMax-M3
+  # signal-below-l0 | resolved=marker/param/guard | l0=8
+  - accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[use_msa=False] TIMEOUT (180)
+  # ----------------------------------------------------------------------
+  # INTEGRATION TESTS  -- a component or feature is under test; the model is a fixture
+  # ----------------------------------------------------------------------
+  # ---- disaggregated/test_disaggregated.py
+  # signal-below-l0 | resolved=marker/param/guard | l0=8
+  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix[DeepSeek-V3-Lite-bf16-short_prompt]
+
+# PLACEMENT UNDECLARED: needs skip_less_device(8) or skip_less_mpi_world_size(8) before this can be scheduled.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+      compute_capability:
+        gte: 10.0
+  tests:
+  # ----------------------------------------------------------------------
+  # MODEL TESTS  -- a specific model is what is under test
+  # ----------------------------------------------------------------------
+  # ---- Qwen/Qwen3.5-397B-A17B
+  # placement-unknown-at-8 | resolved=marker/param/guard | l0=8 | registry_ws=8
+  - accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_nvfp4[8]
