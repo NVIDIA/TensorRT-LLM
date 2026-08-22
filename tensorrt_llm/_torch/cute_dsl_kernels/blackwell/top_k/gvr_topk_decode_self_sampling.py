@@ -3938,7 +3938,9 @@ class GvrTopkRegKernel:
                         p = cutlass.Int32(0)
                         if q >= LOQ:
                             bn = _umin_u32(f2u_rz(q), cutlass.Uint32(self.nbh - 1))
-                            p = atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+                            p = atomic_add_cta(
+                                s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
+                            )
                             if p < lim1:
                                 out_row[p] = idx
                             else:
@@ -4114,7 +4116,9 @@ class GvrTopkRegKernel:
                                     done = cutlass.Int32(1)
                             if done == cutlass.Int32(0):
                                 d2 = rhi - rlo
-                                b2w = cutlass.Int32(32) - clz_i32(cutlass.Int32(d2 | cutlass.Uint32(1)))
+                                b2w = cutlass.Int32(32) - clz_i32(
+                                    cutlass.Int32(d2 | cutlass.Uint32(1))
+                                )
                                 sh2 = cutlass.Int32(0)
                                 if b2w > cutlass.Int32(LNBH):
                                     sh2 = b2w - cutlass.Int32(LNBH)
@@ -4129,7 +4133,8 @@ class GvrTopkRegKernel:
                                             bnn = (unar - rlo) >> cutlass.Uint32(sh2)
                                             bnn = _umin_u32(bnn, cutlass.Uint32(self.nbh - 1))
                                             atomic_add_cta(
-                                                s_hist.iterator + cutlass.Int32(bnn), cutlass.Int32(1)
+                                                s_hist.iterator + cutlass.Int32(bnn),
+                                                cutlass.Int32(1),
                                             )
                                     i = i + cutlass.Int32(BLK)
                                 cute.arch.barrier()  # L1743
@@ -4147,7 +4152,8 @@ class GvrTopkRegKernel:
                                 nlo = rlo + (cutlass.Uint32(b_lv) << cutlass.Uint32(sh2))
                                 if b_lv != cutlass.Int32(self.nbh - 1):
                                     rhi = nlo + (
-                                        (cutlass.Uint32(1) << cutlass.Uint32(sh2)) - cutlass.Uint32(1)
+                                        (cutlass.Uint32(1) << cutlass.Uint32(sh2))
+                                        - cutlass.Uint32(1)
                                     )
                                 rlo = nlo
                                 lev = lev + cutlass.Int32(1)
@@ -4809,7 +4815,9 @@ class GvrClusKernel:
             # ---- row bases (L1830-1833; pre_idx is request-level under varlen) ----
             row64 = cutlass.Int64(row)
             x_addr = logits.iterator.toint() + row64 * cutlass.Int64(npad) * cutlass.Int64(4)
-            p_addr = pre_idx.iterator.toint() + cutlass.Int64(prow) * cutlass.Int64(k) * cutlass.Int64(4)
+            p_addr = pre_idx.iterator.toint() + cutlass.Int64(prow) * cutlass.Int64(
+                k
+            ) * cutlass.Int64(4)
             out_row = out[row, None]
 
             # ---- interleaved chunk ownership (L1835-1846) ----
@@ -5084,7 +5092,9 @@ class GvrClusKernel:
                         isfull = cutlass.Int32(1)
                     if isfull != cutlass.Int32(0):  # full body L2042-2049
                         for uu in cutlass.range_constexpr(PFD, U):
-                            C.ld_g_f32x4(atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD])
+                            C.ld_g_f32x4(
+                                atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
+                            )
                         for uu in cutlass.range_constexpr(U):
                             if cutlass.const_expr(uu < PFD):
                                 vv = pf[uu]
@@ -5110,7 +5120,9 @@ class GvrClusKernel:
                                 okq = cutlass.Int32(1)
                             if okq != cutlass.Int32(0):  # +inf-pad escape, ok-gated
                                 for q in cutlass.range_constexpr(4):
-                                    M = M | (cutlass.Int32(vv[q] >= TF) << cutlass.Int32(uu * 4 + q))
+                                    M = M | (
+                                        cutlass.Int32(vv[q] >= TF) << cutlass.Int32(uu * 4 + q)
+                                    )
                     # ROLL THE PREFETCH FORWARD (L2066-2081): next OWNED chunk,
                     # issued before the reservation and the survivor walk.
                     g2 = g + cutlass.Int32(CS)
@@ -5250,7 +5262,9 @@ class GvrClusKernel:
                         vx = cutlass.Int32(cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF)))
                         idv = cutlass.Int32(pk64 >> cutlass.Uint64(32))
                         xv = C.f32_of_i32(vx)
-                        self._p5_emit(xv, idv, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64)
+                        self._p5_emit(
+                            xv, idv, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
+                        )
                         i = i + cutlass.Int32(BLK)
                 else:
                     # ---- EXACTNESS re-sweep: OWNED CHUNKS + rank-0 true tail
@@ -5395,7 +5409,9 @@ class GvrClusKernel:
                                     sB = s_res[C.RES_B]
                                     nlo = cutlass.Uint32(rlo) + (cutlass.Uint32(sB) << sh2u)
                                     if sB != cutlass.Int32(NBS - 1):  # L2276
-                                        rhi = nlo + ((cutlass.Uint32(1) << sh2u) - cutlass.Uint32(1))
+                                        rhi = nlo + (
+                                            (cutlass.Uint32(1) << sh2u) - cutlass.Uint32(1)
+                                        )
                                     rlo = nlo
                                     lev = lev + cutlass.Int32(1)
                             if tidx == cutlass.Int32(0):  # L2279
@@ -5459,7 +5475,9 @@ class GvrClusKernel:
                             brk = cutlass.Int32(1)
                         else:
                             d2 = cutlass.Uint32(rhi) - cutlass.Uint32(rlo)
-                            b2_ = cutlass.Int32(32) - C.clz_i32(cutlass.Int32(d2 | cutlass.Uint32(1)))
+                            b2_ = cutlass.Int32(32) - C.clz_i32(
+                                cutlass.Int32(d2 | cutlass.Uint32(1))
+                            )
                             sh2 = b2_ - cutlass.Int32(self.lb)
                             if sh2 < cutlass.Int32(0):
                                 sh2 = cutlass.Int32(0)
