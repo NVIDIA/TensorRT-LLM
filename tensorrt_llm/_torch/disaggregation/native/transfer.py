@@ -90,6 +90,10 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+# Inactivity budget for RxSession.has_transferring_tasks(): a peer resolves only
+# when its terminal result arrives, so a dead worker or a lost result would pin
+# KV pages forever.  Rearmed by every dispatch and result.
+_PEER_DRAIN_TIMEOUT_S = float(os.environ.get("TRTLLM_KV_TRANSFER_PEER_DRAIN_TIMEOUT_S", "300"))
 
 
 @dataclass
@@ -234,6 +238,9 @@ class SendTaskBase:
         self._event = threading.Event()
         self._exception: Optional[Exception] = None
         self.lock = threading.Lock()
+        # Peers with a queued-or-active write reading this task's source
+        # addresses.  set add/discard is atomic under the GIL, so no lock.
+        self.pending_peers: set[int] = set()
         self._params = params
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
@@ -313,7 +320,8 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}  # used by listener thread only (single-threaded path)
+        self._dealers = {}  # guarded by _dealers_lock; see _send_via_dealer
+        self._dealers_lock = threading.Lock()
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
@@ -435,7 +443,15 @@ class Sender(SenderBase):
         # Route by (unique_rid, peer_rank) so that:
         # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
         # - Different peers can run on different threads (better load balancing)
+        if self._shutdown:
+            # The workers may already have consumed their sentinel, so nothing
+            # would ever release the claim below and this side has no deadline.
+            raise RuntimeError(f"Sender is shutting down; refusing rid={write_meta.unique_rid}")
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        # Claim the source-address lifetime before the item is visible to a
+        # worker; the worker's finally releases it.  Unconditional so the two
+        # sides stay symmetric even for an already-cancelled session.
+        write_meta.task.pending_peers.add(write_meta.peer_rank)
         self._send_task_queues[thread_idx].put(write_meta)
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
@@ -477,6 +493,8 @@ class Sender(SenderBase):
                         f"unique_rid={write_meta.unique_rid}: {e}"
                     )
                     write_meta.task.fail(e)
+                finally:
+                    write_meta.task.pending_peers.discard(write_meta.peer_rank)
         finally:
             # Clean up this thread's DEALER sockets. threading.local storage
             # is only accessible from the owning thread, so shutdown must
@@ -573,7 +591,7 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -603,7 +621,7 @@ class Sender(SenderBase):
                     f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+                self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
@@ -1135,19 +1153,31 @@ class Sender(SenderBase):
         try:
             peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
             slice_id = info.slice_id if info.slice_id is not None else 0
-            self._get_or_connect_dealer(peer_ri.self_endpoint).send(
+            self._send_via_dealer(
+                peer_ri.self_endpoint,
                 _make_kv_result_msg(
                     self._instance_rank,
                     info.unique_rid,
                     slice_id,
                     True,  # is_last_slice
                     AgentResult.FAILED,
-                )
+                ),
             )
         except Exception as e:
             logger.warning(
                 f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
             )
+
+    def _send_via_dealer(self, endpoint: Optional[str], message: list[bytes]) -> None:
+        """Serialize dealer creation and send; ZMQ sockets are not thread-safe.
+
+        ``_dealers`` is reached from both the listener thread and the executor
+        thread (cancel paths), so an unguarded send can tear a multipart frame.
+        """
+        with self._dealers_lock:
+            if self._shutdown:
+                return
+            self._get_or_connect_dealer(endpoint).send(message)
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
@@ -1195,8 +1225,9 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                self._send_via_dealer(
+                    peer_ri.self_endpoint,
+                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")],
                 )
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
@@ -1226,12 +1257,13 @@ class Sender(SenderBase):
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        for dealer in self._dealers.values():
+        with self._dealers_lock:
+            dealers, self._dealers = list(self._dealers.values()), {}
+        for dealer in dealers:
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
-        self._dealers.clear()
 
     def __del__(self):
         try:
@@ -1387,11 +1419,12 @@ class TxSession(TxSessionBase):
         self._sender.send_cancel_to_receivers(self.disagg_request_id)
 
     def has_transferring_tasks(self) -> bool:
-        """True if any KV task is currently mid-write (TRANSFERRING).
+        """True while a queued or active write still reads this session's buffers.
 
-        cancel_request() must return False while this is True.
+        Per-task TaskStatus cannot express it: one peer failing marks the task
+        terminal while another peer still owns the registered source addresses.
         """
-        return any(t.status == TaskStatus.TRANSFERRING for t in self.kv_tasks)
+        return any(t is not None and t.pending_peers for t in (*self.kv_tasks, self.aux_task))
 
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
         """Poll or block until KV (and optionally aux) transfer finishes.
@@ -1553,6 +1586,12 @@ class KVRecvTask:
         self.status = TaskStatus.INIT
         self.expected_transfers = 0
         self.last_slice_count = 0
+        self.dispatched = False
+        # Peers that returned a terminal result, success or failure.  Counting
+        # responders rather than dispatches is what keeps ADP broadcast honest:
+        # the broadcast reaches every DP group, but only ``expected_transfers``
+        # of them own the request and reply.
+        self.responded_peer_ranks: set[int] = set()
 
         self._unique_rid = unique_rid
         self._kv_slice = kv_slice
@@ -1601,7 +1640,8 @@ class Receiver(ReceiverBase):
         self._registrar = peer_registrar
         self._agent = agent
         self._bounce = bounce
-        self._dealers = {}
+        self._dealers = {}  # guarded by _dealers_lock; see _send_via_dealer
+        self._dealers_lock = threading.Lock()
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
         # compatibility check. Requests targeting such a peer fail fast
@@ -1626,12 +1666,13 @@ class Receiver(ReceiverBase):
         if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
-        for dealer in self._dealers.values():
+        with self._dealers_lock:
+            dealers, self._dealers = list(self._dealers.values()), {}
+        for dealer in dealers:
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Receiver shutdown: {e}")
-        self._dealers.clear()
         self._messenger.stop()
 
     def clear_session(self, unique_rid: int):
@@ -1824,22 +1865,35 @@ class Receiver(ReceiverBase):
                 f"dispatch_task: RxSession {task._unique_rid} not found; "
                 "session may have been closed before dispatch"
             )
-        session.mark_transferring(task.slice_id)
-        # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
-        session._sender_endpoints.update(
-            peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks
-        )
         # Fan-in: each sender gets its own sub-region base (writers must not overwrite); else serialize once.
         fanin_bounce = bounced and task.expected_transfers > 1
         key = (receiver_req.unique_rid, receiver_req.slice_id)
         receiver_req_bytes = None if fanin_bounce else receiver_req.to_bytes()
         for i, rank in enumerate(peer_overlap.ranks):
+            endpoint = peer_infos.sender_endpoints[rank]
+            # A partial dispatch failure below leaves fewer responders than
+            # expected_transfers; the drain deadline is what resolves that.
+            if not session.mark_peer_dispatched(task.slice_id, rank, endpoint):
+                exc = RuntimeError(
+                    f"dispatch_task: RxSession {task._unique_rid} was cancelled "
+                    f"before dispatch to peer_rank={rank}"
+                )
+                task.fail(exc)
+                raise exc
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
             if fanin_bounce:
                 receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
                 receiver_req_bytes = receiver_req.to_bytes()
-            self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+            try:
+                self._request_sender_data(endpoint, receiver_req_bytes)
+            except Exception as exc:
+                task.fail(exc)
+                logger.error(
+                    f"Receiver.dispatch_task failed for rid={task._unique_rid}, "
+                    f"peer_rank={rank}: {exc}"
+                )
+                raise
         return
 
     @staticmethod
@@ -1854,6 +1908,17 @@ class Receiver(ReceiverBase):
     def _should_register_peer(self, params: DisaggregatedParams) -> bool:
         endpoint = self._extract_info_endpoint(params)
         return endpoint not in self._sender_ep_instance_map
+
+    def _send_via_dealer(self, endpoint: Optional[str], message: list[bytes]) -> None:
+        """Serialize dealer creation and send; ZMQ sockets are not thread-safe.
+
+        ``_dealers`` is reached from both the listener thread and the executor
+        thread (cancel paths), so an unguarded send can tear a multipart frame.
+        """
+        with self._dealers_lock:
+            if self._shutdown:
+                return
+            self._get_or_connect_dealer(endpoint).send(message)
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
@@ -1904,10 +1969,11 @@ class Receiver(ReceiverBase):
                 self._incompatible_peers[info_endpoint] = msg
                 raise PeerIncompatibleError(msg) from e
 
+            rank_info = self._registrar.self_rank_info
             for endpoint in sender_info.sender_endpoints:
-                dealer = self._get_or_connect_dealer(endpoint)
-                rank_info = self._registrar.self_rank_info
-                dealer.send([MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()])
+                self._send_via_dealer(
+                    endpoint, [MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()]
+                )
 
             self._sender_ep_instance_map[info_endpoint] = sender_info
             return sender_info
@@ -1919,8 +1985,8 @@ class Receiver(ReceiverBase):
         """Notify all senders involved in this session to cancel."""
         for endpoint in sender_endpoints:
             try:
-                self._get_or_connect_dealer(endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                self._send_via_dealer(
+                    endpoint, [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
                 )
             except Exception as e:
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
@@ -2011,8 +2077,7 @@ class Receiver(ReceiverBase):
     def _request_sender_data(self, endpoint: str, receiver_info_bytes: bytes):
         # receiver_info serialized once and reused for every peer rank (block-table msgpack isn't free at fan-out).
         logger.debug("Sending data request to endpoint '%s'", endpoint)
-        messenger = self._get_or_connect_dealer(endpoint)
-        messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes])
+        self._send_via_dealer(endpoint, [MessageType.REQUEST_DATA, receiver_info_bytes])
 
     def __del__(self):
         try:
@@ -2057,8 +2122,15 @@ class RxSession(RxSessionBase):
         self._kv_tasks: list[KVRecvTask] = []
         self._aux_count = 0
         self._aux_status: TaskStatus = TaskStatus.INIT
+        self._aux_responded_peer_ranks: set[int] = set()
         self._sender_endpoints: set[str] = set()
+        self._cancel_notified = False
         self.lock = threading.Lock()
+        # Monotonic timestamp of the last peer-lifetime event (dispatch or
+        # terminal result).  Drives the drain deadline in
+        # has_transferring_tasks(); None means nothing was ever dispatched.
+        self._last_peer_progress: Optional[float] = None
+        self._drain_timeout_logged = False
         self._receiver.setup_session(self)
 
     @property
@@ -2089,9 +2161,37 @@ class RxSession(RxSessionBase):
                 return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
 
-    def mark_transferring(self, slice_id: int):
+    def mark_peer_dispatched(self, slice_id: int, peer_rank: int, sender_endpoint: str) -> bool:
+        """Register a peer before contacting it; False if cancellation won the race."""
         with self.lock:
-            self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
+            if self._terminal_status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                return False
+            task = self._kv_tasks[slice_id]
+            task.dispatched = True
+            task.status = TaskStatus.TRANSFERRING
+            # Cache the endpoint so cancel() can send CANCEL_SESSION to it.
+            self._sender_endpoints.add(sender_endpoint)
+            self._last_peer_progress = time.monotonic()
+            return True
+
+    def _note_peer_progress_locked(self) -> None:
+        self._last_peer_progress = time.monotonic()
+        self._drain_timeout_logged = False
+
+    def _has_unresolved_peers_locked(self) -> bool:
+        for task in self._kv_tasks:
+            if not task.dispatched:
+                continue
+            # Two distinct windows: a peer that has not replied yet, and (bounce
+            # path only) replies all in but the scatter into the KV pages still
+            # queued -- complete() runs in the scatter's on_done, not here.
+            if len(task.responded_peer_ranks) < task.expected_transfers:
+                return True
+            if task.status == TaskStatus.TRANSFERRING:
+                return True
+            if self._need_aux and len(self._aux_responded_peer_ranks) < task.expected_transfers:
+                return True
+        return False
 
     def receive(self, slice: KVSlice) -> None:
         if self.transfer_start_time is None:
@@ -2127,6 +2227,16 @@ class RxSession(RxSessionBase):
                 f"Sender/receiver slice count mismatch."
             )
             task = self._kv_tasks[sender_slice_id]
+            if peer_rank in task.responded_peer_ranks:
+                logger.warning(
+                    f"RxSession {self.request_id} ignoring duplicate KV result for "
+                    f"slice={sender_slice_id}, peer_rank={peer_rank}"
+                )
+                return
+            # The result means the remote submit/wait released our destination.
+            # Resolve before processing so a raise cannot strand the peer.
+            task.responded_peer_ranks.add(peer_rank)
+            self._note_peer_progress_locked()
             if status == AgentResult.SUCCESS:
                 from .bounce import scatter_write_result
 
@@ -2216,10 +2326,18 @@ class RxSession(RxSessionBase):
                     f"Session {self.request_id} received unknown task status: {status.value}"
                 )
 
-    def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
+    def process_aux_agent_result(self, peer_rank: int, status: AgentResult):
         # Aux is session-level (not per-slice); expected_transfers is identical
         # across all kv_tasks, so any task provides the right count.
         with self.lock:
+            if peer_rank in self._aux_responded_peer_ranks:
+                logger.warning(
+                    f"RxSession {self.request_id} ignoring duplicate aux result "
+                    f"from peer_rank={peer_rank}"
+                )
+                return
+            self._aux_responded_peer_ranks.add(peer_rank)
+            self._note_peer_progress_locked()
             if not self._kv_tasks:
                 logger.warning(
                     f"Aux result received before any KV tasks for request {self.request_id}"
@@ -2291,8 +2409,9 @@ class RxSession(RxSessionBase):
         The lock serializes with process_kv_agent_result() / process_aux_agent_result().
         """
         with self.lock:
-            if self._terminal_status == SessionStatus.CANCELLED:
+            if self._cancel_notified:
                 return
+            self._cancel_notified = True
             self._terminal_status = SessionStatus.CANCELLED
             exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
             for task in self._kv_tasks:
@@ -2306,15 +2425,31 @@ class RxSession(RxSessionBase):
                     # A write may still be mid-flight, so quarantine the region rather than freeing
                     # it; this keeps a cancelled transfer from leaking. No-op when bounce is off.
                     self._receiver._bounce.orphan_reservation(rid_slice)
+            endpoints = set(self._sender_endpoints)
         # Send outside the lock to avoid holding it during I/O.
-        self._receiver.send_cancel_to_senders(self.disagg_request_id, self._sender_endpoints)
+        self._receiver.send_cancel_to_senders(self.disagg_request_id, endpoints)
 
     def has_transferring_tasks(self) -> bool:
-        """True if any KV task is currently mid-write (TRANSFERRING).
+        """True while a dispatched peer may still be writing into our buffers.
 
-        cancel_request() must return False while this is True.
+        Waits on responders bounded by expected_transfers, since under
+        attention-DP the broadcast reaches more peers than ever reply.
         """
-        return any(t.status == TaskStatus.TRANSFERRING for t in self._kv_tasks)
+        with self.lock:
+            if not self._has_unresolved_peers_locked():
+                return False
+            last = self._last_peer_progress
+            if last is not None and time.monotonic() - last > _PEER_DRAIN_TIMEOUT_S:
+                if not self._drain_timeout_logged:
+                    self._drain_timeout_logged = True
+                    logger.error(
+                        f"RxSession {self.disagg_request_id}: no peer progress for "
+                        f"{_PEER_DRAIN_TIMEOUT_S:g}s with peers still unresolved; "
+                        "releasing destination buffers. Set "
+                        "TRTLLM_KV_TRANSFER_PEER_DRAIN_TIMEOUT_S to tune."
+                    )
+                return False
+            return True
 
     def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]:
         """Poll or block until transfer completes.
