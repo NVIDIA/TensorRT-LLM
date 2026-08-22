@@ -5252,6 +5252,15 @@ class TorchLlmArgs(BaseLlmArgs):
         description="NVFP4 GEMM backend config.",
         status="beta")
 
+    enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin: bool = Field(
+        default=True,
+        description=(
+            "Allow the BF16 layer-boundary residual-add RMSNorm path to use "
+            "FlashInfer fused_add_rmsnorm when NVFP4 Marlin GEMM is selected. "
+            "Enabled by default; set false to retain the ATen fallback. This "
+            "does not change Marlin GEMM selection or NVFP4 quantization."),
+        status="beta")
+
     dwdp_config: Optional[DwdpConfig] = Field(
         default=None,
         description="DWDP (Distributed Weight Data Parallelism) config.",

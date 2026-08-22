@@ -142,6 +142,18 @@ def is_nvfp4_marlin_enabled() -> bool:
     return is_supported_sm and has_marlin_kernel and is_marlin_specified
 
 
+def allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin() -> bool:
+    """Whether the default-on Marlin FlashInfer performance path is enabled.
+
+    FlashInfer's fused BF16 add+RMSNorm is independent of the downstream
+    Marlin NVFP4 GEMM. Allow an explicit false setting to retain the ATen
+    fallback for A/B comparison or troubleshooting.
+    """
+    attrs = get_model_extra_attrs()
+    return bool(attrs is None or attrs.get(
+        'enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin', True))
+
+
 @contextlib.contextmanager
 def model_extra_attrs(attrs: Dict):
     old_attrs = getattr(_model_extra_attrs, 'attrs', None)

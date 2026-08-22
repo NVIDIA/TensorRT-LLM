@@ -1533,6 +1533,8 @@ class ModelLoader:
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
             allowed_backends,
+            enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin=self.llm_args.
+            enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin,
             use_cute_dsl_blockscaling_mm=self.llm_args.
             use_cute_dsl_blockscaling_mm,
             use_cute_dsl_blockscaling_bmm=self.llm_args.
@@ -1561,6 +1563,9 @@ class ModelLoader:
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
+        config.extra_attrs[
+            'enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin'] = (
+                config.enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

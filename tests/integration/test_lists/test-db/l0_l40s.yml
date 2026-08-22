@@ -34,6 +34,8 @@ l0_l40s:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-flashinfer]
   # PyTorch: force NVFP4 Marlin on Ada to cover the SM89-compiled Marlin kernels.
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=1]
+  # NVFP4 Marlin O1: FlashInfer BF16 add-RMSNorm matches the explicit ATen fallback.
+  - unittest/_torch/modules/test_rms_norm_marlin_flashinfer_gate.py
   # ------------- Encoder-decoder tests ---------------
   # Representative pre-merge set: eager smoke, CUDA-graph greedy/beam, kv-v2,
   # overlap scheduler, mBART, mixed batches.
