@@ -377,13 +377,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         except ImportError:
             return
-        # warm EVERY admissible row count (next_n multiples up to the
-        # engine's admission envelope): eager mixed prefill+decode batches
-        # arrive at arbitrary in-flight generation counts, and each unwarmed
-        # r_const band costs a multi-second first-touch JIT on the serving
-        # path. The envelope keeps this bounded (<= 32/next_n launches,
-        # ~4-13 distinct engine compiles); over-envelope rows dispatch
-        # in-tree and need no warmup (the helper drops them anyway).
         nn = int(next_n)
         # eager warm span: the launcher is keyed by exact row count, so warm
         # the small-row counts eager mixed batches commonly produce (the
@@ -429,7 +422,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "will JIT-compile lazily on first touch instead."
             )
 
-    def on_update_kv_lens(self):
+    def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -438,6 +431,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
+
+        super().on_update_kv_lens()
 
         # _preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
         # caches so they are recomputed (and captured) on every _forward_step". Invalidate the
