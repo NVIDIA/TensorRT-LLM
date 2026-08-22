@@ -1135,6 +1135,7 @@ class PyTorchModelEngine(ModelEngine):
                 max_lora_rank=lora_config.max_lora_rank,
                 model=self.model,
                 lora_model_config=self.lora_model_config,
+                overlap_lora_and_base=lora_config.overlap_lora_and_base,
                 device='cuda',
                 max_tokens_per_seq=max_tokens_per_seq)
 
