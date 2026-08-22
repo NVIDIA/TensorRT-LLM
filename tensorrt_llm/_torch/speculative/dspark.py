@@ -307,12 +307,32 @@ class DSparkWorker(SpecWorkerBase):
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
-        self._win_inited = True
         logger.info(
             f"DSpark: allocated rolling KV windows "
             f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
             f"({max_batch} request slots + 1 scratch row)"
         )
+
+        # Precompile one dynamic-batch CuteDSL attention kernel for all
+        # supported runtime batch/cache layouts. The helper owns the support
+        # policy and no-ops for unsupported configurations.
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if IS_CUTLASS_DSL_AVAILABLE:
+            from ..custom_ops.dspark_attention_custom_op import precompile_dspark_attention
+
+            precompile_dspark_attention(
+                block_size,
+                int(draft_model._attn_params["n_heads"]),
+                self._kv_windows[:, 0],
+                float(draft_model._attn_params["softmax_scale"]),
+                eps=float(draft_model._attn_params["eps"]),
+            )
+
+        # Publish the initialized state only after every required kernel has
+        # compiled successfully. A compile failure must not leave a worker
+        # that later reaches runtime with an incomplete precompiled table.
+        self._win_inited = True
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
         """Get (or refresh) the slot for a request; reset clears its window."""
