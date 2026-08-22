@@ -283,6 +283,49 @@ class TestOpenAIHttpClient:
         )
 
     @pytest.mark.asyncio
+    async def test_streaming_perf_metrics_preserve_sse_event_boundaries(
+        self, openai_client, streaming_completion_request, mock_session, mock_router
+    ):
+        openai_client._request_perf_metrics = True
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "text/event-stream"}
+
+        response_data = b'data: {"choices":[{"text":"Hello"}]}\n\n'
+        done_data = b"data: [DONE]\n\n"
+        metrics_data = (
+            f'event: {SSE_METRICS_EVENT}\ndata: {{"Server-Timing":"server_ttft;dur=1.0"}}\n\n'
+        ).encode()
+        marker_split = len("event: trtllm")
+
+        async def mock_iter_any():
+            yield response_data
+            yield done_data + metrics_data[:marker_split]
+            yield metrics_data[marker_split:]
+
+        mock_http_response.content = AsyncMock()
+        mock_http_response.content.iter_any = mock_iter_any
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+        hooks = MagicMock(spec=ResponseHooks)
+
+        response_generator = await openai_client.send_request(
+            streaming_completion_request, hooks=hooks
+        )
+        chunks = [chunk async for chunk in response_generator]
+
+        assert chunks == [response_data, done_data]
+        hooks.on_first_token.assert_called_once_with("localhost:8000", streaming_completion_request)
+        hooks.on_perf_metrics.assert_called_once()
+        hooks.on_resp_done.assert_called_once_with(
+            "localhost:8000", streaming_completion_request, None
+        )
+        mock_router.finish_request.assert_called_once_with(
+            streaming_completion_request, mock_session, success=True
+        )
+
+    @pytest.mark.asyncio
     async def test_malformed_streaming_metrics_do_not_fail_request(
         self, openai_client, streaming_completion_request, mock_session, mock_router
     ):
