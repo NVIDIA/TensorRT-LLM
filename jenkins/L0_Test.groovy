@@ -208,6 +208,14 @@ SLURM_NON_TERMINAL_STATES = [
     "REQUEUED", "RESIZING", "SUSPENDED", "SIGNALING", "STOPPED",
 ]
 
+// Controller-authoritative terminal states caused by allocation infrastructure.
+// Native sbatch test stages can retry these as a fresh job while excluding the
+// failed allocation. Application/resource failures (FAILED, OUT_OF_MEMORY) and
+// ambiguous cancellation remain non-retryable.
+SLURM_RETRYABLE_TERMINAL_STATES = [
+    "NODE_FAIL", "BOOT_FAIL", "PREEMPTED", "LAUNCH_FAILED",
+]
+
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
 // were originally inline here, but the Jenkins script-security sandbox
@@ -2076,6 +2084,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     #SBATCH --output=${slurmJobLogPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
                     #SBATCH ${partition.additionalArgs}
+                    #SBATCH --no-requeue
                     ${slurmExcludeDirective}
                     ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
@@ -2083,6 +2092,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # SBATCH directives must appear before any executable commands.
                     set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
+
+                    # These test batches are not checkpointable: a Slurm requeue
+                    # restarts this script from line one over partial test state.
+                    # Record the original allocation for the outer node-avoiding
+                    # retry, and fail closed if cluster policy overrides --no-requeue.
+                    echo "\${SLURM_JOB_NODELIST:-\${SLURM_NODELIST:-UNKNOWN}}" >> "${jobWorkspace}/slurm_node_list.txt"
+                    if [ "\${SLURM_RESTART_COUNT:-0}" -gt 0 ]; then
+                        echo "\${SLURM_RESTART_COUNT}" > "${jobWorkspace}/slurm_restart_count.txt"
+                        echo "[INFRA-RETRY] Refusing to resume non-checkpointable test batch after Slurm restart \${SLURM_RESTART_COUNT}."
+                        exit 75
+                    fi
 
                     echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
@@ -2471,6 +2491,24 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             "SLURM job ${slurmJobId} for ${stageName} ended in state TIMEOUT " +
                             "(hit partition walltime ${partition?.time}min); not retrying.",
                             null)
+                    }
+                    // A forced restart means the controller ignored --no-requeue.
+                    // The launch guard stopped before touching partial test state;
+                    // retry as a fresh job through the existing node-avoiding loop.
+                    def slurmRestartCount = readSlurmWorkspaceFile(
+                        pipeline, remote, "${jobWorkspace}/slurm_restart_count.txt", stageName)
+                    if (slurmRestartCount) {
+                        throw new InfraFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} was restarted in place " +
+                            "(SLURM_RESTART_COUNT=${slurmRestartCount}); these test batches are not checkpointable, " +
+                            "so retrying as a fresh job.",
+                            null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-batch-restarted>")
+                    }
+                    if (SLURM_RETRYABLE_TERMINAL_STATES.contains(slurmState)) {
+                        throw new InfraFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} ended in infrastructure state ${slurmState}; " +
+                            "retrying as a fresh job.",
+                            null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-terminal-infra-state>")
                     }
                     // Verdict unreadable but the job is still alive: a transport blip
                     // dropped the monitor while the job kept running, so this is infra,
