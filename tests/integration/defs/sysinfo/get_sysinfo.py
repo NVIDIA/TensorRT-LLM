@@ -108,6 +108,9 @@ def is_power():
     return platform.processor() == "ppc64le"
 
 
+# TODO(#17993): cherry-picked from PR #17993 to unblock this PR's CI (distro->'na'
+# empty-render bug). Drop this and take main's version when resolving the rebase
+# conflict after #17993 lands.
 def get_linux_distribution():
     try:
         import distro

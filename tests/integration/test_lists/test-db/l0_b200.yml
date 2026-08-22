@@ -97,6 +97,7 @@ l0_b200:
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
@@ -122,6 +123,7 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
@@ -263,6 +265,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
+  - unittest/_torch/visual_gen/test_cosmos3_transfer.py
+  - unittest/_torch/visual_gen/test_control_kernels.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_transformer.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_pipeline.py
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example

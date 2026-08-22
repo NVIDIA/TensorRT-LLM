@@ -707,9 +707,12 @@ def _k3_page_table() -> KVCachePageTable:
     )
 
 
-def _k3_rank_info():
-    # MambaPolicy only reads tp_size / tp_rank / attention.enable_attention_dp.
-    return SimpleNamespace(tp_size=1, tp_rank=0, attention=None)
+def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0):
+    # MambaPolicy reads tp_size / tp_rank / cp_size / cp_rank /
+    # attention.enable_attention_dp.
+    return SimpleNamespace(
+        tp_size=tp_size, tp_rank=tp_rank, cp_size=cp_size, cp_rank=cp_rank, attention=None
+    )
 
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
@@ -796,6 +799,81 @@ class TestHybridK3Bounce:
             )
             == 0
         )
+
+
+# --------------------------------------------------------------------------- #
+# MambaPolicy under decode-CP (helix): shard grid, pairing, receiver sizing
+# --------------------------------------------------------------------------- #
+class TestMambaHelixCP:
+    def test_mamba_tp_helix_grid_is_cp_minor(self):
+        # cp == 1 keeps the plain TP grid; cp > 1 flattens tp*cp CP-minor.
+        assert MambaPolicy._mamba_tp(_k3_rank_info()) == (1, 0)
+        assert MambaPolicy._mamba_tp(_k3_rank_info(cp_size=32, cp_rank=5)) == (32, 5)
+        assert MambaPolicy._mamba_tp(_k3_rank_info(tp_size=2, tp_rank=1, cp_size=4, cp_rank=3)) == (
+            8,
+            7,
+        )
+
+    def test_equal_width_unpaired_sender_sends_nothing(self):
+        # Regression lock for the fan-in collapse: with equal shard widths the
+        # mapper is a whole-slot copy, so an unpaired sender must return empty
+        # frags instead of overwriting the receiver slot with the wrong heads.
+        pt = _k3_page_table()
+        for sender_rank in range(2):
+            for gen_cp_rank in range(2):
+                frags = MambaPolicy.collect_frags(
+                    self_page_table=pt,
+                    peer_page_table=pt,
+                    src_slot=5,
+                    dst_slot=3,
+                    self_ri=_k3_rank_info(tp_size=2, tp_rank=sender_rank),
+                    peer_ri=_k3_rank_info(cp_size=2, cp_rank=gen_cp_rank),
+                )
+                if sender_rank == gen_cp_rank:
+                    assert sum(frags[2]) == _K3_KDA_PAYLOAD_BYTES
+                else:
+                    assert frags == ([], [], [])
+
+    def test_narrow_to_wide_pairing_follows_covering_tree(self):
+        # Sender grid 2, receiver grid 4: receiver g pairs with sender g // 2.
+        pt = _k3_page_table()
+        for sender_rank in range(2):
+            for gen_cp_rank in range(4):
+                frags = MambaPolicy.collect_frags(
+                    self_page_table=pt,
+                    peer_page_table=pt,
+                    src_slot=5,
+                    dst_slot=3,
+                    self_ri=_k3_rank_info(tp_size=2, tp_rank=sender_rank),
+                    peer_ri=_k3_rank_info(cp_size=4, cp_rank=gen_cp_rank),
+                )
+                if gen_cp_rank // 2 == sender_rank:
+                    assert frags[2], (sender_rank, gen_cp_rank)
+                else:
+                    assert frags == ([], [], [])
+
+    def test_receiver_payload_bytes_is_receiver_local(self):
+        # The reservation must equal the receiver's own slot bytes over the
+        # overlapping layers, with no dependency on sender rank identity.
+        pt = _k3_page_table()
+        assert MambaPolicy.receiver_payload_bytes(pt, pt, dst_slot=3) == _K3_KDA_PAYLOAD_BYTES
+        assert MambaPolicy.receiver_payload_bytes(pt, pt, dst_slot=None) == 0
+        pure_attn = KVCachePageTable(
+            tokens_per_block=32,
+            layer_groups=[pt.layer_groups[0]],
+            pool_groups=pt.pool_groups,
+        )
+        assert MambaPolicy.receiver_payload_bytes(pure_attn, pt, dst_slot=3) == 0
+        # ... and matches what the paired equal-width sender actually ships.
+        _, _, sizes = MambaPolicy.collect_frags(
+            self_page_table=pt,
+            peer_page_table=pt,
+            src_slot=5,
+            dst_slot=3,
+            self_ri=_k3_rank_info(tp_size=2, tp_rank=1),
+            peer_ri=_k3_rank_info(cp_size=2, cp_rank=1),
+        )
+        assert sum(sizes) == MambaPolicy.receiver_payload_bytes(pt, pt, dst_slot=3)
 
 
 # --------------------------------------------------------------------------- #

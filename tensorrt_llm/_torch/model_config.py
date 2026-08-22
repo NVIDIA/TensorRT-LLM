@@ -47,8 +47,8 @@ from tensorrt_llm.models.quant_config_utils import \
     update_quant_config_from_compressed_tensors
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
-    is_modelopt_quant_config, read_modelopt_quant_config,
-    warn_if_inline_diverges)
+    canonicalize_quant_algo, is_modelopt_quant_config,
+    read_modelopt_quant_config, warn_if_inline_diverges)
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -526,9 +526,12 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        quant_config.quant_algo = (QuantAlgo(json_quant_configs['quant_algo'])
-                                   if json_quant_configs.get('quant_algo')
-                                   is not None else None)
+        # ``canonicalize_quant_algo`` is applied again here (and per layer
+        # below) because the ``quant_cfg.json`` overlay merged in for
+        # MIXED_PRECISION bypasses ``read_modelopt_quant_config``.
+        quant_config.quant_algo = (
+            QuantAlgo(canonicalize_quant_algo(json_quant_configs['quant_algo']))
+            if json_quant_configs.get('quant_algo') is not None else None)
         quant_config.kv_cache_quant_algo = (
             QuantAlgo(json_quant_configs['kv_cache_quant_algo']) if
             json_quant_configs.get('kv_cache_quant_algo') is not None else None)
@@ -580,7 +583,8 @@ class ModelConfig(Generic[TConfig]):
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
-                config.quant_algo = QuantAlgo(layer_cfg['quant_algo'])
+                config.quant_algo = QuantAlgo(
+                    canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
                 # AWQ-specific extras emitted by modelopt per-layer.
                 if 'has_zero_point' in layer_cfg:
