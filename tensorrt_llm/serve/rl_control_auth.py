@@ -44,5 +44,9 @@ def validate_rl_control_request(
         raise ValueError("RL control endpoints are enabled but no rl_control_api_key is configured")
     expected = _sign_request(rl_control_api_key, body)
     provided = None if headers is None else headers.get(RL_CONTROL_AUTH_HEADER)
-    if provided is None or not hmac.compare_digest(provided, expected):
+    # Starlette decodes raw header bytes as Latin-1. compare_digest rejects
+    # non-ASCII str values with TypeError, so compare encoded bytes instead.
+    if provided is None or not hmac.compare_digest(
+        provided.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise ValueError("Invalid RL control request authentication")
