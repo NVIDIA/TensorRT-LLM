@@ -21,10 +21,18 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+    _KVCacheManagerInitStatus,
+    _sync_kv_cache_manager_init_status,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as kv2_bindings
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -107,8 +115,11 @@ def _make_manager_for_cache_tier_test(
     impl_side_effect: list[object],
     *,
     add_secondary_gpu_tier: bool = False,
+    mapping: Mapping | None = None,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
+    if mapping is None:
+        mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
 
     def build_base_config(
         self: KVCacheManagerV2,
@@ -160,12 +171,54 @@ def _make_manager_for_cache_tier_test(
             tokens_per_block=TOKENS_PER_BLOCK,
             max_seq_len=MAX_SEQ_LEN,
             max_batch_size=1,
-            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            mapping=mapping,
             dtype=DataType.HALF,
             vocab_size=16,
             execution_stream=Mock(),
         )
     return manager, impl_constructor
+
+
+def _host_fallback_consensus_worker() -> dict[str, int | bool]:
+    """Exercise the real world collective from an attention-DP worker."""
+    from tensorrt_llm._utils import mpi_rank, mpi_world_size
+
+    rank = mpi_rank()
+    world_size = mpi_world_size()
+    fallback_impl = Mock()
+    initial_impl = Mock() if rank == 0 else None
+    impl_side_effect = (
+        [initial_impl, fallback_impl]
+        if initial_impl is not None
+        else [_CacheTierInitError("rank-local host tier failure"), fallback_impl]
+    )
+
+    manager, impl_constructor = _make_manager_for_cache_tier_test(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=16 << 20,
+        ),
+        impl_side_effect,
+        mapping=Mapping(
+            world_size=world_size,
+            rank=rank,
+            tp_size=world_size,
+            enable_attention_dp=True,
+        ),
+    )
+
+    return {
+        "rank": rank,
+        "constructor_calls": impl_constructor.call_count,
+        "initial_shutdown_calls": (
+            initial_impl.shutdown.call_count if initial_impl is not None else 0
+        ),
+        "final_has_host": any(
+            isinstance(tier, HostCacheTierConfig)
+            for tier in manager.kv_cache_manager_py_config.cache_tiers
+        ),
+        "can_evict": manager.can_evict,
+    }
 
 
 @pytest.mark.parametrize(
@@ -309,6 +362,313 @@ def test_disk_init_failure_does_not_use_host_fallback(tmp_path) -> None:
             ),
             [_CacheTierInitError("disk tier init failed"), Mock()],
         )
+
+
+def test_kv_cache_manager_init_status_sync_uses_world_max() -> None:
+    mapping = SimpleNamespace(world_size=2)
+    dist = Mock()
+    dist.allreduce.return_value = int(_KVCacheManagerInitStatus.USE_NO_HOST)
+
+    with patch.object(Distributed, "get", return_value=dist):
+        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.KEEP_HOST, mapping)
+
+    assert status == _KVCacheManagerInitStatus.USE_NO_HOST
+    dist.allreduce.assert_called_once_with(
+        int(_KVCacheManagerInitStatus.KEEP_HOST), op=ReduceOp.MAX
+    )
+
+
+def test_kv_cache_manager_init_status_sync_is_noop_for_single_rank() -> None:
+    mapping = SimpleNamespace(world_size=1)
+
+    with patch.object(Distributed, "get") as get_dist:
+        status = _sync_kv_cache_manager_init_status(_KVCacheManagerInitStatus.KEEP_HOST, mapping)
+
+    assert status == _KVCacheManagerInitStatus.KEEP_HOST
+    get_dist.assert_not_called()
+
+
+@pytest.mark.parametrize("derived_name", ["HostOOMError", "DiskOOMError", "CuOOMError"])
+def test_cpp_oom_exception_hierarchy_matches_python_backend(derived_name: str) -> None:
+    assert issubclass(getattr(kv2_bindings, derived_name), kv2_bindings.OutOfMemoryError)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device (MPI) build required")
+def test_attention_dp_ranks_converge_on_hostless_fallback() -> None:
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    session = MpiPoolSession(n_workers=2)
+    try:
+        results = session.submit_sync(_host_fallback_consensus_worker)
+    finally:
+        session.shutdown()
+
+    results = sorted(results, key=lambda result: result["rank"])
+    assert [result["constructor_calls"] for result in results] == [2, 2]
+    assert [result["initial_shutdown_calls"] for result in results] == [1, 0]
+    assert not any(result["final_has_host"] for result in results)
+    assert not any(result["can_evict"] for result in results)
+
+
+def test_all_ranks_keep_successful_host_candidate() -> None:
+    initial_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with patch(
+        f"{module}._sync_kv_cache_manager_init_status",
+        return_value=_KVCacheManagerInitStatus.KEEP_HOST,
+    ) as sync_status:
+        manager, impl_constructor = _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [initial_impl],
+        )
+
+    sync_status.assert_called_once()
+    initial_impl.shutdown.assert_not_called()
+    assert manager.impl is initial_impl
+    assert impl_constructor.call_count == 1
+    assert any(
+        isinstance(tier, HostCacheTierConfig)
+        for tier in manager.kv_cache_manager_py_config.cache_tiers
+    )
+    assert manager.can_evict
+
+
+def test_peer_host_init_failure_rebuilds_successful_local_candidate() -> None:
+    initial_impl = Mock()
+    fallback_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with patch(
+        f"{module}._sync_kv_cache_manager_init_status",
+        side_effect=[
+            _KVCacheManagerInitStatus.USE_NO_HOST,
+            _KVCacheManagerInitStatus.USE_NO_HOST,
+        ],
+    ) as sync_status:
+        manager, impl_constructor = _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [initial_impl, fallback_impl],
+        )
+
+    assert sync_status.call_count == 2
+    initial_impl.shutdown.assert_called_once_with()
+    assert manager.impl is fallback_impl
+    assert impl_constructor.call_count == 2
+    initial_tiers = impl_constructor.call_args_list[0].args[0].cache_tiers
+    fallback_tiers = impl_constructor.call_args_list[1].args[0].cache_tiers
+    assert any(isinstance(tier, HostCacheTierConfig) for tier in initial_tiers)
+    assert all(not isinstance(tier, HostCacheTierConfig) for tier in fallback_tiers)
+    assert all(
+        not isinstance(tier, HostCacheTierConfig)
+        for tier in manager.kv_cache_manager_py_config.cache_tiers
+    )
+    assert not manager.can_evict
+    assert [call.args[0] for call in sync_status.call_args_list] == [
+        _KVCacheManagerInitStatus.KEEP_HOST,
+        _KVCacheManagerInitStatus.USE_NO_HOST,
+    ]
+
+
+def test_no_host_candidate_joins_peer_fallback_consensus_without_rebuild() -> None:
+    no_host_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with patch(
+        f"{module}._sync_kv_cache_manager_init_status",
+        side_effect=[
+            _KVCacheManagerInitStatus.USE_NO_HOST,
+            _KVCacheManagerInitStatus.USE_NO_HOST,
+        ],
+    ) as sync_status:
+        manager, impl_constructor = _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=0,
+            ),
+            [no_host_impl],
+        )
+
+    assert [call.args[0] for call in sync_status.call_args_list] == [
+        _KVCacheManagerInitStatus.USE_NO_HOST,
+        _KVCacheManagerInitStatus.USE_NO_HOST,
+    ]
+    assert impl_constructor.call_count == 1
+    no_host_impl.shutdown.assert_not_called()
+    assert manager.impl is no_host_impl
+
+
+def test_peer_fatal_init_failure_cleans_successful_local_candidate() -> None:
+    initial_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with (
+        patch(
+            f"{module}._sync_kv_cache_manager_init_status",
+            return_value=_KVCacheManagerInitStatus.ABORT,
+        ),
+        pytest.raises(RuntimeError, match="initialization failed on another rank"),
+    ):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [initial_impl],
+        )
+
+    initial_impl.shutdown.assert_called_once_with()
+
+
+def test_peer_fallback_failure_cleans_successful_local_fallback() -> None:
+    initial_impl = Mock()
+    fallback_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with (
+        patch(
+            f"{module}._sync_kv_cache_manager_init_status",
+            side_effect=[
+                _KVCacheManagerInitStatus.USE_NO_HOST,
+                _KVCacheManagerInitStatus.ABORT,
+            ],
+        ),
+        pytest.raises(RuntimeError, match="failed on another rank"),
+    ):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [initial_impl, fallback_impl],
+        )
+
+    initial_impl.shutdown.assert_called_once_with()
+    fallback_impl.shutdown.assert_called_once_with()
+
+
+def test_local_fallback_failure_is_shared_before_raising() -> None:
+    fallback_error = RuntimeError("fallback init failed")
+    unused_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with (
+        patch(
+            f"{module}._sync_kv_cache_manager_init_status",
+            side_effect=[
+                _KVCacheManagerInitStatus.USE_NO_HOST,
+                _KVCacheManagerInitStatus.ABORT,
+            ],
+        ) as sync_status,
+        pytest.raises(RuntimeError, match="fallback init failed"),
+    ):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [
+                _CacheTierInitError("host tier init failed"),
+                fallback_error,
+                unused_impl,
+            ],
+        )
+
+    assert sync_status.call_count == 2
+    assert [call.args[0] for call in sync_status.call_args_list] == [
+        _KVCacheManagerInitStatus.USE_NO_HOST,
+        _KVCacheManagerInitStatus.ABORT,
+    ]
+    unused_impl.shutdown.assert_not_called()
+
+
+def test_candidate_shutdown_failure_aborts_before_fallback_build() -> None:
+    initial_impl = Mock()
+    initial_impl.shutdown.side_effect = RuntimeError("candidate shutdown failed")
+    unused_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with (
+        patch(
+            f"{module}._sync_kv_cache_manager_init_status",
+            side_effect=[
+                _KVCacheManagerInitStatus.USE_NO_HOST,
+                _KVCacheManagerInitStatus.ABORT,
+            ],
+        ) as sync_status,
+        pytest.raises(RuntimeError, match="candidate shutdown failed"),
+    ):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [initial_impl, unused_impl],
+        )
+
+    assert sync_status.call_count == 2
+    assert [call.args[0] for call in sync_status.call_args_list] == [
+        _KVCacheManagerInitStatus.KEEP_HOST,
+        _KVCacheManagerInitStatus.ABORT,
+    ]
+    assert initial_impl.shutdown.call_count == 2
+    unused_impl.shutdown.assert_not_called()
+
+
+def test_consensus_failure_cleans_local_candidate() -> None:
+    initial_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with (
+        patch(
+            f"{module}._sync_kv_cache_manager_init_status",
+            side_effect=RuntimeError("consensus failed"),
+        ),
+        pytest.raises(RuntimeError, match="consensus failed"),
+    ):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [initial_impl],
+        )
+
+    initial_impl.shutdown.assert_called_once_with()
+
+
+def test_fallback_consensus_failure_cleans_local_fallback() -> None:
+    initial_impl = Mock()
+    fallback_impl = Mock()
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+
+    with (
+        patch(
+            f"{module}._sync_kv_cache_manager_init_status",
+            side_effect=[
+                _KVCacheManagerInitStatus.USE_NO_HOST,
+                RuntimeError("fallback consensus failed"),
+            ],
+        ),
+        pytest.raises(RuntimeError, match="fallback consensus failed"),
+    ):
+        _make_manager_for_cache_tier_test(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=16 << 20,
+            ),
+            [initial_impl, fallback_impl],
+        )
+
+    initial_impl.shutdown.assert_called_once_with()
+    fallback_impl.shutdown.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
