@@ -274,9 +274,7 @@ class TestDecodeVideoReferenceWindow:
         assert _frame_indices(window) == [0, 3, 6]
 
     def test_frame_step_one_matches_the_default(self):
-        span = dict(
-            first_frame=0, last_frame=4, target_h=64, target_w=64, device=self._DEVICE
-        )
+        span = dict(first_frame=0, last_frame=4, target_h=64, target_w=64, device=self._DEVICE)
         assert torch.equal(
             decode_video_reference_window(_MP4.read_bytes(), **span),
             decode_video_reference_window(_MP4.read_bytes(), frame_step=1, **span),
