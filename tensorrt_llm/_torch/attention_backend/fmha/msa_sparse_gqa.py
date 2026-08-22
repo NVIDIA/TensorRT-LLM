@@ -159,7 +159,6 @@ def run_msa_paged_gqa(
     because MiniMaxM3MsaSparseAttention.forward_prepopulated_kv also calls this
     helper directly, bypassing TrtllmAttention.forward.
     """
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import use_msa_sparse_decode
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_decode_span_bounds,
         msa_paged_kv,
@@ -273,17 +272,35 @@ def run_msa_paged_gqa(
     # MSA route. Mixed batches retain the Triton generation suffix because
     # their MSA plan covers only the context prefix.
     decode_backend = getattr(getattr(attn, "sparse_params", None), "decode_backend", "default")
-    use_msa_decode = (
-        kv_block_indexes is not None
-        and ported
-        and gen_tok0 == 0
-        and use_msa_sparse_decode(decode_backend, gen_row1 - gen_row0)
-    )
+    pure_sparse_decode = kv_block_indexes is not None and ported and gen_tok0 == 0
+    if decode_backend not in ("default", "msa", "adaptive"):
+        raise ValueError(f"Unsupported MiniMax-M3 decode backend: {decode_backend!r}.")
+    use_msa_decode = pure_sparse_decode and decode_backend == "msa"
     if use_msa_decode and plan is None:
         raise RuntimeError(
             "MiniMax-M3 selected the MSA sparse decode backend but no preplanned "
             "GQA plan is available; metadata preparation and dispatch disagree."
         )
+
+    if pure_sparse_decode and decode_backend == "adaptive":
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.sparse_decode_autotuner import (
+            run_adaptive_sparse_decode,
+        )
+
+        run_adaptive_sparse_decode(
+            q_view,
+            k_paged,
+            v_paged,
+            kv_block_indexes,
+            metadata.msa_block_table[gen_row0:gen_row1],
+            metadata.msa_seq_lens_cuda[gen_row0:gen_row1],
+            out_view,
+            sm_scale=sm_scale,
+            decode_query_len=decode_query_len,
+            plan=plan,
+            is_cuda_graph_metadata=metadata.is_cuda_graph,
+        )
+        return
 
     if kv_block_indexes is not None and ported and not use_msa_decode:
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (

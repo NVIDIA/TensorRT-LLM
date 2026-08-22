@@ -39,7 +39,7 @@ from .common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
     build_paged_kv_slot_mapping,
-    use_msa_sparse_decode,
+    needs_msa_sparse_decode_plan,
     write_kv_slots,
 )
 from .msa_indexer import MsaIndexer, cutedsl_score_runner
@@ -225,6 +225,13 @@ class _MsaGraphSafePlan:
     def __init__(self, metadata, name: str, *, max_batch: int, num_ctas: int, capture_graph: bool):
         buffers = metadata.cuda_graph_buffers
         self._buf = {}
+        # CUDA-graph metadata instances share one global Buffers pool. Most
+        # metadata tensors can safely share a named backing block because they
+        # are refreshed before every replay. A cached plan deliberately skips
+        # that refresh, so each owner needs private backing storage; otherwise
+        # capturing another batch bucket overwrites this owner's worklist while
+        # its local signature still reports a cache hit.
+        buffer_namespace = f"{name}_{id(self):x}"
         # Set by refresh(), read through the plan property.
         self._plan: Optional[tuple] = None
         # A graph metadata instance belongs to one batch/DQL capture key. The
@@ -250,7 +257,7 @@ class _MsaGraphSafePlan:
             self._buf[key] = metadata.get_empty(
                 buffers,
                 shape,
-                cache_name=f"{name}_{key}",
+                cache_name=f"{buffer_namespace}_{key}",
                 dtype=dtype,
                 capture_graph=capture_graph,
             )
@@ -430,6 +437,38 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        # create_cuda_graph_metadata() shallow-copies the eager metadata before
+        # calling this hook. Per-instance cached plans and live step state must
+        # never survive that copy: a graph key owns its plan cache and captured
+        # resolution independently.
+        self.msa_out_cache_loc = None
+        self.msa_kv_indices = None
+        self.msa_max_score = None
+        self.msa_n_valid_blocks = None
+        self.msa_block_table = None
+        self.msa_seq_lens_cuda = None
+        self.msa_subpage_block_table = None
+        self.msa_kv_lens_staged = None
+        self.msa_req_to_token = None
+        self.msa_q_batch_row = None
+        self.msa_q_intra = None
+        self.msa_qo_lens_dev = None
+        self._msa_subpages_per_slot = 0
+        self._msa_prewritten_layer = None
+        self._msa_buffers_ready = False
+        self._msa_fields_ready = False
+        self._msa_proxy_plan = None
+        self._msa_gqa_plan = None
+        self._msa_dense_plan = None
+        self._msa_eager_proxy_plan = None
+        self._msa_eager_gqa_plan = None
+        self._msa_eager_dense_plan = None
+        self._msa_eager_n_valid_buf = None
+        self._msa_eager_n_valid_blocks = None
+        self._msa_decode_span = None
+        self._msa_max_kv_len = 0
+        self._msa_worst_case_max_k_tiles = 0
+        self._msa_captured_resolution = None
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         # See on_update_kv_lens.
@@ -1024,7 +1063,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             span is not None
             and not span.is_mixed
             and self._msa_params is not None
-            and use_msa_sparse_decode(self._msa_params.decode_backend, span.batch)
+            and needs_msa_sparse_decode_plan(self._msa_params.decode_backend)
         )
 
     def _msa_fmha_plan_rows(self) -> Optional[Tuple[int, int]]:
@@ -1314,35 +1353,19 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 output_maxscore=True,
             )
         )
-        # Sparse-layer plan: kv_block_num=topk limits attention to top-k blocks.
-        # For a pure-decode graph, the vendor planner schedules against
-        # topk * page_size and produces a KV-length-invariant 1 MiB worklist.
-        # The persistent 2-D page table makes its page bases invariant too;
-        # on_update_kv_lens patches the two live mask fields on device. Thus a
-        # matching bucket can reactivate the plan without any steady-state host
-        # reconstruction or copy.
-        page_table_stride = int(self.msa_block_table.shape[1])
-        gqa_cache_signature = (
-            tuple(int(value) for value in qo_lens_cpu.tolist()),
-            int(num_q_heads),
-            int(num_kv_heads),
-            int(topk),
-            int(page_size),
-            bool(use_fp8),
-            page_table_stride,
-        )
-        gqa_reused = False
-        gqa_plan = None
-        if is_decode and self._msa_gqa_plan is not None:
-            gqa_plan = self._msa_gqa_plan.reuse_sparse_decode(gqa_cache_signature)
-            gqa_reused = gqa_plan is not None
-        if gqa_plan is None:
-            gqa_plan = plan_for(
+        # Eager sparse GQA needs an ordinary per-step plan. Pure decode builds
+        # its graph-stable plan below, but only when the configured policy may
+        # actually select MSA.
+        gqa_plan = (
+            None
+            if is_decode
+            else plan_for(
                 num_qo_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
                 kv_block_num=topk,
                 use_fp8_kvcache=use_fp8,
             )
+        )
         # Dense-layer plan: no kv_block_num, so it attends the full page table.
         dense_plan = (
             None
@@ -1391,61 +1414,54 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             ),
         )
 
-        # Allocate the graph-safe plan owners once per metadata; later steps
-        # only refresh their contents below. The plan worklists are sized per
-        # expanded row (the planner splits qo_len > 1 requests into per-token
-        # rows under speculative multi-token verify), so use the worst-case
-        # decode-step token count rather than the batch size.
-        if self._msa_proxy_plan is None:
-            max_plan_rows = max(max_batch, self._msa_max_decode_tokens())
-            num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
-            self._msa_proxy_plan = _MsaGraphSafePlan(
-                self,
-                "msa_proxy_plan",
-                max_batch=max_plan_rows,
-                num_ctas=num_ctas,
-                capture_graph=capture_graph,
+        if plan_rows is not None:
+            # The decode planner schedules against topk * page_size and
+            # produces a KV-length-invariant worklist. The persistent 2-D page
+            # table makes its page bases invariant too, so a matching graph
+            # bucket can reactivate the plan without steady-state host work.
+            page_table_stride = int(self.msa_block_table.shape[1])
+            gqa_cache_signature = (
+                tuple(int(value) for value in qo_lens_cpu.tolist()),
+                int(num_q_heads),
+                int(num_kv_heads),
+                int(topk),
+                int(page_size),
+                bool(use_fp8),
+                page_table_stride,
             )
-            self._msa_gqa_plan = _MsaGraphSafePlan(
-                self,
-                "msa_gqa_plan",
-                max_batch=max_plan_rows,
-                num_ctas=num_ctas,
-                capture_graph=capture_graph,
-            )
-            self._msa_dense_plan = _MsaGraphSafePlan(
-                self,
-                "msa_dense_plan",
-                max_batch=max_plan_rows,
-                num_ctas=num_ctas,
-                capture_graph=capture_graph,
-            )
+            gqa_reused = False
+            if self._msa_gqa_plan is not None:
+                gqa_plan = self._msa_gqa_plan.reuse_sparse_decode(gqa_cache_signature)
+                gqa_reused = gqa_plan is not None
+            if gqa_plan is None:
+                gqa_plan = plan_for(
+                    num_qo_heads=num_q_heads,
+                    num_kv_heads=num_kv_heads,
+                    kv_block_num=topk,
+                    use_fp8_kvcache=use_fp8,
+                )
 
-        # refresh() stores each plan tuple on its owner, surfaced by the
-        # msa_decode_*_plan properties. A skipped plan leaves its owner reset,
-        # so both that property and _msa_live_plans keep reporting None and the
-        # graph-safe mirror copies never run.
-        fixed_page_indptr = (
-            None
-            if gqa_plan is None or gqa_reused
-            else _msa_fixed_stride_page_indptr(qo_lens_cpu, page_table_stride)
-        )
-        for owner, plan, cache_signature, reused, stable_overrides in (
-            (self._msa_proxy_plan, proxy_plan, None, False, None),
-            (
-                self._msa_gqa_plan,
-                gqa_plan,
-                gqa_cache_signature if is_decode else None,
-                gqa_reused,
-                {"kv_page_indptr": fixed_page_indptr} if is_decode else None,
-            ),
-            (self._msa_dense_plan, dense_plan, None, False, None),
-        ):
-            if plan is not None and not reused:
-                owner.refresh(
-                    plan,
-                    cache_signature=cache_signature,
-                    stable_overrides=stable_overrides,
+            # Pure decode keeps proxy and dense on ported kernels, so allocate
+            # only the sparse-GQA owner, and only for a policy that may use it.
+            if self._msa_gqa_plan is None:
+                max_plan_rows = max(max_batch, self._msa_max_decode_tokens())
+                num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+                self._msa_gqa_plan = _MsaGraphSafePlan(
+                    self,
+                    "msa_gqa_plan",
+                    max_batch=max_plan_rows,
+                    num_ctas=num_ctas,
+                    capture_graph=capture_graph,
+                )
+            if not gqa_reused:
+                self._msa_gqa_plan.refresh(
+                    gqa_plan,
+                    cache_signature=gqa_cache_signature,
+                    stable_overrides={
+                        "kv_page_indptr": _msa_fixed_stride_page_indptr(
+                            qo_lens_cpu, page_table_stride
+                        )
+                    },
                 )
 
         n_valid = per_token_valid_blocks(

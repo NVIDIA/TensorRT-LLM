@@ -27,28 +27,21 @@ if TYPE_CHECKING:
 _INIT_SCORE = 1e30
 _LOCAL_SCORE = 1e29
 
-# Matched MiniMax-M3 GEN-only sweeps on GB300 found Triton faster below this
-# rank-local decode batch size and MSA faster from this point onward.
-MSA_SPARSE_DECODE_MIN_MBS = 8
 MiniMaxM3DecodeBackend = Literal["default", "msa", "adaptive"]
 
 
-def use_msa_sparse_decode(
-    decode_backend: MiniMaxM3DecodeBackend, rank_local_batch_size: int
-) -> bool:
-    """Whether pure sparse decode should use the preplanned MSA kernel.
+def needs_msa_sparse_decode_plan(decode_backend: MiniMaxM3DecodeBackend) -> bool:
+    """Whether pure sparse decode may need a preplanned MSA kernel.
 
     ``default`` retains the production Triton decode path, ``msa`` forces MSA,
-    and ``adaptive`` selects MSA at the measured rank-local batch-size
-    crossover. Mixed batches are excluded by callers because their MSA plan
-    covers only the context prefix.
+    and ``adaptive`` profiles both tactics for each exact CUDA-graph shape.
+    Metadata must prepare the plan for both latter policies before forward so
+    graph capture can safely fix either tactic.
     """
     if decode_backend == "default":
         return False
-    if decode_backend == "msa":
+    if decode_backend in ("msa", "adaptive"):
         return True
-    if decode_backend == "adaptive":
-        return rank_local_batch_size >= MSA_SPARSE_DECODE_MIN_MBS
     raise ValueError(f"Unsupported MiniMax-M3 decode backend: {decode_backend!r}.")
 
 
