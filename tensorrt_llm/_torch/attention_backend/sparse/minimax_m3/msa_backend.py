@@ -845,6 +845,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])
+        head_major_output = (
+            int(metadata.num_contexts or 0) > 0 and int(metadata.num_generations or 0) == 0
+        )
         idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
         idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
 
@@ -882,6 +885,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             proxy_plan=proxy_plan,
             max_score=max_score,
             n_valid_blocks=n_valid_blocks,
+            head_major_output=head_major_output,
         )
 
     def sparse_attn_predict(

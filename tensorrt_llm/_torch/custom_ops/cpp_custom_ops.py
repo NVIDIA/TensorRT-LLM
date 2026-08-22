@@ -344,6 +344,22 @@ def _register_fake():
         # In-place operation, no return value (void function)
         pass
 
+    @torch.library.register_fake("trtllm::minimax_m3_select_blocks")
+    def _(
+        scores,
+        n_valid_blocks,
+        topk,
+        init_blocks,
+        local_blocks,
+        head_major_output=False,
+    ):
+        del n_valid_blocks, init_blocks, local_blocks
+        if head_major_output:
+            return scores.new_empty((scores.shape[0], scores.shape[2], topk),
+                                    dtype=torch.int32).permute(1, 0, 2)
+        return scores.new_empty((scores.shape[2], scores.shape[0], topk),
+                                dtype=torch.int32)
+
     @torch.library.register_fake("trtllm::kda_decode")
     def _(x_q: torch.Tensor,
           x_k: torch.Tensor,
