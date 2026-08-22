@@ -157,6 +157,23 @@ class TestAttentionConfigQuantValidation:
                 quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
             )
 
+    def test_supported_quant_config_cudnn_fp8(self):
+        attention = AttentionConfig(
+            backend="CUDNN",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8"),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    def test_supported_quant_config_cudnn_mxfp8(self):
+        attention = AttentionConfig(
+            backend="CUDNN",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="mxfp8"),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.v_dtype == "mxfp8"
+
     def test_sage_qk_block_size_rejected_on_cute(self):
         with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
             AttentionConfig(

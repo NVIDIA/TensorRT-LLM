@@ -18,6 +18,9 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # ============================================================================
 # Flash Attention 4 availability
 # ============================================================================
+from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import (
+    _cudnn_import_error as _cudnn_backend_import_error,
+)
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
@@ -43,6 +46,7 @@ from tensorrt_llm.visual_gen.args import (
 
 _flash_attn4_available = _fa4_fwd is not None
 _cute_dsl_available = _cute_dsl_import_error is None
+_cudnn_available = _cudnn_backend_import_error is None
 
 # ============================================================================
 # Original naive implementations for comparison
@@ -171,11 +175,13 @@ def _require_attention_backend(attn_backend: str) -> None:
         pytest.fail("FlashAttention 4 backend is required for FA4 attention test")
     if attn_backend == "CUTEDSL" and not _cute_dsl_available:
         pytest.fail("CuTe DSL backend is required for CUTEDSL attention test")
-    if attn_backend == "CUTEDSL":
+    if attn_backend == "CUDNN" and not _cudnn_available:
+        pytest.fail("cuDNN Python frontend is required for CUDNN attention test")
+    if attn_backend in ("CUTEDSL", "CUDNN"):
         compute_capability = torch.cuda.get_device_capability()
         gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
         if gpu_arch not in ("sm_100a", "sm_103a"):
-            pytest.skip("CUTEDSL attention test requires a supported Blackwell-class GPU")
+            pytest.skip(f"{attn_backend} attention test requires a supported Blackwell-class GPU")
 
 
 def _make_cross_attention_with_mapping(
@@ -349,6 +355,9 @@ class TestSageAttentionBackendRouting:
         ("FA4", None),
         ("CUTEDSL", None),
         ("CUTEDSL", QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8")),
+        ("CUDNN", None),
+        ("CUDNN", QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8")),
+        ("CUDNN", QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="mxfp8")),
     ],
 )
 def test_self_attention_equivalence(
@@ -409,7 +418,14 @@ def test_self_attention_equivalence(
     # Compare (using looser tolerance for bf16)
     max_diff = (out_naive - out_integrated).abs().max().item()
     mean_diff = (out_naive - out_integrated).abs().mean().item()
-    tol = 1e-2 if quant_attention_config is None else 2e-2
+    if quant_attention_config is None:
+        tol = 1e-2
+    elif quant_attention_config.qk_dtype == "bf16":
+        # V-only quantization (QK16PV8): Bmm1 still runs in BF16.
+        tol = 2e-2
+    else:
+        # Q/K quantized as well (CUDNN FP8 / MXFP8): both GEMMs carry FP8 noise.
+        tol = 4e-2
     is_close = torch.allclose(out_naive, out_integrated, rtol=tol, atol=tol)
 
     print("\nResults:")
@@ -637,6 +653,8 @@ def test_cross_attention_equivalence(
         ("FA4", None),
         ("CUTEDSL", None),
         ("CUTEDSL", QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8")),
+        ("CUDNN", None),
+        ("CUDNN", QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="mxfp8")),
     ],
 )
 def test_fast_cross_attention_wan_shapes(
