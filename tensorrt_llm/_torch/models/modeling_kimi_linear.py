@@ -2991,6 +2991,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         num_params = self._load_trunk_params(weights, params, name_map)
         self._load_expert_slices(weights, expert_jobs)
         self._finalize_weight_load(num_params, len(expert_jobs))
+        device = next(self.parameters()).device
+        if device.type == "cuda":
+            # Lazy source mappings are load-scoped; finish nonblocking H2D
+            # work before the caller can release the weights container.
+            torch.cuda.synchronize(device)
 
     def _validate_checkpoint_keys(
         self, weights: Dict[str, torch.Tensor], expected_keys: Set[str], prefix: str

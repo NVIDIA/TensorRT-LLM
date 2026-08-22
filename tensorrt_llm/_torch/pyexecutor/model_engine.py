@@ -3755,6 +3755,16 @@ class PyTorchModelEngine(ModelEngine):
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
+    def _should_use_full_generation_page_table(
+            self, spec_config: Optional[DecodingBaseConfig],
+            attn_metadata: AttentionMetadata) -> bool:
+        """Return whether overlap decode needs every reserved generation page."""
+        # FlashInfer metadata owns the optional device-side KV-length correction used with this
+        # wider page table.
+        return (self.enable_spec_decode and not self._disable_overlap_scheduler
+                and getattr(spec_config, '_use_shared_kv_cache', False)
+                and hasattr(attn_metadata, 'apply_spec_decode_kv_lens_offsets'))
+
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
@@ -3806,6 +3816,17 @@ class PyTorchModelEngine(ModelEngine):
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
                     inputs['attn_metadata'].on_update_kv_lens()
+                # TRTLLM uses `kv_lens_cuda` above; FlashInfer exposes this backend-specific
+                # correction without coupling the engine to its metadata type.
+                elif hasattr(inputs['attn_metadata'],
+                             'apply_spec_decode_kv_lens_offsets'):
+                    inputs['attn_metadata'].apply_spec_decode_kv_lens_offsets(
+                        self.previous_kv_lens_offsets_cuda,
+                        num_gen_requests,
+                        self.get_runtime_tokens_per_gen_step(
+                            self.runtime_draft_len),
+                        num_chunked_contexts=num_chunked_ctx_requests,
+                    )
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -3853,6 +3874,18 @@ class PyTorchModelEngine(ModelEngine):
                                 self.
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
+                # Restore the FlashInfer-specific logical KV lengths through the same optional hook
+                # used by `_preprocess_inputs`.
+                elif hasattr(inputs['attn_metadata'],
+                             'apply_spec_decode_kv_lens_offsets'):
+                    inputs['attn_metadata'].apply_spec_decode_kv_lens_offsets(
+                        self.previous_kv_lens_offsets_cuda,
+                        num_gen_requests,
+                        self.get_runtime_tokens_per_gen_step(
+                            self.runtime_draft_len),
+                        num_chunked_contexts=num_chunked_ctx_requests,
+                        restore=True,
+                    )
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
@@ -4556,7 +4589,10 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            use_full_generation_page_table=(
+                self._should_use_full_generation_page_table(
+                    spec_config, attn_metadata)))
         attn_metadata.kv_cache_manager = kv_cache_manager
         attn_metadata.prepare()
 
@@ -6217,7 +6253,10 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            use_full_generation_page_table=(
+                self._should_use_full_generation_page_table(
+                    spec_config, attn_metadata)))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
