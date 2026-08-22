@@ -2741,15 +2741,15 @@ def record_event(event_idx: int) -> None:
 
 @torch.library.custom_op("trtllm::capture_eagle_hidden_states",
                          mutates_args=("hidden_states_buffer", ))
-def capture_eagle_hidden_states(
-        hidden_states_buffer: torch.Tensor, hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor], dim1_start: int, dim1_end: int,
-        publish_completion: bool) -> None:
+def capture_eagle_hidden_states(hidden_states_buffer: torch.Tensor,
+                                hidden_states: torch.Tensor,
+                                residual: Optional[torch.Tensor],
+                                dim1_start: int, dim1_end: int,
+                                publish_completion: bool) -> None:
     """Write one Eagle capture layer and publish final capture completion."""
     if residual is None:
-        torch.ops.trtllm.inplace_slice_copy(hidden_states_buffer,
-                                            hidden_states, dim1_start,
-                                            dim1_end)
+        torch.ops.trtllm.inplace_slice_copy(hidden_states_buffer, hidden_states,
+                                            dim1_start, dim1_end)
     else:
         destination = hidden_states_buffer[:hidden_states.shape[0],
                                            dim1_start:dim1_end]
@@ -2760,10 +2760,11 @@ def capture_eagle_hidden_states(
 
 
 @torch.library.register_fake("trtllm::capture_eagle_hidden_states")
-def _capture_eagle_hidden_states_fake(
-        hidden_states_buffer: torch.Tensor, hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor], dim1_start: int, dim1_end: int,
-        publish_completion: bool) -> None:
+def _capture_eagle_hidden_states_fake(hidden_states_buffer: torch.Tensor,
+                                      hidden_states: torch.Tensor,
+                                      residual: Optional[torch.Tensor],
+                                      dim1_start: int, dim1_end: int,
+                                      publish_completion: bool) -> None:
     pass
 
 
