@@ -85,26 +85,29 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
         # check default yaml sources from highest to lowest priority
         # NOTE: later in model validation, we throw an error if something was incorrectly configured
         settings_cls: DynamicYamlMixInForSettings = self.settings_cls
-        default_file: Optional[str] = None
+        default_files: PathType | None = None
         if "mode" in self.current_state:
             # later in field validation, it should throw an error if mode was invalid string...
             # but we don't want to fail here, hence we use .get()
-            default_file = settings_cls._get_yaml_default_from_mode(self.current_state["mode"])
-        if not default_file and "yaml_default" in self.current_state:
-            default_file = self.current_state["yaml_default"]
-        if not default_file:
+            default_files = settings_cls._get_yaml_default_from_mode(self.current_state["mode"])
+        if not default_files and "yaml_default" in self.current_state:
+            default_files = self.current_state["yaml_default"]
+        if not default_files:
             # Only attempt to use default mode if the class defines a mode field
             if "mode" in settings_cls.model_fields:
                 default_mode = settings_cls.model_fields["mode"].get_default()
                 if default_mode:
-                    default_file = settings_cls._get_yaml_default_from_mode(default_mode)
-        if not default_file:
-            default_file = settings_cls.model_fields["yaml_default"].get_default()
+                    default_files = settings_cls._get_yaml_default_from_mode(default_mode)
+        if not default_files:
+            default_files = settings_cls.model_fields["yaml_default"].get_default()
 
         # construct config files list
         config_files = []
-        if default_file:
-            config_files.append(default_file)  # default file has lowest priority
+        if default_files:
+            if isinstance(default_files, (str, os.PathLike)):
+                config_files.append(default_files)
+            else:
+                config_files.extend(default_files)
         config_files.extend(self.current_state.get("yaml_extra", []))
 
         merged_data = self._read_files(config_files)
@@ -160,8 +163,8 @@ class DynamicYamlMixInForSettings:
 
     # should be overwritten by the child class!
     @classmethod
-    def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
-        """Get the default yaml file from the mode or return None if no default yaml is found."""
+    def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> PathType | None:
+        """Get the default YAML file(s) for a mode, or None if no default is found."""
         return None
 
     yaml_default: str = Field(

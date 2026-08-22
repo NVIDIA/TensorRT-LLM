@@ -184,9 +184,28 @@ transforms:
   fuse_fp8_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
+  fuse_nanojet_fused_qkv_gemm_norm_rope:
+    stage: post_load_fusion
+    enabled: false
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+    requires_shape_prop: true
+  fuse_nanojet_rmsnorm_fp8:
+    stage: post_load_fusion
+    enabled: false
+    requires_shape_prop: true
+  fuse_nanojet_swiglu_gemm_fp8:
+    stage: post_load_fusion
+    enabled: false
+    requires_shape_prop: true
+  fuse_nanojet_attn_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
+    requires_shape_prop: true
+  fuse_nanojet_gemm_fp8_add:
+    stage: post_load_fusion
+    enabled: false
     requires_shape_prop: true
   fuse_trtllm_attn_quant_fp8:
     stage: post_load_fusion

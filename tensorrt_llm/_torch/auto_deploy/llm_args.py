@@ -272,11 +272,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    mode: Literal["graph", "transformers"] = Field(
+    mode: Literal["graph", "transformers", "nanojet"] = Field(
         default="graph",
-        description="The mode to use for the inference optimizer. Currently, we "
-        "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
-        "or transformers-only cached attention optimization.",
+        description="The inference optimizer mode: 'graph' for full-graph optimization, "
+        "'transformers' for cached-attention-only optimization, or 'nanojet' for full-graph "
+        "prefill-only optimization with NanoJet attention and fused kernels.",
     )
 
     transforms: Dict[str, Dict[str, Any]] = Field(
@@ -421,6 +421,32 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 f"{self.max_num_tokens}."
             )
             self.max_batch_size = self.max_num_tokens
+        return self
+
+    @model_validator(mode="after")
+    def reject_unsupported_nanojet_attention(self):
+        """Refuse configurations the nanojet attention backend cannot serve, at config time.
+
+        It keeps no KV cache, so anything that needs history is out of reach. Catch these
+        cases before loading weights and building the graph.
+        """
+        if self.attn_backend != "nanojet":
+            return self
+
+        unsupported = []
+        if self.enable_chunked_prefill:
+            unsupported.append(
+                "chunked prefill (a continuation chunk's earlier keys live in a cache)"
+            )
+        if self.speculative_config is not None:
+            unsupported.append("speculative decoding (needs cached history)")
+        if unsupported:
+            raise ValueError(
+                "attn_backend='nanojet' does not support: "
+                + "; ".join(unsupported)
+                + ". Use attn_backend='trtllm' or "
+                "'flashinfer', or disable the feature."
+            )
         return self
 
     @model_validator(mode="after")
@@ -572,10 +598,14 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     ### PRIVATE METHODS ############################################################################
     @classmethod
-    def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
+    def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[Union[str, list[str]]]:
         config_path = files(_ad_config_pkg)
         mapping = {
             "graph": str(config_path / "default.yaml"),
             "transformers": str(config_path / "transformers.yaml"),
+            "nanojet": [
+                str(config_path / "default.yaml"),
+                str(config_path / "nanojet.yaml"),
+            ],
         }
         return mapping.get(mode)

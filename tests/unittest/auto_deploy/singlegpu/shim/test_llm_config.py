@@ -107,6 +107,27 @@ def test_yaml_compile_backend_disables_default_piecewise(tmp_path):
     assert args.transforms["compile_model"]["piecewise_enabled"] is False
 
 
+def test_nanojet_mode_resolves_backend_and_fusions():
+    args = LlmArgs(model="test-model", mode="nanojet")
+
+    assert args.attn_backend == "nanojet"
+    assert args.transforms["insert_cached_attention"]["backend"] == "nanojet"
+    assert args.compile_backend == "torch-simple"
+    assert args.transforms["compile_model"]["backend"] == "torch-simple"
+    assert args.transforms["compile_model"]["piecewise_enabled"] is False
+    assert args.cuda_graph_config is None
+    assert "build_model" in args.transforms
+
+    nanojet_transforms = {
+        "fuse_nanojet_fused_qkv_gemm_norm_rope",
+        "fuse_nanojet_rmsnorm_fp8",
+        "fuse_nanojet_swiglu_gemm_fp8",
+        "fuse_nanojet_attn_quant_fp8",
+        "fuse_nanojet_gemm_fp8_add",
+    }
+    assert all(args.transforms[name]["enabled"] for name in nanojet_transforms)
+
+
 def test_cache_transceiver_rejects_unmanaged_persistent_caches():
     """Cache transceiver rejects unmanaged persistent cache resources."""
     args = LlmArgs(
