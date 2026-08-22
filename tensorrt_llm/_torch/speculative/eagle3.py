@@ -5,12 +5,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..modules.multi_stream_utils import do_multi_stream
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -402,6 +402,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    # CUDA-graph metadata copies share this event with the eager worker.
+    hidden_states_ready_event: Optional[torch.cuda.Event] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -426,6 +428,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
+        if (self.num_capture_layers > 0
+                and self.hidden_states_ready_event is None):
+            self.hidden_states_ready_event = torch.cuda.Event(external=True)
         if self.num_capture_layers == 0:
             # No layers to capture (MTP Eagle one-model). Skip buffer
             # allocation entirely; nothing reads self.hidden_states on this
@@ -578,17 +583,22 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                         "EAGLE3 hidden-state capture token count exceeds "
                         f"available hidden states: num_tokens={num_tokens}, "
                         f"hidden_states={hidden_states.shape[0]}")
-                to_save = hidden_states[:num_tokens]
-                if residual is not None:
-                    # residual shares its leading (token) dim with hidden_states
-                    # (both come from the same decoder layer), so the bound
-                    # check above already guarantees num_tokens <=
-                    # residual.shape[0]; no separate check is needed.
-                    to_save = to_save + residual[:num_tokens]
-                inplace_slice_copy(self.hidden_states, to_save,
-                                   i * self.hidden_size,
-                                   (i + 1) * self.hidden_size)
+                # residual shares its leading (token) dim with hidden_states,
+                # so the bound check above covers both tensors.
+                hidden_states = hidden_states[:num_tokens]
+                residual = (residual[:num_tokens]
+                            if residual is not None else None)
+                torch.ops.trtllm.capture_eagle_hidden_states(
+                    self.hidden_states, hidden_states, residual,
+                    i * self.hidden_size, (i + 1) * self.hidden_size,
+                    i == self.num_capture_layers - 1)
                 break
+
+    def wait_for_captured_hidden_states(self) -> None:
+        if not do_multi_stream():
+            return
+        assert self.hidden_states_ready_event is not None
+        self.hidden_states_ready_event.wait()
 
 
 class Eagle3OneModelSampler(MTPSampler):
@@ -1237,6 +1247,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         if not self.is_mtp_eagle:
             # Eagle3: project the multi-layer concatenated hidden states.
+            spec_metadata.wait_for_captured_hidden_states()
             hidden_size_up = spec_metadata.hidden_size * len(
                 spec_metadata.layers_to_capture)
             hidden_states = spec_metadata.hidden_states[:num_tokens, :

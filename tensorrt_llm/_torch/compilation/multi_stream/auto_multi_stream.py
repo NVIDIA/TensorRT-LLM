@@ -208,17 +208,6 @@ class MultiStreamDAG:
                 elif isinstance(arg, torch.fx.Node) and arg.op != "placeholder":
                     in_edges[arg] = self.nodes[arg]
 
-            if node.op == "output":
-                # An in-place op can mutate a graph input without returning a
-                # value (for example, Eagle3 captures intermediate hidden
-                # states with inplace_slice_copy).  Such a side effect is not
-                # otherwise reachable from the FX output.  Make graph exit
-                # wait for the last mutation of every touched tensor so that
-                # an auxiliary stream cannot keep writing after the compiled
-                # callable returns.
-                for mutated_arg, mutator in latest_inplace_stat.items():
-                    in_edges[mutated_arg] = mutator
-
             # For node without in edge, connect it to the entry
             if len(in_edges) == 0:
                 in_edges[None] = self.entry_node
@@ -369,12 +358,17 @@ class MultiStreamDAG:
         self.in_degrees[self.entry_node] = 0
 
         stream_pos = [0] * len(self.streams)
+        remaining_nodes = sum(len(st.nodes) for st in self.streams)
 
         def has_more_nodes() -> bool:
             for st in self.streams:
                 if len(st.nodes) > stream_pos[st.id]:
                     return True
             return False
+
+        def should_defer_output(node: MultiStreamNode) -> bool:
+            return (remaining_nodes > 1 and node.node is not None
+                    and node.node.op == "output")
 
         last_stream = 0
 
@@ -386,6 +380,11 @@ class MultiStreamDAG:
                 node = st.nodes[stream_pos[st.id]]
                 if self.in_degrees[node] != 0:
                     # This stream is not ready to run now.
+                    continue
+                if should_defer_output(node):
+                    # Output must be the final host-side instruction. Other
+                    # streams may still have independent work to launch, but
+                    # this adds no GPU completion dependency.
                     continue
 
                 # Any time the stream is changed, set the stream.
@@ -400,9 +399,12 @@ class MultiStreamDAG:
                     node = st.nodes[stream_pos[st.id]]
                     if self.in_degrees[node] != 0:
                         break
+                    if should_defer_output(node):
+                        break
                     for out_edge in node.out_edges:
                         self.in_degrees[out_edge] -= 1
                     stream_pos[st.id] += 1
+                    remaining_nodes -= 1
                     # It could be the fake entry node.
                     if node.node is not None:
                         # Wait on all the events that the node is waiting on.
