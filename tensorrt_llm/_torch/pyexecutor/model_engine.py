@@ -21,9 +21,9 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.utils import torch_multi_arange
-from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
-                                 prefer_pinned, release_gc, torch_dtype_to_str,
-                                 trace_func)
+from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled,
+                                 maybe_pin_memory, nvtx_range, prefer_pinned,
+                                 release_gc, torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -1658,7 +1658,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # Hold every rank here until the slowest has finished compiling, so the
         # first MoE all-to-all dispatch is entered without JIT skew.
-        if self.mapping.tp_size > 1:
+        if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)
         logger.info("indexer-Q CuTe DSL prewarm complete")
 
@@ -1696,6 +1696,49 @@ class PyTorchModelEngine(ModelEngine):
         with self.no_cuda_graph():
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
+    def _is_distributed_forward(self) -> bool:
+        """Return whether model forward can communicate with peer workers.
+
+        ``dist`` is optional. An engine built without a communicator cannot
+        enter a collective at all, so it has no peers to strand and every
+        warmup failure stays rank-local.
+        """
+        if self.dist is None:
+            return False
+        return self.dist.world_size > 1 or self.mapping.dwdp_enabled
+
+    def _should_run_warmup_batch(self, batch: Optional[ScheduledRequests],
+                                 num_tokens: int, shape: str) -> bool:
+        """Decide whether this warmup shape runs, is skipped, or fails the rank.
+
+        A rank that skips a shape its peers run leaves them blocked in that
+        forward's collectives for the rest of the job, so a missing batch is
+        only skippable when this rank has no peers at all.
+
+        With peers, ``_assert_all_tp_ranks_have_warmup_batch`` turns the TP
+        case into a symmetric error carrying per-rank diagnostics. No such
+        check exists for the other topologies (PP, CP, DWDP), so there the
+        shape fails this rank and the warmup boundary guard in ``PyExecutor``
+        tears the world down.
+        """
+        if batch is None and not self._is_distributed_forward():
+            # Safe to skip, but never silently: a skip during KV cache
+            # estimation makes the profiling peak unrepresentative of
+            # this shape.
+            logger.warning(f"Skipping warmup shape ({shape}): not enough KV "
+                           f"cache space.")
+            return False
+        self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
+        if batch is None:
+            raise RuntimeError(
+                f"Warmup batch creation failed for shape ({shape}) on "
+                f"global_rank={global_mpi_rank()}, "
+                f"model_rank={self.dist.rank}. Peer workers may already be "
+                f"inside the matching forward, so this rank cannot skip the "
+                f"shape without stranding them. Consider increasing "
+                f"--kv_cache_free_gpu_mem_fraction.")
+        return True
+
     def _assert_all_tp_ranks_have_warmup_batch(self, batch,
                                                num_tokens: int) -> None:
         """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
@@ -1704,8 +1747,12 @@ class PyTorchModelEngine(ModelEngine):
         runtime, causing _create_warmup_request to return None on some ranks while
         others proceed into forward() with tp_comm collectives — deadlocking the
         job. This check prevents the deadlock by failing early with diagnostic info.
+
+        ``tp_size`` alone does not establish that peers are reachable: ``dist``
+        is optional, and without a communicator there is no tp_comm collective
+        to deadlock in.
         """
-        if self.mapping.tp_size <= 1:
+        if self.mapping.tp_size <= 1 or self.dist is None:
             return
         has_batch = int(batch is not None)
         all_flags = list(self.dist.tp_allgather(has_batch))
@@ -1733,22 +1780,10 @@ class PyTorchModelEngine(ModelEngine):
                         self._create_warmup_request(resource_manager,
                                                     num_tokens, num_gen_tokens),
                         resource_manager) as batch:
-                    if batch is None and self.mapping.tp_size <= 1:
-                        # Safe to skip, but never silently: a skip during KV
-                        # cache estimation makes the profiling peak
-                        # unrepresentative of this shape.
-                        logger.warning(
-                            f"Skipping general warmup with {num_tokens} tokens "
-                            f"({num_gen_tokens} generation): not enough KV "
-                            f"cache space.")
-                        continue
-                    self._assert_all_tp_ranks_have_warmup_batch(
-                        batch, num_tokens)
-                    if batch is None:
-                        logger.warning(
-                            f"Skipping general warmup with {num_tokens} tokens "
-                            f"({num_gen_tokens} generation): not enough KV "
-                            f"cache space on any TP rank.")
+                    if not self._should_run_warmup_batch(
+                            batch, num_tokens,
+                            f"general, num_tokens={num_tokens}, "
+                            f"num_gen_tokens={num_gen_tokens}"):
                         continue
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
@@ -1758,6 +1793,10 @@ class PyTorchModelEngine(ModelEngine):
                                  resource_manager=resource_manager)
                     torch.cuda.synchronize()
             except torch.OutOfMemoryError:
+                if self._is_distributed_forward():
+                    # Peers are inside the same forward's collectives and
+                    # cannot follow a rank-local skip.
+                    raise
                 logger.warning(
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping.")
@@ -1851,11 +1890,11 @@ class PyTorchModelEngine(ModelEngine):
 
             with self.no_cuda_graph(), self._release_batch_context(
                     warmup_request, resource_manager) as batch:
-                if batch is None and self.mapping.tp_size <= 1:
-                    continue  # Not enough KV cache space (single rank, safe to skip)
-                self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
-                if batch is None:
-                    continue  # All ranks agree: not enough space
+                if not self._should_run_warmup_batch(
+                        batch, num_tokens,
+                        f"attention, num_tokens={num_tokens}, "
+                        f"num_gen_requests={num_gen_requests}"):
+                    continue
                 with trtllm_gen_fmha_jit_warmup():
                     self.forward(batch,
                                  new_tensors_device=None,
@@ -1874,7 +1913,7 @@ class PyTorchModelEngine(ModelEngine):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
-    def _run_autotuner_warmup(self, resource_manager: ResourceManager):
+    def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
         """Runs forward passes to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
@@ -1902,11 +1941,10 @@ class PyTorchModelEngine(ModelEngine):
                     resource_manager, num_tokens, num_gen_requests)
                 with self._release_batch_context(warmup_request,
                                                  resource_manager) as batch:
-                    if batch is None and self.mapping.tp_size <= 1:
-                        continue  # Single rank, safe to skip
-                    self._assert_all_tp_ranks_have_warmup_batch(
-                        batch, num_tokens)
-                    if batch is None:
+                    if not self._should_run_warmup_batch(
+                            batch, num_tokens,
+                            f"autotuner, num_tokens={num_tokens}, "
+                            f"num_gen_requests={num_gen_requests}"):
                         continue
                     # Reset the flag is_first_draft for the draft model.
                     # This is necessary for overlap scheduler.
@@ -1946,7 +1984,8 @@ class PyTorchModelEngine(ModelEngine):
         clear_memory_buffers()
         torch.cuda.empty_cache()
 
-    def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager):
+    def _run_mamba_hybrid_warmup(self,
+                                 resource_manager: ResourceManager) -> None:
         """Pre-JIT the Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels.
 
         Mamba hybrid models (e.g. Nemotron 3 Super 120B, Nemotron-Nano-12B-v2)
@@ -2031,20 +2070,43 @@ class PyTorchModelEngine(ModelEngine):
                  force_init_i) in mamba_warmup_shapes:
                 init_ctx = (Mamba2Metadata.force_initial_states_for_warmup()
                             if force_init_i else contextlib.nullcontext())
-                try:
-                    with init_ctx:
+                shape = (f"Mamba hybrid, num_tokens={num_tokens_i}, "
+                         f"num_gen_requests={num_gen_requests_i}, "
+                         f"force_initstates={force_init_i}")
+                with init_ctx:
+                    try:
                         warmup_request = self._create_warmup_request(
                             resource_manager,
                             num_tokens_i,
                             num_gen_requests_i,
                             least_requests=least_req_i)
+                    except torch.OutOfMemoryError as e:
+                        if self._is_distributed_forward():
+                            raise
+                        logger.warning(f"Warmup skipped for shape ({shape}): "
+                                       f"{type(e).__name__}: {e}")
+                        torch.cuda.empty_cache()
+                        continue
+                    except RuntimeError as e:
+                        # The known KV allocation failure happens before
+                        # forward and is recoverable only when no peer worker
+                        # can advance independently. Any other RuntimeError is
+                        # a defect, not a capacity limit, and is fatal.
+                        if self._is_distributed_forward():
+                            raise
+                        if "Can't allocate new blocks for window size" not in str(
+                                e):
+                            raise
+                        logger.warning(f"Warmup skipped for shape ({shape}): "
+                                       f"{type(e).__name__}: {e}")
+                        torch.cuda.empty_cache()
+                        continue
+
+                    try:
                         with self._release_batch_context(
                                 warmup_request, resource_manager) as batch:
-                            if batch is None and self.mapping.tp_size <= 1:
-                                continue
-                            self._assert_all_tp_ranks_have_warmup_batch(
-                                batch, num_tokens_i)
-                            if batch is None:
+                            if not self._should_run_warmup_batch(
+                                    batch, num_tokens_i, shape):
                                 continue
                             spec_resource_manager = resource_manager.get_resource_manager(
                                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -2063,24 +2125,25 @@ class PyTorchModelEngine(ModelEngine):
                                 AutoTuner.get().clean_pp_flag()
 
                             torch.cuda.synchronize()
-                except (torch.OutOfMemoryError, RuntimeError) as e:
-                    # Catch both OOM and RuntimeError. C++ KV cache block
-                    # allocation ("Can't allocate new blocks for window size
-                    # N") surfaces as RuntimeError, not torch.OutOfMemoryError.
-                    # This warmup is a pure perf optimization: if a shape
-                    # doesn't fit for any reason, log and skip; the model then
-                    # JIT-compiles the missing kernel variants lazily on the
-                    # first real request (i.e. the pre-fix behavior).
-                    logger.warning(f"Mamba hybrid warmup skipped for shape "
-                                   f"num_tokens={num_tokens_i}, "
-                                   f"num_gen_requests={num_gen_requests_i}, "
-                                   f"force_initstates={force_init_i}: "
-                                   f"{type(e).__name__}: {e}")
-                    # Mirror _general_warmup_impl: an OOM between dispatch()
-                    # and combine() leaves MoE A2A state in ``dispatched``,
-                    # tripping ``dispatch called twice`` on the next forward.
-                    self._reset_moe_alltoall_state()
-                    torch.cuda.empty_cache()
+                    # Once peers can enter warmup synchronization or forward,
+                    # any rank-local exception can strand them in a collective.
+                    except Exception as e:  # noqa: BLE001
+                        if self._is_distributed_forward():
+                            raise
+                        # ``torch.OutOfMemoryError`` is a ``RuntimeError``
+                        # subclass; anything outside that hierarchy is a defect
+                        # rather than a capacity limit.
+                        if not isinstance(e, RuntimeError):
+                            raise
+                        # A single-rank warmup is a pure perf optimization. If
+                        # a forward shape does not fit, it can be compiled
+                        # lazily on the first real request.
+                        logger.warning(f"Warmup skipped for shape ({shape}): "
+                                       f"{type(e).__name__}: {e}")
+                        # An OOM between dispatch() and combine() leaves the
+                        # local MoE A2A state in ``dispatched``.
+                        self._reset_moe_alltoall_state()
+                        torch.cuda.empty_cache()
 
         clear_memory_buffers()
         torch.cuda.empty_cache()
@@ -7308,6 +7371,10 @@ class PyTorchModelEngine(ModelEngine):
                     self.encoder_forward(inputs)
                     torch.cuda.synchronize()
                 except torch.OutOfMemoryError:
+                    if self._is_distributed_forward():
+                        # Peers are inside the same forward's collectives and
+                        # cannot follow a rank-local skip.
+                        raise
                     logger.warning(f"OOM during encoder general warmup with "
                                    f"bs={bs}, nt={nt}, sl={sl}. Skipping.")
                     torch.cuda.empty_cache()
