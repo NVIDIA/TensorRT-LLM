@@ -769,9 +769,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         description=
         "Sparse GQA backend for pure-decode batches under the MSA implementation. "
         "'default' retains the Triton decode route, 'msa' always uses the "
-        "preplanned fmha_sm100 route, and 'adaptive' uses Triton for rank-local "
-        "decode batch sizes 1-7 and MSA for batch sizes >= 8. Mixed batches keep "
-        "their existing Triton generation suffix.",
+        "preplanned fmha_sm100 route, and 'adaptive' profiles both routes once "
+        "per exact CUDA-graph shape and caches the faster tactic. Mixed batches "
+        "keep their existing Triton generation suffix.",
         status="prototype",
     )
 
@@ -794,8 +794,8 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
                 "the 'msa' implementation.")
         if self.decode_backend != "default" and self.implementation != "msa":
             raise ValueError(
-                "MiniMax-M3 decode_backend='msa' or 'adaptive' requires the "
-                "'msa' implementation.")
+                f"MiniMax-M3 decode_backend={self.decode_backend!r} requires "
+                "implementation='msa'.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
