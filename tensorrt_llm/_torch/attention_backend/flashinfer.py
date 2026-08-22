@@ -37,6 +37,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from ..metadata import KVCacheParams
 from ..utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
@@ -232,6 +233,8 @@ class MLAPlanParams:
 @dataclass(kw_only=True)
 class FlashInferWrappers:
     is_planned: bool
+    fa2_plan_num_blocks: Optional[tuple[int, ...]] = field(default=None,
+                                                           repr=False)
     decode_wrapper: Optional[
         flashinfer.BatchDecodeWithPagedKVCacheWrapper] = None
     prefill_wrapper: Optional[
@@ -578,6 +581,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             return self.paged_kv_indices
         total_blocks = self.num_generation_blocks + self.num_context_blocks
         return self._vswa_pool_indices_cache[pool_id][:total_blocks]
+
+    def _sanitize_swa_page_indices(self, page_indices: torch.Tensor,
+                                   layer_idx: int) -> None:
+        """Replace evicted SWA pages with a safe in-range page index."""
+        window_vec = getattr(self.kv_cache_manager, 'max_attention_window_vec',
+                             None)
+        if not window_vec or window_vec[layer_idx % len(window_vec)] is None:
+            return
+
+        # KVCacheManagerV2 marks evicted out-of-window pages with -1.
+        # FlashInfer may dereference page IDs before applying window_left, so
+        # keep masked positions in range. The SWA mask excludes their values
+        # from the attention result.
+        page_indices.masked_fill_(page_indices == BAD_PAGE_INDEX, 0)
 
     def swap_paged_kv_indices_for_layer(self, layer_idx: int) -> None:
         """Copy pool-specific page indices into the shared buffer.
@@ -1425,7 +1442,22 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # corresponding forward pass. So, flush them out here as they won't be relevant for
             # subsequent forward calls.
             if plan_params.attention_mask_data is None and plan_params.multi_item_params is None:
-                self._plan_params_to_wrappers[plan_params].is_planned = False
+                wrappers = self._plan_params_to_wrappers[plan_params]
+                if wrappers.fa2_plan_num_blocks is not None:
+                    num_blocks = tuple(self.num_blocks[self.num_contexts:])
+                    if not num_blocks:
+                        wrappers.fa2_plan_num_blocks = None
+                    elif wrappers.fa2_plan_num_blocks == num_blocks:
+                        continue
+                    else:
+                        # Graph replay does not re-enter forward_impl. Refresh
+                        # captured FA2 schedules here; each wrapper owns its
+                        # persistent integer plan workspace, while the shared
+                        # float workspace is run scratch.
+                        wrappers.is_planned = False
+                        self._plan_with_params(plan_params)
+                        continue
+                wrappers.is_planned = False
                 if not defer_plan:
                     self._plan_with_params(plan_params)
             else:
@@ -1542,8 +1574,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
         # indices of used cache blocks for each sequence
+        primary_layer_idx = None
+        if self._vswa_layer_to_pool is not None:
+            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_layer_idx = self._vswa_pool_to_rep_layer[primary_pool_id]
+        else:
+            layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets', {})
+            primary_layer_idx = next(iter(layer_offsets), None)
+
         paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
-            self.request_ids, self.num_blocks)
+            self.request_ids, self.num_blocks, layer_idx=primary_layer_idx)
+        if primary_layer_idx is not None:
+            self._sanitize_swa_page_indices(paged_kv_indices, primary_layer_idx)
 
         self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
             paged_kv_indices, non_blocking=True)
@@ -1579,6 +1621,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 pool_indices = \
                     self.kv_cache_manager.get_batch_cache_indices_flat(
                         self.request_ids, self.num_blocks, layer_idx=rep_layer)
+                self._sanitize_swa_page_indices(pool_indices, rep_layer)
                 buf = getattr(self, f'_vswa_pool_buf_{pool_id}')
                 buf[:pool_indices.size(0)].copy_(pool_indices,
                                                  non_blocking=True)
@@ -1656,11 +1699,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        # Multi-wrapper case (Gemma4 hybrid: different head_dim per layer)
-        # shares one workspace_buffer; eager plan() would overwrite earlier
-        # wrappers' workspace, so defer plan() to forward_impl. Single-wrapper
-        # case (e.g., Llama, Gemma3 uniform head_dim) needs eager plan() here
-        # because forward_impl cannot plan() during cuda-graph stream capture.
+        # Defer ordinary multi-wrapper plans to forward_impl. Captured FA2
+        # schedule refreshes are handled eagerly by _clean_cached_plans because
+        # graph replay does not re-enter Python. Single-wrapper models still
+        # plan eagerly because forward_impl cannot plan during graph capture.
         active_wrappers = [
             pp for pp in self._plan_params_to_wrappers
             if pp.attention_mask_data is None
@@ -1987,8 +2029,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 custom_mask=plan_params.attention_mask_data,
             )
 
+        use_graph_tensor_cores = self.is_cuda_graph and plan_params.head_dim > 128
         if wrappers.decode_wrapper is None:
             use_tensor_cores = self._use_tensor_cores(plan_params)
+            # Gemma4's H256/H512 plans need a tensor-core wrapper with a stable
+            # CUDA Graph launch layout. prepare() may refresh its split-K
+            # schedule in the wrapper's fixed workspace as KV pages change.
 
             wrappers.decode_wrapper = \
                 flashinfer.BatchDecodeWithPagedKVCacheWrapper(
@@ -1998,11 +2044,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     paged_kv_indptr_buffer=self.paged_kv_indptr_decode,
                     paged_kv_indices_buffer=self._paged_kv_indices,
                     paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
-                    use_tensor_cores=use_tensor_cores
+                    use_tensor_cores=use_tensor_cores or use_graph_tensor_cores
                     or flashinfer_backend == "trtllm-gen",
                     backend=flashinfer_backend
                     if flashinfer_backend != "fa2" else
-                    ("fa2" if torch.cuda.get_device_capability(0) == (
+                    ("fa2" if torch.cuda.get_device_capability() == (
                         9, 0) else "auto"),
                 )
         decode_wrapper = wrappers.decode_wrapper
@@ -2026,6 +2072,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if decode_wrapper._backend == 'trtllm-gen':
                 block_tables = self._build_decode_block_tables(
                     plan_params, wrappers)
+            planned_max_kv_len = (decode_wrapper._max_kv_len
+                                  if wrappers.fa2_plan_num_blocks is not None
+                                  else None)
             decode_wrapper.plan(
                 paged_kv_indptr[:self.num_generations + 1],
                 self.paged_kv_indices[self.num_context_blocks:],
@@ -2042,7 +2091,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 block_tables=block_tables,
                 # Keep FlashInfer's recorded graph shape aligned with the wrapper cache key.
                 q_len_per_req=plan_params.q_len_per_req,
+                disable_split_kv=False,
             )
+            if planned_max_kv_len is not None:
+                decode_wrapper._max_kv_len = max(planned_max_kv_len,
+                                                 decode_wrapper._max_kv_len)
+            if use_graph_tensor_cores and decode_wrapper._backend == 'fa2':
+                wrappers.fa2_plan_num_blocks = tuple(
+                    self.num_blocks[self.num_contexts:])
             self._publish_decode_wrapper_kv_lens(decode_wrapper)
 
         # Must sync after append_paged_kv_cache and before plan.
