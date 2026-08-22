@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import platform
 import signal
+import sys
 import traceback
 import weakref
 from abc import ABC, abstractmethod
@@ -734,6 +735,36 @@ class GenerationExecutor(ABC):
             else:
                 wait_set.add(fut)
 
+
+def _register_stack_dump_signal() -> None:
+    """Let an external observer demand this process's thread stacks on SIGUSR1.
+
+    The executor worker runs in a separate MPI-spawned process, so a hang
+    watchdog in the launching process can only ever dump its own threads --
+    which is why CI hang reports have historically shown the client blocked on
+    a queue and nothing at all about what the worker was doing. Registering
+    here (module import time, so it covers the worker process too) gives the
+    watchdog a way to make the worker self-report.
+
+    Stacks go to stderr rather than a file because the worker's stderr is
+    already folded into the stage log, which survives even where no artifact
+    is collected. ``chain=True`` preserves any handler MPI installed for this
+    signal, and registration failures are ignored: this is a diagnostics aid,
+    never a correctness requirement.
+    """
+    handler = getattr(signal, "SIGUSR1", None)
+    if handler is None:  # non-POSIX platform
+        return
+    try:
+        faulthandler.register(handler,
+                              file=sys.stderr,
+                              all_threads=True,
+                              chain=True)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+
+_register_stack_dump_signal()
 
 if enable_llm_debug():
     print_colored("LLM debug mode enabled.\n", "yellow")

@@ -264,6 +264,11 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         "--periodic-junit",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        # This inner pytest is the process that actually owns the LLM, so it is
+        # the only one whose stacks explain a hang. Without this the watchdog
+        # only ever armed in the outer process, whose dump shows nothing but a
+        # blocking wait on this subprocess.
+        "--periodic-hang-traceback",
     ]
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]

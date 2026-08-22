@@ -405,6 +405,14 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                     hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
                 }
             }
+            // Download hang tracebacks. Written next to the JUnit XML by the
+            // periodic-junit watchdog when a test overruns its timeout, so it
+            // lands in this same directory. Best-effort and usually absent:
+            // without this, SLURM-remote stages (all of DGX_B200/B300) silently
+            // dropped the only thread-stack evidence a hang ever produces.
+            def hangTracebackPath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/hang_traceback.txt"
+            Utils.exec(pipeline, script: scpFromRemoteCmd(remote, hangTracebackPath, "${stageName}/"), returnStatus: true, numRetries: 1)
+
             // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
             downloadResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
