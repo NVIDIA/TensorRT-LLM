@@ -2715,7 +2715,13 @@ class BlockManager:
 
 
 class KVCacheCompressionManager(BaseResourceManager):
-    """Base for iteration-driven and storage-boundary KV compression."""
+    """Framework base for KV-cache compression methods in PyExecutor.
+
+    Iteration-driven methods receive ResourceManager callbacks, while
+    storage-boundary methods provide a cold-page codec during cache construction.
+    Subclasses coordinate through KVCacheManagerV2 without owning its pools,
+    mappings, or migration lifecycle.
+    """
 
     uses_iteration_lifecycle = True
     provides_cold_page_codec = False

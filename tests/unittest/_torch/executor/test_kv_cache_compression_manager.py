@@ -19,6 +19,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
 
+pytestmark = pytest.mark.cpu_only
+
 # ---------------------------------------------------------------------- #
 # Mock infra: in-memory managers / requests (avoid touching V2 / model).  #
 # ---------------------------------------------------------------------- #

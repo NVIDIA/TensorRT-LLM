@@ -367,6 +367,7 @@ def test_host_init_fallback_drops_only_host_tier(tmp_path) -> None:
     ]
 
 
+@pytest.mark.cpu_only
 def test_host_init_fallback_recreates_cold_codec_and_keeps_disk(tmp_path) -> None:
     impl = Mock()
     codecs = [object(), object()]

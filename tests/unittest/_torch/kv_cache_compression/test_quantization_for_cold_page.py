@@ -28,6 +28,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     SsmLayerConfig,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _manager(scale_checkpoint_path=None):
     config = ColdPageQuantizationCompressionConfig(
