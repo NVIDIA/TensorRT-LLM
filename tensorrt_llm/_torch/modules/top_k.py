@@ -279,9 +279,7 @@ class TopK(nn.Module):
                 and scores.data_ptr() % 16 == 0
                 and (scores.shape[0] > 1 or scores.shape[1] % 4 == 0)
             ):
-                from ..cute_dsl_kernels.blackwell.top_k import (
-                    selfsampling_topk_run_varlen,
-                )
+                from ..cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
 
                 logger.info_once(
                     "self-sampling GVR top-K engaged "
