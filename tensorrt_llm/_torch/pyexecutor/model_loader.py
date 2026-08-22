@@ -6,6 +6,7 @@ import inspect
 import os
 import traceback
 import warnings
+from dataclasses import replace
 from enum import Enum
 from typing import Callable, Optional, Tuple
 
@@ -16,7 +17,8 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
+    QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, PostTransformConfigIdentity, PostTransformFeature,
     PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
@@ -77,6 +79,10 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
     tied_word_embeddings=frozenset({False}),
     rope_types=frozenset({"default"}),
     rope_fusion=frozenset({True}),
+)
+_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    rope_fusion=frozenset({False}),
 )
 
 
@@ -389,6 +395,7 @@ class ModelLoader:
         if cls._POST_TRANSFORM_PROFILE_REGISTRY is None:
             from ..models.modeling_llama import LlamaForCausalLM
             from ..models.modeling_qwen import Qwen2ForCausalLM
+            from ..models.modeling_qwen3 import Qwen3ForCausalLM
             cls._POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
                 profiles=(
                     PostTransformProfile(
@@ -415,6 +422,20 @@ class ModelLoader:
                         QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
                         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
                         runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+                    ),
+                    PostTransformProfile(
+                        profile_id="qwen3-for-causal-lm-bf16-target-v1",
+                        root_model_class=Qwen3ForCausalLM,
+                        architecture="Qwen3ForCausalLM",
+                        model_type="qwen3",
+                        speculative_mode=None,
+                        protocol_version=cls.
+                        _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+                        transform_abi_id=
+                        QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+                        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+                        runtime_constraints=
+                        _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
                     ),
                 ))
         return cls._POST_TRANSFORM_PROFILE_REGISTRY
