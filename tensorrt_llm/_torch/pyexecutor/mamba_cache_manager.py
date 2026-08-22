@@ -447,6 +447,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         # seed values.  Starts at 0 so the post-init "reset" stream is
         # disjoint from the counter=0 stream used at allocation time.
         self._seed_request_counter = 0
+        # Sync-free seed upload staging (see _reset_context_mamba_slots):
+        # pinned-host/device buffer pairs, ping-ponged so a refill can never
+        # race the previous still-queued non_blocking copy. Lazily sized.
+        self._seed_staging_host = None
+        self._seed_staging_dev = None
+        self._seed_staging_idx = 0
 
         # get tp size
         tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
@@ -1390,24 +1396,35 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self._dummy_request_mask.copy_(self._dummy_request_mask_host,
                                        non_blocking=True)
 
+    @nvtx_range("_reset_context_mamba_slots")
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
             return
 
+        # All writes below are async on the executor thread's current
+        # (default) stream; no blocking sync is needed for correctness.
+        # Write->read ordering with the consuming forward is provided by the
+        # existing stream fences in py_executor (the forward's event-wait
+        # chains the default stream before any consumer runs). The previous
+        # scalar-setitem pattern (`tensor[slots] = 0`) shipped each scalar
+        # via a pageable HtoD copy followed by an implicit
+        # cudaStreamSynchronize; the first such sync stalled the executor
+        # thread until the in-flight forward CUDA graph drained (~2-3 ms per
+        # disagg-gen-init arrival at long ISL).
         context_slots = self.cuda_state_indices[:num_contexts].long()
         if (self._use_replay_state_update
                 and self.prev_num_accepted_tokens is not None
                 and self.cache_buf_idx is not None):
-            self.prev_num_accepted_tokens[context_slots] = 0
-            self.cache_buf_idx[context_slots] = 0
+            self.prev_num_accepted_tokens.index_fill_(0, context_slots, 0)
+            self.cache_buf_idx.index_fill_(0, context_slots, 0)
             if self.old_x is not None:
-                self.old_x[:, context_slots] = 0
+                self.old_x.index_fill_(1, context_slots, 0)
             if self.old_B is not None:
-                self.old_B[:, context_slots] = 0
+                self.old_B.index_fill_(1, context_slots, 0)
             if self.old_dt is not None:
-                self.old_dt[:, context_slots] = 0
+                self.old_dt.index_fill_(1, context_slots, 0)
             if self.old_dA_cumsum is not None:
-                self.old_dA_cumsum[:, context_slots] = 0
+                self.old_dA_cumsum.index_fill_(1, context_slots, 0)
 
         if self.mamba_ssm_rand_seed is None:
             return
@@ -1419,11 +1436,29 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             _compute_deterministic_mamba_seed(counter, slot, rank_offset)
             for slot in host_slots
         ]
-        self.mamba_ssm_rand_seed[context_slots] = torch.tensor(
-            new_seeds,
-            dtype=torch.int64,
-            device=self.mamba_ssm_rand_seed.device,
-        )
+        # Sync-free upload: fill a pinned host buffer, non_blocking copy to a
+        # device staging buffer, then indexed assignment with a device-side
+        # RHS (no pageable HtoD, no implicit stream sync). Ping-pong the
+        # staging pair so this call can never overwrite a buffer whose
+        # previous async copy is still queued behind an in-flight forward.
+        if self._seed_staging_host is None:
+            cap = self.cuda_state_indices.shape[0]
+            device = self.mamba_ssm_rand_seed.device
+            self._seed_staging_host = [
+                torch.empty(cap, dtype=torch.int64, pin_memory=True)
+                for _ in range(2)
+            ]
+            self._seed_staging_dev = [
+                torch.empty(cap, dtype=torch.int64, device=device)
+                for _ in range(2)
+            ]
+        self._seed_staging_idx ^= 1
+        host_buf = self._seed_staging_host[self._seed_staging_idx]
+        dev_buf = self._seed_staging_dev[self._seed_staging_idx]
+        host_buf[:num_contexts] = torch.tensor(new_seeds, dtype=torch.int64)
+        dev_buf[:num_contexts].copy_(host_buf[:num_contexts],
+                                     non_blocking=True)
+        self.mamba_ssm_rand_seed[context_slots] = dev_buf[:num_contexts]
 
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
@@ -2162,6 +2197,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # with the slot index and rank offset to produce reproducible per-slot
         # seed values without any torch.randint.
         self._seed_request_counter = 0
+        # Sync-free seed upload staging (see _reset_context_mamba_slots):
+        # pinned-host/device buffer pairs, ping-ponged so a refill can never
+        # race the previous still-queued non_blocking copy. Lazily sized.
+        self._seed_staging_host = None
+        self._seed_staging_dev = None
+        self._seed_staging_idx = 0
         self.ssm_state_dtype = mamba_ssm_cache_dtype
         # Keep the shared Mamba interface valid on PP ranks that do not own a
         # local Mamba layer.
@@ -2910,6 +2951,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
         self._seed_rank_offset = _mamba_rank_offset(mapping)
         self._seed_request_counter = 0
+        # Sync-free seed upload staging (see _reset_context_mamba_slots):
+        # pinned-host/device buffer pairs, ping-ponged so a refill can never
+        # race the previous still-queued non_blocking copy. Lazily sized.
+        self._seed_staging_host = None
+        self._seed_staging_dev = None
+        self._seed_staging_idx = 0
         num_cuda_graph_padding_dummy_slots = (
             _get_num_cuda_graph_padding_dummy_slots(spec_config,
                                                     max_batch_size))

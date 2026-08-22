@@ -2367,7 +2367,7 @@ class PyExecutor:
             if item.request is None:
                 continue
             try:
-                token_count = len(item.request.input_token_ids)
+                token_count = item.request.num_input_tokens
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
                 # exclude from all queued counters so downstream consumers
@@ -3780,12 +3780,31 @@ class PyExecutor:
             return self.dist.tp_allgather(local_status)
         return [local_status]
 
+    def _disagg_status_checks_are_rank_local(self) -> bool:
+        """Whether the disagg transfer-status checks need no entry vote.
+
+        The entry votes below exist only to guarantee that all ranks enter
+        the status checks together, because those checks contain internal
+        collectives. In flat attention-DP (pp==1, cp==1) the transceiver's
+        internal status-sync comms are singletons (mGroupDataComm is split
+        by dpRank and only spans pp stages; mGroupTPInDPComm only spans CP),
+        so the checks are rank-local and each rank may act on its own need
+        bit without a collective vote.
+        """
+        return (self.enable_attention_dp
+                and self._dist_size(self.dist, "pp_size") == 1
+                and self._dist_size(self.dist, "cp_size") == 1)
+
     def _sync_disagg_gen_status_entry(self, local_need_check: bool) -> int:
+        if self._disagg_status_checks_are_rank_local():
+            return int(local_need_check)
         if self._dist_size(self.dist, "world_size") > 1:
             return self.dist.allreduce(int(local_need_check), op=ReduceOp.MAX)
         return int(local_need_check)
 
     def _sync_disagg_ctx_status_entry(self, local_need_check: bool) -> int:
+        if self._disagg_status_checks_are_rank_local():
+            return int(local_need_check)
         if self._dist_size(self.dist, "cp_size") > 1:
             return int(any(self.dist.tp_cp_allgather(int(local_need_check))))
         if self._dist_size(self.dist, "tp_size") > 1:
@@ -3793,6 +3812,7 @@ class PyExecutor:
                                           op=ReduceOp.MAX)
         return int(local_need_check)
 
+    @nvtx_range("_check_disagg_transfer_progress_when_idle")
     def _check_disagg_transfer_progress_when_idle(
             self,
             num_fitting_reqs: int,

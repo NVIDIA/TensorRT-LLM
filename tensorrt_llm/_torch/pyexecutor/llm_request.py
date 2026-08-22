@@ -1519,7 +1519,17 @@ def executor_request_to_llm_request(
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    if input_token_ids is not None:
+        input_tokens = input_token_ids
+    else:
+        # int32 ndarray bridge: `input_token_ids` materializes O(ISL) PyLongs
+        # and the LlmRequest ctor would cast them back one by one; the i32
+        # accessor plus the ctor's ndarray fast path replace both with
+        # memcpys (~1.5 ms saved per ~100k-token request on the executor
+        # thread). getattr keeps compatibility with older bindings.
+        input_tokens = getattr(executor_request, "input_token_ids_i32", None)
+        if input_tokens is None:
+            input_tokens = executor_request.input_token_ids
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     stop_words_list = convert_wordlist(

@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <cstring>
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
@@ -391,7 +392,7 @@ void initBindings(nb::module_& m)
         .def(
             "__init__",
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
-                tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
+                tb::LlmRequest::SizeType32 max_new_tokens, nb::handle input_tokens_handle,
                 runtime::SamplingConfig sampling_config, bool is_streaming,
                 std::optional<tb::LlmRequest::SizeType32> end_id, std::optional<tb::LlmRequest::SizeType32> pad_id,
                 std::optional<at::Tensor> embedding_bias, std::optional<at::Tensor> bad_words_list,
@@ -452,6 +453,23 @@ void initBindings(nb::module_& m)
                 auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
                 auto multimodal_embedding_tensor_ptr = makeOptionalTensor(multimodal_embedding);
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
+                // Fast path: a 1-D contiguous int32 ndarray is memcpy'd into the
+                // token vector (no per-element PyLong cast, which is O(ISL) on the
+                // GIL-held executor path). Lists fall back to the default cast.
+                auto input_tokens = [&]() -> std::vector<tb::LlmRequest::TokenIdType>
+                {
+                    nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> arr;
+                    if (nb::try_cast(input_tokens_handle, arr, /*convert=*/false))
+                    {
+                        std::vector<tb::LlmRequest::TokenIdType> out(arr.shape(0));
+                        if (arr.shape(0) > 0)
+                        {
+                            std::memcpy(out.data(), arr.data(), arr.shape(0) * sizeof(int32_t));
+                        }
+                        return out;
+                    }
+                    return nb::cast<std::vector<tb::LlmRequest::TokenIdType>>(input_tokens_handle);
+                }();
                 auto mrope_rotary_cos_sin_tensor_ptr = makeOptionalTensor(mrope_rotary_cos_sin);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
                 auto draft_logits_tensor_ptr = makeOptionalTensor(draft_logits);

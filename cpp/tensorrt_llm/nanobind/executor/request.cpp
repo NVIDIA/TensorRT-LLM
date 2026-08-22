@@ -773,6 +773,19 @@ void initRequestBindings(nb::module_& m)
         nb::arg("cache_salt") = nb::none()
     ) // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
+        .def_prop_ro("input_token_ids_i32",
+            [](tle::Request const& self)
+            {
+                // Owned int32 copy of the prompt tokens exposed as a 1-D numpy
+                // array: one memcpy instead of materializing O(ISL) PyLongs on
+                // the GIL-held executor path. Complements the toVecTokens
+                // ndarray fast path above, which accepts such arrays on
+                // Request/LlmRequest construction.
+                auto* vec = new tle::VecTokens(self.getInputTokenIds());
+                nb::capsule owner(vec, [](void* p) noexcept { delete static_cast<tle::VecTokens*>(p); });
+                return nb::ndarray<nb::numpy, int32_t, nb::ndim<1>>(vec->data(), {vec->size()}, owner);
+            },
+            nb::rv_policy::move)
         .def_prop_ro("num_input_tokens", &tle::Request::getNumInputTokens)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
