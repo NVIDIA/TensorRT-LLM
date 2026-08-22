@@ -1726,6 +1726,7 @@ class _StubADPExecutor:
         kv_cache_manager = Mock()
         kv_cache_manager.mapping.has_cp_helix.return_value = False
         kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        kv_cache_manager.is_linear_attention = False
         kv_cache_manager.max_seq_len = (
             max_seq_len if kv_manager_max_seq_len is None else kv_manager_max_seq_len
         )

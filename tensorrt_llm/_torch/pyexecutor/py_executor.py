@@ -6983,7 +6983,19 @@ class PyExecutor:
                          if self._adp_dummy_is_gen else 0)
         available_tokens = self.kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num, max_num_draft_tokens=draft_reserve)
-        return available_tokens >= token_num
+        if available_tokens < token_num:
+            return False
+        # For mamba hybrid models using the C++ unified pool, also check that
+        # the recurrent-state pool has at least one free block for the dummy.
+        if getattr(self.kv_cache_manager, "is_linear_attention", False):
+            stats = self.kv_cache_manager.impl.get_kv_cache_stats()
+            from tensorrt_llm._torch.pyexecutor.resource_manager import \
+                LinearCacheType
+            recurrent_free = stats.num_free_blocks_per_window_size.get(
+                LinearCacheType.RECURRENT_STATES.value, None)
+            if recurrent_free is not None and recurrent_free < 1:
+                return False
+        return True
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
