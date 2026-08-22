@@ -45,7 +45,7 @@ The following table describes the supported and recommended configurations.
 | Beam search | Yes with V1 | Configure `max_beam_width` when constructing `LLM`, then set `use_beam_search=True` in `SamplingParams`. |
 | Attention backend | `TRTLLM` | Use this backend for encoder-decoder models. It is required when `tensor_parallel_size > 1`. |
 | Decoder CUDA graphs | Yes, except in FP32 | `CudaGraphConfig` captures decoder work. V1 supports greedy and beam search; V2 supports its single-beam path. FP32 encoder-decoder models decline capture at engine init and log a warning instead of failing. |
-| Encoder CUDA graphs | Yes | Set `encoder_cuda_graph_config=EncodeCudaGraphConfig(...)` and `encoder_max_batch_size`. Usually set `encoder_max_batch_size` lower than `max_batch_size`. The `TRTLLM` attention backend is required. |
+| Encoder CUDA graphs | Yes | Set `encoder_cuda_graph_config=EncodeCudaGraphConfig(...)` and `encoder_max_batch_size`. Usually set `encoder_max_batch_size` lower than `max_batch_size`. The `TRTLLM` attention backend is required. Text encoders also require `num_tokens` and `seq_lens`; a fixed-shape feature encoder such as Whisper derives both from the model and needs only `batch_sizes`. |
 | Overlap scheduler | Yes | Enabled by default. V1 supports greedy decoding and beam search; V2 remains limited to `max_beam_width=1`. |
 | Tensor parallelism | Yes | Use `tensor_parallel_size > 1` with `attn_backend="TRTLLM"`. Attention head counts must be divisible by the TP size. |
 | Pipeline parallelism | No | Keep `pipeline_parallel_size=1`. |
@@ -437,6 +437,47 @@ size, total packed tokens, and maximum sequence length. The
 limit. With beam search, decoder graph batch sizes must cover the active
 decoder sequences after beam expansion.
 
+Which encoder buckets you must supply depends on the model. A text encoder,
+such as BART or T5, packs a variable number of tokens per request, so
+`num_tokens` and `seq_lens` are part of its key space and are required; leaving
+either unset is rejected when the model engine initializes, which happens in
+the worker after weights load rather than at `LLM(...)` construction — only the
+engine knows which kind of encoder the model has. An encoder whose input is a
+fixed-shape per-request feature tensor, such as Whisper's fixed 30-second
+zero-padded audio waveform (the mel transform runs inside the encoder, so the
+per-request input is the waveform itself, not a spectrogram), produces the same
+number of encoder positions for every request, so both lists follow from the
+model and are derived rather than configured. For those models
+`batch_sizes` alone enables capture, and any `num_tokens` or `seq_lens` you set
+is ignored.
+
+Batch sizes that do not fit `encoder_max_num_tokens` divided by the model's
+encoder output length are dropped, and the encoder stays eager when none fit.
+Size the encoder token budget for the largest bucket before setting the
+buckets: Whisper emits 1500 encoder positions per request, so `batch_sizes` up
+to 8 needs `encoder_max_num_tokens` of at least 12000. `encoder_max_num_tokens`
+falls back to `max_num_tokens` when unset, which is a decoder-sized number and
+usually too small.
+
+```python
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig
+
+
+llm = LLM(
+    model="openai/whisper-large-v3",
+    backend="pytorch",
+    attn_backend="TRTLLM",
+    max_batch_size=8,
+    encoder_max_batch_size=8,
+    # 8 buckets * 1500 encoder positions. Leave this at the default and the
+    # 4 and 8 buckets are silently dropped.
+    encoder_max_num_tokens=12000,
+    encoder_cuda_graph_config=EncodeCudaGraphConfig(batch_sizes=[1, 2, 4, 8]),
+    # ... the remaining Whisper settings from "Transcribe audio with Whisper",
+    # whose `max_batch_size=4` this example raises to 8
+)
+```
+
 `max_batch_size` controls the total decoder concurrency, while
 `encoder_max_batch_size` controls encoder microbatch admission. For better
 performance, tune `encoder_max_batch_size`, `encoder_max_num_tokens`, and the
@@ -655,6 +696,13 @@ Check that `encoder_cuda_graph_config` and `encoder_max_batch_size` are set,
 that the encoder graph buckets cover the request shape, and that
 `attn_backend="TRTLLM"`. Unsupported shapes and attention backends fall back to
 eager encoder execution.
+
+### `num_tokens` or `seq_lens` unset is rejected at engine construction
+
+A text encoder needs both bucket lists, so the engine raises rather than
+silently running eager. Supply them, or drop `encoder_cuda_graph_config` if you
+do not want encoder graphs. A fixed-shape feature encoder such as Whisper does
+not hit this: it derives both from the model and needs only `batch_sizes`.
 
 ### Output quality differs from the Hugging Face example
 

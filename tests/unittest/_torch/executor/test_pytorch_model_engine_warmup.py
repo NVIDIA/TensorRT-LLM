@@ -195,6 +195,7 @@ class TestWarmupCleanup(unittest.TestCase):
             enabled=True,
             is_encoder_decoder=True,
             is_warmup_only=False,
+            feature_mode=False,
             allow_capture=allow_capture,
         )
         model_engine.encoder_cuda_graph_runner = runner

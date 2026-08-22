@@ -49,7 +49,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -221,6 +221,38 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
         ),
         encoder_max_batch_size=encoder_max_batch_size,
     )
+    executor.model_engine = types.SimpleNamespace(
+        encoder_cuda_graph_runner=types.SimpleNamespace(
+            feature_mode=False, enabled=True, supported_batch_sizes=batch_sizes
+        )
+    )
+    executor.batch_wait_timeout_iters = 48
+    executor.encoder_batch_wait_iters_count = 0
+    return executor
+
+
+def _make_feature_encoder_batch_wait_executor(
+    runner_batch_sizes, encoder_max_batch_size=8, runner_enabled=True
+):
+    """Batch-wait executor whose encoder graph config is the feature variant.
+
+    A feature encoder leaves `num_tokens` / `seq_lens` unset and may have had
+    its `batch_sizes` derived rather than configured, so the resolved sizes come
+    from the engine's encoder graph runner rather than the config.
+    """
+    executor = object.__new__(PyExecutor)
+    executor.max_batch_size = 32
+    executor.llm_args = types.SimpleNamespace(
+        encoder_cuda_graph_config=EncodeCudaGraphConfig(enable_padding=True),
+        encoder_max_batch_size=encoder_max_batch_size,
+    )
+    executor.model_engine = types.SimpleNamespace(
+        encoder_cuda_graph_runner=types.SimpleNamespace(
+            supported_batch_sizes=runner_batch_sizes,
+            enabled=runner_enabled,
+            feature_mode=True,
+        )
+    )
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
@@ -232,6 +264,7 @@ def _make_encoder_fallback_batch_wait_executor():
         encoder_cuda_graph_config=None,
         encoder_max_batch_size=None,
     )
+    executor.model_engine = types.SimpleNamespace(encoder_cuda_graph_runner=None)
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     executor.batch_wait_max_tokens_ratio = 0.5
@@ -268,6 +301,69 @@ def test_encoder_graph_warmup_uses_runtime_encoder_stream():
     executor.model_engine._warmup_encoder_cuda_graphs_enc_dec.assert_called_once_with(
         executor.resource_manager
     )
+
+
+@pytest.mark.parametrize(
+    "runner_batch_sizes,config_batch_sizes,num_requests,expected",
+    [
+        # A feature encoder leaves num_tokens / seq_lens unset, so gating this
+        # path on them would skip microbatch admission entirely.
+        ([1, 2, 4, 8], None, 12, 8),
+        # The runner's list is authoritative: the engine filters the configured
+        # sizes by the scheduler's encoder-batch bound, so the config alone can
+        # name sizes that were never captured.
+        ([1, 2, 3, 4], [1, 2, 3, 4, 8], 6, 4),
+    ],
+)
+def test_encoder_microbatch_admission_uses_resolved_feature_batch_sizes(
+    runner_batch_sizes, config_batch_sizes, num_requests, expected
+):
+    executor = _make_feature_encoder_batch_wait_executor(runner_batch_sizes)
+    if config_batch_sizes is not None:
+        executor.llm_args.encoder_cuda_graph_config.batch_sizes = config_batch_sizes
+    encoder_requests = [object() for _ in range(num_requests)]
+
+    scheduled = executor._waiting_encoder_requests(
+        encoder_requests,
+        [],
+        [object()] * 20,
+    )
+
+    assert scheduled == encoder_requests[:expected]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_microbatch_admission_skips_uncaptured_padded_size():
+    # An `encoder_max_batch_size` above `max_batch_size` leaves a captured
+    # bucket beyond the admission limit. Padding admission up to the limit
+    # itself is a token-path move: a feature batch of 8 would have to pad to
+    # the captured 16, which `pad_batch` refuses, so it must target 4 instead.
+    executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 16], encoder_max_batch_size=16)
+    executor.max_batch_size = 8
+    encoder_requests = [object() for _ in range(12)]
+
+    scheduled = executor._waiting_encoder_requests(encoder_requests, [], [object()] * 2)
+
+    assert scheduled == encoder_requests[:4]
+    assert executor.encoder_batch_wait_iters_count == 0
+
+
+def test_encoder_microbatch_admission_ignores_disabled_feature_runner():
+    # supported_batch_sizes stays populated from the config even when capture
+    # was declined (TP > 1, or no bucket fits), so waiting on those shapes
+    # would stall a batch that can only ever run eager. With no decoder work
+    # the request must be released immediately instead.
+    executor = _make_feature_encoder_batch_wait_executor([1, 2, 4, 8], runner_enabled=False)
+    executor.batch_wait_max_tokens_ratio = 0.5
+    executor.max_num_tokens = 32
+    executor.active_requests = []
+    executor.inflight_req_ids = _InflightRequestIds()
+    encoder_requests = [_make_encoder_request(0)]
+
+    scheduled = executor._waiting_encoder_requests(encoder_requests, [], [])
+
+    assert scheduled == encoder_requests
+    assert executor.encoder_batch_wait_iters_count == 0
 
 
 def test_encoder_microbatch_graph_admission_boundaries():

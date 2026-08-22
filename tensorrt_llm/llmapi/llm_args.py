@@ -308,27 +308,35 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         min_length=1,
         description=
         "List of total token counts (sum of all per-request sequence lengths "
-        "in a batch) to create encoder CUDA graphs for.")
+        "in a batch) to create encoder CUDA graphs for. Required for an "
+        "encoder that packs a variable number of tokens per request; ignored "
+        "by an encoder whose input is a fixed-shape per-request feature "
+        "tensor, which derives this from the model.")
 
     max_num_token: NonNegativeInt = Field(
         default=0,
         description="Maximum total number of tokens for encoder CUDA graphs. If "
         "`num_tokens` is provided, must equal max(num_tokens); otherwise "
-        "`num_tokens` is generated from this value.")
+        "`num_tokens` is generated from this value. Ignored by a fixed-shape "
+        "feature encoder.")
 
     seq_lens: Optional[List[PositiveInt]] = Field(
         default=None,
         min_length=1,
         description=
         "List of max per-request sequence lengths to create encoder CUDA "
-        "graphs for.")
+        "graphs for. Required for an encoder that packs a variable number of "
+        "tokens per request; ignored by an encoder whose input is a "
+        "fixed-shape per-request feature tensor, which derives this from the "
+        "model.")
 
     max_seq_len: NonNegativeInt = Field(
         default=0,
         description=
         "Maximum per-request sequence length for encoder CUDA graphs. If "
         "`seq_lens` is provided, must equal max(seq_lens); otherwise "
-        "`seq_lens` is generated from this value.")
+        "`seq_lens` is generated from this value. Ignored by a fixed-shape "
+        "feature encoder.")
 
     @model_validator(mode='after')
     def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
@@ -5300,15 +5308,11 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.encoder_max_batch_size is None:
             raise ValueError(
                 "encoder_cuda_graph_config requires encoder_max_batch_size.")
-        missing = []
-        if not self.encoder_cuda_graph_config.num_tokens:
-            missing.append("num_tokens/max_num_token")
-        if not self.encoder_cuda_graph_config.seq_lens:
-            missing.append("seq_lens/max_seq_len")
-        if missing:
-            raise ValueError("encoder_cuda_graph_config requires "
-                             f"{' and '.join(missing)}.")
-
+        # `num_tokens` / `seq_lens` are checked by the model engine rather than
+        # here: an encoder whose input is a fixed-shape per-request feature
+        # tensor derives both from the model, and only the engine knows which
+        # kind of encoder the model has. It still raises for the token encoders
+        # that require them.
         return self
 
     attn_backend: str = Field(
