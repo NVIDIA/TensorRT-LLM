@@ -1996,12 +1996,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # the model does not specify one, so paged-context attention does not
         # read stale page-table entries (BAD_PAGE_INDEX).
         if forward_args.attention_window_size is None and metadata.kv_cache_manager is not None:
-            window_vec = getattr(metadata.kv_cache_manager,
-                                 'max_attention_window_vec', None)
-            if window_vec:
-                window = window_vec[self.local_layer_idx % len(window_vec)]
-                if window is not None:
-                    forward_args.attention_window_size = window
+            window = metadata.kv_cache_manager.max_attention_window_vec[
+                self.local_layer_idx]
+            if window is not None:
+                forward_args.attention_window_size = window
         if forward_args.attention_window_size is None:
             forward_args.attention_window_size = metadata.max_seq_len
 
