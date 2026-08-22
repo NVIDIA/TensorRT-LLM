@@ -1509,6 +1509,13 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
+        # POC: if this is a BOLT-instrumented build (CI profile-gen job sets
+        # TLLM_BOLT_CLEAR_COUNTERS=1), reset the instrumentation counters now
+        # that all startup JIT/autotune/graph-capture is done, so the emitted
+        # .fdata reflects steady-state serving only. No-op on normal builds.
+        from ..bolt_profiling import maybe_bolt_clear_counters
+        maybe_bolt_clear_counters()
+
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
         every 32-aligned batch bucket the runtime can produce.
