@@ -1028,7 +1028,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._host_paged_kv_indices: Optional[torch.Tensor] = None
         self._host_paged_kv_indptr_decode: Optional[torch.Tensor] = None
         self._uses_full_generation_page_table = False
-        self._host_paged_kv_last_page_len: Optional[torch.Tensor] = None
         self._max_num_blocks_per_seq = 0
 
         # VSWA (Variable Sliding Window Attention): models with per-layer
@@ -1451,6 +1450,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     elif wrappers.fa2_plan_num_blocks == num_blocks:
                         continue
                     else:
+                        # Graph replay does not re-enter forward_impl. Refresh
+                        # captured FA2 schedules here; each wrapper owns its
+                        # persistent integer plan workspace, while the shared
+                        # float workspace is run scratch.
                         wrappers.is_planned = False
                         self._plan_with_params(plan_params)
                         continue
@@ -1696,11 +1699,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        # Multi-wrapper case (Gemma4 hybrid: different head_dim per layer)
-        # shares one workspace_buffer; eager plan() would overwrite earlier
-        # wrappers' workspace, so defer plan() to forward_impl. Single-wrapper
-        # case (e.g., Llama, Gemma3 uniform head_dim) needs eager plan() here
-        # because forward_impl cannot plan() during cuda-graph stream capture.
+        # Defer ordinary multi-wrapper plans to forward_impl. Captured FA2
+        # schedule refreshes are handled eagerly by _clean_cached_plans because
+        # graph replay does not re-enter Python. Single-wrapper models still
+        # plan eagerly because forward_impl cannot plan during graph capture.
         active_wrappers = [
             pp for pp in self._plan_params_to_wrappers
             if pp.attention_mask_data is None
