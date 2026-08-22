@@ -116,6 +116,7 @@ from ..modules.fused_moe.interface import _compute_ep_partition
 from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear as TrtllmLinear
+from ..modules.linear import TensorParallelMode, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
@@ -1665,7 +1666,7 @@ class KimiKDARuntime(nn.Module):
         if state_indices is None or state_indices.shape[0] != batch_size:
             state_indices = mamba_metadata.state_indices[:batch_size].long()
         cu_seqlens = mamba_metadata.query_start_loc_long[: num_prefills + 1]
-        num_decodes = batch_size - num_prefills
+        num_generations = batch_size - num_prefills
 
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W] bf16
@@ -1685,9 +1686,9 @@ class KimiKDARuntime(nn.Module):
                     layer_cache,
                 )
             )
-        if num_decodes > 0:
-            decode_rows = hidden_states.shape[0] - num_ctx_tokens
-            if decode_rows == num_decodes:
+        if num_generations > 0:
+            num_gen_tokens = hidden_states.shape[0] - num_ctx_tokens
+            if num_gen_tokens == num_generations:
                 outputs.append(
                     self._forward_decode(
                         hidden_states[num_ctx_tokens:],
@@ -1710,13 +1711,13 @@ class KimiKDARuntime(nn.Module):
                 # SpeculativeState scratch buffers — never the live pools —
                 # and kv_cache_manager.update_mamba_states() promotes the
                 # accepted step after sampling.
-                assert decode_rows % num_decodes == 0, (
-                    f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
+                assert num_gen_tokens % num_generations == 0, (
+                    f"ragged generation batch: {num_gen_tokens} tokens for {num_generations} requests"
                 )
                 outputs.append(
                     self._forward_verify(
                         hidden_states[num_ctx_tokens:],
-                        decode_rows // num_decodes,
+                        num_gen_tokens // num_generations,
                         layer_cache,
                         conv_pool,
                         ssm_pool,
@@ -1732,7 +1733,7 @@ class KimiKDARuntime(nn.Module):
 
     def _has_kda_replay_caches(self, layer_cache) -> bool:
         """True when the manager allocated the fused-verify replay caches."""
-        return getattr(layer_cache, "kda_qkg_cache", None) is not None
+        return layer_cache is not None and layer_cache.has_kda_replay_caches
 
     def _sync_kda_replay_conv_window(
         self, layer_cache, slot_indices, conv_q, conv_k, conv_v
@@ -1748,13 +1749,7 @@ class KimiKDARuntime(nn.Module):
         """
         if not self._has_kda_replay_caches(layer_cache):
             return
-        w = self.mixer.conv_size
-        for cache, window in (
-            (layer_cache.kda_conv_q, conv_q),
-            (layer_cache.kda_conv_k, conv_k),
-            (layer_cache.kda_conv_v, conv_v),
-        ):
-            cache[:, :, : w - 1].index_copy_(0, slot_indices, window[:, :, 1:].to(cache.dtype))
+        layer_cache.commit_conv_window(slot_indices, conv_q, conv_k, conv_v, self.mixer.conv_size)
 
     def _forward_prefill(
         self,
@@ -2203,12 +2198,12 @@ class KimiKDARuntime(nn.Module):
         additively with a token offset ``>= num_accepted``.
         """
         mixer = self.mixer
-        num_decodes = x2d.shape[0] // num_steps
+        num_generations = x2d.shape[0] // num_steps
         num_spec = num_steps - 1
         H = mixer.num_heads
         K = mixer.head_k_dim
-        x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
-        T_total = num_decodes * num_steps
+        x = x2d.view(num_generations, num_steps, -1)  # [B, T, hidden]
+        T_total = num_generations * num_steps
 
         projections = self._project_verify_inputs(x, T_total)
         if projections is None:
@@ -2239,9 +2234,9 @@ class KimiKDARuntime(nn.Module):
             torch.int32
         )  # accepted drafts of the previous round, per req
         cu_seqlens = torch.arange(
-            0, (num_decodes + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
+            0, (num_generations + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
         )
-        cu_seqlens[:num_decodes].sub_(pending)
+        cu_seqlens[:num_generations].sub_(pending)
 
         out = mixer._dispatch.mtp_verify(
             x_q=x_q,
@@ -2270,7 +2265,7 @@ class KimiKDARuntime(nn.Module):
             lower_bound=lower_bound,
             scale=mixer.head_k_dim**-0.5,
         )
-        o = out.view(num_decodes, num_steps, H, mixer.head_dim)
+        o = out.view(num_generations, num_steps, H, mixer.head_dim)
         return self._output_gate_and_proj(x, o, onorm_g)
 
     def _build_mtp_conv_weights(self) -> None:
@@ -2316,8 +2311,8 @@ class KimiKDARuntime(nn.Module):
 
         mixer = self.mixer
         d = self.proj_size
-        num_decodes = x2d.shape[0] // num_steps
-        x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
+        num_generations = x2d.shape[0] // num_steps
+        x = x2d.view(num_generations, num_steps, -1)  # [B, T, hidden]
 
         projections = self._project_verify_inputs(x, x2d.shape[0])
         if projections is None:
@@ -2373,12 +2368,12 @@ class KimiKDARuntime(nn.Module):
             )
             step_outputs.append(o_t)
 
-            # Batch-row indexed ([:num_decodes] prefix), matching
+            # Batch-row indexed ([:num_generations] prefix), matching
             # update_mamba_states()'s intermediate_state_indices.
-            intermediate_conv[:num_decodes, t] = torch.cat([conv_q, conv_k, conv_v], dim=1).to(
+            intermediate_conv[:num_generations, t] = torch.cat([conv_q, conv_k, conv_v], dim=1).to(
                 intermediate_conv.dtype
             )
-            intermediate_ssm[:num_decodes, t] = state.to(intermediate_ssm.dtype)
+            intermediate_ssm[:num_generations, t] = state.to(intermediate_ssm.dtype)
 
         o = torch.cat(step_outputs, dim=1)  # [B, T, H, V]
         return self._output_gate_and_proj(x, o, onorm_g)
@@ -3074,6 +3069,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 kda_tp_rank = layer.self_attn._kda_tp_rank
                 break
 
+        COL = TensorParallelMode.COLUMN  # shards output rows (dim 0)
+        ROW = TensorParallelMode.ROW  # shards input columns (dim 1)
+        is_kda_by_layer = [getattr(layer, "is_kda", False) for layer in self.model.layers]
+
+        def _layer_is_kda(name: str) -> bool:
+            idx = int(name.split("layers.", 1)[1].split(".", 1)[0])
+            return is_kda_by_layer[idx]
+
         def load_param(name: str, param: torch.nn.Parameter):
             if device.type == "cuda":
                 torch.cuda.set_device(device)
@@ -3081,22 +3084,25 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 # Row-concat the checkpoint's separate gate_proj / up_proj
                 # tensors into the fused [gate | up] parameter.
                 gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
-                # This branch materializes its own sources, so it needs the
-                # same FP8 handling as the single-tensor path below.
-                gate = _dequantize_fp8_block_scaled(
+                inter = param.shape[0] // 2
+                # Materialize + FP8-block-dequant each half (this branch reads
+                # its own sources, so it needs the same FP8 handling as the
+                # single-tensor path below), then column(TP)-shard and
+                # row-concat. TP factor from the checkpoint-vs-param shapes; a
+                # subgroup smaller than model TP repeats, so the shard index is
+                # model tp_rank modulo the half's shard count.
+                gate_full = _dequantize_fp8_block_scaled(
                     gate_key, _materialize(weights[gate_key]), weights
                 )
-                up = _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights)
-                inter = param.shape[0] // 2
-                if gate.shape[0] != inter and gate.shape[0] % inter == 0:
-                    # TP-sharded fused MLP (shared experts on the direct
-                    # MoE path, dense MLP with attention-DP off): take this
-                    # subgroup rank's matching row block from each half so
-                    # the SiTU gate/up pairs stay aligned.
-                    shard_count = gate.shape[0] // inter
-                    lo = (model_tp_rank % shard_count) * inter
-                    gate = gate[lo : lo + inter]
-                    up = up[lo : lo + inter]
+                tp = gate_full.shape[0] // inter
+                rk = (model_tp_rank % tp) if tp > 1 else 0
+                gate = load_weight_shard(gate_full, tp, rk, COL)
+                up = load_weight_shard(
+                    _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights),
+                    tp,
+                    rk,
+                    COL,
+                )
                 if gate.shape != (inter, param.shape[1]) or up.shape != gate.shape:
                     raise ValueError(
                         f"{name}: checkpoint gate/up shapes "
@@ -3153,9 +3159,32 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                             f"{param.numel()} entries, got nonzero tail"
                         )
                     src = src[: param.numel()]
+            if ".self_attn." in name and _layer_is_kda(name):
+                # KDA head-shard: the checkpoint is an exact kda_tp_size
+                # multiple on the head-major axis. Replicated projections
+                # (f_a/g_a, o_norm) already match and are copied as-is;
+                # o_proj shards its input columns (ROW), every other
+                # head-major projection its output rows (COLUMN). MLA
+                # projections are head-sharded by their own Linear modules
+                # (mla_head_shard_linears) in the shape-mismatch block below.
+                if src.shape != param.shape:
+                    mode = ROW if name.endswith(".o_proj.weight") else COL
+                    src = load_weight_shard(src, kda_tp_size, kda_tp_rank, mode)
+            elif ".shared_experts." in name or ".mlp." in name:
+                # Shared-expert / dense-MLP: gate/up column, down row; TP factor
+                # from the shapes (the module is built at the per-rank dim). A
+                # subgroup smaller than model TP repeats, so the shard index is
+                # model tp_rank modulo the parameter's shard count.
+                if src.shape != param.shape:
+                    mode, axis = (ROW, 1) if name.endswith(".down_proj.weight") else (COL, 0)
+                    tp = src.shape[axis] // param.shape[axis]
+                    src = load_weight_shard(src, tp, (model_tp_rank % tp) if tp > 1 else 0, mode)
+
             if src.shape != param.shape:
-                # Delegate MLA q_b/g/o slicing to the same Linear modules that
-                # own their COLUMN/ROW sharding policy. KV-B is handled above.
+                # MLA q_b/g/o head-shard: delegate to the same Linear modules
+                # that own their COLUMN/ROW sharding policy (#17684 removed the
+                # 96->128 head padding). KV-B is handled above; KDA and
+                # shared-expert/MLP shards were resolved in the pre-block above.
                 mla_sharded_linear = mla_head_shard_linears.get(id(param))
                 if mla_sharded_linear is not None:
                     shard = mla_sharded_linear.load_shard(src, device=param.device)
@@ -3166,61 +3195,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         )
                     param.data.copy_(shard.to(param.dtype))
                     return
-                # KDA head-shard (attention-DP off): every mismatching KDA
-                # tensor is head-major with the checkpoint exactly
-                # kda_tp_size times larger on one axis — q/k/v/g/f_b
-                # projections, b_proj, dt_bias, and the depthwise conv
-                # weights on dim 0 (rows), o_proj on dim 1 (columns).
-                # MLA head-sharded projections were handled by parameter
-                # identity above, so shape ratios identify the KDA slices.
-                if kda_tp_size > 1 and ".self_attn." in name:
-                    if (
-                        src.shape[0] == param.shape[0] * kda_tp_size
-                        and src.shape[1:] == param.shape[1:]
-                    ):
-                        s = param.shape[0]
-                        lo = kda_tp_rank * s
-                        param.data.copy_(src[lo : lo + s].to(param.dtype))
-                        return
-                    if (
-                        src.dim() == 2
-                        and src.shape[0] == param.shape[0]
-                        and src.shape[1] == param.shape[1] * kda_tp_size
-                    ):
-                        s = param.shape[1]
-                        lo = kda_tp_rank * s
-                        param.data.copy_(src[:, lo : lo + s].to(param.dtype))
-                        return
-                # Shared-expert TP (direct MoE path): the module holds a
-                # 1/tp shard of the FFN dim — column shard for gate/up
-                # (output rows), row shard for down (input columns).
-                if ".shared_experts." in name or ".mlp." in name:
-                    # Shared experts (direct MoE path) and the dense L0
-                    # MLP (attention-DP off): the fused gate_up_proj is
-                    # sliced in its dedicated branch above; here the
-                    # unfused halves (if ever configured) and down_proj.
-                    if (
-                        name.endswith((".gate_proj.weight", ".up_proj.weight"))
-                        and src.shape[0] % param.shape[0] == 0
-                        and src.shape[1:] == param.shape[1:]
-                    ):
-                        shard_count = src.shape[0] // param.shape[0]
-                        lo = (model_tp_rank % shard_count) * param.shape[0]
-                        param.data.copy_(src[lo : lo + param.shape[0]].to(param.dtype))
-                        return
-                    if (
-                        name.endswith(".down_proj.weight")
-                        and src.shape[1] % param.shape[1] == 0
-                        and src.shape[0] == param.shape[0]
-                    ):
-                        shard_count = src.shape[1] // param.shape[1]
-                        lo = (model_tp_rank % shard_count) * param.shape[1]
-                        param.data.copy_(src[:, lo : lo + param.shape[1]].to(param.dtype))
-                        return
                 raise ValueError(
-                    f"{name}: checkpoint shape "
-                    f"{tuple(src.shape)} != param shape "
-                    f"{tuple(param.shape)}"
+                    f"{name}: shard/pad result {tuple(src.shape)} != param "
+                    f"shape {tuple(param.shape)}"
                 )
             param.data.copy_(src.to(param.dtype))
             # Keep the checkpoint's FP8 pair for the weight-read conversion,

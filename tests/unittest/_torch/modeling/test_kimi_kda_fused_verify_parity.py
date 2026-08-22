@@ -147,6 +147,7 @@ def _make_fused_layer_cache(B, conv_pool):
         kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
         kda_beta_cache=torch.zeros(B, M, H, device="cuda", dtype=torch.float32),
         prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
+        has_kda_replay_caches=True,
         intermediate_conv_window=None,
         intermediate_ssm=None,
     )
@@ -156,6 +157,7 @@ def _make_seq_layer_cache(B):
     d = H * K
     return SimpleNamespace(
         kda_qkg_cache=None,
+        has_kda_replay_caches=False,
         intermediate_conv_window=torch.zeros(
             B, M + 1, 3 * d, W, device="cuda", dtype=torch.bfloat16
         ),
