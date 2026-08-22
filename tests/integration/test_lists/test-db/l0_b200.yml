@@ -108,6 +108,7 @@ l0_b200:
   - unittest/_torch/modules/moe/test_kimi_k3_mlp.py
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
+  - unittest/_torch/custom_ops/test_cutedsl_fc2_tuning.py
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
