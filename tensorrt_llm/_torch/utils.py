@@ -543,7 +543,28 @@ def split(x: torch.Tensor,
     return torch.split(x, split_size, dim=dim)[idx]
 
 
+@functools.lru_cache(maxsize=1)
+def _fused_relu2_impl():
+    """Resolve the fused relu2 kernel once, or None if it is unavailable.
+
+    Kept lazy so importing this module does not pull in Triton, and so a build
+    without a working Triton falls back instead of failing at import time.
+    """
+    if os.environ.get("TRTLLM_FUSED_RELU2", "1") != "1":
+        return None
+    try:
+        from .fused_relu2_triton import fused_relu2, is_eligible
+        return fused_relu2, is_eligible
+    except ImportError:
+        return None
+
+
 def relu2(x: torch.Tensor) -> torch.Tensor:
+    # Fusing the two elementwise passes halves the activation's memory traffic.
+    # Bit-identical to the eager form; set TRTLLM_FUSED_RELU2=0 to disable.
+    impl = _fused_relu2_impl()
+    if impl is not None and impl[1](x):
+        return impl[0](x)
     return torch.square(F.relu(x))
 
 
