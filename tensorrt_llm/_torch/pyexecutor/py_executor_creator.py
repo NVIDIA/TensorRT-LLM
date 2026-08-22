@@ -207,6 +207,19 @@ def _get_mapping(_mapping: Mapping) -> Mapping:
     return mapping
 
 
+def _get_draft_llm_args(llm_args: TorchLlmArgs,
+                        spec_config: SpeculativeConfig) -> TorchLlmArgs:
+    draft_llm_args = copy.copy(llm_args)
+    if spec_config.moe_backend is not None:
+        draft_llm_args.moe_config = llm_args.moe_config.model_copy(
+            update={"backend": spec_config.moe_backend})
+
+    if spec_config.load_format == "dummy":
+        draft_llm_args.load_format = LoadFormat.DUMMY
+
+    return draft_llm_args
+
+
 def update_sampler_max_seq_len(max_seq_len, sampler):
     # Originally, TRTLLMSampler is constructed with executor_config, but
     # _create_kv_cache_manager (via build_managers) may later overwrite executor_config.max_seq_len.
@@ -651,9 +664,7 @@ def create_py_executor(
             else:
                 drafting_loop_wrapper = None
 
-            draft_llm_args = copy.copy(llm_args)
-            if spec_config.load_format == "dummy":
-                draft_llm_args.load_format = LoadFormat.DUMMY
+            draft_llm_args = _get_draft_llm_args(llm_args, spec_config)
 
             model_weights_memory_tag = None
             model_weights_restore_mode = None

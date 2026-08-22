@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import sys
 import unittest
@@ -1767,6 +1782,77 @@ def test_mtp_checkpoint_type_config(uses_external_draft_model):
         assert get_num_spec_layers(spec_config) == 0
         assert get_num_extra_kv_tokens(spec_config) == 0
         assert not should_use_separate_draft_kv_cache(spec_config)
+
+
+@pytest.mark.parametrize("num_nextn_predict_layers", [2, 3])
+def test_mtp_moe_backend_rejected_after_checkpoint_resolves_one_engine(
+    num_nextn_predict_layers,
+):
+    spec_config = MTPDecodingConfig(
+        max_draft_len=1,
+        speculative_model="/tmp/assistant",
+        mtp_eagle_one_model=False,
+        moe_backend="CUTLASS",
+    )
+    assert spec_config.spec_dec_mode.is_mtp_eagle()
+    model_config = SimpleNamespace(
+        architectures=["LlamaForCausalLM"],
+        num_nextn_predict_layers=num_nextn_predict_layers,
+    )
+
+    with pytest.raises(ValueError, match="does not support one-engine MTP"):
+        update_spec_config_from_model_config(spec_config, model_config)
+
+
+def test_mtp_moe_backend_allowed_after_checkpoint_keeps_two_engine():
+    spec_config = MTPDecodingConfig(
+        max_draft_len=1,
+        speculative_model="/tmp/assistant",
+        mtp_eagle_one_model=False,
+        moe_backend="CUTLASS",
+    )
+    model_config = SimpleNamespace(
+        architectures=["LlamaForCausalLM"],
+        num_nextn_predict_layers=1,
+    )
+
+    update_spec_config_from_model_config(spec_config, model_config)
+
+    assert spec_config.spec_dec_mode.is_mtp_eagle()
+
+
+def test_mtp_moe_backend_rejected_for_internal_mtp_eagle_one_model():
+    spec_config = MTPDecodingConfig(
+        max_draft_len=1,
+        speculative_model="/tmp/assistant",
+        moe_backend="CUTLASS",
+    )
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    model_config = SimpleNamespace(
+        architectures=["LlamaForCausalLM"],
+        num_nextn_predict_layers=1,
+    )
+
+    with pytest.raises(ValueError, match="does not support one-engine MTP"):
+        update_spec_config_from_model_config(spec_config, model_config)
+
+
+def test_mtp_moe_backend_allowed_for_shared_kv_external_assistant():
+    spec_config = MTPDecodingConfig(
+        max_draft_len=1,
+        speculative_model="/tmp/assistant",
+        moe_backend="CUTLASS",
+    )
+    model_config = SimpleNamespace(
+        architectures=["Gemma4ForCausalLM"],
+        num_nextn_predict_layers=1,
+    )
+
+    update_spec_config_from_model_config(spec_config, model_config)
+
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec_config._use_shared_kv_cache
+    assert spec_config.moe_backend == "CUTLASS"
 
 
 def test_mtp_shared_kv_draft_inputs():
