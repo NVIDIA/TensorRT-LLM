@@ -8236,7 +8236,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False,
                                         dtype="fp8" if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
-            implementation="msa" if use_msa else "triton")
+            implementation="msa" if use_msa else "triton",
+            indexer_kv_dtype="fp8" if use_msa else "bf16")
         moe_config = MoeConfig(backend="CUTLASS")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,

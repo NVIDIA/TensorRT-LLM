@@ -381,6 +381,26 @@ def _register_fake():
         # x_q is [1, tokens, H, 128]; the kernel emits one row per token.
         return x_q.new_empty((x_q.size(1), 1, x_v.size(2), x_v.size(3)))
 
+    @torch.library.register_fake("trtllm::minimax_m3_fp8_indexer_qk_norm_rope")
+    def minimax_m3_fp8_indexer_qk_norm_rope_fake(
+        qk: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        num_heads_q: int,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        base: float,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Infer the specialized index-Q result without executing CUDA."""
+        del index_k_cache, out_cache_loc, rotary_dim, eps, q_weight, k_weight
+        del base, position_ids
+        return qk.new_empty((qk.shape[0], num_heads_q, head_dim),
+                            dtype=torch.float8_e4m3fn)
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)
