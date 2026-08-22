@@ -150,6 +150,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``sparse_index_dim`` — width of the index-K/V vectors.
     """
 
+    _main_kv_mapper_kind = MapperKind.NHD
+
     def __init__(
         self,
         *args,
@@ -164,6 +166,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # disable_index_value=True, sparse_index_dim=128).
         sparse_attn_config = kwargs.get("sparse_attn_config")
         num_layers = kwargs.get("num_layers")
+        implementation = getattr(sparse_attn_config, "implementation", "triton")
+        self._main_kv_mapper_kind = MapperKind.HND if implementation == "msa" else MapperKind.NHD
 
         if sparse_index_dim is None:
             sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
@@ -230,11 +234,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         }
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
-        """Declare MiniMax M3's token-major K/V and replicated index-K."""
+        """Declare the backend's main K/V layout and replicated index-K."""
         return {
-            Role.ALL: MapperKind.NHD,
+            Role.ALL: self._main_kv_mapper_kind,
             Role.INDEX_KEY: MapperKind.REPLICATED,
         }
+
+    def _main_kv_layout_name(self) -> str:
+        """Return the tensor-view layout name for the selected mapper kind."""
+        return "HND" if self._main_kv_mapper_kind == MapperKind.HND else "NHD"
 
     def _compute_num_total_slots(self) -> int:
         """Total token slots across all blocks in the main K pool.
@@ -258,12 +266,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return torch.float32
         return torch.bfloat16
 
-    def get_index_k_buffer(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def get_index_k_buffer(
+        self, layer_idx: int, kv_layout: Optional[str] = None
+    ) -> Optional[torch.Tensor]:
         """Return the V2-managed paged index-K view for ``layer_idx``.
 
         NHD shape is ``[num_pages, tokens_per_block, 1, sparse_index_dim]``;
         HND shape is ``[num_pages, 1, tokens_per_block, sparse_index_dim]``.
+        When omitted, ``kv_layout`` follows the selected sparse backend.
         """
+        if kv_layout is None:
+            kv_layout = self._main_kv_layout_name()
         return super().get_index_k_buffer(
             layer_idx,
             num_heads=1,
@@ -279,7 +292,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     def has_index_value(self, layer_idx: int) -> bool:
         return layer_idx in self._index_v_buffers
 
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def get_buffers(
+        self, layer_idx: int, kv_layout: Optional[str] = None
+    ) -> Optional[torch.Tensor]:
         """Return a paged K+V view with strides spanning the coalesced pool.
 
         The base :meth:`KVCacheManagerV2.get_buffers` produces a
@@ -295,7 +310,10 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         at K's base, then slices ``[:, :2]`` to extract K+V. The slice
         preserves the dim-0 stride (``scale * page_stride``), so
         ``view[s, 0/1, ...]`` lands on this layer's K/V at slot ``s``.
+        When omitted, ``kv_layout`` follows the selected sparse backend.
         """
+        if kv_layout is None:
+            kv_layout = self._main_kv_layout_name()
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
