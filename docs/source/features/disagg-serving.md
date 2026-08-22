@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Disaggregated Serving
 
 - [Motivation](#Motivation)
@@ -13,6 +18,7 @@
   - [Multiple Instances](#multiple-instances)
 - [Environment Variables](#Environment-Variables)
 - [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
+  - [AWS EFA with LIBFABRIC](#aws-efa-with-libfabric)
 
 ## Motivation
 
@@ -67,6 +73,8 @@ NIXL supports multiple underlying communication backends for KV cache exchange i
 If an unsupported backend is specified, NIXL will automatically fall back to UCX.
 
 For detailed setup instructions and configuration examples, please refer to the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md).
+
+For AWS EFA deployments, see the [AWS EFA and LIBFABRIC for Disaggregated Serving](disagg-serving-aws-efa.md) checklist.
 
 ### Overlap Optimization
 
@@ -393,6 +401,14 @@ A. Yes, but it's not recommended. TRT-LLM does not implement optimal scheduling 
 A. Yes, it's recommended that different server instances use different GPUs. We support running context and generation servers on the same node or different nodes. The `CUDA_VISIBLE_DEVICES` env variable can be used to control which GPUs are used by each instance.
 
 ### Debugging FAQs
+
+#### AWS EFA with LIBFABRIC
+
+For cross-node deployments on AWS EFA, the NIXL cache transceiver can use the
+LIBFABRIC transport by setting `cache_transceiver_config.backend: NIXL` and
+`TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`. See
+[AWS EFA and LIBFABRIC for Disaggregated Serving](disagg-serving-aws-efa.md) for
+the EFA device-plugin, container, Kubernetes, and verification checklist.
 
 *Q. Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?*
 
