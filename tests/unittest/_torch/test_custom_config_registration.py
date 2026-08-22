@@ -153,3 +153,104 @@ def test_load_hf_model_config_uses_autoconfig_dispatch(tmp_path, model_type):
     assert cfg is not None
     assert isinstance(cfg, DeepseekV3Config)
     assert cfg.max_position_embeddings == 16384
+
+
+# The published nvidia/NVIDIA-Nemotron-Nano-9B-v2 pattern: "-" marks MLP layers.
+_NEMOTRON_H_DENSE_PATTERN = "M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-"
+
+
+def _nemotron_h_min_config(pattern: str) -> dict:
+    return {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "hybrid_override_pattern": pattern,
+        "num_hidden_layers": len(pattern),
+        "hidden_size": 4480,
+        "intermediate_size": 15680,
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "max_position_embeddings": 131072,
+        "vocab_size": 131072,
+        "ssm_state_size": 128,
+        "conv_kernel": 4,
+        "chunk_size": 128,
+        "n_groups": 8,
+        "mamba_num_heads": 128,
+        "mamba_head_dim": 80,
+        "rms_norm_eps": 1e-5,
+    }
+
+
+def _write_config(tmp_path, name: str, config_dict: dict) -> str:
+    model_dir = tmp_path / name
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(config_dict))
+    return str(model_dir)
+
+
+def test_nemotron_h_dense_pattern_survives_autoconfig(tmp_path):
+    # transformers 5.5.x NemotronHConfig converts hybrid_override_pattern to
+    # layers_block_type with a mapping that only knows "M"/"E"/"*", so every
+    # dense Nemotron-H checkpoint raises `KeyError: '-'` inside
+    # AutoConfig.from_pretrained (and therefore AutoTokenizer.from_pretrained).
+    # TRT-LLM builds the model by iterating hybrid_override_pattern, so the
+    # literal string has to survive config loading intact.
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    model_dir = _write_config(
+        tmp_path, "nemotron_h_dense", _nemotron_h_min_config(_NEMOTRON_H_DENSE_PATTERN)
+    )
+
+    cfg = AutoConfig.from_pretrained(model_dir)
+
+    assert isinstance(cfg, NemotronHConfig)
+    assert cfg.hybrid_override_pattern == _NEMOTRON_H_DENSE_PATTERN
+    assert cfg.num_hidden_layers == len(_NEMOTRON_H_DENSE_PATTERN)
+    # Layer routing in modeling_nemotron_h / model_config counts these chars.
+    assert cfg.hybrid_override_pattern.count("*") == 4
+    assert cfg.hybrid_override_pattern.count("M") == 27
+    assert cfg.hybrid_override_pattern.count("-") == 25
+    assert cfg.layers_block_type.count("mlp") == 25
+    # Attributes modeling_nemotron_h reads off the pretrained config.
+    assert cfg.ssm_state_size == 128
+    assert cfg.mamba_head_dim == 80
+    assert cfg.rms_norm_eps == 1e-5
+    assert cfg.num_nextn_predict_layers == 0
+
+
+def test_nemotron_h_representable_pattern_uses_native_config(tmp_path):
+    # Patterns the installed transformers can express must keep loading through
+    # the native class, so this shim cannot regress checkpoints that work today.
+    from transformers.models.nemotron_h.configuration_nemotron_h import (
+        NemotronHConfig as HFNemotronHConfig,
+    )
+
+    model_dir = _write_config(tmp_path, "nemotron_h_moe", _nemotron_h_min_config("M*E" * 4))
+
+    cfg = AutoConfig.from_pretrained(model_dir)
+
+    assert type(cfg) is HFNemotronHConfig
+    assert cfg.hybrid_override_pattern == "M*E" * 4
+
+
+def test_nemotron_h_invalid_pattern_rejected():
+    from tensorrt_llm._torch.configs import NemotronHConfig
+
+    with pytest.raises(ValueError, match="hybrid_override_pattern"):
+        NemotronHConfig(hybrid_override_pattern="M*XZ-")
+
+
+def test_load_hf_model_config_handles_dense_nemotron_h(tmp_path):
+    # ModelLoader.load_hf_model_config swallows exceptions and returns None,
+    # which is how the KeyError surfaced as a confusing downstream failure.
+    from tensorrt_llm.llmapi.llm_utils import ModelLoader
+
+    model_dir = _write_config(
+        tmp_path, "nemotron_h_loader", _nemotron_h_min_config(_NEMOTRON_H_DENSE_PATTERN)
+    )
+
+    cfg = ModelLoader.load_hf_model_config(model_dir)
+
+    assert cfg is not None
+    assert cfg.hybrid_override_pattern == _NEMOTRON_H_DENSE_PATTERN
