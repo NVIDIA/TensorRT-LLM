@@ -16,6 +16,8 @@ SERVER_LOG_PATH=${SERVER_LOG_PATH-}
 SERVER_PROCESS_PID=${SERVER_PROCESS_PID-}
 BACKEND=${BACKEND-}
 INPUT_REFERENCE=${INPUT_REFERENCE-}
+TRANSFER_HINT=${TRANSFER_HINT-}
+CONTROL_REFERENCE=${CONTROL_REFERENCE-}
 EXTRA_PARAMS=${EXTRA_PARAMS-"{}"}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8000}
@@ -146,11 +148,13 @@ case "$MODE" in
     t2i)
         EXPECTED_BACKEND=openai-images
         ;;
-    t2v|i2v|v2v|t2av|ti2av)
+    t2v|i2v|v2v|transfer|t2av|ti2av)
         EXPECTED_BACKEND=openai-videos
         ;;
     *)
-        fail "MODE must be one of t2i, t2v, i2v, v2v, t2av, or ti2av; got '${MODE}'"
+        fail \
+            "MODE must be one of t2i, t2v, i2v, v2v, transfer, t2av, or " \
+            "ti2av; got '${MODE}'"
         ;;
 esac
 
@@ -159,21 +163,65 @@ if [ -n "$BACKEND" ] && [ "$BACKEND" != "$EXPECTED_BACKEND" ]; then
 fi
 BACKEND=$EXPECTED_BACKEND
 
+if [ -n "$INPUT_REFERENCE" ] && [ ! -f "$INPUT_REFERENCE" ]; then
+    fail "INPUT_REFERENCE file does not exist: ${INPUT_REFERENCE}"
+fi
+if [ -n "$CONTROL_REFERENCE" ] && [ ! -f "$CONTROL_REFERENCE" ]; then
+    fail "CONTROL_REFERENCE file does not exist: ${CONTROL_REFERENCE}"
+fi
+
 case "$MODE" in
     i2v|v2v|ti2av)
         if [ -z "$INPUT_REFERENCE" ]; then
             fail "MODE=${MODE} requires INPUT_REFERENCE pointing to an image or video file"
         fi
-        if [ ! -f "$INPUT_REFERENCE" ]; then
-            fail "INPUT_REFERENCE file does not exist: ${INPUT_REFERENCE}"
+        ;;
+    transfer)
+        if [ -z "$TRANSFER_HINT" ]; then
+            fail "MODE=transfer requires TRANSFER_HINT=edge, blur, depth, seg, or wsm"
         fi
+        case "$TRANSFER_HINT" in
+            edge|blur)
+                if [ -z "$INPUT_REFERENCE" ] && [ -z "$CONTROL_REFERENCE" ]; then
+                    fail \
+                        "TRANSFER_HINT=${TRANSFER_HINT} requires INPUT_REFERENCE or " \
+                        "CONTROL_REFERENCE"
+                fi
+                ;;
+            depth|seg|wsm)
+                if [ -z "$CONTROL_REFERENCE" ]; then
+                    fail "TRANSFER_HINT=${TRANSFER_HINT} requires CONTROL_REFERENCE"
+                fi
+                ;;
+            *)
+                fail \
+                    "TRANSFER_HINT must be edge, blur, depth, seg, or wsm; " \
+                    "got '${TRANSFER_HINT}'"
+                ;;
+        esac
+        case "$MODEL" in
+            *Cosmos3-Edge*|*cosmos3-edge*)
+                fail "Cosmos3-Edge does not support Transfer; use Cosmos3-Nano or Cosmos3-Super"
+                ;;
+        esac
         ;;
     *)
         if [ -n "$INPUT_REFERENCE" ]; then
-            fail "MODE=${MODE} does not accept INPUT_REFERENCE; use i2v, v2v, or ti2av"
+            fail \
+                "MODE=${MODE} does not accept INPUT_REFERENCE; use i2v, v2v, " \
+                "transfer, or ti2av"
         fi
         ;;
 esac
+
+if [ "$MODE" != "transfer" ]; then
+    if [ -n "$TRANSFER_HINT" ]; then
+        fail "TRANSFER_HINT requires MODE=transfer"
+    fi
+    if [ -n "$CONTROL_REFERENCE" ]; then
+        fail "CONTROL_REFERENCE requires MODE=transfer"
+    fi
+fi
 
 case "$MODE" in
     t2av|ti2av)
@@ -327,6 +375,12 @@ fi
 if [ -n "$INPUT_REFERENCE" ]; then
     BENCHMARK_CMD+=(--input-reference "$INPUT_REFERENCE")
 fi
+if [ -n "$TRANSFER_HINT" ]; then
+    BENCHMARK_CMD+=(--transfer-hint "$TRANSFER_HINT")
+fi
+if [ -n "$CONTROL_REFERENCE" ]; then
+    BENCHMARK_CMD+=(--control-reference "$CONTROL_REFERENCE")
+fi
 case "$MODE" in
     t2av|ti2av) BENCHMARK_CMD+=(--require-audio) ;;
 esac
@@ -340,6 +394,10 @@ INPUT_REFERENCE_BASENAME=
 if [ -n "$INPUT_REFERENCE" ]; then
     INPUT_REFERENCE_BASENAME=$(basename "$INPUT_REFERENCE")
 fi
+CONTROL_REFERENCE_BASENAME=
+if [ -n "$CONTROL_REFERENCE" ]; then
+    CONTROL_REFERENCE_BASENAME=$(basename "$CONTROL_REFERENCE")
+fi
 CONFIG_METADATA=$SERVER_CONFIG
 if [ -z "$CONFIG_METADATA" ]; then
     CONFIG_METADATA=checkpoint-defaults
@@ -349,6 +407,8 @@ BENCHMARK_CMD+=(
     "mode=${MODE}"
     "server_config=${CONFIG_METADATA}"
     "input_reference=${INPUT_REFERENCE_BASENAME}"
+    "transfer_hint=${TRANSFER_HINT}"
+    "control_reference=${CONTROL_REFERENCE_BASENAME}"
 )
 
 mkdir -p "$RESULT_DIR"
@@ -367,6 +427,8 @@ from pathlib import Path
     request_rate,
     max_concurrency,
     input_reference,
+    transfer_hint,
+    control_reference,
     request_body,
     save_media,
 ) = sys.argv[1:]
@@ -380,6 +442,8 @@ metadata = {
     "request_rate": request_rate,
     "max_concurrency": int(max_concurrency),
     "input_reference": input_reference or None,
+    "transfer_hint": transfer_hint or None,
+    "control_reference": control_reference or None,
     "extra_params": request_body.get("extra_params", {}),
     "request_body": request_body,
     "save_media": save_media == "true",
@@ -394,6 +458,8 @@ Path(output_path).write_text(json.dumps(metadata, indent=2) + "\n", encoding="ut
     "$REQUEST_RATE" \
     "$MAX_CONCURRENCY" \
     "$INPUT_REFERENCE_BASENAME" \
+    "$TRANSFER_HINT" \
+    "$CONTROL_REFERENCE_BASENAME" \
     "$EXTRA_BODY" \
     "$SAVE_MEDIA"
 
@@ -407,6 +473,8 @@ echo "GPUs:                ${NUM_GPUS_VALUE}"
 echo "Request rate:        ${REQUEST_RATE}"
 echo "Max concurrency:     ${MAX_CONCURRENCY}"
 echo "Input reference:     ${INPUT_REFERENCE_BASENAME:-none}"
+echo "Transfer hint:       ${TRANSFER_HINT:-none}"
+echo "Control reference:   ${CONTROL_REFERENCE_BASENAME:-none}"
 echo "Client media:        ${CLIENT_MEDIA_DIR:-disabled}"
 echo "Server metrics log:  ${SERVER_LOG_PATH:-disabled}"
 echo "Result directory:    ${RESULT_DIR}"

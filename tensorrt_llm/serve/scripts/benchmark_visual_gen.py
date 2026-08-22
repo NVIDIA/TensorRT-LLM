@@ -73,6 +73,8 @@ from tensorrt_llm.serve.visual_gen_metrics import (
 )
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+TRANSFER_HINTS = frozenset({"edge", "blur", "depth", "seg", "wsm"})
+AUTO_TRANSFER_HINTS = frozenset({"edge", "blur"})
 
 
 @dataclass
@@ -730,6 +732,51 @@ def _validate_input_reference(path_value: Optional[str]) -> Optional[str]:
     return str(path.resolve())
 
 
+def _prepare_transfer_extra_body(
+    *,
+    extra_body: Optional[dict[str, Any]],
+    input_reference: Optional[str],
+    transfer_hint: Optional[str],
+    control_reference: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Add one Transfer hint without carrying control media in the CLI argv."""
+    if transfer_hint is None:
+        if control_reference is not None:
+            raise ValueError("--control-reference requires --transfer-hint")
+        return extra_body
+
+    if transfer_hint not in TRANSFER_HINTS:
+        raise ValueError(
+            f"--transfer-hint must be one of {sorted(TRANSFER_HINTS)}, got {transfer_hint!r}"
+        )
+    if control_reference is None:
+        if transfer_hint not in AUTO_TRANSFER_HINTS:
+            raise ValueError(
+                f"--transfer-hint={transfer_hint} requires --control-reference; only "
+                "edge and blur can derive a control from --input-reference"
+            )
+        if input_reference is None:
+            raise ValueError(
+                f"--transfer-hint={transfer_hint} requires --input-reference or --control-reference"
+            )
+
+    body = dict(extra_body or {})
+    extra_params = dict(body.get("extra_params") or {})
+    if transfer_hint in extra_params:
+        raise ValueError(
+            f"--transfer-hint={transfer_hint} conflicts with "
+            f"--extra-body.extra_params.{transfer_hint}"
+        )
+
+    if control_reference is None:
+        extra_params[transfer_hint] = True
+    else:
+        control_bytes = Path(control_reference).read_bytes()
+        extra_params[transfer_hint] = {"control": base64.b64encode(control_bytes).decode("ascii")}
+    body["extra_params"] = extra_params
+    return body
+
+
 def _validate_request_configuration(
     *,
     backend: str,
@@ -737,6 +784,7 @@ def _validate_request_configuration(
     input_reference: Optional[str],
     extra_body: Optional[dict[str, Any]],
     require_audio: bool,
+    transfer_hint: Optional[str] = None,
 ) -> None:
     """Reject incompatible client request combinations before benchmarking."""
     if input_reference is not None and backend != "openai-videos":
@@ -746,6 +794,13 @@ def _validate_request_configuration(
             "Specify conditioning media with --input-reference, not both "
             "--input-reference and --extra-body.input_reference"
         )
+    if transfer_hint is not None:
+        if backend != "openai-videos":
+            raise ValueError("--transfer-hint is supported only by the openai-videos backend")
+        if "cosmos3-edge" in model_id.lower():
+            raise ValueError("Cosmos3-Edge does not support Transfer benchmarks")
+        if require_audio:
+            raise ValueError("Cosmos3 Transfer cannot be combined with audio generation")
     if not require_audio:
         return
     if backend != "openai-videos":
@@ -827,12 +882,20 @@ def main(args: argparse.Namespace):
 
     extra_body = _parse_extra_body(args.extra_body)
     input_reference = _validate_input_reference(args.input_reference)
+    control_reference = _validate_input_reference(args.control_reference)
+    extra_body = _prepare_transfer_extra_body(
+        extra_body=extra_body,
+        input_reference=input_reference,
+        transfer_hint=args.transfer_hint,
+        control_reference=control_reference,
+    )
     _validate_request_configuration(
         backend=backend,
         model_id=model_id,
         input_reference=input_reference,
         extra_body=extra_body,
         require_audio=args.require_audio,
+        transfer_hint=args.transfer_hint,
     )
 
     num_gpus = _resolve_num_gpus(args)
@@ -875,6 +938,10 @@ def main(args: argparse.Namespace):
         result_json["num_prompts"] = args.num_prompts
         if input_reference is not None:
             result_json["input_reference"] = Path(input_reference).name
+        if args.transfer_hint is not None:
+            result_json["transfer_hint"] = args.transfer_hint
+        if control_reference is not None:
+            result_json["control_reference"] = Path(control_reference).name
 
         if args.metadata:
             for item in args.metadata:
@@ -1029,6 +1096,22 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Image or video conditioning file for multipart video requests.",
+    )
+    gen_group.add_argument(
+        "--transfer-hint",
+        type=str,
+        choices=sorted(TRANSFER_HINTS),
+        default=None,
+        help=(
+            "Cosmos3 Transfer control hint. Edge/blur can derive control from "
+            "--input-reference; all hints accept --control-reference."
+        ),
+    )
+    gen_group.add_argument(
+        "--control-reference",
+        type=str,
+        default=None,
+        help="Precomputed MP4/AVI Transfer control clip, encoded into extra_params client-side.",
     )
     gen_group.add_argument(
         "--require-audio",
