@@ -194,7 +194,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             )
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
-            # tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
+            # NOTE: this barrier is required: the thread that writes a
+            # conv_state cell below is not the one that read it above (the
+            # read uses a 1-D layout, the write a 2-D one), so nothing else
+            # orders the two accesses.
+            tl.debug_barrier()
             tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
         else:
@@ -228,10 +232,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 )  # token-index  # token-index  # feature-index
                 loaded_x = tl.load(x_ptrs, mask_x, 0.0)
 
-                # tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
-                new_conv_state = tl.where(
-                    mask, conv_state, loaded_x
-                )  # BUG in 'tl.where'  which requires a barrier before this
+                # NOTE: this barrier is required: the thread that writes a
+                # conv_state cell below is not the one that read it above (the
+                # read uses a 1-D layout, the write a 2-D one), so nothing else
+                # orders the two accesses.
+                tl.debug_barrier()
+                new_conv_state = tl.where(mask, conv_state, loaded_x)
                 conv_states_ptrs_target = (
                     conv_states_base + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )  # [BLOCK_M, BLOCK_N]
@@ -382,6 +388,9 @@ def causal_conv1d_fn(
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
+    _block_n: int | None = None,
+    _num_warps: int | None = None,
+    _num_stages: int | None = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -541,8 +550,9 @@ def causal_conv1d_fn(
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=8,
-        BLOCK_N=256,
-        num_stages=2,
+        BLOCK_N=_block_n if _block_n is not None else 256,
+        num_warps=_num_warps if _num_warps is not None else 4,
+        num_stages=_num_stages if _num_stages is not None else 2,
     )
     return out
 
@@ -722,7 +732,10 @@ def _causal_conv1d_update_kernel(
         & (idx_feats < dim)[None, :]
     )  # token-index  # token-index  # feature-index
     loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    # tl.debug_barrier()
+    # NOTE: this barrier is required: the thread that writes a conv_state cell
+    # below is not the one that read it in STEP 1 (the read uses a 1-D layout,
+    # the write a 2-D one), so nothing else orders the two accesses.
+    tl.debug_barrier()
 
     new_conv_state = tl.where(mask, conv_state, loaded_x)
 
