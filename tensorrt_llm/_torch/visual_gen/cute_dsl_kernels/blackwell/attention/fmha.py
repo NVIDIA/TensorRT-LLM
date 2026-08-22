@@ -368,6 +368,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        scale_v_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
@@ -486,6 +487,17 @@ class BlackwellFusedMultiHeadAttentionForward:
             sink = cute.make_tensor(sink_tensor.iterator, sink_layout)
         else:
             sink = None
+
+        if cutlass.const_expr(scale_v_channels is not None):
+            # scale_v_channels is per (h_k, dv): shape (h_k * dv,) row-major.
+            # Expose as (dv, ((h_r, h_k), b)) where h_r and b are 0-stride broadcasts.
+            scale_v_channels_layout = cute.make_layout(
+                (dv, ((h_r, h_k), b)),
+                stride=(1, ((0, dv), 0)),
+            )
+            mScaleV_channels = cute.make_tensor(scale_v_channels.iterator, scale_v_channels_layout)
+        else:
+            mScaleV_channels = None
 
         self.tile_sched_params, grid = fmha_utils.compute_grid(
             cute.shape((s_q_max, d, ((h_r, h_k), b))),
@@ -686,6 +698,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             scale_softmax_log2,
             scale_softmax,
             scale_output,
+            mScaleV_channels,
             skip_softmax_threshold_log2,
             window_size_left,
             window_size_right,
@@ -728,6 +741,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        mScaleV_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
@@ -1625,6 +1639,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     sO[None, None, 0],
                                     mLSE,
                                     mSink,
+                                    mScaleV_channels,
                                 ),
                                 (
                                     s0_corr_consumer,
@@ -1647,6 +1662,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     sO[None, None, 1],
                                     mLSE,
                                     mSink,
+                                    mScaleV_channels,
                                 ),
                                 (
                                     s1_corr_consumer,
@@ -1688,6 +1704,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 gO0,
                                 mLSE,
                                 mSink,
+                                mScaleV_channels,
                             ),
                             (s0_corr_consumer, mma_corr_consumer),
                             (row_idx, *value_args),
@@ -1704,6 +1721,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 gO1,
                                 mLSE,
                                 mSink,
+                                mScaleV_channels,
                             ),
                             (s1_corr_consumer, mma_corr_consumer),
                             (row_idx, *value_args),
@@ -3002,7 +3020,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type thr_mma: cute.ThrMma
         :param tiled_tmem_load_vec: Tiled memory load operation for the vectorized row-wise max
         :type tiled_tmem_load_vec: cute.TiledCopy
-        :param tensor_args: Tuple containing (tOtO, tTMEM_LOAD_VECtSi, tTMEM_LOAD_VECcS, sO_or_gO, mLSE, mSink)
+        :param tensor_args: Tuple containing (tOtO, tTMEM_LOAD_VECtSi, tTMEM_LOAD_VECcS, sO_or_gO, mLSE, mSink, mScaleV_channels)
         :type tensor_args: Tuple
         :param pipeline_args: When use_tma_store: (si_corr_consumer, mma_corr_consumer, corr_epi_producer).
                               When not use_tma_store: (si_corr_consumer, mma_corr_consumer).
@@ -3010,7 +3028,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param value_args: Tuple containing (row_idx, cuseqlen_q, seqlen_q, blk_coord, scale_softmax, scale_output)
         :type value_args: Tuple
         """
-        tOtO, tTMEM_LOAD_VECtSi, tTMEM_LOAD_VECcS, dest_O, mLSE, mSink = tensor_args
+        (
+            tOtO,
+            tTMEM_LOAD_VECtSi,
+            tTMEM_LOAD_VECcS,
+            dest_O,
+            mLSE,
+            mSink,
+            mScaleV_channels,
+        ) = tensor_args
         row_idx, cuseqlen_q, seqlen_q, blk_coord, scale_softmax, scale_output = value_args
 
         pv_tiled_mma_shape = (
@@ -3076,16 +3102,27 @@ class BlackwellFusedMultiHeadAttentionForward:
             row_sum = row_sum + sink_exp
         scale = scale_output / row_sum
 
+        if cutlass.const_expr(mScaleV_channels is not None):
+            scaleV_ch_h = mScaleV_channels[None, blk_coord[2]]
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADdO_i = tTMEM_LOADdO[None, 0, 0, i]
-            tTMrO = cute.make_rmem_tensor(tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tTMEM_LOADoO_i = tTMEM_LOADoO[None, 0, 0, i]
+            tTMrO = cute.make_rmem_tensor(tTMEM_LOADoO_i.shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
             for j in range(0, cute.size(tTMrO), 2):
                 tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
+            if cutlass.const_expr(mScaleV_channels is not None):
+                for j in range(0, cute.size(tTMrO), 2):
+                    _, n0 = tTMEM_LOADoO_i[j]
+                    _, n1 = tTMEM_LOADoO_i[j + 1]
+                    tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
+                        (tTMrO[j], tTMrO[j + 1]),
+                        (scaleV_ch_h[n0], scaleV_ch_h[n1]),
+                    )
             tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tDMrO.store(o_vec.to(self.o_dtype))
