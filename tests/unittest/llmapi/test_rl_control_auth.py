@@ -21,13 +21,13 @@ from fastapi.testclient import TestClient
 
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm.serve.openai_server import OpenAIServer
-from tensorrt_llm.serve.rl_control_auth import build_rl_control_auth_headers
+from tensorrt_llm.serve.rl_control_auth import RL_CONTROL_AUTH_HEADER, build_rl_control_auth_headers
 
 
 def _make_server(enabled: bool) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
     server.app = FastAPI()
-    server.generator = MagicMock(spec=AsyncLLM)
+    server.generator = object.__new__(AsyncLLM)
     server.generator.collective_rpc = AsyncMock()
     server._enable_rl_control_endpoints = enabled
     server._rl_control_api_key = "secret"
@@ -45,7 +45,7 @@ def _post_signed(client: TestClient, endpoint: str, payload: dict, key: str = "s
 def test_rl_control_routes_require_key():
     with pytest.raises(ValueError, match="rl_control_api_key is required"):
         OpenAIServer(
-            generator=MagicMock(spec=AsyncLLM),
+            generator=object.__new__(AsyncLLM),
             model="model",
             tool_parser=None,
             server_role=None,
@@ -107,6 +107,23 @@ def test_rl_control_routes_reject_wrong_key(endpoint):
 
     with TestClient(server.app) as client:
         response = _post_signed(client, endpoint, {"tags": ["kv_cache"]}, key="wrong")
+
+    assert response.status_code == 401
+    server.generator.collective_rpc.assert_not_awaited()
+
+
+def test_rl_control_routes_reject_non_ascii_signature():
+    server = _make_server(enabled=True)
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/release_memory",
+            json={"tags": ["kv_cache"]},
+            headers=[
+                (b"content-type", b"application/json"),
+                (RL_CONTROL_AUTH_HEADER.encode("ascii"), b"\xff"),
+            ],
+        )
 
     assert response.status_code == 401
     server.generator.collective_rpc.assert_not_awaited()

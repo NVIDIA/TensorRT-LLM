@@ -595,8 +595,6 @@ def launch_server(
         num_media_load_workers: int = 8,
         multi_frontend_enabled: bool = True,
         internal_disagg_auth_key: Optional[str] = None,
-        enable_rl_control_endpoints: bool = False,
-        rl_control_api_key: Optional[str] = None,
         report_addr: Optional[str] = None):
 
     backend = llm_args["backend"]
@@ -697,9 +695,7 @@ def launch_server(
                 allow_request_chat_template=allow_request_chat_template,
                 input_processor_workers=num_input_processor_workers,
                 media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key,
-                enable_rl_control_endpoints=enable_rl_control_endpoints,
-                rl_control_api_key=rl_control_api_key)
+                internal_disagg_auth_key=internal_disagg_auth_key)
             _apply_fastapi_middlewares(server.app, middleware)
 
             # Optionally disable GC (default: not disabled)
@@ -1401,10 +1397,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                                        or extra_allow_request_chat_template)
         internal_disagg_auth_key = _pop_optional_str_config_option(
             llm_args_extra_dict, "internal_request_auth_key")
-        enable_rl_control_endpoints = _pop_bool_config_option(
-            llm_args_extra_dict, "enable_rl_control_endpoints")
-        rl_control_api_key = _pop_optional_str_config_option(
-            llm_args_extra_dict, "rl_control_api_key")
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -1461,9 +1453,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 if allow_request_chat_template else None,
                 "internal_request_auth_key":
                 internal_disagg_auth_key,
-                "enable_rl_control_endpoints":
-                enable_rl_control_endpoints
-                if enable_rl_control_endpoints else None,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1507,8 +1496,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 num_input_processor_workers=num_input_processor_workers,
                 num_media_load_workers=num_media_load_workers,
                 internal_disagg_auth_key=internal_disagg_auth_key,
-                enable_rl_control_endpoints=enable_rl_control_endpoints,
-                rl_control_api_key=rl_control_api_key,
                 report_addr=report_addr)
 
     def _serve_visual_gen():
