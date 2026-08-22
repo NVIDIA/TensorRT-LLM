@@ -826,15 +826,18 @@ def _register_fake():
         return packed, scale
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
-    def _(input: torch.Tensor):
-        # Returns (fp8_e4m3 [m, k], packed_ue8m0_int32 [m, packed_sf_k])
-        # matching deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor's return shape.
+    def _(input: torch.Tensor,
+          use_r128c4_layout: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape[0], input.shape[1]
         num_n_blocks = (k + 127) // 128
         num_packed_sf_k = (num_n_blocks + 3) // 4
-        return torch.empty_like(input,
-                                dtype=torch.float8_e4m3fn), input.new_empty(
-                                    (m, num_packed_sf_k), dtype=torch.int32)
+        if use_r128c4_layout:
+            m_padded = (m + 127) // 128 * 128
+            sf_k_padded = ((k + 31) // 32 + 3) // 4 * 4
+            scale = input.new_empty((m_padded * sf_k_padded), dtype=torch.uint8)
+        else:
+            scale = input.new_empty((m, num_packed_sf_k), dtype=torch.int32)
+        return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_cutedsl_ue8m0")
     def _(input: torch.Tensor):
