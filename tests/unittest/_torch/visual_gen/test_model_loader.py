@@ -124,6 +124,155 @@ def test_dual_transformer_checkpoint_creates_distinct_model_configs(tmp_path):
     assert transformer_2_config.pretrained_config.num_attention_heads == 32
 
 
+def test_vae_quant_config_is_independent_from_transformer(tmp_path):
+    """VAE and transformer precision can be selected independently."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+                "vae": ["diffusers", "AutoencoderKLWan"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    transformer_dir = tmp_path / "transformer"
+    transformer_dir.mkdir()
+    (transformer_dir / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"}),
+        encoding="utf-8",
+    )
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir()
+    (vae_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "AutoencoderKLWan",
+                "quantization_config": {"quant_algo": "NVFP4"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = DiffusionPipelineConfig.from_pretrained(
+        str(tmp_path),
+        args=VisualGenArgs(
+            model=str(tmp_path),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            vae_quant_config={
+                "ignore": ["decoder.up_blocks.0.*"],
+                "config_groups": {
+                    "default": {
+                        "weights": {"dynamic": False},
+                        "input_activations": {"dynamic": True},
+                    }
+                },
+            },
+        ),
+    )
+
+    assert config.quant_config.quant_algo == QuantAlgo.FP8
+    assert config.primary_model_config.quant_config.quant_algo == QuantAlgo.FP8
+    assert config.vae_quant_config is not None
+    assert config.vae_quant_config.quant_algo == QuantAlgo.NVFP4
+    assert config.vae_quant_config.is_module_excluded_from_quantization(
+        "decoder.up_blocks.0.resnets.0.conv1"
+    )
+    assert config.vae_dynamic_weight_quant is False
+    assert config.vae_dynamic_activation_quant is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"quant_algo": "NVFP4"}, (None, None)),
+        ({"quant_algo": "NVFP4", "dynamic": True}, (True, True)),
+        ({"quant_algo": "NVFP4", "dynamic": False}, (False, False)),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {
+                    "default": {
+                        "weights": {"dynamic": False},
+                        "input_activations": {"dynamic": True},
+                    }
+                },
+            },
+            (False, True),
+        ),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {"default": {"weights": {"dynamic": True}}},
+            },
+            (True, None),
+        ),
+    ],
+)
+def test_parse_vae_dynamic_quantization_modes(raw, expected):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config, dynamic_weight, dynamic_activation = (
+        DiffusionPipelineConfig.load_vae_quant_config(raw)
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.NVFP4
+    assert (dynamic_weight, dynamic_activation) == expected
+
+
+def test_vae_quant_config_dict_inherits_checkpoint_algorithm():
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config, dynamic_weight, dynamic_activation = (
+        DiffusionPipelineConfig.load_vae_quant_config(
+            {"ignore": ["decoder.conv1"]},
+            {"quant_algo": "NVFP4", "dynamic": False},
+        )
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.NVFP4
+    assert quant_config.is_module_excluded_from_quantization("decoder.conv1")
+    # Checkpoint metadata is authoritative for packed tensors and scales, but
+    # only explicit user dynamic settings override the loader's auto mode.
+    assert dynamic_weight is None
+    assert dynamic_activation is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (
+            {
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+                "config_groups": {"default": {}},
+            },
+            "cannot specify both",
+        ),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {"first": {}, "second": {}},
+            },
+            "exactly one",
+        ),
+        ({"quant_algo": "NVFP4", "dynamic": 1}, "must be a boolean"),
+        ({"quant_algo": "FP8", "dynamic": True}, "require quant_algo='NVFP4'"),
+    ],
+)
+def test_reject_invalid_vae_dynamic_quantization_modes(raw, message):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+    with pytest.raises(ValueError, match=message):
+        DiffusionPipelineConfig.load_vae_quant_config(raw)
+
+
 def test_load_wan_pipeline_basic(checkpoint_exists):
     """Test basic loading without quantization using VisualGenArgs."""
     if not checkpoint_exists:

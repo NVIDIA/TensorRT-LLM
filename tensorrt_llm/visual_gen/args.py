@@ -562,6 +562,19 @@ class VisualGenArgs(StrictBaseModel):
             "DiffusionPipelineConfig.from_pretrained."
         ),
     )
+    vae_quant_config: Optional[Union[QuantConfig, Dict[str, Any]]] = Field(
+        None,
+        status="prototype",
+        description=(
+            "VAE quantization config, independent from the transformer. "
+            "Accepts QuantConfig or a ModelOpt-format dict; the latter may "
+            "use ``ignore`` to exclude matching VAE modules and either "
+            "top-level ``dynamic`` for weight-plus-activation shorthand or "
+            "one ``config_groups`` entry to configure them independently. "
+            "A dict without ``quant_algo`` inherits the VAE checkpoint "
+            "algorithm; ``None`` leaves all choices checkpoint-driven."
+        ),
+    )
     compilation_config: CompilationConfig = Field(
         default_factory=CompilationConfig,
         status="prototype",

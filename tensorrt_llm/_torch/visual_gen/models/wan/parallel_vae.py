@@ -117,6 +117,26 @@ class WanCausalConvHalo(HaloExchangeConv):
         spatial_padding[spatial_axis] = 0
         return (spatial_padding[0], spatial_padding[1])
 
+    @property
+    def absorbs_silu(self) -> bool:
+        # Delegate the fusion contract through the halo wrapper. RMSNorm and
+        # SiLU are pointwise over spatial positions, so applying them after
+        # halo exchange is mathematically equivalent.
+        return getattr(self.module, "absorbs_silu", False)
+
+    @property
+    def absorbs_norm(self) -> bool:
+        return getattr(self.module, "absorbs_norm", False)
+
+    @property
+    def supports_residual_fusion(self) -> bool:
+        # A rank-local residual can enter the epilogue only when the wrapped
+        # convolution directly emits the local extent. The fallback path emits
+        # halo outputs and strips them after the convolution.
+        return self._local_output_spatial_padding is not None and getattr(
+            self.module, "supports_residual_fusion", False
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -311,6 +331,9 @@ class ParallelVAE_TrtllmWan(ParallelVAE_Wan):
     the native ``WanConv2d`` subclasses ``nn.Conv2d``.
     """
 
+    # ``NVFP4WanCausalConv3d`` subclasses this native class, so the same rewrite
+    # wraps both BF16 and FP4 convs with ``WanCausalConvHalo``. The halo wrapper
+    # delegates the FP4 fusion flags defined above.
     _conv3d_cls = wan_vae.WanCausalConv3d
     _attn_cls = wan_vae.WanAttentionBlock
 
