@@ -204,6 +204,23 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 _DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
 _NUM_GEN_TOKENS_RE = re.compile(r"'num_generation_tokens':\s*(\d+)")
 
+# currank_total_requests = <current-rank-fetched>/<total-fetched> on every
+# iter line (py_executor.py: num_fetch_requests_cur_rank / num_fetch_requests).
+# The denominator increments when the worker fetches a new request, so it
+# marks request boundaries inside one client's log segment: with warmup
+# enabled the segment holds warmup (total = 1) then the measured request
+# (total = 2).
+_CURRANK_TOTAL_REQUESTS_RE = re.compile(r"currank_total_requests\s*=\s*\d+/(\d+)")
+
+# Usable rows to drop once the request count crosses skip_leading_requests,
+# mirroring the iter < 5 startup skip. prev_device_step_time on row N is the
+# device time of iter N-1, so post-boundary rows still carry earlier time:
+# row +0 is the previous request's last step, row +1 is the inter-request
+# gap (the stall this skip exists to exclude), and measured runs show +2
+# still settling with steady state from +3 on. 5 = 3 measured + 2 margin
+# for longer gaps, and costs <2% of the shortest (~256-row) request.
+_REQUEST_BOUNDARY_SETTLE_ROWS = 5
+
 
 def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
     """Current byte size of each gen_server_{i}.log (0 if missing).
@@ -223,8 +240,18 @@ def _scan_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
+    skip_leading_requests: int = 0,
 ) -> Tuple[List[Tuple[Dict[int, Tuple[int, float]], int, float]], int]:
     """Single-pass scan of the gen logs.
+
+    When skip_leading_requests > 0 (warmup lanes), each file's stats cover
+    only rows after currank_total_requests' denominator exceeds that many
+    requests, plus a _REQUEST_BOUNDARY_SETTLE_ROWS settle skip — so the
+    warmup request and the inter-request stall stay out of the mean
+    (nvbugs 6609977 / TRTLLM-15394). If a file never crosses the boundary
+    (e.g. the warmup request was routed elsewhere, or the log format drops
+    currank_total_requests), that file falls back to the full-window stats,
+    which is the pre-warmup-aware behavior.
 
     Returns (per_file_scans, total_count):
       - per_file_scans: one entry per file that produced >=1 usable row, each
@@ -267,6 +294,14 @@ def _scan_gen_worker_device_step_time(
         by_ngen: Dict[int, Tuple[int, float]] = {}
         all_count = 0
         all_mean = 0.0
+        # Post-boundary accumulators mirror the full-window ones; used only
+        # when skip_leading_requests > 0 and the boundary is actually seen.
+        post_by_ngen: Dict[int, Tuple[int, float]] = {}
+        post_all_count = 0
+        post_all_mean = 0.0
+        seen_requests = 0
+        post_rows_seen = 0
+        skipped_post_boundary_dts: List[float] = []
         with open(log_path, errors="replace") as f:
             if seek_to:
                 f.seek(seek_to)
@@ -278,19 +313,48 @@ def _scan_gen_worker_device_step_time(
                     continue
                 total_count += 1
                 dt = float(m.group(2))
-                # All-iter fallback aggregate (every usable row).
+                # Per-ngen bucket key (rows without a parseable ngen only
+                # feed the all-iter fallback aggregates).
+                ngen_m = _NUM_GEN_TOKENS_RE.search(line)
+                ngen = int(ngen_m.group(1)) if ngen_m is not None else None
+                # Full-window aggregates (every usable row).
                 all_count += 1
                 all_mean += (dt - all_mean) / all_count
-                # Per-ngen bucket (only rows with a parseable ngen).
-                ngen_m = _NUM_GEN_TOKENS_RE.search(line)
-                if ngen_m is None:
-                    continue
-                ngen = int(ngen_m.group(1))
-                count, mean = by_ngen.get(ngen, (0, 0.0))
-                count += 1
-                mean += (dt - mean) / count
-                by_ngen[ngen] = (count, mean)
-        if all_count:
+                if ngen is not None:
+                    count, mean = by_ngen.get(ngen, (0, 0.0))
+                    count += 1
+                    mean += (dt - mean) / count
+                    by_ngen[ngen] = (count, mean)
+                if skip_leading_requests:
+                    req_m = _CURRANK_TOTAL_REQUESTS_RE.search(line)
+                    if req_m is not None:
+                        seen_requests = max(seen_requests, int(req_m.group(1)))
+                    if seen_requests > skip_leading_requests:
+                        post_rows_seen += 1
+                        if post_rows_seen <= _REQUEST_BOUNDARY_SETTLE_ROWS:
+                            skipped_post_boundary_dts.append(dt)
+                        else:
+                            post_all_count += 1
+                            post_all_mean += (dt - post_all_mean) / post_all_count
+                            if ngen is not None:
+                                count, mean = post_by_ngen.get(ngen, (0, 0.0))
+                                count += 1
+                                mean += (dt - mean) / count
+                                post_by_ngen[ngen] = (count, mean)
+        boundary_seen = seen_requests > skip_leading_requests
+        if boundary_seen:
+            print_info(
+                f"Dropped {len(skipped_post_boundary_dts)} post-boundary "
+                f"device-step rows from {log_path}: {skipped_post_boundary_dts}"
+            )
+            if post_all_count:
+                per_file_scans.append((post_by_ngen, post_all_count, post_all_mean))
+            else:
+                print_info(
+                    f"No device-step rows remain after request-boundary settling for "
+                    f"{log_path}: all_count={all_count}, post_rows_seen={post_rows_seen}"
+                )
+        elif all_count:
             per_file_scans.append((by_ngen, all_count, all_mean))
     return per_file_scans, total_count
 
@@ -328,6 +392,7 @@ def parse_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
+    skip_leading_requests: int = 0,
 ) -> Optional[float]:
     """Mean per-iter prev_device_step_time (ms) across all gen workers.
 
@@ -348,6 +413,11 @@ def parse_gen_worker_device_step_time(
     end-of-file are considered for gen_server_{i}.log — used to slice out a
     single client's iteration segment.
 
+    skip_leading_requests (warmup lanes pass 1) further narrows each file's
+    window to rows after that many requests have been admitted, so the
+    warmup request and the boundary stall stay out of the mean — see
+    _scan_gen_worker_device_step_time (nvbugs 6609977 / TRTLLM-15394).
+
     The log is read exactly once. The caller (DisaggTestCmds.run_cmd) normally
     waits for the gen_server_{i}.done sentinels first, so every gen srun has
     exited and its &> aggregate log is fully flushed. If the dedicated
@@ -358,7 +428,7 @@ def parse_gen_worker_device_step_time(
     (nvbugs 6487036 / 6487040 / 6487038).
     """
     per_file_scans, _total_count = _scan_gen_worker_device_step_time(
-        output_dir, num_gen_servers, start_offsets
+        output_dir, num_gen_servers, start_offsets, skip_leading_requests
     )
     return _mean_at_mode_ngen(per_file_scans)
 
@@ -1436,6 +1506,7 @@ class DisaggTestCmds(NamedTuple):
                 self.test_output_dir,
                 self.num_gen_servers,
                 start_offsets=record["start_offsets"],
+                skip_leading_requests=record.get("skip_leading_requests", 0),
             )
             if device_step_time_mean is None:
                 continue
@@ -1652,6 +1723,13 @@ class DisaggTestCmds(NamedTuple):
                                     "output_index": len(outputs) - 1,
                                     "benchmark_file_path": benchmark_file_path,
                                     "start_offsets": gen_log_start_offsets,
+                                    # With warmup on, the offset window spans
+                                    # warmup + measured request; tell the
+                                    # parser to drop the leading request
+                                    # (nvbugs 6609977 / TRTLLM-15394).
+                                    "skip_leading_requests": (
+                                        1 if client_config and client_config.warmup else 0
+                                    ),
                                 }
                             )
                     else:
