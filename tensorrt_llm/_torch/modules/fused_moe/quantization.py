@@ -315,7 +315,8 @@ class FusedMoEMethodBase(ABC):
 
     @classmethod
     def _online_eplb_not_verified(cls, module):
-        if cls.need_load_shared_weights(module):
+        if (cls.eplb_support_status == EplbSupportStatus.NOT_VERIFIED
+                and cls.need_load_shared_weights(module)):
             logger.warning(f'{cls.__name__} online EPLB is not verified yet')
 
     def create_weights(
@@ -1352,6 +1353,7 @@ def resmooth_and_transform_fp8_scale(
 
 class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def _needs_e8m0_resmooth(self):
         return is_sm_100f() or get_sm_version() == 120

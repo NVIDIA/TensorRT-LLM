@@ -1,12 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
 import unittest
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 import torch
 from mpi4py import MPI
 
-from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import \
-    HostMoeTensorSharer
+from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
+    HostMoeTensorSharer, _FileBackedSharedMemory, _tensor_to_weight)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -18,14 +36,17 @@ class TestHostMoeTensorSharer(unittest.TestCase):
         """Verify tensor data matches the expected pattern for the given expert ID.
 
         Args:
-            tensor_data: The tensor data to verify
+            tensor_data: The tensor data to verify (may be 1-D flat blob or 2-D)
             expert_id: The expert ID for which the data was generated
-            tensor_shape: Expected shape of the tensor
+            tensor_shape: Original 2-D shape used to generate the data
 
         Returns:
             (bool, str): Tuple containing (success, error_message)
         """
         try:
+            # Tensors are now stored as flat 1-D blobs; reshape for value checks.
+            if isinstance(tensor_data, torch.Tensor) and tensor_data.dim() == 1:
+                tensor_data = tensor_data.view(tensor_shape)
             # Verify tensor shape
             if tensor_data.shape != tensor_shape:
                 return False, f"Expert {expert_id}'s tensor has incorrect shape: {tensor_data.shape}, expected: {tensor_shape}"
@@ -72,6 +93,92 @@ class TestHostMoeTensorSharer(unittest.TestCase):
             for j in range(tensor_shape[1]):
                 tensor_data[i, j] = expert_id * 1000 + i * 100 + j
         return tensor_data
+
+    def test_flat_byte_blob_migration(self):
+        """Row-major and column-major tensors are both migrated as flat byte blobs."""
+        # Row-major (4, 6) tensor.
+        row_major = torch.arange(24, dtype=torch.int32).reshape(4, 6)
+        self.assertTrue(row_major.is_contiguous())
+
+        # Column-major (6, 4) view — stride[0] == 1, same storage.
+        column_major = row_major.transpose(0, 1)
+        self.assertFalse(column_major.is_contiguous())
+
+        elt = row_major.element_size()
+        total_bytes = 24 * elt
+
+        for label, t in [("row_major", row_major),
+                         ("column_major", column_major)]:
+            moe_weight = _tensor_to_weight(t)
+            self.assertEqual(moe_weight.height, 1, label)
+            self.assertEqual(moe_weight.width, total_bytes, label)
+            self.assertEqual(moe_weight.pitch, total_bytes, label)
+            self.assertEqual(moe_weight.weight_ptr, t.data_ptr(), label)
+
+        # get_flat_storage_view returns a 1-D view in storage-byte order.
+        flat_rm = HostMoeTensorSharer.get_flat_storage_view(row_major)
+        flat_cm = HostMoeTensorSharer.get_flat_storage_view(column_major)
+        self.assertEqual(flat_rm.shape, (24, ))
+        self.assertEqual(flat_cm.shape, (24, ))
+        # Both views share the same underlying storage bytes.
+        torch.testing.assert_close(flat_rm, flat_cm)
+
+    def test_file_backed_storage(self):
+        """File-backed EPLB staging preserves tensors outside /dev/shm."""
+        comm = MPI.COMM_SELF
+        tensor_shape = (16, 32)
+        tensor_data = self.generate_tensor_data(0, tensor_shape)
+        flush_calls = []
+        original_flush = _FileBackedSharedMemory.flush
+
+        def tracked_flush(storage):
+            flush_calls.append(storage)
+            return original_flush(storage)
+
+        with TemporaryDirectory() as directory, patch.dict(
+                "os.environ", {
+                    "TRTLLM_EPLB_SHM_DIR": directory,
+                    "TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL": "True",
+                }), patch.object(_FileBackedSharedMemory, "flush",
+                                 tracked_flush):
+            sharer = HostMoeTensorSharer(0, 1, comm)
+            sharer.set_shared_memory_base_name("test_file_backed_sharer")
+            sharer.share_host_tensor_with_shape(0, "weight", tensor_data)
+            sharer.finalize_layer_weights()
+            self.assertEqual(len(flush_calls), 1)
+            retrieved = {}
+            sharer.finalize_host_tensor_sharing(
+                lambda expert_id, name, tensor: retrieved.setdefault(
+                    (expert_id, name), tensor.clone()))
+
+            torch.testing.assert_close(retrieved[(0, "weight")], tensor_data)
+            backing_path = os.path.join(directory,
+                                        sharer.get_shared_memory_name())
+            self.assertTrue(os.path.exists(backing_path))
+
+            sharer.pre_shutdown_cleanup()
+            sharer.post_shutdown_cleanup()
+            self.assertFalse(os.path.exists(backing_path))
+
+    def test_file_backed_mappings_are_coherent_after_flush(self):
+        """Completed file-backed layers are flushed before further loading."""
+        with TemporaryDirectory() as directory:
+            creator = _FileBackedSharedMemory("test_eplb_map",
+                                              directory,
+                                              create=True,
+                                              size=4096)
+            peer = _FileBackedSharedMemory("test_eplb_map", directory)
+            try:
+                creator.buf[:8] = b"EPLBTEST"
+                creator.flush()
+                self.assertEqual(peer.buf[:8], b"EPLBTEST")
+                peer.buf[:8] = b"PEERVIEW"
+                peer.flush()
+                self.assertEqual(creator.buf[:8], b"PEERVIEW")
+            finally:
+                peer.close()
+                creator.close()
+                creator.unlink()
 
     def test_host_tensor_sharing_basic(self):
         """Basic test for host tensor sharing"""
