@@ -32,6 +32,14 @@ class VisualGenParams(StrictBaseModel):
     ``guidance_scale_2``) should be passed via ``extra_params``.
     Use ``VisualGen.extra_param_specs`` to discover valid keys
     for the loaded pipeline.
+
+    **``model_fields_set`` carries caller intent.** Defaults are merged in
+    before a pipeline sees the request, so a non-``None`` field says nothing
+    about who chose it: the merge assigns the pipeline default and then
+    ``discard``s that field, leaving only what the caller supplied. To
+    distinguish the two, test ``"frame_rate" in params.model_fields_set``
+    rather than ``params.frame_rate is not None``. The set is live state --
+    assigning a field re-marks it as caller intent.
     """
 
     # Core — None means "use model default"
@@ -93,6 +101,7 @@ _TYPE_MAP = {
     "str": (str,),
     "list": (list,),
     "bytes": (bytes,),
+    "bool_or_bytes_or_dict": (bool, bytes, dict),
 }
 
 # Generation config fields that pipelines declare defaults for. If a user
