@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <functional>
@@ -279,6 +280,13 @@ public:
     int numCommittedTokens() const noexcept
     {
         return static_cast<int>(mCommittedTokens.size());
+    }
+
+    // Internal diagnostic: prefix supported by the attention pages alone,
+    // before recurrent-state (SSM) snapshot pruning shortened the reuse.
+    int numTokensBeforeHybridPruning() const noexcept
+    {
+        return mNumTokensBeforeHybridPruning;
     }
 
     std::vector<TokenIdExt> const& committedTokens() const noexcept
@@ -581,6 +589,7 @@ private:
     std::vector<TokenIdExt> mCommittedTokens;
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
+    int mNumTokensBeforeHybridPruning;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
     int mTokensPerBlock;

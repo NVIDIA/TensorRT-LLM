@@ -181,6 +181,7 @@ def worker_main(
     _torch_model_class_mapping: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
     ready_signal: Optional[str] = None,
+    worker_process_identities_signal: Optional[bytes] = None,
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     hf_model_dir: Optional[Path] = None,
@@ -341,6 +342,21 @@ def worker_main(
     mpi_comm().barrier()
     worker_process_identities = mpi_comm().allgather(
         capture_worker_process_identity(mpi_rank()))
+
+    # Publish the process identities before backend construction begins. Model
+    # construction can load weights for several minutes, and an externally
+    # killed worker may not complete its MPI future. Registering the workers at
+    # this point lets the proxy observe such a death while it is still waiting
+    # for the READY signal.
+    if is_leader and worker_process_identities_signal is not None:
+        identities_msg = (worker_process_identities_signal, None,
+                          worker_process_identities)
+        if not worker_init_status_queue.notify_with_retry(identities_msg):
+            # The failed status queue cannot report its own failure. Let this
+            # escape through the MPI future so the proxy can observe it.
+            raise RuntimeError(
+                "Failed to deliver worker process identities to proxy")
+
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:

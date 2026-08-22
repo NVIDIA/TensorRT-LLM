@@ -2,17 +2,34 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import os
+from collections.abc import Mapping
+from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+from PIL import Image, UnidentifiedImageError
 
 from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
+from tensorrt_llm.serve.openai_protocol import (
+    ImageEditRequest,
+    ImageGenerationRequest,
+    VideoGenerationRequest,
+)
 
 if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+
+IMAGE_EDIT_MAX_IMAGES = 16
+IMAGE_EDIT_MAX_IMAGE_BYTES = 50 * 1024 * 1024
+IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES = 256 * 1024 * 1024
+IMAGE_EDIT_MAX_OUTPUT_IMAGES = 64
+_IMAGE_EDIT_INPUT_FORMATS = {"PNG", "JPEG"}
+_INVALID_IMAGE_EDIT_INPUT_MESSAGE = "image edit input is not a PNG/JPEG image"
 
 # Per-field warnings for OpenAI-shaped knobs that the engine has no
 # semantic for. Each entry maps the request attribute to the message
@@ -107,8 +124,222 @@ def _read_reference_payload(reference) -> bytes:
     return reference.file.read()
 
 
+def _decode_inline_media(extra_params: dict | None, specs) -> None:
+    """Turn base64 strings into bytes for extra params declared as media.
+
+    JSON has no byte type, so a client can only inline binary as base64. Any
+    extra param whose spec accepts ``bytes`` is decoded here, at the HTTP
+    boundary, so pipelines keep a bytes-only contract and never parse
+    transport encodings. Values that already arrived as bytes (multipart)
+    pass through.
+    """
+    if not extra_params:
+        return
+    for key, value in list(extra_params.items()):
+        spec = specs.get(key) if specs else None
+        if spec is None or "bytes" not in getattr(spec, "type", ""):
+            continue
+        if isinstance(value, Mapping):
+            inner = value.get("control")
+            if isinstance(inner, str):
+                extra_params[key] = {**value, "control": _b64(key, inner)}
+        elif isinstance(value, str):
+            extra_params[key] = _b64(key, value)
+
+
+def _b64(key: str, value: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        raise ValueError(
+            f"extra_params['{key}'] must be base64-encoded media bytes; "
+            "it is not valid base64 data."
+        ) from exc
+
+
+def _decode_base64_media(value: str) -> Optional[bytes]:
+    payload = value
+    if value.startswith("data:"):
+        _, sep, payload = value.partition(",")
+        if not sep:
+            return None
+    if len(payload) > ((IMAGE_EDIT_MAX_IMAGE_BYTES + 2) // 3) * 4:
+        raise ValueError(
+            "Image edit input exceeds the per-image byte limit "
+            f"before decoding ({len(payload)} encoded bytes)."
+        )
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _write_bytes_with_limit(value: bytes, path: str) -> int:
+    size = len(value)
+    if size > IMAGE_EDIT_MAX_IMAGE_BYTES:
+        raise ValueError(
+            "Image edit input exceeds the per-image byte limit "
+            f"({size} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+        )
+    _validate_png_jpeg_image(value)
+    with open(path, "wb") as f:
+        f.write(value)
+    return size
+
+
+def _validate_png_jpeg_image(value: bytes) -> None:
+    try:
+        with Image.open(BytesIO(value)) as image:
+            image_format = image.format
+            image.verify()
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+        raise ValueError(_INVALID_IMAGE_EDIT_INPUT_MESSAGE) from exc
+    if image_format not in _IMAGE_EDIT_INPUT_FORMATS:
+        raise ValueError(_INVALID_IMAGE_EDIT_INPUT_MESSAGE)
+
+
+def _copy_upload_with_limit(value: Any, path: str) -> int:
+    total = 0
+    if hasattr(value.file, "seek"):
+        value.file.seek(0)
+    chunks = []
+    while True:
+        chunk = value.file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > IMAGE_EDIT_MAX_IMAGE_BYTES:
+            raise ValueError(
+                "Image edit input exceeds the per-image byte limit "
+                f"({total} > {IMAGE_EDIT_MAX_IMAGE_BYTES})."
+            )
+        chunks.append(chunk)
+    return _write_bytes_with_limit(b"".join(chunks), path)
+
+
+def _materialize_conditioning_input(
+    value: Any,
+    path: str,
+) -> tuple[str, int]:
+    """Return a server-owned file path for upload or base64 inputs."""
+    try:
+        if isinstance(value, str):
+            decoded = _decode_base64_media(value)
+            if decoded is None:
+                parsed = urlparse(value)
+                if parsed.scheme in ("file", "http", "https"):
+                    raise ValueError(
+                        "Image edit inputs must be uploaded files or base64-encoded images; "
+                        "local paths and URLs are not supported."
+                    )
+                raise ValueError("String image edit inputs must be base64-encoded image data.")
+            return path, _write_bytes_with_limit(decoded, path)
+
+        if isinstance(value, bytes):
+            return path, _write_bytes_with_limit(value, path)
+
+        if hasattr(value, "file"):
+            return path, _copy_upload_with_limit(value, path)
+    except Exception:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        raise
+
+    raise ValueError(f"Unsupported conditioning input type: {type(value)}")
+
+
+def _resolve_image_edit_layer_multiplier(
+    request: ImageEditRequest,
+    generator: VisualGen,
+) -> int:
+    extra = request.extra_params or {}
+    save_layers_to_grid = extra.get("save_layers_to_grid", False)
+    if save_layers_to_grid is True:
+        return 1
+    if save_layers_to_grid not in (False, None):
+        raise ValueError(
+            "extra_params.save_layers_to_grid must be a bool when estimating image edit output count."
+        )
+
+    layer_spec = generator.extra_param_specs.get("layers")
+    if layer_spec is None:
+        return 1
+
+    layers = extra.get("layers", getattr(layer_spec, "default", 1))
+    if layers is None:
+        return 1
+    if isinstance(layers, bool) or not isinstance(layers, int):
+        raise ValueError(
+            "extra_params.layers must be an int when estimating image edit output count."
+        )
+    return layers
+
+
+def _validate_image_edit_request_limits(
+    request: ImageEditRequest,
+    generator: VisualGen,
+) -> int:
+    image_count = len(request.image) if isinstance(request.image, list) else 1
+    if image_count > IMAGE_EDIT_MAX_IMAGES:
+        raise ValueError(
+            f"Image edit accepts at most {IMAGE_EDIT_MAX_IMAGES} input images, got {image_count}."
+        )
+
+    output_count = (request.n or 1) * _resolve_image_edit_layer_multiplier(request, generator)
+    if output_count > IMAGE_EDIT_MAX_OUTPUT_IMAGES:
+        raise ValueError(
+            "Image edit request can produce at most "
+            f"{IMAGE_EDIT_MAX_OUTPUT_IMAGES} output images, got {output_count}."
+        )
+    return image_count
+
+
+def _materialize_conditioning_inputs(
+    value: Any,
+    *,
+    id: str,
+    field_name: str,
+    media_storage_path: str,
+) -> str | List[str]:
+    values = value if isinstance(value, list) else [value]
+    paths = []
+    total_bytes = 0
+    try:
+        for i, item in enumerate(values):
+            path, size = _materialize_conditioning_input(
+                item,
+                os.path.join(media_storage_path, f"{id}_{field_name}_{i}.png"),
+            )
+            paths.append(path)
+            total_bytes += size
+            if total_bytes > IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES:
+                raise ValueError(
+                    "Image edit inputs exceed the total byte limit "
+                    f"({total_bytes} > {IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES})."
+                )
+    except Exception:
+        cleanup_materialized_conditioning_inputs(paths)
+        raise
+    return paths if isinstance(value, list) else paths[0]
+
+
+def cleanup_materialized_conditioning_inputs(value: Any) -> None:
+    paths = value if isinstance(value, list) else [value]
+    for path in paths:
+        if not isinstance(path, str):
+            continue
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Failed to remove temporary image edit input %r: %s", path, exc)
+
+
 def parse_visual_gen_params(
-    request: ImageGenerationRequest | VideoGenerationRequest,
+    request: ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest,
     id: str,
     generator: VisualGen,
     media_storage_path: Optional[str] = None,
@@ -133,6 +364,10 @@ def parse_visual_gen_params(
         params.width, params.height = request.width, request.height
     elif request.size is not None and request.size != "auto":
         params.width, params.height = map(int, request.size.split("x"))
+    elif isinstance(request, ImageEditRequest):
+        if request.width is None and request.height is None and request.size in (None, "auto"):
+            params.width = None
+            params.height = None
 
     # Universal per-request overlays — each guard is the "do not
     # override with None" rule in action.
@@ -150,6 +385,21 @@ def parse_visual_gen_params(
     if isinstance(request, ImageGenerationRequest):
         if request.n is not None:
             params.num_images_per_prompt = request.n
+
+    elif isinstance(request, ImageEditRequest):
+        if request.mask is not None:
+            raise ValueError("Image edit mask input is not supported yet.")
+        if request.n is not None:
+            params.num_images_per_prompt = request.n
+        if media_storage_path is None:
+            raise ValueError("media_storage_path is required when image edit inputs are provided")
+        _validate_image_edit_request_limits(request, generator)
+        params.image = _materialize_conditioning_inputs(
+            request.image,
+            id=id,
+            field_name="image",
+            media_storage_path=media_storage_path,
+        )
 
     elif isinstance(request, VideoGenerationRequest):
         if request.frame_rate is not None:
@@ -214,6 +464,7 @@ def parse_visual_gen_params(
                 )
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
+    _decode_inline_media(request.extra_params, generator.extra_param_specs)
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)
 
     return params
