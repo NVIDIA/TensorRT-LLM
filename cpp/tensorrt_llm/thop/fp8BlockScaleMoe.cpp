@@ -413,10 +413,16 @@ public:
         int64_t const totalExpertsPerToken = topK + numFusedSharedExpert.value_or(0);
         int64_t const numTotalLocalExperts = numLocalExperts + numFusedSharedExpert.value_or(0);
         // WAR: the small-tile (tileN 8/16) dynB TRTLLM-Gen batched-GEMM cubins flakily hit an
-        // illegal memory access (garbage TMA-descriptor pointer, MMU fault in the gemm2 K-loop)
-        // when shared experts are fused into the grouped GEMM (num_fused_shared_experts > 0);
+        // illegal memory access (garbage TMA-descriptor pointer, MMU fault in the gemm2 K-loop);
         // tileN >= 32 is unaffected (10/10 clean vs minutes-to-crash baseline on B300 TP=4).
-        // Restrict the fused path to tileN >= 32 until the kernel-side fix lands (nvbug TBD).
+        // Originally scoped to the fused shared-expert path, but the defect is in the shared
+        // small-tile cubins and not caused by expert fusion: DeepSeek-R1 FP8 TP=8 (unfused)
+        // faults identically during warmup, where the 1/2/8-token shapes are the only ones that
+        // can select tileN 8/16 (12288 tokens gets tileN 64/128 and always passes). Excluding
+        // the small tiles for every caller is safe because every FP8 block-scale MoE shape also
+        // offers a tileN >= 32 tactic, so the returned list is never emptied. The tiles stay in
+        // mSupportedTileN: the ctor builds one runner per tile and each asserts a non-empty
+        // passing-config list, so the exclusion has to happen at tactic-selection time.
         // TLLM_MOE_FUSED_MIN_TILEN overrides the threshold (0 disables) for A/B experiments.
         static int const fusedMinTileN = []()
         {
@@ -427,7 +433,7 @@ public:
         std::vector<std::vector<int64_t>> tactics;
         for (auto& [tileN, runner] : mRunners)
         {
-            if (numFusedSharedExpert.value_or(0) > 0 && tileN < fusedMinTileN)
+            if (tileN < fusedMinTileN)
             {
                 continue;
             }
@@ -474,49 +480,42 @@ public:
                 = static_cast<float>(num_tokens * total_experts_per_token) / num_total_local_experts;
             tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
 
-            if (num_fused_shared_experts.value_or(0) > 0)
+            // getDefaultValidConfigIndex only pairs the per-GEMM "default" indices without
+            // re-validating them against the actual problem size, which can return a config
+            // whose kernel is absent (illegal memory access at launch). Pick an
+            // explicitly-validated config instead -- the same set the autotuner draws from --
+            // searching the heuristic tileN first. Small warmup batches clamp the heuristic to
+            // mSupportedTileN.front(), so this fallback is the path that reaches the defective
+            // small-tile cubins; it needs the same tileN >= 32 exclusion as getValidConfigs
+            // (see the WAR comment there).
+            config = -1;
+            std::vector<int32_t> tileN_candidates{static_cast<int32_t>(tileN)};
+            for (auto t : mSupportedTileN)
             {
-                // getDefaultValidConfigIndex only pairs the per-GEMM "default" indices without
-                // re-validating them against the actual problem size. For the inflated fused
-                // expert/topK counts that can return a config whose kernel is absent (illegal
-                // memory access at launch). Pick an explicitly-validated config instead -- the
-                // same set the autotuner draws from -- searching the heuristic tileN first.
-                config = -1;
-                std::vector<int32_t> tileN_candidates{static_cast<int32_t>(tileN)};
-                for (auto t : mSupportedTileN)
-                {
-                    if (t != tileN)
-                        tileN_candidates.push_back(t);
-                }
-                // Same small-tile exclusion as getValidConfigs (see the WAR comment there).
-                static int const fusedMinTileNFallback = []()
-                {
-                    char const* env = std::getenv("TLLM_MOE_FUSED_MIN_TILEN");
-                    return env != nullptr ? std::atoi(env) : 32;
-                }();
-                for (auto t : tileN_candidates)
-                {
-                    if (t < fusedMinTileNFallback)
-                    {
-                        continue;
-                    }
-                    auto valid = mRunners.at(t)->getValidConfigIndices(
-                        total_experts_per_token, hidden_size, intermediate_size, num_total_local_experts, num_tokens);
-                    if (!valid.empty())
-                    {
-                        tileN = t;
-                        config = valid.front();
-                        break;
-                    }
-                }
-                TLLM_CHECK_WITH_INFO(
-                    config != -1, "No valid TRTLLM-Gen config found for fused shared-expert FP8 block-scale MoE.");
+                if (t != tileN)
+                    tileN_candidates.push_back(t);
             }
-            else
+            static int const fusedMinTileNFallback = []()
             {
-                config = mRunners.at(tileN)->getDefaultValidConfigIndex(
+                char const* env = std::getenv("TLLM_MOE_FUSED_MIN_TILEN");
+                return env != nullptr ? std::atoi(env) : 32;
+            }();
+            for (auto t : tileN_candidates)
+            {
+                if (t < fusedMinTileNFallback)
+                {
+                    continue;
+                }
+                auto valid = mRunners.at(t)->getValidConfigIndices(
                     total_experts_per_token, hidden_size, intermediate_size, num_total_local_experts, num_tokens);
+                if (!valid.empty())
+                {
+                    tileN = t;
+                    config = valid.front();
+                    break;
+                }
             }
+            TLLM_CHECK_WITH_INFO(config != -1, "No valid TRTLLM-Gen config found for FP8 block-scale MoE.");
         }
 
         return run_fp8_block_scale_moe(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
