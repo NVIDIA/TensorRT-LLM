@@ -514,6 +514,13 @@ private:
     // no later writes to this KvCache's memory). Mirrors Python's _commit_block.
     void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false);
 
+    // Re-attach committed tree blocks of ours that the tail-prune walk detached while we
+    // still referenced them (triggered by evicting an unheld SSM snapshot). Relinks the
+    // chain from the deepest surviving ancestor. The evicted page stays absent, which is
+    // fine: pruneMatch() truncates reuse before a block that lacks it.
+    // See https://nvbugs/6625710.
+    void _reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& root);
+
     struct TakenPage
     {
         SharedPtr<UncommittedPage> page;
