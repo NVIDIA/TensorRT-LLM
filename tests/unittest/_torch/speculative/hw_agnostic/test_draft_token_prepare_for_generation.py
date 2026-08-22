@@ -1,6 +1,4 @@
 import math
-import os
-import sys
 
 import torch
 from utils.llm_data import llm_models_root
@@ -10,8 +8,6 @@ from tensorrt_llm._torch.speculative.drafting_loops import StaticTreeDraftingLoo
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 class DummyModel(torch.nn.Module):

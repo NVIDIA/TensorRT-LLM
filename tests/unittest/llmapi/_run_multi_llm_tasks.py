@@ -1,16 +1,14 @@
 import os
 import sys
 
-cur_dir = os.path.dirname(os.path.abspath(__file__))
-
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM  # noqa: E402
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.utils import print_colored
 
-# isort: off
-sys.path.append(os.path.join(cur_dir, '..'))
-from utils.llm_data import llm_models_root
-# isort: on
+# Standalone script: won't pollute sys.path of pytest process.
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from utils.llm_data import llm_models_root  # noqa: E402
 
 model_path = llm_models_root() / "llama-models-v2" / "TinyLlama-1.1B-Chat-v1.0"
 

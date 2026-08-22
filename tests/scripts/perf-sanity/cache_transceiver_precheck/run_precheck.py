@@ -71,11 +71,16 @@ import socket
 import sys
 import time
 
-CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-if CUR_DIR not in sys.path:
+__extra_import_path__ = ["."]
+try:
+    import precheck_config as pcfg
+except ImportError:
+    # Run as a standalone script (`python run_precheck.py`), add path ourselves.
+    # Not doing it unconditionally, to avoid polluting sys.path of the pytest
+    # process, which may interfere with other tests.
+    CUR_DIR = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, CUR_DIR)
-
-import precheck_config as pcfg  # noqa: E402
+    import precheck_config as pcfg
 
 # Request-id scheme: rids must be unique across the whole precheck AND
 # dense within a (ctx, gen) session -- the C++ transceiver derives its

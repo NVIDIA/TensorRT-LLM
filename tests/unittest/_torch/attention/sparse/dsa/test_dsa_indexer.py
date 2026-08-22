@@ -24,14 +24,11 @@ This file tests:
 
 import builtins
 import random
-import sys
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.attention_backend.interface import (
@@ -75,6 +72,10 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
+
+__extra_import_path__ = ["..", "~/tests/unittest"]
+
+from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 
 def has_deep_gemm():
@@ -446,9 +447,6 @@ def cdiv(a: int, b: int) -> int:
 
 
 def _load_cast_back_from_fp4():
-    sparse_test_dir = Path(__file__).resolve().parents[1]
-    if str(sparse_test_dir) not in sys.path:
-        sys.path.insert(0, str(sparse_test_dir))
     from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
     return cast_back_from_fp4

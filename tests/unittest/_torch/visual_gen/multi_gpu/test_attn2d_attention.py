@@ -34,9 +34,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    import sys
-    from pathlib import Path
-
     from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.visual_gen.attention_backend import Attention2DAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
@@ -47,8 +44,7 @@ try:
 
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
+    from ._visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:

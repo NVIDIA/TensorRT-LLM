@@ -13,22 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
+from enum import Enum
 from typing import Tuple
 
 import pytest
 import torch
 import torch.nn.functional as F
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-
-# NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
-# unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
-# and test_moe_module.py. Add new MoE tests there instead of here.
-
-from enum import Enum
-
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
@@ -36,6 +26,10 @@ from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
+
+# NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
+# unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
+# and test_moe_module.py. Add new MoE tests there instead of here.
 
 
 # Keep this in sync with the ActType in cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h

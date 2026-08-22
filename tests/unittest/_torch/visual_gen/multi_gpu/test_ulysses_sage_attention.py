@@ -37,19 +37,14 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 try:
-    import sys
-    from pathlib import Path
-
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
     from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+    from ._visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
     ATTENTION_META_DICT = threading.local()

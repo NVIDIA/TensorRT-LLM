@@ -31,13 +31,23 @@ import sys
 import torch
 import torch.nn.functional as F
 
-# Allow running as a standalone script without triggering the full
-# tensorrt_llm import chain.  We import only the triton_routing module.
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
+try:
+    from .triton_routing import triton_fused_topk_softmax_fn
+except ImportError:
+    # Running as a standalone script, so there is no parent package to import
+    # from. Reach the sibling module by path instead, which is what keeps the
+    # full tensorrt_llm import chain out of the standalone run.
+    #
+    # Only on this path: the entry is global and permanent, so doing it
+    # unconditionally would also change how everything imported afterwards
+    # resolves its names. custom_ops/__init__.py imports every module in this
+    # package via pkgutil.walk_packages, so an unconditional insert here would
+    # leak into any process that merely imports the auto_deploy custom ops.
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _THIS_DIR not in sys.path:
+        sys.path.insert(0, _THIS_DIR)
 
-from triton_routing import triton_fused_topk_softmax_fn  # noqa: E402
+    from triton_routing import triton_fused_topk_softmax_fn
 
 # ============================================================================
 # Baseline: 3-op PyTorch implementation (softmax -> topk -> renormalize)

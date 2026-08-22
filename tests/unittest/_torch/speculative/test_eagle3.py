@@ -15,7 +15,6 @@
 
 import json
 import os
-import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -46,8 +45,6 @@ from tensorrt_llm._torch.speculative.mtp_dynamic_tree import \
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:

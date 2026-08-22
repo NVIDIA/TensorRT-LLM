@@ -15,7 +15,6 @@
 
 import math
 import os
-import sys
 import tempfile
 import time
 from unittest.mock import MagicMock, patch
@@ -577,17 +576,20 @@ def test_connector_rejects_unsupported_config(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_e2e_persistent_cache(enforce_single_worker):
+def test_connector_e2e_persistent_cache(enforce_single_worker, monkeypatch):
     """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
 
     Runs generation twice with separate LLM instances sharing a disk-based
     connector cache, verifying that outputs are identical (proving cache
     save/load works end-to-end).
     """
+    # sys.path, not __extra_import_path__: the connector module is imported by
+    # name from inside tensorrt_llm, not by this file. monkeypatch restores the
+    # entry at teardown so a failure cannot leak it into later tests.
     examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..",
                                 "..", "examples", "llm-api")
     examples_dir = os.path.abspath(examples_dir)
-    sys.path.insert(0, examples_dir)
+    monkeypatch.syspath_prepend(examples_dir)
 
     cache_dir = tempfile.mkdtemp()
     os.environ["CONNECTOR_CACHE_FOLDER"] = cache_dir
@@ -632,9 +634,6 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
         del llm2
     finally:
         os.environ.pop("CONNECTOR_CACHE_FOLDER", None)
-
-        if examples_dir in sys.path:
-            sys.path.remove(examples_dir)
 
         import shutil
         shutil.rmtree(cache_dir, ignore_errors=True)

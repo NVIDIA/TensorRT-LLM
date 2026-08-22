@@ -1,16 +1,15 @@
 import os
 import subprocess
-import sys
 import tempfile
 
 import pytest
 import yaml
-from utils.util import skip_gpu_memory_less_than_80gb
 
 from .openai_server import RemoteOpenAIServer
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+__extra_import_path__ = ["..", "~/tests/unittest"]
 from test_llm import get_model_path
+from utils.util import skip_gpu_memory_less_than_80gb
 
 
 @pytest.fixture(scope="module", ids=["Qwen2.5-VL-3B-Instruct"])

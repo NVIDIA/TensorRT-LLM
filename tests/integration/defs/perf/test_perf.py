@@ -19,7 +19,6 @@ import json
 import os
 import re
 import shutil
-import sys
 from typing import Dict, List, NamedTuple
 
 import pytest
@@ -29,14 +28,17 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import (get_device_count, get_llm_root, llm_models_root,
-                        trt_environment)
+from ..conftest import get_device_count, llm_models_root, trt_environment
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
                     generate_test_nodes)
+
+# allowed_configs lives beside this file and is imported lazily in
+# _get_allowed_configs() below.
+__extra_import_path__ = ["."]
 
 if not hasattr(re, "Pattern"):
     re.Pattern = type(re.compile(""))
@@ -142,8 +144,6 @@ def import_allowed_perf_config():
     else:
         global ALLOWED_CONFIGS_CACHE
         if ALLOWED_CONFIGS_CACHE is None:
-            sys.path.append((os.path.join(get_llm_root(),
-                                          "tests/integration/defs/perf")))
             import allowed_configs
             ALLOWED_CONFIGS_CACHE = allowed_configs
         else:

@@ -18,8 +18,6 @@ import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
-import sys
-from pathlib import Path
 from typing import Callable
 
 import pytest
@@ -35,8 +33,7 @@ from tensorrt_llm._torch.visual_gen.models.ltx2.parallel_vae import tile_paralle
 
 # Spawn distributed workers via a helper that retries with a fresh master
 # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _visual_gen_dist_utils import spawn_with_retry  # noqa: E402
+from ._visual_gen_dist_utils import spawn_with_retry
 
 
 @pytest.fixture(autouse=True, scope="module")

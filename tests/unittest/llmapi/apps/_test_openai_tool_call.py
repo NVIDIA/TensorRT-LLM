@@ -1,13 +1,11 @@
 import json
-import os
-import sys
 
 import openai
 import pytest
 
 from .openai_server import RemoteOpenAIServer
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+__extra_import_path__ = [".."]
 from test_llm import get_model_path
 
 TOOLS = [
