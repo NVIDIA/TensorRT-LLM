@@ -439,7 +439,7 @@ class TestCosmos3TransformerCheckpoint:
             )
         _assert_finite_output(out.video, hs.shape)
 
-    @pytest.mark.parametrize("quant_algo", ["FP8"])
+    @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_PER_CHANNEL_PER_TOKEN"])
     def test_load_fp8_quantization(self, quant_algo: str):
         checkpoint_dir = _require_checkpoint()
         if not torch.cuda.is_available():
