@@ -22,7 +22,7 @@ from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
                     AsyncIterator, List, Optional, Union)
 
 import uvicorn
-from fastapi import Body, FastAPI, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
@@ -101,6 +101,7 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import \
     build_visual_gen_timing_headers
@@ -370,7 +371,16 @@ class OpenAIServer(_VideoRoutesMixin):
             embedding_max_queue_size: int = 2048,
             input_processor_workers: int = 8,
             media_load_workers: int = 8,
-            internal_disagg_auth_key: Optional[str] = None):
+            internal_disagg_auth_key: Optional[str] = None,
+            enable_rl_control_endpoints: bool = False,
+            rl_control_api_key: Optional[str] = None):
+        if enable_rl_control_endpoints and not rl_control_api_key:
+            raise ValueError(
+                "rl_control_api_key is required when RL control endpoints are enabled"
+            )
+        if enable_rl_control_endpoints and not isinstance(generator, AsyncLLM):
+            raise ValueError("RL control endpoints require AsyncLLM")
+
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)
         self._embedding_max_queue_delay = embedding_max_queue_delay
@@ -395,6 +405,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.multimodal_server_config = cfg
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
+        self._enable_rl_control_endpoints = enable_rl_control_endpoints
+        self._rl_control_api_key = rl_control_api_key
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -1035,16 +1047,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.tokenize,
                                methods=["POST"])
 
-        # RL-only endpoints
-        self.app.add_api_route("/release_memory",
-                               self.release_memory,
-                               methods=["POST"])
-        self.app.add_api_route("/resume_memory",
-                               self.resume_memory,
-                               methods=["POST"])
-        self.app.add_api_route("/update_weights",
-                               self.update_weights,
-                               methods=["POST"])
+        self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
@@ -1085,16 +1088,33 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_mm_encoder,
                                methods=["POST"])
-        # RL-only endpoints
+
+    async def _require_rl_control_auth(self, raw_request: Request) -> None:
+        body = await raw_request.body()
+        try:
+            validate_rl_control_request(self._rl_control_api_key, body,
+                                        raw_request.headers)
+        except ValueError as e:
+            raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED,
+                                detail=str(e)) from e
+
+    def _register_rl_control_routes(self) -> None:
+        if not self._enable_rl_control_endpoints:
+            return
+
+        dependencies = [Depends(self._require_rl_control_auth)]
         self.app.add_api_route("/release_memory",
                                self.release_memory,
-                               methods=["POST"])
+                               methods=["POST"],
+                               dependencies=dependencies)
         self.app.add_api_route("/resume_memory",
                                self.resume_memory,
-                               methods=["POST"])
+                               methods=["POST"],
+                               dependencies=dependencies)
         self.app.add_api_route("/update_weights",
                                self.update_weights,
-                               methods=["POST"])
+                               methods=["POST"],
+                               dependencies=dependencies)
 
     def _init_embedding_batcher(self):
         """Create the encode dynamic batcher for the embedding server.

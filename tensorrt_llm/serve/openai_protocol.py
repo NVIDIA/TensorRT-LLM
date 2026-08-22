@@ -1424,7 +1424,9 @@ class ResponsesStreamResponse(OpenAIBaseModel):
 
 
 class MemoryUpdateRequest(OpenAIBaseModel):
-    tags: List[str] = Field(default=["model", "kv_cache"])
+    tags: list[str] = Field(
+        min_length=1,
+        description="Memory tags to release/resume, e.g. ['model', 'kv_cache']")
 
 
 class UpdateWeightsRequest(OpenAIBaseModel):
