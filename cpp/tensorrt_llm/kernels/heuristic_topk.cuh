@@ -164,6 +164,13 @@ constexpr int SAFETY_MARGIN = 2048;
 constexpr int MAX_CANDIDATES = TOP_K + SAFETY_MARGIN * 2; // 6144
 
 constexpr int MAX_REFINE_ITERS = 15;
+// Phase-3 repair bisection budget. The repair bisects on the order-preserving
+// uint32 image of the float key space (see floatToOrderedKey), so the bracket
+// provably collapses to adjacent representable values in <= 32 steps; 40 is
+// that bound plus slack. Only rows whose Phase-2 secant did NOT converge
+// (done != 1) ever enter the loop, and it exits as soon as the candidate
+// count lands in [kK, kCC] — the converged fast path is untouched.
+constexpr int MAX_REPAIR_ITERS = 40;
 constexpr int NUM_BINS = 2048;
 
 static_assert(TOP_K % BLOCK_SIZE == 0);
@@ -420,6 +427,26 @@ __device__ __forceinline__ float warpReduceMax(float val)
 #endif
 
 // ============================================================================
+// Order-preserving float <-> uint32 map (arch-independent)
+// ============================================================================
+// Same bijection as floatToOrderedUint/orderedUintToFloat above, but defined
+// for every __CUDA_ARCH__ (those are inside the >= 800 reduction block). Used
+// by the Phase-3 repair to bisect on the key space itself: `a < b` for finite
+// floats iff `gvrOrderKey(a) < gvrOrderKey(b)`, so a uint32 midpoint always
+// makes progress and the bracket collapses to adjacent representable values
+// in at most 32 steps — a float-average midpoint has no such bound.
+__device__ __forceinline__ unsigned gvrOrderKey(float f)
+{
+    unsigned u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+__device__ __forceinline__ float gvrOrderKeyToFloat(unsigned u)
+{
+    return __uint_as_float((u & 0x80000000u) ? (u & ~0x80000000u) : ~u);
+}
+
+// ============================================================================
 // Device: Block count ≥ threshold in GLOBAL memory  (1-sync pattern)
 // ============================================================================
 
@@ -661,15 +688,31 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         }
         __syncthreads();
 
+        // Degenerate hint (every hinted value identical, or none in range):
+        // Phase 1 produced no usable bracket. This used to emit the first K
+        // elements of the row verbatim, which is not a top-K at all — it is
+        // simply the head of the row. Fall through instead with the widest
+        // trusted bracket and let the Phase-3 repair locate the threshold;
+        // the hint only ever affects speed, never the answer. done = 2 stops
+        // Phase 2 after its single seed probe (which can still promote to the
+        // done = 1 fast path): the secant interpolates on the LINEAR float
+        // scale, so across a (-FLT_MAX, FLT_MAX) bracket it cannot converge
+        // within MAX_REFINE_ITERS and would burn 15 full-N counting passes
+        // before the repair fixes the row anyway. The Phase-3 bisection on
+        // the ordered-key image collapses any bracket in <= 32 steps.
         if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
         {
             if (tid == 0)
-                for (int i = 0; i < topK && i < N; i++)
-                {
-                    outputIndices[i] = i;
-                    outputValues[i] = input[i];
-                }
-            return;
+            {
+                float const seed = (smem->val_hi <= -FLT_MAX) ? 0.0f : smem->pmax_saved;
+                smem->val_lo = -FLT_MAX;
+                smem->val_hi = FLT_MAX;
+                smem->cnt_lo = N;
+                smem->cnt_hi = 0;
+                smem->threshold = seed;
+                smem->done = 2;
+            }
+            __syncthreads();
         }
 
         // ================================================================
@@ -775,23 +818,61 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
 
     // When done==1, Phase 2 already verified the candidate count is in
     // [kK, kCC]; skip the redundant full-N blockCountGE re-check.
+    //
+    // Otherwise the Phase-2 secant did not converge and `threshold` carries
+    // no guarantee at all. The repair below restores the invariant the
+    // collect depends on — cand_count >= kK — on BOTH sides:
+    //
+    //   cand_count > kCC : candidates overflow smem->keys[]; the collect
+    //                      silently drops the excess (my_write_pos < kCC).
+    //   cand_count < kK  : the collect emits fewer than K entries and the
+    //                      Phase-4 tail pads the rest with index -1, i.e. a
+    //                      silently WRONG top-K. The previous loop guarded
+    //                      only the overflow side (`cand_count > kCC`), so
+    //                      an undershooting threshold — which the `done=2`
+    //                      fallback above can pick outright via val_hi —
+    //                      went straight through. Reproduced on production
+    //                      DSv4 decode captures: V4-Flash K=512 N=131075
+    //                      layers 22/24 (283 / 87 slots left at -1) and
+    //                      V4-Pro K=1024 N=262127 layer 40 (550 slots),
+    //                      all on rows whose temporal hint was poor
+    //                      (hit-rate 0.02 - 0.12), which starts the secant
+    //                      from a bracket far off the true K-th value.
     if (smem->done != 1)
     {
         blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
-        if (tid == 0 && smem->cand_count > kCC)
-            smem->val_lo = smem->threshold;
+        // Reset the bracket to endpoints whose counts are KNOWN. Phase 1 seeds
+        // val_lo/val_hi from the min/max of the *hinted* values with invented
+        // counts (M + M/4, 1); neither is measured, so a poor hint can leave
+        // both ends on the same side of the K-th value. The collapse handling
+        // below relies on count(val_lo) >= kK > count(val_hi), so anchor the
+        // untested end at a float extreme: count(-FLT_MAX) = #finite >= kK and
+        // count(FLT_MAX) = 0 < kK for any normal row.
+        if (tid == 0)
+        {
+            int c = smem->cand_count;
+            if (c > kCC)
+            {
+                smem->val_lo = smem->threshold;
+                smem->val_hi = FLT_MAX;
+            }
+            else if (c < kK)
+            {
+                smem->val_hi = smem->threshold;
+                smem->val_lo = -FLT_MAX;
+            }
+        }
         __syncthreads();
 
-        for (int retry = 0; retry < 10 && smem->cand_count > kCC; retry++)
+        // Invariant maintained below: count(val_lo) >= kK.
+        for (int retry = 0; retry < MAX_REPAIR_ITERS && (smem->cand_count > kCC || smem->cand_count < kK); retry++)
         {
+            unsigned const klo = gvrOrderKey(smem->val_lo);
+            unsigned const khi = gvrOrderKey(smem->val_hi);
+            if (khi <= klo + 1u)
+                break; // bracket collapsed to adjacent representable values
             if (tid == 0)
-            {
-                float lo = smem->val_lo, hi = smem->val_hi;
-                float mid = (lo + hi) * 0.5f;
-                if (mid == lo)
-                    mid = hi;
-                smem->threshold = mid;
-            }
+                smem->threshold = gvrOrderKeyToFloat(klo + ((khi - klo) >> 1));
             __syncthreads();
             blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
             if (tid == 0)
@@ -803,6 +884,80 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
                     smem->val_hi = smem->threshold;
             }
             __syncthreads();
+        }
+
+        // Still short of kK => the bisection collapsed. Fall back to val_lo,
+        // which by the invariant admits >= kK elements (or the row simply has
+        // fewer than kK finite entries, in which case the Phase-4 tail pad is
+        // the correct answer). blockCountGE also refreshes per_thread_counts,
+        // which the collect below consumes.
+        if (smem->cand_count < kK)
+        {
+            if (tid == 0)
+                smem->threshold = smem->val_lo;
+            __syncthreads();
+            blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
+        }
+        // blockCountGE publishes cand_count from tid 0 only; the branch below
+        // must be uniform across the block.
+        __syncthreads();
+
+        // Collapsed bracket with more than kCC elements at the threshold:
+        // every value in [val_lo, val_hi) equals val_lo, so the answer is
+        // "all elements strictly above val_lo" (fewer than kK of them, since
+        // count(val_hi) < kK) plus arbitrary ties at val_lo. The candidate
+        // buffer cannot hold them all, so emit directly instead — any tie
+        // subset is a valid top-K.
+        // The direct emit below is only valid once the bracket has collapsed:
+        // it assumes count(> thr) < kK, which is exactly "val_hi is the next
+        // representable value above val_lo and count(val_hi) < kK". If the
+        // loop ran out of iterations without collapsing (it cannot, given
+        // MAX_REPAIR_ITERS >= 32, but the guard keeps that an invariant rather
+        // than an assumption) fall through to the ordinary collect.
+        if (smem->cand_count > kCC && gvrOrderKey(smem->val_hi) <= gvrOrderKey(smem->val_lo) + 1u)
+        {
+            float const thr = smem->threshold;
+            if (tid == 0)
+                smem->out_count = 0;
+            __syncthreads();
+            for (int i = tid; i < N; i += BLOCK_SIZE)
+            {
+                float const v = __ldg(&input[i]);
+                if (v > thr)
+                {
+                    int const p = atomicAdd(&smem->out_count, 1);
+                    if (p < kK)
+                    {
+                        outputValues[p] = v;
+                        outputIndices[p] = i;
+                    }
+                }
+            }
+            __syncthreads();
+            int const n_gt = min(smem->out_count, kK);
+            if (tid == 0)
+                smem->out_count = n_gt;
+            __syncthreads();
+            for (int i = tid; i < N && smem->out_count < kK; i += BLOCK_SIZE)
+            {
+                float const v = __ldg(&input[i]);
+                if (v == thr)
+                {
+                    int const p = atomicAdd(&smem->out_count, 1);
+                    if (p < kK)
+                    {
+                        outputValues[p] = v;
+                        outputIndices[p] = i;
+                    }
+                }
+            }
+            __syncthreads();
+            for (int i = min(smem->out_count, kK) + tid; i < kK; i += BLOCK_SIZE)
+            {
+                outputValues[i] = -FLT_MAX;
+                outputIndices[i] = -1;
+            }
+            return;
         }
     }
 
@@ -1227,15 +1382,31 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         }
         __syncthreads();
 
+        // Degenerate hint (every hinted value identical, or none in range):
+        // Phase 1 produced no usable bracket. This used to emit the first K
+        // elements of the row verbatim, which is not a top-K at all — it is
+        // simply the head of the row. Fall through instead with the widest
+        // trusted bracket and let the Phase-3 repair locate the threshold;
+        // the hint only ever affects speed, never the answer. done = 2 stops
+        // Phase 2 after its single seed probe (which can still promote to the
+        // done = 1 fast path): the secant interpolates on the LINEAR float
+        // scale, so across a (-FLT_MAX, FLT_MAX) bracket it cannot converge
+        // within MAX_REFINE_ITERS and would burn 15 full-N counting passes
+        // before the repair fixes the row anyway. The Phase-3 bisection on
+        // the ordered-key image collapses any bracket in <= 32 steps.
         if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
         {
             if (tid == 0)
-                for (int i = 0; i < topK && i < N; i++)
-                {
-                    outputIndices[i] = i;
-                    outputValues[i] = __ldg(&input[i]); // both InputT, no convert
-                }
-            return;
+            {
+                float const seed = (smem->val_hi <= -FLT_MAX) ? 0.0f : smem->pmax_saved;
+                smem->val_lo = -FLT_MAX;
+                smem->val_hi = FLT_MAX;
+                smem->cnt_lo = N;
+                smem->cnt_hi = 0;
+                smem->threshold = seed;
+                smem->done = 2;
+            }
+            __syncthreads();
         }
 
         // ================================================================
@@ -1339,23 +1510,40 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
     // Phase 3 — Ballot-free candidate collect
     // ================================================================
 
+    // Mirror of the fp32 Phase-3 repair in gvrTopKJob — see the comment block
+    // there for why the undershoot side (cand_count < kK) must be repaired:
+    // without it the collect emits < K entries and the tail is padded with
+    // index -1, i.e. a silently wrong top-K.
     if (smem->done != 1)
     {
         blockCountGEDtype<InputT>(input, N, smem->threshold, smem, tid, warp_id, lane);
-        if (tid == 0 && smem->cand_count > kCC)
-            smem->val_lo = smem->threshold;
+        // See the fp32 path: anchor the untested bracket end at a float extreme
+        // so count(val_lo) >= kK > count(val_hi) holds by construction.
+        if (tid == 0)
+        {
+            int c = smem->cand_count;
+            if (c > kCC)
+            {
+                smem->val_lo = smem->threshold;
+                smem->val_hi = FLT_MAX;
+            }
+            else if (c < kK)
+            {
+                smem->val_hi = smem->threshold;
+                smem->val_lo = -FLT_MAX;
+            }
+        }
         __syncthreads();
 
-        for (int retry = 0; retry < 10 && smem->cand_count > kCC; retry++)
+        // Invariant maintained below: count(val_lo) >= kK.
+        for (int retry = 0; retry < MAX_REPAIR_ITERS && (smem->cand_count > kCC || smem->cand_count < kK); retry++)
         {
+            unsigned const klo = gvrOrderKey(smem->val_lo);
+            unsigned const khi = gvrOrderKey(smem->val_hi);
+            if (khi <= klo + 1u)
+                break; // bracket collapsed to adjacent representable values
             if (tid == 0)
-            {
-                float lo = smem->val_lo, hi = smem->val_hi;
-                float mid = (lo + hi) * 0.5f;
-                if (mid == lo)
-                    mid = hi;
-                smem->threshold = mid;
-            }
+                smem->threshold = gvrOrderKeyToFloat(klo + ((khi - klo) >> 1));
             __syncthreads();
             blockCountGEDtype<InputT>(input, N, smem->threshold, smem, tid, warp_id, lane);
             if (tid == 0)
@@ -1367,6 +1555,72 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
                     smem->val_hi = smem->threshold;
             }
             __syncthreads();
+        }
+
+        if (smem->cand_count < kK)
+        {
+            if (tid == 0)
+                smem->threshold = smem->val_lo;
+            __syncthreads();
+            blockCountGEDtype<InputT>(input, N, smem->threshold, smem, tid, warp_id, lane);
+        }
+        // blockCountGEDtype publishes cand_count from tid 0 only; the branch
+        // below must be uniform across the block.
+        __syncthreads();
+
+        // Collapsed bracket with > kCC elements at the threshold: emit the
+        // strictly-greater set plus arbitrary ties directly (see fp32 path).
+        // The direct emit below is only valid once the bracket has collapsed:
+        // it assumes count(> thr) < kK, which is exactly "val_hi is the next
+        // representable value above val_lo and count(val_hi) < kK". If the
+        // loop ran out of iterations without collapsing (it cannot, given
+        // MAX_REPAIR_ITERS >= 32, but the guard keeps that an invariant rather
+        // than an assumption) fall through to the ordinary collect.
+        if (smem->cand_count > kCC && gvrOrderKey(smem->val_hi) <= gvrOrderKey(smem->val_lo) + 1u)
+        {
+            float const thr = smem->threshold;
+            if (tid == 0)
+                smem->out_count = 0;
+            __syncthreads();
+            for (int i = tid; i < N; i += BLOCK_SIZE)
+            {
+                float const v = Trait::to_fp32(__ldg(&input[i]));
+                if (v > thr)
+                {
+                    int const p = atomicAdd(&smem->out_count, 1);
+                    if (p < kK)
+                    {
+                        outputValues[p] = Trait::from_fp32(v);
+                        outputIndices[p] = i;
+                    }
+                }
+            }
+            __syncthreads();
+            int const n_gt = min(smem->out_count, kK);
+            if (tid == 0)
+                smem->out_count = n_gt;
+            __syncthreads();
+            for (int i = tid; i < N && smem->out_count < kK; i += BLOCK_SIZE)
+            {
+                float const v = Trait::to_fp32(__ldg(&input[i]));
+                if (v == thr)
+                {
+                    int const p = atomicAdd(&smem->out_count, 1);
+                    if (p < kK)
+                    {
+                        outputValues[p] = Trait::from_fp32(v);
+                        outputIndices[p] = i;
+                    }
+                }
+            }
+            __syncthreads();
+            InputT const neg_max = Trait::from_fp32(-FLT_MAX);
+            for (int i = min(smem->out_count, kK) + tid; i < kK; i += BLOCK_SIZE)
+            {
+                outputValues[i] = neg_max;
+                outputIndices[i] = -1;
+            }
+            return;
         }
     }
 

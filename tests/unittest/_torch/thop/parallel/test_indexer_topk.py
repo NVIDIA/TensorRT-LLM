@@ -2350,3 +2350,125 @@ def test_prefill_overflow_policy_overflow(
         dtype,
         row_start_offset=row_start_offset,
     )
+
+
+# ============================================================================
+# GVR Phase-3 threshold-repair regressions
+# ============================================================================
+# The heuristic (GVR) decode path locates a value threshold whose candidate
+# count lands in [K, kC] and then selects the top-K out of those candidates.
+# Three inputs used to defeat that search and produce a silently WRONG top-K
+# (no error, no -1-free output guarantee):
+#
+#   1. undershoot     — the search ends with fewer than K candidates, the
+#                       collect emits them all and pads the tail with -1.
+#   2. degenerate hint— every hinted value identical, so Phase 1 builds an
+#                       empty bracket; the kernel emitted the first K entries
+#                       of the row verbatim (the head of the row, not a top-K).
+#   3. tie plateau    — more than kC elements share the K-th value, so NO
+#                       threshold yields a count in [K, kC]; the candidate
+#                       buffer overflowed and dropped strictly-greater entries.
+#
+# All three are hint-quality driven, i.e. they need no special logits — only a
+# hint that points away from the true top-K, which production hits whenever a
+# layer's temporal locality breaks down.
+
+
+def _gvr_decode_exact_check(logits_row, pre_idx_row, index_topk, tag):
+    """Run indexer_topk_decode (cr=4, BS=1) and assert a tie-aware exact top-K."""
+    n = logits_row.shape[-1]
+    dtype = logits_row.dtype
+    logits = logits_row.view(1, n).contiguous()
+    pre_idx = pre_idx_row.view(1, index_topk).to(torch.int32).contiguous()
+    seq_lens = torch.full((1,), n * 4, dtype=torch.int32, device="cuda")
+    # -1 sentinel: a slot the kernel never writes must trip the assertions
+    # below rather than hold whatever torch.empty happened to contain.
+    indices = torch.full((1, index_topk), -1, dtype=torch.int32, device="cuda")
+    scratch = torch.empty(index_topk, dtype=dtype, device="cuda")
+    aux_indices, aux_logits = _build_radix_aux_buffers(1, index_topk)
+    torch.ops.trtllm.indexer_topk_decode(
+        logits,
+        seq_lens,
+        indices,
+        1,
+        index_topk,
+        pre_idx,
+        scratch,
+        compress_ratio=4,
+        radix_aux_indices=aux_indices,
+        radix_aux_logits=aux_logits,
+    )
+    torch.cuda.synchronize()
+
+    assert int((indices < 0).sum()) == 0, (
+        f"{tag}: {int((indices < 0).sum())} of {index_topk} output slots are -1"
+    )
+    # Distinctness: the repair paths emit through an atomic counter, and a
+    # duplicated index paired with an omitted one on a tie plateau would leave
+    # the sorted value multiset (checked below) unchanged.
+    n_unique = int(torch.unique(indices[0]).numel())
+    assert n_unique == index_topk, (
+        f"{tag}: only {n_unique} of {index_topk} output indices are distinct"
+    )
+    flat = logits[0].float()
+    got = flat[indices[0].long()].sort().values
+    ref = flat.topk(index_topk).values.sort().values
+    assert torch.equal(got, ref), f"{tag}: selected values differ from torch.topk"
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [65536, 131072])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"]
+)
+@pytest.mark.parametrize("hint", ["bottom_k", "uniform_max", "random"])
+def test_indexer_topk_decode_gvr_hostile_hint(index_topk, num_tokens, dtype, hint):
+    """A hint that points away from the top-K must not change the result.
+
+    ``uniform_max`` (every slot = argmax) additionally collapses Phase 1's
+    min/max bracket to a point, which used to short-circuit the kernel into
+    emitting row[0:K].
+    """
+    torch.manual_seed(1234)
+    logits = torch.randn(num_tokens, dtype=torch.float32, device="cuda").to(dtype)
+    flat = logits.float()
+    if hint == "bottom_k":
+        pre = flat.topk(index_topk, largest=False).indices
+    elif hint == "uniform_max":
+        pre = flat.argmax().repeat(index_topk)
+    else:
+        pre = torch.randint(0, num_tokens, (index_topk,), device="cuda")
+    _gvr_decode_exact_check(logits, pre, index_topk, f"hint={hint}")
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("n_tie", [6000, 20000, 100000])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"]
+)
+def test_indexer_topk_decode_gvr_tie_plateau(index_topk, n_tie, dtype):
+    """More ties at the K-th value than the candidate buffer can hold.
+
+    No threshold yields a candidate count in [K, kC], so the search must
+    collapse the bracket and emit "everything strictly greater + arbitrary
+    ties" — dropping strictly-greater entries instead is a wrong top-K. The
+    bf16/fp16 parameterizations exercise the direct-emit block in the reduced-
+    precision driver, which is separate code from the fp32 one.
+    """
+    torch.manual_seed(1234)
+    num_tokens = 131072
+    n_above = index_topk // 2
+    logits = torch.full((num_tokens,), -1.0, dtype=torch.float32, device="cuda")
+    logits[:n_above] = torch.linspace(2.0, 3.0, n_above, device="cuda")
+    logits[n_above : n_above + n_tie] = 1.0
+    # The plateau (1.0) and floor (-1.0) are exact in every dtype, so casting
+    # never merges the strictly-greater set into the plateau. Casting may merge
+    # some strictly-greater values with EACH OTHER (bf16 resolves ~128 steps in
+    # [2, 4)), which the test tolerates: the top-K contract only needs the
+    # plateau to stay the K-th value with more than kC ties, and the exactness
+    # check compares value multisets computed from the same cast tensor.
+    logits = logits[torch.randperm(num_tokens, device="cuda")].contiguous().to(dtype)
+    pre = torch.randint(0, num_tokens, (index_topk,), device="cuda")
+    _gvr_decode_exact_check(logits, pre, index_topk, f"n_tie={n_tie}")
