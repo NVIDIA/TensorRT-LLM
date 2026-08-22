@@ -327,7 +327,7 @@ def _shutdown_kv_cache_manager_candidate(candidate: Optional[KVCacheManagerPy]) 
     try:
         candidate.shutdown()
     except Exception as error:
-        logger.error("Failed to clean up an uncommitted KV cache manager:", error)
+        logger.error(f"Failed to clean up an uncommitted KV cache manager: {error}")
 
 
 def _estimate_swa_cache_size(
@@ -1119,109 +1119,79 @@ class KVCacheManagerV2(BaseResourceManager):
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
 
-        candidate = None
-        init_error: Optional[Exception] = None
-        local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
-        try:
+        candidate: Optional[KVCacheManagerPy] = None
+        if not has_host_cache_tier:
             candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
-            if not has_host_cache_tier:
+        else:
+            init_error: Optional[Exception] = None
+            try:
+                candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+                local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+            except (CuError, KVCacheOutOfMemoryError):
                 local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
-        except (CuError, KVCacheOutOfMemoryError) as error:
-            if has_host_cache_tier:
-                # Do not retain the traceback of a failed Python HostMem
-                # constructor: its frames can keep a partially allocated mmap
-                # alive while the hostless fallback is being built.
-                local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
-            else:
+            except Exception as error:
                 init_error = error.with_traceback(None)
                 local_init_status = _KVCacheManagerInitStatus.ABORT
-        except Exception as error:
-            # Every rank must reach the consensus below even when only one
-            # sees an unexpected constructor error. The error is re-raised
-            # after peers have observed the fatal status. Drop its traceback
-            # so a partial constructor is not retained across the collective.
-            init_error = error.with_traceback(None)
-            local_init_status = _KVCacheManagerInitStatus.ABORT
 
-        try:
-            init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
-        except Exception:
-            _shutdown_kv_cache_manager_candidate(candidate)
-            raise
+            try:
+                init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
+            except Exception:
+                _shutdown_kv_cache_manager_candidate(candidate)
+                raise
 
-        if init_status == _KVCacheManagerInitStatus.ABORT:
-            _shutdown_kv_cache_manager_candidate(candidate)
-            if local_init_status == _KVCacheManagerInitStatus.ABORT:
-                assert init_error is not None
-                raise init_error
-            raise RuntimeError("KV cache manager initialization failed on another rank")
+            if init_status == _KVCacheManagerInitStatus.ABORT:
+                _shutdown_kv_cache_manager_candidate(candidate)
+                if init_error is not None:
+                    raise init_error
+                raise RuntimeError("KV cache manager initialization failed on another rank")
 
-        if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
-            if has_host_cache_tier:
+            if init_status == _KVCacheManagerInitStatus.USE_NO_HOST:
                 logger.warning(
                     "At least one rank could not use the KV cache manager host tier "
                     "(cuMemHostRegister may have failed). Rebuilding without the "
                     "host cache tier on all ranks."
                 )
-            fallback_config = None
-            fallback_error: Optional[Exception] = None
-            try:
-                cache_tiers_without_host = [
-                    tier for tier in config.cache_tiers if not isinstance(tier, HostCacheTierConfig)
-                ]
-                fallback_config = replace(config, cache_tiers=cache_tiers_without_host)
-            except Exception as error:
-                # Config derivation is rank-local too, so it must participate
-                # in the same completion vote as teardown and reconstruction.
-                fallback_error = error.with_traceback(None)
-
-            stale_candidate = None
-            if has_host_cache_tier and candidate is not None:
-                stale_candidate = candidate
+                _shutdown_kv_cache_manager_candidate(candidate)
                 candidate = None
+                fallback_error: Optional[Exception] = None
                 try:
-                    stale_candidate.shutdown()
+                    config = replace(
+                        config,
+                        cache_tiers=[
+                            tier
+                            for tier in config.cache_tiers
+                            if not isinstance(tier, HostCacheTierConfig)
+                        ],
+                    )
                 except Exception as error:
                     fallback_error = error.with_traceback(None)
                 else:
-                    stale_candidate = None
+                    try:
+                        candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
+                    except Exception as error:
+                        fallback_error = error.with_traceback(None)
 
-            if fallback_error is None and candidate is None:
-                assert fallback_config is not None
-                try:
-                    candidate = KVCacheManagerPy(fallback_config, event_manager=self.event_manager)
-                except Exception as error:
-                    # A fallback-construction failure is fatal because there
-                    # is no lower cache tier to retry.
-                    fallback_error = error.with_traceback(None)
-
-            local_fallback_status = (
-                _KVCacheManagerInitStatus.USE_NO_HOST
-                if fallback_error is None
-                else _KVCacheManagerInitStatus.ABORT
-            )
-
-            try:
-                fallback_status = _sync_kv_cache_manager_init_status(local_fallback_status, mapping)
-            except Exception:
-                _shutdown_kv_cache_manager_candidate(candidate)
-                _shutdown_kv_cache_manager_candidate(stale_candidate)
-                raise
-
-            if fallback_status == _KVCacheManagerInitStatus.ABORT:
-                _shutdown_kv_cache_manager_candidate(candidate)
-                _shutdown_kv_cache_manager_candidate(stale_candidate)
-                if fallback_error is not None:
-                    raise fallback_error
-                raise RuntimeError(
-                    "KV cache manager initialization without the host cache tier "
-                    "failed on another rank"
+                local_fallback_status = (
+                    _KVCacheManagerInitStatus.USE_NO_HOST
+                    if fallback_error is None
+                    else _KVCacheManagerInitStatus.ABORT
                 )
+                try:
+                    fallback_status = _sync_kv_cache_manager_init_status(
+                        local_fallback_status, mapping
+                    )
+                except Exception:
+                    _shutdown_kv_cache_manager_candidate(candidate)
+                    raise
 
-            assert stale_candidate is None
-            assert candidate is not None
-            assert fallback_config is not None
-            config = fallback_config
+                if fallback_status == _KVCacheManagerInitStatus.ABORT:
+                    _shutdown_kv_cache_manager_candidate(candidate)
+                    if fallback_error is not None:
+                        raise fallback_error
+                    raise RuntimeError(
+                        "KV cache manager initialization without the host cache tier "
+                        "failed on another rank"
+                    )
 
         assert candidate is not None
         self.kv_cache_manager_py_config = config
