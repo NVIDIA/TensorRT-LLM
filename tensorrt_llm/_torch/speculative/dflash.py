@@ -81,6 +81,10 @@ class DFlashSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Preserve the initial slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
+
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -279,7 +283,14 @@ class DFlashWorker(SpecWorkerBase):
         if self._ctx_buf_inited:
             return
 
-        max_batch = spec_metadata.max_num_requests
+        # Worker-owned and allocated once, then reused for every later batch
+        # shape, so this must span a stable upper bound. _free_slots assigns
+        # rows by request ID and only needs the pre-graph max_num_requests;
+        # num_seq_slots is the surviving proxy after max_num_requests is
+        # narrowed to a captured graph bucket. Under disagg-ADP it can be
+        # 2 * max_num_requests, so this deliberately overallocates the large
+        # context K/V buffers to keep one safe capacity across graph buckets.
+        max_batch = spec_metadata.num_seq_slots
 
         # Prefer runtime max_seq_len over max_position_embeddings: YaRN
         # models advertise 100k+ positions, which would OOM the ctx buffer
