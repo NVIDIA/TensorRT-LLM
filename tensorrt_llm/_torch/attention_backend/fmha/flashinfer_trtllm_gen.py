@@ -752,7 +752,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, f"non-positive tokens_per_block ({tokens_per_block})."
         if tokens_per_block & (tokens_per_block - 1) != 0:
             return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
-        if tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK:
+        # Do not add P128 to the global allowlist: a substantial part of the
+        # shipped TRTLLM-Gen artifact only exports P32 shapes. Cache-manager
+        # adapters whose exact shapes are exported may opt in explicitly.
+        extra_tokens_per_block = getattr(
+            meta.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()
+        )
+        if (
+            tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK
+            and tokens_per_block not in extra_tokens_per_block
+        ):
             supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
 

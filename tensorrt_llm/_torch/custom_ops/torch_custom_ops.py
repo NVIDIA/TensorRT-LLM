@@ -2702,6 +2702,17 @@ def get_event(event_idx: int):
     return extra_attrs["events"]()[event_idx]
 
 
+def get_eagle_hidden_states_event() -> torch.cuda.Event:
+    from ..utils import get_model_extra_attrs
+    extra_attrs = get_model_extra_attrs()
+    assert extra_attrs is not None, "Missing model extra attributes"
+    spec_metadata = extra_attrs.get("spec_metadata")
+    assert spec_metadata is not None, "Missing speculative metadata"
+    event = spec_metadata.hidden_states_ready_event
+    assert event is not None, "Missing Eagle hidden-state event"
+    return event
+
+
 def get_stream(stream_id: int):
     from ..utils import get_model_extra_attrs
     extra_attrs = get_model_extra_attrs()
@@ -2726,6 +2737,35 @@ def record_event(event_idx: int) -> None:
         return
     event = get_event(event_idx)
     event.record()
+
+
+@torch.library.custom_op("trtllm::capture_eagle_hidden_states",
+                         mutates_args=("hidden_states_buffer", ))
+def capture_eagle_hidden_states(hidden_states_buffer: torch.Tensor,
+                                hidden_states: torch.Tensor,
+                                residual: Optional[torch.Tensor],
+                                dim1_start: int, dim1_end: int,
+                                publish_completion: bool) -> None:
+    """Write one Eagle capture layer and publish final capture completion."""
+    if residual is None:
+        torch.ops.trtllm.inplace_slice_copy(hidden_states_buffer, hidden_states,
+                                            dim1_start, dim1_end)
+    else:
+        destination = hidden_states_buffer[:hidden_states.shape[0],
+                                           dim1_start:dim1_end]
+        torch.add(hidden_states, residual, out=destination)
+
+    if do_multi_stream() and publish_completion:
+        get_eagle_hidden_states_event().record()
+
+
+@torch.library.register_fake("trtllm::capture_eagle_hidden_states")
+def _capture_eagle_hidden_states_fake(hidden_states_buffer: torch.Tensor,
+                                      hidden_states: torch.Tensor,
+                                      residual: Optional[torch.Tensor],
+                                      dim1_start: int, dim1_end: int,
+                                      publish_completion: bool) -> None:
+    pass
 
 
 @torch.library.custom_op("trtllm::wait_event", mutates_args=())

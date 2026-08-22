@@ -2108,8 +2108,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
     def get_draft_kv_cache_manager(self, resource_manager):
         """
-        Get the draft-side KV manager (separate manager or the target
-        manager's draft sub-page view); see resolve_draft_kv_cache_manager.
+        Get the draft-side KV manager (separate manager or a target-manager
+        draft view); see resolve_draft_kv_cache_manager.
         """
         if resource_manager is None:
             return None

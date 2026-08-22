@@ -527,9 +527,9 @@ def resolve_draft_kv_cache_manager(resource_manager):
     """Resolve the draft-side KV manager for one-model speculative decoding.
 
     The registered separate manager is the ground truth when present;
-    otherwise ask the target manager for its draft sub-page view (managers
-    without one — e.g. same-geometry shared drafters — resolve to None and
-    the drafter attends the shared manager directly).
+    otherwise ask the target manager for its draft KV-cache view (managers
+    without one resolve to None and the drafter attends the shared manager
+    directly).
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
@@ -542,7 +542,7 @@ def resolve_draft_kv_cache_manager(resource_manager):
     # getattr fetches the method without executing it, so a failure inside
     # view construction propagates from the call itself instead of being
     # silently swallowed into "no view".
-    get_view = getattr(target_manager, "get_draft_subpage_view", None)
+    get_view = getattr(target_manager, "get_draft_kv_cache_view", None)
     return get_view() if get_view is not None else None
 
 
@@ -550,8 +550,8 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
     Returns the draft KV cache manager only in one-model speculative decoding
     mode: the separate manager when the target manages one, or the target
-    manager's draft sub-page view when shared draft layers run at a smaller
-    kernel page size (e.g. MiniMax-M3). See resolve_draft_kv_cache_manager.
+    manager's draft view when its shared layout needs an adapter. See
+    resolve_draft_kv_cache_manager.
     """
     if spec_config is None:
         return None

@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import time
 from dataclasses import dataclass, field
 from operator import getitem
@@ -344,12 +358,17 @@ class MultiStreamDAG:
         self.in_degrees[self.entry_node] = 0
 
         stream_pos = [0] * len(self.streams)
+        remaining_nodes = sum(len(st.nodes) for st in self.streams)
 
         def has_more_nodes() -> bool:
             for st in self.streams:
                 if len(st.nodes) > stream_pos[st.id]:
                     return True
             return False
+
+        def should_defer_output(node: MultiStreamNode) -> bool:
+            return (remaining_nodes > 1 and node.node is not None
+                    and node.node.op == "output")
 
         last_stream = 0
 
@@ -361,6 +380,11 @@ class MultiStreamDAG:
                 node = st.nodes[stream_pos[st.id]]
                 if self.in_degrees[node] != 0:
                     # This stream is not ready to run now.
+                    continue
+                if should_defer_output(node):
+                    # Output must be the final host-side instruction. Other
+                    # streams may still have independent work to launch, but
+                    # this adds no GPU completion dependency.
                     continue
 
                 # Any time the stream is changed, set the stream.
@@ -375,9 +399,12 @@ class MultiStreamDAG:
                     node = st.nodes[stream_pos[st.id]]
                     if self.in_degrees[node] != 0:
                         break
+                    if should_defer_output(node):
+                        break
                     for out_edge in node.out_edges:
                         self.in_degrees[out_edge] -= 1
                     stream_pos[st.id] += 1
+                    remaining_nodes -= 1
                     # It could be the fake entry node.
                     if node.node is not None:
                         # Wait on all the events that the node is waiting on.
