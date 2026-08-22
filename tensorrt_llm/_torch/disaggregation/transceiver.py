@@ -151,7 +151,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._page_table = self._transfer_worker.page_table
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
         # except under attention DP where the local count already is the total.
-        self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
+        # Helix CP ranks hold disjoint block sets, so they scale the request
+        # total the same way TP shards do (metric only).
+        self._kv_size_rank_factor = (
+            1 if mapping.enable_attention_dp else max(1, mapping.tp_size * mapping.cp_size)
+        )
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -1037,10 +1041,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._wait_reqs[rid]
 
     def _check_compatible(self):
-        if self._mapping.cp_size != 1:
+        if self._mapping.cp_size != 1 and not self._mapping.has_cp_helix():
             raise ValueError(
-                f"KvCacheTransceiverV2: _check_compatible: only support context parallelism is 1: "
-                f"cp_size: {self._mapping.cp_size}"
+                f"KvCacheTransceiverV2: _check_compatible: unsupported context parallelism "
+                f"(cp_size={self._mapping.cp_size}, cp_type={self._mapping.cp_config.get('cp_type')}); "
+                f"only cp_size == 1 or helix CP is supported"
             )
 
     def commit_blocks_for_reuse(self, req) -> None:

@@ -767,6 +767,10 @@ def _copy_swa_block_offsets_with_scratch_compiled(
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
+    # Declared on the class so it is present even when an instance is built without running __init__.
+    _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2667,6 +2671,32 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return _introspection.storage_statistics(self.impl, cache_level)
 
+    def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
+        """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
+
+        Ordered by cold pool-group id. Cold levels number their pool groups independently of the hot
+        level, so these ids are meaningful only within the cold view. KVCM uses one mapping for every
+        cold level, and the grouping is fixed at construction, so it is queried from level 1 once.
+        """
+        if self._cold_pool_group_membership_cache is None:
+            membership: tuple[tuple[int, frozenset[int]], ...] = ()
+            if len(self.impl.cache_tier_list) > 1:
+                grouped: dict[int, set[int]] = defaultdict(set)
+                mapping = _introspection.life_cycle_pool_group_indices(self.impl, CacheLevel(1))
+                for life_cycle_id, pool_group_id in enumerate(mapping):
+                    grouped[pool_group_id].add(life_cycle_id)
+                membership = tuple(sorted((pg, frozenset(lcs)) for pg, lcs in grouped.items()))
+            self._cold_pool_group_membership_cache = membership
+        return self._cold_pool_group_membership_cache
+
+    @staticmethod
+    def _stats_slot_sizes(pool_group_stats: object) -> tuple[int, ...]:
+        """Return slot sizes from either the native or pure-Python statistics object."""
+        slot_sizes = getattr(pool_group_stats, "slot_sizes", None)
+        if slot_sizes is None:
+            slot_sizes = getattr(pool_group_stats, "slot_size")
+        return tuple(slot_sizes)
+
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
         # life cycle (== layer group) -> pool group is static structure exposed by
         # the public pool_group_descs API; no introspection needed.
@@ -2757,9 +2787,10 @@ class KVCacheManagerV2(BaseResourceManager):
             setattr(stats, field_name, getattr(delta, field_name))
         stats.iter_cache_hit_rate = KVCacheManagerV2._iteration_cache_hit_rate(stats)
 
+    @staticmethod
     def _build_iteration_stats(
-        self,
         pool_group_ids: Iterable[int],
+        secondary_pool_group_ids: Sequence[tuple[int, ...]],
         primary_stats,
         secondary_stats_by_level,
         primary_peak_stats,
@@ -2767,6 +2798,14 @@ class KVCacheManagerV2(BaseResourceManager):
         delta,
         field_names=KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     ):
+        """Aggregate block stats over ``pool_group_ids`` at the hot level and ``secondary_pool_group_ids``
+        at each cold level.
+
+        Hot and cold levels number their pool groups independently, so a cold level cannot be indexed
+        with hot ids; ``secondary_pool_group_ids`` carries each cold level's own ids and must be
+        parallel to ``secondary_stats_by_level``. Only the cold-pool-group view reports cold blocks, so
+        the hot-keyed callers pass ``()`` here and leave the ``secondary_*`` fields at zero.
+        """
         pool_group_ids = tuple(pool_group_ids)
         stats = KvCacheIterationStats()
         stats.primary_max_num_blocks = sum(
@@ -2788,40 +2827,43 @@ class KVCacheManagerV2(BaseResourceManager):
         stats.primary_peak_evictable_num_blocks = sum(
             primary_peak_stats[pool_group_id].evictable for pool_group_id in pool_group_ids
         )
+        secondary_levels = tuple(zip(secondary_stats_by_level, secondary_pool_group_ids))
+        secondary_peak_levels = tuple(zip(secondary_peak_stats_by_level, secondary_pool_group_ids))
+
         stats.secondary_max_num_blocks = sum(
             level_stats[pool_group_id].total
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_free_num_blocks = sum(
             level_stats[pool_group_id].available
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_used_num_blocks = (
             stats.secondary_max_num_blocks - stats.secondary_free_num_blocks
         )
         stats.secondary_evictable_num_blocks = sum(
             level_stats[pool_group_id].evictable
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_free_num_blocks = sum(
             peak_stats[pool_group_id].available
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_used_num_blocks = sum(
             peak_stats[pool_group_id].unavailable
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_evictable_num_blocks = sum(
             peak_stats[pool_group_id].evictable
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
-        self._apply_iteration_stats_delta(stats, delta, field_names)
+        KVCacheManagerV2._apply_iteration_stats_delta(stats, delta, field_names)
         return stats
 
     def _collect_iteration_stats_deltas(
@@ -2879,6 +2921,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         stats = self._build_iteration_stats(
             pool_group_ids,
+            (),
             primary_stats,
             secondary_stats_by_level,
             primary_peak_stats,
@@ -2900,17 +2943,13 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_group_delta,
     ) -> KVCacheV2PoolGroupIterationStats:
         primary_pool_group_stats = primary_stats[pool_group_id]
-        slot_size = (
-            primary_pool_group_stats.slot_sizes
-            if hasattr(primary_pool_group_stats, "slot_sizes")
-            else primary_pool_group_stats.slot_size
-        )
         return KVCacheV2PoolGroupIterationStats(
             pool_group_id=pool_group_id,
-            slot_size=tuple(slot_size),
+            slot_size=self._stats_slot_sizes(primary_pool_group_stats),
             window_sizes=windows_by_pool_group.get(pool_group_id, ()),
             stats=self._build_iteration_stats(
                 (pool_group_id,),
+                (),
                 primary_stats,
                 secondary_stats_by_level,
                 primary_peak_stats,
@@ -2919,6 +2958,60 @@ class KVCacheManagerV2(BaseResourceManager):
                 KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
             ),
         )
+
+    def _build_cold_pool_group_iteration_stats(
+        self,
+        life_cycle_metadata,
+        primary_stats,
+        secondary_stats_by_level,
+        primary_peak_stats,
+        secondary_peak_stats_by_level,
+    ) -> dict[int, KVCacheV2PoolGroupIterationStats]:
+        """Report every cold pool group in its own numbering, summed over all cold levels.
+
+        The window and hot-pool-group views drop a cold group that spans several hot groups, since
+        attributing it to any one of them would double count. This view has no such gap, so host and
+        disk blocks are always accounted for somewhere.
+
+        The returned ``pool_group_id`` is a *cold* pool-group index. It is unrelated to the hot index
+        of the same name in the by-pool-group view, because hot and cold levels number their groups
+        independently; ``window_sizes`` is the correlation key shared by both views.
+        """
+        # No cold tiers means nothing to report, and the pool-group mapping need not be queried.
+        if not secondary_stats_by_level:
+            return {}
+        cold_members = self._cold_pool_group_membership()
+        if not cold_members:
+            return {}
+        assert all(
+            len(level_stats) == len(cold_members) for level_stats in secondary_stats_by_level
+        )
+
+        report: dict[int, KVCacheV2PoolGroupIterationStats] = {}
+        for cold_pool_group_id, life_cycles in cold_members:
+            level_ids = [(cold_pool_group_id,) for _ in secondary_stats_by_level]
+            cold_stats = secondary_stats_by_level[0][cold_pool_group_id]
+            window_sizes = {
+                life_cycle_metadata[life_cycle_id][1]
+                for life_cycle_id in life_cycles
+                if life_cycle_metadata.get(life_cycle_id, (None, None, None))[1] is not None
+            }
+            report[cold_pool_group_id] = KVCacheV2PoolGroupIterationStats(
+                pool_group_id=cold_pool_group_id,
+                slot_size=self._stats_slot_sizes(cold_stats),
+                window_sizes=tuple(sorted(window_sizes)),
+                stats=self._build_iteration_stats(
+                    (),
+                    level_ids,
+                    primary_stats,
+                    secondary_stats_by_level,
+                    primary_peak_stats,
+                    secondary_peak_stats_by_level,
+                    None,
+                    KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
+                ),
+            )
+        return report
 
     def _build_attention_life_cycle_iteration_stats(
         self,
@@ -2938,6 +3031,7 @@ class KVCacheManagerV2(BaseResourceManager):
             window_size=window_size,
             kind=kind,
             stats=self._build_iteration_stats(
+                (),
                 (),
                 primary_stats,
                 secondary_stats_by_level,
@@ -3095,7 +3189,16 @@ class KVCacheManagerV2(BaseResourceManager):
         stats_by_life_cycle = dict(sorted(stats_by_life_cycle.items()))
 
         return KVCacheV2IterationStatsReport(
-            stats_by_window, stats_by_pool_group, stats_by_life_cycle
+            stats_by_window,
+            stats_by_pool_group,
+            stats_by_life_cycle,
+            self._build_cold_pool_group_iteration_stats(
+                life_cycle_metadata,
+                primary_stats,
+                secondary_stats_by_level,
+                primary_peak_stats,
+                secondary_peak_stats_by_level,
+            ),
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:

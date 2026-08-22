@@ -82,7 +82,7 @@ struct KVCacheStoredBlockData
 {
     EventBlockHash blockHash;
     std::vector<UniqueToken> tokens;
-    int cacheLevel = kGpuLevel.value();
+    int cacheLevel = kHotLevel.value();
     int priority = kPriorityDefault;
     std::vector<MmKey> mmKeys;
     std::optional<std::string> cacheSalt;

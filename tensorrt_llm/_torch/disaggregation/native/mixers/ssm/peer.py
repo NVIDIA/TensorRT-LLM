@@ -443,6 +443,10 @@ class MambaPolicy:
         """
         if ri.attention and ri.attention.enable_attention_dp:
             return 1, 0
+        if ri.cp_size > 1:
+            # Helix repurposes CP ranks as TP for the mamba layers, so the
+            # shard grid is tp*cp with CP-minor flat rank (matches Mapping).
+            return ri.tp_size * ri.cp_size, ri.tp_rank * ri.cp_size + ri.cp_rank
         return ri.tp_size, ri.tp_rank
 
     @staticmethod
@@ -540,6 +544,19 @@ class MambaPolicy:
         peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
         tp_match = self_mamba_tp == peer_mamba_tp
 
+        # Overlap targets are attention-domain (helix: every ctx rank
+        # targets every gen rank) but the mappers below assume corresponding
+        # mamba shards; unpaired senders must send nothing, or they
+        # last-writer-win the receiver's slot with the wrong head range.
+        if self_mamba_tp <= peer_mamba_tp:
+            ratio = peer_mamba_tp // self_mamba_tp
+            paired = (peer_mamba_tp_rank // ratio) == self_mamba_tp_rank
+        else:
+            ratio = self_mamba_tp // peer_mamba_tp
+            paired = (self_mamba_tp_rank // ratio) == peer_mamba_tp_rank
+        if not paired:
+            return [], [], []
+
         src_frags: List[int] = []
         dst_frags: List[int] = []
         kv_sizes: List[int] = []
@@ -591,6 +608,33 @@ class MambaPolicy:
                 kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
 
         return src_frags, dst_frags, kv_sizes
+
+    @staticmethod
+    def receiver_payload_bytes(
+        sender_page_table: KVCachePageTable,
+        receiver_page_table: KVCachePageTable,
+        dst_slot: Optional[int],
+    ) -> int:
+        """Recurrent-state bytes that will land in the receiver's slot.
+
+        Receiver-local invariant: regardless of the sender-side shard
+        pairing, the slot receives exactly the receiver's own per-layer
+        slot bytes over the overlapping mamba layers. A sender-side
+        simulation is not usable here: RankInfoServer runs on ctx rank 0
+        only, so receivers paired with any other sender would compute 0
+        and under-reserve the bounce slot.
+        """
+        if dst_slot is None:
+            return 0
+        self_mlg = MambaPolicy._find_mamba_layer_group(sender_page_table)
+        peer_mlg = MambaPolicy._find_mamba_layer_group(receiver_page_table)
+        if self_mlg is None or peer_mlg is None:
+            return 0
+        overlap = set(self_mlg.mamba_layer_offsets.keys()) & set(
+            peer_mlg.mamba_layer_offsets.keys()
+        )
+        per_layer = peer_mlg.conv_states.slot_bytes + peer_mlg.ssm_states.slot_bytes
+        return len(overlap) * int(per_layer)
 
     @staticmethod
     def payload_bytes(

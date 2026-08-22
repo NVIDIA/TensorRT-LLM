@@ -57,7 +57,9 @@ from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
-from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
+from .kv_cache_transceiver import (
+    AttentionTypeCpp, create_kv_cache_transceiver,
+    maybe_enable_fabric_memory_for_python_transceiver)
 from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
@@ -589,28 +591,8 @@ class KvCacheCreator:
         self._maybe_enable_fabric_memory_for_python_transceiver()
 
     def _maybe_enable_fabric_memory_for_python_transceiver(self) -> None:
-        """Default TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 for the Python
-        transceiver on the C++ V1 KV cache manager.
-
-        The Python transceiver (KvCacheTransceiverV2) transfers KV blocks
-        directly out of the C++ pool, so the pool should be allocated with
-        fabric memory to enable MNNVL transfers. This must run before any
-        pool allocation because the C++ env getter caches the value on first
-        read. Explicit user settings are respected, and platforms without
-        fabric memory support fall back to standard allocation in C++.
-        """
-        if (self._cache_transceiver_config is None
-                or self._cache_transceiver_config.backend is None or
-                self._cache_transceiver_config.transceiver_runtime != "PYTHON"):
-            return
-        if not issubclass(self._kv_cache_manager_cls, KVCacheManager):
-            return
-        if os.environ.get("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY") is None:
-            os.environ["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
-            logger.info(
-                "Python cache transceiver with C++ KV cache manager detected; "
-                "defaulting TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY=1 (set it "
-                "to 0 explicitly to disable)")
+        maybe_enable_fabric_memory_for_python_transceiver(
+            self._cache_transceiver_config, self._kv_cache_manager_cls)
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -1487,15 +1469,15 @@ class KvCacheCreator:
         if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
-            # pool_ratio describes one manager's pool-group layout. The
+            # pool_ratio describes one manager's layer-group layout. The
             # target hybrid manager may have separate recurrent-state and
-            # attention groups, while a non-VSWA draft manager has one
-            # attention group. Reusing the target's ratios fails its arity
+            # attention layer groups, while a non-VSWA draft manager has one
+            # attention layer group. Reusing the target's ratios fails its arity
             # check.
             logger.info(
                 "Normalizing the separate one-model draft KV cache pool_ratio "
                 f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
-                "pool group.")
+                "layer group.")
             draft_kv_config.pool_ratio = [1.0]
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(

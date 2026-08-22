@@ -473,7 +473,37 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
-- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`, ...
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`, and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
+
+##### Cosmos3 transfer hints
+
+`extra_params` is JSON, so a control clip travels as a **base64-encoded** MP4/AVI
+string under `<hint>.control`; the server decodes it at the HTTP boundary. Only
+`edge` and `blur` can be auto-computed — pass `true` and supply a `video`
+reference for them to derive from. `depth`/`seg`/`wsm` have no generator, so
+they always need a control clip.
+
+```json
+{
+  "prompt": "a city street at dusk",
+  "extra_params": {
+    "video": "<base64 MP4/AVI>",
+    "edge": {"preset_edge_threshold": "medium"},
+    "blur": {"preset_blur_strength": "medium"},
+    "depth": {"control": "<base64 MP4/AVI>"},
+    "control_guidance": 1.5
+  }
+}
+```
+
+`preset_edge_threshold` and `preset_blur_strength` accept
+`none`/`very_low`/`low`/`medium`/`high`/`very_high` and default to `medium`; a
+bare `true` (or `"<base64>"`) is shorthand for the object form. Individual
+values are validated before the job is queued, so a bad preset or an
+unsupported frame count fails fast; combinations that only make sense together
+— a transfer option with no hint selected, or `edge`/`blur` asked to
+auto-compute with no `video` — are still reported by the worker, as a client
+error, once the request is running.
 
 > **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
 > `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
