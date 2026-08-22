@@ -1051,6 +1051,41 @@ def _register_fake():
                 total_num_padded_tokens, num_non_exiting_tiles
             ]
 
+        @torch.library.register_fake("trtllm::moe_metadata_from_expert_counts")
+        def _(
+            expert_counts: torch.Tensor,
+            capacity: int,
+            tile_size: int,
+        ) -> List[torch.Tensor]:
+            num_local_experts = expert_counts.size(0)
+            num_tokens = num_local_experts * capacity
+            max_num_tiles = (num_tokens +
+                             (tile_size - 1) * num_local_experts) // tile_size
+            max_num_permuted_tokens = max_num_tiles * tile_size
+            device = expert_counts.device
+            tile_idx_to_expert_idx = torch.empty((max_num_tiles, ),
+                                                 dtype=torch.int32,
+                                                 device=device)
+            tile_idx_to_mn_limit = torch.empty((max_num_tiles, ),
+                                               dtype=torch.int32,
+                                               device=device)
+            expanded_idx_to_permuted_idx = torch.empty((num_tokens, 1),
+                                                       dtype=torch.int32,
+                                                       device=device)
+            permuted_idx_to_expanded_idx = torch.empty(
+                (max_num_permuted_tokens, ), dtype=torch.int32, device=device)
+            total_num_padded_tokens = torch.empty((1, ),
+                                                  dtype=torch.int32,
+                                                  device=device)
+            num_non_exiting_tiles = torch.empty((1, ),
+                                                dtype=torch.int32,
+                                                device=device)
+            return [
+                tile_idx_to_expert_idx, tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx,
+                total_num_padded_tokens, num_non_exiting_tiles
+            ]
+
     @torch.library.register_fake("trtllm::moe_permute")
     def _(
         input: torch.Tensor,

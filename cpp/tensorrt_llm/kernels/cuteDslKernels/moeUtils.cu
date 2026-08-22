@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,6 +58,100 @@ auto constexpr sfElemPerCopy()
     return bitsPerElem<SFCopyType>() / bitsPerElem<T>();
 }
 } // namespace
+
+template <int32_t kThreadsPerBlock>
+__global__ void moeMetadataFromExpertCountsKernel(int32_t const* expertCounts, int32_t* tileIdxToExpertIdx,
+    int32_t* tileIdxToMnLimit, int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
+    int32_t* totalNumPaddedTokens, int32_t* numNonExitingTiles, int32_t const numLocalExperts, int32_t const capacity,
+    int32_t const tileSize, int32_t const maxNumTiles, int32_t const maxNumPermutedTokens)
+{
+    extern __shared__ int32_t tileOffsets[];
+
+    for (int32_t expertIdx = threadIdx.x; expertIdx < numLocalExperts; expertIdx += kThreadsPerBlock)
+    {
+        int32_t count = expertCounts[expertIdx];
+        count = count < 0 ? 0 : count;
+        count = count > capacity ? capacity : count;
+        tileOffsets[expertIdx] = count == 0 ? 0 : (count - 1) / tileSize + 1;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        int32_t runningTileCount = 0;
+        for (int32_t expertIdx = 0; expertIdx < numLocalExperts; ++expertIdx)
+        {
+            int32_t const expertTileCount = tileOffsets[expertIdx];
+            tileOffsets[expertIdx] = runningTileCount;
+            runningTileCount += expertTileCount;
+        }
+        tileOffsets[numLocalExperts] = runningTileCount;
+        totalNumPaddedTokens[0] = runningTileCount * tileSize;
+        numNonExitingTiles[0] = runningTileCount;
+    }
+    __syncthreads();
+
+    for (int32_t tileIdx = threadIdx.x; tileIdx < maxNumTiles; tileIdx += kThreadsPerBlock)
+    {
+        tileIdxToExpertIdx[tileIdx] = -1;
+        tileIdxToMnLimit[tileIdx] = 0;
+    }
+    for (int32_t permutedIdx = threadIdx.x; permutedIdx < maxNumPermutedTokens; permutedIdx += kThreadsPerBlock)
+    {
+        permutedIdxToExpandedIdx[permutedIdx] = -1;
+    }
+    int32_t const numExpandedTokens = numLocalExperts * capacity;
+    for (int32_t expandedIdx = threadIdx.x; expandedIdx < numExpandedTokens; expandedIdx += kThreadsPerBlock)
+    {
+        expandedIdxToPermutedIdx[expandedIdx] = -1;
+    }
+    __syncthreads();
+
+    for (int32_t expandedIdx = threadIdx.x; expandedIdx < numExpandedTokens; expandedIdx += kThreadsPerBlock)
+    {
+        int32_t const expertIdx = expandedIdx / capacity;
+        int32_t const rowInExpert = expandedIdx - expertIdx * capacity;
+        int32_t count = expertCounts[expertIdx];
+        count = count < 0 ? 0 : count;
+        count = count > capacity ? capacity : count;
+        if (rowInExpert < count)
+        {
+            int32_t const permutedIdx = tileOffsets[expertIdx] * tileSize + rowInExpert;
+            expandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
+            permutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+        }
+    }
+
+    for (int32_t expertIdx = threadIdx.x; expertIdx < numLocalExperts; expertIdx += kThreadsPerBlock)
+    {
+        int32_t count = expertCounts[expertIdx];
+        count = count < 0 ? 0 : count;
+        count = count > capacity ? capacity : count;
+        int32_t const expertTileStart = tileOffsets[expertIdx];
+        int32_t const expertTileEnd = tileOffsets[expertIdx + 1];
+        for (int32_t tileIdx = expertTileStart; tileIdx < expertTileEnd; ++tileIdx)
+        {
+            int32_t const rowStart = (tileIdx - expertTileStart) * tileSize;
+            int32_t const rowsInTile = min(tileSize, count - rowStart);
+            tileIdxToExpertIdx[tileIdx] = expertIdx;
+            tileIdxToMnLimit[tileIdx] = tileIdx * tileSize + rowsInTile;
+        }
+    }
+}
+
+void moeMetadataFromExpertCounts(int32_t const* expertCounts, int32_t* tileIdxToExpertIdx, int32_t* tileIdxToMnLimit,
+    int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx, int32_t* totalNumPaddedTokens,
+    int32_t* numNonExitingTiles, int32_t const numLocalExperts, int32_t const capacity, int32_t const tileSize,
+    int32_t const maxNumTiles, int32_t const maxNumPermutedTokens, cudaStream_t stream)
+{
+    int32_t constexpr kThreadsPerBlock = 256;
+    size_t const sharedMemoryBytes = static_cast<size_t>(numLocalExperts + 1) * sizeof(int32_t);
+    moeMetadataFromExpertCountsKernel<kThreadsPerBlock>
+        <<<1, kThreadsPerBlock, sharedMemoryBytes, stream>>>(expertCounts, tileIdxToExpertIdx, tileIdxToMnLimit,
+            expandedIdxToPermutedIdx, permutedIdxToExpandedIdx, totalNumPaddedTokens, numNonExitingTiles,
+            numLocalExperts, capacity, tileSize, maxNumTiles, maxNumPermutedTokens);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
 
 template <typename InputType, typename SFType, int32_t kSFVecSize, int32_t kThreadsPerBlock>
 __global__ void moePermuteKernel(InputType const* input, InputType* permuted_output, SFType const* input_sf,
@@ -378,6 +472,79 @@ INSTANTIATE_MOE_OUTPUT_MEMSET(half);
 INSTANTIATE_MOE_OUTPUT_MEMSET(__nv_bfloat16);
 #endif
 #undef INSTANTIATE_MOE_OUTPUT_MEMSET
+
+template <typename InputType, int32_t kThreadsPerBlock>
+__global__ void moeOutputMemsetFromExpertCountsKernel(InputType* input, int32_t const* expertCounts,
+    int32_t const numLocalExperts, int32_t const expertCapacity, int32_t const hiddenSize)
+{
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    int64_t const copiesPerToken = hiddenSize / kElemPerCopy;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    int32_t const numExpandedTokens = numLocalExperts * expertCapacity;
+    for (int32_t expandedIdx = blockIdx.x; expandedIdx < numExpandedTokens; expandedIdx += gridDim.x)
+    {
+        int32_t const expertIdx = expandedIdx / expertCapacity;
+        int32_t const rowInExpert = expandedIdx - expertIdx * expertCapacity;
+        int32_t const count = min(max(expertCounts[expertIdx], 0), expertCapacity);
+        if (rowInExpert >= count)
+        {
+            continue;
+        }
+
+        auto* dst = reinterpret_cast<ElemCopyType*>(input) + expandedIdx * copiesPerToken;
+        ElemCopyType const zero{};
+        for (int64_t copyIdx = threadIdx.x; copyIdx < copiesPerToken; copyIdx += kThreadsPerBlock)
+        {
+            dst[copyIdx] = zero;
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <typename InputType>
+void moeOutputMemsetFromExpertCounts(InputType* input, int32_t const* expertCounts, int32_t const numLocalExperts,
+    int32_t const expertCapacity, int32_t const hiddenSize, cudaStream_t stream)
+{
+    int32_t constexpr kThreadsPerBlock = 256;
+    int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
+    TLLM_CHECK_WITH_INFO(hiddenSize % kElemPerCopy == 0, "hiddenSize must be divisible by %d.", kElemPerCopy);
+    TLLM_CHECK_WITH_INFO(numLocalExperts > 0, "numLocalExperts must be positive.");
+    TLLM_CHECK_WITH_INFO(expertCapacity > 0, "expertCapacity must be positive.");
+
+    auto kernel = &moeOutputMemsetFromExpertCountsKernel<InputType, kThreadsPerBlock>;
+    static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+    int32_t const maxBlocksPerSM = tensorrt_llm::common::getMaxActiveBlocksPerSM(kernel, kThreadsPerBlock, 0);
+    int32_t const blocks = std::min(smCount * maxBlocksPerSM, numLocalExperts * expertCapacity);
+
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = kThreadsPerBlock;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel, input, expertCounts, numLocalExperts, expertCapacity, hiddenSize);
+}
+
+#define INSTANTIATE_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(InputType)                                                    \
+    template void moeOutputMemsetFromExpertCounts<InputType>(InputType * input, int32_t const* expertCounts,           \
+        int32_t numLocalExperts, int32_t expertCapacity, int32_t hiddenSize, cudaStream_t stream)
+
+INSTANTIATE_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(half);
+#ifdef ENABLE_BF16
+INSTANTIATE_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(__nv_bfloat16);
+#endif
+#undef INSTANTIATE_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS
 
 template <typename InputType, typename OutputType, typename SFType, int32_t kSFVecSize, typename ActFn,
     int32_t kThreadsPerBlock>

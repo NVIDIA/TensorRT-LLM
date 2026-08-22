@@ -230,6 +230,22 @@ class ExternalCommMoEScheduler(MoEScheduler):
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
 
+    def _use_cutedsl_deep_ep_direct_metadata(self, supports_post_quant: bool) -> bool:
+        """Whether the full adapter-free, count-native DeepEP path is supported."""
+        moe = self.moe
+        # DeepEP has already consumed the model's routing top-k here. Its
+        # expert-major receive buffer exposes one local placeholder slot per
+        # physical row, so the pre-dispatch routing top-k is not an eligibility
+        # constraint for this post-dispatch path.
+        return (
+            isinstance(moe.comm, DeepEPLowLatency)
+            and moe.backend.capabilities.supports_deep_ep_direct_metadata
+            and not moe.backend.disable_deep_ep_direct_metadata
+            and moe.backend.has_nvfp4
+            and supports_post_quant
+            and moe.backend.use_fused_finalize
+        )
+
     # ------------------------------------------------------------------
     # DeepGemm workspace allocation
     # ------------------------------------------------------------------
@@ -508,6 +524,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 should_update_eplb_after_dispatch = True
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
+        use_deep_ep_direct_metadata = False
         if moe.comm is not None:
             # Debug: optional dummy AllReduce to break load-balancing artifacts
             if moe.enable_dummy_allreduce:
@@ -518,6 +535,15 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # through **kwargs, so the request does not need a comm-side test.
             if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
+            if (
+                isinstance(moe.comm, DeepEPLowLatency)
+                and moe.backend.capabilities.supports_deep_ep_direct_metadata
+            ):
+                use_deep_ep_direct_metadata = self._use_cutedsl_deep_ep_direct_metadata(
+                    supports_post_quant
+                )
+                dispatch_kwargs["use_direct_expert_metadata"] = use_deep_ep_direct_metadata
+                dispatch_kwargs["remove_adapter"] = use_deep_ep_direct_metadata
 
             if supports_post_quant:
                 # Quantize -> Dispatch
@@ -570,6 +596,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             output_dtype=output_dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             lora_params=lora_params,
+            use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -809,6 +836,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         lora_params: Optional[Dict],
+        use_deep_ep_direct_metadata: bool = False,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -827,13 +855,18 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params if moe.backend.capabilities.supports_moe_lora else None,
             router_logits=router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            comm_plan=self._build_comm_plan(all_rank_num_tokens, output_dtype),
+            comm_plan=self._build_comm_plan(
+                all_rank_num_tokens,
+                output_dtype,
+                use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+            ),
         )
 
     def _build_comm_plan(
         self,
         all_rank_num_tokens: Optional[List[int]],
         output_dtype: Optional[torch.dtype],
+        use_deep_ep_direct_metadata: bool = False,
     ) -> MoECommPlan:
         """The comm-layer facts for this forward, derived once for every backend.
 
@@ -851,11 +884,23 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
             moe.comm.payload_in_workspace = payload_in_workspace
+        recv_expert_count = None
+        deep_ep_expert_capacity = None
+        if (
+            isinstance(moe.comm, DeepEPLowLatency)
+            and moe.backend.capabilities.supports_deep_ep_direct_metadata
+        ):
+            recv_expert_count, deep_ep_expert_capacity = (
+                moe.comm.get_expert_major_dispatch_metadata()
+            )
         return MoECommPlan(
             input_sf_swizzled=not supports_post_quant,
             enable_alltoall=moe.enable_alltoall,
             moe_output=moe_output,
             payload_in_workspace=payload_in_workspace,
+            recv_expert_count=recv_expert_count,
+            deep_ep_expert_capacity=deep_ep_expert_capacity,
+            use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
         )
 
 

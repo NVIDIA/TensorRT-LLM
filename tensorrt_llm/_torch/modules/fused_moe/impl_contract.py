@@ -41,6 +41,9 @@ class MoEStaticCapability:
     supports_moe_lora: bool = False
     # Legacy gate: CuteDslFusedMoE isinstance check in ConfigurableMoE DWDP.
     supports_dwdp: bool = False
+    # Whether the backend can consume DeepEP's expert-major receive counts
+    # directly, without materializing token-major adapter metadata.
+    supports_deep_ep_direct_metadata: bool = False
 
 
 @dataclass(frozen=True)
@@ -428,6 +431,11 @@ class MoECommPlan:
     # made; TRTLLM-14972 makes ``combine()`` read it from here and drops the
     # attribute.
     payload_in_workspace: bool
+    # DeepEP Low-Latency expert-major layout metadata. These stay unset for
+    # every other communication strategy.
+    recv_expert_count: Optional[torch.Tensor] = None
+    deep_ep_expert_capacity: Optional[int] = None
+    use_deep_ep_direct_metadata: bool = False
 
 
 @dataclass(frozen=True)
