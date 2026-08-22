@@ -1196,9 +1196,7 @@ class TestFailFastDuringBenchmarkFill:
         assert result is not None
         ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
         ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
-        ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
-            0, [admitted_req], False, False, is_idle=True
-        )
+        ex._check_disagg_transfer_progress_when_idle.assert_called_once_with()
         ex._handle_errors.assert_not_called()
 
     def test_fill_with_no_init_requests_does_not_kill(self):
@@ -1231,8 +1229,7 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
         ex._prepare_disagg_gen_init.assert_called_once_with([])
-        ex._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
-        ex._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        ex._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
     @pytest.mark.parametrize(

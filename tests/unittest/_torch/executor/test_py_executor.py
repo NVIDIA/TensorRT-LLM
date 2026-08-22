@@ -87,14 +87,7 @@ def _run_sync_idle_progress_rank(rank: int, world_size: int, rendezvous_file: st
         executor.dist = _TorchCollectiveDist()
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
-        PyExecutor._check_disagg_transfer_progress_when_idle(
-            executor,
-            num_fitting_reqs=0,
-            fitting_disagg_gen_init_requests=[],
-            wait_for_disagg_gen_transfer_progress=True,
-            all_gen_first=False,
-            is_idle=True,
-        )
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
     finally:
         torch_dist.destroy_process_group()
 
@@ -969,58 +962,40 @@ class TestDisaggTransferIdleProgress:
 
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
-    def test_polls_generation_transfer_when_admission_blocked(self):
+    def test_polls_context_transfers_without_blocking(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
-        PyExecutor._check_disagg_transfer_progress_when_idle(
-            executor,
-            num_fitting_reqs=0,
-            fitting_disagg_gen_init_requests=[],
-            wait_for_disagg_gen_transfer_progress=True,
-            all_gen_first=False,
-        )
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
 
-    def test_peer_rank_enters_bounded_progress_poll(self):
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
-        executor.dist.allreduce.return_value = 1
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(
-            executor,
-            num_fitting_reqs=1,
-            fitting_disagg_gen_init_requests=[],
-            wait_for_disagg_gen_transfer_progress=True,
-            all_gen_first=False,
-        )
-
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
-        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
-
-    def test_falls_back_to_context_transfer_when_not_generation_blocked(self):
+    def test_does_not_repeat_gen_status_polled_by_loop_head(self):
+        """The loop head already polls GEN status every iteration."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
-        PyExecutor._check_disagg_transfer_progress_when_idle(
-            executor,
-            num_fitting_reqs=0,
-            fitting_disagg_gen_init_requests=[],
-            wait_for_disagg_gen_transfer_progress=False,
-            all_gen_first=False,
-        )
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+
+    def test_idle_poll_enters_no_extra_collective(self):
+        """The context poll is rank-symmetric, so no gating collective is needed."""
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=4, cp_size=4, world_size=16)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
+
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_not_called()
+        executor.dist.tp_cp_allgather.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
 
     def test_gen_only_no_context_benchmark_polls_context_when_idle(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1028,24 +1003,14 @@ class TestDisaggTransferIdleProgress:
         monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor.dist.allreduce.return_value = 0
-        executor.dist.tp_allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
-        PyExecutor._check_disagg_transfer_progress_when_idle(
-            executor,
-            num_fitting_reqs=0,
-            fitting_disagg_gen_init_requests=[],
-            wait_for_disagg_gen_transfer_progress=True,
-            all_gen_first=False,
-            is_idle=True,
-        )
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
-        executor.dist.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
-        executor.dist.tp_allreduce.assert_called_once_with(1, op=ReduceOp.MAX)
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
 
     def test_sync_transfer_skips_idle_progress_collectives(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1056,14 +1021,7 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
-        PyExecutor._check_disagg_transfer_progress_when_idle(
-            executor,
-            num_fitting_reqs=0,
-            fitting_disagg_gen_init_requests=[],
-            wait_for_disagg_gen_transfer_progress=True,
-            all_gen_first=False,
-            is_idle=True,
-        )
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
         executor.dist.allreduce.assert_not_called()
         executor.dist.tp_allreduce.assert_not_called()
@@ -1164,26 +1122,6 @@ class TestDisaggTransferIdleProgress:
             requests=[error_request],
             charge_budget=False,
         )
-
-    def test_peer_cp_rank_enters_context_progress_poll(self):
-        executor = object.__new__(PyExecutor)
-        executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
-        executor.dist.allreduce.return_value = 0
-        executor.dist.tp_cp_allgather.return_value = [0, 1, 0, 0]
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
-
-        PyExecutor._check_disagg_transfer_progress_when_idle(
-            executor,
-            num_fitting_reqs=1,
-            fitting_disagg_gen_init_requests=[],
-            wait_for_disagg_gen_transfer_progress=False,
-            all_gen_first=False,
-        )
-
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor.dist.tp_cp_allgather.assert_called_once_with(0)
 
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
