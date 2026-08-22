@@ -40,8 +40,10 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             ToolDescription, load_harmony_encoding)
 from transformers import AutoProcessor, PretrainedConfig
 
-from tensorrt_llm._utils import \
-    get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
+from tensorrt_llm._utils import (
+    AdjustedSteadyClock,
+    get_steady_clock_now_in_seconds,  # noqa: F401  (re-export)
+)
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
@@ -1988,15 +1990,16 @@ class ServerArrivalTimeMiddleware:
     See: https://github.com/encode/starlette/discussions/2094
     """
 
-    def __init__(self, app):
+    def __init__(self, app, adjusted_clock: Optional[AdjustedSteadyClock] = None):
         self.app = app
+        self._adjusted_clock = adjusted_clock or AdjustedSteadyClock()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             # Add arrival time to scope
             scope["state"] = {}
             scope["state"][
-                "server_arrival_time"] = get_steady_clock_now_in_seconds()
+                "server_arrival_time"] = self._adjusted_clock.now()
 
         # Pass through the original receive/send - no wrapping!
         await self.app(scope, receive, send)

@@ -22,6 +22,7 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, List, Optional, Tup
 
 import aiohttp
 
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_auth import (
@@ -42,6 +43,7 @@ from tensorrt_llm.serve.perf_metrics import (
     SSE_METRICS_EVENT,
     ClientMetricsCollector,
     build_metrics_record_from_headers,
+    adjusted_clock_from_headers,
 )
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
@@ -264,6 +266,12 @@ class OpenAIHttpClient(OpenAIClient):
                     data=body,
                     headers=headers,
                 ) as http_response:
+                    response_clock = AdjustedSteadyClock()
+                    if self._request_perf_metrics:
+                        destination_time = get_steady_clock_now_in_seconds()
+                        response_clock = adjusted_clock_from_headers(
+                            http_response.headers, start_time, destination_time
+                        )
                     content_type = http_response.headers.get("Content-Type", "")
                     if self._request_perf_metrics:
                         role = _metrics_phase(self._role)
@@ -279,6 +287,7 @@ class OpenAIHttpClient(OpenAIClient):
                             http_response.headers,
                             role,
                             request_id=request_id,
+                            adjusted_clock=response_clock,
                         )
                         if hooks and response_metrics:
                             hooks.on_perf_metrics(
@@ -294,7 +303,13 @@ class OpenAIHttpClient(OpenAIClient):
                         # do NOT return generator directly here or the response will go
                         # out of scope and get destroyed
                         async for line in self._response_generator(
-                            request, http_response, start_time, server, hooks, req_id
+                            request,
+                            http_response,
+                            start_time,
+                            server,
+                            hooks,
+                            req_id,
+                            response_clock,
                         ):
                             lines_yielded += 1
                             yield line
@@ -364,6 +379,7 @@ class OpenAIHttpClient(OpenAIClient):
         server: str,
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
+        response_clock: Optional[AdjustedSteadyClock] = None,
     ) -> AsyncGenerator[Any, None]:
         assert request.stream, "Request is not streaming"
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
@@ -423,7 +439,9 @@ class OpenAIHttpClient(OpenAIClient):
                     try:
                         headers = json.loads(data)
                         metrics = build_metrics_record_from_headers(
-                            headers, _metrics_phase(self._role)
+                            headers,
+                            _metrics_phase(self._role),
+                            adjusted_clock=response_clock,
                         )
                     except (TypeError, ValueError) as error:
                         logger.warning("Ignoring malformed perf metrics event: %s", error)
