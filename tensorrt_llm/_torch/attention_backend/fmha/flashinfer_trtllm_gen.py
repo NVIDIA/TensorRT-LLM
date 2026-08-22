@@ -411,6 +411,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
+    # (headDimQk, headDimV, tokens_per_block) combinations for which the trtllm-gen
+    # MLA decode kernel reached through FlashInfer is slower than the thop.attention
+    # fallback. Declining them here is what routes DeepSeek-V3-family / Kimi-K2 MLA
+    # generation at the default tokens_per_block=32 to the fallback backend.
+    # Dropped by accident in #15300 and restored here; see https://nvbugs/6617948.
+    SLOWER_MLA_GENERATION_KERNELS = {
+        (576, 512, 32),
+    }
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -530,6 +538,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -565,6 +574,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
+            return (
+                False,
+                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
+                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
+                f"tokens_per_block={tokens_per_block}.",
             )
 
         return True, ""
@@ -733,6 +750,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )
