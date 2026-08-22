@@ -217,13 +217,19 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 assert blk != BAD_PAGE_INDEX, (
                     f"Writing new KV into an evicted/invalid page (pos {pos}); "
                     "block_ids/metadata are inconsistent.")
-                dst = torch.arange(off, off + n, device=kv_cache_tensor.device)
-                kv_cache_tensor[blk, 0].view(dtype=access_type).index_copy_(
-                    0, dst,
-                    k_selected[0, written:written + n].view(dtype=access_type))
-                kv_cache_tensor[blk, 1].view(dtype=access_type).index_copy_(
-                    0, dst,
-                    v_selected[0, written:written + n].view(dtype=access_type))
+                # Slicing the outermost (token) dim keeps the destination
+                # contiguous, so a plain copy_ avoids the per-iteration arange
+                # and scatter. view(access_type) reinterprets to an int of the
+                # same width so copy_ works for dtypes (e.g. fp8) it otherwise
+                # rejects.
+                kv_cache_tensor[blk, 0,
+                                off:off + n].view(dtype=access_type).copy_(
+                                    k_selected[0, written:written +
+                                               n].view(dtype=access_type))
+                kv_cache_tensor[blk, 1,
+                                off:off + n].view(dtype=access_type).copy_(
+                                    v_selected[0, written:written +
+                                               n].view(dtype=access_type))
                 written += n
 
         if sparse_kv_indices is not None:
@@ -347,6 +353,55 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             scale=qk_scale,
             enable_gqa=True,
         )
+
+    @staticmethod
+    def _single_token_sparse_attn_forward(q: torch.Tensor,
+                                          key_states: torch.Tensor,
+                                          value_states: torch.Tensor,
+                                          sparse_indices: torch.Tensor,
+                                          indices_block_size: int,
+                                          qk_scale: float) -> torch.Tensor:
+        """Run one-token GQA over selected sparse units."""
+        if indices_block_size <= 0:
+            raise ValueError("indices_block_size must be positive")
+        if sparse_indices.ndim != 2:
+            raise ValueError(
+                "sparse_indices must have shape [num_kv_heads, topk]")
+        num_kv_heads = key_states.shape[1]
+        if sparse_indices.shape[0] != num_kv_heads:
+            raise ValueError(
+                "sparse_indices and key_states must have matching KV heads")
+        if q.shape[0] % num_kv_heads != 0:
+            raise ValueError("Query heads must be divisible by KV heads")
+        if torch.any(sparse_indices < -1):
+            raise ValueError("Sparse indices may only use -1 as padding")
+
+        heads_per_kv = q.shape[0] // num_kv_heads
+        unit_offsets = torch.arange(indices_block_size,
+                                    device=sparse_indices.device)
+        output = torch.empty_like(q, dtype=torch.float32)
+        for kv_head in range(num_kv_heads):
+            token_indices = (
+                sparse_indices[kv_head, :, None] * indices_block_size +
+                unit_offsets).flatten()
+            token_indices = token_indices[(token_indices >= 0)
+                                          &
+                                          (token_indices < key_states.shape[0])]
+            if token_indices.numel() == 0:
+                raise ValueError("Every KV head must select at least one token")
+            token_indices = torch.unique(token_indices).to(torch.long)
+            selected_keys = key_states.index_select(
+                0, token_indices)[:, kv_head].to(torch.float32)
+            selected_values = value_states.index_select(
+                0, token_indices)[:, kv_head].to(torch.float32)
+            head_start = kv_head * heads_per_kv
+            head_end = head_start + heads_per_kv
+            scores = torch.matmul(q[head_start:head_end].to(torch.float32),
+                                  selected_keys.T) * qk_scale
+            probabilities = F.softmax(scores, dim=-1, dtype=torch.float32)
+            output[head_start:head_end] = torch.matmul(probabilities,
+                                                       selected_values)
+        return output
 
     def _single_request_forward(self,
                                 q,
@@ -646,6 +701,49 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         return torch.cat(outputs, dim=0)
 
+    @staticmethod
+    def _selected_mla_attention(
+        query: torch.Tensor,
+        selected_latent: torch.Tensor,
+        *,
+        value_dim: int,
+        scale: float,
+        attention_sink: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute absorbed MLA over selected latent rows."""
+        if query.ndim != 2 or selected_latent.ndim != 2:
+            raise ValueError("Selected MLA query and latent rows must be 2D")
+        if selected_latent.shape[0] == 0:
+            raise ValueError("Selected MLA requires at least one latent row")
+        if query.shape[1] != selected_latent.shape[1]:
+            raise ValueError(
+                "Selected MLA query and latent dimensions must match, got "
+                f"{query.shape[1]} and {selected_latent.shape[1]}")
+        if value_dim <= 0 or value_dim > selected_latent.shape[1]:
+            raise ValueError(
+                f"Selected MLA value_dim must be in [1, {selected_latent.shape[1]}], "
+                f"got {value_dim}")
+
+        scores = torch.matmul(query, selected_latent.T) * scale
+        scores = scores.float()
+        if attention_sink is None:
+            probabilities = F.softmax(scores, dim=-1).to(query.dtype)
+        else:
+            if attention_sink.shape != (query.shape[0], ):
+                raise ValueError(
+                    "Selected MLA attention sink must have shape "
+                    f"[{query.shape[0]}], got {tuple(attention_sink.shape)}")
+            sink = attention_sink.to(device=query.device,
+                                     dtype=torch.float32).unsqueeze(1)
+            max_score = torch.maximum(scores.amax(dim=-1, keepdim=True), sink)
+            score_exp = torch.exp(scores - max_score)
+            denominator = score_exp.sum(dim=-1, keepdim=True)
+            denominator += torch.exp(sink - max_score)
+            probabilities = (score_exp / denominator).to(query.dtype)
+
+        return torch.matmul(probabilities,
+                            selected_latent[:, :value_dim].to(query.dtype))
+
     def _mla_forward_context(self, q: torch.Tensor, k: torch.Tensor,
                              v: torch.Tensor,
                              metadata: VanillaAttentionMetadata,
@@ -710,6 +808,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 raise ValueError("Vanilla MLA requires a KV cache manager.")
             if forward_args.latent_cache is None:
                 raise ValueError("Vanilla MLA requires latent_cache.")
+            if self.sparse_params is not None:
+                raise NotImplementedError(
+                    f"{self.sparse_params.algorithm} requires its specialized "
+                    "Vanilla attention backend")
             if forward_args.attention_input_type == AttentionInputType.context_only:
                 assert k is not None and v is not None
                 return self._mla_forward_context(q, k, v, metadata,
