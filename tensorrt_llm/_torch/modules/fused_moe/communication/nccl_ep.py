@@ -136,7 +136,6 @@ class NcclEP(Communication):
                     "NcclEP context must be initialized before CUDA graph capture. "
                     "Run an eager warmup forward before enabling or capturing CUDA graphs."
                 )
-            from nccl.ep import Layout
 
             from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import get_nccl_ep_context
 
@@ -146,7 +145,8 @@ class NcclEP(Communication):
                 self.max_tokens_per_rank,
                 self.hidden_size,
                 self.max_top_k,
-                Layout.RANK_MAJOR,
+                # None => honor the TRTLLM_NCCL_EP_ALGO-gated layout default.
+                None,
             )
         return self._ctx
 
@@ -242,12 +242,28 @@ class NcclEP(Communication):
             topk_idx=ctx.recv_topk_idx_nd,
             scales=None,
         )
-        layout_info = LayoutInfo(src_rank_counters=ctx.recv_rank_counter_nd)
+        # Shipped V1 nccl_ep.h: "For HT mode [layout_info] should be NULL, the
+        # counter information is available through ncclEpUpdateHandle".
+        # src_rank_counters is an LL-rank-major-only field. Branch on the
+        # context's stored algorithm (fixed at context creation, part of the
+        # context cache key), not the environment: the buffers this call uses
+        # were shaped by that stored value, and a re-read could disagree with
+        # them if the env changed after context creation.
+        _ht = ctx.is_high_throughput
+        layout_info = None if _ht else LayoutInfo(
+            src_rank_counters=ctx.recv_rank_counter_nd
+        )
         # The v0.2-gated capability path asks the kernel to emit global
         # expert ids directly; v0.1 retains the default local-id contract
-        # and uses the translation below.
-        if ctx._expert_id_kind_global is not None:
+        # and uses the translation below. Track whether THIS dispatch
+        # actually requested global ids: under HT layout_info is None, so
+        # the request is never made and the kernel writes LOCAL ids even
+        # when the binding capability exists — the pass-through below must
+        # key on the configured kind, not the capability flag.
+        dispatch_writes_global_ids = False
+        if layout_info is not None and ctx._expert_id_kind_global is not None:
             layout_info._lowpp.recv_topk_idx_kind = ctx._expert_id_kind_global
+            dispatch_writes_global_ids = True
 
         topk_idx_dev = token_selected_slots.to(ctx.topk_idx_dtype).contiguous()
         topk_nd = Tensor(topk_idx_dev)
@@ -281,8 +297,10 @@ class NcclEP(Communication):
         # numbering downstream consumers expect.
         # The dispatch buffer is 3D [ep_size, max_tokens_per_rank, max_top_k]
         # per the LL rank-major contract; flatten to 2D for downstream.
-        recv_topk_idx_flat = ctx.recv_topk_idx_buf.view(self.max_recv_tokens, self.max_top_k)
-        if ctx.kernel_writes_global_ids:
+        recv_topk_idx_flat = ctx.recv_topk_idx_buf.reshape(
+            self.max_recv_tokens, self.max_top_k
+        )
+        if dispatch_writes_global_ids:
             recv_slots_global = recv_topk_idx_flat
         else:
             recv_slots_global = torch.where(
@@ -295,10 +313,13 @@ class NcclEP(Communication):
         # LL rank-major contract; downstream MoE pipeline expects 2D --
         # flatten via view.
         return (
-            ctx.output_tokens_buf.view(self.max_recv_tokens, self.hidden_size),
+            ctx.output_tokens_buf.reshape(self.max_recv_tokens, self.hidden_size),
             None,
-            recv_slots_global,
-            ctx.recv_topk_weights_buf.view(self.max_recv_tokens, self.max_top_k),
+            # torch.ops.trtllm.fused_moe requires int32 routing ids, while the
+            # v0.1 HT kernel ABI requires the int64 recv buffer allocated above.
+            # Narrow here so both contracts hold; -1 sentinels survive the cast.
+            recv_slots_global.to(torch.int32),
+            ctx.recv_topk_weights_buf.reshape(self.max_recv_tokens, self.max_top_k),
         )
 
     # ------------------------------------------------------------------
@@ -335,11 +356,14 @@ class NcclEP(Communication):
                     f"combine input shape={tuple(final_hidden_states.shape)} "
                     f"expected={expected_shape}"
                 )
-            final_hidden_states = final_hidden_states.view(
-                self.ep_size,
-                self.max_tokens_per_rank,
-                self.hidden_size,
-            )
+            # Same rule as dispatch: the algorithm comes from the context, not
+            # a fresh env read (E713-clean and stable across env changes).
+            if not ctx.is_high_throughput:
+                final_hidden_states = final_hidden_states.view(
+                    self.ep_size,
+                    self.max_tokens_per_rank,
+                    self.hidden_size,
+                )
         elif final_hidden_states.dim() == 3:
             expected_shape = (self.ep_size, self.max_tokens_per_rank, self.hidden_size)
             if tuple(final_hidden_states.shape) != expected_shape:
