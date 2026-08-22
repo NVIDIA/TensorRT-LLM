@@ -23,6 +23,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "build_wheel.py"
 MSA_INTERFACE = Path("python/fmha_sm100/cute/interface.py")
+MSA_KERNEL = Path("python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp")
+MSA_JIT = Path("python/fmha_sm100/jit.py")
 MSA_PATCH = Path("3rdparty/patches/msa_strided_paged_kv.patch")
 
 _SPEC = importlib.util.spec_from_file_location("build_wheel", SCRIPT_PATH)
@@ -51,32 +53,62 @@ def _stage_project(tmp_path: Path) -> Path:
     return project_dir
 
 
+def _assert_msa_patch_applied(project_dir: Path) -> None:
+    msa_dir = project_dir / "3rdparty" / "MSA"
+    assert "def _prepare_paged_hnd_input" in (msa_dir / MSA_INTERFACE).read_text()
+    assert "cudaGridDependencySynchronize();" in (msa_dir / MSA_KERNEL).read_text()
+    patched_jit = msa_dir / MSA_JIT
+    source = patched_jit.read_text()
+    assert "def _compute_csrc_fingerprint" in source
+    compile(source, str(patched_jit), "exec")
+
+
 def test_apply_msa_patch_is_idempotent_in_place(tmp_path):
     project_dir = _stage_project(tmp_path)
-    patched_interface = project_dir / "3rdparty" / "MSA" / MSA_INTERFACE
 
     apply_msa_patch(project_dir)
-    assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+    _assert_msa_patch_applied(project_dir)
 
     # A second call must short-circuit via the reverse-check guard rather than
     # raise, leaving the patched content in place.
     apply_msa_patch(project_dir)
-    assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+    _assert_msa_patch_applied(project_dir)
 
 
 def test_apply_msa_patch_with_dangling_submodule_gitlink(tmp_path):
     """Patching must work in a copied tree whose gitlink points nowhere."""
     project_dir = _stage_project(tmp_path)
-    patched_interface = project_dir / "3rdparty" / "MSA" / MSA_INTERFACE
     (project_dir / "3rdparty" / "MSA" / ".git").write_text(
         "gitdir: ../../.git/modules/3rdparty/MSA\n"
     )
 
     apply_msa_patch(project_dir)
-    assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+    _assert_msa_patch_applied(project_dir)
 
     apply_msa_patch(project_dir)
-    assert "def _prepare_paged_hnd_input" in patched_interface.read_text()
+    _assert_msa_patch_applied(project_dir)
+
+
+def test_patched_msa_jit_cache_is_source_qualified(tmp_path, monkeypatch):
+    project_dir = _stage_project(tmp_path)
+    patched_msa = project_dir / "3rdparty" / "MSA"
+    patched_jit = patched_msa / MSA_JIT
+    apply_msa_patch(project_dir)
+
+    monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(tmp_path / "cache"))
+    spec = importlib.util.spec_from_file_location("patched_msa_jit", patched_jit)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    first_cache = module._compute_cache_base()
+    source = patched_msa / "python/fmha_sm100/csrc/gmem_bounds_check.h"
+    source.write_text(source.read_text() + "\n")
+    second_cache = module._compute_cache_base()
+
+    assert first_cache.parent == tmp_path / "cache"
+    assert first_cache.name.startswith("source-")
+    assert first_cache != second_cache
 
 
 def test_apply_msa_patch_reports_conflict(tmp_path):
