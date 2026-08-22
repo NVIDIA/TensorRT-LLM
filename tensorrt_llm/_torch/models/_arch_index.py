@@ -114,6 +114,7 @@ MODEL_ARCH_TO_MODULE = {
     "Step3p5ForCausalLM": "modeling_step3p7",
     "Step3p7ForConditionalGeneration": "modeling_step3p7vl",
     "T5ForConditionalGeneration": "modeling_t5",
+    "TeleChat4ForCausalLM": "modeling_telechat4",
     "WhisperForConditionalGeneration": "modeling_whisper",
 }
 
@@ -183,6 +184,7 @@ MODEL_CLASS_TO_MODULE = {
     "Step3p7ForCausalLM": "modeling_step3p7",
     "Step3p7VLForConditionalGeneration": "modeling_step3p7vl",
     "T5ForConditionalGeneration": "modeling_t5",
+    "TeleChat4ForCausalLM": "modeling_telechat4",
     "VilaModel": "modeling_vila",
     "WhisperForConditionalGeneration": "modeling_whisper",
 }

@@ -55,6 +55,7 @@ def _register_custom_configs_with_transformers() -> None:
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
+        "telechat4": DeepseekV3Config,
         "gemma4_assistant": Gemma4AssistantConfig,
         # Kimi K3 composite multimodal config ("kimi_k3") and its text config
         # ("kimi_linear"). pyexecutor.config_utils.load_pretrained_config keeps

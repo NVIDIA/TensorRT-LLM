@@ -387,6 +387,51 @@ class PoolsideV1ReasoningParser(DeepSeekV4ReasoningParser):
                 chat_template_kwargs=chat_template_kwargs)
 
 
+@register_reasoning_parser("telechat", "telechat4")
+class TeleChatReasoningParser(BaseReasoningParser):
+    """Reasoning parser for TeleChat models, including TeleChat4.
+
+    TeleChat templates render the thinking markers in the prompt, so the model
+    output begins inside the reasoning block when thinking is enabled and is
+    otherwise plain content. Thinking defaults to on, matching the TeleChat
+    chat template, and is toggled through the usual `enable_thinking` /
+    `thinking` chat-template kwargs.
+    """
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        kwargs = chat_template_kwargs or {}
+        value = kwargs.get("enable_thinking", kwargs.get("thinking"))
+        thinking_enabled = True if value is None else bool(value)
+
+        if thinking_enabled:
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=True,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        else:
+            self._parser = IdentityReasoningParser(
+                chat_template_kwargs=chat_template_kwargs, )
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        if text.startswith(self.reasoning_start):
+            text = text[len(self.reasoning_start):]
+        return self._parser.parse(text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return self._parser.parse_delta(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        return self._parser.finish()
+
+
 @register_reasoning_parser("minimax_m3")
 class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for MiniMax-M3.
@@ -442,6 +487,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
+    "telechat4": "telechat",
     "laguna": "poolside_v1",
     "deepseek_v4": "deepseek_v4",
     "nemotron_h": "nemotron-v3",
