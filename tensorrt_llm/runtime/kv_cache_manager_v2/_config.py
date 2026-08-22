@@ -258,6 +258,12 @@ class KVCacheManagerConfig:
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
     """
 
+    enable_partial_commit: bool = True
+    """
+    If True, publish a finalized partial block for reuse when committing stops.
+    Beam search disables this while retaining full-block reuse.
+    """
+
     @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self.swa_scratch_reuse is not None

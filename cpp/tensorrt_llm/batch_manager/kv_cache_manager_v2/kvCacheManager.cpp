@@ -386,6 +386,11 @@ bool KvCacheManager::enablePartialMatch() const noexcept
     return mConfig.enablePartialReuse;
 }
 
+bool KvCacheManager::enablePartialCommit() const noexcept
+{
+    return mConfig.enablePartialCommit;
+}
+
 int KvCacheManager::numLayers() const noexcept
 {
     return static_cast<int>(mStorage->layerToLifeCycleIds().size());

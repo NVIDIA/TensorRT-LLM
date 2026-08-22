@@ -301,6 +301,10 @@ struct KVCacheManagerConfig
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
 
+    // Publish a finalized partial block for reuse when committing stops.
+    // Beam search disables this while retaining full-block reuse.
+    bool enablePartialCommit = true;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();
