@@ -320,16 +320,6 @@ def _sync_kv_cache_manager_init_status(
     return local_status
 
 
-def _shutdown_kv_cache_manager_candidate(candidate: Optional[KVCacheManagerPy]) -> None:
-    """Best-effort cleanup for an uncommitted KV cache manager candidate."""
-    if candidate is None:
-        return
-    try:
-        candidate.shutdown()
-    except Exception as error:
-        logger.error(f"Failed to clean up an uncommitted KV cache manager: {error}")
-
-
 def _estimate_swa_cache_size(
     layer_sizes: Sequence[int],
     attention_windows: Sequence[Optional[int]],
@@ -1124,23 +1114,21 @@ class KVCacheManagerV2(BaseResourceManager):
             candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
         else:
             init_error: Optional[Exception] = None
+            local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
             try:
                 candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
-                local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
-            except (CuError, KVCacheOutOfMemoryError):
-                local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
             except Exception as error:
-                init_error = error.with_traceback(None)
-                local_init_status = _KVCacheManagerInitStatus.ABORT
+                if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
+                    local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
+                else:
+                    init_error = error.with_traceback(None)
+                    local_init_status = _KVCacheManagerInitStatus.ABORT
 
-            try:
-                init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
-            except Exception:
-                _shutdown_kv_cache_manager_candidate(candidate)
-                raise
+            init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
 
             if init_status == _KVCacheManagerInitStatus.ABORT:
-                _shutdown_kv_cache_manager_candidate(candidate)
+                if candidate is not None:
+                    candidate.shutdown()
                 if init_error is not None:
                     raise init_error
                 raise RuntimeError("KV cache manager initialization failed on another rank")
@@ -1151,10 +1139,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     "(cuMemHostRegister may have failed). Rebuilding without the "
                     "host cache tier on all ranks."
                 )
-                _shutdown_kv_cache_manager_candidate(candidate)
-                candidate = None
                 fallback_error: Optional[Exception] = None
                 try:
+                    if candidate is not None:
+                        candidate.shutdown()
+                    candidate = None
                     config = replace(
                         config,
                         cache_tiers=[
@@ -1163,29 +1152,20 @@ class KVCacheManagerV2(BaseResourceManager):
                             if not isinstance(tier, HostCacheTierConfig)
                         ],
                     )
+                    candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
                 except Exception as error:
                     fallback_error = error.with_traceback(None)
-                else:
-                    try:
-                        candidate = KVCacheManagerPy(config, event_manager=self.event_manager)
-                    except Exception as error:
-                        fallback_error = error.with_traceback(None)
 
                 local_fallback_status = (
                     _KVCacheManagerInitStatus.USE_NO_HOST
                     if fallback_error is None
                     else _KVCacheManagerInitStatus.ABORT
                 )
-                try:
-                    fallback_status = _sync_kv_cache_manager_init_status(
-                        local_fallback_status, mapping
-                    )
-                except Exception:
-                    _shutdown_kv_cache_manager_candidate(candidate)
-                    raise
+                fallback_status = _sync_kv_cache_manager_init_status(local_fallback_status, mapping)
 
                 if fallback_status == _KVCacheManagerInitStatus.ABORT:
-                    _shutdown_kv_cache_manager_candidate(candidate)
+                    if candidate is not None:
+                        candidate.shutdown()
                     if fallback_error is not None:
                         raise fallback_error
                     raise RuntimeError(
