@@ -2124,7 +2124,7 @@ def _make_test_params():
     # Keep equal-sized MPI pools adjacent to reduce MPIPoolExecutor churn.
     for ep_size in [2, 4]:
         for comm_type in ALL_COMM_TYPES:
-            for top_k in [2, 4, 8]:
+            for top_k in [2, 4, 8, 16]:
                 for workload in _make_workloads(ep_size):
                     for use_low_precision_combine in [False, True]:
                         config = CommTestConfig(
@@ -2271,28 +2271,29 @@ def _make_non_divisible_ep_test_params():
 def _make_postquant_test_params():
     """Generate post-quant test parameters using POSTQUANT_COMM_MAP.
 
-    Uses simplified workloads (ep_size=2, top_k=2, small tokens) to keep
+    Uses simplified workloads (ep_size=2, top_k=2/16, small tokens) to keep
     the matrix manageable while covering all valid (comm_type, quant_mode)
     combinations.
     """
     configs = []
     for quant_mode, comm_types in POSTQUANT_COMM_MAP.items():
         for comm_type in comm_types:
-            top_k = 8 if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else 2
-            for use_low_precision_combine in [False, True]:
-                config = CommTestConfig(
-                    comm_type=comm_type,
-                    ep_size=2,
-                    num_experts=FIXED_NUM_EXPERTS,
-                    top_k=top_k,
-                    hidden_size=DEFAULT_HIDDEN_SIZE,
-                    all_num_tokens=[16, 16],
-                    quant_mode=quant_mode,
-                    use_low_precision_combine=use_low_precision_combine,
-                )
-                if not _is_static_feasible(config):
-                    continue
-                configs.append(config)
+            top_ks = [8] if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else [2, 16]
+            for top_k in top_ks:
+                for use_low_precision_combine in [False, True]:
+                    config = CommTestConfig(
+                        comm_type=comm_type,
+                        ep_size=2,
+                        num_experts=FIXED_NUM_EXPERTS,
+                        top_k=top_k,
+                        hidden_size=DEFAULT_HIDDEN_SIZE,
+                        all_num_tokens=[16, 16],
+                        quant_mode=quant_mode,
+                        use_low_precision_combine=use_low_precision_combine,
+                    )
+                    if not _is_static_feasible(config):
+                        continue
+                    configs.append(config)
     return _make_grouped_params(configs)
 
 
