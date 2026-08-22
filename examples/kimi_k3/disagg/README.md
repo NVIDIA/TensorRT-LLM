@@ -11,7 +11,8 @@ for constraints.
 | File | Purpose |
 |---|---|
 | `ctx_config.yaml` | Context-server extra LLM-API options (DEP16, overlap scheduler off, no spec decode) |
-| `gen_config_no_sa.yaml` | Generation-server options, no speculative decoding (CUDA graphs ON by default: GSM8K 96.89, 765/2138 tok/s @c64/c256 vs aggregated 643/1972; null `cuda_graph_config` for token-parity debugging). A suffix-automaton (SA) speculative-decoding variant lands together with K3 SA support. |
+| `gen_config.yaml` | Generation-server options WITH suffix-automaton (SA) speculative decoding (DEP16, eager) |
+| `gen_config_no_sa.yaml` | Generation-server options WITHOUT spec decode — use this first (CUDA graphs ON by default: GSM8K 96.89, 765/2138 tok/s @c64/c256 vs aggregated 643/1972; null `cuda_graph_config` for token-parity debugging) |
 | `disagg_proxy_config.yaml` | `trtllm-serve disaggregated` proxy config (1 ctx + 1 gen) |
 | `benchmark_kimi_k3_dep16.yaml` | Config for the SLURM benchmark harness (`examples/disaggregated/slurm/benchmark/submit.py`) |
 
@@ -34,8 +35,8 @@ for constraints.
   C++ transceiver, which throws at construction for K3's
   `MixedMambaHybridCacheManager`.
 - `disable_overlap_scheduler: true` on the ctx server (disagg
-  requirement) and on the gen server (keeps the smoke runs maximally
-  comparable across configurations).
+  requirement) and on the gen server (SA runs eager; also keeps the
+  SA-off smoke maximally comparable).
 - `enable_block_reuse: false`, `tokens_per_block: 64`, no chunked
   prefill, beam width 1 (model requirements).
 - `max_tokens_in_buffer: 8448` covers the target max ISL of 8192; raise
@@ -53,12 +54,14 @@ for constraints.
 
 ## Launch sequence (manual, single ctx + single gen)
 
-Each K3 worker spans 16 GPUs (4 NVL72 nodes at 4 GPUs/node). Leave
-`UCX_TLS` unset in every worker shell so UCX selects transports itself,
-RDMA/verbs included; in particular, unset any container-default
-`UCX_TLS=tcp`, which breaks V2 NIXL VRAM registration. Override the
-transport list only on clusters whose verbs transports cannot
-initialize (see caveats 1 and 4 below for the symptom and the override).
+Each K3 worker spans 16 GPUs (4 NVL72 nodes at 4 GPUs/node). Environment
+prerequisites for every worker shell (see caveats below for why):
+
+```bash
+export UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc   # on clusters where verbs cannot
+                                                # initialize; a container-default
+                                                # UCX_TLS=tcp breaks V2 NIXL
+```
 
 1. Start the context server (16-rank MPI world across its 4 nodes):
 
@@ -68,7 +71,7 @@ initialize (see caveats 1 and 4 below for the symptom and the override).
        --config examples/kimi_k3/disagg/ctx_config.yaml
    ```
 
-2. Start the generation server:
+2. Start the generation server (SA off first):
 
    ```bash
    trtllm-llmapi-launch trtllm-serve $MODEL_PATH \
@@ -83,7 +86,9 @@ initialize (see caveats 1 and 4 below for the symptom and the override).
    trtllm-serve disaggregated -c examples/kimi_k3/disagg/disagg_proxy_config.yaml
    ```
 
-4. Send OpenAI-compatible requests to the proxy (port 8000).
+4. Send OpenAI-compatible requests to the proxy (port 8000). Once the
+   SA-off path is parity-validated, restart the gen server with
+   `gen_config.yaml` to enable SA.
 
 ## SLURM benchmark harness
 
@@ -101,11 +106,9 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
 - **Gen-only baseline**: set `benchmark.mode: gen_only_no_context`
   (submit.py exports `TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1` to the
   workers) to measure the decode-side ceiling without KV transfer.
-- The harness's `start_worker.sh` clears any container-provided
-  `UCX_TLS`, so workers run with UCX's own transport selection by
-  default. Clusters that need a transport override (caveat 4) carry it
-  via `TRTLLM_WORKER_UCX_TLS` in `worker_env_var`, which
-  `start_worker.sh` re-exports as `UCX_TLS` after the clear.
+- The harness's `start_worker.sh` clears `UCX_TLS`; the config carries
+  the transport pin via `TRTLLM_WORKER_UCX_TLS`, which `start_worker.sh`
+  re-exports as `UCX_TLS` after the clear.
 - pyxis/enroot resets image-defined variables (notably `PATH`) at
   container start, so the config injects the in-place TRT-LLM venv via
   `TRTLLM_PATH_PREPEND` / `TRTLLM_PYTHONPATH_PREPEND`, applied inside
@@ -123,22 +126,22 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
    setup MPI collectives. Not an MPI/pmix or V2 code bug; with
    `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` V2 NIXL passes multi-node
    with no code change.
-2. **No speculative decoding yet.** These configs run the gen server
-   without spec decode. Suffix-automaton (SA) speculative decoding for
-   K3 disagg is validated on the feature branch and lands in a separate
-   change together with K3 SA support (an SA `gen_config.yaml` variant
-   ships with it).
+2. **SA ships eager here.** SA speculative decoding in disagg is
+   validated for accuracy (GSM8K parity with aggregated serving) with
+   CUDA graphs disabled, as configured in `gen_config.yaml`. SA with
+   CUDA graphs is functional (the MLA latent-cache append under CUDA
+   graphs handles spec-dec verification), but the disagg SA + graphs
+   perf points have not been re-measured yet, so `gen_config.yaml`
+   keeps graphs off. Start with `gen_config_no_sa.yaml` for the first
+   bring-up on a new cluster, then switch to `gen_config.yaml`.
 3. **Matched-DP only.** Keep ctx and gen at identical DEP16 with
    attention-DP on both sides; heterogeneous parallelism with
    attention-DP off is rejected (see constraints above).
-4. **Cluster environment** (NVL72 nodes): the default is to leave
-   `UCX_TLS` unset and let UCX pick transports (RDMA/verbs included).
-   Two exceptions: never run V2 NIXL with a container-default
-   `UCX_TLS=tcp` (breaks V2 NIXL VRAM registration; unset it), and on
-   clusters whose verbs transports cannot initialize, pin
-   `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` (an effective `UCX_TLS=all`
-   hangs setup there, see caveat 1). The pin excludes RDMA/verbs, so do
-   not carry it to clusters where verbs works.
+4. **Cluster environment** (NVL72 nodes): on clusters where verbs
+   transports cannot initialize, pin
+   `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` (`UCX_TLS=all` hangs setup,
+   see caveat 1) and never run V2 NIXL with a container-default
+   `UCX_TLS=tcp` (breaks V2 NIXL VRAM registration) — unset/override it.
    No bounce env override is needed: the byte gate
    (`TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES`, default 2 MiB) is always cleared
    by K3 payloads (constraints section above).
@@ -153,16 +156,18 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
    the per-token MLA latent; ≥1024 MB for 8k ISL). An undersized region
    does not error — every transfer silently falls back to a much slower
    host-staged TCP path.
-7. **Prefill capacity and TTFT under burst.** Without chunked prefill,
+7. **SA caps gen-side batch size.** SA requires `max_batch_size` ≤ 8 on
+   the generation server, which bounds per-instance concurrency at
+   `8 × dp_size` (128 with DEP16). Plan instance counts accordingly.
+8. **Prefill capacity and TTFT under burst.** Without chunked prefill,
    context-server throughput is limited and queued prefills grow TTFT
    roughly linearly under closed-loop bursts. Rate-match the ctx:gen
    instance ratio to the expected traffic instead of oversubscribing a
    single context server.
-8. **Startup time.** Weight loading takes tens of minutes per 16-GPU
+9. **Startup time.** Weight loading takes tens of minutes per 16-GPU
    instance before the first token; set health-check, idle-reaper, and
    job time limits accordingly. The disaggregated proxy does not serve
    `/v1/models` (404) — point readiness probes at a different endpoint.
-9. **`max_num_tokens` coupling.** The generation side must cover
-   `max_batch_size × (1 + max_draft_len)` scheduled tokens (with spec
-   decode off, `max_draft_len` is 0); the context side needs
-   `max_tokens_in_buffer` ≥ max ISL (see constraints above).
+10. **`max_num_tokens` coupling.** The generation side must cover
+    `max_batch_size × (1 + max_draft_len)`; the context side needs
+    `max_tokens_in_buffer` ≥ max ISL (see constraints above).

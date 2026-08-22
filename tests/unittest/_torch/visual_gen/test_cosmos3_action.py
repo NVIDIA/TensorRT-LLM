@@ -280,10 +280,22 @@ class TestActionReferenceSize:
         """Bytes are measured from the header, never by decoding a frame."""
         import tensorrt_llm.media.decoding as decoding
 
-        monkeypatch.setattr(decoding, "probe_video_dimensions", lambda data: (480, 640))
+        monkeypatch.setattr(
+            decoding,
+            "video_stream_info",
+            lambda data: decoding.VideoStreamInfo(480, 640, 30.0),
+        )
         assert action_reference_size(
             action_mode="inverse_dynamics", image=None, video=b"\x00mp4"
         ) == (480, 640)
+
+    def test_unreadable_video_bytes_are_rejected(self, monkeypatch):
+        """An unreadable container fails here, not silently at decode."""
+        import tensorrt_llm.media.decoding as decoding
+
+        monkeypatch.setattr(decoding, "video_stream_info", lambda data: None)
+        with pytest.raises(ValueError, match="could not be demuxed"):
+            action_reference_size(action_mode="inverse_dynamics", image=None, video=b"\x00bad")
 
 
 class TestActionJsonPrompt:

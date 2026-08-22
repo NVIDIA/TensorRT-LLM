@@ -444,9 +444,15 @@ def action_reference_size(
     if source is None:
         raise ValueError(f"Cosmos3 action_mode={action_mode!r} requires an image or video input.")
     if isinstance(source, bytes):
-        from tensorrt_llm.media.decoding import probe_video_dimensions
+        from tensorrt_llm.media.decoding import video_stream_info
 
-        return probe_video_dimensions(source)
+        info = video_stream_info(source)
+        if info is None:
+            raise ValueError(
+                f"Cosmos3 action_mode={action_mode!r} video reference could not be demuxed "
+                "(corrupt or not a supported container)."
+            )
+        return info.height, info.width
     reference = pil_to_rgb(source)
     return reference.height, reference.width
 

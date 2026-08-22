@@ -275,6 +275,31 @@ def _compute_auto_host_tier_quota(
     return host_quota
 
 
+def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
+    """Reduce the auto-provisioned host cache tier quota to the fleet minimum.
+
+    ``_compute_auto_host_tier_quota`` reads rank-local host state
+    (``SC_AVPHYS_PAGES``, ``RLIMIT_MEMLOCK``), so co-scheduled ranks can arrive
+    at divergent host quotas (observed up to 10x). Divergent host-tier
+    retention makes per-rank MAX_UTILIZATION schedulers disagree about which
+    suspended requests can resume, which wedges collectives on
+    non-attention-DP TP. Reducing to the fleet minimum makes the
+    most-constrained rank set the value for everyone, mirroring the device
+    quota sync. A single-rank job needs no collective and is returned as-is.
+
+    Args:
+        host_quota: This rank's locally-computed host tier quota in bytes.
+        mapping: Parallelism mapping; ``world_size`` selects whether a
+            collective is needed.
+
+    Returns:
+        The globally-agreed host tier quota in bytes (the fleet ``MIN``).
+    """
+    if mapping.world_size > 1:
+        host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
+    return host_quota
+
+
 def _estimate_swa_cache_size(
     layer_sizes: Sequence[int],
     attention_windows: Sequence[Optional[int]],
@@ -742,6 +767,10 @@ def _copy_swa_block_offsets_with_scratch_compiled(
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
+    # Declared on the class so it is present even when an instance is built without running __init__.
+    _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -995,10 +1024,9 @@ class KVCacheManagerV2(BaseResourceManager):
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
-            # evict and later restore KV cache pages.  Without a host tier,
-            # suspended pages have nowhere to be offloaded and resume()
-            # always fails, causing a scheduling deadlock where no
-            # generation request can ever make progress.
+            # evict and later restore KV cache pages. Without a secondary
+            # tier, suspended held pages cannot migrate out of GPU, so
+            # suspension cannot free capacity and scheduling can deadlock.
             #
             # Automatically provision a host tier matching the GPU quota so
             # suspend/resume works out of the box.  Cap at available host
@@ -1030,13 +1058,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{local_ranks} co-located rank(s) on this node, "
                 f"available host memory {mem_available / (1 << 30):.2f}GiB"
             )
-            # Auto sizing reads rank-local host state, so co-scheduled ranks
-            # can get divergent host quotas (observed up to 10x). Divergent
-            # host-tier retention makes per-rank schedulers disagree, which
-            # wedges collectives on non-attention-DP TP. Sync to the fleet
-            # minimum, like the device quota above.
-            if mapping.world_size > 1:
-                host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
+            # Reduce the rank-local auto quota to the fleet minimum; see
+            # _sync_host_tier_quota for why divergence wedges collectives.
+            host_quota = _sync_host_tier_quota(host_quota, mapping)
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
@@ -1061,31 +1085,36 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
         )
         config = self._build_cache_config(config)
+        has_host_cache_tier = any(
+            isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
+        )
 
         self.kv_cache_manager_py_config = config
 
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
-            if len(cache_tiers) > 1:
+            if has_host_cache_tier:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
                     "tier (cuMemHostRegister may have failed). "
                     "Retrying without host cache tier."
                 )
-                cache_tiers_gpu_only = [t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)]
-                config = replace(config, cache_tiers=cache_tiers_gpu_only)
-                cache_tiers = cache_tiers_gpu_only
+                cache_tiers_without_host = [
+                    tier for tier in config.cache_tiers if not isinstance(tier, HostCacheTierConfig)
+                ]
+                config = replace(config, cache_tiers=cache_tiers_without_host)
                 self.kv_cache_manager_py_config = config
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
                 raise
+        self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()
             )
             self.event_manager.add_created_event(
-                self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
+                self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
             )
 
@@ -2473,7 +2502,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache (move to host tier)."""
+        """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
@@ -2642,6 +2671,32 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return _introspection.storage_statistics(self.impl, cache_level)
 
+    def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
+        """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
+
+        Ordered by cold pool-group id. Cold levels number their pool groups independently of the hot
+        level, so these ids are meaningful only within the cold view. KVCM uses one mapping for every
+        cold level, and the grouping is fixed at construction, so it is queried from level 1 once.
+        """
+        if self._cold_pool_group_membership_cache is None:
+            membership: tuple[tuple[int, frozenset[int]], ...] = ()
+            if len(self.impl.cache_tier_list) > 1:
+                grouped: dict[int, set[int]] = defaultdict(set)
+                mapping = _introspection.life_cycle_pool_group_indices(self.impl, CacheLevel(1))
+                for life_cycle_id, pool_group_id in enumerate(mapping):
+                    grouped[pool_group_id].add(life_cycle_id)
+                membership = tuple(sorted((pg, frozenset(lcs)) for pg, lcs in grouped.items()))
+            self._cold_pool_group_membership_cache = membership
+        return self._cold_pool_group_membership_cache
+
+    @staticmethod
+    def _stats_slot_sizes(pool_group_stats: object) -> tuple[int, ...]:
+        """Return slot sizes from either the native or pure-Python statistics object."""
+        slot_sizes = getattr(pool_group_stats, "slot_sizes", None)
+        if slot_sizes is None:
+            slot_sizes = getattr(pool_group_stats, "slot_size")
+        return tuple(slot_sizes)
+
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
         # life cycle (== layer group) -> pool group is static structure exposed by
         # the public pool_group_descs API; no introspection needed.
@@ -2732,9 +2787,10 @@ class KVCacheManagerV2(BaseResourceManager):
             setattr(stats, field_name, getattr(delta, field_name))
         stats.iter_cache_hit_rate = KVCacheManagerV2._iteration_cache_hit_rate(stats)
 
+    @staticmethod
     def _build_iteration_stats(
-        self,
         pool_group_ids: Iterable[int],
+        secondary_pool_group_ids: Sequence[tuple[int, ...]],
         primary_stats,
         secondary_stats_by_level,
         primary_peak_stats,
@@ -2742,6 +2798,14 @@ class KVCacheManagerV2(BaseResourceManager):
         delta,
         field_names=KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     ):
+        """Aggregate block stats over ``pool_group_ids`` at the hot level and ``secondary_pool_group_ids``
+        at each cold level.
+
+        Hot and cold levels number their pool groups independently, so a cold level cannot be indexed
+        with hot ids; ``secondary_pool_group_ids`` carries each cold level's own ids and must be
+        parallel to ``secondary_stats_by_level``. Only the cold-pool-group view reports cold blocks, so
+        the hot-keyed callers pass ``()`` here and leave the ``secondary_*`` fields at zero.
+        """
         pool_group_ids = tuple(pool_group_ids)
         stats = KvCacheIterationStats()
         stats.primary_max_num_blocks = sum(
@@ -2763,40 +2827,43 @@ class KVCacheManagerV2(BaseResourceManager):
         stats.primary_peak_evictable_num_blocks = sum(
             primary_peak_stats[pool_group_id].evictable for pool_group_id in pool_group_ids
         )
+        secondary_levels = tuple(zip(secondary_stats_by_level, secondary_pool_group_ids))
+        secondary_peak_levels = tuple(zip(secondary_peak_stats_by_level, secondary_pool_group_ids))
+
         stats.secondary_max_num_blocks = sum(
             level_stats[pool_group_id].total
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_free_num_blocks = sum(
             level_stats[pool_group_id].available
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_used_num_blocks = (
             stats.secondary_max_num_blocks - stats.secondary_free_num_blocks
         )
         stats.secondary_evictable_num_blocks = sum(
             level_stats[pool_group_id].evictable
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_free_num_blocks = sum(
             peak_stats[pool_group_id].available
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_used_num_blocks = sum(
             peak_stats[pool_group_id].unavailable
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_evictable_num_blocks = sum(
             peak_stats[pool_group_id].evictable
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
-        self._apply_iteration_stats_delta(stats, delta, field_names)
+        KVCacheManagerV2._apply_iteration_stats_delta(stats, delta, field_names)
         return stats
 
     def _collect_iteration_stats_deltas(
@@ -2854,6 +2921,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         stats = self._build_iteration_stats(
             pool_group_ids,
+            (),
             primary_stats,
             secondary_stats_by_level,
             primary_peak_stats,
@@ -2875,17 +2943,13 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_group_delta,
     ) -> KVCacheV2PoolGroupIterationStats:
         primary_pool_group_stats = primary_stats[pool_group_id]
-        slot_size = (
-            primary_pool_group_stats.slot_sizes
-            if hasattr(primary_pool_group_stats, "slot_sizes")
-            else primary_pool_group_stats.slot_size
-        )
         return KVCacheV2PoolGroupIterationStats(
             pool_group_id=pool_group_id,
-            slot_size=tuple(slot_size),
+            slot_size=self._stats_slot_sizes(primary_pool_group_stats),
             window_sizes=windows_by_pool_group.get(pool_group_id, ()),
             stats=self._build_iteration_stats(
                 (pool_group_id,),
+                (),
                 primary_stats,
                 secondary_stats_by_level,
                 primary_peak_stats,
@@ -2894,6 +2958,60 @@ class KVCacheManagerV2(BaseResourceManager):
                 KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
             ),
         )
+
+    def _build_cold_pool_group_iteration_stats(
+        self,
+        life_cycle_metadata,
+        primary_stats,
+        secondary_stats_by_level,
+        primary_peak_stats,
+        secondary_peak_stats_by_level,
+    ) -> dict[int, KVCacheV2PoolGroupIterationStats]:
+        """Report every cold pool group in its own numbering, summed over all cold levels.
+
+        The window and hot-pool-group views drop a cold group that spans several hot groups, since
+        attributing it to any one of them would double count. This view has no such gap, so host and
+        disk blocks are always accounted for somewhere.
+
+        The returned ``pool_group_id`` is a *cold* pool-group index. It is unrelated to the hot index
+        of the same name in the by-pool-group view, because hot and cold levels number their groups
+        independently; ``window_sizes`` is the correlation key shared by both views.
+        """
+        # No cold tiers means nothing to report, and the pool-group mapping need not be queried.
+        if not secondary_stats_by_level:
+            return {}
+        cold_members = self._cold_pool_group_membership()
+        if not cold_members:
+            return {}
+        assert all(
+            len(level_stats) == len(cold_members) for level_stats in secondary_stats_by_level
+        )
+
+        report: dict[int, KVCacheV2PoolGroupIterationStats] = {}
+        for cold_pool_group_id, life_cycles in cold_members:
+            level_ids = [(cold_pool_group_id,) for _ in secondary_stats_by_level]
+            cold_stats = secondary_stats_by_level[0][cold_pool_group_id]
+            window_sizes = {
+                life_cycle_metadata[life_cycle_id][1]
+                for life_cycle_id in life_cycles
+                if life_cycle_metadata.get(life_cycle_id, (None, None, None))[1] is not None
+            }
+            report[cold_pool_group_id] = KVCacheV2PoolGroupIterationStats(
+                pool_group_id=cold_pool_group_id,
+                slot_size=self._stats_slot_sizes(cold_stats),
+                window_sizes=tuple(sorted(window_sizes)),
+                stats=self._build_iteration_stats(
+                    (),
+                    level_ids,
+                    primary_stats,
+                    secondary_stats_by_level,
+                    primary_peak_stats,
+                    secondary_peak_stats_by_level,
+                    None,
+                    KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
+                ),
+            )
+        return report
 
     def _build_attention_life_cycle_iteration_stats(
         self,
@@ -2913,6 +3031,7 @@ class KVCacheManagerV2(BaseResourceManager):
             window_size=window_size,
             kind=kind,
             stats=self._build_iteration_stats(
+                (),
                 (),
                 primary_stats,
                 secondary_stats_by_level,
@@ -3070,7 +3189,16 @@ class KVCacheManagerV2(BaseResourceManager):
         stats_by_life_cycle = dict(sorted(stats_by_life_cycle.items()))
 
         return KVCacheV2IterationStatsReport(
-            stats_by_window, stats_by_pool_group, stats_by_life_cycle
+            stats_by_window,
+            stats_by_pool_group,
+            stats_by_life_cycle,
+            self._build_cold_pool_group_iteration_stats(
+                life_cycle_metadata,
+                primary_stats,
+                secondary_stats_by_level,
+                primary_peak_stats,
+                secondary_peak_stats_by_level,
+            ),
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
@@ -3098,6 +3226,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
+        # Materialize the blocks backing the declared history instead of treating it as
+        # already committed. Only meaningful together with is_gen.
+        #
+        # Set when the caller writes the history itself and needs those blocks backed,
+        # instead of letting sliding-window pools keep only the last window_size.
+        materialize_history: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         kv_reserve_draft_tokens: Optional[int] = None,
@@ -3136,7 +3270,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
             # token_num - 1 is the past history length in generation.
-            history_hint = max(0, token_num - 1) if is_gen else None
+            history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
             encoder_input_tokens = (
                 [1] * encoder_output_len if encoder_output_len is not None else None
@@ -3174,7 +3308,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
-                if is_gen:
+                if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.

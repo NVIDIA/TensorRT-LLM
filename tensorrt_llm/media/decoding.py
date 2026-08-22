@@ -27,6 +27,7 @@ CPU-only host must never load the driver-linked extension.
 
 import functools
 import math
+from typing import NamedTuple
 
 import torch
 
@@ -152,21 +153,38 @@ def resize_fit_pad_uint8(frames: torch.Tensor, target_h: int, target_w: int) -> 
 _RESIZE_MODES = {"cover": resize_center_crop_uint8, "fit": resize_fit_pad_uint8}
 
 
-def probe_video_dimensions(data: bytes) -> tuple[int, int]:
-    """Return the reference's ``(height, width)`` without decoding a frame.
+class VideoStreamInfo(NamedTuple):
+    """What a container header reports about its video stream."""
 
-    The container header carries the source resolution, so a caller that must
-    choose its target size from the source aspect ratio - Cosmos3 action picks
-    the canvas whose shape is closest to the reference - can do so before
-    committing to a decode.
+    height: int
+    width: int
+    frame_rate: float | None  # None when the header reports nothing usable
+
+
+def video_stream_info(data: bytes) -> VideoStreamInfo | None:
+    """Read a clip's dimensions and frame rate from its container header.
+
+    Demuxing is CPU-side FFmpeg inside PyNvVideoCodec, so this costs no GPU and
+    decodes no frame — everything here comes straight off the header, in one
+    open, so a caller wanting both does not pay for two.
+
+    The dimensions are the *coded* ones. A container may additionally carry a
+    display matrix (a phone shooting portrait usually records landscape frames
+    plus a 90-degree rotation); the demuxer does not expose it and the decode
+    path does not apply it, so a clip carrying that metadata decodes
+    pixel-identically to the same clip without it. Coded dimensions therefore
+    describe the frames a caller actually receives, which is what a caller
+    sizing its output against them needs.
+
+    Returns ``None`` when the header cannot be read or reports no usable
+    dimensions, leaving the caller on its own defaults: this is a convenience
+    probe, and a genuinely unreadable stream still fails with a proper error at
+    decode.
     """
     try:
         import PyNvVideoCodec as nvc
-    except ImportError as exc:
-        raise ImportError(
-            "PyNvVideoCodec is required for video-reference decoding; "
-            "install the declared dependency (pip install PyNvVideoCodec)."
-        ) from exc
+    except ImportError:
+        return None
 
     position = 0
 
@@ -179,11 +197,13 @@ def probe_video_dimensions(data: bytes) -> tuple[int, int]:
 
     try:
         demuxer = nvc.CreateDemuxer(_read)
-        return int(demuxer.Height()), int(demuxer.Width())
-    except nvc.PyNvVCException as exc:
-        raise ValueError(
-            f"Video reference could not be demuxed (corrupt or not a supported container): {exc}"
-        ) from exc
+        height, width = int(demuxer.Height()), int(demuxer.Width())
+        frame_rate = float(demuxer.FrameRate())
+    except nvc.PyNvVCException:
+        return None
+    if height <= 0 or width <= 0:
+        return None
+    return VideoStreamInfo(height, width, frame_rate if frame_rate > 0 else None)
 
 
 def decode_video_reference_window(
