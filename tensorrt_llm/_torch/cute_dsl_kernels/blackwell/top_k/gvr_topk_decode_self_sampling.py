@@ -1548,80 +1548,15 @@ class GvrMainKernel:
                 Q = cutlass.Int32(0)
             if short == cutlass.Int32(0):
                 n = nv
-                # ---- aim ladder (route_dynamic mirror) ----
-                # r6 = int(0.5 + sqrt(6n)) computed EXACTLY in integers: f32
-                # sqrt seed, fixup to isqrt, then round-half-up via the
-                # (x - r*r > r) test (bit-parity with the host double form,
-                # fuzz-proven over the whole n domain).
-                x6 = cutlass.Int32(6) * n
-                ri = cutlass.Int32(cmath.sqrt(cutlass.Float32(x6)))
-                while ri * ri > x6:
-                    ri = ri - cutlass.Int32(1)
-                while (ri + cutlass.Int32(1)) * (ri + cutlass.Int32(1)) <= x6:
-                    ri = ri + cutlass.Int32(1)
-                r6 = ri
-                if x6 - ri * ri > ri:
-                    r6 = ri + cutlass.Int32(1)
-                aim = aim_base
-                if r6 > aim:
-                    aim = r6
-                if cutlass.const_expr(self.r_const > 1):
-                    if aim < amin:
-                        aim = amin
-                scap_c = cutlass.Int32(SCPB)  # SCAP == SCPB for gvr_main (proven identity)
-                if aim > (scap_c >> cutlass.Int32(1)):
-                    aim = scap_c >> cutlass.Int32(1)
-                if aim < k:
-                    aim = k
                 n4v = n >> cutlass.Int32(2)
+                # Ladder-scalar baselines only: the real SMP/SS2/TGT/TGT2 are
+                # derived by warp0 alone in the P2a block below (bit-identical
+                # formulas) and published through s_lad — every thread's local
+                # copies here are overwritten by the post-barrier smem read.
                 SMP = cutlass.Int32(0)
                 SS2 = cutlass.Int32(1)
                 TGT = cutlass.Int32(0)
                 TGT2 = cutlass.Int32(0)
-                # pair-sample gate: (n > SCAP or small_dense) and n4 >= 4;
-                # small_dense = k > 1024 and not big and n <= SCAP and n > 2k
-                # (k/big folded into the launch-constant sd_en flag).
-                gate = cutlass.Int32(0)
-                if n > scap_c:
-                    gate = cutlass.Int32(1)
-                if sd_en != cutlass.Int32(0):
-                    if n <= scap_c:
-                        if n > (k << cutlass.Int32(1)):
-                            gate = cutlass.Int32(1)
-                if n4v < cutlass.Int32(4):
-                    gate = cutlass.Int32(0)
-                if gate != cutlass.Int32(0):
-                    sel = sfac * n // aim
-                    if sel < cutlass.Int32(256):
-                        sel = cutlass.Int32(256)
-                    nh = n >> cutlass.Int32(1)
-                    if sel > nh:
-                        sel = nh
-                    pairs = sel >> cutlass.Int32(3)
-                    if pairs < cutlass.Int32(1):
-                        pairs = cutlass.Int32(1)
-                    half = n4v >> cutlass.Int32(1)
-                    if half < cutlass.Int32(1):
-                        half = cutlass.Int32(1)
-                    if pairs > half:
-                        pairs = half
-                    SS2 = half // pairs
-                    if SS2 < cutlass.Int32(1):
-                        SS2 = cutlass.Int32(1)
-                    SMP = half // SS2
-                    if SMP < cutlass.Int32(1):
-                        SMP = cutlass.Int32(1)
-                    # TGT/TGT2 are 64-bit products in the CUDA host (aim*SMP*8
-                    # overflows i32 at large n) — mirror with Int64.
-                    smp8 = cutlass.Int64(SMP) * cutlass.Int64(8)
-                    tgt64 = cutlass.Int64(aim) * smp8 // cutlass.Int64(n)
-                    TGT = cutlass.Int32(tgt64)
-                    if TGT < cutlass.Int32(1):
-                        TGT = cutlass.Int32(1)
-                    tgt264 = cutlass.Int64(k) * smp8 // cutlass.Int64(n)
-                    TGT2 = cutlass.Int32(tgt264)
-                    if TGT2 < cutlass.Int32(1):
-                        TGT2 = cutlass.Int32(1)
                 if cutlass.const_expr(self.split):
                     Q = (n4v + cutlass.Int32(self.r_const - 1)) // cutlass.Int32(self.r_const)
                 else:
@@ -1671,6 +1606,12 @@ class GvrMainKernel:
         s_kmm = smem.allocate_tensor(  # L463 [0]=kmin [1]=kmax
             cutlass.Uint32, cute.make_ordered_layout((2,), order=(0,)), byte_alignment=8
         )
+        if cutlass.const_expr(self.varlen):
+            # P2a ladder broadcast slots: [0]=SMP [1]=SS2 [2]=TGT [3]=TGT2
+            # (static like s_x4, so dyn_bytes keeps CUDA dispatch parity)
+            s_lad = smem.allocate_tensor(
+                cutlass.Int32, cute.make_ordered_layout((4,), order=(0,)), byte_alignment=16
+            )
         blob = smem.allocate_tensor(  # dynamic-equivalent L447-456
             cutlass.Int8, cute.make_ordered_layout((self.dyn_bytes,), order=(0,)), byte_alignment=16
         )
@@ -1761,6 +1702,137 @@ class GvrMainKernel:
             s_res[C.RES_B3] = cutlass.Int32(-1)
         if tidx < cutlass.Int32(self.hb):  # L484-487 (HB<=BLK always)
             s_hist[tidx] = cutlass.Int32(0)
+
+        # ===== varlen P2a: warp0-only ladder mirror + register-free L2 hints =
+        # The sampling-ladder scalars are a pure function of the row, and the
+        # per-thread mirror chain cost more instructions than the rest of the
+        # kernel on 1-row launches (l1p1 ncu: inst x1.58-1.73, all of it the
+        # DSL's runtime Int32/Int64 divides + isqrt fixups, redundantly issued
+        # by every thread).  warp0 alone walks the chain and publishes the four
+        # derived scalars through s_lad; the other warps spend the wait issuing
+        # L2 prefetch hints for this CTA's own P3 slice (register-free, so zero
+        # pressure on the 64-reg arms — the PRIME-LATE register loads below are
+        # untouched and simply hit L2).  Values are bit-identical to the
+        # per-thread derivation this replaces.
+        if cutlass.const_expr(self.varlen):
+            if tidx < cutlass.Int32(32):
+                if short == cutlass.Int32(0):
+                    # ---- aim ladder (P2b cheap mirror) ----
+                    # The ladder scalars steer the sampling rung only —
+                    # exactness is schedule-invariant (retry/degen close every
+                    # miss), so schedule-quantity drift of +-1 vs the host
+                    # double form is sanctioned (same argument as the clus
+                    # port's always-sample deviation).  Serial latency is what
+                    # matters here (this chain sits in front of a barrier):
+                    # runtime divides become MUFU.RCP multiplies and the isqrt
+                    # fixup loops collapse to single steps (the f32 sqrt of an
+                    # exactly-representable int (6n <= 2^23) is within 1 of
+                    # isqrt, so one correction per side suffices).  Q (chunk
+                    # ownership) stays exact — compile-time divisor, all-thread.
+                    x6 = cutlass.Int32(6) * n
+                    ri = cutlass.Int32(cmath.sqrt(cutlass.Float32(x6)))
+                    if ri * ri > x6:
+                        ri = ri - cutlass.Int32(1)
+                    if (ri + cutlass.Int32(1)) * (ri + cutlass.Int32(1)) <= x6:
+                        ri = ri + cutlass.Int32(1)
+                    r6 = ri
+                    if x6 - ri * ri > ri:
+                        r6 = ri + cutlass.Int32(1)
+                    aim = aim_base
+                    if r6 > aim:
+                        aim = r6
+                    if cutlass.const_expr(self.r_const > 1):
+                        if aim < amin:
+                            aim = amin
+                    scap_c = cutlass.Int32(SCPB)  # SCAP == SCPB for gvr_main (proven identity)
+                    if aim > (scap_c >> cutlass.Int32(1)):
+                        aim = scap_c >> cutlass.Int32(1)
+                    if aim < k:
+                        aim = k
+                    n4w = n >> cutlass.Int32(2)
+                    # pair-sample gate: (n > SCAP or small_dense) and n4 >= 4;
+                    # small_dense = k > 1024 and not big and n <= SCAP and n > 2k
+                    # (k/big folded into the launch-constant sd_en flag).
+                    gate = cutlass.Int32(0)
+                    if n > scap_c:
+                        gate = cutlass.Int32(1)
+                    if sd_en != cutlass.Int32(0):
+                        if n <= scap_c:
+                            if n > (k << cutlass.Int32(1)):
+                                gate = cutlass.Int32(1)
+                    if n4w < cutlass.Int32(4):
+                        gate = cutlass.Int32(0)
+                    if gate != cutlass.Int32(0):
+                        # sel = sfac*n // aim via rcp (sfac*n <= 2^24: f32-exact
+                        # to the last unit; quotient error < 1 => +-1 drift)
+                        sel = cutlass.Int32(
+                            cutlass.Float32(sfac * n) * cute.arch.rcp_approx(cutlass.Float32(aim))
+                        )
+                        if sel < cutlass.Int32(256):
+                            sel = cutlass.Int32(256)
+                        nh = n >> cutlass.Int32(1)
+                        if sel > nh:
+                            sel = nh
+                        pairs = sel >> cutlass.Int32(3)
+                        if pairs < cutlass.Int32(1):
+                            pairs = cutlass.Int32(1)
+                        half = n4w >> cutlass.Int32(1)
+                        if half < cutlass.Int32(1):
+                            half = cutlass.Int32(1)
+                        if pairs > half:
+                            pairs = half
+                        SS2 = cutlass.Int32(
+                            cutlass.Float32(half) * cute.arch.rcp_approx(cutlass.Float32(pairs))
+                        )
+                        if SS2 < cutlass.Int32(1):
+                            SS2 = cutlass.Int32(1)
+                        SMP = cutlass.Int32(
+                            cutlass.Float32(half) * cute.arch.rcp_approx(cutlass.Float32(SS2))
+                        )
+                        # sample-window guard: the P1 gather indexes up to
+                        # ~SMP*SS2*2 f32x4 lines; keep SMP*SS2 <= half so the
+                        # window never walks past the row (approx error is
+                        # bounded by +1, one decrement closes it)
+                        if SMP * SS2 > half:
+                            SMP = SMP - cutlass.Int32(1)
+                        if SMP < cutlass.Int32(1):
+                            SMP = cutlass.Int32(1)
+                        # TGT/TGT2: i64 products // n -> f32 mul + one rcp(n).
+                        # aim/SMP/k/n are all f32-exact here (<= 2^20); the
+                        # quotients are <= 8*aim ~ 2^16, so the approx error
+                        # stays far below 1 unit — +-1 at worst on the floor.
+                        rn_ = cute.arch.rcp_approx(cutlass.Float32(n))
+                        smp8f = cutlass.Float32(SMP) * cutlass.Float32(8.0)
+                        TGT = cutlass.Int32(cutlass.Float32(aim) * smp8f * rn_)
+                        if TGT < cutlass.Int32(1):
+                            TGT = cutlass.Int32(1)
+                        TGT2 = cutlass.Int32(cutlass.Float32(k) * smp8f * rn_)
+                        if TGT2 < cutlass.Int32(1):
+                            TGT2 = cutlass.Int32(1)
+                if tidx == cutlass.Int32(0):
+                    s_lad[0] = SMP
+                    s_lad[1] = SS2
+                    s_lad[2] = TGT
+                    s_lad[3] = TGT2
+            # Register-free L2 hints for the first U-batch of this CTA's own
+            # P3 slice (clamped in-row, prefetch site #3 spelling): the data
+            # P3 touches first starts flowing while warp0 walks the chain.
+            # Short rows clamp every hint to the row's last line — harmless.
+            plim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
+            for uu in cutlass.range_constexpr(U):
+                # NOTE: names must not collide with the PRIME-LATE block's
+                # i_/ic — the DSL kills inner-scope names at region exit and
+                # a later same-name assignment inside a dynamic `if` trips
+                # "is None prior to this if".
+                pic = c0 + tidx + cutlass.Int32(uu * BLK)
+                if pic >= c1:
+                    pic = plim4
+                C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
+            cute.arch.barrier()  # publish s_lad (also covers the smem inits)
+            SMP = s_lad[0]
+            SS2 = s_lad[1]
+            TGT = s_lad[2]
+            TGT2 = s_lad[3]
 
         # ============ P1: sample prefetch (hint gather LAZY, L489-529) =======
         atom128 = C.g2r_atom_f32(128, invariant=True)
@@ -4587,13 +4659,22 @@ class GvrClusKernel:
                 short = cutlass.Int32(1)
             if short == cutlass.Int32(0):
                 n = nv
-                # ---- aim ladder (route_dynamic mirror; isqrt discipline and
-                # Int64 target products exactly as the GvrMainKernel prologue).
+                # ---- aim ladder (P2b cheap mirror, all-thread) ----
+                # Schedule quantities only (exactness is schedule-invariant,
+                # same argument as the always-sample deviation above): divides
+                # become MUFU.RCP multiplies and the isqrt fixup loops collapse
+                # to single steps (f32 sqrt of an exactly-representable int
+                # (6n <= 2^23) is within 1 of isqrt).  All-thread on purpose:
+                # this family's mirror redundancy is small (inst x1.26-1.28)
+                # and a warp0+barrier hoist EXPOSES the chain's serial latency
+                # at ~1 CTA/SM — measured 1.14->1.31 tax regression on
+                # pro_1024k r32 — while the redundant form hides it across
+                # warps.  Q (chunk ownership) keeps its exact shift form.
                 x6 = cutlass.Int32(6) * nv
                 ri = cutlass.Int32(cmath.sqrt(cutlass.Float32(x6)))
-                while ri * ri > x6:
+                if ri * ri > x6:
                     ri = ri - cutlass.Int32(1)
-                while (ri + cutlass.Int32(1)) * (ri + cutlass.Int32(1)) <= x6:
+                if (ri + cutlass.Int32(1)) * (ri + cutlass.Int32(1)) <= x6:
                     ri = ri + cutlass.Int32(1)
                 r6 = ri
                 if x6 - ri * ri > ri:
@@ -4621,7 +4702,11 @@ class GvrClusKernel:
                 # always-on per the deviation note above; k <= 1024 for this
                 # family so sfac has no k > 1024 arm).
                 n4v = nv >> cutlass.Int32(2)
-                sel = cutlass.Int32(32 if self.cs == 2 else 16) * nv // aim
+                sel = cutlass.Int32(
+                    cutlass.Float32(nv)
+                    * cutlass.Float32(32.0 if self.cs == 2 else 16.0)
+                    * cute.arch.rcp_approx(cutlass.Float32(aim))
+                )
                 if sel < cutlass.Int32(256):
                     sel = cutlass.Int32(256)
                 nh = nv >> cutlass.Int32(1)
@@ -4635,19 +4720,26 @@ class GvrClusKernel:
                     quarter = cutlass.Int32(1)
                 if quads > quarter:
                     quads = quarter
-                SS2 = quarter // quads
+                SS2 = cutlass.Int32(
+                    cutlass.Float32(quarter) * cute.arch.rcp_approx(cutlass.Float32(quads))
+                )
                 if SS2 < cutlass.Int32(1):
                     SS2 = cutlass.Int32(1)
-                SMP = quarter // SS2
+                SMP = cutlass.Int32(
+                    cutlass.Float32(quarter) * cute.arch.rcp_approx(cutlass.Float32(SS2))
+                )
+                # sample-window guard: P1 indexes up to ~SMP*SS2*4 lines; keep
+                # SMP*SS2 <= quarter (approx error <= +1, one step closes it)
+                if SMP * SS2 > quarter:
+                    SMP = SMP - cutlass.Int32(1)
                 if SMP < cutlass.Int32(1):
                     SMP = cutlass.Int32(1)
-                smp16 = cutlass.Int64(SMP) * cutlass.Int64(16)
-                tgt64 = cutlass.Int64(aim) * smp16 // cutlass.Int64(nv)
-                TGT = cutlass.Int32(tgt64)
+                rn_ = cute.arch.rcp_approx(cutlass.Float32(nv))
+                smp16f = cutlass.Float32(SMP) * cutlass.Float32(16.0)
+                TGT = cutlass.Int32(cutlass.Float32(aim) * smp16f * rn_)
                 if TGT < cutlass.Int32(1):
                     TGT = cutlass.Int32(1)
-                tgt264 = cutlass.Int64(k) * smp16 // cutlass.Int64(nv)
-                TGT2 = cutlass.Int32(tgt264)
+                TGT2 = cutlass.Int32(cutlass.Float32(k) * smp16f * rn_)
                 if TGT2 < cutlass.Int32(1):
                     TGT2 = cutlass.Int32(1)
                 Q = (n4v + cutlass.Int32(CS - 1)) >> cutlass.Int32(self.lcs)
