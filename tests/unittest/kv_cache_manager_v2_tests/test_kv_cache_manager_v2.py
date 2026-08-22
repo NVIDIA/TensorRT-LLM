@@ -3326,6 +3326,35 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertEqual(slots[attn_pg], 2)
         manager.shutdown()
 
+    def test_ssm_only_constraint_does_not_reserve_resume_headroom(self):
+        """Pure SSM pools use every slot while attention pools retain headroom."""
+        num_requests = 2
+        max_util_for_resume = 0.5
+        granularity = 2 << 20
+        ssm_slots = num_requests
+        attn_slots = num_requests * 2
+        gpu_quota = (
+            round_up(ssm_slots * self.SSM_STATE_SLOT_SIZE, granularity)
+            + round_up(ssm_slots * self.SSM_CONV_SLOT_SIZE, granularity)
+            + round_up(attn_slots * self.ATTN_SLOT_SIZE, granularity)
+        )
+        config = self._make_hybrid_config(gpu_quota)
+        config.constraints = [
+            BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
+        ]
+        config.max_util_for_resume = max_util_for_resume
+
+        manager = KVCacheManager(config)
+        ssm_lc = _introspection.ssm_life_cycle_id(manager)
+        assert ssm_lc is not None
+        ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
+        attn_pg = 1 - ssm_pg
+        stats = _introspection.storage_statistics(manager)
+
+        self.assertEqual(stats[ssm_pg].total, ssm_slots)
+        self.assertGreaterEqual(stats[attn_pg].total, attn_slots)
+        manager.shutdown()
+
     def test_constraints_floor_typical_step(self):
         """Constraints clamp the typical_step ratio from below."""
         typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)

@@ -164,11 +164,9 @@ def make_kv_cache_manager(
     resize_context_fn=None,
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
-    can_evict=False,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
-    mgr.can_evict = can_evict
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
@@ -503,8 +501,7 @@ class TestKVCacheFailuresGen:
         assert out.recompute_paused_requests == []
         mgr.suspend_request.assert_called_once_with(victim)
 
-    @pytest.mark.parametrize("can_evict", [False, True])
-    def test_gen_alloc_fails_preserved_eviction_falls_back_to_release(self, can_evict):
+    def test_gen_alloc_fails_preserved_eviction_falls_back_to_release(self):
         """Release preserved caches without inspecting physical tier topology."""
         call_count = [0]
 
@@ -512,10 +509,7 @@ class TestKVCacheFailuresGen:
             call_count[0] += 1
             return call_count[0] <= 1  # only first succeeds
 
-        mgr = make_kv_cache_manager(
-            try_allocate_generation_fn=alloc_fn,
-            can_evict=can_evict,
-        )
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), make_gen_request(1), victim]
@@ -530,9 +524,8 @@ class TestKVCacheFailuresGen:
         mgr.suspend_request.assert_has_calls([call(victim), call(reqs[1])])
         mgr.free_resources.assert_called_once_with(victim)
 
-    @pytest.mark.parametrize("can_evict", [False, True])
-    def test_recompute_pause_retries_immediately_without_tier_knowledge(self, can_evict):
-        """Full teardown is retried in the same pass for every tier layout."""
+    def test_recompute_pause_retries_immediately_without_tier_knowledge(self):
+        """Full teardown is retried without exposing physical tier layout."""
         call_count = [0]
 
         def alloc_fn(req):
@@ -541,10 +534,10 @@ class TestKVCacheFailuresGen:
             # after its ordinary victim is upgraded to full recompute teardown.
             return call_count[0] in (1, 4)
 
-        mgr = make_kv_cache_manager(
-            try_allocate_generation_fn=alloc_fn,
-            can_evict=can_evict,
-        )
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        # Touching the removed tier-topology state raises instead of silently
+        # creating another child Mock.
+        del mgr.can_evict
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), make_gen_request(1), victim]
@@ -563,7 +556,7 @@ class TestKVCacheFailuresGen:
             call_count[0] += 1
             return call_count[0] == 1
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(
             mgr,
             max_num_tokens=100,
@@ -645,10 +638,7 @@ class TestKVCacheFailuresGen:
                 return 3 in freed_request_ids
             raise AssertionError(f"Evicted request {request_id} was revisited")
 
-        mgr = make_kv_cache_manager(
-            try_allocate_generation_fn=alloc_fn,
-            can_evict=True,
-        )
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
         sched = make_scheduler(mgr, max_num_tokens=100)
 
@@ -2491,7 +2481,7 @@ class TestMixedOrdering:
         def selective_gen_alloc(req):
             return req.request_id != 0
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=selective_gen_alloc, can_evict=True)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=selective_gen_alloc)
         sched = make_scheduler(mgr, max_num_tokens=1000)
         reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(2)]
         out = sched.schedule_request(reqs, set())

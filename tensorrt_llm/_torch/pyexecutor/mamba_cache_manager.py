@@ -3079,7 +3079,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE)
             num_ssm_slots = ((num_ssm_pages + self._ssm_page_index_scale - 1) //
                              self._ssm_page_index_scale)
-            required_live_slots = self._minimum_resumable_state_slots()
+            required_live_slots = self._minimum_physical_ssm_slots()
             if num_ssm_slots < required_live_slots:
                 KVCacheManagerV2.shutdown(self)
                 raise ValueError(
@@ -3210,14 +3210,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return _get_v2_guaranteed_resident_sequences(self.max_batch_size,
                                                      self.mapping)
 
-    def _minimum_resumable_state_slots(self) -> int:
-        """Return physical SSM slots needed for one resumable request."""
-        logical_slots = (self._minimum_gpu_resident_sequences() +
-                         self._num_reserved_dummy_slots)
-        if logical_slots == 0:
-            return 0
-        return math.ceil(logical_slots /
-                         self.kv_cache_config.max_util_for_resume)
+    def _minimum_physical_ssm_slots(self) -> int:
+        """Return the physical SSM slot floor for runnable and dummy requests."""
+        return (self._minimum_gpu_resident_sequences() +
+                self._num_reserved_dummy_slots)
 
     def _mamba_state_bytes_per_slot(self) -> int:
         return self.local_num_mamba_layers * (self.ssm_bytes + self.conv_bytes)
@@ -3414,7 +3410,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # Reserve only state slots that cannot be offloaded: one runnable
         # request in a single-stage executor, or the full PP working set needed
         # for rank-consistent scheduling, plus persistent padding dummies.
-        # StorageManager adds max_util_for_resume headroom to this constraint.
+        # StorageManager keeps this exact floor for the pure SSM pool; only
+        # pool groups containing attention reserve max_util_for_resume headroom.
         ssm_floor_slots = (self._minimum_gpu_resident_sequences() +
                            self._num_reserved_dummy_slots)
         constraints = [

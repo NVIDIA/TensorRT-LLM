@@ -245,9 +245,9 @@ class StorageManager:
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
         # Constraints stay feasibility floors even under an explicit initial pool
-        # ratio (a share below what a declared batch needs is clamped up), and the
-        # floors are scaled by 1/max_util_for_resume because _KVCache.resume rejects
-        # any pool group above that utilization. Mirrors PR #16269.
+        # ratio (a share below what a declared batch needs is clamped up). Pools
+        # containing attention also reserve the headroom enforced by _KVCache.resume.
+        # Pure SSM pools have a fixed-size live working set and use their full capacity.
         self._min_slots = self._compute_min_slots_from_constraints(
             constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
@@ -312,6 +312,13 @@ class StorageManager:
 
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
+
+    def pool_group_needs_resume_headroom(self, pool_group: PoolGroupIndex) -> bool:
+        """Return whether a pool group contains an attention life cycle."""
+        return any(
+            self.get_pool_group_index(life_cycle) == pool_group
+            for life_cycle, _ in self.life_cycles.attention_life_cycles()
+        )
 
     def new_gpu_slots(
         self,
@@ -929,7 +936,8 @@ class StorageManager:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
         All returned elements are positive. Constraint-derived floors include
-        headroom for the utilization gate checked by ``_KVCache.resume``.
+        headroom only for pool groups whose utilization is limited by
+        ``_KVCache.resume``.
         """
         if not 0 < max_util_for_resume <= 1:
             raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
@@ -958,7 +966,10 @@ class StorageManager:
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for pg_idx in typed_range(self.num_pool_groups):
-                scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
+                utilization_limit = (
+                    max_util_for_resume if self.pool_group_needs_resume_headroom(pg_idx) else 1.0
+                )
+                scaled_slots = math.ceil(slots[pg_idx] / utilization_limit)
                 max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
         return max_slots
 

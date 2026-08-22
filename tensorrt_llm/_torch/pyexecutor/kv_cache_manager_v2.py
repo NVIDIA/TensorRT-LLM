@@ -1104,7 +1104,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
                 raise
-        self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()

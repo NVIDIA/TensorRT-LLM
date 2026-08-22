@@ -202,6 +202,7 @@ public:
     }
 
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
+    bool poolGroupNeedsResumeHeadroom(PoolGroupIndex pgIdx) const;
     PoolIndex numPools(PoolGroupIndex pgIdx) const;
 
     // Return the byte size of each pool in a pool group.

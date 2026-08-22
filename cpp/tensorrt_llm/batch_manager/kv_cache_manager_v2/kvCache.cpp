@@ -352,21 +352,13 @@ bool KvCache::resume(std::optional<CUstream> stream)
     // SSM state has a fixed one-slot working set and needs no decode-growth
     // headroom. Attention keeps the configured limit, including any pool
     // group it shares with SSM.
-    TypedVec<PoolGroupIndex, float> maxUtilForResume(storageMgr.numPoolGroups(), 1.0F);
-    for (LifeCycleId lc{0}; lc < numLc; ++lc)
-    {
-        bool const isSsm = ssmLcId.has_value() && lc == *ssmLcId;
-        if (!isSsm)
-        {
-            maxUtilForResume[storageMgr.getPoolGroupIndex(lc)] = mManager->config().maxUtilForResume;
-        }
-    }
-
     for (PoolGroupIndex pgIdx{0}; pgIdx < storageMgr.numPoolGroups(); ++pgIdx)
     {
         auto const stats = storageMgr.getStatistics(kGpuLevel, pgIdx);
         auto const projectedUnavailable = stats.unavailable() + additionalRequiredSlots[pgIdx];
-        auto const limit = static_cast<double>(stats.total) * maxUtilForResume[pgIdx];
+        double const maxUtilForResume
+            = storageMgr.poolGroupNeedsResumeHeadroom(pgIdx) ? mManager->config().maxUtilForResume : 1.0;
+        auto const limit = static_cast<double>(stats.total) * maxUtilForResume;
         if (additionalRequiredSlots[pgIdx] > 0 && static_cast<double>(projectedUnavailable) > limit)
         {
             return false;

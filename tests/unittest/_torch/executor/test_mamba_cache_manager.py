@@ -1536,8 +1536,7 @@ def test_hybrid_mtp_layout_honors_explicit_base_partition():
                 kv_cache_config=KvCacheConfig(enable_block_reuse=False),
                 spec_config=spec_config,
             )
-            expected_intercept = 2400
-            assert cache_cost == (64 * (rank + 1), expected_intercept)
+            assert cache_cost == (64 * (rank + 1), 2400)
 
 
 def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
@@ -1691,6 +1690,7 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     kv_cache_config = KvCacheConfig(
         enable_partial_reuse=True,
         avg_seq_len=96,
+        max_util_for_resume=0.5,
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=48,
             additional_snapshot_offsets_from_start=[32],
@@ -1755,6 +1755,7 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     # states can reside in host memory. Zero capacity avoids charging attention
     # pages for this one-runnable-request + dummy constraint.
     required_ssm_slots = mgr._minimum_gpu_resident_sequences() + mgr._num_reserved_dummy_slots
+    assert mgr._minimum_physical_ssm_slots() == required_ssm_slots
     assert any(
         all(kv.capacity == 0 for kv in batch.kv_caches)
         and len(batch.kv_caches) >= required_ssm_slots

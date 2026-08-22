@@ -1270,16 +1270,12 @@ class _KVCache:
         # SSM state has a fixed one-slot working set and needs no decode-growth
         # headroom. Attention keeps the configured limit, including any pool
         # group it shares with SSM.
-        max_util_for_resume = filled_list(1.0, storage.num_pool_groups)
-        for lc_idx, lc in life_cycles.items():
-            if not isinstance(lc, SsmLifeCycle):
-                max_util_for_resume[storage.get_pool_group_index(lc_idx)] = (
-                    self.manager._init_config.max_util_for_resume
-                )
+        configured_max_util = self.manager._init_config.max_util_for_resume
         if any(
             additional_required_slots[pg_idx] > 0
             and stat.unavailable + additional_required_slots[pg_idx]
-            > stat.total * max_util_for_resume[pg_idx]
+            > stat.total
+            * (configured_max_util if storage.pool_group_needs_resume_headroom(pg_idx) else 1.0)
             for pg_idx, stat in typed_enumerate(gpu_stats)
         ):
             return False

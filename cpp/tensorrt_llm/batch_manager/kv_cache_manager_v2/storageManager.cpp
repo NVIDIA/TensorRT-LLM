@@ -161,9 +161,9 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     size_t gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
     // Constraints stay feasibility floors even under an explicit initial pool
-    // ratio (a share below what a declared batch needs is clamped up), and the
-    // floors are scaled by 1/maxUtilForResume because KvCache::resume rejects any
-    // pool group above that utilization. Mirrors PR#16269 on the Python side.
+    // ratio (a share below what a declared batch needs is clamped up). Pools
+    // containing attention also reserve the headroom enforced by KvCache::resume.
+    // Pure SSM pools have a fixed-size live working set and use their full capacity.
     mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
     // Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
@@ -829,6 +829,18 @@ PoolGroupIndex StorageManager::getPoolGroupIndex(LifeCycleId lc) const
     return mLifeCycleGrouping.at(lc);
 }
 
+bool StorageManager::poolGroupNeedsResumeHeadroom(PoolGroupIndex pgIdx) const
+{
+    for (auto const& [lcIdx, lc] : mLifeCycles)
+    {
+        if (std::holds_alternative<AttnLifeCycle>(lc) && getPoolGroupIndex(lcIdx) == pgIdx)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 PoolIndex StorageManager::mNumPools(PoolGroupIndex pgIdx) const
 {
     TLLM_CHECK_DEBUG(!mLevels.empty());
@@ -1144,8 +1156,8 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstrain
     std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
 {
     TLLM_CHECK_DEBUG(maxUtilForResume > 0.0f && maxUtilForResume <= 1.0f);
-    // All returned elements are positive. Constraint-derived floors include headroom
-    // for the utilization gate checked by KvCache::resume.
+    // All returned elements are positive. Constraint-derived floors include
+    // headroom only for pool groups whose utilization is limited by KvCache::resume.
     TypedVec<PoolGroupIndex, SlotCount> maxSlots(numPoolGroups(), 0);
 
     auto swaFloorBlocks = [tokensPerBlock](AttnLifeCycle const& lc) -> int
@@ -1186,8 +1198,9 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstrain
         auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
         for (PoolGroupIndex pgIdx{0}; pgIdx < slots.size(); ++pgIdx)
         {
-            auto const scaledSlots = static_cast<SlotCount>(
-                std::ceil(static_cast<double>(slots[pgIdx]) / static_cast<double>(maxUtilForResume)));
+            double const utilizationLimit = poolGroupNeedsResumeHeadroom(pgIdx) ? maxUtilForResume : 1.0;
+            auto const scaledSlots
+                = static_cast<SlotCount>(std::ceil(static_cast<double>(slots[pgIdx]) / utilizationLimit));
             maxSlots[pgIdx] = std::max(maxSlots[pgIdx], scaledSlots);
         }
     }
