@@ -22,6 +22,7 @@ l0_b300:
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/visual_gen/kernels/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
   - unittest/_torch/executor # 250s
   # ------------- modules (non-MoE) ---------------
