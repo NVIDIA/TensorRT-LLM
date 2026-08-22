@@ -1010,6 +1010,44 @@ def test_v2_beam_fallback_depends_on_backend(monkeypatch, backend, expected_mana
     )
 
 
+@pytest.mark.parametrize("algorithm", ["deepseek_v4", "minimax_m3"])
+def test_v2_sparse_attention_rejects_beam_search(algorithm):
+    # Sparse backends subclass TrtllmAttentionMetadata, so ModelEngine never
+    # hands them cache_indirection; beams would read beam 0's unmapped prompt
+    # rows. Fail at startup instead of asserting inside metadata preparation.
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm=algorithm),
+        is_encoder_decoder=False,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 2
+
+    with pytest.raises(NotImplementedError, match="max_beam_width > 1"):
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+
+
+def test_v2_sparse_attention_allowed_without_beam_search():
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm="deepseek_v4"),
+        is_encoder_decoder=False,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 1
+
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+        is KVCacheManagerV2
+    )
+
+
 def _make_mgr(
     max_batch_size=4, max_draft_len=2, enable_attention_dp=False, use_replay_state_update=False
 ):

@@ -656,14 +656,21 @@ class KvCacheCreator:
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
+            sparse_attn_config = model_config.sparse_attention_config
             python_v2_backend = (os.environ.get(
                 "TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python")
             # Encoder-decoder cross KV remains request-scoped (beam width 1),
             # and V2 does not yet replicate its beam-0 row into decoder beams.
             encoder_decoder = getattr(model_config, "is_encoder_decoder", False)
+            # Sparse attention: ModelEngine only forwards cache_indirection when
+            # the metadata type is exactly TrtllmAttentionMetadata, and every
+            # sparse backend uses a subclass, so beams would read beam 0's
+            # unmapped prompt rows. The sparse managers' own block tables
+            # (indexer K-cache, pool block indices) are beam-0 only as well.
             if (self._max_beam_width is not None and self._max_beam_width > 1
                     and (python_v2_backend or encoder_decoder
-                         or is_hybrid_linear(config))):
+                         or is_hybrid_linear(config)
+                         or sparse_attn_config is not None)):
                 incompat.append("max_beam_width > 1")
             if incompat:
                 incompat_str = ", ".join(incompat)
@@ -689,7 +696,9 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback.")
+                        "provide a compatible fallback. Disable the "
+                        "incompatible features (e.g. use max_beam_width=1 and "
+                        "no KV connector) to run hybrid Mamba models.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.

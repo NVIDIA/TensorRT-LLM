@@ -1516,6 +1516,11 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
     int const promptLength = mExpectedPromptLength.value_or(0);
     BlockOrdinal const firstGenerationBlock{promptLength / mTokensPerBlock};
 
+    // Slot accounting and the copy loops below must agree exactly, or the
+    // trailing "all slots consumed" check trips and the surplus slots leak.
+    // Both sides therefore key off blockPageGetPage(), which is stricter than
+    // blockPageIsNull(): a slot holding an invalidated lock or an empty holder
+    // is not a copy source.
     TypedVec<LifeCycleId, SlotCount> slotCounts(numLc, 0);
     for (BlockOrdinal ordinal = firstGenerationBlock; ordinal < mBlocks.size(); ++ordinal)
     {
@@ -1527,13 +1532,16 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
         auto const& sourceBeamBlock = block.pages[kDefaultBeamIndex];
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
-            if (!blockPageIsNull(sourceBeamBlock[lc]))
+            if (blockPageGetPage(sourceBeamBlock[lc]))
                 slotCounts[lc] += numNewBeams;
         }
     }
 
     auto const ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
-    if (ssmLcId.has_value() && !blockPageIsNull(mSsmBlocks[kDefaultBeamIndex][*ssmLcId]))
+    SharedPtr<Page> sourceSsmPage;
+    if (ssmLcId.has_value())
+        sourceSsmPage = blockPageGetPage(mSsmBlocks[kDefaultBeamIndex][*ssmLcId]);
+    if (sourceSsmPage)
         slotCounts[*ssmLcId] += numNewBeams;
 
     MigrationRecorder const migrationRecorder
@@ -1586,11 +1594,12 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
             LifeCycleBlockPages newBeamBlock(numLc);
             for (LifeCycleId lc{0}; lc < numLc; ++lc)
             {
-                auto const& source = block.pages[kDefaultBeamIndex][lc];
-                if (blockPageIsNull(source))
+                // By value: push_back() below may reallocate block.pages.
+                auto const sourcePage = blockPageGetPage(block.pages[kDefaultBeamIndex][lc]);
+                if (!sourcePage)
                     continue;
                 auto& slot = newSlots[lc].back();
-                newBeamBlock[lc] = copyPage(blockPageGetPage(source), slot, ordinal, lc, beamIdx);
+                newBeamBlock[lc] = copyPage(sourcePage, slot, ordinal, lc, beamIdx);
                 newSlots[lc].pop_back();
                 if (_shouldRecordStats())
                 {
@@ -1604,9 +1613,6 @@ void KvCache::_appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth)
         }
     }
 
-    SharedPtr<Page> sourceSsmPage;
-    if (ssmLcId.has_value())
-        sourceSsmPage = blockPageGetPage(mSsmBlocks[kDefaultBeamIndex][*ssmLcId]);
     for (BeamIndex beamIdx = oldBeamWidth; beamIdx < newBeamWidth; ++beamIdx)
     {
         LifeCycleBlockPages newSsmBlock(numLc);
@@ -1897,7 +1903,7 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         mCommitState = CommitState::VIRTUAL_STOP;
     }
 
-    if (sb.treeBlock && sb.pages.size() > BeamIndex{1})
+    if (didCommit && sb.pages.size() > BeamIndex{1})
     {
         // A committed reusable block is canonicalized to beam 0. Other beams
         // are divergent generation alternatives and must be released.
