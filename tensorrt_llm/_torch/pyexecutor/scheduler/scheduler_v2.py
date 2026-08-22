@@ -612,7 +612,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
-            self._suspend_prepared_context(req)
+            self._evict_request(req)
             return cross_action, 0, False
 
         return ScheduleAction.SCHEDULED, req_tokens, False
@@ -714,7 +714,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
-            self._suspend_prepared_context(req)
+            self._evict_request(req)
             return cross_action, 0, False
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
@@ -1009,7 +1009,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end, False
 
-        success = self.kv_cache_manager.try_allocate_generation(req)
+        success = self._try_allocate_generation(req)
 
         # A completing request is guaranteed to release its resources after
         # this scheduling pass. Avoid moving or discarding another request's
@@ -1075,6 +1075,25 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Eviction ----
 
+    def _try_allocate_generation(self, req: LlmRequest) -> bool:
+        """Resume cross KV transactionally before growing the self cache."""
+        cross_kv_cache_manager = self.cross_kv_cache_manager
+        cross_cache_resumed = False
+        if cross_kv_cache_manager is not None and not cross_kv_cache_manager.is_request_active(
+            req.py_request_id
+        ):
+            if not cross_kv_cache_manager.resume_request(req):
+                return False
+            cross_cache_resumed = True
+
+        success = False
+        try:
+            success = self.kv_cache_manager.try_allocate_generation(req)
+            return success
+        finally:
+            if not success and cross_cache_resumed and cross_kv_cache_manager is not None:
+                cross_kv_cache_manager.suspend_request(req)
+
     @staticmethod
     def _is_started_request(req: LlmRequest) -> bool:
         """A request that has begun execution and can be paused.
@@ -1090,8 +1109,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         The scheduler does not select a physical cache tier. Suspending the
         request releases its page locks; the cache manager decides whether
         allocation pressure leaves those pages on GPU or migrates them to a
-        lower tier. Cross KV uses an independent pool and remains active so a
-        resumed generation request can keep reading its encoder state.
+        lower tier. Self, draft, and cross caches move through the same logical
+        request lifecycle; generation admission resumes cross KV before the
+        request can enter a forward batch.
 
         TODO: Also release PEFT resources (mark_request_done) for the
         suspended request so the C++ PeftCacheManager can evict its
@@ -1103,10 +1123,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.suspend_request(req)
-
-    def _suspend_prepared_context(self, req: LlmRequest) -> None:
-        """Roll back every cache prepared for a failed context admission."""
-        self._evict_request(req)
         if self.cross_kv_cache_manager is not None:
             self.cross_kv_cache_manager.suspend_request(req)
 
@@ -1192,7 +1208,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             evicted.append(victim)
             req_it_end = victim_idx
 
-            if self.kv_cache_manager.try_allocate_generation(req):
+            if self._try_allocate_generation(req):
                 return req_it_end, True
 
         return req_it_end, False
@@ -1261,7 +1277,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # Releasing a preserved request can also free room in a lower tier,
             # so give another active request the ordinary eviction path before
             # selecting another recompute victim.
-            success = self.kv_cache_manager.try_allocate_generation(req)
+            success = self._try_allocate_generation(req)
             if not success:
                 req_it_end, success = self._try_evict_for_gen(
                     req,

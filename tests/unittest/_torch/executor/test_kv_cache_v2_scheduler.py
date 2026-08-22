@@ -164,6 +164,7 @@ def make_kv_cache_manager(
     resize_context_fn=None,
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
+    resume_request_fn=None,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
@@ -176,7 +177,14 @@ def make_kv_cache_manager(
     def suspend_request(req):
         mgr.kv_cache_map[req.py_request_id].is_active = False
 
+    def resume_request(req):
+        if resume_request_fn is not None and not resume_request_fn(req):
+            return False
+        mgr.kv_cache_map[req.py_request_id].is_active = True
+        return True
+
     mgr.suspend_request.side_effect = suspend_request
+    mgr.resume_request.side_effect = resume_request
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
     return mgr
 
@@ -1093,8 +1101,8 @@ class TestEviction:
         assert out.paused_requests == [victim]
         assert out.recompute_paused_requests == []
 
-    def test_preserved_eviction_does_not_suspend_cross_cache(self):
-        """Cross KV uses an independent pool and remains valid for generation."""
+    def test_preserved_eviction_suspends_cross_cache(self):
+        """Every request-owned cache becomes reclaimable after eviction."""
         call_count = [0]
 
         def alloc_fn(req):
@@ -1112,7 +1120,57 @@ class TestEviction:
         reqs = [make_gen_request(0), victim]
         sched.schedule_request(reqs, set())
         mgr.suspend_request.assert_called_once_with(victim)
+        cross_mgr.suspend_request.assert_called_once_with(victim)
+
+    def test_generation_admission_resumes_suspended_cross_cache(self):
+        mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            cross_kv_cache_manager=cross_mgr,
+        )
+        req = make_gen_request(0)
+        cross_mgr.kv_cache_map[req.py_request_id].is_active = False
+
+        out = sched.schedule_request([req], set())
+
+        assert out.generation_requests == [req]
+        cross_mgr.resume_request.assert_called_once_with(req)
         cross_mgr.suspend_request.assert_not_called()
+        assert cross_mgr.is_request_active(req.py_request_id)
+
+    def test_failed_self_admission_rolls_back_cross_resume(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda _req: False)
+        cross_mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            cross_kv_cache_manager=cross_mgr,
+        )
+        req = make_gen_request(0)
+        cross_mgr.kv_cache_map[req.py_request_id].is_active = False
+
+        assert not sched._try_allocate_generation(req)
+        cross_mgr.resume_request.assert_called_once_with(req)
+        cross_mgr.suspend_request.assert_called_once_with(req)
+        assert not cross_mgr.is_request_active(req.py_request_id)
+
+    def test_failed_cross_resume_does_not_grow_self_cache(self):
+        mgr = make_kv_cache_manager()
+        cross_mgr = make_kv_cache_manager(resume_request_fn=lambda _req: False)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            cross_kv_cache_manager=cross_mgr,
+        )
+        req = make_gen_request(0)
+        cross_mgr.kv_cache_map[req.py_request_id].is_active = False
+
+        assert not sched._try_allocate_generation(req)
+        cross_mgr.resume_request.assert_called_once_with(req)
+        cross_mgr.suspend_request.assert_not_called()
+        mgr.try_allocate_generation.assert_not_called()
 
     def test_eviction_clears_request_runtime_state(self):
         mgr = make_kv_cache_manager(
