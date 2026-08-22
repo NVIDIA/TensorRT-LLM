@@ -122,14 +122,23 @@ def hash_files(paths: list[Path]) -> dict[Path, str]:
 
 
 def normalize_path(filepath: str, repo_root: Path) -> str:
-    """Normalize an absolute path to repo-relative."""
+    """Normalize a path into the POSIX form used as a baseline JSON key.
+
+    An absolute path under ``repo_root`` becomes repo-relative; an absolute
+    path outside it stays absolute; a relative path is left as-is. Every case
+    is returned with forward slashes.
+
+    The baseline JSON stores forward-slash keys. Returning the platform
+    separator instead would make every lookup miss on Windows, so each
+    violation already recorded in the baseline would be reported as new.
+    """
     p = Path(filepath)
     if p.is_absolute():
         try:
-            return str(p.relative_to(repo_root))
+            return p.relative_to(repo_root).as_posix()
         except ValueError:
-            return str(p)
-    return str(p)
+            return p.as_posix()
+    return p.as_posix()
 
 
 def count_violations(violations: list[dict], repo_root: Path) -> dict[str, dict[str, int]]:
