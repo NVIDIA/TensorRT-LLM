@@ -165,6 +165,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dflash
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8

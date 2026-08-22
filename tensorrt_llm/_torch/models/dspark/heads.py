@@ -217,14 +217,22 @@ class DSparkConfidenceHead(nn.Module):
     Markov head's previous-token embedding. Output is a single logit per position.
     """
 
-    def __init__(self, *, hidden_size: int, markov_rank: int = 0, with_markov: bool = False):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        markov_rank: int = 0,
+        with_markov: bool = False,
+        bias: bool = False,
+    ):
         super().__init__()
         self.with_markov = bool(with_markov)
         input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
-        # The checkpoint stores ``proj`` as a bias-free bf16 weight, but the
+        # The V4-Pro checkpoint stores ``proj`` as a bias-free bf16 weight; the
+        # DeepSpec Qwen3 drafter checkpoints carry a bias. Either way the
         # confidence score is computed in fp32 (mirrors the DeepSpec reference
         # ``Linear(input_dim, 1, dtype=torch.float32)`` with the fp32 matmul).
-        self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
+        self.proj = nn.Linear(input_dim, 1, bias=bias, dtype=torch.float32)
 
     def forward(
         self, hidden_states: torch.Tensor, prev_embeddings: Optional[torch.Tensor] = None

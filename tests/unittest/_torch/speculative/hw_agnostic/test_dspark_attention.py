@@ -158,7 +158,9 @@ def test_dspark_block_uses_stage_id_as_attention_layer_idx(monkeypatch):
         fake_decoder_layer_init,
     )
     model_config = types.SimpleNamespace(
-        pretrained_config=types.SimpleNamespace(vocab_size=128, hc_mult=2),
+        pretrained_config=types.SimpleNamespace(
+            vocab_size=128, hc_mult=2, dspark_noise_token_id=127
+        ),
         spec_config=None,
     )
 

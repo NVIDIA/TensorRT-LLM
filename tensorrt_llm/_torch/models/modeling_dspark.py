@@ -15,9 +15,21 @@
 #
 # DSpark backbone ported from the DeepSeek-V4-Pro-DSpark reference
 # (`inference/model.py`: DSparkBlock / Transformer.forward_spec).
-"""DeepSeek-V4-Pro DSpark speculative-decoding draft backbone.
+"""DSpark speculative-decoding draft backbones.
 
-The DSpark draft is ``n_mtp_layers`` (3 for V4-Pro) **full DeepSeek-V4 blocks**
+This module is the home of both DSpark drafters:
+
+  - the DeepSeek-V4-Pro drafter (``DSparkDraftModel``), whose weights live in
+    the target checkpoint's ``mtp.*`` namespace;
+  - the DeepSpec-released dense Qwen3 drafter (``Qwen3DSparkDraftModel``),
+    a separate flat-namespace checkpoint.
+
+Both implement the same worker-facing protocol (``DSparkForCausalLMBase``) and
+share the head / propose / input helpers in the ``dspark/`` package, so
+``DSparkWorker`` / ``DSparkSpecMetadata`` / CUDA-graph plumbing drive them
+unchanged.
+
+The DeepSeek-V4 DSpark draft is ``n_mtp_layers`` (3 for V4-Pro) **full DeepSeek-V4 blocks**
 stored under the ``mtp.*`` checkpoint namespace — it reuses the V4 decoder block
 (MLA attention + MoE + manifold Hyper-Connections) and adds:
 
@@ -60,7 +72,7 @@ from .dspark.attention import (
     dspark_attention_forward_batched,
     precompute_dspark_freqs_cis,
 )
-from .dspark.draft import build_draft_input_ids, dspark_propose
+from .dspark.draft import build_draft_input_ids, dspark_propose, resolve_noise_token_id
 from .dspark.heads import DSparkConfidenceHead, build_markov_head
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
@@ -275,13 +287,8 @@ class DSparkBlock(DeepseekV4DecoderLayer):
         spec_cfg = getattr(model_config, "spec_config", None)
         self.stage_id = int(stage_id)
         self.num_stages = int(num_stages)
-        # mask_token_id is a user override on the speculative_config; None means
-        # fall back to the draft checkpoint's dspark_noise_token_id.
-        mask_token_id = getattr(spec_cfg, "mask_token_id", None)
-        self.noise_token_id = int(
-            mask_token_id
-            if mask_token_id is not None
-            else getattr(config, "dspark_noise_token_id", config.vocab_size)
+        self.noise_token_id = resolve_noise_token_id(
+            getattr(spec_cfg, "mask_token_id", None), config, "dspark_noise_token_id"
         )
         self.markov_rank = int(getattr(config, "dspark_markov_rank", 0))
         self.hc_mult = config.hc_mult
@@ -351,6 +358,7 @@ class DSparkDraftModel(nn.Module):
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         num_stages: Optional[int] = None,
         block_size: Optional[int] = None,
+        mask_token_id: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -375,14 +383,7 @@ class DSparkDraftModel(nn.Module):
         self.block_size = int(
             block_size if block_size is not None else getattr(config, "dspark_block_size", 5)
         )
-        # mask_token_id is a user override on the speculative_config; None means
-        # fall back to the draft checkpoint's dspark_noise_token_id.
-        mask_token_id = getattr(spec_cfg, "mask_token_id", None)
-        self.noise_token_id = int(
-            mask_token_id
-            if mask_token_id is not None
-            else getattr(config, "dspark_noise_token_id", config.vocab_size)
-        )
+        self.noise_token_id = resolve_noise_token_id(mask_token_id, config, "dspark_noise_token_id")
         self.hc_mult = config.hc_mult
         target_layer_ids = getattr(config, "dspark_target_layer_ids", [])
         self.num_capture_layers = len(target_layer_ids)
@@ -1151,39 +1152,588 @@ class DSparkDraftModel(nn.Module):
         )
 
 
-class DSparkForCausalLM(nn.Module):
-    """One-engine draft wrapper for DSpark (mirrors ``DFlashForCausalLM``).
+# --------------------------------------------------------------------------- #
+# Qwen3 DSpark drafter
+# --------------------------------------------------------------------------- #
 
-    Wraps :class:`DSparkDraftModel` (the ``n_mtp_layers``-stage ``mtp.*`` backbone)
-    for the single-engine external-drafter flow: created by ``get_draft_model``,
-    appended to the target's epilogue, and driven by ``DSparkWorker``.
+_DEFAULT_CTX_WINDOW = 2048
 
-    ``embed_tokens`` / ``lm_head`` are shared with the target model
-    (:meth:`load_weights_from_target_model`). The draft weights live in the SAME
-    checkpoint under ``mtp.*``; :meth:`load_weights` remaps them
-    (``remap_dspark_draft_keys``), loads via ``DeepseekV4WeightLoader``, runs the
-    fp8 ``post_load_weights`` transforms, and caches the bf16 captured-context
-    attention weights from the in-memory state dict.
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """HF-style rotary embedding on ``[..., num_heads, head_dim]``.
+
+    ``cos``/``sin`` are ``[..., head_dim]`` (one row per position) and are
+    broadcast over the heads axis.
+    """
+    cos = cos.unsqueeze(-2)
+    sin = sin.unsqueeze(-2)
+    return x * cos + _rotate_half(x) * sin
+
+
+class _Qwen3RMSNorm(nn.Module):
+    """Qwen3RMSNorm: fp32 normalize, cast back, then scale by the bf16 weight."""
+
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(dim))
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dt = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.weight * xf.to(dt)
+
+
+class _Qwen3Attention(nn.Module):
+    """Weight container for one draft layer's GQA attention (names match ckpt)."""
+
+    def __init__(self, hidden: int, n_heads: int, n_kv_heads: int, head_dim: int, eps: float):
+        super().__init__()
+        self.q_proj = nn.Linear(hidden, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden, n_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * head_dim, hidden, bias=False)
+        self.q_norm = _Qwen3RMSNorm(head_dim, eps)
+        self.k_norm = _Qwen3RMSNorm(head_dim, eps)
+
+
+class _Qwen3MLP(nn.Module):
+    def __init__(self, hidden: int, intermediate: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.down_proj = nn.Linear(intermediate, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _Qwen3DecoderLayer(nn.Module):
+    def __init__(
+        self,
+        hidden: int,
+        intermediate: int,
+        n_heads: int,
+        n_kv_heads: int,
+        head_dim: int,
+        eps: float,
+    ):
+        super().__init__()
+        self.self_attn = _Qwen3Attention(hidden, n_heads, n_kv_heads, head_dim, eps)
+        self.mlp = _Qwen3MLP(hidden, intermediate)
+        self.input_layernorm = _Qwen3RMSNorm(hidden, eps)
+        self.post_attention_layernorm = _Qwen3RMSNorm(hidden, eps)
+
+
+class Qwen3DSparkDraftModel(nn.Module):
+    """Qwen3-based DSpark draft backbone + heads (DeepSpec ``Qwen3DSparkModel``).
+
+    Unlike the DeepSeek-V4 drafter above — whose draft weights live in the
+    target checkpoint's ``mtp.*`` namespace and whose stages are full V4 blocks
+    (MLA + MoE + mHC) — the DeepSpec-released Qwen3 drafters (e.g.
+    ``deepseek-ai/dspark_qwen3_8b_block7``) are separate dense bf16 checkpoints
+    with a flat namespace:
+
+      - ``fc`` + ``hidden_norm``: project the concatenated captured
+        target-layer hidden states (``hidden_size * num_capture_layers``) into
+        the draft hidden size — the layer-invariant *context stream*
+        (``main_x``).
+      - ``layers.{0..n-1}``: standard Qwen3 GQA decoder layers (q/k per-head
+        RMSNorm, RoPE, gated-SiLU MLP), except attention keys/values come from
+        BOTH the projected context (one row per committed token) and the draft
+        block itself, and the ``block_size`` draft queries attend
+        bidirectionally within the block.
+      - ``norm`` + (target-shared) ``lm_head`` -> :func:`dspark_propose`
+        (Markov head refinement; the confidence head is inert scaffolding, as
+        in the V4 path).
+
+    The worker-facing protocol matches :class:`DSparkDraftModel`, so
+    ``DSparkWorker`` and ``DSparkSpecMetadata`` drive both drafters unchanged.
+    The worker-owned rolling buffer here holds per-layer context K/V
+    (``[max_batch, num_layers, window, 2 * num_kv_heads * head_dim]``, K then
+    V, K stored RoPE'd/k-normed). Frame convention: the worker passes window
+    frames ``f = absolute_position + 1``; this model stores the context row of
+    the token at absolute position ``p`` at ring index ``p % window`` with
+    RoPE phase ``p``, matching the DeepSpec reference (its draft
+    ``DynamicCache`` holds the context K/V of positions ``0..start-1`` in
+    order; the ring is an O(1)-memory window over the most recent ``window``
+    positions — acceptance-rate only, standard target verification keeps
+    outputs correct regardless).
+
+    ``embed_tokens`` / ``lm_head`` are shared with the target model (the
+    checkpoint carries frozen copies of both; they are identical to the
+    target's, so the shared modules are used and the copies skipped at load).
+
+    Reference: https://github.com/deepseek-ai/DeepSpec
+    (``deepspec/modeling/dspark/qwen3/modeling.py`` and
+    ``deepspec/eval/dspark/draft_ops.py``).
     """
 
-    def __init__(self, draft_config, aux_stream_dict=None, num_stages=None, block_size=None):
+    def __init__(
+        self,
+        model_config,
+        block_size: Optional[int] = None,
+        mask_token_id: Optional[int] = None,
+        ctx_window_size: Optional[int] = None,
+        serving_max_seq_len: Optional[int] = None,
+    ):
         super().__init__()
-        self.dspark_model = DSparkDraftModel(
-            draft_config,
-            aux_stream_dict,
-            num_stages=num_stages,
-            block_size=block_size,
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.config = config
+
+        self.hidden_size = int(config.hidden_size)
+        self.num_heads = int(config.num_attention_heads)
+        self.num_kv_heads = int(config.num_key_value_heads)
+        self.head_dim = int(getattr(config, "head_dim", None) or self.hidden_size // self.num_heads)
+        self.kv_dim = self.num_kv_heads * self.head_dim
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.softmax_scale = self.head_dim**-0.5
+        eps = float(config.rms_norm_eps)
+        num_layers = int(config.num_hidden_layers)
+        # Worker-facing stage count (== draft layer count for this drafter).
+        self.num_stages = num_layers
+
+        self.block_size = int(
+            block_size if block_size is not None else getattr(config, "block_size", 7)
         )
-        # Generic handles expected by the loader / weight mappers.
-        self.model = self.dspark_model
+        self.noise_token_id = resolve_noise_token_id(mask_token_id, config, "mask_token_id")
+
+        target_layer_ids = list(getattr(config, "target_layer_ids", []) or [])
+        self.num_capture_layers = len(target_layer_ids)
+        assert self.num_capture_layers > 0, (
+            "Qwen3 DSpark drafter config must provide target_layer_ids"
+        )
+
+        # Plain-RoPE parameters. transformers>=5 nests rope_theta under
+        # rope_parameters; older versions keep the flat attribute (and expose
+        # ``rope_scaling`` as a back-compat alias of ``rope_parameters``, so
+        # its mere presence means nothing — ``rope_type`` is the discriminator).
+        rope_params = (
+            getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+        )
+        # Only plain RoPE is implemented here (no YaRN / linear / dynamic
+        # scaling), so reject a scaled drafter config rather than silently
+        # ignoring the scaling and drafting on the wrong rotary phases.
+        rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
+        if rope_type != "default":
+            raise ValueError(
+                f"Qwen3 DSpark drafter does not support rope_type={rope_type!r}; "
+                "only plain RoPE (rope_type='default') is implemented."
+            )
+        self._rope_theta = float(
+            rope_params.get("rope_theta", None) or getattr(config, "rope_theta", 1000000.0)
+        )
+        max_pos = int(getattr(config, "max_position_embeddings", 40960))
+        self._freqs_cap = max_pos + self.block_size + 2
+        self._build_rope_tables()
+
+        # RoPE phases are precomputed up to max_pos and clamped beyond that
+        # (see _gather_cos_sin) for graph-safety; this is silent by design
+        # (correctness is unaffected, target verification always corrects the
+        # draft), but once the serving max_seq_len runs past the drafter's
+        # trained range every draft query/context position collapses onto the
+        # same rotary phase, which shows up only as an unexplained
+        # acceptance-rate/perf cliff. Warn once at construction time so the
+        # cliff is attributable. The drafter's own ModelConfig never carries the
+        # serving length (external_drafter_config_kwargs does not propagate it),
+        # so the target's value is passed in by ``get_draft_model``.
+        if serving_max_seq_len is not None and serving_max_seq_len > max_pos:
+            logger.warning(
+                f"Qwen3 DSpark drafter max_position_embeddings ({max_pos}) is "
+                f"smaller than the serving max_seq_len ({serving_max_seq_len}); "
+                "draft RoPE phases beyond that clamp to the last trained "
+                "position, which degrades draft acceptance rate (not "
+                "correctness) for requests running past that length."
+            )
+
+        # Ring-window length for the worker-owned context K/V buffer.
+        requested_window = int(
+            ctx_window_size if ctx_window_size is not None else _DEFAULT_CTX_WINDOW
+        )
+        window = max(self.block_size + 2, min(requested_window, max_pos))
+        if window != requested_window:
+            logger.warning(
+                f"DSpark ctx_window_size={requested_window} was clamped to "
+                f"{window} (must be in [{self.block_size + 2}, {max_pos}])."
+            )
+        # Worker allocation contract (DSparkWorker._lazy_init):
+        # kv_windows = [max_batch, num_stages, window_size, head_dim], where
+        # "head_dim" is the per-position row width — here K||V flattened.
+        self._attn_params = dict(
+            window_size=window,
+            head_dim=2 * self.kv_dim,
+        )
+
+        self.markov_rank = int(getattr(config, "markov_rank", 0))
+        self.fc = nn.Linear(
+            self.num_capture_layers * self.hidden_size, self.hidden_size, bias=False
+        )
+        self.hidden_norm = _Qwen3RMSNorm(self.hidden_size, eps)
+        self.layers = nn.ModuleList(
+            [
+                _Qwen3DecoderLayer(
+                    self.hidden_size,
+                    int(config.intermediate_size),
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    eps,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.norm = _Qwen3RMSNorm(self.hidden_size, eps)
+        self.markov_head = build_markov_head(
+            markov_head_type=str(getattr(config, "markov_head_type", "vanilla")),
+            vocab_size=int(config.vocab_size),
+            markov_rank=self.markov_rank,
+            hidden_size=self.hidden_size,
+        )
+        self.confidence_head = None
+        if bool(getattr(config, "enable_confidence_head", False)):
+            # Inert scaffolding — the worker always passes
+            # ``confidence_threshold=0.0`` — kept for checkpoint completeness.
+            self.confidence_head = DSparkConfidenceHead(
+                hidden_size=self.hidden_size,
+                markov_rank=self.markov_rank,
+                # Only concat the Markov prev-token embedding when a Markov head
+                # actually exists (build_markov_head returns None for
+                # markov_rank <= 0); otherwise dspark_propose passes no
+                # prev_embeddings and DSparkConfidenceHead.forward would assert.
+                with_markov=(
+                    bool(getattr(config, "confidence_head_with_markov", False))
+                    and self.markov_rank > 0
+                ),
+                bias=True,
+            )
+
+        # Shared with target; wired by the spec wrapper after construction.
+        self.embed_tokens: Optional[nn.Module] = None
+        self.lm_head: Optional[nn.Module] = None
+
+    # ------------------------------------------------------------------ RoPE
+
+    def _build_rope_tables(self) -> None:
+        """Precompute the cos/sin tables as non-persistent buffers.
+
+        Built eagerly at construction rather than lazily on first use.
+        """
+        inv_freq = 1.0 / (
+            self._rope_theta
+            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
+        t = torch.arange(self._freqs_cap, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("_rope_cos", emb.cos(), persistent=False)
+        self.register_buffer("_rope_sin", emb.sin(), persistent=False)
+
+    def _gather_cos_sin(self, positions: torch.Tensor, dtype: torch.dtype):
+        # Clamp for graph-safety: masked-out entries may carry arbitrary
+        # (already clamped by the worker) positions.
+        p = positions.long().clamp(min=0, max=self._freqs_cap - 1)
+        return self._rope_cos[p].to(dtype), self._rope_sin[p].to(dtype)
+
+    # ---------------------------------------------------------- context K/V
+
+    def _project_ctx(self, main_hidden: torch.Tensor) -> torch.Tensor:
+        """``hidden_norm(fc(captured))`` — the layer-invariant context stream."""
+        return self.hidden_norm(self.fc(main_hidden))
+
+    def _ctx_kv(
+        self, layer: _Qwen3DecoderLayer, main_x: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-layer context K/V rows ``[..., 2*kv_dim]`` (K RoPE'd/normed || V)."""
+        a = layer.self_attn
+        shp = main_x.shape[:-1]
+        k = a.k_proj(main_x).view(*shp, self.num_kv_heads, self.head_dim)
+        k = a.k_norm(k)
+        cos, sin = self._gather_cos_sin(positions, k.dtype)
+        k = _apply_rope(k, cos, sin)
+        v = a.v_proj(main_x)
+        return torch.cat([k.reshape(*shp, self.kv_dim), v], dim=-1)
+
+    @torch.inference_mode()
+    def write_context_windows(
+        self, main_hidden: torch.Tensor, positions: torch.Tensor, stage_windows: torch.Tensor
+    ) -> None:
+        """Seed one request's ring windows from captured context (prefill path).
+
+        Args:
+            main_hidden: ``[M, num_capture * hidden]`` captured target hiddens.
+            positions: ``[M]`` window frames (= absolute position + 1, the
+                worker's generation-path convention).
+            stage_windows: ``[num_layers, window, 2*kv_dim]``, updated in place.
+        """
+        M = int(main_hidden.shape[0])
+        if M == 0:
+            return
+        win = int(self._attn_params["window_size"])
+        p = positions.to(main_hidden.device).long() - 1
+        cols = p % win
+        main_x = self._project_ctx(main_hidden)
+        for li, layer in enumerate(self.layers):
+            kv = self._ctx_kv(layer, main_x, p)
+            stage_windows[li, cols] = kv.to(stage_windows.dtype)
+
+    def write_context_windows_batched(
+        self,
+        main_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor,
+        mask: torch.Tensor,
+        kv_windows: torch.Tensor,
+    ) -> None:
+        """CUDA-graph-safe masked back-fill of interim accepted tokens.
+
+        Args:
+            main_hidden: ``[G, M, num_capture * hidden]``.
+            positions: ``[G, M]`` window frames (masked entries arbitrary).
+            slots: ``[G]`` request rows into ``kv_windows``.
+            mask: ``[G, M]`` bool validity.
+            kv_windows: ``[N, num_layers, window, 2*kv_dim]``, in place.
+        """
+        G, M = positions.shape
+        if G == 0 or M == 0:
+            return
+        win = int(self._attn_params["window_size"])
+        p = positions.long() - 1
+        cols = p % win
+        rows = slots.long()[:, None].expand(-1, M)
+        mask3 = mask.unsqueeze(-1)
+        main_x = self._project_ctx(main_hidden)
+        for li, layer in enumerate(self.layers):
+            kv = self._ctx_kv(layer, main_x, p)  # [G, M, 2*kv_dim]
+            win_l = kv_windows[:, li]  # [N, win, 2*kv_dim] view
+            cur = win_l[rows, cols]
+            win_l[rows, cols] = torch.where(mask3, kv.to(win_l.dtype), cur)
+
+    # ------------------------------------------------------------- backbone
+
+    def forward_batched(
+        self,
+        main_hidden: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        start_pos: torch.Tensor,
+        *,
+        kv_windows: torch.Tensor,
+        slots: torch.Tensor,
+        temperature: float = 0.0,
+        confidence_threshold: float = 0.0,
+        return_logits: bool = False,
+        all_rank_num_tokens: Optional[List[int]] = None,
+    ) -> tuple:
+        """CUDA-graph-safe batched block draft (all gen requests at once).
+
+        Mirrors DeepSpec ``forward_dspark_draft_block`` + ``build_dspark_proposal``.
+
+        Args:
+            main_hidden: ``[G, num_capture * hidden]`` captured hidden of the
+                newest committed context token per request.
+            bonus_token_ids: ``[G]`` last accepted token per request.
+            start_pos: ``[G]`` absolute decode position of the bonus token.
+            kv_windows: ``[N, num_layers, window, 2*kv_dim]`` persistent buffer.
+            slots: ``[G]`` request rows into ``kv_windows``.
+        Returns:
+            ``(draft_tokens [G, block], num_proposed [G])`` and, with
+            ``return_logits``, the corrected block logits ``[G, block, vocab]``.
+        """
+        del all_rank_num_tokens  # dense drafter: no cross-rank MoE lockstep
+        G = int(main_hidden.shape[0])
+        B = self.block_size
+        win = int(self._attn_params["window_size"])
+        device = main_hidden.device
+        start_pos = start_pos.long()
+
+        main_x = self._project_ctx(main_hidden)  # [G, hidden]
+        p0 = start_pos - 1
+        cols0 = p0 % win
+
+        draft_ids = build_draft_input_ids(
+            bonus_token_ids, block_size=B, noise_token_id=self.noise_token_id
+        )
+        h = self.embed_tokens(draft_ids)  # [G, B, hidden]
+
+        pos_q = start_pos.unsqueeze(1) + torch.arange(B, device=device)  # [G, B]
+        cos_q, sin_q = self._gather_cos_sin(pos_q, h.dtype)
+
+        # Bool attention mask [G, 1, B, win + B]: the block attends to itself
+        # bidirectionally, and to the ring rows that actually hold a context
+        # row. The worker zeroes a slot's window when it assigns it and only seeds the positions
+        # the target actually processed, so under KV-cache prefix reuse (or any
+        # partially seeded slot) the rows below the request's first seeded
+        # position hold nothing, and attending to them would mix all-zero K/V
+        # into the softmax. Validity is read off the buffer instead. All
+        # layers are written together, so layer 0 answers for the whole stack.
+        blk_valid = torch.ones(G, 1, B, B, dtype=torch.bool, device=device)
+        attn_mask = None
+
+        for li, layer in enumerate(self.layers):
+            a = layer.self_attn
+            win_l = kv_windows[:, li]  # [N, win, 2*kv_dim] view
+            # Write the newest committed token's context row, then read the ring.
+            kv0 = self._ctx_kv(layer, main_x, p0)  # [G, 2*kv_dim]
+            win_l[slots, cols0] = kv0.to(win_l.dtype)
+            ctx = win_l[slots]  # [G, win, 2*kv_dim]
+            if attn_mask is None:  # layer 0, after its own context write
+                ctx_valid = (ctx != 0).any(dim=-1)  # [G, win]
+                attn_mask = torch.cat(
+                    [ctx_valid[:, None, None, :].expand(G, 1, B, win), blk_valid], dim=-1
+                )
+            k_ctx = ctx[..., : self.kv_dim].view(G, win, self.num_kv_heads, self.head_dim)
+            v_ctx = ctx[..., self.kv_dim :].view(G, win, self.num_kv_heads, self.head_dim)
+
+            residual = h
+            x = layer.input_layernorm(h)
+            q = a.q_norm(a.q_proj(x).view(G, B, self.num_heads, self.head_dim))
+            q = _apply_rope(q, cos_q, sin_q)
+            k_blk = a.k_norm(a.k_proj(x).view(G, B, self.num_kv_heads, self.head_dim))
+            k_blk = _apply_rope(k_blk, cos_q, sin_q)
+            v_blk = a.v_proj(x).view(G, B, self.num_kv_heads, self.head_dim)
+
+            k = torch.cat([k_ctx.to(h.dtype), k_blk], dim=1).transpose(1, 2)
+            v = torch.cat([v_ctx.to(h.dtype), v_blk], dim=1).transpose(1, 2)
+            k = k.repeat_interleave(self.num_kv_groups, dim=1)
+            v = v.repeat_interleave(self.num_kv_groups, dim=1)
+            o = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k, v, attn_mask=attn_mask, scale=self.softmax_scale
+            )
+            o = o.transpose(1, 2).reshape(G, B, self.num_heads * self.head_dim)
+            h = residual + a.o_proj(o)
+
+            residual = h
+            h = residual + layer.mlp(layer.post_attention_layernorm(h))
+
+        h = self.norm(h)
+        base_logits = self.lm_head(h)
+        return dspark_propose(
+            base_logits,
+            bonus_token_ids=bonus_token_ids,
+            block_hidden=h,
+            markov_head=self.markov_head,
+            confidence_head=self.confidence_head,
+            block_size=B,
+            temperature=temperature,
+            confidence_threshold=confidence_threshold,
+            return_logits=return_logits,
+        )
+
+    def forward(
+        self,
+        main_hidden: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        start_pos,
+        *,
+        kv_windows: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> tuple:
+        """Eager/single-shot convenience wrapper over :meth:`forward_batched`.
+
+        With no ``kv_windows`` the request drafts against an empty ring (only
+        the newest committed token's row is written, and the all-zero rows are
+        masked out); callers that want the prompt's context must seed a buffer
+        with `write_context_windows` and pass it, as ``DSparkWorker`` does.
+        """
+        T = int(main_hidden.shape[0])
+        device = main_hidden.device
+        if not torch.is_tensor(start_pos):
+            start_pos = torch.full((T,), int(start_pos), dtype=torch.long, device=device)
+        # Same precondition as DSparkDraftModel.forward
+        # Checked here (host sync) because this is the eager single-shot path.
+        assert bool((start_pos > 0).all()), "DSpark draft runs at generation (start_pos > 0)"
+        if kv_windows is None:
+            kv_windows = torch.zeros(
+                (
+                    T,
+                    self.num_stages,
+                    self._attn_params["window_size"],
+                    self._attn_params["head_dim"],
+                ),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        slots = torch.arange(T, device=device)
+        return self.forward_batched(
+            main_hidden, bonus_token_ids, start_pos, kv_windows=kv_windows, slots=slots, **kwargs
+        )
+
+    def run_moe_lockstep_noop(self, all_rank_num_tokens, device) -> None:
+        """Dense drafter: no cross-rank MoE barrier to keep in lockstep."""
+        return None
+
+    # --------------------------------------------------------------- loading
+
+    def load_weights(self, weights: Dict) -> None:
+        device = self.fc.weight.device
+        if device.type == "meta":
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        sd = {}
+        for k, v in weights.items():
+            # embed_tokens / lm_head are frozen copies of the target's; the
+            # shared target modules are used instead (load_weights_from_target_model).
+            if k.startswith(("embed_tokens.", "lm_head.")):
+                continue
+            t = v.to(device)
+            t = t.float() if k.startswith("confidence_head.") else t.to(torch.bfloat16)
+            sd[k] = t
+        self.load_state_dict(sd, strict=True, assign=True)
+        # assign=True rebinds the parameters only; move the RoPE buffers along.
+        self.to(device)
+        logger.info(
+            f"[DSpark-Qwen3] loaded {len(sd)} draft params "
+            f"({self.num_stages} layers, block_size={self.block_size}, "
+            f"ctx_window={self._attn_params['window_size']})"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# One-engine draft wrappers
+# --------------------------------------------------------------------------- #
+
+
+class DSparkForCausalLMBase(nn.Module):
+    """Shared one-engine draft wrapper for the DSpark drafters.
+
+    Every DSpark drafter is created by ``get_draft_model``, appended to the
+    target's epilogue, and driven by ``DSparkWorker`` through the same
+    protocol: ``forward`` / ``forward_batched`` / ``write_context_windows`` /
+    ``write_context_windows_batched`` / ``run_moe_lockstep_noop`` plus the
+    ``num_stages`` / ``_attn_params`` / ``block_size`` worker-allocation
+    scalars. This base class pins that surface in one place; a drafter
+    subclass constructs its backbone (``dspark_model``) and implements
+    ``load_weights``.
+
+    ``embed_tokens`` / ``lm_head`` are shared with the target model
+    (:meth:`load_weights_from_target_model`).
+    """
+
+    def __init__(self, dspark_model: nn.Module, draft_config):
+        super().__init__()
+        self.dspark_model = dspark_model
         self.model_config = draft_config
         self.config = draft_config.pretrained_config
         # Worker-facing interface (the worker receives this wrapper as
         # ``draft_model`` and calls forward()/reads these properties and scalars).
-        self.num_stages = self.dspark_model.num_stages
-        self._attn_params = self.dspark_model._attn_params
+        self.num_stages = dspark_model.num_stages
+        self._attn_params = dspark_model._attn_params
         self.lm_head = None  # shared from the target (load_weights_from_target_model)
         self.logits_processor = None  # set by the caller after construction
+
+    @property
+    def model(self):
+        """Generic handle expected by the loader / weight mappers.
+
+        A property, not a second attribute binding: registering the same
+        nn.Module twice would emit every draft tensor twice in ``state_dict``.
+        """
+        return self.dspark_model
 
     @property
     def block_size(self):
@@ -1214,6 +1764,48 @@ class DSparkForCausalLM(nn.Module):
             main_hidden, positions, slots, mask, kv_windows
         )
 
+    def load_weights_from_target_model(self, target_model):
+        """Share the target's embed_tokens / lm_head with the drafter."""
+        if self.dspark_model.embed_tokens is None:
+            self.dspark_model.embed_tokens = target_model.model.embed_tokens
+        if self.lm_head is None:
+            self.lm_head = target_model.lm_head
+            self.dspark_model.lm_head = target_model.lm_head
+
+
+class DSparkForCausalLM(DSparkForCausalLMBase):
+    """One-engine draft wrapper for DSpark (mirrors ``DFlashForCausalLM``).
+
+    Wraps :class:`DSparkDraftModel` (the ``n_mtp_layers``-stage ``mtp.*`` backbone)
+    for the single-engine external-drafter flow — see
+    :class:`DSparkForCausalLMBase` for the worker-facing surface.
+
+    The draft weights live in the SAME checkpoint under ``mtp.*``;
+    :meth:`load_weights` remaps them (``remap_dspark_draft_keys``), loads via
+    ``DeepseekV4WeightLoader``, runs the fp8 ``post_load_weights`` transforms, and
+    caches the bf16 captured-context attention weights from the in-memory state
+    dict.
+    """
+
+    def __init__(
+        self,
+        draft_config,
+        aux_stream_dict=None,
+        num_stages=None,
+        block_size=None,
+        mask_token_id=None,
+    ):
+        super().__init__(
+            DSparkDraftModel(
+                draft_config,
+                aux_stream_dict,
+                num_stages=num_stages,
+                block_size=block_size,
+                mask_token_id=mask_token_id,
+            ),
+            draft_config,
+        )
+
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Load the ``mtp.*`` draft weights from the (full) checkpoint dict.
 
@@ -1232,19 +1824,51 @@ class DSparkForCausalLM(nn.Module):
         self.dspark_model.cache_attn_weights_from_state_dict(weights)
         logger.info("[DSpark] draft weight load complete")
 
-    def load_weights_from_target_model(self, target_model):
-        """Share the target's embed_tokens / lm_head (DSpark has neither)."""
-        if self.dspark_model.embed_tokens is None:
-            self.dspark_model.embed_tokens = target_model.model.embed_tokens
-        if self.lm_head is None:
-            self.lm_head = target_model.lm_head
-            self.dspark_model.lm_head = target_model.lm_head
+
+class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
+    """One-engine draft wrapper for the Qwen3 DSpark drafter.
+
+    Wraps :class:`Qwen3DSparkDraftModel` — see :class:`DSparkForCausalLMBase`
+    for the worker-facing surface. ``embed_tokens`` / ``lm_head`` are shared
+    with the target model (the drafter checkpoint's copies are identical
+    frozen snapshots and are skipped at load).
+    """
+
+    def __init__(
+        self,
+        draft_config,
+        block_size: Optional[int] = None,
+        mask_token_id: Optional[int] = None,
+        ctx_window_size: Optional[int] = None,
+        serving_max_seq_len: Optional[int] = None,
+    ):
+        super().__init__(
+            Qwen3DSparkDraftModel(
+                draft_config,
+                block_size=block_size,
+                mask_token_id=mask_token_id,
+                ctx_window_size=ctx_window_size,
+                serving_max_seq_len=serving_max_seq_len,
+            ),
+            draft_config,
+        )
+
+    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
+        """Load the flat-namespace Qwen3 DSpark drafter checkpoint.
+
+        ``weight_mapper`` is accepted for loader-interface parity but unused —
+        the checkpoint names map 1:1 onto the module tree.
+        """
+        self.dspark_model.load_weights(weights)
 
 
 __all__ = [
     "DSparkBlock",
     "DSparkDraftModel",
     "DSparkForCausalLM",
+    "DSparkForCausalLMBase",
+    "Qwen3DSparkDraftModel",
+    "Qwen3DSparkForCausalLM",
     "validate_dspark_eplb_layer_base",
     "validate_dspark_eplb_stage_layers",
 ]
