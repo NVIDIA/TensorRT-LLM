@@ -32,6 +32,8 @@ from tensorrt_llm.mapping import Mapping
 from ...attention.backends import AttentionMetadata
 from ...model_config import ModelConfig
 from ...peft.lora.layer import LoraLayer, LoraModuleType
+from ...pyexecutor.breakable_cuda_graph import (eager_on_graph,
+                                                is_in_breakable_cuda_graph)
 from ...speculative import SpecMetadata
 from ...utils import get_model_extra_attrs, is_torch_compiling
 from ..linear import Linear, TensorParallelMode
@@ -84,6 +86,9 @@ def mamba2_custom_op_inplace(zxbcdt: torch.Tensor, layer_idx: str,
     mamba_layer.forward_core(zxbcdt, attn_metadata,
                              attn_metadata.mamba_metadata, spec_metadata,
                              ssm_out)
+
+
+maybe_bcg_mamba2_custom_op_inplace = eager_on_graph(mamba2_custom_op_inplace)
 
 
 @torch.library.custom_op("trtllm::flashinfer_selective_state_update",
@@ -451,13 +456,16 @@ class Mamba2Mixer(nn.Module):
             device=zxbcdt.device,
         )
 
-        if self.register_to_config and is_torch_compiling():
+        use_breakable_cuda_graph = (not is_torch_compiling()
+                                    and is_in_breakable_cuda_graph())
+        if self.register_to_config and (is_torch_compiling()
+                                        or use_breakable_cuda_graph):
             # Route the conv+SSM core through the opaque boundary op (see its
-            # comment) so the traced graph stays free of batch-composition
-            # ints and uniform in the num_tokens dim.
-            torch.ops.trtllm.mamba2_custom_op_inplace(zxbcdt,
-                                                      self.layer_idx_str,
-                                                      preallocated_ssm_out)
+            # comment): under torch.compile the traced graph stays free of
+            # batch-composition ints; under breakable CUDA graph capture the
+            # op is the eager bridge between captured segments.
+            maybe_bcg_mamba2_custom_op_inplace(zxbcdt, self.layer_idx_str,
+                                               preallocated_ssm_out)
         else:
             self.forward_core(zxbcdt, attn_metadata, mamba_metadata,
                               spec_metadata, preallocated_ssm_out)
