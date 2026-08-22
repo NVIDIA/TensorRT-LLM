@@ -81,7 +81,8 @@ mA = cute.make_tensor(ptr, layout=layout)
 
 ### Register/Fragment Tensors (Owning)
 ```python
-rmem = cute.make_rmem_tensor(layout_or_shape, dtype)
+rmem = cute.make_rmem_tensor(layout)
+frag = cute.make_fragment(shape, dtype)
 ```
 
 ## Accessing Tensors

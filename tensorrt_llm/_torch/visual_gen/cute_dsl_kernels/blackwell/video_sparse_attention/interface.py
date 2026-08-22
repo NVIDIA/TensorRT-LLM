@@ -28,24 +28,22 @@ from typing import Tuple
 
 import torch
 
-_cute_import_error: Exception | None = None
 try:
     import cuda.bindings.driver as _cuda
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
     from .block_sparse_attn_dsl_fwd import (
-        VideoSparseAttentionForwardGroup2QInterleaveKV as _VideoSparseAttentionForward,
+        VideoSparseAttentionForwardGroup2QInterleaveKV as VideoSparseAttentionForward,
     )
 
     CUTE_AVAILABLE = True
-except (ImportError, OSError) as error:
+except ImportError:  # cuda-bindings / cutlass-dsl not installed
     _cuda = None
     cute = None
     from_dlpack = None
-    _VideoSparseAttentionForward = None
+    VideoSparseAttentionForward = None
     CUTE_AVAILABLE = False
-    _cute_import_error = error
 
 
 __all__ = [
@@ -108,14 +106,14 @@ def block_sparse_attn_from_indices_cute(
     if not CUTE_AVAILABLE:
         raise RuntimeError(
             "block_sparse_attn_from_indices_cute called but cuda.bindings or "
-            f"cutlass-dsl is not importable: {_cute_import_error}"
-        ) from _cute_import_error
+            "cutlass-dsl is not importable."
+        )
 
     num_q_blk = variable_block_sizes.shape[0]
-    if num_q_blk > _VideoSparseAttentionForward.MAX_INDICES:
+    if num_q_blk > VideoSparseAttentionForward.MAX_INDICES:
         raise ValueError(
             f"variable_block_sizes has {num_q_blk} entries but the CuTe kernel "
-            f"supports at most {_VideoSparseAttentionForward.MAX_INDICES} "
+            f"supports at most {VideoSparseAttentionForward.MAX_INDICES} "
             "(SMEM-allocated sVariable_block_sizes buffer). Lower video "
             "resolution/length or fall back to dense SDPA."
         )
@@ -145,7 +143,7 @@ def block_sparse_attn_from_indices_cute(
     compile_key = (D, q.dtype, float(sm_scale)) + tuple(q2k_idx.shape)
     compiled = _COMPILE_CACHE.get(compile_key)
     if compiled is None:
-        fwd_kernel = _VideoSparseAttentionForward(block_m=64, block_n=64, headdim=D)
+        fwd_kernel = VideoSparseAttentionForward(block_m=64, block_n=64, headdim=D)
         compiled = cute.compile(
             fwd_kernel,
             q_packed,

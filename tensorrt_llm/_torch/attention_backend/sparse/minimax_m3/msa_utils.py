@@ -20,34 +20,15 @@ MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
 
 
-def _install_msa_cutlass_compatibility() -> None:
-    """Provide the CUTLASS 4.5 names still referenced by the packaged MSA sources."""
-    try:
-        import cutlass.cute as cute
-    except ImportError:
-        return
-
-    # MSA has not yet migrated these two aliases to their CUTLASS DSL 4.6
-    # names. Keep this shim local to the MSA import path and remove it once the
-    # packaged sources use cute.ThrMma and cute.make_rmem_tensor directly.
-    if not hasattr(cute.core, "ThrMma"):
-        setattr(cute.core, "ThrMma", cute.ThrMma)
-    if not hasattr(cute, "make_fragment"):
-        setattr(cute, "make_fragment", cute.make_rmem_tensor)
-
-
 @functools.lru_cache(maxsize=1)
 def msa_package_available() -> bool:
-    """Prepare and report whether the packaged fmha_sm100 module can be imported.
+    """Return whether the packaged fmha_sm100 module can be imported.
 
     Cached: each call scans sys.path until fmha_sm100 is first imported, and
     create_fmha_libs asks once per attention layer. Whether the package is
     installed cannot change within a process.
     """
-    if importlib.util.find_spec("fmha_sm100") is None:
-        return False
-    _install_msa_cutlass_compatibility()
-    return True
+    return importlib.util.find_spec("fmha_sm100") is not None
 
 
 def require_msa_module() -> types.ModuleType:
@@ -57,7 +38,6 @@ def require_msa_module() -> types.ModuleType:
     advertised in the config schema on systems where the kernels cannot load.
     A missing package is a hard error, never a silent fallback to another backend.
     """
-    _install_msa_cutlass_compatibility()
     try:
         import fmha_sm100
     except ImportError as exc:
