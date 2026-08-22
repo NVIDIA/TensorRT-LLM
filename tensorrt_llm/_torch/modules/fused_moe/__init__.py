@@ -20,8 +20,8 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       MiniMaxM3MoeRoutingMethod, RenormalizeMoeRoutingMethod,
                       RenormalizeNaiveMoeRoutingMethod, RoutingMethodType,
                       SigmoidRenormMoeRoutingMethod,
-                      SparseMixerMoeRoutingMethod, StaticMoeRoutingMethod,
-                      create_load_balanced_logits)
+                      SparseMixerMoeRoutingMethod, SqrtSoftplusMoeRoutingMethod,
+                      StaticMoeRoutingMethod, create_load_balanced_logits)
 from .weight_owner import is_moe_weight_owner
 
 # yapf: enable
@@ -51,6 +51,7 @@ __all__ = [
     "MiniMaxM2MoeRoutingMethod",
     "DeepSeekV4MoeRoutingMethod",
     "MiniMaxM3MoeRoutingMethod",
+    "SqrtSoftplusMoeRoutingMethod",
     "RenormalizeMoeRoutingMethod",
     "SigmoidRenormMoeRoutingMethod",
     "RenormalizeNaiveMoeRoutingMethod",
