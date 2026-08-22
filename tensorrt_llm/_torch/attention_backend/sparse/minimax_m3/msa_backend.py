@@ -32,6 +32,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.bindings import DataType
 
 from .common import (
@@ -59,26 +60,6 @@ def _cache_device(meta) -> torch.device:
         except Exception:
             pass
     return torch.device(f"cuda:{torch.cuda.current_device()}")
-
-
-def _stage_sparse_plan_kv_lens_host(plan: tuple, kv_lens_cpu: torch.Tensor) -> None:
-    """Give the sparse-prefill sub-plan a host copy of its kv_segment_lens.
-
-    sparse_fmha._build_page_table runs once per sparse layer and reads
-    plan["kv_segment_lens"] with .tolist(), which blocks on a D2H copy while
-    that tensor lives on the device. The page table still builds on the device
-    from kv_indices, so the host copy adds no work. Only the sparse-prefill
-    sub-plan (MM-SA-Nv) qualifies: decode and dense plans need their lengths on
-    the device for the kernel.
-    """
-    has_mixed, split = plan[0], plan[1]
-    # A non-mixed batch has one sparse sub-plan (plan[3]); a mixed batch puts
-    # the sparse prefill rows in plan[4], after the split decode rows.
-    sparse_dict = plan[4] if has_mixed else plan[3]
-    if sparse_dict is None or not sparse_dict.get("MM-SA-Nv"):
-        return
-    lens = kv_lens_cpu[split:] if has_mixed else kv_lens_cpu
-    sparse_dict["kv_segment_lens"] = lens.to(torch.int32).contiguous()
 
 
 def _worst_case_proxy_max_k_tiles(
@@ -285,12 +266,19 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
-        """Per-request query length (host int32), from the base seq_lens."""
+        """Per-request query length (host int32), from the base seq_lens.
+
+        Pinned where pinning helps, as with the other two length properties:
+        the planners stage them to the device with non-blocking copies, which
+        degrade to a synchronous staging copy from pageable memory.
+        """
         seq_lens = self.seq_lens
         if seq_lens is None:
             return None
         out = seq_lens[: self.num_seqs]
-        return out if out.dtype == torch.int32 else out.to(torch.int32)
+        if out.dtype != torch.int32:
+            out = out.to(torch.int32)
+        return maybe_pin_memory(out)
 
     @property
     def msa_kv_lens_cpu(self) -> Optional[torch.Tensor]:
@@ -299,7 +287,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         if self.seq_lens is None or kv_lens is None:
             return None
         out = kv_lens[: self.num_seqs]
-        return out if out.dtype == torch.int32 else out.to(torch.int32)
+        if out.dtype != torch.int32:
+            out = out.to(torch.int32)
+        return maybe_pin_memory(out)
 
     @property
     def msa_qo_offset_cpu(self) -> Optional[torch.Tensor]:
@@ -308,7 +298,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         kv = self.msa_kv_lens_cpu
         if qo is None or kv is None:
             return None
-        return kv - qo
+        return maybe_pin_memory(kv - qo)
 
     @property
     def msa_decode_proxy_plan(self) -> Optional[tuple]:
@@ -605,7 +595,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_eager_proxy_plan = proxy_plan
             self._msa_eager_gqa_plan = gqa_plan
             self._msa_eager_dense_plan = dense_plan
-            _stage_sparse_plan_kv_lens_host(gqa_plan, kv_lens_cpu)
             # Stage the valid-block count to the device once for the whole step
             # (see _msa_eager_n_valid_blocks).
             n_valid_host = per_token_valid_blocks(
@@ -699,14 +688,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # fine: forwards read only the persistent buffers filled below.
         # qo_offset is the prefix length, so one build covers prefill
         # (num_cached) and decode (kv_len - 1 with qo_len 1).
-        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+        mapping = build_paged_kv_slot_mapping(
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             qo_lens_cpu=qo_lens_cpu,
             qo_offset_cpu=qo_offset_cpu,
             device=cache_device,
         )
-        kv_indices = build_kv_page_indices(req_to_token, slot_ids, kv_lens_cpu, page_size)
+        out_cache_loc = mapping.out_cache_loc
+        # The page table comes from the same host block ids the mapping was
+        # built from, so it costs no device work.
+        kv_indices = build_kv_page_indices(mapping.block_ids_cpu, kv_lens_cpu, page_size)
 
         total_new_tokens = int(out_cache_loc.shape[0])
         total_pages = int(kv_indices.shape[0])
