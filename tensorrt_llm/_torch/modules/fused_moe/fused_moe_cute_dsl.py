@@ -487,6 +487,25 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     def supports_moe_output_in_alltoall_workspace(self):
         return self.has_nvfp4
 
+    def get_deep_ep_nvfp4_dispatch_input_scale(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+    ) -> Optional[torch.Tensor]:
+        """Return the static scale for the supported DeepEP fusion contract."""
+        if type(self) is not CuteDslFusedMoE:
+            return None
+        if not isinstance(x, torch.Tensor) or x.ndim != 2:
+            return None
+        if not self.has_nvfp4 or getattr(self, "force_dynamic_quantization",
+                                         False):
+            return None
+        if getattr(self, "fc31_act_scale", None) is not None:
+            return None
+        if x.shape[
+                -1] != self.hidden_size or self.hidden_size != self.unpadded_hidden_size:
+            return None
+        return getattr(self, "fc31_input_scale", None)
+
     def quantize_input(self,
                        x: Union[torch.Tensor, Fp4QuantizedTensor],
                        post_quant_comm: bool = True):

@@ -144,6 +144,16 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
   - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
   - unittest/_torch/modules/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
+  # WideEP DeepEP NVFP4 transport fusion and fail-closed backend contracts.
+  - unittest/_torch/modules/moe/test_deep_ep_bf16_fp4_dispatch.py
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_deep_ep_binary_env
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_deep_ep_binary_env_rejects_invalid_value
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_cutedsl_deep_ep_nvfp4_dispatch_capability_fails_closed
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_unvalidated_backend_cannot_bypass_quantize_input_for_deep_ep_dispatch
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_deep_ep_bf16_nvfp4_fusion_gate_falls_back_for_unsupported_input
+  - unittest/others/test_deep_ep_recv_metadata_staging_patch.py
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"

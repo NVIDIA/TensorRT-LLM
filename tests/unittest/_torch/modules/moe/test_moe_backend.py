@@ -46,7 +46,12 @@ from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
+from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import (
+    DeepEPLowLatency,
+    _read_binary_env,
+)
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -69,6 +74,7 @@ from tensorrt_llm._torch.modules.fused_moe.interface import (
 )
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
+from tensorrt_llm._torch.modules.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -128,6 +134,233 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
 
     with pytest.raises(RuntimeError, match="no valid fallback tactic"):
         _select_explicit_fallback_tactic([])
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_deep_ep_binary_env(monkeypatch, value, expected):
+    name = "TRTLLM_TEST_DEEP_EP_BINARY_ENV"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert _read_binary_env(name) is expected
+
+
+def test_deep_ep_binary_env_rejects_invalid_value(monkeypatch):
+    name = "TRTLLM_TEST_DEEP_EP_BINARY_ENV"
+    monkeypatch.setenv(name, "true")
+    with pytest.raises(ValueError, match=rf"{name} must be 0 or 1"):
+        _read_binary_env(name)
+
+
+def test_deep_ep_nvfp4_fused_output_scale_skips_standalone_scale_op(monkeypatch):
+    calculate_global_scale = MagicMock(
+        side_effect=AssertionError("standalone NVFP4 output-scale op must not run")
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "calculate_nvfp4_global_scale",
+        calculate_global_scale,
+    )
+
+    combined_output = torch.empty(2, 4, dtype=torch.bfloat16)
+    combine_low_precision = MagicMock(return_value=combined_output)
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm.mapping = SimpleNamespace(moe_ep_size=2)
+    comm.expert_size_per_partition = 2
+    comm.hidden_size = 4
+    comm.use_low_precision_combine = True
+    comm._fuse_nvfp4_output_scale = True
+    comm._stage_low_precision_combine_metadata = True
+    comm.quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_nvfp4=lambda: True))
+    comm.deep_ep_buffer = SimpleNamespace(low_latency_combine_low_precision=combine_low_precision)
+    recv_expert_count = torch.tensor([2, 0], dtype=torch.int32)
+    topk_idx = torch.zeros(2, 1, dtype=torch.int32)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    deep_ep_handle = object()
+    comm._dispatch_state = {
+        "deep_ep_handle": deep_ep_handle,
+        "deep_ep_topk_idx": topk_idx,
+        "deep_ep_topk_weights": topk_weights,
+        "recv_expert_count": recv_expert_count,
+    }
+
+    final_hidden_states = torch.randn(8, 4, dtype=torch.bfloat16)
+    output = comm.combine(final_hidden_states, all_rank_max_num_tokens=2)
+
+    assert output is combined_output
+    calculate_global_scale.assert_not_called()
+    call_args = combine_low_precision.call_args.args
+    assert call_args[0] == "nvfp4"
+    assert call_args[1].shape == (2, 4, 4)
+    assert call_args[2] is None
+    assert call_args[3] is topk_idx
+    assert call_args[4] is topk_weights
+    assert call_args[5] is deep_ep_handle
+    assert combine_low_precision.call_args.kwargs["stage_recv_metadata"] is True
+
+
+def _run_deep_ep_dispatch_scheduler(
+    backend: MoE,
+    comm: DeepEPLowLatency,
+    x: torch.Tensor,
+    selected_slots: torch.Tensor,
+    final_scales: torch.Tensor,
+) -> None:
+    moe = SimpleNamespace(
+        backend=backend,
+        comm=comm,
+        routing_method=SimpleNamespace(
+            requires_separated_routing=False,
+            experts_per_token=1,
+            apply=MagicMock(return_value=(selected_slots, final_scales)),
+        ),
+        apply_router_weight_on_input=False,
+        layer_load_balancer=None,
+        layer_idx=0,
+        num_slots=1,
+        enable_dummy_allreduce=False,
+        enable_alltoall=False,
+        _using_load_balancer=MagicMock(return_value=False),
+        _load_balancer_start_wait_gpu_stage=MagicMock(),
+        _load_balancer_start_set_cpu_stage=MagicMock(),
+        _load_balancer_done_set_cpu_stage=MagicMock(),
+    )
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler.moe = moe
+
+    scheduler._forward_chunk_impl(
+        x,
+        torch.empty(x.shape[0], 1),
+        torch.bfloat16,
+        [x.shape[0]],
+        False,
+        True,
+        True,
+    )
+
+
+def test_scheduler_fuses_cutedsl_bf16_quantization_into_deep_ep_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fused_moe.moe_scheduler.get_calibrator",
+        lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
+    )
+    x = torch.empty(4, 8, dtype=torch.bfloat16)
+    selected_slots = torch.zeros(4, 1, dtype=torch.int32)
+    final_scales = torch.ones(4, 1, dtype=torch.float32)
+    input_scale = torch.tensor(0.75, dtype=torch.float32)
+
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm.supports_post_quant_dispatch = MagicMock(return_value=True)
+    comm.should_fuse_bf16_nvfp4_dispatch = MagicMock(return_value=True)
+    comm.dispatch = MagicMock(return_value=(x, None, selected_slots, final_scales))
+    comm.combine = MagicMock(side_effect=lambda output, **_kwargs: output)
+
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_nvfp4=lambda: True))
+    backend.force_dynamic_quantization = False
+    backend.fc31_act_scale = None
+    backend.fc31_input_scale = input_scale
+    backend.hidden_size = x.shape[-1]
+    backend.unpadded_hidden_size = x.shape[-1]
+    backend._supports_load_balancer = MagicMock(return_value=False)
+    backend.quantize_input = MagicMock(
+        side_effect=AssertionError("standalone NVFP4 quantization must not run")
+    )
+    backend.run_moe = MagicMock(return_value=x)
+
+    _run_deep_ep_dispatch_scheduler(backend, comm, x, selected_slots, final_scales)
+
+    backend.quantize_input.assert_not_called()
+    dispatch_kwargs = comm.dispatch.call_args.kwargs
+    assert dispatch_kwargs["hidden_states"] is x
+    assert dispatch_kwargs["hidden_states_sf"] is None
+    assert dispatch_kwargs["fuse_bf16_nvfp4_quantization"] is True
+    assert dispatch_kwargs["nvfp4_input_scale"] is input_scale
+
+
+@pytest.mark.parametrize("unsupported_case", ["dynamic", "awq", "padding", "subclass"])
+def test_cutedsl_deep_ep_nvfp4_dispatch_capability_fails_closed(
+    unsupported_case: str,
+) -> None:
+    class UnvalidatedCuteDslBackend(CuteDslFusedMoE):
+        pass
+
+    backend_type = UnvalidatedCuteDslBackend if unsupported_case == "subclass" else CuteDslFusedMoE
+    backend = backend_type.__new__(backend_type)
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_nvfp4=lambda: True))
+    backend.force_dynamic_quantization = unsupported_case == "dynamic"
+    backend.fc31_act_scale = (
+        torch.ones(1, 8, dtype=torch.float32) if unsupported_case == "awq" else None
+    )
+    backend.fc31_input_scale = torch.tensor(0.75, dtype=torch.float32)
+    backend.hidden_size = 16 if unsupported_case == "padding" else 8
+    backend.unpadded_hidden_size = 8
+
+    x = torch.empty(4, 8, dtype=torch.bfloat16)
+    assert backend.get_deep_ep_nvfp4_dispatch_input_scale(x) is None
+
+
+def test_unvalidated_backend_cannot_bypass_quantize_input_for_deep_ep_dispatch(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fused_moe.moe_scheduler.get_calibrator",
+        lambda: SimpleNamespace(maybe_collect_or_replay_slots=lambda _num_slots, slots: slots),
+    )
+    x = torch.empty(4, 8, dtype=torch.bfloat16)
+    selected_slots = torch.zeros(4, 1, dtype=torch.int32)
+    final_scales = torch.ones(4, 1, dtype=torch.float32)
+    quantized_x = x.view(torch.float4_e2m1fn_x2)
+    quantized_sf = torch.empty(4, 1, dtype=torch.uint8)
+
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm.supports_post_quant_dispatch = MagicMock(return_value=True)
+    comm.should_fuse_bf16_nvfp4_dispatch = MagicMock(return_value=True)
+    comm.dispatch = MagicMock(
+        return_value=(quantized_x, quantized_sf, selected_slots, final_scales)
+    )
+    comm.combine = MagicMock(side_effect=lambda output, **_kwargs: output)
+
+    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    backend.fc31_input_scale = torch.tensor(0.75, dtype=torch.float32)
+    backend._supports_load_balancer = MagicMock(return_value=False)
+    backend.quantize_input = MagicMock(return_value=(quantized_x, quantized_sf))
+    backend.run_moe = MagicMock(return_value=x)
+
+    _run_deep_ep_dispatch_scheduler(backend, comm, x, selected_slots, final_scales)
+
+    backend.quantize_input.assert_called_once_with(x)
+    comm.should_fuse_bf16_nvfp4_dispatch.assert_not_called()
+    dispatch_kwargs = comm.dispatch.call_args.kwargs
+    assert dispatch_kwargs["hidden_states"] is quantized_x
+    assert dispatch_kwargs["hidden_states_sf"] is quantized_sf
+    assert "fuse_bf16_nvfp4_quantization" not in dispatch_kwargs
+    assert "nvfp4_input_scale" not in dispatch_kwargs
+
+
+def test_deep_ep_bf16_nvfp4_fusion_gate_falls_back_for_unsupported_input():
+    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+    comm._fuse_nvfp4_bf16_dispatch = True
+    comm.enable_postquant_alltoall = True
+    comm.hidden_size = 8
+    comm.SUPPORTED_HIDDEN_SIZES_EXTENSION = frozenset({8})
+    comm.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=lambda: True,
+            has_fp8_qdq=lambda: False,
+        )
+    )
+    scale = torch.tensor(0.75, dtype=torch.float32)
+
+    assert comm.should_fuse_bf16_nvfp4_dispatch(torch.empty(4, 8, dtype=torch.bfloat16), scale)
+    assert not comm.should_fuse_bf16_nvfp4_dispatch(torch.empty(4, 8, dtype=torch.float32), scale)
+    assert not comm.should_fuse_bf16_nvfp4_dispatch(torch.empty(4, 16, dtype=torch.bfloat16), scale)
+    assert not comm.should_fuse_bf16_nvfp4_dispatch(
+        torch.empty(4, 8, dtype=torch.bfloat16), torch.ones(2, dtype=torch.float32)
+    )
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
