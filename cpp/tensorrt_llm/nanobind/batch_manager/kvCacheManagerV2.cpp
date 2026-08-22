@@ -1877,7 +1877,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             {
                 parent = nb::cast<EventManagerTestBlock&>(parentObject).block.get();
             }
-            auto block = kv::addOrGetExistingBlock(parent, std::move(tokens), knownNoDigest);
+            // addOrGetExistingBlock() may hand back a pre-existing block -- an exact-key
+            // match, or a longer sibling covering these tokens. This helper then installs
+            // pages into `storage` directly (bypassing replacePage()), which would clobber
+            // that block's existing back-pointers, so reject the case outright: a test
+            // asking for a block that already exists is a test bug.
+            bool blockIsNew = false;
+            auto block = kv::addOrGetExistingBlock(parent, std::move(tokens), knownNoDigest, &blockIsNew);
+            if (!blockIsNew)
+            {
+                throw std::invalid_argument("make_test_block: an equivalent block is already in the tree");
+            }
 
             kv::TypedVec<kv::LifeCycleId, kv::SlotCount> counts(manager.lifeCycles().size(), 0);
             for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
