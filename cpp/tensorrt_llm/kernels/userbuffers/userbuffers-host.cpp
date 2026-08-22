@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -302,7 +302,7 @@ void destroy_communicator(communicator* comm)
 
 int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* comm)
 {
-    if (comm->free_region > MAX_REGIONS)
+    if (comm->free_region >= MAX_REGIONS)
         return -1;
     int const hndl = comm->free_region;
     comm->peer_ptr[hndl] = (void**) malloc(sizeof(void*) * (comm->nvsize));
@@ -432,5 +432,56 @@ error:
     comm->mem_ptr[hndl] = *gpubuff;
 
     return comm->free_region++;
+}
+
+// This teardown is a fail-stop collective. Every rank must unregister the same handles, the same number of times,
+// and in the same LIFO order. If a rank violates this contract or fails after teardown starts, the communicator is
+// unrecoverable and peer ranks may block in a barrier.
+void unregister_user_buffer_collective(int handle, communicator* comm)
+{
+    TLLM_CHECK(handle > 0);
+    TLLM_CHECK(handle == comm->free_region - 1);
+    TLLM_CHECK(comm->memflags[handle] & UB_MEM_ALLOCATED);
+
+    auto const alignedSize = comm->mem_size[handle];
+    auto const mappedSize = alignedSize * comm->nvsize;
+    auto const basePtr = reinterpret_cast<CUdeviceptr>(comm->ucbase_ptr[handle]);
+
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    ub_barrier(comm->comm_intra);
+
+    if (comm->memflags[handle] & UB_MEM_MC_CREATED)
+    {
+        TLLM_CHECK(comm->mc_offset >= alignedSize);
+        auto const mcOffset = comm->mc_offset - alignedSize;
+        TLLM_CHECK(comm->mc_ptr[handle] == reinterpret_cast<uint8_t*>(comm->mc_baseptr) + mcOffset);
+        CUCHECK(cuMulticastUnbind(comm->mc_handle, comm->mydev, mcOffset, alignedSize));
+        comm->mc_offset = mcOffset;
+    }
+
+    for (int rank = 0; rank < comm->nvsize; ++rank)
+    {
+        CUCHECK(cuMemUnmap(basePtr + alignedSize * rank, alignedSize));
+    }
+    CUCHECK(cuMemAddressFree(basePtr, mappedSize));
+    for (int rank = 0; rank < comm->nvsize; ++rank)
+    {
+        CUCHECK(cuMemRelease(comm->uchandles[handle][rank]));
+    }
+
+    TLLM_CUDA_CHECK(cudaMemset(
+        static_cast<char*>(comm->gpu_ptrs) + handle * comm->nvsize * sizeof(void*), 0, comm->nvsize * sizeof(void*)));
+
+    free(comm->uchandles[handle]);
+    free(comm->peer_ptr[handle]);
+    comm->uchandles[handle] = nullptr;
+    comm->peer_ptr[handle] = nullptr;
+    comm->ucbase_ptr[handle] = nullptr;
+    comm->mem_ptr[handle] = nullptr;
+    comm->mc_ptr[handle] = nullptr;
+    comm->mem_size[handle] = 0;
+    comm->memflags[handle] = 0;
+    --comm->free_region;
+    ub_barrier(comm->comm_intra);
 }
 } // namespace tensorrt_llm::runtime::ub

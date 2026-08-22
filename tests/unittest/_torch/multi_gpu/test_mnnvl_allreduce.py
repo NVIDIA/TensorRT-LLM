@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import os
 import pickle
 import sys
@@ -26,6 +27,7 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
+from tensorrt_llm.bindings.internal import userbuffers as userbuffers_bindings
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -74,6 +76,21 @@ QUANT_FUSION_OPS = (
                  id="residual_rms_norm_out_quant_nvfp4",
                  marks=skip_pre_blackwell),
 )
+
+
+def _shutdown_userbuffers_manager(_):
+    gc.collect()
+    userbuffers_bindings.shutdown_userbuffers_manager()
+    return True
+
+
+@pytest.fixture
+def shutdown_userbuffers_manager_after_test(mpi_pool_executor):
+    yield
+    results = mpi_pool_executor.map(_shutdown_userbuffers_manager,
+                                    range(mpi_pool_executor.num_workers))
+    for result in results:
+        assert result is True
 
 
 def _seq_len_id(seq_len: tuple[int, ...]):
@@ -567,9 +584,9 @@ def test_mnnvl_nvfp4_rejects_fp32_before_launch(mpi_pool_executor):
 @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("fusion", FUSION_CASES, ids=["fusion", "no_fusion"])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_nccl_symmetric_row_linear_residual_norm_fusion(seq_len, hidden_size,
-                                                        dtype, fusion,
-                                                        mpi_pool_executor):
+def test_nccl_symmetric_row_linear_residual_norm_fusion(
+        seq_len, hidden_size, dtype, fusion, mpi_pool_executor,
+        shutdown_userbuffers_manager_after_test):
     _run_row_linear_residual_norm_fusion(
         seq_len,
         hidden_size,
