@@ -329,18 +329,24 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
     // update bh.numBeamsCBA
 
     size_t const bid = blockIdx.x;       // Index of Batch
-    size_t const nBM{bh.nBeamWidth};
+    int const tid = threadIdx.x;         // Index of Thread
+    int const nBM{static_cast<int>(bh.nBeamWidth)};
     size_t const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
     size_t const nMSL{bh.nMaxSeqLen};
     bool const bOutputLogProbs{bh.logProbsCBA != nullptr && bh.logProbsTiled != nullptr};
-    int const indexDstStart{bh.numBeamsCBA[bid]};
+    __shared__ int indexDstStart;
+    if (tid == 0)
+    {
+        indexDstStart = bh.numBeamsCBA[bid];
+    }
+    __syncthreads();
 
     if (bh.batchDones[bid])
     {
         return;
     }
 
-    for (int i = 0; i < nBM; ++i)
+    for (int i = tid; i < nBM; i += blockDim.x)
     {
         int const srcBeam = bid * nBM + i;
         int const dstBeam = bid * nBM * 2 + i + indexDstStart;
@@ -378,13 +384,20 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
         bh.normedScoresCBA[dstBeam]
             = applyLengthPenalty(bh.cumLogProbs[srcBeam], step - bh.inputLengths[srcBeam] + 1, bh.lengthPenalties[bid]);
         bh.cumLogProbsCBA[dstBeam] = bh.cumLogProbs[srcBeam];
-        bh.numBeamsCBA[bid]++;
+    }
+
+    __syncthreads();
+    if (tid == 0)
+    {
+        bh.numBeamsCBA[bid] = indexDstStart + nBM;
     }
 }
 
 void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream)
 {
-    insertUnfinishedPathKernel<<<bh.nBatchSize, 1, 0, stream>>>(bh);
+    constexpr int kThreadsPerBlock{128};
+    // Beam reconstruction is serial within a beam, but beams are independent.
+    insertUnfinishedPathKernel<<<bh.nBatchSize, kThreadsPerBlock, 0, stream>>>(bh);
 }
 
 __global__ void finalizeKernel(BeamHypotheses bh)
