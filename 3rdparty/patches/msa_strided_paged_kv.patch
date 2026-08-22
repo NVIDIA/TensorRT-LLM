@@ -5158,3 +5158,68 @@ index 306b416b39e269cbcb86256958b53253534d1750..f181202daecfed580935c1ed78533752
          out.copy_(result)
          return out, None
      return result, None
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+@@ -216,4 +216,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
+   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
+-// #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-//     asm volatile("griddepcontrol.wait;");
+-// #endif
++#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++    // FMHA::run launches this kernel with programmatic stream serialization.
++    // The immediately preceding sparse block selector produces
++    // kv_block_indexes, so no global input is safe to consume until the PDL
++    // dependency has completed and its writes are visible.
++    cudaGridDependencySynchronize();
++#endif
+diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
+index fa63a02..9fb2104 100644
+--- a/python/fmha_sm100/jit.py
++++ b/python/fmha_sm100/jit.py
+@@ -11,0 +12 @@ To recompile after kernel changes: scripts/clear_fmha_cache.sh
++import hashlib
+@@ -24,0 +26,12 @@ logger = logging.getLogger(__name__)
++
++def _compute_csrc_fingerprint() -> str:
++    """Return a stable fingerprint for sources embedded in JIT artifacts."""
++    csrc_dir = Path(__file__).resolve().parent / "csrc"
++    digest = hashlib.sha256()
++    for path in sorted(p for p in csrc_dir.rglob("*") if p.is_file()):
++        digest.update(path.relative_to(csrc_dir).as_posix().encode())
++        digest.update(b"\0")
++        digest.update(path.read_bytes())
++    return digest.hexdigest()[:16]
++
++
+@@ -28,13 +41,17 @@ def _compute_cache_base():
+-        return Path(explicit)
+-    base = Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
+-    # Different build configs get separate cache dirs to avoid conflicts
+-    suffix = ""
+-    if os.environ.get("GPU_TRACE") is not None:
+-        suffix += "_gpu_trace"
+-    if os.environ.get("SM_TIMING") is not None:
+-        suffix += "_sm_timing"
+-    if os.environ.get("FMHA_GMEM_CHECK") is not None:
+-        suffix += "_gmem_check"
+-    if suffix:
+-        base = base.parent / (base.name + suffix)
+-    return base
++        base = Path(explicit)
++    else:
++        base = Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
++        # Different build configs get separate cache dirs to avoid conflicts
++        suffix = ""
++        if os.environ.get("GPU_TRACE") is not None:
++            suffix += "_gpu_trace"
++        if os.environ.get("SM_TIMING") is not None:
++            suffix += "_sm_timing"
++        if os.environ.get("FMHA_GMEM_CHECK") is not None:
++            suffix += "_gmem_check"
++        if suffix:
++            base = base.parent / (base.name + suffix)
++    # A source-qualified namespace prevents an upgraded package from silently
++    # loading stale cubins compiled from older headers.  This matters for
++    # correctness fixes as well as for ordinary kernel changes.
++    return base / f"source-{_compute_csrc_fingerprint()}"
