@@ -612,7 +612,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
-            self._evict_request(req)
+            self._suspend_prepared_context(req)
             return cross_action, 0, False
 
         return ScheduleAction.SCHEDULED, req_tokens, False
@@ -714,7 +714,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         cross_action = self._try_schedule_cross_context(req)
         if cross_action is not ScheduleAction.SCHEDULED:
-            self._evict_request(req)
+            self._suspend_prepared_context(req)
             return cross_action, 0, False
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
@@ -1090,7 +1090,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         The scheduler does not select a physical cache tier. Suspending the
         request releases its page locks; the cache manager decides whether
         allocation pressure leaves those pages on GPU or migrates them to a
-        lower tier.
+        lower tier. Cross KV uses an independent pool and remains active so a
+        resumed generation request can keep reading its encoder state.
 
         TODO: Also release PEFT resources (mark_request_done) for the
         suspended request so the C++ PeftCacheManager can evict its
@@ -1102,6 +1103,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.suspend_request(req)
+
+    def _suspend_prepared_context(self, req: LlmRequest) -> None:
+        """Roll back every cache prepared for a failed context admission."""
+        self._evict_request(req)
         if self.cross_kv_cache_manager is not None:
             self.cross_kv_cache_manager.suspend_request(req)
 

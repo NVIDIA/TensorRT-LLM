@@ -1093,7 +1093,8 @@ class TestEviction:
         assert out.paused_requests == [victim]
         assert out.recompute_paused_requests == []
 
-    def test_suspend_called_on_victim(self):
+    def test_preserved_eviction_does_not_suspend_cross_cache(self):
+        """Cross KV uses an independent pool and remains valid for generation."""
         call_count = [0]
 
         def alloc_fn(req):
@@ -1111,7 +1112,7 @@ class TestEviction:
         reqs = [make_gen_request(0), victim]
         sched.schedule_request(reqs, set())
         mgr.suspend_request.assert_called_once_with(victim)
-        cross_mgr.suspend_request.assert_called_once_with(victim)
+        cross_mgr.suspend_request.assert_not_called()
 
     def test_eviction_clears_request_runtime_state(self):
         mgr = make_kv_cache_manager(
