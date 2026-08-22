@@ -25,6 +25,7 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
     get_size_in_bytes,
+    get_sm_version,
     nvtx_range_debug,
     prefer_pinned,
 )
@@ -47,6 +48,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from .compressor import KVCacheDtype
 from .params import (
+    DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN,
+    DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES,
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
@@ -54,6 +57,13 @@ from .params import (
     compress_ratio_has_attention,
     is_overlap_compressor,
 )
+
+
+def _flash_mla_shadow_bytes_per_token(tokens_per_block: int, compress_ratio: int) -> int:
+    """Return manager-accounted MODEL1 shadow bytes per original cache token."""
+    shadow_tokens_per_block = tokens_per_block // compress_ratio
+    shadow_bytes_per_block = shadow_tokens_per_block * DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
+    return shadow_bytes_per_block // tokens_per_block
 
 
 def get_attn_dim(
@@ -122,6 +132,8 @@ def _estimate_non_sliding_attn_size_per_token(
     index_head_dim: int,
     compress_ratios: List[int],
     has_fp8_kv_cache,
+    tokens_per_block: int,
+    use_flash_mla_shadow: bool,
     indexer_k_dtype: str = "fp8",
 ) -> int:
     total_bytes = 0
@@ -136,6 +148,8 @@ def _estimate_non_sliding_attn_size_per_token(
                     has_fp8_kv_cache,
                     indexer_k_dtype=indexer_k_dtype,
                 )
+        if use_flash_mla_shadow and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO:
+            total_bytes += _flash_mla_shadow_bytes_per_token(tokens_per_block, compress_ratio)
     return total_bytes
 
 
@@ -149,6 +163,7 @@ def _estimate_swa_cache_size(
     *,
     context: bool,
     scratch: bool,
+    use_flash_mla_shadow: bool,
     indexer_k_dtype: str = "fp8",
 ) -> Tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
@@ -179,6 +194,12 @@ def _estimate_swa_cache_size(
                 has_fp8_kv_cache,
                 indexer_k_dtype=indexer_k_dtype,
             )
+            if (
+                use_flash_mla_shadow
+                and compress_ratio == DEEPSEEK_V4_SPARSE_RATIO
+                and attn_type == DeepseekV4AttentionType.SWA
+            ):
+                token_bytes += _flash_mla_shadow_bytes_per_token(tokens_per_block, 1)
             if not context:
                 size_per_request += window_tokens * token_bytes
             elif not scratch:
@@ -233,6 +254,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     # The block size of the (indexer) compressed cache.
     # For other attention types, block size is tokens_per_block.
     compressed_block_sizes: List[int]
+
+    def _uses_flash_mla_shadow(self) -> bool:
+        return getattr(self, "_use_flash_mla_shadow", False)
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int:
         """Retain DeepSeek-V4's max-length pool-sizing model by default."""
@@ -315,6 +339,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         self._max_input_len = max_input_len
         self._max_num_tokens = max_num_tokens
+        self._use_flash_mla_shadow = get_sm_version() == 90
 
         # General initialization
         super().__init__(
@@ -433,6 +458,121 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             dtype = self._indexer_dtype
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
+
+    def get_flash_mla_shadow_buffer(
+        self, layer_idx: int, attn_type: DeepseekV4AttentionType
+    ) -> torch.Tensor:
+        """Return a manager-owned MODEL1 shadow buffer, including row padding."""
+        if not self._uses_flash_mla_shadow():
+            raise RuntimeError("FlashMLA shadow buffers are only allocated on Hopper")
+        if attn_type not in DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES:
+            raise ValueError(f"Unsupported FlashMLA shadow type: {attn_type}")
+
+        layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
+        data_role = DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES[attn_type]
+        page_index_mode = _get_index_mode(attn_type)
+        addr = self.impl.get_mem_pool_base_address(layer_id, data_role, page_index_mode)
+        page_index_upper_bound = self.impl.get_page_index_upper_bound(layer_id, data_role)
+        if page_index_mode == PageIndexMode.PER_LAYER:
+            converter = self.impl.get_page_index_converter(layer_id, data_role)
+            if converter.layer_offset is not None:
+                page_index_upper_bound += converter.layer_offset * converter.expansion
+
+        shape = (
+            page_index_upper_bound,
+            self._get_flash_mla_shadow_bytes_per_block(attn_type, layer_idx),
+        )
+        return convert_to_torch_tensor(TensorWrapper(addr, DataType.UINT8, shape))
+
+    def _map_flash_mla_shadow_pages(
+        self,
+        layer_idx: int,
+        attn_type: DeepseekV4AttentionType,
+        source_pages: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map source-cache pages to the matching manager-owned shadow pages."""
+        layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
+        source = self.impl.get_page_index_converter(layer_id, attn_type.role)
+        shadow = self.impl.get_page_index_converter(
+            layer_id, DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES[attn_type]
+        )
+        if source.expansion != 1 or shadow.expansion != 1:
+            raise RuntimeError("FlashMLA shadow buffers do not support expanded page indices")
+
+        index_mode = _get_index_mode(attn_type)
+        source_offset = source.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
+        shadow_offset = shadow.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
+        base_pages = torch.div(
+            source_pages - source_offset,
+            source.scale,
+            rounding_mode="floor",
+        )
+        return base_pages * shadow.scale + shadow_offset
+
+    def map_flash_mla_shadow_token_indices(
+        self,
+        layer_idx: int,
+        attn_type: DeepseekV4AttentionType,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map source-pool token indices to manager-owned shadow indices."""
+        block_size = self.tokens_per_block
+        if attn_type == DeepseekV4AttentionType.COMPRESS:
+            block_size = self.compressed_block_sizes[layer_idx]
+        valid = indices >= 0
+        source_page = torch.div(indices, block_size, rounding_mode="floor")
+        token_offset = indices % block_size
+        shadow_page = self._map_flash_mla_shadow_pages(layer_idx, attn_type, source_page)
+        return torch.where(valid, shadow_page * block_size + token_offset, indices)
+
+    def map_flash_mla_shadow_write_slots(
+        self,
+        layer_idx: int,
+        attn_type: DeepseekV4AttentionType,
+        block_table: torch.Tensor,
+        request_indices: torch.Tensor,
+        token_positions: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Map request-relative writes to source and shadow cache slots."""
+        block_size = self.tokens_per_block
+        if attn_type == DeepseekV4AttentionType.COMPRESS:
+            block_size = self.compressed_block_sizes[layer_idx]
+
+        source_num_blocks = self.get_buffers(layer_idx, attn_type).shape[0]
+        shadow_num_blocks = self.get_flash_mla_shadow_buffer(layer_idx, attn_type).shape[0]
+
+        block_grid = token_positions // block_size
+        token_offset = token_positions % block_size
+        block_valid = (block_grid >= 0) & (block_grid < block_table.shape[1])
+        block_grid_safe = block_grid.clamp(min=0, max=block_table.shape[1] - 1)
+        source_block = block_table[request_indices, block_grid_safe].to(torch.long)
+        shadow_block = self._map_flash_mla_shadow_pages(layer_idx, attn_type, source_block)
+        valid = (
+            valid
+            & block_valid
+            & (source_block >= 0)
+            & (source_block < source_num_blocks)
+            & (shadow_block >= 0)
+            & (shadow_block < shadow_num_blocks)
+        )
+
+        layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
+        index_mode = _get_index_mode(attn_type)
+        source = self.impl.get_page_index_converter(layer_id, attn_type.role)
+        shadow = self.impl.get_page_index_converter(
+            layer_id, DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES[attn_type]
+        )
+        source_fallback = source.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
+        shadow_fallback = shadow.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
+
+        # Preserve static shapes for CUDA graphs without adding padding to each
+        # shadow page. Invalid entries rewrite one matching canonical slot, so
+        # duplicate writes are byte-identical and cannot corrupt live cache data.
+        source_block = torch.where(valid, source_block, source_fallback)
+        shadow_block = torch.where(valid, shadow_block, shadow_fallback)
+        token_offset = torch.where(valid, token_offset, 0)
+        return source_block, shadow_block, token_offset
 
     def _get_window_size(
         self, compress_ratio: int, attn_type: DeepseekV4AttentionType
@@ -731,6 +871,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self.index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
         (
@@ -745,6 +887,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._swa_window_size,
             context=True,
             scratch=self.enable_swa_scratch_reuse,
+            use_flash_mla_shadow=self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
         (
@@ -759,6 +902,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._swa_window_size,
             context=False,
             scratch=False,
+            use_flash_mla_shadow=self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
         max_context_tokens = (
@@ -783,6 +927,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self.index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
         context_swa_size_per_token, _ = _estimate_swa_cache_size(
@@ -794,6 +940,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._swa_window_size,
             context=True,
             scratch=self.enable_swa_scratch_reuse,
+            use_flash_mla_shadow=self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
         (
@@ -808,6 +955,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._swa_window_size,
             context=False,
             scratch=False,
+            use_flash_mla_shadow=self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
         padding = self._get_extra_quota_padding()
@@ -849,15 +997,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     layer_idx,
                     attn_type,
                 )
-            layer_config = AttentionLayerConfig(
-                layer_id=layer_id,
-                buffers=[
+            buffers = [
+                BufferConfig(
+                    role=attn_type.role,
+                    size=self._get_attn_bytes_per_block(attn_type, layer_idx),
+                )
+                for attn_type in attention_types
+            ]
+            if (
+                self._uses_flash_mla_shadow()
+                and self._compress_ratios[layer_idx] == DEEPSEEK_V4_SPARSE_RATIO
+            ):
+                buffers.extend(
                     BufferConfig(
-                        role=attn_type.role,
-                        size=self._get_attn_bytes_per_block(attn_type, layer_idx),
+                        role=DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES[attn_type],
+                        size=self._get_flash_mla_shadow_bytes_per_block(attn_type, layer_idx),
                     )
                     for attn_type in attention_types
-                ],
+                    if attn_type in DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES
+                )
+            layer_config = AttentionLayerConfig(
+                layer_id=layer_id,
+                buffers=buffers,
                 sliding_window_size=sliding_window_size,
                 num_sink_tokens=None,
             )
@@ -1051,6 +1212,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         return token_bytes * block_size
 
+    def _get_flash_mla_shadow_bytes_per_block(
+        self,
+        attn_type: DeepseekV4AttentionType,
+        layer_idx: int,
+    ) -> int:
+        block_size = self.tokens_per_block
+        if attn_type == DeepseekV4AttentionType.COMPRESS:
+            block_size = self.compressed_block_sizes[layer_idx]
+        return block_size * DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
+
     def get_cache_bytes_per_token(self) -> int:
         """Get the average cache bytes per token for DeepSeek-V4."""
         has_fp8_kv_cache = self.dtype == DataType.FP8
@@ -1060,6 +1231,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self.index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
 
@@ -1103,6 +1276,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self.index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
+            self.tokens_per_block,
+            self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
@@ -1114,6 +1289,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             self._swa_window_size,
             context=context,
             scratch=self.enable_swa_scratch_reuse,
+            use_flash_mla_shadow=self._uses_flash_mla_shadow(),
             indexer_k_dtype=self._indexer_k_dtype,
         )
         return int(
@@ -1378,6 +1554,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             index_head_dim,
             compress_ratios,
             has_fp8_kv_cache,
+            kwargs["tokens_per_block"],
+            get_sm_version() == 90,
             indexer_k_dtype=indexer_k_dtype,
         )
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
@@ -1389,6 +1567,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             model_config.sparse_attention_config.window_size,
             context=False,
             scratch=False,
+            use_flash_mla_shadow=get_sm_version() == 90,
             indexer_k_dtype=indexer_k_dtype,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)

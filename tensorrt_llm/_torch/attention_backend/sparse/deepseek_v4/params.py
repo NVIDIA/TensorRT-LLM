@@ -12,6 +12,7 @@ from ..dsa.params import DSAMetadataParams, DSAParams
 
 DEEPSEEK_V4_SPARSE_RATIO = 4
 DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO = 4
+DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN = 584
 
 
 class DeepseekV4AttentionType(Enum):
@@ -31,6 +32,12 @@ class DeepseekV4AttentionType(Enum):
     @property
     def role(self) -> DataRole:
         return DataRole(f"deepseek_v4_{self.name.lower()}")
+
+
+DEEPSEEK_V4_FLASH_MLA_SHADOW_ROLES = {
+    DeepseekV4AttentionType.SWA: DataRole("deepseek_v4_flash_mla_swa_shadow"),
+    DeepseekV4AttentionType.COMPRESS: DataRole("deepseek_v4_flash_mla_compress_shadow"),
+}
 
 
 DEEPSEEK_V4_SLIDING_ATTENTION = (

@@ -23,6 +23,7 @@ from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
 from ..params import SparseBackendForwardArgs
+from .flash_mla import DeepSeekV4FlashMLA
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed import AllReduceParams
@@ -119,6 +120,12 @@ def initialize_sparse_attn(self) -> None:
         is_neox=self.pos_embd_params.is_neox,
         inverse=True,
     )
+    self._dsv4_flash_mla = None
+    sm_version = get_sm_version()
+    if sm_version < 90:
+        raise RuntimeError(f"DeepSeek-V4 requires Hopper or newer GPUs, got SM{sm_version}")
+    if sm_version == 90:
+        self._dsv4_flash_mla = DeepSeekV4FlashMLA(self.mqa, self.mqa.compress_ratio)
     self._disable_dsv4_epilogue_fusion = os.environ.get(
         "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION", ""
     ).strip().lower() in ("1", "true", "on")
@@ -627,8 +634,20 @@ def forward_generation_sparse_attn(
     enable_dsv4_epilogue_fusion: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 generation absorption path."""
-    if get_sm_version() < 100:
-        raise RuntimeError("DeepSeek-V4 is not supported on pre-Blackwell GPUs")
+    if get_sm_version() == 90:
+        if self._dsv4_flash_mla is None:
+            raise RuntimeError("DeepSeek-V4 Hopper FlashMLA helper is not initialized")
+        return self._dsv4_flash_mla.forward_generation(
+            q,
+            latent_cache,
+            attn_metadata,
+            output,
+            topk_indices,
+            self.softmax_scale,
+            position_ids=position_ids,
+            rotary_cos_sin=self.inverse_rotary_emb.rotary_cos_sin,
+            is_neox=self.inverse_rotary_emb.is_neox,
+        )
     del compressed_kv, k_pe
     num_tokens = q.shape[0]
     q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
@@ -795,8 +814,20 @@ def forward_context_sparse_attn(
     enable_dsv4_epilogue_fusion: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 context absorption path."""
-    if get_sm_version() < 100:
-        raise RuntimeError("DeepSeek-V4 is not supported on pre-Blackwell GPUs")
+    if get_sm_version() == 90:
+        if self._dsv4_flash_mla is None:
+            raise RuntimeError("DeepSeek-V4 Hopper FlashMLA helper is not initialized")
+        return self._dsv4_flash_mla.forward_context(
+            q,
+            latent_cache,
+            attn_metadata,
+            output,
+            topk_indices,
+            self.softmax_scale,
+            position_ids=position_ids,
+            rotary_cos_sin=self.inverse_rotary_emb.rotary_cos_sin,
+            is_neox=self.inverse_rotary_emb.is_neox,
+        )
     del compressed_kv, k_pe
     num_tokens = q.shape[0]
     q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]

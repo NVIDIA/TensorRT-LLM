@@ -11,7 +11,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
 from .indexer import DeepseekV4Indexer
@@ -36,6 +36,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     num_total_compressed_tokens: Dict[int, int]
     # The max number of context compressed tokens for each compress ratio
     max_ctx_compressed_tokens: Dict[int, int]
+    # Context metadata used by Hopper FlashMLA.
+    max_ctx_seq_len: int = 0
+    num_ctx_cached_tokens: int = 0
+    max_ctx_kv_len: int = 0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -555,6 +559,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.cu_seq_lens_cuda[: num_requests + 1].copy_(
             self.cu_seq_lens[: num_requests + 1], non_blocking=True
         )
+
+        # Hopper uses the fused MLA RoPE/cache-append helpers for context and
+        # generation. Blackwell's FMHA plan/run path prepares this state
+        # internally.
+        if get_sm_version() == 90:
+            self.prepare_for_mla_rope_append(cached_token_lens[:num_requests], kv_lens)
 
         # For indices conversion
         self.prepare_for_indices_conversion()
