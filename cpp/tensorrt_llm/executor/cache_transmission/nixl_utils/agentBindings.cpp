@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #ifdef ENABLE_NIXL
+#include "bounceV2Bindings.h"
 #include "transferAgent.h"
 #endif
 
@@ -262,7 +263,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("get_last_status_str", &kvc::NixlTransferStatus::getLastStatusStr);
 
     // NixlTransferAgent class
-    nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
+    auto nixlAgentCls = nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent");
+    nixlAgentCls
         .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &kvc::NixlTransferAgent::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"),
@@ -294,6 +296,10 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
             nb::call_guard<nb::gil_scoped_release>());
+
+    // Bounce v2 mechanism layer (CompletionPoller / BatchedCopyPool / FabricArena) + the
+    // below-the-splitter agent primitives (register_region / post_transfer_1to1).
+    kvc::bounce_v2::initBounceV2Bindings(m, nixlAgentCls);
 #endif
 
     // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally

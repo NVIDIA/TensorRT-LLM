@@ -54,6 +54,10 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TxSessionBase,
     WaitResult,
 )
+from tensorrt_llm._torch.disaggregation.bounce_v2.engine import (
+    NoBounceEngine,
+    create_bounce_v2_engine,
+)
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
     build_aux_transfer_layout,
@@ -304,11 +308,14 @@ class Sender(SenderBase):
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
         bounce=None,
+        bounce_v2=None,
     ):
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._bounce = bounce
+        # Null object when disabled: call sites stay unconditional.
+        self._bounce_v2 = bounce_v2 if bounce_v2 is not None else NoBounceEngine()
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -589,34 +596,51 @@ class Sender(SenderBase):
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
         if write_meta.src_ptrs.size > 0:
-            try:
-                request, send_slot_id = build_send_request(
-                    self._bounce,
-                    write_meta,
-                    lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
-                )
-            except Exception as e:
-                # Don't let a gather fault escape: without a result the receiver would hang and its
-                # region leak. Tell the receiver it failed and fail the local task instead.
-                logger.error(
-                    f"_deliver_kv_to_agent: failed to build the KV send request for "
-                    f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
-                )
-                task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
-                    _make_kv_result_msg(
-                        self._instance_rank,
-                        write_meta.unique_rid,
-                        write_meta.slice_id,
-                        True,  # is_last_slice — ensures receiver resolves its task future
-                        AgentResult.FAILED,
+            # bounce_v2 admission: env-gated engine + peer handshake + shape
+            # thresholds. The engine path does its own gather/write/scatter,
+            # so it bypasses build_send_request (and the v1 bounce) entirely.
+            request = None
+            use_bounce_v2 = write_meta.dst_device_id is not None and self._bounce_v2.should_use(
+                write_meta.sizes, write_meta.peer_name
+            )
+            if not use_bounce_v2:
+                try:
+                    request, send_slot_id = build_send_request(
+                        self._bounce,
+                        write_meta,
+                        lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
                     )
-                )
-                return
+                except Exception as e:
+                    # Don't let a gather fault escape: without a result the receiver would hang and its
+                    # region leak. Tell the receiver it failed and fail the local task instead.
+                    logger.error(
+                        f"_deliver_kv_to_agent: failed to build the KV send request for "
+                        f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
+                    )
+                    task.fail(RuntimeError(f"build_send_request failed: {e}"))
+                    self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+                        _make_kv_result_msg(
+                            self._instance_rank,
+                            write_meta.unique_rid,
+                            write_meta.slice_id,
+                            True,  # is_last_slice — ensures receiver resolves its task future
+                            AgentResult.FAILED,
+                        )
+                    )
+                    return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
-                status = self._agent.submit_transfer_requests(request)
+                if use_bounce_v2:
+                    status = self._bounce_v2.submit(
+                        write_meta.src_ptrs,
+                        write_meta.dst_ptrs,
+                        write_meta.sizes,
+                        write_meta.dst_device_id,
+                        write_meta.peer_name,
+                    )
+                else:
+                    status = self._agent.submit_transfer_requests(request)
                 if not status.wait():
                     agent_result = AgentResult.FAILED
                     last_status = getattr(status, "last_status_str", lambda: "<no detail>")()
@@ -1086,6 +1110,10 @@ class Sender(SenderBase):
         )
         with self._loaded_remote_agents_lock:
             self._loaded_remote_agents.add(agent_name)
+        # bounce_v2 control route: registration is replacement, so a peer
+        # re-registering without (or with an incompatible) handshake cleanly
+        # falls back to the standard NIXL path. No-op when disabled.
+        self._bounce_v2.add_peer(agent_name, getattr(ri, "bounce_v2_handshake", None))
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
@@ -1220,6 +1248,11 @@ class Sender(SenderBase):
             self._loaded_remote_agents.clear()
         # Invalidate all loaded remote agents to release fabric/POSIX FD resources.
         for agent_name in loaded_agents:
+            # Drop the peer's bounce_v2 route synchronously; its in-flight
+            # requests are failed asynchronously on the bounce reactor thread
+            # (within one tick), independent of the agent invalidation below
+            # (no-op when disabled).
+            self._bounce_v2.forget_peer(agent_name)
             try:
                 self._agent.invalidate_remote_agent(agent_name)
             except Exception as e:
@@ -2566,7 +2599,21 @@ class TransferWorker:
             # The bounce object owns its own NIXL descriptors (deregistered by Transport.close in
             # shutdown), so they are NOT added to _registered_mem — single-source to avoid a
             # double deregister.
-            self._sender = Sender(self._peer_registrar, self._agent, bounce=self._bounce)
+            # bounce_v2 (hybrid Python/C++ bounce, gated by TRTLLM_BOUNCE_V2_ENABLE).
+            # MUST be constructed BEFORE get_local_agent_desc() below: the engine's
+            # arena registers itself with the agent so every peer's loaded metadata
+            # includes it (single-descriptor per-chunk writes). Owns its own NIXL
+            # registration (deregistered by engine.shutdown), so nothing is added
+            # to _registered_mem.
+            self._bounce_v2 = create_bounce_v2_engine(
+                self._agent,
+                self._config.device_id,
+                self._rank_info.instance_name + str(self._rank_info.instance_rank),
+            )
+            self._rank_info.bounce_v2_handshake = self._bounce_v2.local_handshake_blob() or None
+            self._sender = Sender(
+                self._peer_registrar, self._agent, bounce=self._bounce, bounce_v2=self._bounce_v2
+            )
             self._receiver = Receiver(self._peer_registrar, self._agent, bounce=self._bounce)
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
@@ -2645,6 +2692,15 @@ class TransferWorker:
                 bounce.close()
             except Exception as e:
                 logger.warning(f"TransferWorker.shutdown: bounce close failed: {e}")
+        # bounce_v2 teardown (reactor -> device drain -> poller/pool -> arena
+        # deregistration) must run BEFORE the agent shuts down: the arena
+        # deregisters through the still-live agent. No-op when disabled.
+        bounce_v2 = getattr(self, "_bounce_v2", None)
+        if bounce_v2 is not None:
+            try:
+                bounce_v2.shutdown()
+            except Exception as e:
+                logger.warning(f"TransferWorker.shutdown: bounce_v2 shutdown failed: {e}")
         # Deregister NIXL memory before agent.shutdown so pinned GPU memory is released
         # (e.g. when the KV cache manager is recreated after profiling).
         agent = getattr(self, "_agent", None)
