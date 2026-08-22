@@ -2834,6 +2834,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # Recurrent-state snapshots use a specialized commit/history protocol.
+    # Keep one-model MTP on its existing unpaired draft allocation path until
+    # that protocol implements shifted draft block reuse explicitly.
+    _supports_paired_draft_reuse = False
 
     def __init__(
         self,

@@ -122,8 +122,8 @@ def test_capacity_only_is_scoped_to_target_manager() -> None:
 
 @pytest.mark.parametrize(
     ("is_draft", "expected_capacity"),
-    [(True, 201), (False, 230)],
-    ids=["draft-reclaims-reserve", "target-has-no-reserve"],
+    [(True, 201), (False, 201)],
+    ids=["draft-reclaims-reserve", "target-reclaims-reserve"],
 )
 def test_dynamic_tree_reserved_capacity(is_draft: bool, expected_capacity: int) -> None:
     manager = _manager(is_draft=is_draft, kv_reserve_draft_tokens=60)

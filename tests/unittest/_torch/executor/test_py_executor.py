@@ -1746,6 +1746,11 @@ class _StubADPExecutor:
 
         kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
         self.kv_cache_manager = kv_cache_manager
+        self.draft_kv_cache_manager = None
+        self._paired_draft_kv_cache_manager = None
+        self._free_adp_dummy_kv_resources = types.MethodType(
+            PyExecutor._free_adp_dummy_kv_resources, self
+        )
 
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
@@ -2109,10 +2114,58 @@ def test_adp_pad_dummy_capacity_includes_draft_reserve():
     assert stub._pending_adp_dummy_request is None
 
 
-def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate():
+@pytest.mark.parametrize("enable_adp_dummy_fixes", [False, True])
+def test_adp_pad_dummy_passes_paired_draft_manager(enable_adp_dummy_fixes):
+    stub = _StubADPExecutor(enable_adp_dummy_fixes=enable_adp_dummy_fixes)
+    paired_draft_manager = Mock()
+    paired_draft_manager.get_num_available_tokens.return_value = 1 << 30
+    stub._paired_draft_kv_cache_manager = paired_draft_manager
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls[0]["draft_kv_cache_manager"] is paired_draft_manager
+    paired_draft_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=1, max_num_draft_tokens=0
+    )
+
+
+def test_adp_pad_dummy_does_not_use_unpaired_two_model_draft_manager():
     stub = _StubADPExecutor()
+    stub.draft_kv_cache_manager = Mock()
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls[0]["draft_kv_cache_manager"] is None
+    stub.draft_kv_cache_manager.get_num_available_tokens.assert_not_called()
+
+
+def test_adp_pad_dummy_rejects_when_paired_draft_has_no_capacity():
+    stub = _StubADPExecutor()
+    stub.max_total_draft_tokens = 3
+    paired_draft_manager = Mock()
+    paired_draft_manager.get_num_available_tokens.return_value = 3
+    stub._paired_draft_kv_cache_manager = paired_draft_manager
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=4, max_num_draft_tokens=3
+    )
+    paired_draft_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=4, max_num_draft_tokens=3
+    )
+    stub.kv_cache_manager.add_dummy_requests.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_adp_dummy_fixes", [False, True])
+def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate(enable_adp_dummy_fixes):
+    stub = _StubADPExecutor(enable_adp_dummy_fixes=enable_adp_dummy_fixes)
+    paired_draft_manager = Mock()
+    paired_draft_manager.get_num_available_tokens.return_value = 1 << 30
+    stub._paired_draft_kv_cache_manager = paired_draft_manager
     terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
-    stub.active_requests = [terminal_request]
+    initial_requests = [terminal_request] if enable_adp_dummy_fixes else []
+    stub.active_requests = initial_requests.copy()
     stub.expected_num_active_requests = 2
     spec_resource_manager = Mock()
     spec_resource_manager.add_dummy_requests.side_effect = NoFreeSlotsError("No free slots")
@@ -2120,9 +2173,32 @@ def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate():
 
     _run_pad(stub)
 
-    assert stub.active_requests == [terminal_request]
+    assert stub.active_requests == initial_requests
     assert stub._pending_adp_dummy_request is None
-    stub.kv_cache_manager.free_resources.assert_called_once()
+    dummy_request = stub.kv_cache_manager.free_resources.call_args.args[0]
+    stub.kv_cache_manager.free_resources.assert_called_once_with(dummy_request)
+    paired_draft_manager.free_resources.assert_called_once_with(dummy_request)
+
+
+def test_non_disagg_adp_dummy_rolls_back_paired_kv_when_fleet_cannot_queue():
+    stub = _StubADPExecutor(kv_cache_transceiver=None)
+    paired_draft_manager = Mock()
+    paired_draft_manager.get_num_available_tokens.return_value = 1 << 30
+    stub._paired_draft_kv_cache_manager = paired_draft_manager
+    spec_resource_manager = Mock()
+    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+
+    _run_pad(stub)
+    dummy_request = stub._pending_adp_dummy_request
+    assert dummy_request is not None
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue=False)
+
+    assert stub.active_requests == []
+    assert stub._pending_adp_dummy_request is None
+    spec_resource_manager.free_resources.assert_called_once_with(dummy_request)
+    stub.kv_cache_manager.free_resources.assert_called_once_with(dummy_request)
+    paired_draft_manager.free_resources.assert_called_once_with(dummy_request)
 
 
 def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
@@ -2336,6 +2412,9 @@ def _unfittable_rank(**kwargs):
 
 def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     stub, scheduled_batch = _unfittable_rank()
+    paired_draft_manager = Mock()
+    paired_draft_manager.get_num_available_tokens.return_value = 1 << 30
+    stub._paired_draft_kv_cache_manager = paired_draft_manager
 
     _run_pad_empty(stub, scheduled_batch)
 
@@ -2348,6 +2427,7 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch():
     # pick: this rank is empty precisely because it is short of KV cache.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
+    assert stub.add_dummy_calls[0]["draft_kv_cache_manager"] is paired_draft_manager
 
 
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():
@@ -2428,6 +2508,26 @@ def test_pad_empty_batch_degrades_on_allocation_error(error):
     assert len(stub.active_requests) == 1
 
 
+def test_pad_empty_batch_spec_failure_rolls_back_paired_kv_candidate():
+    stub, scheduled_batch = _unfittable_rank()
+    active_request = stub.active_requests[0]
+    paired_draft_manager = Mock()
+    paired_draft_manager.get_num_available_tokens.return_value = 1 << 30
+    stub._paired_draft_kv_cache_manager = paired_draft_manager
+    spec_resource_manager = Mock()
+    spec_resource_manager.add_dummy_requests.side_effect = NoFreeSlotsError("no slots")
+    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 0
+    assert stub.active_requests == [active_request]
+    assert stub._pending_adp_dummy_request is None
+    dummy_request = stub.kv_cache_manager.free_resources.call_args.args[0]
+    stub.kv_cache_manager.free_resources.assert_called_once_with(dummy_request)
+    paired_draft_manager.free_resources.assert_called_once_with(dummy_request)
+
+
 @pytest.mark.parametrize("enable_adp_dummy_fixes", [False, True])
 def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
     enable_adp_dummy_fixes,
@@ -2437,6 +2537,9 @@ def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
     # ADP dummy fixes are enabled.
     stub, scheduled_batch = _unfittable_rank(enable_adp_dummy_fixes=enable_adp_dummy_fixes)
     active_request = stub.active_requests[0]
+    paired_draft_manager = Mock()
+    paired_draft_manager.get_num_available_tokens.return_value = 1 << 30
+    stub._paired_draft_kv_cache_manager = paired_draft_manager
     spec_resource_manager = Mock()
     stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
 
@@ -2450,6 +2553,7 @@ def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
     assert stub._pending_adp_dummy_request is None
     spec_resource_manager.free_resources.assert_called_once_with(dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(dummy)
+    paired_draft_manager.free_resources.assert_called_once_with(dummy)
 
 
 def test_pad_empty_batch_dummy_kept_when_fleet_can_queue():
@@ -2481,6 +2585,37 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
 
     reverted = [c.args[0] for c in stub.kv_cache_manager.revert_allocate_generation.call_args_list]
     assert reverted == [real_gen_request]
+
+
+def test_v2_generation_allocation_rollback_covers_paired_draft_manager():
+    stub = object.__new__(PyExecutor)
+    stub._is_kv_manager_v2 = True
+    stub.kv_cache_manager = Mock()
+    stub.draft_kv_cache_manager = Mock()
+    stub._paired_draft_kv_cache_manager = stub.draft_kv_cache_manager
+    request = Mock(py_skip_gen_alloc_revert=False)
+    batch = ScheduledRequests()
+    batch.generation_requests.append(request)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.KVCacheManagerV2",
+        new=type(stub.draft_kv_cache_manager),
+    ):
+        PyExecutor._revert_gen_alloc(stub, batch)
+
+    stub.kv_cache_manager.revert_allocate_generation.assert_called_once_with(request)
+    stub.draft_kv_cache_manager.revert_allocate_generation.assert_called_once_with(request)
+
+
+def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
+    stub = object.__new__(PyExecutor)
+    stub.kv_cache_manager = Mock()
+    stub.draft_kv_cache_manager = Mock()
+
+    PyExecutor.reset_prefix_cache(stub)
+
+    stub.kv_cache_manager.reset_reuse_state.assert_called_once_with()
+    stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -3014,6 +3149,7 @@ class TestOneModelMTPDraftTokenScheduling:
         ex._handle_dynamic_draft_len(batch)
 
         assert ex.model_engine.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
+        assert batch.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
         assert gen.py_needs_onehot_draft_probs
         assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
 

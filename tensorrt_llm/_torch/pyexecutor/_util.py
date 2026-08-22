@@ -3058,6 +3058,9 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_capacity=v2_scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            paired_draft_kv_cache=(
+                should_use_separate_draft_kv_cache(spec_config)
+                and spec_config.spec_dec_mode.is_mtp_one_model()),
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,

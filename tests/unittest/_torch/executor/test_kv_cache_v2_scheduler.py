@@ -162,16 +162,26 @@ def make_kv_cache_manager(
     tokens_per_block=64,
     prepare_context_fn=None,
     resize_context_fn=None,
+    try_allocate_draft_context_fn=None,
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
     can_evict=False,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
+    mgr.block_reuse_policy = "per_request"
+    mgr.enable_partial_reuse = True
     mgr.can_evict = can_evict
     mgr.kv_cache_map = _KVCacheMap()
-    mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
+    mgr.prepare_context.side_effect = prepare_context_fn or (lambda req, reuse_limit=None: True)
+    mgr.probe_context_reuse.return_value = 0
+    mgr.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 0
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
+    mgr.try_allocate_draft_context.side_effect = (
+        (lambda req, n: try_allocate_draft_context_fn(req))
+        if try_allocate_draft_context_fn is not None
+        else (lambda req, n: True)
+    )
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
 
@@ -200,6 +210,7 @@ def make_scheduler(
     scheduler_capacity: int | None = None,
     no_schedule_until_state: LlmRequestState | None = None,
     no_schedule_after_state: LlmRequestState | None = None,
+    draft_kv_cache_manager: Mock | None = None,
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
@@ -216,6 +227,9 @@ def make_scheduler(
             kwargs["no_schedule_until_state"] = no_schedule_until_state
         if no_schedule_after_state is not None:
             kwargs["no_schedule_after_state"] = no_schedule_after_state
+        if draft_kv_cache_manager is not None:
+            kwargs["draft_kv_cache_manager"] = draft_kv_cache_manager
+            kwargs["paired_draft_kv_cache"] = True
         if cross_kv_cache_manager is not None:
             kwargs["cross_kv_cache_manager"] = cross_kv_cache_manager
         return KVCacheV2Scheduler(
@@ -829,6 +843,176 @@ class TestKVCacheFailuresCtx:
         out = sched.schedule_request(reqs, set())
         assert ids(out.context_requests) == [1]
 
+    def test_draft_ctx_allocation_succeeds(self):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=500)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        draft_mgr.try_allocate_draft_context.assert_called_once_with(req, 500)
+        mgr.revert_allocate_context.assert_not_called()
+
+    @pytest.mark.parametrize("unsupported_manager", ["target", "draft"])
+    def test_paired_draft_reuse_requires_manager_capability(self, unsupported_manager):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        mgr._supports_paired_draft_reuse = True
+        draft_mgr._supports_paired_draft_reuse = True
+        if unsupported_manager == "target":
+            mgr._supports_paired_draft_reuse = False
+        else:
+            draft_mgr._supports_paired_draft_reuse = False
+
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+
+        assert sched.draft_kv_cache_manager_v2 is None
+
+    def test_draft_reuse_uses_common_prefix_before_budgeting(self):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        mgr.probe_context_reuse.return_value = 192
+        draft_mgr.probe_context_reuse.return_value = 128
+        mgr.prepare_context_cache.side_effect = lambda req, limit=None: limit
+        draft_mgr.prepare_context_cache.side_effect = lambda req, limit=None: limit
+
+        def finalize_reuse(req, reuse):
+            req.context_current_position = reuse
+            req.context_remaining_length = req.prompt_len - reuse
+
+        mgr.finalize_context_reuse.side_effect = finalize_reuse
+        draft_mgr.finalize_context_reuse.side_effect = finalize_reuse
+        sched = make_scheduler(
+            mgr,
+            # The original 500-token prompt cannot fit; the shared 128-token
+            # hit must be applied before budgeting to admit the 372-token
+            # remainder.
+            max_num_tokens=400,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=500)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        mgr.prepare_context_cache.assert_called_once_with(req, 128)
+        draft_mgr.prepare_context_cache.assert_called_once_with(req, 128)
+        mgr.finalize_context_reuse.assert_called_once_with(req, 128)
+        draft_mgr.finalize_context_reuse.assert_called_once_with(req, 128)
+        mgr.resize_context.assert_called_once_with(req, 372)
+        draft_mgr.try_allocate_draft_context.assert_called_once_with(req, 372)
+
+    def test_draft_reuse_floors_common_prefix_without_partial_reuse(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        draft_mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.enable_partial_reuse = False
+        mgr.probe_context_reuse.return_value = 190
+        draft_mgr.probe_context_reuse.return_value = 170
+        mgr.prepare_context_cache.side_effect = lambda req, limit=None: limit
+        draft_mgr.prepare_context_cache.side_effect = lambda req, limit=None: limit
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=500)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        mgr.prepare_context_cache.assert_called_once_with(req, 128)
+        draft_mgr.prepare_context_cache.assert_called_once_with(req, 128)
+
+    def test_draft_reuse_probe_race_falls_back_to_no_reuse(self):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        mgr.probe_context_reuse.return_value = 128
+        draft_mgr.probe_context_reuse.return_value = 128
+        mgr.prepare_context_cache.side_effect = [128, 0]
+        draft_mgr.prepare_context_cache.side_effect = [64, 0]
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=500)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert mgr.prepare_context_cache.call_args_list[1].args == (req, 0)
+        assert draft_mgr.prepare_context_cache.call_args_list[1].args == (req, 0)
+        mgr.discard_context_cache.assert_called_once_with(req)
+        draft_mgr.discard_context_cache.assert_called_once_with(req)
+        mgr.finalize_context_reuse.assert_called_once_with(req, 0)
+        draft_mgr.finalize_context_reuse.assert_called_once_with(req, 0)
+
+    def test_draft_ctx_allocation_failure_rolls_back_both_pools(self):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager(
+            try_allocate_draft_context_fn=lambda req: False,
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        reqs = [make_ctx_request(0, 500), make_gen_request(1)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert len(out.context_requests) == 0
+        assert ids(out.generation_requests) == [1]
+        mgr.revert_allocate_context.assert_called_once_with(reqs[0])
+        mgr.suspend_request.assert_called_once_with(reqs[0])
+        draft_mgr.suspend_request.assert_called_once_with(reqs[0])
+
+    def test_target_ctx_allocation_failure_suspends_both_pools(self):
+        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, 500)
+
+        out = sched.schedule_request([req], set())
+
+        assert not out.context_requests
+        draft_mgr.try_allocate_draft_context.assert_not_called()
+        mgr.suspend_request.assert_called_once_with(req)
+        draft_mgr.suspend_request.assert_called_once_with(req)
+
+    def test_draft_generation_failure_reverts_target_growth(self):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_gen_request(0, num_draft_tokens=3)
+
+        out = sched.schedule_request([req], set())
+
+        assert not out.generation_requests
+        mgr.try_allocate_generation.assert_called_once_with(req)
+        draft_mgr.try_allocate_generation.assert_called_once_with(req)
+        mgr.revert_allocate_generation.assert_called_once_with(req)
+
 
 class TestKVCacheFailuresCtxChunked:
     """Context KV failures (chunked)."""
@@ -863,6 +1047,41 @@ class TestKVCacheFailuresCtxChunked:
         out = sched.schedule_request(reqs, set())
         assert len(out.context_requests) == 0
         assert ids(out.generation_requests) == [1]
+
+    def test_chunked_full_prompt_draft_failure_is_deferred(self):
+        """Draft full-prompt OOM is handled during admission, not resource prep."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        draft_mgr = make_kv_cache_manager(
+            tokens_per_block=64,
+            try_allocate_draft_context_fn=lambda req: False,
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=32000,
+            ctx_chunk_config=(None, 64),
+            draft_kv_cache_manager=draft_mgr,
+        )
+        reqs = [
+            make_ctx_request(
+                39,
+                context_remaining_length=61901,
+                num_draft_tokens=3,
+                is_last_context_chunk=False,
+            ),
+            make_gen_request(40),
+        ]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert len(out.context_requests) == 0
+        assert ids(out.generation_requests) == [40]
+        resized_tokens = mgr.resize_context.call_args.args[1]
+        assert resized_tokens < reqs[0].prompt_len
+        assert resized_tokens <= 32000
+        draft_mgr.try_allocate_draft_context.assert_called_once_with(reqs[0], resized_tokens)
+        mgr.revert_allocate_context.assert_called_once_with(reqs[0])
+        mgr.suspend_request.assert_called_once_with(reqs[0])
+        draft_mgr.suspend_request.assert_called_once_with(reqs[0])
 
 
 # ===========================================================================

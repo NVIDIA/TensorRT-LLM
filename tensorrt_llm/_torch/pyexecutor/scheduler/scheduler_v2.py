@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import math
 import os
 from typing import Optional
 
@@ -160,6 +161,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
         draft_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for MTP draft layers
+        paired_draft_kv_cache: bool = False,
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
@@ -175,6 +177,29 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         self.kv_cache_manager = kv_cache_manager
         self.draft_kv_cache_manager = draft_kv_cache_manager
+        self.draft_kv_cache_manager_v2 = (
+            draft_kv_cache_manager
+            if paired_draft_kv_cache
+            and draft_kv_cache_manager is not None
+            and getattr(self.kv_cache_manager, "_supports_paired_draft_reuse", False)
+            and getattr(draft_kv_cache_manager, "_supports_paired_draft_reuse", False)
+            and all(
+                hasattr(draft_kv_cache_manager, method)
+                for method in (
+                    "prepare_context_cache",
+                    "finalize_context_reuse",
+                    "probe_context_reuse",
+                    "try_allocate_draft_context",
+                )
+            )
+            else None
+        )
+        if self.draft_kv_cache_manager_v2 is not None:
+            assert (
+                self.kv_cache_manager.tokens_per_block
+                == self.draft_kv_cache_manager_v2.tokens_per_block
+            ), "Paired target/draft KV caches require the same tokens_per_block"
+            self.draft_kv_cache_manager_v2._scheduler_owns_draft_admission = True
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         self.enable_recompute_pause = enable_recompute_pause
@@ -575,7 +600,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Prepare first so block reuse updates context_remaining_length
         # before budget check.
-        if not self.kv_cache_manager.prepare_context(req):
+        if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for context request {req.py_request_id}")
             return ScheduleAction.STOP, 0, False
 
@@ -592,7 +617,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # V2 resizes KV cache directly in the scheduler (no separate
         # prepareResources for main cache), so include draft tokens.
-        if not self.kv_cache_manager.resize_context(req, context_tokens + draft_len):
+        if not self._try_allocate_context(req, context_tokens + draft_len):
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -624,7 +649,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 return ScheduleAction.SKIP, 0, False
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
-        if not self.kv_cache_manager.prepare_context(req):
+        if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
             return ScheduleAction.SKIP, 0, False
 
@@ -694,7 +719,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # V2 resizes KV cache directly in the scheduler, so include
         # draft tokens for last chunk.
-        if not self.kv_cache_manager.resize_context(req, resize_tokens):
+        if not self._try_allocate_context(req, resize_tokens):
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -705,6 +730,114 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
         return ScheduleAction.SCHEDULED, chunk_tokens, chunking_flag
+
+    def _common_context_reuse_limit(self, req: LlmRequest) -> int:
+        """Select one reusable prefix shared by target and draft page tables."""
+        draft_manager = self.draft_kv_cache_manager_v2
+        assert draft_manager is not None
+
+        common = min(
+            self.kv_cache_manager.probe_context_reuse(req),
+            draft_manager.probe_context_reuse(req),
+        )
+        # Draft block keys include look-ahead at complete block boundaries.
+        # Keep paired reuse block-aligned even if either backend supports a
+        # partial copy for ordinary target-only reuse.
+        alignment = math.lcm(
+            self.kv_cache_manager.tokens_per_block,
+            draft_manager.tokens_per_block,
+        )
+        common = common // alignment * alignment
+        return common
+
+    def _prepare_context_pair(self, req: LlmRequest) -> bool:
+        """Prepare target/draft caches with one verified logical reuse depth."""
+        draft_manager = self.draft_kv_cache_manager_v2
+        if draft_manager is None:
+            return self.kv_cache_manager.prepare_context(req)
+
+        if not req.is_first_context_chunk:
+            if not self.kv_cache_manager.prepare_context(req):
+                return False
+            if draft_manager.prepare_context(req):
+                return True
+            self._suspend_request(req)
+            return False
+
+        target_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
+        draft_cache = draft_manager.kv_cache_map.get(req.py_request_id)
+        both_existing = target_cache is not None and draft_cache is not None
+        if both_existing:
+            if target_cache.num_committed_tokens != draft_cache.num_committed_tokens:
+                raise RuntimeError(
+                    f"Existing target/draft KV caches disagree on reusable prefix "
+                    f"for request {req.py_request_id}: "
+                    f"{target_cache.num_committed_tokens} vs "
+                    f"{draft_cache.num_committed_tokens}"
+                )
+            reuse_limit = target_cache.num_committed_tokens
+        elif target_cache is not None:
+            reuse_limit = target_cache.num_committed_tokens
+        elif draft_cache is not None:
+            reuse_limit = draft_cache.num_committed_tokens
+        else:
+            reuse_limit = self._common_context_reuse_limit(req)
+
+        target_reuse = self.kv_cache_manager.prepare_context_cache(req, reuse_limit)
+        if target_reuse is None:
+            return False
+        draft_reuse = draft_manager.prepare_context_cache(req, reuse_limit)
+        if draft_reuse is None:
+            self._suspend_request(req)
+            return False
+
+        if target_reuse != draft_reuse:
+            if both_existing:
+                raise RuntimeError(
+                    f"Target/draft KV reuse diverged for request {req.py_request_id}: "
+                    f"{target_reuse} vs {draft_reuse}"
+                )
+            # Probe is advisory. If the radix state changed before the two
+            # caches claimed their pages, rebuild both without lookup. Request
+            # cursors have not been finalized yet, so this fallback is safe.
+            self.kv_cache_manager.discard_context_cache(req)
+            draft_manager.discard_context_cache(req)
+            target_reuse = self.kv_cache_manager.prepare_context_cache(req, 0)
+            draft_reuse = draft_manager.prepare_context_cache(req, 0)
+            if target_reuse is None or draft_reuse is None:
+                self._suspend_request(req)
+                return False
+            if target_reuse != 0 or draft_reuse != 0:
+                raise RuntimeError(
+                    f"Could not establish a common no-reuse fallback for request "
+                    f"{req.py_request_id}: target={target_reuse}, draft={draft_reuse}"
+                )
+
+        self.kv_cache_manager.finalize_context_reuse(req, target_reuse)
+        draft_manager.finalize_context_reuse(req, target_reuse)
+        return True
+
+    def _try_allocate_context(self, req: LlmRequest, num_tokens: int) -> bool:
+        """Atomically admit a context request to the primary and draft pools."""
+        if not self.kv_cache_manager.resize_context(req, num_tokens):
+            # prepare_context_pair may already have resumed both caches.  The
+            # target resize suspends itself on a first-chunk failure, but the
+            # draft pages must also be released or they can starve the retry.
+            if self.draft_kv_cache_manager_v2 is not None:
+                self._suspend_request(req)
+            return False
+        if self.draft_kv_cache_manager_v2 is None:
+            return True
+        if self.draft_kv_cache_manager_v2.try_allocate_draft_context(req, num_tokens):
+            return True
+
+        self.kv_cache_manager.revert_allocate_context(req)
+        self._suspend_request(req)
+        logger.debug(
+            "Draft context allocation failed for request %s; deferring it",
+            req.py_request_id,
+        )
+        return False
 
     def _align_chunk_to_mm_block(
         self,
@@ -990,7 +1123,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
-        success = self.kv_cache_manager.try_allocate_generation(req)
+        success = self._try_allocate_generation_pair(req)
 
         if not success:
             req_it_end, success = self._try_evict_for_gen(
@@ -1025,6 +1158,18 @@ class KVCacheV2Scheduler(RequestScheduler):
             evicted.append(req)
 
         return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+
+    def _try_allocate_generation_pair(self, req: LlmRequest) -> bool:
+        """Atomically grow target and draft caches for one decode step."""
+        if not self.kv_cache_manager.try_allocate_generation(req):
+            return False
+        draft_manager = self.draft_kv_cache_manager_v2
+        if draft_manager is None:
+            return True
+        if draft_manager.try_allocate_generation(req):
+            return True
+        self.kv_cache_manager.revert_allocate_generation(req)
+        return False
 
     # ---- Eviction ----
 
@@ -1124,7 +1269,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             evicted.append(victim)
             req_it_end = victim_idx
 
-            if self.kv_cache_manager.try_allocate_generation(req):
+            if self._try_allocate_generation_pair(req):
                 return req_it_end, True
 
         return req_it_end, False
@@ -1201,7 +1346,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # for an already-suspended victim. If it still fails, use any
             # secondary-tier capacity just released to ordinary-suspend another
             # active victim.
-            success = self.kv_cache_manager.try_allocate_generation(req)
+            success = self._try_allocate_generation_pair(req)
             if not success and self.kv_cache_manager.can_evict:
                 req_it_end, success = self._try_evict_for_gen(
                     req, requests_list, req_it, req_it_end, evicted, inflight_request_ids

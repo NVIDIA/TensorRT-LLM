@@ -15,15 +15,16 @@
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
@@ -76,6 +77,7 @@ def _make_cache_config_for_test(
     max_num_tokens: int | None = None,
     max_draft_len: int = 0,
     num_extra_kv_tokens: int = 0,
+    draft_reuse_lookahead: int = 0,
 ) -> KVCacheManagerConfig:
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.kv_cache_type = CacheType.SELFKONLY
@@ -93,6 +95,7 @@ def _make_cache_config_for_test(
     cache_manager.max_batch_size = max_batch_size
     cache_manager.max_num_tokens = max_num_tokens
     cache_manager.max_draft_len = max_draft_len
+    cache_manager._draft_reuse_lookahead = draft_reuse_lookahead
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
 
     return cache_manager._build_base_config(
@@ -169,18 +172,26 @@ def _make_manager_for_cache_tier_test(
 
 
 @pytest.mark.parametrize(
-    ("enable_block_reuse", "block_reuse_policy", "is_draft", "commit_min_snapshot"),
+    (
+        "enable_block_reuse",
+        "block_reuse_policy",
+        "is_draft",
+        "draft_reuse_lookahead",
+        "commit_min_snapshot",
+    ),
     [
-        (True, "all_reusable", False, False),
-        (True, "per_request", False, True),
-        (False, "per_request", False, False),
-        (True, "per_request", True, True),
+        (True, "all_reusable", False, 0, False),
+        (True, "per_request", False, 0, True),
+        (False, "per_request", False, 0, False),
+        (True, "per_request", True, 0, True),
+        (True, "per_request", True, 3, False),
     ],
 )
 def test_commit_min_snapshot_follows_block_reuse_policy(
     enable_block_reuse: bool,
     block_reuse_policy: str,
     is_draft: bool,
+    draft_reuse_lookahead: int,
     commit_min_snapshot: bool,
 ) -> None:
     config = _make_cache_config_for_test(
@@ -190,6 +201,7 @@ def test_commit_min_snapshot_follows_block_reuse_policy(
             enable_partial_reuse=True,
         ),
         is_draft=is_draft,
+        draft_reuse_lookahead=draft_reuse_lookahead,
     )
 
     assert config.commit_min_snapshot is commit_min_snapshot
@@ -379,6 +391,471 @@ def test_extra_tokens_are_in_context_capacity() -> None:
     assert config.constraints[1] == BatchDesc([KVCacheDesc(capacity=258, history_length=0)])
 
 
+def test_real_llm_request_keeps_target_and_draft_reuse_views_in_sync() -> None:
+    request = LlmRequest(
+        request_id=39,
+        max_new_tokens=16,
+        input_tokens=[0] * 512,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+
+    target_cache = SimpleNamespace(num_committed_tokens=128)
+    draft_cache = SimpleNamespace(
+        num_committed_tokens=64,
+        capacity=64,
+        is_active=True,
+        resize=Mock(return_value=True),
+    )
+    target_manager = object.__new__(KVCacheManagerV2)
+    target_manager.is_draft = False
+    target_manager.enable_block_reuse = True
+    target_manager.tokens_per_block = 64
+    target_manager.kv_cache_map = {request.py_request_id: target_cache}
+    draft_manager = object.__new__(KVCacheManagerV2)
+    draft_manager.is_draft = True
+    draft_manager.enable_block_reuse = True
+    draft_manager.tokens_per_block = 64
+    draft_manager.num_extra_kv_tokens = 0
+    draft_manager.kv_cache_map = {request.py_request_id: draft_cache}
+    draft_manager._resume_and_restore = Mock(return_value=True)
+
+    target_manager.finalize_context_reuse(request, 128)
+    draft_manager.finalize_context_reuse(request, 64)
+
+    assert request.context_current_position == 128
+    assert request.prepopulated_prompt_len == 128
+    request.use_draft_model = True
+    assert request.context_current_position == 64
+    assert request.prepopulated_prompt_len == 64
+    request.use_draft_model = False
+
+    # Paired V2 admission chooses one common frontier, then copies the target
+    # chunk size to the independent draft request fields before the forward.
+    target_cache.num_committed_tokens = 64
+    target_manager.finalize_context_reuse(request, 64)
+    request.context_chunk_size = 128
+    assert draft_manager.try_allocate_draft_context(request, 128)
+
+    assert request.context_current_position == 64
+    assert request.context_chunk_size == 128
+    request.use_draft_model = True
+    assert request.context_current_position == 64
+    assert request.context_chunk_size == 128
+    request.use_draft_model = False
+
+    request.move_to_next_context_chunk()
+
+    assert request.context_current_position == 192
+    assert request.context_chunk_size == 0
+    request.use_draft_model = True
+    assert request.context_current_position == 192
+    assert request.context_chunk_size == 0
+    request.use_draft_model = False
+
+
+def test_try_allocate_draft_context_reserves_scheduled_chunk() -> None:
+    request = SimpleNamespace(
+        py_request_id=39,
+        prompt_len=61901,
+        context_current_position=128,
+        context_chunk_size=32000,
+        prepopulated_prompt_len=128,
+        use_draft_model=False,
+        py_draft_tokens=[1, 2, 3],
+        has_draft_tokens=True,
+        num_draft_tokens=3,
+    )
+    kv_cache = Mock(capacity=0)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._resume_and_restore = Mock(return_value=True)
+
+    assert manager.try_allocate_draft_context(request, 32000)
+
+    manager._resume_and_restore.assert_called_once_with(request.py_request_id, kv_cache)
+    kv_cache.resize.assert_called_once_with(32128)
+    assert request.context_chunk_size == 32000
+    assert not request.use_draft_model
+
+
+def test_try_allocate_draft_context_keeps_existing_excess_capacity() -> None:
+    request = SimpleNamespace(
+        py_request_id=39,
+        prompt_len=61901,
+        context_current_position=128,
+        context_chunk_size=32000,
+        prepopulated_prompt_len=128,
+        use_draft_model=False,
+        py_draft_tokens=[1, 2, 3],
+    )
+    kv_cache = Mock(capacity=70000)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._resume_and_restore = Mock(return_value=True)
+
+    assert manager.try_allocate_draft_context(request, 32000)
+
+    kv_cache.resize.assert_called_once_with(70000)
+
+
+def test_try_allocate_draft_context_reserves_exact_last_chunk_capacity() -> None:
+    request = LlmRequest(
+        request_id=39,
+        max_new_tokens=16,
+        input_tokens=[0] * 61901,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        draft_tokens=[1, 2, 3],
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.context_current_position = 32000
+    request.context_chunk_size = 29901
+    request.use_draft_model = True
+    request.context_current_position = 32000
+    request.use_draft_model = False
+
+    kv_cache = Mock(capacity=32000, is_active=True)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.num_extra_kv_tokens = 0
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._resume_and_restore = Mock(return_value=True)
+
+    assert request.is_last_context_chunk
+    assert manager.try_allocate_draft_context(request, 29901 + 3)
+
+    kv_cache.resize.assert_called_once_with(61904)
+    request.use_draft_model = True
+    assert request.context_current_position == 32000
+    assert request.context_chunk_size == 29901
+    request.use_draft_model = False
+
+
+def test_draft_generation_reserve_is_preallocated_and_exactly_reverted() -> None:
+    request = SimpleNamespace(
+        py_request_id=38,
+        py_draft_tokens=[1, 2, 3],
+        use_draft_model=False,
+    )
+    kv_cache = Mock(capacity=100, is_active=True)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager._kv_reserve_draft_tokens = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._allocated_draft_lens = {}
+    manager._generation_pre_resize_caps = {}
+
+    assert manager.try_allocate_generation(request)
+
+    kv_cache.resize.assert_called_once_with(109)
+    assert manager._allocated_draft_lens[request.py_request_id] == 8
+    assert manager._generation_pre_resize_caps[request.py_request_id] == 100
+
+    manager.revert_allocate_generation(request)
+
+    assert kv_cache.resize.call_args_list[-1].args == (100,)
+    assert request.py_request_id not in manager._allocated_draft_lens
+    assert request.py_request_id not in manager._generation_pre_resize_caps
+
+
+def test_target_generation_reserves_dynamic_draft_width_before_normalization() -> None:
+    request = SimpleNamespace(
+        py_request_id=38,
+        py_draft_tokens=[],
+        use_draft_model=False,
+        is_disagg_generation_transmission_complete=False,
+    )
+    kv_cache = Mock(capacity=100, is_active=True)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
+    manager._kv_reserve_draft_tokens = 4
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._allocated_draft_lens = {}
+    manager._generation_pre_resize_caps = {}
+
+    assert manager.try_allocate_generation(request)
+
+    kv_cache.resize.assert_called_once_with(105)
+    assert manager._allocated_draft_lens[request.py_request_id] == 4
+
+
+def test_generation_update_reclaims_exact_target_reserve() -> None:
+    request = SimpleNamespace(
+        py_request_id=38,
+        py_rewind_len=2,
+        py_num_accepted_draft_tokens=2,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        max_beam_num_tokens=103,
+    )
+    kv_cache = Mock(capacity=105, is_active=True)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
+    manager._kv_reserve_draft_tokens = 4
+    manager.kv_compression_manages_history = False
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._allocated_draft_lens = {request.py_request_id: 4}
+    manager._generation_pre_resize_caps = {request.py_request_id: 100}
+    batch = ScheduledRequests()
+    batch.generation_requests.append(request)
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2._update_kv_cache_draft_token_location"
+    ):
+        manager.update_resources(batch)
+
+    kv_cache.resize.assert_called_once_with(103, 102)
+    assert request.py_request_id not in manager._allocated_draft_lens
+    assert request.py_request_id not in manager._generation_pre_resize_caps
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_prepare_context_does_not_reapply_reuse_on_later_chunk(is_draft: bool) -> None:
+    request = LlmRequest(
+        request_id=39,
+        max_new_tokens=4,
+        input_tokens=[0] * 512,
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    for use_draft_model in (False, True):
+        request.use_draft_model = use_draft_model
+        request.context_current_position = 64
+        request.context_chunk_size = 128
+    request.use_draft_model = False
+    request.move_to_next_context_chunk()
+
+    kv_cache = SimpleNamespace(num_committed_tokens=64, is_active=True)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = is_draft
+    manager.enable_block_reuse = True
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._resume_and_restore = Mock(return_value=True)
+
+    assert manager.prepare_context(request)
+
+    request.use_draft_model = is_draft
+    assert request.context_current_position == 192
+    request.use_draft_model = False
+
+
+def test_scheduler_preallocated_draft_generation_is_not_resized_twice() -> None:
+    request = SimpleNamespace(
+        py_request_id=38,
+        py_draft_tokens=[1, 2, 3],
+        use_draft_model=False,
+    )
+    kv_cache = Mock(capacity=109, is_active=True)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager._kv_reserve_draft_tokens = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._generation_pre_resize_caps = {request.py_request_id: 100}
+    manager._resume_and_restore = Mock(return_value=True)
+    batch = ScheduledRequests()
+    batch.generation_requests.append(request)
+
+    manager._prepare_draft_resources(batch)
+
+    kv_cache.resize.assert_not_called()
+    assert not request.use_draft_model
+
+
+def test_disagg_draft_context_fallback_resizes_new_cache() -> None:
+    request = SimpleNamespace(
+        py_request_id=39,
+        lora_task_id=None,
+        cache_salt=None,
+        is_dummy=False,
+        is_disagg_generation_init_state=True,
+        context_current_position=100,
+        context_chunk_size=20,
+        is_last_context_chunk=True,
+        py_draft_tokens=[1, 2, 3],
+        use_draft_model=False,
+    )
+    kv_cache = Mock(capacity=0)
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.enable_block_reuse = True
+    manager.num_extra_kv_tokens = 1
+    manager._scheduler_owns_draft_admission = True
+    manager.kv_cache_map = {}
+    manager._create_kv_cache = Mock(return_value=kv_cache)
+    manager._resume_and_restore = Mock(return_value=True)
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+
+    manager._prepare_draft_resources(batch)
+
+    kv_cache.resize.assert_called_once_with(124)
+    assert not request.use_draft_model
+
+
+def test_draft_reuse_key_includes_shifted_lookahead() -> None:
+    request = SimpleNamespace(
+        multimodal_hashes=None,
+        multimodal_positions=None,
+        multimodal_lengths=None,
+    )
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager._draft_reuse_lookahead = 3
+    manager.tokens_per_block = 4
+
+    prompt_a = list(range(11))
+    prompt_b = prompt_a.copy()
+    prompt_b[4] = 99
+
+    keys_a = manager._block_reuse_tokens(prompt_a, request, end=8)
+    keys_b = manager._block_reuse_tokens(prompt_b, request, end=8)
+
+    assert len(keys_a) == 8
+    assert isinstance(keys_a[3], bytes)
+    assert len(keys_a[3]) == 32
+    assert keys_a[3] != keys_b[3]
+    assert keys_a[7] == keys_b[7]
+
+
+def test_draft_reuse_excludes_block_without_full_lookahead() -> None:
+    request = SimpleNamespace(
+        multimodal_hashes=None,
+        multimodal_positions=None,
+        multimodal_lengths=None,
+    )
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager._draft_reuse_lookahead = 3
+    manager.tokens_per_block = 4
+
+    assert manager._block_reuse_tokens(list(range(6)), request, end=6) == []
+
+
+@pytest.mark.parametrize(
+    ("compute_end", "expected_ceiling"),
+    [(128, 64), (131, 128)],
+)
+def test_draft_commit_ceiling_stops_before_first_chunk_shifted_tail(
+    compute_end: int, expected_ceiling: int
+) -> None:
+    request = SimpleNamespace(
+        py_request_id=41,
+        py_last_context_chunk=(0, compute_end),
+    )
+    kv_cache = SimpleNamespace(num_committed_tokens=0)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager._draft_reuse_lookahead = 3
+    manager.tokens_per_block = 64
+    manager._draft_context_commit_ceilings = {}
+
+    assert manager._draft_context_commit_limit(request, kv_cache, 3) == expected_ceiling
+
+    request.py_last_context_chunk = (compute_end, compute_end + 128)
+    assert manager._draft_context_commit_limit(request, kv_cache, 3) == expected_ceiling
+
+
+@pytest.mark.parametrize("runtime_draft_len", [None, 2])
+def test_draft_commit_ceiling_rejects_unproven_layer_depth(
+    runtime_draft_len: int | None,
+) -> None:
+    request = SimpleNamespace(
+        py_request_id=42,
+        py_last_context_chunk=(0, 131),
+    )
+    kv_cache = SimpleNamespace(num_committed_tokens=64)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager._draft_reuse_lookahead = 3
+    manager.tokens_per_block = 64
+    manager._draft_context_commit_ceilings = {}
+
+    assert manager._draft_context_commit_limit(request, kv_cache, runtime_draft_len) == 64
+
+
+def test_inactive_draft_cache_records_first_executed_chunk_ceiling() -> None:
+    request = SimpleNamespace(
+        py_request_id=43,
+        py_last_context_chunk=(0, 128),
+        is_last_context_chunk=False,
+    )
+    kv_cache = SimpleNamespace(is_active=False, num_committed_tokens=0)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager._draft_reuse_lookahead = 3
+    manager.tokens_per_block = 64
+    manager._draft_context_commit_ceilings = {}
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+
+    manager.update_context_resources(batch, runtime_draft_len=3)
+
+    assert manager._draft_context_commit_ceilings[request.py_request_id] == 64
+    request.py_last_context_chunk = (128, 256)
+    assert manager._draft_context_commit_limit(request, kv_cache, 3) == 64
+
+
+def test_draft_commit_ceiling_keeps_native_history_at_executed_context() -> None:
+    request = SimpleNamespace(
+        py_request_id=44,
+        py_last_context_chunk=(0, 131),
+        is_dummy_request=False,
+        is_last_context_chunk=False,
+        context_current_position=131,
+        context_remaining_length=125,
+        get_tokens=lambda beam_id: list(range(256)),
+        get_tokens_view=lambda beam_id: np.arange(256, dtype=np.int32),
+    )
+    kv_cache = Mock(is_active=True, num_committed_tokens=0)
+
+    def commit(tokens: list[int]) -> None:
+        kv_cache.num_committed_tokens += len(tokens)
+
+    kv_cache.commit.side_effect = commit
+    kv_cache.resize.return_value = True
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager._draft_reuse_lookahead = 3
+    manager.tokens_per_block = 64
+    manager._draft_context_commit_ceilings = {}
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager.enable_block_reuse = True
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.conversation_manager = None
+    manager._block_reuse_tokens = lambda tokens, request, start, end: tokens[start:end]
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+
+    manager.update_context_resources(batch, runtime_draft_len=3)
+
+    assert kv_cache.resize.call_args_list == [call(None, 131)]
+    assert len(kv_cache.commit.call_args.args[0]) == 128
+    assert kv_cache.num_committed_tokens == 128
+
+    request.py_last_context_chunk = (131, 256)
+    request.context_current_position = 256
+    request.context_remaining_length = 0
+    manager.update_context_resources(batch, runtime_draft_len=3)
+
+    assert kv_cache.resize.call_args_list == [call(None, 131), call(None, 256)]
+    assert kv_cache.commit.call_count == 1
+    assert kv_cache.num_committed_tokens == 128
+
+
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
     request = SimpleNamespace(
         py_request_id=1,
@@ -404,6 +881,32 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
     assert list(kv_cache.committed_tokens) == [4, 5, 6, 7, 8, 9]
     assert kv_cache.num_committed_tokens == 10
     assert kv_cache.stopped_committing
+
+
+def test_try_commit_blocks_commits_draft_request_view() -> None:
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=4,
+        input_tokens=list(range(10)),
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    request.use_draft_model = True
+    request.context_current_position = request.prompt_len
+    kv_cache = _FakeKVCache(num_committed_tokens=4)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = True
+    manager.is_draft = True
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+
+    manager.try_commit_blocks(request)
+
+    assert list(kv_cache.committed_tokens) == [4, 5, 6, 7, 8, 9]
+    assert kv_cache.num_committed_tokens == 10
+    assert kv_cache.stopped_committing
+    request.use_draft_model = False
 
 
 @dataclass

@@ -717,6 +717,16 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        self.draft_kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        scheduler_for_kv = self.scheduler
+        while hasattr(scheduler_for_kv, "scheduler"):
+            wrapped_scheduler = scheduler_for_kv.scheduler
+            if wrapped_scheduler is scheduler_for_kv:
+                break
+            scheduler_for_kv = wrapped_scheduler
+        self._paired_draft_kv_cache_manager = getattr(
+            scheduler_for_kv, "draft_kv_cache_manager_v2", None)
         # V2 owns KV allocation, suspend, resume, and context finalization.
         # The executor skips the V1 terminate/pause paths and finalizes V2
         # context resources before transfer or response handling can terminate
@@ -3387,8 +3397,7 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     # Finalize V2 context KV before disagg transfer/response
                     # handling can terminate the request.
-                    self.kv_cache_manager.update_context_resources(
-                        scheduled_requests)
+                    self._update_v2_context_resources(scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -3461,6 +3470,7 @@ class PyExecutor:
         When dynamic draft length is not enabled, runtime_draft_len is simply
         set to max_draft_len (the static maximum).
         """
+        scheduled_batch.runtime_draft_len = None
         if not hasattr(self.model_engine, 'max_draft_len'):
             return
 
@@ -3468,6 +3478,7 @@ class PyExecutor:
             for request in scheduled_batch.generation_requests:
                 request.py_draft_tokens = []
             self.model_engine.runtime_draft_len = 0
+            scheduled_batch.runtime_draft_len = 0
             return
 
         if (self.model_engine.spec_config is not None
@@ -3533,6 +3544,7 @@ class PyExecutor:
                 self.model_engine.max_draft_len
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
+        scheduled_batch.runtime_draft_len = self.model_engine.runtime_draft_len
 
     @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
@@ -3570,6 +3582,36 @@ class PyExecutor:
                 if getattr(req, "py_skip_gen_alloc_revert", False):
                     continue
                 self.kv_cache_manager.revert_allocate_generation(req)
+                draft_manager = getattr(
+                    self,
+                    "_paired_draft_kv_cache_manager",
+                    getattr(self, "draft_kv_cache_manager", None),
+                )
+                if isinstance(draft_manager, KVCacheManagerV2):
+                    draft_manager.revert_allocate_generation(req)
+
+    def _update_v2_context_resources(self, scheduled_batch) -> None:
+        """Commit one context frontier to target and paired draft caches."""
+        self.kv_cache_manager.update_context_resources(scheduled_batch)
+        draft_manager = getattr(
+            self,
+            "_paired_draft_kv_cache_manager",
+            getattr(self, "draft_kv_cache_manager", None),
+        )
+        if isinstance(draft_manager, KVCacheManagerV2):
+            with request_context(True, scheduled_batch):
+                draft_manager.update_context_resources(
+                    scheduled_batch,
+                    runtime_draft_len=scheduled_batch.runtime_draft_len,
+                )
+
+    def _free_adp_dummy_kv_resources(self, dummy_request: LlmRequest) -> None:
+        """Release KV allocated before full ADP dummy preparation."""
+        self.kv_cache_manager.free_resources(dummy_request)
+        draft_manager = getattr(self, "_paired_draft_kv_cache_manager", None)
+        if (draft_manager is not None
+                and draft_manager is not self.kv_cache_manager):
+            draft_manager.free_resources(dummy_request)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -3602,13 +3644,20 @@ class PyExecutor:
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
-        self.kv_cache_manager.free_resources(dummy_request)
+        self._free_adp_dummy_kv_resources(dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
         """Revert V2 context KV growth for requests deferred after scheduling."""
         for req in dropped_context_requests:
             self.kv_cache_manager.revert_allocate_context(req)
+            draft_manager = getattr(
+                self,
+                "_paired_draft_kv_cache_manager",
+                getattr(self, "draft_kv_cache_manager", None),
+            )
+            if isinstance(draft_manager, KVCacheManagerV2):
+                draft_manager.revert_allocate_draft_context(req)
 
     @nvtx_range("_prefetch_for_context_requests")
     def _prefetch_for_context_requests(self) -> None:
@@ -4309,9 +4358,7 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     if self._is_kv_manager_v2:
-                        for req in scheduled_batch.generation_requests:
-                            self.kv_cache_manager.revert_allocate_generation(
-                                req)
+                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -4474,8 +4521,7 @@ class PyExecutor:
                     if self._is_kv_manager_v2:
                         # Finalize V2 context KV before disagg transfer/response
                         # handling can terminate the request.
-                        self.kv_cache_manager.update_context_resources(
-                            scheduled_batch)
+                        self._update_v2_context_resources(scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -5137,9 +5183,7 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     if self._is_kv_manager_v2:
-                        for req in scheduled_batch.generation_requests:
-                            self.kv_cache_manager.revert_allocate_generation(
-                                req)
+                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -5353,8 +5397,7 @@ class PyExecutor:
                     # Only applies to KV cache manager V2 + scheduler V2.
                     if (self._is_kv_manager_v2
                             and scheduled_batch.context_requests):
-                        self.kv_cache_manager.update_context_resources(
-                            scheduled_batch)
+                        self._update_v2_context_resources(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -6933,9 +6976,16 @@ class PyExecutor:
             token_num = max(token_num, 2)
         draft_reserve = (self.max_total_draft_tokens
                          if self._adp_dummy_is_gen else 0)
-        available_tokens = self.kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=token_num, max_num_draft_tokens=draft_reserve)
-        return available_tokens >= token_num
+        cache_managers = [self.kv_cache_manager]
+        draft_manager = getattr(self, "_paired_draft_kv_cache_manager", None)
+        if (draft_manager is not None
+                and draft_manager is not self.kv_cache_manager):
+            cache_managers.append(draft_manager)
+
+        return all(
+            manager.get_num_available_tokens(token_num_upper_bound=token_num,
+                                             max_num_draft_tokens=draft_reserve)
+            >= token_num for manager in cache_managers)
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
@@ -7074,19 +7124,31 @@ class PyExecutor:
 
         if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
-            llm_request = self.kv_cache_manager.add_dummy_requests(
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
+                draft_kv_cache_manager=getattr(
+                    self, "_paired_draft_kv_cache_manager", None),
+            )
+            if not dummy_requests:
+                return
+            llm_request = dummy_requests[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                try:
+                    spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                except NoFreeSlotsError:
+                    self._free_adp_dummy_kv_resources(llm_request)
+                    return
             self.active_requests.append(llm_request)
+            if self._enable_adp_dummy_fixes:
+                assert self._pending_adp_dummy_request is None
+                self._pending_adp_dummy_request = llm_request
             return
 
         assert self._pending_adp_dummy_request is None
@@ -7103,6 +7165,8 @@ class PyExecutor:
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=getattr(
+                    self, "_paired_draft_kv_cache_manager", None),
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -7118,7 +7182,7 @@ class PyExecutor:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
-                self.kv_cache_manager.free_resources(dummy_request)
+                self._free_adp_dummy_kv_resources(dummy_request)
                 return
 
         assert dummy_request is not None
@@ -7186,6 +7250,8 @@ class PyExecutor:
                 is_gen=True,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=getattr(
+                    self, "_paired_draft_kv_cache_manager", None),
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -7203,7 +7269,7 @@ class PyExecutor:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
-                self.kv_cache_manager.free_resources(dummy_request)
+                self._free_adp_dummy_kv_resources(dummy_request)
                 return
 
         dummy_request.is_attention_dp_dummy = True
@@ -8674,6 +8740,9 @@ class PyExecutor:
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
+        draft_manager = getattr(self, "draft_kv_cache_manager", None)
+        if draft_manager is not None and draft_manager is not self.kv_cache_manager:
+            draft_manager.reset_reuse_state()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,

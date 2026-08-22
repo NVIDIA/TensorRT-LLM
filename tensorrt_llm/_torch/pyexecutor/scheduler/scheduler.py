@@ -213,6 +213,8 @@ class ScheduledRequests:
     """Maps a request id to the prompt-ordered indices of its multimodal items
     selected for encoder execution this iteration (only items whose encoder
     outputs are still missing). ``None`` when no items were scheduled."""
+    runtime_draft_len: int | None
+    """Speculative width used by this exact batch's forward pass."""
 
     def __init__(self):
         self.encoder_requests: RequestList = []
@@ -223,6 +225,7 @@ class ScheduledRequests:
         self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+        self.runtime_draft_len: int | None = None
 
     @property
     def is_generation_only(self) -> bool:
