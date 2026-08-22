@@ -147,6 +147,16 @@ torch::Tensor fp8_block_scale_gemm_blackwell_geforce(torch::Tensor const& mat1, 
     float const* mat1ScalePtr = reinterpret_cast<float const*>(mat1Scale.data_ptr());
     float const* mat2ScalePtr = reinterpret_cast<float const*>(mat2Scale.data_ptr());
 
+    // Allocate workspace for SwapAB sliced-K (M<=8, small-N shapes). getWorkspaceSize
+    // returns 0 on shapes that don't need sliced-K, so no alloc in the common case.
+    int64_t const ws_size = static_cast<int64_t>(gemm_runner->getWorkspaceSize(m, n, k));
+    at::Tensor workspace;
+    if (ws_size > 0)
+    {
+        workspace = at::detail::empty_cuda({ws_size}, at::ScalarType::Byte, mat1.device(), std::nullopt);
+        gemm_runner->configureWorkspace(static_cast<char*>(workspace.data_ptr()));
+    }
+
     gemm_runner->gemm(reinterpret_cast<__nv_fp8_e4m3*>(mat1.data_ptr()), k,
         reinterpret_cast<__nv_fp8_e4m3*>(mat2.data_ptr()), k, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), n, m, n,
         k, mat1ScalePtr, mat2ScalePtr, stream);
@@ -426,6 +436,17 @@ torch::Tensor fp8_block_scaling_bmm_out(torch::Tensor const& mat1, torch::Tensor
 
     // mat1Scale is a 1D tensor which doesn't carry any stride information, no effect on sm120
     auto const strideScalesA = ((m + 4 - 1) / 4 * 4) * ((k + 128 - 1) / 128);
+
+    // Allocate workspace for SwapAB sliced-K on sm120 (M<=8, small-N shapes). top_k=1,
+    // num_problems=b so the per-batch FP32 accumulator fits.
+    int64_t const ws_size
+        = static_cast<int64_t>(gemm_runner->getWorkspaceSize(m, n, k, /*top_k*/ 1, /*num_problems*/ b));
+    at::Tensor workspace;
+    if (ws_size > 0)
+    {
+        workspace = at::detail::empty_cuda({ws_size}, at::ScalarType::Byte, mat1.device(), std::nullopt);
+        gemm_runner->configureWorkspace(static_cast<char*>(workspace.data_ptr()));
+    }
 
     gemm_runner->strideBatchGemm(out_ptr, ldd, strideD, mat1_ptr, lda, strideA, mat2_ptr, ldb, strideB, b, m, n, k,
         stream, mat1ScalePtr, strideScalesA, mat2ScalePtr);
