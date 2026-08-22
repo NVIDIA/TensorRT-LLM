@@ -443,11 +443,29 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                     target_sr=getattr(self._processor.feature_extractor, "sampling_rate", 16000),
                 )
                 proc_kwargs["audio"] = norm_audios
-            proc_out = self._processor(**proc_kwargs).to(dtype=self.dtype)
+            # NOTE: do *not* blanket-cast the processor output to the model
+            # dtype. Gemma 4 applies no normalization in the processor and
+            # scales in model code instead: the patch embedder computes
+            # ``2 * (pixel_values - 0.5)`` and only *then* casts to the weight
+            # dtype (``modeling_gemma4_vision.py`` ``Gemma4VisionPatchEmbedder.forward``,
+            # mirroring reference ``modeling_gemma4.py`` line 567-568). Rescaled
+            # pixels live in ``[0, 1]``, so ``x - 0.5`` is a cancelling
+            # subtraction; rounding to bfloat16 first quantizes the input to a
+            # ~0.0039 grid and destroys exactly the bits the subtraction would
+            # have exposed. Measured on the checkpoint's own image, rounding
+            # first perturbs 50.4 % of pixel elements with up to 98.4 %
+            # per-element relative error. The vision tower runs under
+            # ``torch.autocast`` and the embedder casts explicitly, so leaving
+            # these in the processor's float32 is both correct and safe.
+            proc_out = self._processor(**proc_kwargs)
             input_ids = proc_out["input_ids"]
             pixel_values = proc_out.get("pixel_values")
             image_position_ids = proc_out.get("image_position_ids")
             input_features = proc_out.get("input_features")
+            if input_features is not None:
+                # Audio has no such deferred cast; keep its existing behaviour,
+                # matching the manual branch below.
+                input_features = input_features.to(dtype=self.dtype)
             input_features_mask = proc_out.get("input_features_mask")
         else:
             input_ids = self._tokenizer(
@@ -456,9 +474,10 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
             )["input_ids"]
             if images is not None and self._image_processor is not None:
                 img_out = self._image_processor(images=images, return_tensors="pt")
+                # Left in the processor's dtype for the same reason as above:
+                # the patch embedder's ``2 * (x - 0.5)`` must not run on an
+                # already-bfloat16-rounded tensor.
                 pixel_values = img_out.get("pixel_values")
-                if pixel_values is not None:
-                    pixel_values = pixel_values.to(dtype=self.dtype)
                 image_position_ids = img_out.get("image_position_ids")
             if (
                 audios is not None
@@ -476,6 +495,14 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
                     input_features = input_features.to(dtype=self.dtype)
 
         # Cast video features to model dtype.
+        #
+        # Video frames feed the *same* ``Gemma4VisionPatchEmbedder`` as images,
+        # so in principle they carry the same deferred-cast contract as
+        # ``pixel_values`` above. This task's modalities are text and image
+        # only, though, and video support is explicitly out of scope, so the
+        # pre-existing behaviour is kept here verbatim rather than changed
+        # unvalidated: no video path is exercised by any of the H200 nodes, and
+        # an untested change to one is scope creep, not a fix.
         if pixel_values_videos is not None:
             pixel_values_videos = pixel_values_videos.to(dtype=self.dtype)
         return (
@@ -562,9 +589,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return {
-            "attn_backend": "FLASHINFER",
-        }
+        return Gemma4ForCausalLM.get_model_defaults(llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

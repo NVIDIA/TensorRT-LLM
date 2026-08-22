@@ -2714,6 +2714,52 @@ class TestMultimodalAwareChunkingV2:
         )
         assert out == 0
 
+    # ---- left-edge block against the scheduler's own ceiling ----
+    #
+    # Deferring is only a legitimate answer while the shortfall is transient.
+    # These three cases pin the boundary with the geometry a real Gemma 4 image
+    # request produces: the HF chat template renders the image five tokens in,
+    # so its 266 bidirectional soft tokens occupy [5, 271) and snap-down floors
+    # to (5 // 32) * 32 == 0 — the chunk's own left edge.
+
+    def test_left_edge_block_raises_when_budget_ceiling_can_never_grant_it(self):
+        """Measured Gemma 4 livelock: the request deferred forever at 0% GPU.
+
+        With ``max_num_tokens=270`` the only chunk that keeps the block whole is
+        ``round_up(271, 32) == 288`` tokens, which exceeds the per-iteration
+        ceiling, and snap-down floors to 0. Every iteration recomputed the same
+        impossible chunk, so the executor held the request's memory and made no
+        progress. It must fail immediately with a configuration error instead.
+        """
+        sched = self._make_sched(chunk_unit_size=32, max_num_tokens=270)
+        req = self._make_mm_req(0, context_remaining=1024, mm_runs=[(5, 271)])
+        with pytest.raises(ValueError, match=r"livelock.*Increase max_num_tokens to at least 288"):
+            sched._align_chunk_to_mm_block(
+                req, chunk_size=256, remaining_budget=270, context_remaining=1024
+            )
+
+    def test_left_edge_block_progresses_when_ceiling_admits_the_snap_up(self):
+        """Same geometry, a ceiling that fits: snap up and make progress."""
+        sched = self._make_sched(chunk_unit_size=32, max_num_tokens=288)
+        req = self._make_mm_req(0, context_remaining=1024, mm_runs=[(5, 271)])
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=256, remaining_budget=288, context_remaining=1024
+        )
+        assert out == 288
+
+    def test_left_edge_block_defers_only_while_the_shortfall_is_transient(self):
+        """Ceiling admits the snap-up but this iteration's budget does not.
+
+        A concurrent request is holding the budget, so the next iteration can
+        still grant 288 — defer, do not raise.
+        """
+        sched = self._make_sched(chunk_unit_size=32, max_num_tokens=288)
+        req = self._make_mm_req(0, context_remaining=1024, mm_runs=[(5, 271)])
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=128, remaining_budget=160, context_remaining=1024
+        )
+        assert out == 0
+
     # ---- gates ----
 
     def test_no_op_when_bidirectional_flag_false(self):
@@ -2789,9 +2835,13 @@ class TestMultimodalAwareChunkingV2:
         """When alignment returns 0 (last-resort defer), the caller must SKIP
         the request — it must not appear in scheduled context_requests, and
         resize_context must not be called for it."""
-        # block_size=18 ≤ max_context_length=20 (no impossibility raise),
-        # but unit_size=8 round-up pushes up_block_end to 24 > 20, so
-        # snap-up fails. Block at lo=0 → snap-down zeros → defer.
+        # block_size=18, unit_size=8 → snap-up needs 24 tokens, and the block
+        # sits at lo=0 so snap-down would zero the chunk. The co-scheduled
+        # generation request takes 1+8=9 of the 32-token budget first, leaving
+        # 23 < 24: a *transient* shortfall, so the next iteration can still
+        # grant the snap-up and deferring is the right answer. (A shortfall
+        # against max_num_tokens itself would livelock and raises instead —
+        # see ``test_left_edge_block_raises_when_budget_ceiling_can_never_grant_it``.)
         resize_calls = []
 
         def track_resize(req, n):
@@ -2799,8 +2849,10 @@ class TestMultimodalAwareChunkingV2:
             return True
 
         mgr = make_kv_cache_manager(tokens_per_block=8, resize_context_fn=track_resize)
-        sched = make_scheduler(mgr, max_num_tokens=20, ctx_chunk_config=(None, 8))
+        sched = make_scheduler(mgr, max_num_tokens=32, ctx_chunk_config=(None, 8))
+        gen = make_gen_request(1, num_draft_tokens=8)
         req = self._make_mm_req(0, context_remaining=32, mm_runs=[(0, 18)])
-        out = sched.schedule_request([req], set())
+        out = sched.schedule_request([gen, req], set())
+        assert ids(out.generation_requests) == [1]
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache

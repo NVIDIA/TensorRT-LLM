@@ -20,7 +20,7 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, NewType, Optional, TypeAlias, cast
+from typing import Any, Dict, List, NewType, Optional, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -37,6 +37,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 from ..metadata import KVCacheParams
 from ..utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
@@ -232,6 +233,15 @@ class MLAPlanParams:
 @dataclass(kw_only=True)
 class FlashInferWrappers:
     is_planned: bool
+    # FlashInfer plans into this buffer and its kernels read the plan back out
+    # of it at launch.  Each wrapper set therefore needs its *own* workspace:
+    # a model with more than one attention geometry (Gemma 4's sliding
+    # head_dim 256 and global head_dim 512) plans several wrapper sets per
+    # step, and a shared buffer means each plan overwrites the previous one.
+    # Eagerly that is survivable by planning immediately before each layer
+    # runs, but a CUDA graph replays every layer's kernel without re-planning,
+    # so all but the last layer would read another geometry's plan.
+    workspace_buffer: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_wrapper: Optional[
         flashinfer.BatchDecodeWithPagedKVCacheWrapper] = None
     prefill_wrapper: Optional[
@@ -258,6 +268,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
     _paged_kv_indices: torch.Tensor = field(init=False, repr=False)
+    _fi_page_indices: torch.Tensor = field(init=False, repr=False)
     _paged_kv_last_page_len: torch.Tensor = field(init=False)
     _qo_indptr: torch.Tensor = field(init=False)
     _kv_indptr: torch.Tensor = field(init=False)
@@ -600,10 +611,116 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.num_generation_blocks + self.num_context_blocks)
         src = self._vswa_pool_indices_cache[pool_id][:n]
         self._paged_kv_indices[:n].copy_(src, non_blocking=True)
+        self._refresh_flashinfer_page_indices(n)
         self._vswa_active_pool_id = pool_id
         # Keep the host mirror in lockstep with the device buffer so decode
         # plans build their block tables from the active pool's indices.
         self._host_paged_kv_indices = self._host_pool_indices[pool_id]
+
+    def _refresh_flashinfer_page_indices(self, num_entries: int) -> None:
+        """Publish a FlashInfer-safe copy of the active page indices.
+
+        ``_paged_kv_indices`` carries the KVCacheManagerV2 page table
+        verbatim, including the ``BAD_PAGE_INDEX`` (-1) placeholders it uses
+        for blocks a request no longer owns (sliding-window blocks that fell
+        out of the window, so no live token maps to them).  FlashInfer's
+        paged kernels index the pool with every entry a request's indptr
+        range spans, so a -1 would be dereferenced and fault; masking by
+        ``window_left`` happens after the load, not instead of it.  Clamping
+        those dead slots to page 0 keeps the load in bounds while the window
+        mask still discards the tokens, which is the same treatment the
+        Triton prefill and vanilla backends give the placeholder.
+
+        Runs unconditionally so the recorded op sequence is identical on
+        every CUDA-graph capture and replay.  The width is capped at the most
+        pages one batch can reference: the VSWA swap asks for the whole buffer
+        because its own width has to stay constant for capture, and the pool
+        can be orders of magnitude larger than any single batch's page list.
+        """
+        width = min(num_entries, self._max_flashinfer_page_entries)
+        torch.clamp_min(self._paged_kv_indices[:width],
+                        0,
+                        out=self._fi_page_indices[:width])
+
+    @property
+    def flashinfer_page_indices(self) -> torch.Tensor:
+        """Live page indices as handed to the FlashInfer wrappers."""
+        return self._fi_page_indices[:self.num_generation_blocks +
+                                     self.num_context_blocks]
+
+    def _layer_attention_window(self,
+                                layer_idx: Optional[int]) -> Optional[int]:
+        """Sliding-window size of ``layer_idx``'s pool, ``None`` if unbounded."""
+        window_vec = getattr(self.kv_cache_manager, 'max_attention_window_vec',
+                             None)
+        if not window_vec:
+            return None
+        if layer_idx is None:
+            local_idx = 0
+        else:
+            layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets',
+                                    None)
+            local_idx = (layer_offsets[layer_idx]
+                         if layer_offsets is not None else layer_idx)
+        return window_vec[local_idx % len(window_vec)]
+
+    def _check_evicted_pages_are_out_of_window(
+            self, host_page_indices: torch.Tensor, kv_lens_host: np.ndarray,
+            q_lens_host: np.ndarray, layer_idx: Optional[int]) -> None:
+        """Assert every ``BAD_PAGE_INDEX`` slot really holds no live token.
+
+        ``_refresh_flashinfer_page_indices`` clamps those slots so FlashInfer
+        cannot fault on them, and correctness then rests on the window mask
+        discarding the tokens they would have contributed.  That is only true
+        when a placeholder is a *leading* block whose whole token range fell
+        out of the layer's sliding window.  A placeholder anywhere else means
+        the page table lost a block the request still needs, so fail loudly
+        instead of silently attending page 0.
+
+        Costs one host-side scan of the already-materialized index array, and
+        only walks per-request ranges when a placeholder is actually present
+        (i.e. a sliding-window sequence that outgrew its window).
+        """
+        pages = host_page_indices.numpy()
+        if pages.size == 0 or not (pages == BAD_PAGE_INDEX).any():
+            return
+
+        window = self._layer_attention_window(layer_idx)
+        offset = 0
+        for req_idx, num_blocks in enumerate(self.num_blocks):
+            request_pages = pages[offset:offset + num_blocks]
+            offset += num_blocks
+            evicted = request_pages == BAD_PAGE_INDEX
+            num_evicted = int(evicted.sum())
+            if num_evicted == 0:
+                continue
+            if not evicted[:num_evicted].all():
+                raise RuntimeError(
+                    f"KV page table for request index {req_idx} (layer "
+                    f"{layer_idx}) has interior BAD_PAGE_INDEX entries: "
+                    f"{request_pages.tolist()}. FlashInfer needs live pages "
+                    "to be a contiguous suffix of each request's blocks.")
+            if window is None:
+                raise RuntimeError(
+                    f"KV page table for request index {req_idx} (layer "
+                    f"{layer_idx}) dropped {num_evicted} block(s) although "
+                    "the layer has no sliding window; those tokens are still "
+                    "attended.")
+            # Last token position covered by the final evicted block. The
+            # earliest query in this pass sits at position kv_len - q_len and
+            # reaches back window - 1 tokens, so anything strictly older than
+            # that is unreachable and safe to drop.
+            last_evicted_pos = num_evicted * self.page_size - 1
+            oldest_attended = (int(kv_lens_host[req_idx]) -
+                               int(q_lens_host[req_idx]) - int(window) + 1)
+            if last_evicted_pos >= oldest_attended:
+                raise RuntimeError(
+                    f"KV page table for request index {req_idx} (layer "
+                    f"{layer_idx}) dropped block(s) covering token "
+                    f"{last_evicted_pos}, which is still inside the "
+                    f"{window}-token window at kv_len "
+                    f"{int(kv_lens_host[req_idx])} / q_len "
+                    f"{int(q_lens_host[req_idx])}.")
 
     @property
     def paged_kv_last_page_len(self) -> torch.Tensor:
@@ -744,6 +861,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._vswa_pool_indices_cache = None
             self._host_pool_indices = {}
             self._vswa_active_pool_id = None
+        self._refresh_flashinfer_page_indices(total_blocks)
 
         host_indptr = maybe_pin_memory(
             torch.from_numpy(
@@ -875,6 +993,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.request_ids, self.num_blocks)
         self._paged_kv_indices[:paged_kv_indices.numel()].copy_(
             paged_kv_indices, non_blocking=True)
+        self._refresh_flashinfer_page_indices(paged_kv_indices.numel())
         self._host_paged_kv_indices = paged_kv_indices
 
         host_indptr = maybe_pin_memory(
@@ -1001,6 +1120,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                       dtype=torch.int,
                                       device='cuda')
         self._plan_params_to_wrappers = {}
+        # Per-wrapper-set FlashInfer workspaces (see FlashInferWrappers).
+        # `workspace_buffer` itself is handed to the first set (so a
+        # single-geometry model allocates nothing beyond what it always did);
+        # extra sets get private buffers, and the free list recycles those so
+        # transient custom-mask plans do not allocate a new 320 MiB buffer per
+        # image request.
+        self._primary_workspace_claimed = False
+        self._free_workspaces: List[torch.Tensor] = []
 
         # Host-side state for sync-free trtllm-gen decode plans, retained by
         # prepare(): a host mirror of _paged_kv_indices (kept in lockstep
@@ -1030,6 +1157,24 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 capture_graph=capture_graph,
             )
 
+            # KVCacheManagerV2 page tables are linear in token position and
+            # mark blocks the cache no longer owns - e.g. sliding-window
+            # blocks evicted once the sequence grows past its window - with
+            # BAD_PAGE_INDEX (-1).  FlashInfer's paged kernels dereference
+            # every page listed for a request, so a -1 entry is an illegal
+            # address rather than a skipped block.  Keep _paged_kv_indices
+            # raw for the consumers that filter on -1 themselves (the Triton
+            # custom-mask prefill) and hand the FlashInfer wrappers this
+            # sanitized mirror instead.  Same size and the same graph-stable
+            # allocation, so wrapper buffer addresses survive replays.
+            self._fi_page_indices = self.get_empty(
+                buffers,
+                (blocks_in_primary_pool, ),
+                dtype=torch.int,
+                cache_name="_fi_page_indices",
+                capture_graph=capture_graph,
+            )
+
             # Maximum block count across ALL pools: sizes the VSWA pool
             # buffers below. Computed for every model, not just VSWA —
             # non-VSWA managers have a single pool, so this stays
@@ -1041,6 +1186,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     if lbuf is not None:
                         max_num_blocks = max(max_num_blocks, lbuf.shape[0])
             self._max_num_blocks_per_seq = self.kv_cache_manager.max_blocks_per_seq
+            # Upper bound on the page-index entries any single batch can hand
+            # FlashInfer; sanitizing beyond it would burn a full-pool pass per
+            # layer per step for indices no kernel reads.
+            self._max_flashinfer_page_entries = min(
+                blocks_in_primary_pool,
+                self.max_num_requests * max(1, self._max_num_blocks_per_seq))
 
             # Layers may share one page-index list only when they are in the
             # same pool AND have the same page-index scale: VSWA splits pools,
@@ -1419,6 +1570,47 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         wrappers.decode_block_table_active_width = max_n
         return block_tables[:num_gens]
 
+    def _acquire_workspace(self) -> torch.Tensor:
+        """Hand out a FlashInfer workspace that no other wrapper set shares.
+
+        The first wrapper set this metadata creates gets ``workspace_buffer``
+        itself, so a single-geometry model (one wrapper set per metadata) has
+        exactly the allocation footprint it always had.  Every *additional*
+        set gets a private buffer: a plan is read back out of its workspace by
+        the kernels it configured -- at launch for a captured decode -- so two
+        sets planning into one buffer in the same ``prepare()`` (Gemma 4's two
+        attention geometries, planned eagerly for CUDA-graph metadata) would
+        leave only the last plan intact and replay every other geometry
+        against it.
+
+        Draft-view metadata never claims ``workspace_buffer``: it aliases the
+        target metadata's buffer (``create_draft_metadata`` shares it), and
+        the draft's plans run in the same step as the target's, after the
+        target's ``prepare()``.
+
+        Private buffers are recycled through ``_free_workspaces`` when a
+        transient wrapper set -- a custom-mask plan, which lives for one
+        forward -- is evicted, so the count stabilizes at the number of
+        wrapper sets alive at once rather than growing per image request.
+        """
+        is_draft_view = (self._is_shared_kv_draft_view
+                         or self._is_separate_kv_draft_view)
+        if not self._primary_workspace_claimed and not is_draft_view:
+            self._primary_workspace_claimed = True
+            return self.workspace_buffer
+        if self._free_workspaces:
+            return self._free_workspaces.pop()
+        return torch.empty_like(self.workspace_buffer)
+
+    def _release_workspace(self, wrappers: "FlashInferWrappers") -> None:
+        buffer = wrappers.workspace_buffer
+        if buffer is None:
+            return
+        if buffer is self.workspace_buffer:
+            self._primary_workspace_claimed = False
+            return
+        self._free_workspaces.append(buffer)
+
     def _clean_cached_plans(self, *, defer_plan: bool):
         for plan_params in list(self._plan_params_to_wrappers.keys()):
             # Generally, plan_params with non-trivial attention masking are relevant only the
@@ -1429,6 +1621,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 if not defer_plan:
                     self._plan_with_params(plan_params)
             else:
+                self._release_workspace(
+                    self._plan_params_to_wrappers[plan_params])
                 del self._plan_params_to_wrappers[plan_params]
 
     def prepare(self) -> None:
@@ -1547,6 +1741,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
             paged_kv_indices, non_blocking=True)
+        self._refresh_flashinfer_page_indices(paged_kv_indices.size(0))
+        q_lens_host = self.seq_lens_kv.numpy()
+        self._check_evicted_pages_are_out_of_window(paged_kv_indices,
+                                                    kv_lens_host,
+                                                    q_lens_host,
+                                                    layer_idx=None)
 
         # Retain a host mirror of _paged_kv_indices: decode plans build the
         # trtllm-gen block tables from host data, with no GPU round trips.
@@ -1584,6 +1784,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                  non_blocking=True)
                 self._vswa_pool_indices_cache[pool_id] = buf
                 self._host_pool_indices[pool_id] = pool_indices
+                self._check_evicted_pages_are_out_of_window(pool_indices,
+                                                            kv_lens_host,
+                                                            q_lens_host,
+                                                            layer_idx=rep_layer)
             self._vswa_active_pool_id = primary_pool_id
 
         # number of tokens in the last cache block used by each sequence,
@@ -1657,15 +1861,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                       non_blocking=True)
 
         # Multi-wrapper case (Gemma4 hybrid: different head_dim per layer)
-        # shares one workspace_buffer; eager plan() would overwrite earlier
-        # wrappers' workspace, so defer plan() to forward_impl. Single-wrapper
-        # case (e.g., Llama, Gemma3 uniform head_dim) needs eager plan() here
-        # because forward_impl cannot plan() during cuda-graph stream capture.
+        # defers plan() to forward_impl so each layer plans right before it
+        # runs. Single-wrapper case (e.g., Llama, Gemma3 uniform head_dim)
+        # needs eager plan() here because forward_impl cannot plan() during
+        # cuda-graph stream capture.
+        #
+        # Deferring is not an option for a CUDA-graph metadata: replay runs the
+        # recorded kernels and never re-enters forward_impl, so a deferred plan
+        # is never refreshed for the step being replayed. Plan eagerly there
+        # instead -- safe now that each wrapper set owns its workspace (see
+        # FlashInferWrappers), which is what made deferral necessary.
         active_wrappers = [
             pp for pp in self._plan_params_to_wrappers
             if pp.attention_mask_data is None
         ]
-        defer_plan = len(active_wrappers) > 1
+        defer_plan = len(active_wrappers) > 1 and not self.is_cuda_graph
         if not (self._is_separate_kv_draft_view and self.is_cuda_graph):
             self._clean_cached_plans(defer_plan=defer_plan)
 
@@ -1713,6 +1923,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             total_blocks = self.num_generation_blocks + self.num_context_blocks
             src = self._vswa_pool_indices_cache[primary_pool_id][:total_blocks]
             self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
+            self._refresh_flashinfer_page_indices(total_blocks)
             self._vswa_active_pool_id = primary_pool_id
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
@@ -1782,6 +1993,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     # Advance by the uncropped count so the next request starts at the correct
                     # offset even if this row hit `table_width`.
                     source_offset += num_blocks_for_row
+                # The pool indices carry BAD_PAGE_INDEX (-1) for blocks a
+                # sliding-window request no longer owns; the trtllm-gen decode
+                # kernel indexes the pool with every block table entry, so
+                # clamp them to page 0 exactly as the FlashInfer page-index
+                # buffer does. `prepare()` has already proven those slots hold
+                # no in-window token.
+                host_table.clamp_(min=0)
                 # Keep the graph-captured device address stable and transfer only the compact
                 # rectangle prepared in pinned host memory.
                 block_tables[:update_rows, :update_width].copy_(
@@ -1938,18 +2156,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # device buffer address must survive replans for CUDA graphs.
         wrappers = self._plan_params_to_wrappers.get(plan_params)
         if wrappers is None:
-            wrappers = FlashInferWrappers(is_planned=False)
+            wrappers = FlashInferWrappers(
+                is_planned=False, workspace_buffer=self._acquire_workspace())
             self._plan_params_to_wrappers[plan_params] = wrappers
+        workspace_buffer = wrappers.workspace_buffer
 
         if wrappers.prefill_wrapper is None:
             wrappers.prefill_wrapper = \
                 flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
+                    workspace_buffer,
                     self.kv_layout,
                     backend=flashinfer_backend,
                     qo_indptr_buf=self.qo_indptr,
                     paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
-                    paged_kv_indices_buf=self._paged_kv_indices,
+                    paged_kv_indices_buf=self._fi_page_indices,
                     paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
                     use_cuda_graph=self.is_cuda_graph)
         prefill_wrapper = wrappers.prefill_wrapper
@@ -1972,7 +2192,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             prefill_wrapper.plan(
                 self.qo_indptr[:self.num_contexts + 1],
                 self.paged_kv_indptr_prefill[:self.num_contexts + 1],
-                self._paged_kv_indices[:self.num_context_blocks],
+                self._fi_page_indices[:self.num_context_blocks],
                 self._paged_kv_last_page_len[:self.num_contexts],
                 plan_params.num_heads,
                 plan_params.num_kv_heads,
@@ -1992,11 +2212,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
             wrappers.decode_wrapper = \
                 flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
+                    workspace_buffer,
                     self.kv_layout,
                     use_cuda_graph=self.is_cuda_graph,
                     paged_kv_indptr_buffer=self.paged_kv_indptr_decode,
-                    paged_kv_indices_buffer=self._paged_kv_indices,
+                    paged_kv_indices_buffer=self._fi_page_indices,
                     paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
                     use_tensor_cores=use_tensor_cores
                     or flashinfer_backend == "trtllm-gen",
@@ -2028,7 +2248,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     plan_params, wrappers)
             decode_wrapper.plan(
                 paged_kv_indptr[:self.num_generations + 1],
-                self.paged_kv_indices[self.num_context_blocks:],
+                self.flashinfer_page_indices[self.num_context_blocks:],
                 self.paged_kv_last_page_len[self.num_contexts:],
                 plan_params.num_heads,
                 plan_params.num_kv_heads,

@@ -30,7 +30,7 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1273,10 +1273,24 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         FlashInfer backend is required for hybrid attention (per-layer
         head_dim 256/512 with VSWA), trtllm-gen cubin dispatch, and
         bidirectional attention masks for multimodal tokens.
+
+        On Hopper (SM90) the CUTLASS MoE finalize fusion is disabled by
+        default: with top-k > 2 (Gemma 4 routes top-k 8) the fused FC2 +
+        finalize epilogue is nondeterministic, so repeated greedy requests
+        through one engine can return different tokens. Disabling it measured
+        no throughput cost at the validated H200 operating point (8k ISL / 1k
+        OSL, concurrency 12: 680.76 vs 680.00 output tok/s). Blackwell keeps
+        the stock default; its configurations were validated with the fusion
+        enabled.
         """
-        return {
+        defaults: dict = {
             "attn_backend": "FLASHINFER",
         }
+        if get_sm_version() == 90:
+            defaults["moe_config"] = {
+                "disable_finalize_fusion": True,
+            }
+        return defaults
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
@@ -1339,11 +1353,18 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         """Build context mask with causal + bidirectional for MM tokens.
 
         Returns a [extend_len, prefix_len + extend_len] mask where:
-        - The first `prefix_len` columns (cached/paged history) are True for
-          all rows. SWA window enforcement is delegated to the kernel's
-          window_left clip. Bidirectional MM across the prefix/extend
-          boundary is NOT supported here; callers must ensure chunk
-          boundaries do not split a multimodal block.
+        - The first `prefix_len` columns (cached/paged history) carry the
+          sliding-window clip themselves, computed on *absolute* positions.
+          They cannot delegate it to the kernel: FlashInfer's prefill plan
+          sets ``window_left = -1`` whenever ``custom_mask`` is supplied
+          (``flashinfer.py``: "Setting `window_left` to -1 for custom
+          attention mask is important. Else, FlashInfer proceeds to use SWA
+          regardless of attention_mask_data"), so a mask that leaves these
+          columns unconditionally True lets a sliding layer read arbitrarily
+          far back once a chunked multimodal prefill grows past the window.
+          Bidirectional MM across the prefix/extend boundary is NOT supported
+          here; callers must ensure chunk boundaries do not split a
+          multimodal block.
         - The last `extend_len` columns follow the original causal +
           (optional) sliding window + MM-bidirectional logic.
         """
@@ -1360,9 +1381,23 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         causal_mask = causal_mask.masked_fill(token_type_mask, True)
 
         if prefix_len > 0:
-            prefix_block = torch.ones(
-                extend_len, prefix_len, dtype=causal_mask.dtype, device=device
-            )
+            # Rows are absolute positions ``prefix_len + r``; prefix columns are
+            # absolute positions ``c``. Same window predicate the extend block
+            # uses (``c > r_abs - window``), just expressed across the boundary.
+            if (
+                effective_sliding_window is not None
+                and effective_sliding_window <= prefix_len + extend_len - 1
+            ):
+                row_abs = torch.arange(prefix_len, prefix_len + extend_len, device=device)
+                col_abs = torch.arange(prefix_len, device=device)
+                prefix_block = (
+                    col_abs.unsqueeze(0) > row_abs.unsqueeze(1) - effective_sliding_window
+                )
+                prefix_block = prefix_block.to(causal_mask.dtype)
+            else:
+                prefix_block = torch.ones(
+                    extend_len, prefix_len, dtype=causal_mask.dtype, device=device
+                )
             causal_mask = torch.cat([prefix_block, causal_mask], dim=1)
 
         return causal_mask
