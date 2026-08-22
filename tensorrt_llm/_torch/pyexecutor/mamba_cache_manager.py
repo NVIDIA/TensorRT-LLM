@@ -2485,11 +2485,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        # For capturable drafting loops. During normal inference, the draft model always
-        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
-        # we need to make the KV cache manager aware that multiple autoregressive steps will
-        # occur.
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
@@ -2502,7 +2497,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if requests:
@@ -3550,7 +3544,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
     ) -> List[LlmRequest]:
         requests = super().add_dummy_requests(
@@ -3563,7 +3556,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
             encoder_output_lens=encoder_output_lens,
-            num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
         if requests and prepare_resource:

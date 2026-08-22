@@ -3238,7 +3238,6 @@ class KVCacheManagerV2(BaseResourceManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
     ):
         _kv_draft = (
@@ -3307,7 +3306,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     release_resources(req)
                     return None
                 kv_cache.stop_committing()
-                dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
+                dummy_capacity = token_num + self.num_extra_kv_tokens
                 if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block

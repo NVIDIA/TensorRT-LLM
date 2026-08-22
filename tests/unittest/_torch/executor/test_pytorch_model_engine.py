@@ -216,7 +216,6 @@ def _make_forward_only_engine(
     )
     engine.runtime_draft_len = 0
     engine.attn_backend = None
-    engine.model_is_wrapped = False
     engine.original_max_draft_len = 0
     engine.original_max_total_draft_tokens = 0
     engine._spec_dec_max_total_draft_tokens = 0
