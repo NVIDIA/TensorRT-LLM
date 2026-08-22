@@ -1,0 +1,69 @@
+{
+  "sparse_attention_config": {
+    "config_groups": {
+      "group_0": {
+        "algorithm": "skip_softmax",
+        "targets": [
+          "WanAttention"
+        ],
+        "ignore": [
+          "blocks.0.attn1",
+          "blocks.0.attn2",
+          "blocks.1.attn1",
+          "blocks.1.attn2",
+          "blocks.2.attn2",
+          "blocks.3.attn2",
+          "blocks.4.attn2",
+          "blocks.5.attn2",
+          "blocks.6.attn2",
+          "blocks.7.attn2",
+          "blocks.8.attn2",
+          "blocks.9.attn2",
+          "blocks.10.attn2",
+          "blocks.11.attn2",
+          "blocks.12.attn2",
+          "blocks.13.attn2",
+          "blocks.14.attn2",
+          "blocks.15.attn2",
+          "blocks.16.attn2",
+          "blocks.17.attn2",
+          "blocks.18.attn2",
+          "blocks.19.attn2",
+          "blocks.20.attn2",
+          "blocks.21.attn2",
+          "blocks.22.attn2",
+          "blocks.23.attn2",
+          "blocks.24.attn2",
+          "blocks.25.attn2",
+          "blocks.26.attn2",
+          "blocks.27.attn2",
+          "blocks.28.attn2",
+          "blocks.29.attn2",
+          "blocks.30.attn2",
+          "blocks.31.attn2",
+          "blocks.32.attn2",
+          "blocks.33.attn2",
+          "blocks.34.attn2",
+          "blocks.35.attn2",
+          "blocks.36.attn2",
+          "blocks.37.attn2",
+          "blocks.38.attn1",
+          "blocks.38.attn2",
+          "blocks.39.attn1",
+          "blocks.39.attn2"
+        ],
+        "threshold_scale_factor": {
+          "formula": "a * exp(b * target_sparsity)",
+          "coefficients": {
+            "a": 314.68242763240454,
+            "b": 6.166472427782809
+          }
+        },
+        "target_sparsity": 0.5
+      }
+    },
+    "producer": {
+      "name": "modelopt"
+    }
+  }
+}
