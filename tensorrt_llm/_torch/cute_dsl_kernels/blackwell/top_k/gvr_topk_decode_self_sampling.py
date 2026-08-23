@@ -426,7 +426,7 @@ def ldg_f32(base_addr, idx):
         cute.AddressSpace.gmem,
         assumed_align=4,
     )
-    frag = cute.make_fragment((1,), cutlass.Float32)
+    frag = cute.make_rmem_tensor((1,), cutlass.Float32)
     cute.copy(atom, cute.make_tensor(p, cute.make_layout((1,))), frag)
     return frag[0]
 
@@ -788,7 +788,7 @@ def scan_cross0(
         atom = smem_atom_i32_128()
         hbase = s_hist.iterator.toint()
         # pass 1: span sum via NV uint4 LDS.128 (L243-251)
-        frags = [cute.make_fragment((4,), cutlass.Int32) for _ in range(NV)]
+        frags = [cute.make_rmem_tensor((4,), cutlass.Int32) for _ in range(NV)]
         sm = cutlass.Int32(0)
         for q in cutlass.range_constexpr(NV):
             boff = (lane * cutlass.Int32(NV) + cutlass.Int32(q)) * cutlass.Int32(16)
@@ -806,10 +806,10 @@ def scan_cross0(
             if cutlass.const_expr(HOLD):
                 vv = frags[q]
             else:
-                vv = cute.make_fragment((4,), cutlass.Int32)  # re-read span
+                vv = cute.make_rmem_tensor((4,), cutlass.Int32)  # re-read span
                 boff = (lane * cutlass.Int32(NV) + cutlass.Int32(q)) * cutlass.Int32(16)
                 lds128_i32(atom, hbase, boff, vv)
-            o4 = cute.make_fragment((4,), cutlass.Int32)
+            o4 = cute.make_rmem_tensor((4,), cutlass.Int32)
             for j in cutlass.range_constexpr(3, -1, -1):
                 cq = vv[j]
                 if cutlass.const_expr(zero):
@@ -847,7 +847,7 @@ def scan_cross0(
                         s_res[RES_B3] = gb
                 after = after + cq
             if cutlass.const_expr(addf):  # fold per-rank bin offset (L279-282)
-                av = cute.make_fragment((4,), cutlass.Int32)
+                av = cute.make_rmem_tensor((4,), cutlass.Int32)
                 aoff = (lane * cutlass.Int32(NV) + cutlass.Int32(q)) * cutlass.Int32(16)
                 lds128_i32(atom, s_addv.iterator.toint(), aoff, av)
                 for j in cutlass.range_constexpr(4):
@@ -933,7 +933,7 @@ def scan_cross_w(s_hist, s_ws, target, tidx, s_res, blk: cutlass.Constexpr, nb: 
     NW = blk // 32
     lane = tidx & cutlass.Int32(31)
     wid = tidx >> cutlass.Int32(5)
-    loc = cute.make_fragment((BPT,), cutlass.Int32)
+    loc = cute.make_rmem_tensor((BPT,), cutlass.Int32)
     base = tidx * cutlass.Int32(BPT)
     sm = cutlass.Int32(0)
     for i in cutlass.range_constexpr(BPT):  # L297-300 (#pragma unroll)
@@ -1023,7 +1023,7 @@ def merge_scan0(
         base = lane * cutlass.Int32(BPT)
         # descending walk: crossing pin + prefix-biased cursors into mrg
         for q in cutlass.range_constexpr(NV - 1, -1, -1):  # L151-165
-            o4 = cute.make_fragment((4,), cutlass.Int32)
+            o4 = cute.make_rmem_tensor((4,), cutlass.Int32)
             for j in cutlass.range_constexpr(3, -1, -1):
                 cq = tot_r[q][j]
                 o4[j] = after + pre_r[q][j]
@@ -1278,7 +1278,7 @@ def _ldg_f32_rs(base_addr, idx, sc4):
         cute.AddressSpace.gmem,
         assumed_align=4,
     )
-    frag = cute.make_fragment((1,), cutlass.Float32)
+    frag = cute.make_rmem_tensor((1,), cutlass.Float32)
     cute.copy(atom, cute.make_tensor(p, cute.make_layout((1,))), frag)
     return frag[0]
 
@@ -1836,8 +1836,8 @@ class GvrMainKernel:
 
         # ============ P1: sample prefetch (hint gather LAZY, L489-529) =======
         atom128 = C.g2r_atom_f32(128, invariant=True)
-        fsa = cute.make_fragment((4,), cutlass.Float32)
-        fsb = cute.make_fragment((4,), cutlass.Float32)
+        fsa = cute.make_rmem_tensor((4,), cutlass.Float32)
+        fsb = cute.make_rmem_tensor((4,), cutlass.Float32)
         shas = cutlass.Int32(0)
         if tidx < SMP:
             shas = cutlass.Int32(1)
@@ -1856,8 +1856,8 @@ class GvrMainKernel:
             for t in cutlass.range_constexpr(4):
                 smn = C.fmin_f32(smn, fsb[t])
                 smx = C.fmax_f32(smx, fsb[t])
-        fma_ = cute.make_fragment((4,), cutlass.Float32)  # strided-tail pair bufs
-        fmb_ = cute.make_fragment((4,), cutlass.Float32)
+        fma_ = cute.make_rmem_tensor((4,), cutlass.Float32)  # strided-tail pair bufs
+        fmb_ = cute.make_rmem_tensor((4,), cutlass.Float32)
         j = tidx + cutlass.Int32(BLK)  # L544-550 strided tail
         while j < SMP:
             p4 = j * SS2 * cutlass.Int32(2)
@@ -1879,7 +1879,7 @@ class GvrMainKernel:
 
         # PRIME-LATE prefetch block (L556-616): strictly after the barrier.
         lim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)  # L524
-        pf = [cute.make_fragment((4,), cutlass.Float32) for _ in range(max(PFD, 1))]
+        pf = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(max(PFD, 1))]
         if cutlass.const_expr(self.pf):
             fullsl = cutlass.Int32(0)
             if (c1 - c0) >= cutlass.Int32(BLK * U):
@@ -2061,7 +2061,7 @@ class GvrMainKernel:
         alive = cutlass.Int32(1)
 
         fr = [
-            cute.make_fragment((4,), cutlass.Float32) for _ in range(max(U - PFD, 1))
+            cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(max(U - PFD, 1))
         ]  # explicit batch (op43 L1)
         att = cutlass.Int32(0)
         running = cutlass.Int32(1)
@@ -3583,7 +3583,7 @@ class GvrTopkRegKernel:
 
             # ---- row load: exact-fit peel + float4[VPT] register batch (L1327-1350)
             atom128 = g2r_atom_f32(128, invariant=True)
-            frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(VPT)]
+            frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(VPT)]
             if n4 >= cutlass.Int32(self.blk * self.vpt):  # block-uniform peel
                 for u in cutlass.range_constexpr(VPT):
                     ld_g_f32x4(atom128, x_addr, tid + cutlass.Int32(u * self.blk), frags[u])
@@ -4547,7 +4547,7 @@ class GvrClusKernel:
             base = lane * cutlass.Int32(BPT)
             # descending walk: crossing pin + prefix-biased cursors into mrg
             for q in cutlass.range_constexpr(NV - 1, -1, -1):  # L151-165
-                o4 = cute.make_fragment((4,), cutlass.Int32)
+                o4 = cute.make_rmem_tensor((4,), cutlass.Int32)
                 for j in cutlass.range_constexpr(3, -1, -1):
                     cq = tot_r[q][j]
                     o4[j] = after + pre_r[q][j]
@@ -4840,8 +4840,8 @@ class GvrClusKernel:
             # one 64B line = 4 float4 per location, TWO threads: tid takes the
             # lower pair at p4, tid+SMP the upper pair at p4+2 (L1868-1869).
             atom128 = C.g2r_atom_f32(128, invariant=True)
-            fsa = cute.make_fragment((4,), cutlass.Float32)
-            fsb = cute.make_fragment((4,), cutlass.Float32)
+            fsa = cute.make_rmem_tensor((4,), cutlass.Float32)
+            fsb = cute.make_rmem_tensor((4,), cutlass.Float32)
             smp2 = SMP * cutlass.Int32(2)
             shas = cutlass.Int32(0)
             if tidx < smp2:
@@ -4863,8 +4863,8 @@ class GvrClusKernel:
                 for t in cutlass.range_constexpr(4):
                     smn = C.fmin_f32(smn, fsb[t])
                     smx = C.fmax_f32(smx, fsb[t])
-            fma_ = cute.make_fragment((4,), cutlass.Float32)  # mop-up pair bufs
-            fmb_ = cute.make_fragment((4,), cutlass.Float32)
+            fma_ = cute.make_rmem_tensor((4,), cutlass.Float32)  # mop-up pair bufs
+            fmb_ = cute.make_rmem_tensor((4,), cutlass.Float32)
             j = tidx + cutlass.Int32(BLK)  # mop-up L1891-1897
             while j < smp2:
                 p4 = j * SS2 * cutlass.Int32(4)
@@ -4888,7 +4888,7 @@ class GvrClusKernel:
 
             # PRIME-LATE (L1903-1916): every rank's sample has landed; prime NOW.
             lim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)  # L1904
-            pf = [cute.make_fragment((4,), cutlass.Float32) for _ in range(PFD)]
+            pf = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(PFD)]
             for uu in cutlass.range_constexpr(PFD):  # clamped prime L1906
                 i_ = rank * cutlass.Int32(STEPC) + tidx + cutlass.Int32(uu * BLK)
                 ic = i_
@@ -5037,7 +5037,7 @@ class GvrClusKernel:
             valid = cutlass.Int32(0)
 
             fr = [
-                cute.make_fragment((4,), cutlass.Float32) for _ in range(U - PFD)
+                cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(U - PFD)
             ]  # explicit batch (op43 L1)
             # (empty for U<=PFD — every row-pass float4 then comes from pf[])
             att = cutlass.Int32(0)
@@ -6021,7 +6021,7 @@ class GvrRegClusKernel:
             # the CUDA has NO exact-fit peel here, guard is per-load). Issue all
             # loads first (op43 L1), then -INFINITY-fill missed slots (op43 L2).
             atom128 = g2r_atom_f32(128, invariant=True)
-            frags = [cute.make_fragment((4,), cutlass.Float32) for _ in range(VPT)]
+            frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(VPT)]
             for u in cutlass.range_constexpr(VPT):
                 i = base4 + tid + cutlass.Int32(u * self.blk)
                 if i < n4:
