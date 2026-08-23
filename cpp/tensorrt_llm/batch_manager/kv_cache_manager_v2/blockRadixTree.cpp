@@ -480,7 +480,8 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     // curr when its last shared_ptr is dropped.
     Block* curr
         = pruneStart && pruneStart->type() == NodeBase::Type::kBLOCK ? static_cast<Block*>(pruneStart) : nullptr;
-    while (curr && curr->next.empty() && curr->storage.at(lcIdx) == nullptr)
+    while (curr && curr->next.empty()
+        && std::all_of(curr->storage.begin(), curr->storage.end(), [](auto p) { return p == nullptr; }))
     {
         NodeBase* prevNode = curr->prev;
         BlockKey const currKey = curr->key;

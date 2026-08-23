@@ -18,7 +18,6 @@
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
-#include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
@@ -31,27 +30,21 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
-
 namespace
 {
 
-// Copy one slot's data across all pools in a pool group.
-// Used by resume() (GPU→GPU partial block copy) and _snapshotSsmToTreeBlock().
-void copySlotData(StorageManager& storageMgr, CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex pgIdx,
-    SlotId dstSlotId, SlotId srcSlotId, CUstream stream)
+int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleId lifeCycle)
 {
-    auto slotSizes = storageMgr.slotSize(pgIdx);
-    CacheTier dstTier = storageMgr.cacheTier(dstLevel);
-    CacheTier srcTier = storageMgr.cacheTier(srcLevel);
-    for (PoolIndex poolIdx{0}; poolIdx < slotSizes.size(); ++poolIdx)
+    PoolGroupIndex const poolGroup = storage.getPoolGroupIndex(level, lifeCycle);
+    int64_t pageSize = 0;
+    for (size_t const size : storage.slotSize(level, poolGroup))
     {
-        Address dst = storageMgr.slotAddress(dstLevel, pgIdx, dstSlotId, poolIdx);
-        Address src = storageMgr.slotAddress(srcLevel, pgIdx, srcSlotId, poolIdx);
-        batchedCopy(dstTier, srcTier, static_cast<size_t>(slotSizes[poolIdx]), {{dst, src}}, stream);
+        pageSize += static_cast<int64_t>(size);
     }
+    return pageSize;
 }
 
-} // anonymous namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // KvCache constructor
@@ -264,7 +257,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
     // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kGpuLevel);
+    auto const utilizations = mManager->storage().getUtilization(kHotLevel);
     float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
     if (utilization > mManager->config().maxUtilForResume)
     {
@@ -337,11 +330,13 @@ bool KvCache::resume(std::optional<CUstream> stream)
                     tmpSlots[lc].pop_back();
                 }
                 // Remaining slots are scratch slots.
+                auto& scratchSlots = mScratchSlots[lc];
+                scratchSlots.reserve(scratchSlots.size() + tmpSlots[lc].size());
                 for (auto& slot : tmpSlots[lc])
                 {
-                    mScratchSlots[lc].emplace_back(std::move(slot), *this, lc,
+                    scratchSlots.emplace_back(std::move(slot), *this, lc,
                         /*skipWait=*/true);
-                    scratchReadyEvents.push_back(&mScratchSlots[lc].back().slot().readyEvent);
+                    scratchReadyEvents.push_back(&scratchSlots.back().slot().readyEvent);
                 }
             }
         }
@@ -362,7 +357,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (deferredSlots[lc].has_value())
-                storageMgr.releaseSlot(lc, kGpuLevel, std::move(*deferredSlots[lc]));
+                storageMgr.releaseSlot(lc, kHotLevel, std::move(*deferredSlots[lc]));
         }
         // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
         // a recordEventScope, matching Python behavior.
@@ -412,8 +407,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
             srcLocks.push_back(lock);
 
-            PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
-            copySlotData(storageMgr, kGpuLevel, kGpuLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+            storageMgr.copySlotData(lcIdx, kHotLevel, kHotLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
             if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && _shouldRecordStats())
             {
                 bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
@@ -425,10 +419,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             }
             KVCacheIterationStatsDelta iterationStats;
             iterationStats.iterIntraDeviceCopyBlocks = 1;
-            for (size_t const size : storageMgr.slotSize(pgIdx))
-            {
-                iterationStats.iterIntraDeviceCopyBytes += static_cast<int64_t>(size);
-            }
+            iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(storageMgr, kHotLevel, lcIdx);
             _recordDirectIterationStats(lcIdx, iterationStats);
         }
 
@@ -461,7 +452,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 blockOrdinal = lastOrdinal;
             }
 
-            auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kGpuLevel, beamIdx);
+            auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kHotLevel, beamIdx);
             newPage->setSlot(newSlot);
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
@@ -482,11 +473,11 @@ bool KvCache::prefetch(CacheLevel target)
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
     CacheLevel const numTiers = storageMgr.numCacheLevels();
-    TLLM_CHECK_DEBUG(kGpuLevel <= target && target < numTiers);
+    TLLM_CHECK_DEBUG(kHotLevel <= target && target < numTiers);
 
-    PoolGroupIndex const numPoolGroups = storageMgr.numPoolGroups();
-    TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
-        numPoolGroups, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
+    LifeCycleId const numLifeCycles = storageMgr.numLifeCycles();
+    TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
+        numLifeCycles, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
 
     for (auto const& activePage : _activePages())
     {
@@ -500,8 +491,7 @@ bool KvCache::prefetch(CacheLevel target)
         {
             continue;
         }
-        auto const pgIdx = storageMgr.getPoolGroupIndex(activePage.lcId);
-        allPages.at(pgIdx).at(level).push_back(std::move(page));
+        allPages.at(activePage.lcId).at(level).push_back(std::move(page));
     }
 
     try
@@ -650,21 +640,14 @@ void KvCache::_recordMigratedSlots(
         LifeCycleId const lifeCycle = page->lifeCycle;
         bool const isAttention = std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle));
 
-        PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
-        int64_t pageSize = 0;
-        for (size_t const size : mManager->storage().slotSize(poolGroup))
-        {
-            pageSize += static_cast<int64_t>(size);
-        }
-
         KVCacheStatsDelta stats;
         KVCacheIterationStatsDelta iterationStats;
-        if (srcLevel == kGpuLevel && dstLevel > kGpuLevel)
+        if (srcLevel == kHotLevel && dstLevel > kHotLevel)
         {
             iterationStats.iterOffloadBlocks = 1;
-            iterationStats.iterOffloadBytes = pageSize;
+            iterationStats.iterOffloadBytes = sumSlotBytes(mManager->storage(), dstLevel, lifeCycle);
         }
-        else if (dstLevel == kGpuLevel)
+        else if (dstLevel == kHotLevel)
         {
             // Global cache-hit accounting is attention-only. SSM movement is
             // reported by lifecycle/pool-group iteration statistics instead.
@@ -675,15 +658,15 @@ void KvCache::_recordMigratedSlots(
             }
             iterationStats.iterAllocTotalBlocks = 1;
             iterationStats.iterAllocNewBlocks = 1;
-            if (srcLevel > kGpuLevel)
+            if (srcLevel > kHotLevel)
             {
                 iterationStats.iterOnboardBlocks = 1;
-                iterationStats.iterOnboardBytes = pageSize;
+                iterationStats.iterOnboardBytes = sumSlotBytes(mManager->storage(), srcLevel, lifeCycle);
             }
-            else if (srcLevel == kGpuLevel)
+            else if (srcLevel == kHotLevel)
             {
                 iterationStats.iterIntraDeviceCopyBlocks = 1;
-                iterationStats.iterIntraDeviceCopyBytes = pageSize;
+                iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(mManager->storage(), kHotLevel, lifeCycle);
             }
         }
 
@@ -698,7 +681,6 @@ void KvCache::_recordMigratedSlots(
 
 void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
 {
-    (void) cacheLevel;
     if (!_shouldRecordStats())
     {
         return;
@@ -706,15 +688,9 @@ void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, Cac
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
-        PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
-        int64_t pageSize = 0;
-        for (size_t const size : mManager->storage().slotSize(poolGroup))
-        {
-            pageSize += static_cast<int64_t>(size);
-        }
         KVCacheIterationStatsDelta iterationStats;
         iterationStats.iterHostDroppedBlocks = 1;
-        iterationStats.iterHostDroppedBytes = pageSize;
+        iterationStats.iterHostDroppedBytes = sumSlotBytes(mManager->storage(), cacheLevel, lifeCycle);
         _recordDirectIterationStats(lifeCycle, iterationStats);
     }
 }
@@ -800,10 +776,10 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
     }
 
     auto& storageMgr = mManager->storage();
-    PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
 
     for (CacheLevel lvl = srcPage->cacheLevel; lvl < storageMgr.numCacheLevels(); ++lvl)
     {
+        PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lvl, lcIdx);
         Slot newSlot;
         try
         {
@@ -817,7 +793,7 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 
         CUstream stream = cudaStream();
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        copySlotData(storageMgr, lvl, srcPage->cacheLevel, pgIdx, newSlot.slotId(), srcPage->slotId(), stream);
+        storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
 
         newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
         auto committed = makeShared<CommittedPage>(
@@ -1117,7 +1093,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     auto slot = std::move(slots[lc].back());
                     slots[lc].pop_back();
                     slot.readyEvent = finishEvent();
-                    mManager->storage().releaseSlot(lc, kGpuLevel, std::move(slot));
+                    mManager->storage().releaseSlot(lc, kHotLevel, std::move(slot));
                 }
             }
         }
@@ -1198,7 +1174,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     }
                     auto slot = std::move(slots[lc].back());
                     slots[lc].pop_back();
-                    auto page = makeShared<UncommittedPage>(*this, ord, lc, kGpuLevel, bi);
+                    auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, bi);
                     page->setSlot(slot);
                     sb.pages[bi][lc] = page->lock(*this, bi, ord, lc, /*skipWait=*/true);
                 }
@@ -1231,7 +1207,7 @@ void KvCache::setCapacity(int cap)
 void KvCache::setHistoryLength(int hist)
 {
     bool success = resize(std::nullopt, hist);
-    TLLM_CHECK_DEBUG(success);
+    TLLM_CHECK(success);
     (void) success;
 }
 
@@ -1363,7 +1339,7 @@ void KvCache::_increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength)
 
             size_t si = slotCounters[lc]++;
             auto& slot = allSlots[lc][si];
-            auto page = makeShared<UncommittedPage>(*this, ord, lc, kGpuLevel, kDefaultBeamIndex);
+            auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, kDefaultBeamIndex);
             page->setSlot(slot);
             sb.pages[kDefaultBeamIndex][lc] = page->lock(*this, kDefaultBeamIndex, ord, lc);
         }
@@ -1742,14 +1718,18 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
 
     bool const commitMinSnapshot = mManager->commitMinSnapshot();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    int const numCommitted = static_cast<int>(mCommittedTokens.size()) + static_cast<int>(tokens.size());
     if (commitMinSnapshot)
     {
-        int const newNumCommitted = static_cast<int>(mCommittedTokens.size()) + static_cast<int>(tokens.size());
-        if (mHistoryLength != static_cast<int>(mCommittedTokens.size()) && mHistoryLength != newNumCommitted)
+        if (mHistoryLength != static_cast<int>(mCommittedTokens.size()) && mHistoryLength != numCommitted)
         {
             throw AssertionError("commit_min_snapshot requires commit() to start or end at history_length");
         }
     }
+
+    // Update history before mutating the committed-token state so an invalid growth leaves commit() retryable.
+    if (mCommitState != CommitState::VIRTUAL_STOP && mHistoryLength < numCommitted)
+        setHistoryLength(numCommitted);
 
     // Append tokens to committed list.
     mCommittedTokens.insert(mCommittedTokens.end(), tokens.begin(), tokens.end());
@@ -1759,12 +1739,6 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
             mCommitState = CommitState::USER_STOP;
         return;
     }
-
-    // Bump history_length to cover newly committed tokens (mirrors Python — done
-    // BEFORE the commit loop so stale-range computation sees the new history).
-    int const numCommitted = static_cast<int>(mCommittedTokens.size());
-    if (mHistoryLength < numCommitted)
-        setHistoryLength(numCommitted);
 
     int const numCommittedBlocksBefore = mNumCommittedBlocks;
     int const newNumFullBlocks = numCommitted / mTokensPerBlock;
