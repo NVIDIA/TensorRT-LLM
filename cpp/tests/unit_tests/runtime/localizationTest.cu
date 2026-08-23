@@ -145,10 +145,25 @@ protected:
     struct StreamHolder
     {
         CUstream stream = nullptr;
+        //! True only for streams this holder created. Borrowed localized streams are owned by the
+        //! process-lifetime localization resource and must stay unowned here.
+        bool owned = false;
 
         StreamHolder() = default;
         StreamHolder(StreamHolder const&) = delete;
         StreamHolder& operator=(StreamHolder const&) = delete;
+
+        ~StreamHolder() noexcept
+        {
+            if (owned && stream != nullptr)
+            {
+                auto const result = cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream));
+                if (result != cudaSuccess)
+                {
+                    ADD_FAILURE() << "cudaStreamDestroy failed during cleanup: " << cudaGetErrorString(result);
+                }
+            }
+        }
     };
 
     std::unique_ptr<LocalizationHandle> mHandle;
@@ -445,6 +460,7 @@ TEST_F(LocalizationTest, DISABLED_PerformanceTestSingleStream20GB)
     // Create stream
     StreamHolder stream;
     TLLM_CUDA_CHECK(cudaStreamCreate(reinterpret_cast<cudaStream_t*>(&stream.stream)));
+    stream.owned = true;
 
     // Run test
     float totalTime = runMemcpyTest(devDst.ptr, devSrc.ptr, sizeBytes, stream.stream, iterations);

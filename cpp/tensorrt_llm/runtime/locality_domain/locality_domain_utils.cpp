@@ -486,7 +486,7 @@ private:
             }
         }
 
-        if (mRemainderStream != nullptr && mApi.greenCtxDestroy != nullptr)
+        if (mRemainderStream != nullptr)
         {
             CUresult const result = cuStreamDestroy(mRemainderStream);
             if (result != CUDA_SUCCESS)
