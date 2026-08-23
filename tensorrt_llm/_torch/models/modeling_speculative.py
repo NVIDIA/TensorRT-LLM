@@ -45,6 +45,8 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              get_model_architecture, register_auto_model)
 
+_SPECULATIVE_POSITION_HEADROOM = "_speculative_position_headroom"
+
 
 def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
     if hasattr(config,
@@ -2552,7 +2554,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
-                    self.draft_config.extra_attrs = model_config.extra_attrs
+                    self.draft_config.extra_attrs = dict(
+                        model_config.extra_attrs)
+                    self.draft_config.extra_attrs[
+                        _SPECULATIVE_POSITION_HEADROOM] = (
+                            2 * spec_config.tokens_per_gen_step)
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(
