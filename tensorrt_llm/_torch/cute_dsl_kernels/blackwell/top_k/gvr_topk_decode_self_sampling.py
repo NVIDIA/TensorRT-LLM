@@ -402,19 +402,49 @@ def g2r_atom_i32(bits: int, invariant: bool = False):
     )
 
 
+@dsl_user_op
+def _ld_g_nc_v4_f32(gaddr, *, loc=None, ip=None):
+    """Pinned `ld.global.nc.v4.f32` (CUDA `__ldg(const float4*)`).
+
+    DSL 4.6.1's NVVM rewrites adjacent 128-bit f32 copy-atom loads into
+    v2.b64 register-PAIR loads plus mov.b64 unpacks (PTX diff: v4.b32
+    30->12, v2.b64 0->+18 on gvr_clus). The even-aligned pair constraint
+    fragments allocation at the 64-register wall: same source, same ptxas
+    13.2 gives 64 regs / 4B spill from the 4.5.0 PTX but 63 regs / 80B
+    spill from the 4.6.1 PTX (clus +20% time, reg +8.5%). The asm boundary
+    pins the four-scalar-f32 shape on every DSL version."""
+    from cutlass._mlir import ir as _ir
+
+    st = _ir.Type.parse("!llvm.struct<(f32, f32, f32, f32)>")
+    r = mlir_llvm.inline_asm(
+        st,
+        [gaddr.ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Float32(mlir_llvm.extractvalue(T.f32(), r, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
 def ld_g_f32x4(copy_atom, base_addr, v_idx, frag):
     """Load float4 #v_idx (16B units) from gmem byte base into frag[0..3].
 
     op43 ct_tp.py:236-245 idiom. base_addr: Int64 byte address; frag: (4,) f32
     fragment. Issue ALL batch members before consuming any (op43 lesson L1).
+    Pinned-asm form (see _ld_g_nc_v4_f32); copy_atom kept for call-site
+    compatibility.
     """
-    p = cute.make_ptr(
-        cutlass.Float32,
-        base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16),
-        cute.AddressSpace.gmem,
-        assumed_align=16,
-    )
-    cute.copy(copy_atom, cute.make_tensor(p, cute.make_layout((4,))), frag)
+    v0, v1, v2, v3 = _ld_g_nc_v4_f32(base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16))
+    frag[0] = v0
+    frag[1] = v1
+    frag[2] = v2
+    frag[3] = v3
 
 
 def ldg_f32(base_addr, idx):
