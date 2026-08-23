@@ -1561,9 +1561,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("buffers", &kv::SsmLayerConfig::buffers) DEF_COPY(kv::SsmLayerConfig);
 
     nb::class_<kv::KVCacheDesc>(m, "KVCacheDesc")
-        .def(nb::init<int, int>(), nb::arg("capacity"), nb::arg("history_length"))
+        .def(nb::init<int, int, int, int>(), nb::arg("capacity"), nb::arg("history_length"), nb::arg("beam_width") = 1,
+            nb::arg("prompt_length") = 0)
         .def_rw("capacity", &kv::KVCacheDesc::capacity)
         .def_rw("history_length", &kv::KVCacheDesc::historyLength)
+        .def_rw("beam_width", &kv::KVCacheDesc::beamWidth)
+        .def_rw("prompt_length", &kv::KVCacheDesc::promptLength)
         .def("__eq__",
             [](kv::KVCacheDesc const& self, nb::handle other)
             {
@@ -1576,8 +1579,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__repr__",
             [](kv::KVCacheDesc const& self)
             {
-                return "KVCacheDesc(capacity=" + std::to_string(self.capacity)
-                    + ", history_length=" + std::to_string(self.historyLength) + ")";
+                return "KVCacheDesc(capacity=" + std::to_string(self.capacity) + ", history_length="
+                    + std::to_string(self.historyLength) + ", beam_width=" + std::to_string(self.beamWidth)
+                    + ", prompt_length=" + std::to_string(self.promptLength) + ")";
             }) DEF_COPY(kv::KVCacheDesc);
 
     nb::class_<kv::BatchDesc>(m, "BatchDesc")

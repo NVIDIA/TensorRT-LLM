@@ -145,9 +145,20 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class KVCacheDesc:
     capacity: int
     history_length: int
+    # Beam search does not replicate the whole cache. Blocks that lie entirely
+    # inside the prompt are committed and canonicalized to beam 0 (see
+    # KVCache._append_beams, which skips ordinals below
+    # prompt_length // tokens_per_block and every committed block); only the
+    # prompt tail onward is replicated. Scaling everything by beam_width would
+    # cancel out in the normalized pool ratio and leave the skew between life
+    # cycles in place, so the split has to be modelled explicitly.
+    beam_width: int = 1
+    prompt_length: int = 0
 
     def __post_init__(self) -> None:
         assert 0 <= self.history_length <= self.capacity
+        assert self.beam_width >= 1
+        assert self.prompt_length >= 0
 
 
 # A batch of requests, working as a use case the KVCacheManager must always support.
