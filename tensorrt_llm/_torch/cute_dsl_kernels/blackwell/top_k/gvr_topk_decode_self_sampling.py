@@ -3338,10 +3338,29 @@ def _no_carveout():
 
     orig = _cdsl._build_kernel_attrs
     _cdsl._build_kernel_attrs = lambda config: {}
+    # DSL >= 4.6.1 also derives a carveout inside the compiled artifact from
+    # the smem.max_smem_per_mp MLIR attribute (emitted when
+    # min_blocks_per_mp > 1).  That calculation only sees the static smem, so
+    # with dynamic launch smem it selects a 16 KiB shared-memory config and
+    # pins the SM to one resident CTA.  Drop the attribute as well so the
+    # driver default carveout stays in effect.
+    base = getattr(_cdsl, "CutlassBaseDSL", None)
+    orig_gen = getattr(base, "_generate_kernel_attrs", None)
+
+    if orig_gen is not None:
+
+        def _gen(self, config, _orig=orig_gen):
+            ret = _orig(self, config)
+            ret.pop("smem.max_smem_per_mp", None)
+            return ret
+
+        base._generate_kernel_attrs = _gen
     try:
         yield
     finally:
         _cdsl._build_kernel_attrs = orig
+        if orig_gen is not None:
+            base._generate_kernel_attrs = orig_gen
 
 
 class GvrTopkRegKernel:
