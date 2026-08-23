@@ -3735,6 +3735,78 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertEqual(slots[attn_pg], 2)
         manager.shutdown()
 
+    def _skip_without_cpp_beam_sizing(self) -> None:
+        # The pure-Python backend carries KVCacheDesc.beam_width for API parity
+        # only; it cannot run beam search, so it does not model the beam split.
+        if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python":
+            self.skipTest("beam-aware pool sizing is implemented by the C++ backend")
+
+    def test_beam_width_replicates_only_the_blocks_past_the_prompt_tail(self):
+        """Blocks fully inside the prompt stay shared; the tail scales per beam."""
+        self._skip_without_cpp_beam_sizing()
+        manager = KVCacheManager(self._make_hybrid_config())
+        ssm_lc = _introspection.ssm_life_cycle_id(manager)
+        assert ssm_lc is not None
+        ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
+        attn_pg = 1 - ssm_pg
+        tpb = self.TOKENS_PER_BLOCK
+
+        # 2 prompt blocks shared across beams + 2 blocks past the prompt tail.
+        prompt_length = 2 * tpb
+        capacity = 4 * tpb
+
+        def attn_slots(beam_width: int) -> int:
+            batch = BatchDesc(
+                kv_caches=[
+                    KVCacheDesc(
+                        capacity=capacity,
+                        history_length=capacity - 1,
+                        beam_width=beam_width,
+                        prompt_length=prompt_length,
+                    )
+                ]
+            )
+            return _introspection.compute_slots_for_batch(manager, batch, tpb, None)[attn_pg]
+
+        self.assertEqual(attn_slots(1), 4)
+        # 2 shared + 3 * 2 per-beam, not 3 * 4.
+        self.assertEqual(attn_slots(3), 8)
+        manager.shutdown()
+
+    def test_beam_width_replicates_the_ssm_slot_per_beam(self):
+        """_append_beams gives every beam its own recurrent state."""
+        self._skip_without_cpp_beam_sizing()
+        manager = KVCacheManager(self._make_hybrid_config())
+        ssm_lc = _introspection.ssm_life_cycle_id(manager)
+        assert ssm_lc is not None
+        ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
+
+        batch = BatchDesc(
+            kv_caches=[
+                KVCacheDesc(capacity=64, history_length=63, beam_width=3),
+                KVCacheDesc(capacity=64, history_length=63),
+            ]
+        )
+        slots = _introspection.compute_slots_for_batch(manager, batch, self.TOKENS_PER_BLOCK, None)
+        self.assertEqual(slots[ssm_pg], 4)
+        manager.shutdown()
+
+    def test_beam_width_without_prompt_length_scales_every_block(self):
+        """Defaulting prompt_length to 0 over-provisions rather than under-provisions."""
+        self._skip_without_cpp_beam_sizing()
+        manager = KVCacheManager(self._make_hybrid_config())
+        ssm_lc = _introspection.ssm_life_cycle_id(manager)
+        assert ssm_lc is not None
+        attn_pg = 1 - _introspection.pool_group_index(manager, ssm_lc)
+        tpb = self.TOKENS_PER_BLOCK
+
+        batch = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=4 * tpb, history_length=4 * tpb - 1, beam_width=3)]
+        )
+        slots = _introspection.compute_slots_for_batch(manager, batch, tpb, None)
+        self.assertEqual(slots[attn_pg], 12)
+        manager.shutdown()
+
     def test_constraints_floor_typical_step(self):
         """Constraints clamp the typical_step ratio from below."""
         typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)

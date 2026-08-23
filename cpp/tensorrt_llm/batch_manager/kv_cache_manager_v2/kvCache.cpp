@@ -573,6 +573,12 @@ void KvCache::close()
         mAvgCapacity.update(static_cast<double>(mCapacity));
         mManager->updateAvgSqrCapacity(mAvgCapacity.value() * mAvgCapacity.value());
         mManager->updateAvgSqrHistoryLength(mAvgHistoryLength.value() * mAvgHistoryLength.value());
+        // Beam width and prompt length are sampled plainly rather than as an RMS:
+        // the tuner uses them to split blocks into a shared prefix and a per-beam
+        // tail, and over-weighting the wide/long tail there would inflate the beam
+        // factor for the whole pool instead of just widening one request.
+        mManager->updateAvgBeamWidth(static_cast<double>(mBeamWidth.value()));
+        mManager->updateAvgPromptLength(static_cast<double>(mExpectedPromptLength.value_or(0)));
         mManager->incrementNumSampledKvCaches();
         mManager->tryUpdateTargetRatios();
     }

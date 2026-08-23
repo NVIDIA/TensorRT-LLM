@@ -1920,11 +1920,21 @@ class KVCacheManagerV2(BaseResourceManager):
             # They should not count toward the scratch range.
             scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
 
-        # KVCacheDesc has no beam dimension, so the descs below model beam
-        # width 1. Beam search only replicates blocks from the prompt tail
-        # onward, and a uniform factor would cancel out in the normalized pool
-        # ratio anyway, so the residual skew is not worth guessing at here.
-        # Set kv_cache_config.pool_ratio explicitly if the split needs tuning.
+        # Beam search only replicates blocks from the prompt tail onward, so
+        # KVCacheDesc splits each request into a shared prefix (prompt_length)
+        # and a per-beam tail. Nothing here knows how a typical sequence divides
+        # into prompt and output, so the descs leave prompt_length at 0: every
+        # block counts as per-beam, which over-provisions rather than under-
+        # provisions the block counts the CUDA-graph warmup constraints depend
+        # on. Because the factor is then uniform across life cycles it cancels
+        # out in the normalized ratio, leaving the static split exactly where it
+        # is today; the runtime tuner refines it once avg_prompt_length has real
+        # samples (see KvCacheManager::tryUpdateTargetRatios). Set
+        # kv_cache_config.pool_ratio explicitly to pin the split instead.
+        #
+        # Context requests always run at beam width 1 -- beams are only added at
+        # the first generation step (_ensure_generation_beam_width).
+        beam_width = self.max_beam_width
         typical_step = None
         constraints = []
         if kv_cache_config.pool_ratio is None:
@@ -1948,6 +1958,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         KVCacheDesc(
                             capacity=typical_seq_len,
                             history_length=generation_history_length,
+                            beam_width=beam_width,
                         )
                     ]
                     * (self.max_batch_size - 1)
@@ -1962,9 +1973,16 @@ class KVCacheManagerV2(BaseResourceManager):
                             KVCacheDesc(
                                 capacity=self.max_seq_len,
                                 history_length=self.max_seq_len - 1,
+                                beam_width=beam_width,
                             )
                         ]
-                        + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                        + [
+                            KVCacheDesc(
+                                capacity=min_decode_capacity,
+                                history_length=0,
+                                beam_width=beam_width,
+                            )
+                        ]
                         * (self.max_batch_size - 1)
                     )
                 )

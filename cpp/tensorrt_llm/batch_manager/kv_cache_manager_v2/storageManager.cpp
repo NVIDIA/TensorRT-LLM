@@ -1648,7 +1648,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::getRatioList(CacheLevel level) c
 }
 
 TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
-    CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const
+    CacheLevel level, int tokensPerBlock, int historyLength, int capacity, int beamWidth, int promptLength) const
 {
     if (capacity < historyLength)
     {
@@ -1657,6 +1657,10 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
     }
 
     int const numBlocks = divUp(capacity, tokensPerBlock);
+    int const effBeamWidth = std::max(1, beamWidth);
+    // Floors, so the block holding the prompt tail lands on the per-beam side —
+    // same boundary KvCache::_appendBeams() uses.
+    HalfOpenRange<BlockOrdinal> const sharedRange{0, std::min(std::max(promptLength, 0) / tokensPerBlock, numBlocks)};
     TypedVec<LifeCycleId, size_t> numBytes(numLifeCycles(), 0);
     auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
     auto const& lifeCycles = mLifeCycles.getAll();
@@ -1667,12 +1671,17 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
         int numRequiredBlocks;
         if (ssmLcId.has_value() && lifeCycle == *ssmLcId)
         {
-            numRequiredBlocks = 1;
+            // One recurrent-state block per beam.
+            numRequiredBlocks = effBeamWidth;
         }
         else
         {
             auto const stale = getStaleRange(lifeCycles[lifeCycle], historyLength, tokensPerBlock);
-            numRequiredBlocks = std::max(numBlocks - stale.length(), 1);
+            int const nonStale = std::max(numBlocks - stale.length(), 1);
+            int const nonStaleShared
+                = std::min(sharedRange.length() - intersect(stale, sharedRange).length(), nonStale);
+            int const nonStaleBeam = nonStale - nonStaleShared;
+            numRequiredBlocks = std::max(nonStaleShared + effBeamWidth * nonStaleBeam, 1);
         }
         numBytes[lifeCycle] = static_cast<size_t>(numRequiredBlocks) * slotBytes;
     }
@@ -1817,8 +1826,14 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
     {
         if (ssmLcId.has_value() && lcIdx == *ssmLcId)
         {
-            // SSM: always 1 dedicated block per request, never shared.
-            numSlots[lcIdx] += slotCountValueFromSize(batch.kvCaches.size());
+            // SSM: one dedicated block per request per beam, never shared.
+            // _appendBeams() gives every beam its own recurrent-state slot.
+            size_t ssmBlocks = 0;
+            for (auto const& kv : batch.kvCaches)
+            {
+                ssmBlocks += static_cast<size_t>(std::max(1, kv.beamWidth));
+            }
+            numSlots[lcIdx] += slotCountValueFromSize(ssmBlocks);
             continue;
         }
         // Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
@@ -1839,17 +1854,33 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
             int nonStale = totalBlocks - stale.length();
             int nonStaleSys = sysBlocks - intersect(stale, sysRange).length();
             int uniqueNonStale = std::max(0, nonStale - nonStaleSys);
+
+            // Split into the prefix the beams share and the tail each beam owns.
+            // The block holding the prompt tail is itself per-beam, so the
+            // boundary floors rather than rounds up — this matches
+            // _appendBeams()'s firstGenerationBlock exactly.
+            int const beamWidth = std::max(1, kv.beamWidth);
+            HalfOpenRange<BlockOrdinal> const sharedRange{0, std::min(kv.promptLength / tokensPerBlock, totalBlocks)};
+            int const nonStaleShared = sharedRange.length() - intersect(stale, sharedRange).length();
+            int const uniqueShared = std::min(std::max(0, nonStaleShared - nonStaleSys), uniqueNonStale);
+            int const uniqueBeam = uniqueNonStale - uniqueShared;
+
             if (swaScratchReuse.has_value())
             {
                 auto scratch = computeScratchRange(
                     lc, kv.historyLength, kv.capacity, tokensPerBlock, swaScratchReuse->maxRewindLen);
                 int numScratch = scratch.length();
+                // Scratch blocks are input blocks, so they sit in the per-beam
+                // tail; only a conservative remainder can reach the shared prefix.
+                int const scratchBeam = std::min(numScratch, uniqueBeam);
+                int const scratchShared = std::min(numScratch - scratchBeam, uniqueShared);
                 // Scratch blocks share coalesced slots: actual slots = ceil(numScratch * fracMax).
-                numSlots[lcIdx] += (uniqueNonStale - numScratch) + mSlotUtilFracMax[lcIdx].ceilMul(numScratch);
+                numSlots[lcIdx] += (uniqueShared - scratchShared) + mSlotUtilFracMax[lcIdx].ceilMul(scratchShared)
+                    + beamWidth * ((uniqueBeam - scratchBeam) + mSlotUtilFracMax[lcIdx].ceilMul(scratchBeam));
             }
             else
             {
-                numSlots[lcIdx] += uniqueNonStale;
+                numSlots[lcIdx] += uniqueShared + beamWidth * uniqueBeam;
             }
         }
     }

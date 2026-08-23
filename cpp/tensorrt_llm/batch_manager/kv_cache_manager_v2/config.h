@@ -192,17 +192,29 @@ struct KVCacheDesc
 {
     int capacity = 0;
     int historyLength = 0;
+    // Beam search does not replicate the whole cache. Blocks that lie entirely
+    // inside the prompt are committed and canonicalized to beam 0 (see
+    // KvCache::_appendBeams(), which skips ordinals below promptLength /
+    // tokensPerBlock and every committed block); only the prompt tail onward is
+    // replicated. Sizing that scales everything by beamWidth would cancel out in
+    // the normalized pool ratio and leave the skew between life cycles in place,
+    // so the split has to be modelled explicitly.
+    int beamWidth = 1;
+    int promptLength = 0;
 
     void validate() const
     {
         TLLM_CHECK_DEBUG(0 <= historyLength && historyLength <= capacity);
+        TLLM_CHECK_DEBUG(beamWidth >= 1);
+        TLLM_CHECK_DEBUG(0 <= promptLength);
     }
 
     // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
     // bindings replace. Required so tests can compare descs by value.
     bool operator==(KVCacheDesc const& other) const noexcept
     {
-        return capacity == other.capacity && historyLength == other.historyLength;
+        return capacity == other.capacity && historyLength == other.historyLength && beamWidth == other.beamWidth
+            && promptLength == other.promptLength;
     }
 
     bool operator!=(KVCacheDesc const& other) const noexcept

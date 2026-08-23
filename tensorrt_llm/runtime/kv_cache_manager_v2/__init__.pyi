@@ -168,6 +168,8 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class KVCacheDesc:
     capacity: int
     history_length: int
+    beam_width: int = 1
+    prompt_length: int = 0
 
 @dataclass(slots=True)
 class BatchDesc:

@@ -4532,9 +4532,18 @@ class PyExecutor:
     def _can_pause_for_rebalance(self) -> bool:
         """Gate KV pool rebalance to the cases the hook supports.
 
-        Scope: no in-flight disagg transfer, no beam search, no drafter, not
-        during warmup or shutdown.  Honors the ``enable_kv_pool_rebalance``
-        opt-in flag (default off).
+        Scope: no in-flight disagg transfer, no drafter, not during warmup or
+        shutdown.  Honors the ``enable_kv_pool_rebalance`` opt-in flag (default
+        off).
+
+        Beam search *is* supported.  It needs no special handling on this side:
+        ``KvCache::suspend`` / ``resume`` walk every beam already
+        (``_activePages`` iterates ``block.pages.size()``), ``adjust()`` moves
+        pages without touching beam width, and the CUDA-graph padding dummies
+        are created at ``max_beam_width``.  What did have to change is the
+        target the tuner converges to -- ``ratioFromLength`` now models the
+        shared prompt prefix and the per-beam tail separately, so the ratio it
+        aims at is no longer skewed by beam width.
 
         Pipeline parallelism *is* supported, but not in the same shape as the
         other two loops.  ``_executor_loop`` and ``_executor_loop_overlap``
@@ -4563,8 +4572,6 @@ class PyExecutor:
         if self.is_warmup:
             return False
         if self.is_shutdown:
-            return False
-        if self.kv_cache_manager.max_beam_width > 1:
             return False
         if self.drafter is not None:
             return False
