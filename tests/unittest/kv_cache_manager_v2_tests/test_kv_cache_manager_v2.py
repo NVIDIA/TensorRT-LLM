@@ -415,7 +415,9 @@ class TestNoBatching(TestKVCacheManagerV2):
         prompt: list[TokenIdExt]
         decode_len: int
 
-    def _prepare_beam_cache(self, tokens_per_block: int) -> None:
+    def _prepare_beam_cache(
+        self, tokens_per_block: int, *, enable_partial_reuse: bool = False
+    ) -> None:
         if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python":
             self.skipTest("beam search is implemented by the C++ KV cache manager v2 backend")
         self.prepare(
@@ -426,10 +428,12 @@ class TestNoBatching(TestKVCacheManagerV2):
             128,
             0,
             tokens_per_block=tokens_per_block,
-            enable_partial_reuse=False,
+            enable_partial_reuse=enable_partial_reuse,
             enable_partial_commit=False,
         )
-        self.assertFalse(self.manager.enable_partial_match)
+        # Beam search only requires partial commit off; partial matching stays
+        # under the caller's control.
+        self.assertIs(self.manager.enable_partial_match, enable_partial_reuse)
         self.assertFalse(self.manager.enable_partial_commit)
 
     def _make_beam_context_cache(
@@ -661,6 +665,63 @@ class TestNoBatching(TestKVCacheManagerV2):
                 source_beam=DEFAULT_BEAM_INDEX,
             )
             reused.close()
+        stream_holder.take_finish_event().synchronize()
+
+    def test_beam_partial_reuse_copies_matched_tail_per_beam(self) -> None:
+        # Partial matching is orthogonal to partial commit: the partially
+        # matched tail block is copied into a private uncommitted page on first
+        # resume, so beam expansion still hands every beam its own writable
+        # page for the block the beams diverge in.
+        tokens_per_block = 4
+        num_matched_tail = 2
+        self._prepare_beam_cache(tokens_per_block, enable_partial_reuse=True)
+        producer_prompt = [self.next_token() for _ in range(2 * tokens_per_block)]
+        num_reused = tokens_per_block + num_matched_tail
+        # Diverges from the producer inside block 1, so only its first
+        # `num_matched_tail` tokens can be matched.
+        consumer_prompt = producer_prompt[:num_reused] + [self.next_token()]
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            producer = self.manager.create_kv_cache(expected_prompt_length=len(producer_prompt))
+            producer.cuda_stream = stream
+            self.assertTrue(producer.resume(stream))
+            self.assertTrue(producer.resize(len(producer_prompt)))
+            self.engine.execute([Step(producer, producer_prompt, [])], stream)
+            producer.commit(producer_prompt)
+            producer.stop_committing()
+            producer.close()
+
+            consumer = self.manager.create_kv_cache(
+                input_tokens=consumer_prompt,
+                expected_prompt_length=len(consumer_prompt),
+            )
+            self.assertEqual(consumer.num_committed_tokens, num_reused)
+            consumer.cuda_stream = stream
+            self.assertTrue(consumer.resume(stream))
+            consumer.stop_committing()
+            self.assertTrue(consumer.resize(len(consumer_prompt)))
+            self.engine.execute(
+                [Step(consumer, consumer_prompt[num_reused:], consumer_prompt[:num_reused])],
+                stream,
+            )
+            consumer.beam_width = BeamIndex(2)
+
+            layer_group_id = self.manager.get_layer_group_id(LayerId(0))
+            beam0_pages = consumer.get_base_page_indices(layer_group_id, DEFAULT_BEAM_INDEX)
+            beam1_pages = consumer.get_base_page_indices(layer_group_id, BeamIndex(1))
+            # Block 0 is fully committed, hence canonicalized to beam 0.
+            self.assertEqual(beam1_pages[0], BAD_PAGE_INDEX)
+            self.assertNotEqual(beam0_pages[1], BAD_PAGE_INDEX)
+            self.assertNotEqual(beam1_pages[1], BAD_PAGE_INDEX)
+            self.assertNotEqual(beam0_pages[1], beam1_pages[1])
+            self._assert_block_token_source(
+                consumer,
+                beam=BeamIndex(1),
+                block_ordinal=1,
+                tokens=consumer_prompt[tokens_per_block:],
+                source_beam=DEFAULT_BEAM_INDEX,
+            )
+            consumer.close()
         stream_holder.take_finish_event().synchronize()
 
     def test_partial_commit_disabled_keeps_full_block_reuse(self) -> None:

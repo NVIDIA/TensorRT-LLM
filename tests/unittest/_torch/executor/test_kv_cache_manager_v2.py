@@ -83,8 +83,10 @@ def _make_cache_config_for_test(
     max_num_tokens: int | None = None,
     max_draft_len: int = 0,
     num_extra_kv_tokens: int = 0,
+    max_beam_width: int = 1,
 ) -> KVCacheManagerConfig:
     cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager.max_beam_width = max_beam_width
     cache_manager.kv_cache_type = CacheType.SELFKONLY
     cache_manager.dtype = DataType.HALF
     cache_manager.head_dim_per_layer = [128]
@@ -256,6 +258,25 @@ def test_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
     config = _make_cache_config_for_test(KvCacheConfig(enable_partial_reuse=enable_partial_reuse))
 
     assert config.enable_partial_reuse is enable_partial_reuse
+
+
+@pytest.mark.parametrize("max_beam_width", [1, 4])
+@pytest.mark.parametrize("enable_partial_reuse", [False, True])
+def test_beam_search_disables_only_partial_commit(
+    max_beam_width: int, enable_partial_reuse: bool
+) -> None:
+    # Partial commit publishes the prompt's trailing partial block into the
+    # radix tree and canonicalizes it to beam 0, which is incompatible with the
+    # per-beam writes that follow, so beam search must turn it off. Partial
+    # reuse matches a token prefix inside ordinary full blocks and is copied to
+    # a private page before beams are added, so it stays user-controlled.
+    config = _make_cache_config_for_test(
+        KvCacheConfig(enable_partial_reuse=enable_partial_reuse),
+        max_beam_width=max_beam_width,
+    )
+
+    assert config.enable_partial_reuse is enable_partial_reuse
+    assert config.enable_partial_commit is (max_beam_width == 1)
 
 
 def test_pool_ratio_overrides_constraints() -> None:

@@ -1284,7 +1284,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
-        self.enable_partial_reuse = self._resolve_enable_partial_reuse(kv_cache_config)
+        self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
         enable_conversation_manager = (
             self.enable_block_reuse
@@ -1901,19 +1901,6 @@ class KVCacheManagerV2(BaseResourceManager):
             non_blocking=True,
         )
 
-    def _resolve_enable_partial_reuse(self, kv_cache_config: KvCacheConfig) -> bool:
-        """Whether partial (sub-block) prefix matching may be enabled.
-
-        Beam search turns off ``enable_partial_commit``, so nobody publishes a
-        finalized prompt tail; matching against one would only find blocks that
-        can never appear. Keep the two flags in lockstep.
-
-        ``_build_base_config`` runs before ``self.enable_partial_reuse`` is
-        assigned, so both callers go through this helper instead of repeating
-        the expression.
-        """
-        return kv_cache_config.enable_partial_reuse and self.max_beam_width == 1
-
     def _build_base_config(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2055,7 +2042,14 @@ class KVCacheManagerV2(BaseResourceManager):
             typical_step=typical_step,
             constraints=constraints,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
-            enable_partial_reuse=self._resolve_enable_partial_reuse(kv_cache_config),
+            enable_partial_reuse=kv_cache_config.enable_partial_reuse,
+            # Partial commit hands the prompt's trailing partial block to the
+            # radix tree and canonicalizes it to beam 0, but that block is
+            # exactly where the beams diverge and each needs its own writable
+            # page. set_beam_width() therefore rejects partial commit outright.
+            # Partial *reuse* is unaffected: it matches a token prefix inside
+            # ordinary full blocks, and the matched partial block is copied into
+            # a private uncommitted page on first resume, before beams are added.
             enable_partial_commit=self.max_beam_width == 1,
             enable_stats=self.enable_stats,
             swa_scratch_reuse=scratch_reuse_config,
