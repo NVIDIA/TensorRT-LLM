@@ -118,6 +118,7 @@ add_library(
   IndexerTopKOp.cpp
   sparseKvCacheCompactOp.cpp
   minimaxM3Fp8IndexerOp.cpp
+  minimaxM3SelectBlocksOp.cpp
   mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp

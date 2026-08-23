@@ -848,6 +848,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         num_tokens = int(idx_q.shape[0])
         # Preserve split column views without allowing an implicit copy. The
         # scorer and cache writer below both honor their source strides.
+        head_major_output = (
+            int(metadata.num_contexts or 0) > 0 and int(metadata.num_generations or 0) == 0
+        )
         idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
         configured_for_fp8 = self.indexer_kv_dtype == "fp8"
@@ -910,6 +913,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             proxy_plan=proxy_plan,
             max_score=max_score,
             n_valid_blocks=n_valid_blocks,
+            head_major_output=head_major_output,
         )
 
     def sparse_attn_predict(
