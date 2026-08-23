@@ -351,27 +351,7 @@ std::vector<AggregatedPageDesc> KvCacheManager::getAggregatedPages(std::vector<B
 
 TypedVec<PoolGroupIndex, PoolGroupDesc> KvCacheManager::poolGroupDescs() const
 {
-    auto const& slotDescList = mStorage->slotDescList();
-    TypedVec<PoolGroupIndex, PoolGroupDesc> result;
-    result.reserve(slotDescList.size());
-
-    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
-    {
-        auto const& slotDesc = slotDescList.at(pgIdx);
-        auto slotSizeList = mStorage->slotSize(pgIdx);
-
-        TypedVec<PoolIndex, PoolDesc> pools;
-        pools.reserve(slotSizeList.size());
-        for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
-        {
-            pools.push_back(
-                PoolDesc{poolIdx, mStorage->getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx)});
-        }
-
-        result.push_back(PoolGroupDesc{pgIdx, mStorage->numSlots(pgIdx, kHotLevel), slotDesc, std::move(pools)});
-    }
-
-    return result;
+    return mStorage->poolGroupDescs();
 }
 
 // ---- Query / info ---------------------------------------------------------
