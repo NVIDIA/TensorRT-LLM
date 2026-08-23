@@ -669,17 +669,26 @@ void KvCache::_recordMigratedSlots(
         return;
     }
     TLLM_CHECK_DEBUG(pages.size() == slots.size());
+
+    // One migration batch moves every page between the same pair of cache levels and does not
+    // mutate the storage while we record, so the per-page contributions differ only by life
+    // cycle. Aggregate them and commit once: commitStats() re-samples the peak block statistics
+    // on every call, which is O(cache levels x pool groups), so committing per page turns a
+    // long-sequence eviction into thousands of redundant full scans.
+    KVCacheStatsDelta stats{};
+    IterationStatsByLifeCycle iterationStatsByLifeCycle{};
+    bool recorded = false;
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
         bool const isAttention = std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle));
 
-        KVCacheStatsDelta stats;
-        KVCacheIterationStatsDelta iterationStats;
         if (srcLevel == kHotLevel && dstLevel > kHotLevel)
         {
-            iterationStats.iterOffloadBlocks = 1;
-            iterationStats.iterOffloadBytes = sumSlotBytes(mManager->storage(), dstLevel, lifeCycle);
+            auto& iterationStats = iterationStatsByLifeCycle[lifeCycle];
+            iterationStats.iterOffloadBlocks += 1;
+            iterationStats.iterOffloadBytes += sumSlotBytes(mManager->storage(), dstLevel, lifeCycle);
+            recorded = true;
         }
         else if (dstLevel == kHotLevel)
         {
@@ -687,46 +696,48 @@ void KvCache::_recordMigratedSlots(
             // reported by lifecycle/pool-group iteration statistics instead.
             if (isAttention)
             {
-                stats.allocTotalBlocks = 1;
-                stats.allocNewBlocks = 1;
+                stats.allocTotalBlocks += 1;
+                stats.allocNewBlocks += 1;
             }
-            iterationStats.iterAllocTotalBlocks = 1;
-            iterationStats.iterAllocNewBlocks = 1;
+            auto& iterationStats = iterationStatsByLifeCycle[lifeCycle];
+            iterationStats.iterAllocTotalBlocks += 1;
+            iterationStats.iterAllocNewBlocks += 1;
             if (srcLevel > kHotLevel)
             {
-                iterationStats.iterOnboardBlocks = 1;
-                iterationStats.iterOnboardBytes = sumSlotBytes(mManager->storage(), srcLevel, lifeCycle);
+                iterationStats.iterOnboardBlocks += 1;
+                iterationStats.iterOnboardBytes += sumSlotBytes(mManager->storage(), srcLevel, lifeCycle);
             }
             else if (srcLevel == kHotLevel)
             {
-                iterationStats.iterIntraDeviceCopyBlocks = 1;
-                iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(mManager->storage(), kHotLevel, lifeCycle);
+                iterationStats.iterIntraDeviceCopyBlocks += 1;
+                iterationStats.iterIntraDeviceCopyBytes += sumSlotBytes(mManager->storage(), kHotLevel, lifeCycle);
             }
+            recorded = true;
         }
+    }
 
-        if (!stats.empty() || !iterationStats.empty())
-        {
-            IterationStatsByLifeCycle iterationStatsByLifeCycle;
-            iterationStatsByLifeCycle.emplace(lifeCycle, iterationStats);
-            mManager->commitStats(stats, iterationStatsByLifeCycle);
-        }
+    if (recorded)
+    {
+        mManager->commitStats(stats, iterationStatsByLifeCycle);
     }
 }
 
 void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
 {
-    if (!_shouldRecordManagerStats())
+    if (!_shouldRecordManagerStats() || pages.empty())
     {
         return;
     }
+    // Aggregate per life cycle and commit once — see _recordMigratedSlots for why.
+    IterationStatsByLifeCycle iterationStatsByLifeCycle;
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
-        KVCacheIterationStatsDelta iterationStats;
-        iterationStats.iterHostDroppedBlocks = 1;
-        iterationStats.iterHostDroppedBytes = sumSlotBytes(mManager->storage(), cacheLevel, lifeCycle);
-        _recordDirectIterationStats(lifeCycle, iterationStats);
+        auto& iterationStats = iterationStatsByLifeCycle[lifeCycle];
+        iterationStats.iterHostDroppedBlocks += 1;
+        iterationStats.iterHostDroppedBytes += sumSlotBytes(mManager->storage(), cacheLevel, lifeCycle);
     }
+    mManager->commitStats({}, iterationStatsByLifeCycle);
 }
 
 void KvCache::_recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdinal blockEnd,
