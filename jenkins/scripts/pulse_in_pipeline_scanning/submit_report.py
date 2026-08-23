@@ -230,7 +230,7 @@ def submit_source_code_licenses(
                 "s_package_type": component.get("type"),
                 "s_ticket_url": triaged_deps.get(package_name, ""),
             }
-            if not is_preapproved(map_preapproved, package_name, "pypi"):
+            if not is_preapproved(map_preapproved, package_name, component.get("type")):
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
 
