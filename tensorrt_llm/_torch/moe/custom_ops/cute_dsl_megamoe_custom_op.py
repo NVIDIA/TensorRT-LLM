@@ -494,7 +494,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # ``Nvfp4BlockSize`` is probe-only at module load to fail fast
         # when the kernel package is partially installed; it is consumed
         # by the lazy import inside ``validate_megamoe_tactic``.
-        from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4 import SfPaddingBlock
+        from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4 import (
+            Nvfp4BlockSize,  # noqa: F401
+            SfPaddingBlock,
+        )
 
         IS_MEGAMOE_OP_AVAILABLE = True
     except Exception as _megamoe_import_err:  # pragma: no cover - env-specific
