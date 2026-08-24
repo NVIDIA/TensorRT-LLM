@@ -23,6 +23,8 @@ from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.rl_control_auth import RL_CONTROL_AUTH_HEADER, build_rl_control_auth_headers
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_server(enabled: bool) -> OpenAIServer:
     server = object.__new__(OpenAIServer)
