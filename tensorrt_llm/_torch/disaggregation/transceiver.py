@@ -45,7 +45,11 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    CtxTransferStatus,
+    GenTransferStatus,
+    KvCacheTransceiver,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
@@ -243,7 +247,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             f"waiting_for_peer_info={len(self._wait_reqs)}"
         )
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
@@ -676,7 +680,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs[rid] = req
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
-    def respond_and_send_async(self, req: LlmRequest):
+    def respond_and_send_async(self, req: LlmRequest) -> None:
         self._ever_had_send_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         session = self._get_or_create_send_session(req)
@@ -685,7 +689,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
-    def request_and_receive_sync(self, req: LlmRequest):
+    def request_and_receive_sync(self, req: LlmRequest) -> None:
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
@@ -721,7 +725,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._recv_reqs.pop(rid, None)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
-    def request_and_receive_async(self, req: LlmRequest):
+    def request_and_receive_async(self, req: LlmRequest) -> None:
         self._ever_had_recv_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         rid = get_unique_rid(req)
@@ -740,7 +744,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
-    ):
+    ) -> CtxTransferStatus:
         # A worker that never sends KV has nothing to reconcile here, so skip the consensus. Safe
         # because the flag flips together on every rank and never resets, so they all skip in step;
         # gating on the live session dict instead would not be, since a cancel clears it per-rank.
@@ -748,7 +752,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not self._ever_had_send_session:
             if self._ctx_need_tp_sync or self._ctx_need_pp_sync:
                 self._transfer_worker.sweep_stale_req_infos()
-            return [], []
+            return CtxTransferStatus([], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
         need_progress = wait_num > 0
@@ -810,11 +814,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
-        return completed, failed
+        return CtxTransferStatus(completed, failed)
 
-    def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
+    def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
-            return [], [], []
+            return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
         need_progress = wait_num > 0
@@ -895,7 +899,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
-        return completed, failed, cancelled_reqs
+        return GenTransferStatus(completed, failed, cancelled_reqs)
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
         self._poll_sessions_for_interval(
@@ -1016,7 +1020,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None,
         }
 
-    def prepare_context_requests(self, requests: List[LlmRequest]):
+    def prepare_context_requests(self, requests: List[LlmRequest]) -> None:
         # Place new generation-first context requests into wait state, then
         # use allgather consensus to promote ready requests to CONTEXT_INIT.
         for req in requests:
