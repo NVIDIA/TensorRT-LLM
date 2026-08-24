@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime parity for the Kimi K3 FP8 packed q/k/v prefill projection."""
+"""Parity for the Kimi K3 FP8 packed q/k/v prefill projection."""
 
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -12,9 +12,9 @@ from torch import nn
 pytest.importorskip("fla")
 
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
-    KimiKDARuntime,
     _convert_kda_projections_to_fp8_weight_read,
 )
+from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 
 
 class _Cfg:
@@ -30,16 +30,16 @@ class _Cfg:
 
 
 class _Layer(nn.Module):
-    def __init__(self, runtime: KimiKDARuntime) -> None:
+    def __init__(self, attention: KimiKDALinearAttention) -> None:
         super().__init__()
         self.is_kda = True
-        self.self_attn = runtime
+        self.linear_attn = attention
 
 
 class _Model(nn.Module):
-    def __init__(self, runtime: KimiKDARuntime) -> None:
+    def __init__(self, attention: KimiKDALinearAttention) -> None:
         super().__init__()
-        self.layers = nn.ModuleList([_Layer(runtime)])
+        self.layers = nn.ModuleList([_Layer(attention)])
 
 
 def _has_supported_gpu() -> bool:
@@ -52,10 +52,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_runtime() -> KimiKDARuntime:
-    runtime = KimiKDARuntime(_Cfg(), layer_idx=0).to("cuda")
-    assert _convert_kda_projections_to_fp8_weight_read(_Model(runtime)) == 5
-    return runtime
+def _make_attention() -> KimiKDALinearAttention:
+    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).to("cuda")
+    assert _convert_kda_projections_to_fp8_weight_read(_Model(attention)) == 5
+    return attention
 
 
 def _assert_numerically_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -70,13 +70,14 @@ def _assert_numerically_close(actual: torch.Tensor, expected: torch.Tensor) -> N
 @torch.no_grad()
 def test_fp8_packed_qkv_projection_matches_separate_views() -> None:
     torch.manual_seed(0)
-    runtime = _make_runtime()
-    mixer = runtime.mixer
+    attention = _make_attention()
     hidden = torch.randn(1, 193, _Cfg.hidden_size, device="cuda", dtype=torch.bfloat16) * 0.05
 
-    packed = mixer.qkvg_proj(hidden)[..., : 3 * runtime.proj_size]
-    actual = packed.split(runtime.proj_size, dim=-1)
-    expected = (mixer.q_proj(hidden), mixer.k_proj(hidden), mixer.v_proj(hidden))
+    qkvg_proj = attention.qkvg_proj
+    assert qkvg_proj is not None
+    packed = qkvg_proj(hidden)[..., : 3 * attention.proj_size]
+    actual = packed.split(attention.proj_size, dim=-1)
+    expected = (attention.q_proj(hidden), attention.k_proj(hidden), attention.v_proj(hidden))
 
     for packed_part, separate_part in zip(actual, expected):
         _assert_numerically_close(packed_part, separate_part)
@@ -94,12 +95,11 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
     sequence_lengths: list[int], use_initial_states: bool, has_initial_states: list[bool]
 ) -> None:
     torch.manual_seed(1)
-    runtime = _make_runtime()
-    mixer = runtime.mixer
+    attention = _make_attention()
     num_prefills = len(sequence_lengths)
     num_tokens = sum(sequence_lengths)
     slots = num_prefills + 3
-    d = runtime.proj_size
+    d = attention.proj_size
     h = _Cfg.linear_attn_config["num_heads"]
     head_dim = _Cfg.linear_attn_config["head_dim"]
     conv_size = _Cfg.linear_attn_config["short_conv_kernel_size"]
@@ -126,18 +126,19 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
 
         return _hook
 
+    fused_qkvg = attention.qkvg_proj
+    assert fused_qkvg is not None
     handles = [
-        mixer.qkvg_proj.register_forward_hook(_count("qkvg")),
-        mixer.q_proj.register_forward_hook(_count("q")),
-        mixer.k_proj.register_forward_hook(_count("k")),
-        mixer.v_proj.register_forward_hook(_count("v")),
+        fused_qkvg.register_forward_hook(_count("qkvg")),
+        attention.q_proj.register_forward_hook(_count("q")),
+        attention.k_proj.register_forward_hook(_count("k")),
+        attention.v_proj.register_forward_hook(_count("v")),
     ]
-    fused_qkvg = mixer.qkvg_proj
     try:
-        mixer.qkvg_proj = None
+        attention.qkvg_proj = None
         ref_conv = conv_seed.clone()
         ref_state = state_seed.clone()
-        expected = runtime._forward_prefill(
+        expected = attention.forward_prefill(
             hidden,
             cu_seqlens,
             metadata,
@@ -149,10 +150,10 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
         assert calls == {"qkvg": 0, "q": 1, "k": 1, "v": 1}
 
         calls.update(qkvg=0, q=0, k=0, v=0)
-        mixer.qkvg_proj = fused_qkvg
+        attention.qkvg_proj = fused_qkvg
         actual_conv = conv_seed.clone()
         actual_state = state_seed.clone()
-        actual = runtime._forward_prefill(
+        actual = attention.forward_prefill(
             hidden,
             cu_seqlens,
             metadata,
@@ -163,7 +164,7 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
         )
         assert calls == {"qkvg": 1, "q": 0, "k": 0, "v": 0}
     finally:
-        mixer.qkvg_proj = fused_qkvg
+        attention.qkvg_proj = fused_qkvg
         for handle in handles:
             handle.remove()
 
@@ -189,7 +190,7 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
 
     repeat_conv = conv_seed.clone()
     repeat_state = state_seed.clone()
-    repeated = runtime._forward_prefill(
+    repeated = attention.forward_prefill(
         hidden,
         cu_seqlens,
         metadata,

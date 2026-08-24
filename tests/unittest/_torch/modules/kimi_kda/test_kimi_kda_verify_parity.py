@@ -3,7 +3,7 @@
 """KDA runtime projection and speculative-verification parity.
 
 The verify path must produce, for every step t, exactly the state and output
-that t sequential single-token _forward_decode calls would produce — the two
+that t sequential single-token forward_decode calls would produce — the two
 paths call the same FLA kernels with the same [B, 1] shapes, so agreement is
 expected to near-bitwise tolerance. A real mismatch here means the verify
 implementation (state threading, conv stepping, intermediate writes) is
@@ -23,8 +23,11 @@ import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
+from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (
+    get_production_decode_kernel_path,
+)
 
 
 class _Cfg:
@@ -115,14 +118,14 @@ def test_kda_fused_prefill_matches_separate_projections():
     d = h * head_dim
     w = lin["short_conv_kernel_size"]
 
-    runtime = KimiKDARuntime(cfg, layer_idx=0).to(device)
-    if runtime.mixer.decode_kernel_path != "optimized":
+    runtime = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
+    if get_production_decode_kernel_path(runtime) != "optimized":
         pytest.skip("needs an SM100/SM103 GPU")
     for param in runtime.parameters():
         if param.is_floating_point():
             torch.nn.init.normal_(param, std=0.02)
 
-    reference = KimiKDARuntime(cfg, layer_idx=0).to(device)
+    reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
     runtime.finalize_decode_weights()
     assert runtime._qkvg_proj_weight is not None
@@ -162,14 +165,14 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
     d = h * head_dim
     w = lin["short_conv_kernel_size"]
 
-    runtime = KimiKDARuntime(cfg, layer_idx=0, aux_stream=torch.cuda.Stream()).to(device)
-    if runtime.mixer.decode_kernel_path != "optimized":
+    runtime = KimiKDALinearAttention(cfg, layer_idx=0, aux_stream=torch.cuda.Stream()).to(device)
+    if get_production_decode_kernel_path(runtime) != "optimized":
         pytest.skip("needs an SM100/SM103 GPU")
     for param in runtime.parameters():
         if param.is_floating_point():
             torch.nn.init.normal_(param, std=0.02)
 
-    reference = KimiKDARuntime(cfg, layer_idx=0).to(device)
+    reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
     runtime.finalize_decode_weights()
     assert runtime._qkvg_proj_weight is not None
@@ -209,11 +212,11 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     dim = h * lin["head_dim"]
     w = lin["short_conv_kernel_size"]
 
-    runtime = KimiKDARuntime(cfg, layer_idx=0).to(device)
+    runtime = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     # dt_bias is torch.empty at construction and only filled by
     # load_weights(); with random weights it holds heap garbage, and a
     # NaN/Inf bit pattern poisons both paths identically (nvbug 6599150).
-    torch.nn.init.normal_(runtime.mixer.dt_bias, std=0.1)
+    torch.nn.init.normal_(runtime.dt_bias, std=0.1)
     slots = batch + 2  # non-trivial slot mapping
     cache = _LayerCache(slots, 3 * dim, w, h, lin["head_dim"], lin["head_dim"], t_steps, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)
@@ -228,7 +231,7 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     ref_ssm = cache.temporal.clone()
     ref_outs, ref_conv_steps, ref_ssm_steps = [], [], []
     for t in range(t_steps):
-        out = runtime._forward_decode(x[:, t], ref_conv, ref_ssm, slot_indices)
+        out = runtime.forward_decode(x[:, t], ref_conv, ref_ssm, slot_indices)
         ref_outs.append(out)
         ref_conv_steps.append(ref_conv.index_select(0, slot_indices).clone())
         ref_ssm_steps.append(ref_ssm.index_select(0, slot_indices).clone())
@@ -236,7 +239,7 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     # --- Verify path: one call, intermediates into the scratch buffers. ---
     pristine_conv = cache.conv.clone()
     pristine_ssm = cache.temporal.clone()
-    out_verify = runtime._forward_verify(
+    out_verify = runtime.forward_verify(
         x.reshape(batch * t_steps, cfg.hidden_size),
         t_steps,
         cache,
