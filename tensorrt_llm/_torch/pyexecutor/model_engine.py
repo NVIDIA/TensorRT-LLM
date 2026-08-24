@@ -4838,6 +4838,7 @@ class PyTorchModelEngine(ModelEngine):
         new_tokens_device = new_tensors_device.new_tokens  # [batch, 1 + draft_len]
         new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
         next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+        is_forced_ctx = getattr(scheduled_requests, "is_forced_context", False)
 
         # Pre-compute constants
         extend_requests = scheduled_requests.generation_requests
@@ -5151,6 +5152,7 @@ class PyTorchModelEngine(ModelEngine):
                 assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+        is_forced_ctx = getattr(scheduled_requests, "is_forced_context", False)
 
         # Must be before the update of py_batch_idx
         if self.guided_decoder is not None:
@@ -5160,6 +5162,7 @@ class PyTorchModelEngine(ModelEngine):
                 runtime_draft_len=self.runtime_draft_len)
 
         if (not promoted_context_request_ids
+                and not is_forced_ctx
                 and self._can_use_incremental_update(scheduled_requests,
                                                      new_tokens_device,
                                                      next_draft_tokens_device)):
@@ -5175,6 +5178,7 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager)
 
         if (not promoted_context_request_ids
+                and not is_forced_ctx
                 and type(attn_metadata) is TrtllmAttentionMetadata
                 and self._can_use_encoder_decoder_input_fast_path(
                     scheduled_requests, new_tokens_device,
@@ -5185,6 +5189,7 @@ class PyTorchModelEngine(ModelEngine):
 
         self._encoder_decoder_staged_request_ids = None
         if (not promoted_context_request_ids
+                and not is_forced_ctx
                 and self._can_use_steady_gen_fast_prepare(
                     scheduled_requests, new_tokens_device,
                     next_draft_tokens_device, spec_metadata)):

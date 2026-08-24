@@ -7533,6 +7533,17 @@ class PyExecutor:
             scheduled_requests: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
+        mapping = getattr(getattr(self, "model_engine", self), "mapping", None)
+        if mapping and getattr(mapping, "enable_attention_dp", False):
+            local_has_ctx = len(scheduled_requests.context_requests) > 0
+            local_status = (local_has_ctx,)
+            allgather_fn = getattr(self, "_allgather_model_parallel_status", getattr(getattr(self, "model_engine", None), "_allgather_model_parallel_status", None))
+            if allgather_fn:
+                all_rank_status = allgather_fn(local_status)
+                global_has_ctx = any(status[0] for status in all_rank_status)
+                if global_has_ctx and not local_has_ctx:
+                    scheduled_requests.is_forced_context = True
+
         ExpertStatistic.set_iter(self.iter_counter)
 
         num_ctx_tokens = sum(req.context_chunk_size
