@@ -47,7 +47,7 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
 
-// >>> BOLT profile-bundle overlay (Option C) -- ships INERT (dead code) >>>
+// >>> BOLT profile-bundle overlay -- ships INERT (dead code) >>>
 // Master gate. While false (the default, i.e. the scaffolding PR), buildImage
 // behaves EXACTLY as before: the raw build is published straight to the canonical
 // tag and NONE of the overlay code runs. The follow-up "enable BOLT" PR flips this
@@ -290,7 +290,7 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 
-// Option C: produce each CANONICAL image from its raw `-noprofiles` build by
+// Produce each CANONICAL image from its raw `-noprofiles` build by
 // overlaying the merged LLVM BOLT profile bundle as a thin layer (docker/
 // Dockerfile.bolt via the docker/Makefile `bolt_overlay` target). Canonical is
 // written ONLY here, so a profile-less image can never masquerade as canonical.
@@ -528,7 +528,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
         BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
         TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
-        // Option C (gated by BOLT_OVERLAY_ENABLED): when the overlay is enabled the
+        // Gated by BOLT_OVERLAY_ENABLED: when the overlay is enabled the
         // raw build is published to <tag>-noprofiles and the CANONICAL <tag> is
         // produced ONLY by the overlay (below), so a profile-less image can never
         // masquerade as canonical. When disabled (default), the suffix is empty ->
@@ -618,8 +618,8 @@ def buildImage(config, imageKeyToTag, versionOverride)
             }
         }
 
-        // Option C (gated): produce the CANONICAL tag(s) from the raw -noprofiles
-        // build by overlaying the profile bundle. When BOLT_OVERLAY_ENABLED is
+        // Gated: produce the CANONICAL tag(s) from the raw -noprofiles
+        // build by overlaying the BOLT profile bundle. When BOLT_OVERLAY_ENABLED is
         // false this whole block is skipped and the raw build above already IS the
         // canonical image (rawImageTag == imageWithTag) -- i.e. inert dead code.
         // When enabled, canonical is written EXCLUSIVELY here, so it always carries
@@ -852,7 +852,7 @@ pipeline {
         booleanParam(
             name: "boltOverlayEnabled",
             defaultValue: false,
-            description: "Option C: publish the raw build as <tag>-noprofiles and produce the canonical <tag> by overlaying the merged BOLT profile bundle. While false, images are built exactly as before (overlay is inert). Flipped on by the BOLT-enable rollout."
+            description: "Publish the raw build as <tag>-noprofiles and produce the canonical <tag> by overlaying the merged BOLT profile bundle. While false (the default), images are built exactly as before and none of the overlay code runs."
         )
         booleanParam(
             name: "boltProfilesRequired",
