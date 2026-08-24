@@ -7,8 +7,8 @@ set -ex
 CUDA_VER="13.4" # 13.4.59
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.25.0.15-1"
-NCCL_VER="2.30.7-1+cuda13.4"
+CUDNN_VER="9.25.0.28-1" # TODO(dlfw-26.08): exact internal build, not yet on the public CUDA apt repo (public max is 9.25.0.15-1)
+NCCL_VER="2.30.7-1+cuda13.3"
 CUBLAS_VER="13.7.0.27-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
@@ -68,9 +68,11 @@ install_ubuntu_requirements() {
         apt-get remove --purge -y --allow-change-held-packages libnccl* || true
         PKGS_TO_INSTALL+=(libnccl2=${NCCL_VER} libnccl-dev=${NCCL_VER})
     fi
-    if [[ "$(installed_pkg_version libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER})" != "${CUBLAS_VER}" ]]; then
+    # NOTE: package name is libcublas-<CUDA_MAJOR>-<CUDA_MINOR> (matches cuda-nvrtc-dev's
+    # naming), not libcublas<CUBLAS_MAJOR>-cuda-<CUDA_MAJOR> (that's a separate, older package).
+    if [[ "$(installed_pkg_version libcublas-${NVRTC_CUDA_VERSION})" != "${CUBLAS_VER}" ]]; then
         apt-get remove --purge -y --allow-change-held-packages libcublas* || true
-        PKGS_TO_INSTALL+=(libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} libcublas${CUBLAS_MAJOR_VER}-dev-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER})
+        PKGS_TO_INSTALL+=(libcublas-${NVRTC_CUDA_VERSION}=${CUBLAS_VER} libcublas-dev-${NVRTC_CUDA_VERSION}=${CUBLAS_VER})
     fi
     if [[ "$(installed_pkg_version cuda-nvrtc-dev-${NVRTC_CUDA_VERSION})" != "${NVRTC_VER}" ]]; then
         apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev* || true
