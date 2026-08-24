@@ -114,6 +114,13 @@ l0_b200:
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_megamoe_streaming_load.py
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_cutedsl_standard_swiglu_keeps_original_activation_path
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_cutedsl_tactic_autotune_defaults_off
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_enumerate_megamoe_candidate_tactics_curated_space
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"

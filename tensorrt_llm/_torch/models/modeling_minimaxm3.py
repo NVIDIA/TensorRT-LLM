@@ -52,6 +52,7 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
+from ..modules.fused_moe.interface import MoESchedulerKind
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
@@ -84,6 +85,17 @@ _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 # Experimental A/B gate for producing compact FP8 Q while inserting main K/V
 # directly into the MSA paged cache during supported eager pure-prefill steps.
 _FUSED_MAIN_KV_WRITE_ENV = "TRTLLM_MINIMAX_M3_FUSED_MAIN_KV_WRITE"
+
+
+def _moe_routed_output_is_global(experts: nn.Module) -> bool:
+    """Whether the MoE backend returns an already combined routed output.
+
+    Fused-communication backends own dispatch and combine inside the MoE
+    kernel.  Their output therefore contains the complete routed-expert
+    contribution for each input token, irrespective of ``reduce_results``.
+    """
+    backend = getattr(experts, "backend", experts)
+    return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -407,20 +419,19 @@ def _build_swiglu_oai_dense_mlp(
     1 via ``overridden_tp_size=1`` so the MLP is replicated and operates
     purely rank-locally (no sharding, no allreduce on ``down_proj``).
 
-    For the MoE shared-expert path (``is_shared_expert=True``)
-    ``reduce_output`` is forced ``False`` regardless of ADP: the routed
-    branch is also constructed with ``reduce_results=False`` and the
-    composition runs a single external AllReduce on
-    ``routed + shared``, matching the DeepSeekV3 / GLM convention.
+    For the MoE shared-expert path (``is_shared_expert=True``),
+    ``reduce_output`` is forced ``False`` regardless of ADP. External-
+    communication MoE backends reduce ``routed + shared`` together, while
+    fused-communication backends reduce only this TP-local shared term before
+    adding their already-global routed output.
     """
     config = model_config.pretrained_config
     swiglu_alpha = float(getattr(config, "swiglu_alpha", 1.702))
     swiglu_limit = float(getattr(config, "swiglu_limit", 7.0))
     enable_adp = model_config.mapping.enable_attention_dp
-    # Shared experts inside the MoE block defer the cross-rank reduction
-    # to the MoE's single external AllReduce. The dense MLP path (no
-    # MoE composition) carries its own reduction unless ADP collapses
-    # TP to 1.
+    # Shared experts inside the MoE block defer cross-rank reduction to the
+    # MoE composition. The dense MLP path (no MoE composition) carries its own
+    # reduction unless ADP collapses TP to 1.
     reduce_output = False if is_shared_expert else (not enable_adp)
     # SwiGLU-OAI is plain SwiGLU with an alpha gain and (up + 1) offset, so it
     # routes through the fused silu_and_mul kernel (one launch, optional fp8
@@ -549,15 +560,14 @@ class MiniMaxM3MoE(nn.Module):
     ``swiglu_no_interleaved_with_alpha_and_limit`` shape. We plumb
     ``alpha``, ``beta=1.0`` (the ``up + 1`` offset), and ``limit`` per
     local expert into ``create_moe`` together with
-    ``ActivationType.SwigluBias``, which dispatches the CUTLASS-family
-    ``SwigluBiasAdaptor`` operator inside the fused MoE kernel.
+    ``ActivationType.SwigluBias``. Each supported backend then selects its
+    matching fused activation implementation.
 
-    The routed branch and the shared expert both produce local partial
-    outputs (``reduce_results=False`` / ``reduce_output=False``); their
-    sum runs through a single external AllReduce only when not under
-    Attention DP and ``tp_size > 1``. This matches the
-    DeepSeekV3 / GLM convention and avoids the duplicate communication
-    that the previous independent-reduction wiring incurred.
+    External-communication backends return a TP-local routed contribution, so
+    ``routed + shared`` is reduced once. Fused-communication backends already
+    return the EP-global routed contribution, so only the TP-local shared term
+    is reduced before composition. Attention DP performs neither outer
+    reduction because each rank owns independent tokens.
     """
 
     @staticmethod
@@ -636,11 +646,11 @@ class MiniMaxM3MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
-        # Routed branch produces local partial outputs; the external
-        # AllReduce below combines routed + shared in a single round
-        # (matches DeepSeekV3). Under Attention DP the fused MoE already
-        # skips its in-op all-reduce, so ``reduce_results=False`` is
-        # also the correct flag there.
+        # External-communication backends return a local routed contribution;
+        # fused-communication backends own the EP combine and return a global
+        # routed contribution. ``reduce_results=False`` avoids a second
+        # backend-side reduction in both cases; composition below performs
+        # only the outer reduction still required by the selected contract.
         experts_quant_config = MiniMaxM3MoE._get_experts_quant_config(model_config, layer_idx)
         self.experts = create_moe(
             routing_method=self.gate.routing_method,
@@ -655,6 +665,7 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_limit=self.swiglu_limit,
             activation_type=ActivationType.SwigluBias,
         )
+        self.routed_output_is_global = _moe_routed_output_is_global(self.experts)
         # Defensive: if a future MoE-resolution path (new load-balancer
         # mode, new DWDP variant) shifts the local expert count in a
         # way our resolver doesn't yet model, fail here with a
@@ -668,11 +679,10 @@ class MiniMaxM3MoE(nn.Module):
             f"match the MoE module's resolved layout."
         )
 
-        # Shared expert: dense MLP fused into MoE output. Constructed
-        # with ``is_shared_expert=True`` so ``reduce_output=False``
-        # (the external AllReduce below performs the combined
-        # reduction) and so the LoRA module types match the shared-
-        # expert convention.
+        # Shared expert: dense MLP fused into MoE output. Constructed with
+        # ``is_shared_expert=True`` so ``reduce_output=False`` (composition
+        # below performs the required reduction) and so the LoRA module types
+        # match the shared-expert convention.
         n_shared = int(getattr(config, "n_shared_experts", 0) or 0)
         if n_shared > 0:
             shared_intermediate = (
@@ -687,10 +697,10 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.shared_experts = None
 
-        # External AllReduce on the combined routed + shared output.
-        # Skipped under Attention DP (each rank's tokens are independent
-        # so cross-rank reduction would mix them) and under tp_size==1
-        # (nothing to reduce).
+        # Outer TP AllReduce used either on routed + shared (external comm) or
+        # on shared alone (fused comm). Skipped under Attention DP (each rank's
+        # tokens are independent, so cross-rank reduction would mix them) and
+        # under tp_size==1 (nothing to reduce).
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
             self.allreduce = AllReduce(
@@ -726,7 +736,8 @@ class MiniMaxM3MoE(nn.Module):
             return self.shared_experts(hidden_states)
 
         if self.shared_experts is None:
-            result = _compute_routed_output()
+            routed_output = _compute_routed_output()
+            result = routed_output
         else:
             routed_output, shared_output = maybe_execute_in_parallel(
                 _compute_routed_output,
@@ -736,11 +747,19 @@ class MiniMaxM3MoE(nn.Module):
                 self.aux_stream,
                 disable_on_compile=True,
             )
+            if self.routed_output_is_global and self.allreduce is not None:
+                # Fused-communication MoE already combined the routed result
+                # across EP ranks.  Only the TP-local shared expert needs an
+                # AllReduce; reducing their sum would multiply the routed
+                # contribution by TP size.
+                shared_output = self.allreduce(shared_output)
+                return shared_output.add_(routed_output)
+
             # In-place add into ``shared_output`` to avoid allocating a
             # temporary (matches DeepSeekV3 / GLM convention).
             result = shared_output.add_(routed_output)
 
-        if self.allreduce is not None:
+        if self.allreduce is not None and not self.routed_output_is_global:
             result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
         return result
 
@@ -2344,6 +2363,12 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         self.enable_fusion &= (not self.enable_attention_dp) and self.mapping.tp_size > 1
         self.pre_feed_forward_fusion = self.enable_fusion
         self.post_feed_forward_fusion = self.enable_fusion
+        if self.block_sparse_moe is not None and self.block_sparse_moe.routed_output_is_global:
+            # POST fusion would defer a reduction of routed+shared to the
+            # layer boundary, but a fused-communication MoE has already
+            # combined the routed term.  Let the MoE reduce only its local
+            # shared-expert output before adding the routed result.
+            self.post_feed_forward_fusion = False
 
         self.allreduce = None
         if not self.enable_attention_dp and self.mapping.tp_size > 1:

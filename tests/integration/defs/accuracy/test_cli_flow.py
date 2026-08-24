@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,17 +17,31 @@ import pytest
 from tensorrt_llm.llmapi import EagleDecodingConfig, MedusaDecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (get_sm_version, llm_models_root, parametrize_with_ids,
-                        skip_no_nvls, skip_post_blackwell, skip_pre_ada,
-                        skip_pre_blackwell, skip_pre_hopper)
-from .accuracy_core import (MMLU, CliFlowAccuracyTestHarness, CnnDailymail,
-                            Humaneval, PassKeyRetrieval64k, ZeroScrolls)
+from ..conftest import (
+    get_sm_version,
+    llm_models_root,
+    parametrize_with_ids,
+    skip_no_nvls,
+    skip_post_blackwell,
+    skip_pre_ada,
+    skip_pre_blackwell,
+    skip_pre_hopper,
+)
+from .accuracy_core import (
+    MMLU,
+    CliFlowAccuracyTestHarness,
+    CnnDailymail,
+    Humaneval,
+    PassKeyRetrieval64k,
+    ZeroScrolls,
+)
 
 # skip trt flow cases on post-Blackwell-Ultra
 if get_sm_version() >= 103:
     pytest.skip(
         "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
-        allow_module_level=True)
+        allow_module_level=True,
+    )
 
 
 class TestGpt2(CliFlowAccuracyTestHarness):
@@ -37,7 +51,7 @@ class TestGpt2(CliFlowAccuracyTestHarness):
 
     def test_auto_dtype(self):
         # float16
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
@@ -46,9 +60,11 @@ class TestGpt2(CliFlowAccuracyTestHarness):
         self.run(quant_algo=quant_algo)
 
     def test_beam_search(self):
-        self.run(extra_acc_spec="beam_width=4",
-                 extra_build_args=["--max_beam_width=4"],
-                 extra_summarize_args=["--num_beams=4", "--length_penalty=2.0"])
+        self.run(
+            extra_acc_spec="beam_width=4",
+            extra_build_args=["--max_beam_width=4"],
+            extra_summarize_args=["--num_beams=4", "--length_penalty=2.0"],
+        )
 
 
 class TestGpt2Medium(CliFlowAccuracyTestHarness):
@@ -57,7 +73,7 @@ class TestGpt2Medium(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/gpt"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_pre_ada
     def test_fp8(self):
@@ -70,7 +86,7 @@ class TestStarcoder2_3B(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/gpt"
 
     def test_auto_dtype(self):
-        self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype='auto')
+        self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype="auto")
 
 
 class TestStarcoder2_15B(CliFlowAccuracyTestHarness):
@@ -87,7 +103,7 @@ class TestGptNext(CliFlowAccuracyTestHarness):
 
     def test_auto_dtype(self):
         # bfloat16
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
 
 class TestMinitron4BBase(CliFlowAccuracyTestHarness):
@@ -96,15 +112,17 @@ class TestMinitron4BBase(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/gpt"
 
     def test_auto_dtype(self):
-        self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype='auto')
+        self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype="auto")
 
     @skip_pre_ada
     def test_fp8(self, mocker):
         # Accuracy regression when using large batch size
         mocker.patch.object(Humaneval, "MAX_BATCH_SIZE", 1)
-        self.run(tasks=[Humaneval(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8)
+        self.run(
+            tasks=[Humaneval(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+        )
 
 
 class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
@@ -115,8 +133,9 @@ class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
+            self.__class__,
+            "MODEL_PATH",
+            f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export",
         )
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
@@ -131,7 +150,7 @@ class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_tp2(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
+        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype="auto")
 
 
 class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
@@ -140,18 +159,20 @@ class TestLlama3_1NemotronNano8Bv1(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/llama"
 
     def test_auto_dtype(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
+        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype="auto")
 
     @skip_pre_hopper
     @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8")
+            self.__class__, "MODEL_PATH", f"{llm_models_root()}/Llama-3.1-Nemotron-Nano-8B-v1-FP8"
+        )
 
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8)
+        self.run(
+            tasks=[MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+        )
 
 
 @pytest.mark.timeout(10800)
@@ -170,14 +191,15 @@ class TestNemotronUltra(CliFlowAccuracyTestHarness):
         if cuda_graph:
             extra_summarize_args.append("--cuda_graph_mode")
 
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 tp_size=tp_size,
-                 pp_size=pp_size,
-                 extra_build_args=["--gemm_plugin=auto"],
-                 extra_summarize_args=extra_summarize_args)
+        self.run(
+            tasks=[MMLU(self.MODEL_NAME)],
+            tp_size=tp_size,
+            pp_size=pp_size,
+            extra_build_args=["--gemm_plugin=auto"],
+            extra_summarize_args=extra_summarize_args,
+        )
 
-    @pytest.mark.skip(
-        reason="nemotron-nas scripts have to accommodate fp8 flags")
+    @pytest.mark.skip(reason="nemotron-nas scripts have to accommodate fp8 flags")
     @skip_pre_hopper
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
@@ -185,21 +207,24 @@ class TestNemotronUltra(CliFlowAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size", [(8, 1)], ids=["tp8"])
     def test_fp8_prequantized(self, cuda_graph, tp_size, pp_size, mocker):
         mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8"
+            self.__class__,
+            "MODEL_PATH",
+            f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
         )
 
         extra_summarize_args = []
         if cuda_graph:
             extra_summarize_args.append("--cuda_graph_mode")
 
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=tp_size,
-                 pp_size=pp_size,
-                 extra_build_args=["--gemm_plugin=auto"],
-                 extra_summarize_args=extra_summarize_args)
+        self.run(
+            tasks=[MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            extra_build_args=["--gemm_plugin=auto"],
+            extra_summarize_args=extra_summarize_args,
+        )
 
 
 @skip_post_blackwell
@@ -210,7 +235,7 @@ class TestPhi2(CliFlowAccuracyTestHarness):
 
     @skip_post_blackwell
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_post_blackwell
     @pytest.mark.skip_less_device(2)
@@ -225,7 +250,7 @@ class TestPhi3Mini4kInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/phi"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
 
 @skip_post_blackwell
@@ -235,7 +260,7 @@ class TestPhi3Mini128kInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/phi"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
 
 @skip_post_blackwell
@@ -245,7 +270,7 @@ class TestPhi3Small8kInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/phi"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
 
 @skip_post_blackwell
@@ -255,7 +280,7 @@ class TestPhi3Small128kInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/phi"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
 
 @skip_post_blackwell
@@ -265,7 +290,7 @@ class TestPhi3_5MiniInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/phi"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
 
 class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
@@ -274,7 +299,7 @@ class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/phi"
 
     def test_auto_dtype(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
+        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype="auto")
 
     @pytest.mark.skip_less_device(2)
     def test_tp2(self):
@@ -297,12 +322,14 @@ class TestLongAlpaca7B(CliFlowAccuracyTestHarness):
 
     def test_multiblock_aggressive(self):
         # MMHA + aggressive Multi_block_mode (export TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG=1)
-        self.run(tasks=[ZeroScrolls(self.MODEL_NAME)],
-                 extra_build_args=["--gemm_plugin=auto"],
-                 env={
-                     "TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG": "1",
-                     "TRTLLM_MMHA_BLOCKS_PER_SEQUENCE": "32"
-                 })
+        self.run(
+            tasks=[ZeroScrolls(self.MODEL_NAME)],
+            extra_build_args=["--gemm_plugin=auto"],
+            env={
+                "TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG": "1",
+                "TRTLLM_MMHA_BLOCKS_PER_SEQUENCE": "32",
+            },
+        )
 
 
 class TestMamba130M(CliFlowAccuracyTestHarness):
@@ -311,7 +338,7 @@ class TestMamba130M(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/mamba"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
 
 class TestVicuna7B(CliFlowAccuracyTestHarness):
@@ -330,52 +357,66 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
         extra_summarize_args = [
-            "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]"
+            "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], "
+            "[3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], "
+            "[0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], "
+            "[0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], "
+            "[0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], "
+            "[6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], "
+            "[0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], "
+            "[0, 7, 0]]"
         ]
         if cuda_graph:
             extra_summarize_args.append("--cuda_graph_mode")
 
-        self.run(dtype="float16",
-                 spec_dec_algo=MedusaDecodingConfig.
-                 model_fields["decoding_type"].default,
-                 extra_convert_args=[
-                     f"--medusa_model_dir={self.MEDUSA_MODEL_PATH}",
-                     "--num_medusa_heads=4"
-                 ],
-                 extra_build_args=["--speculative_decoding_mode=medusa"],
-                 extra_summarize_args=extra_summarize_args)
+        self.run(
+            dtype="float16",
+            spec_dec_algo=MedusaDecodingConfig.model_fields["decoding_type"].default,
+            extra_convert_args=[
+                f"--medusa_model_dir={self.MEDUSA_MODEL_PATH}",
+                "--num_medusa_heads=4",
+            ],
+            extra_build_args=["--speculative_decoding_mode=medusa"],
+            extra_summarize_args=extra_summarize_args,
+        )
 
     @skip_post_blackwell
-    @parametrize_with_ids("cuda_graph,chunked_context,typical_acceptance",
-                          [(False, False, False), (True, False, False),
-                           (True, True, False), (True, False, True)])
-    def test_eagle(self, cuda_graph, chunked_context, typical_acceptance,
-                   mocker):
+    @parametrize_with_ids(
+        "cuda_graph,chunked_context,typical_acceptance",
+        [(False, False, False), (True, False, False), (True, True, False), (True, False, True)],
+    )
+    def test_eagle(self, cuda_graph, chunked_context, typical_acceptance, mocker):
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "eagle")
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
         extra_summarize_args = [
-            "--eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]"
+            "--eagle_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], "
+            "[3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], "
+            "[0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], "
+            "[0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], "
+            "[0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], "
+            "[6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], "
+            "[0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], "
+            "[0, 7, 0]]"
         ]
         if cuda_graph:
             extra_summarize_args.append("--cuda_graph_mode")
         if chunked_context:
             extra_summarize_args.append("--enable_chunked_context")
         if typical_acceptance:
-            extra_summarize_args.extend(
-                ["--eagle_posterior_threshold=0.09", "--temperature=0.7"])
+            extra_summarize_args.extend(["--eagle_posterior_threshold=0.09", "--temperature=0.7"])
 
-        self.run(spec_dec_algo=EagleDecodingConfig.
-                 model_fields["decoding_type"].default,
-                 extra_convert_args=[
-                     f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
-                     "--max_draft_len=63", "--num_eagle_layers=4",
-                     "--max_non_leaves_per_layer=10"
-                 ],
-                 extra_build_args=[
-                     "--speculative_decoding_mode=eagle", "--max_draft_len=63"
-                 ],
-                 extra_summarize_args=extra_summarize_args)
+        self.run(
+            spec_dec_algo=EagleDecodingConfig.model_fields["decoding_type"].default,
+            extra_convert_args=[
+                f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
+                "--max_draft_len=63",
+                "--num_eagle_layers=4",
+                "--max_non_leaves_per_layer=10",
+            ],
+            extra_build_args=["--speculative_decoding_mode=eagle", "--max_draft_len=63"],
+            extra_summarize_args=extra_summarize_args,
+        )
 
 
 class TestTinyLlama1_1BChat(CliFlowAccuracyTestHarness):
@@ -384,7 +425,7 @@ class TestTinyLlama1_1BChat(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/llama"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
@@ -408,7 +449,7 @@ class TestLlama3_8BInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/llama"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_pre_ada
     def test_fp8(self):
@@ -416,33 +457,41 @@ class TestLlama3_8BInstruct(CliFlowAccuracyTestHarness):
 
     @skip_pre_blackwell
     def test_nvfp4(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.NVFP4,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 extra_build_args=["--gemm_plugin=disable"])
+        self.run(
+            tasks=[MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.NVFP4,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            extra_build_args=["--gemm_plugin=disable"],
+        )
 
-    @pytest.mark.skip(
-        reason="Broken by modelopt. Will be fixed in next release")
+    @pytest.mark.skip(reason="Broken by modelopt. Will be fixed in next release")
     @skip_pre_blackwell
-    @pytest.mark.parametrize("fuse_fp4_quant", [False, True],
-                             ids=["disable_fused_quant", "enable_fused_quant"])
     @pytest.mark.parametrize(
-        "norm_quant_fusion", [False, True],
-        ids=["disable_norm_quant_fusion", "enable_norm_quant_fusion"])
-    def test_nvfp4_gemm_plugin(self, fuse_fp4_quant: bool,
-                               norm_quant_fusion: bool):
+        "fuse_fp4_quant", [False, True], ids=["disable_fused_quant", "enable_fused_quant"]
+    )
+    @pytest.mark.parametrize(
+        "norm_quant_fusion",
+        [False, True],
+        ids=["disable_norm_quant_fusion", "enable_norm_quant_fusion"],
+    )
+    def test_nvfp4_gemm_plugin(self, fuse_fp4_quant: bool, norm_quant_fusion: bool):
         extra_build_args = ["--gemm_plugin=nvfp4"]
         if fuse_fp4_quant:
-            extra_build_args.extend([
-                "--use_paged_context_fmha=enable",
-                "--use_fp8_context_fmha=enable", "--fuse_fp4_quant=enable"
-            ])
+            extra_build_args.extend(
+                [
+                    "--use_paged_context_fmha=enable",
+                    "--use_fp8_context_fmha=enable",
+                    "--fuse_fp4_quant=enable",
+                ]
+            )
         if norm_quant_fusion:
             extra_build_args.append("--norm_quant_fusion=enable")
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.NVFP4,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 extra_build_args=extra_build_args)
+        self.run(
+            tasks=[MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.NVFP4,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            extra_build_args=extra_build_args,
+        )
 
 
 class TestLlama3_8BInstructGradient1048k(CliFlowAccuracyTestHarness):
@@ -457,7 +506,7 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/llama"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_pre_ada
     def test_fp8(self):
@@ -466,47 +515,54 @@ class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @skip_post_blackwell
     def test_fp8_rowwise(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+        self.run(
+            tasks=[CnnDailymail(self.MODEL_NAME), MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+        )
 
     @skip_pre_ada
     @skip_post_blackwell
     def test_fp8_rowwise_meta_recipe(self):
-        self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
-                 extra_acc_spec="meta_recipe",
-                 extra_convert_args=["--use_meta_fp8_rowwise_recipe"])
+        self.run(
+            quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            extra_acc_spec="meta_recipe",
+            extra_convert_args=["--use_meta_fp8_rowwise_recipe"],
+        )
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
-        "gemm_allreduce", [False, pytest.param(True, marks=skip_no_nvls)],
-        ids=["disable_gemm_allreduce_plugin", "enable_gemm_allreduce_plugin"])
+        "gemm_allreduce",
+        [False, pytest.param(True, marks=skip_no_nvls)],
+        ids=["disable_gemm_allreduce_plugin", "enable_gemm_allreduce_plugin"],
+    )
     def test_tp4(self, gemm_allreduce: bool):
         extra_build_args = None
         if gemm_allreduce:
             extra_build_args = ["--gemm_allreduce_plugin=bfloat16"]
         self.run(
-            tasks=[PassKeyRetrieval64k(self.MODEL_NAME),
-                   MMLU(self.MODEL_NAME)],
+            tasks=[PassKeyRetrieval64k(self.MODEL_NAME), MMLU(self.MODEL_NAME)],
             tp_size=4,
-            extra_build_args=extra_build_args)
+            extra_build_args=extra_build_args,
+        )
 
     @skip_pre_hopper
     @skip_post_blackwell
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
-        "gemm_allreduce", [False, pytest.param(True, marks=skip_no_nvls)],
-        ids=["disable_gemm_allreduce_plugin", "enable_gemm_allreduce_plugin"])
+        "gemm_allreduce",
+        [False, pytest.param(True, marks=skip_no_nvls)],
+        ids=["disable_gemm_allreduce_plugin", "enable_gemm_allreduce_plugin"],
+    )
     def test_fp8_rowwise_tp4(self, gemm_allreduce: bool):
         extra_build_args = None
         if gemm_allreduce:
             extra_build_args = ["--gemm_allreduce_plugin=bfloat16"]
         self.run(
-            tasks=[PassKeyRetrieval64k(self.MODEL_NAME),
-                   MMLU(self.MODEL_NAME)],
+            tasks=[PassKeyRetrieval64k(self.MODEL_NAME), MMLU(self.MODEL_NAME)],
             quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
             tp_size=4,
-            extra_build_args=extra_build_args)
+            extra_build_args=extra_build_args,
+        )
 
 
 class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
@@ -515,32 +571,42 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/llama"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_pre_hopper
     def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8")
+            self.__class__,
+            "MODEL_PATH",
+            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+        )
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
     @skip_pre_hopper
     @skip_post_blackwell
     def test_medusa_fp8_prequantized(self, mocker):
         # nvidia/Llama-3.1-8B-Medusa-FP8
-        mocker.patch.object(self.__class__, "MODEL_PATH",
-                            f"{llm_models_root()}/llama3.1-medusa-8b-hf_v0.1")
+        mocker.patch.object(
+            self.__class__, "MODEL_PATH", f"{llm_models_root()}/llama3.1-medusa-8b-hf_v0.1"
+        )
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "medusa")
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
         extra_summarize_args = [
-            "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [1, 6], [0, 7, 0]]"
+            "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], "
+            "[3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], "
+            "[0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], "
+            "[0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 1, 1], "
+            "[0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], "
+            "[0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], "
+            "[1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [1, 6], [0, 7, 0]]"
         ]
-        self.run(dtype="float16",
-                 spec_dec_algo=MedusaDecodingConfig.
-                 model_fields["decoding_type"].default,
-                 extra_build_args=["--speculative_decoding_mode=medusa"],
-                 extra_summarize_args=extra_summarize_args)
+        self.run(
+            dtype="float16",
+            spec_dec_algo=MedusaDecodingConfig.model_fields["decoding_type"].default,
+            extra_build_args=["--speculative_decoding_mode=medusa"],
+            extra_summarize_args=extra_summarize_args,
+        )
 
 
 class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
@@ -549,7 +615,7 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/llama"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_pre_ada
     def test_fp8(self):
@@ -558,21 +624,20 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize(
-        "fp8_context_fmha", [False, True],
-        ids=["disable_fp8_context_fmha", "enable_fp8_context_fmha"])
+        "fp8_context_fmha",
+        [False, True],
+        ids=["disable_fp8_context_fmha", "enable_fp8_context_fmha"],
+    )
     @pytest.mark.parametrize(
-        "reduce_fusion", [False, True],
-        ids=["disable_reduce_fusion", "enable_reduce_fusion"])
+        "reduce_fusion", [False, True], ids=["disable_reduce_fusion", "enable_reduce_fusion"]
+    )
     def test_fp8_tp2(self, fp8_context_fmha: bool, reduce_fusion: bool):
         if fp8_context_fmha:
-            extra_build_args = [
-                "--use_fp8_context_fmha=enable",
-                "--use_paged_context_fmha=enable"
-            ]
+            extra_build_args = ["--use_fp8_context_fmha=enable", "--use_paged_context_fmha=enable"]
         else:
             extra_build_args = [
                 "--use_fp8_context_fmha=disable",
-                "--use_paged_context_fmha=disable"
+                "--use_paged_context_fmha=disable",
             ]
 
         if reduce_fusion:
@@ -580,10 +645,12 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
         else:
             extra_build_args.append("--reduce_fusion=disable")
 
-        self.run(quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 extra_build_args=extra_build_args)
+        self.run(
+            quant_algo=QuantAlgo.FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            tp_size=2,
+            extra_build_args=extra_build_args,
+        )
 
     @skip_pre_ada
     @skip_post_blackwell
@@ -593,14 +660,18 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @skip_post_blackwell
     def test_fp8_rowwise_meta_recipe(self):
-        self.run(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
-                 extra_acc_spec="meta_recipe",
-                 extra_convert_args=["--use_meta_fp8_rowwise_recipe"])
+        self.run(
+            quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+            extra_acc_spec="meta_recipe",
+            extra_convert_args=["--use_meta_fp8_rowwise_recipe"],
+        )
 
     @pytest.mark.parametrize("max_gpu_percent", [0.1, 1.0])
     def test_weight_streaming(self, max_gpu_percent: float):
-        self.run(extra_build_args=["--weight_streaming"],
-                 extra_summarize_args=["--gpu_weights_percent=0"])
+        self.run(
+            extra_build_args=["--weight_streaming"],
+            extra_summarize_args=["--gpu_weights_percent=0"],
+        )
 
         for gpu_percent in [0.1, 0.5, 0.9, 1]:
             if gpu_percent > max_gpu_percent:
@@ -618,7 +689,7 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype_tp8(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
+        self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype="auto")
 
 
 class TestMistral7B(CliFlowAccuracyTestHarness):
@@ -628,12 +699,15 @@ class TestMistral7B(CliFlowAccuracyTestHarness):
 
     @skip_pre_blackwell
     def test_beam_search(self):
-        self.run(extra_acc_spec="beam_width=4",
-                 extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
-                 extra_summarize_args=["--num_beams=4"])
+        self.run(
+            extra_acc_spec="beam_width=4",
+            extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
+            extra_summarize_args=["--num_beams=4"],
+        )
         import gc
 
         import torch
+
         for num_beams in [1, 2]:
             gc.collect()
             torch.cuda.empty_cache()
@@ -650,47 +724,51 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
     def test_tp2(self):
-        self.run(dtype='auto', tp_size=2)
+        self.run(dtype="auto", tp_size=2)
 
     @skip_pre_ada
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
     def test_fp8_tp2(self):
-        self.run(quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2)
+        self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8, tp_size=2)
 
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(40000)
     def test_fp8_tp2pp2(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 pp_size=2)
+        self.run(
+            tasks=[CnnDailymail(self.MODEL_NAME), MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            tp_size=2,
+            pp_size=2,
+        )
 
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(40000)
     def test_fp8_tp2pp2_manage_weights(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 pp_size=2,
-                 extra_build_args=["--fast_build"])
+        self.run(
+            tasks=[CnnDailymail(self.MODEL_NAME), MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            tp_size=2,
+            pp_size=2,
+            extra_build_args=["--fast_build"],
+        )
 
     @skip_pre_blackwell
     def test_nvfp4_prequantized(self, mocker):
         mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1")
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.NVFP4,
-                 kv_cache_quant_algo=QuantAlgo.FP8)
+            self.__class__,
+            "MODEL_PATH",
+            f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1",
+        )
+        self.run(
+            tasks=[MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.NVFP4,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+        )
 
 
 class TestMixtral8x22B(CliFlowAccuracyTestHarness):
@@ -702,14 +780,15 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     def test_fp8_tp2pp2(self, timeout_manager):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 pp_size=2,
-                 extra_convert_args=["--calib_size=32"],
-                 extra_build_args=["--gemm_plugin=auto"],
-                 timeout_manager=timeout_manager)
+        self.run(
+            tasks=[CnnDailymail(self.MODEL_NAME), MMLU(self.MODEL_NAME)],
+            quant_algo=QuantAlgo.FP8,
+            tp_size=2,
+            pp_size=2,
+            extra_convert_args=["--calib_size=32"],
+            extra_build_args=["--gemm_plugin=auto"],
+            timeout_manager=timeout_manager,
+        )
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):
@@ -718,7 +797,7 @@ class TestGemma2B(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/gemma"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto', extra_convert_args=["--ckpt-type=hf"])
+        self.run(dtype="auto", extra_convert_args=["--ckpt-type=hf"])
 
     @pytest.mark.parametrize("precision", ["int8"])
     def test_weight_only(self, precision: str):
@@ -737,7 +816,7 @@ class TestGemma7B(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/gemma"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto', extra_convert_args=["--ckpt-type=hf"])
+        self.run(dtype="auto", extra_convert_args=["--ckpt-type=hf"])
 
     @pytest.mark.parametrize("precision", ["int8"])
     def test_weight_only(self, precision: str):
@@ -757,10 +836,11 @@ class TestGemma2_9BIt(CliFlowAccuracyTestHarness):
 
     @skip_post_blackwell
     def test_auto_dtype(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 dtype='auto',
-                 extra_convert_args=["--ckpt-type=hf"])
+        self.run(
+            tasks=[CnnDailymail(self.MODEL_NAME), MMLU(self.MODEL_NAME)],
+            dtype="auto",
+            extra_convert_args=["--ckpt-type=hf"],
+        )
 
     @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
@@ -770,9 +850,11 @@ class TestGemma2_9BIt(CliFlowAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_fp8(self):
-        self.run(quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 extra_convert_args=["--device_map=sequential"])
+        self.run(
+            quant_algo=QuantAlgo.FP8,
+            kv_cache_quant_algo=QuantAlgo.FP8,
+            extra_convert_args=["--device_map=sequential"],
+        )
 
 
 class TestQwen7BChat(CliFlowAccuracyTestHarness):
@@ -781,7 +863,7 @@ class TestQwen7BChat(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/qwen"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
@@ -794,7 +876,7 @@ class TestQwen1_5MoeA2_7BChat(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/qwen"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @pytest.mark.skip(reason="https://nvbugs/5100102")
     def test_weight_only(self):
@@ -807,7 +889,7 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/qwen"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_post_blackwell
     def test_weight_only(self):
@@ -815,9 +897,9 @@ class TestQwen2_0_5BInstruct(CliFlowAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8)
+        self.run(
+            tasks=[CnnDailymail(self.MODEL_NAME), MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.FP8
+        )
 
 
 class TestQwen2_1_5B(CliFlowAccuracyTestHarness):
@@ -832,7 +914,7 @@ class TestQwen2_7BInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/qwen"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_post_blackwell
     def test_weight_only(self):
@@ -857,7 +939,7 @@ class TestQwen2_5_1_5BInstruct(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/qwen"
 
     def test_auto_dtype(self):
-        self.run(dtype='auto')
+        self.run(dtype="auto")
 
     @skip_post_blackwell
     def test_weight_only(self):
@@ -865,6 +947,6 @@ class TestQwen2_5_1_5BInstruct(CliFlowAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8)
+        self.run(
+            tasks=[CnnDailymail(self.MODEL_NAME), MMLU(self.MODEL_NAME)], quant_algo=QuantAlgo.FP8
+        )

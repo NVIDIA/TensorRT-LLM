@@ -331,8 +331,11 @@ def create_moe_backend(
                            ], f"bias not supported in {moe_cls.__name__}."
 
     if swiglu_alpha is not None or swiglu_beta is not None:
-        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE], \
-            f"swiglu_alpha and swiglu_beta are only supported in CutlassFusedMoE, TritonFusedMoE and TRTLLMGenFusedMoE, not in {moe_cls.__name__}."
+        assert moe_cls in [
+            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE,
+            MegaMoECuteDsl
+        ], \
+            f"swiglu_alpha and swiglu_beta are only supported in CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE and MegaMoECuteDsl, not in {moe_cls.__name__}."
         assert swiglu_alpha is not None and swiglu_beta is not None, \
             "Both swiglu_alpha and swiglu_beta must be provided."
 
@@ -343,9 +346,11 @@ def create_moe_backend(
         ], f"swiglu_limit is not supported in {moe_cls.__name__}."
 
     if swiglu_limit_scalar is not None:
+        # MegaMoECuteDsl uses the scalar only as a fallback when no per-expert
+        # tensor limit is given (see the MegaMoE branch below).
         assert moe_cls in [
             CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
-            MegaMoEDeepGemm, CuteDslFusedMoE
+            MegaMoEDeepGemm, CuteDslFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
@@ -524,7 +529,13 @@ def create_moe_backend(
             activation_type=activation_type,
         )
         if moe_cls is MegaMoECuteDsl:
-            megamoe_kwargs["swiglu_limit"] = swiglu_limit
+            # ``_resolve_gate_up_clamp`` accepts tensor or scalar; fall back
+            # to the scalar form when only that was wired.
+            megamoe_kwargs["swiglu_limit"] = (swiglu_limit
+                                              if swiglu_limit is not None else
+                                              swiglu_limit_scalar)
+            megamoe_kwargs["swiglu_alpha"] = swiglu_alpha
+            megamoe_kwargs["swiglu_beta"] = swiglu_beta
         else:
             megamoe_kwargs["swiglu_limit_scalar"] = swiglu_limit_scalar
         return moe_cls(**megamoe_kwargs)
