@@ -3665,8 +3665,8 @@ class PyExecutor:
         if not any(status[0] for status in all_rank_status):
             return False
 
-        all_ranks_fetched = all(status[0] for status in all_rank_status)
-        any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
+        all_ranks_fetched = all(status[1] for status in all_rank_status)
+        any_rank_terminal_no_fit = any(status[2] for status in all_rank_status)
         return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
