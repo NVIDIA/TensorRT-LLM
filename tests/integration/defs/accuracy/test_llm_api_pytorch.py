@@ -4663,7 +4663,10 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # The 16-GPU K3 recipes are qualified on GB300 (one NVL72 domain) only:
     # on 2-node 180-190 GiB parts (B200/GB200, InfiniBand between nodes) the
     # EP16 MoE-comm bring-up hangs and the KV-budget assumptions do not hold,
-    # so gate on GB300-class device memory.
+    # so gate on GB300-class device memory. B300 clears this memory gate but
+    # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) — do not
+    # schedule these tests on B300; that exclusion is enforced by QA's
+    # platform selection, not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
     @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
     def test_w4a16_mxfp4(self, mode: str,

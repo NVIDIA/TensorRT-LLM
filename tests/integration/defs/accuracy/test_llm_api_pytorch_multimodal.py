@@ -549,7 +549,10 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # The 16-GPU K3 recipes are qualified on GB300 (one NVL72 domain) only:
     # on 2-node 180-190 GiB parts (B200/GB200, InfiniBand between nodes) the
     # EP16 MoE-comm bring-up hangs and the KV-budget assumptions do not hold,
-    # so gate on GB300-class device memory.
+    # so gate on GB300-class device memory. B300 clears this memory gate but
+    # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) — do not
+    # schedule these tests on B300; that exclusion is enforced by QA's
+    # platform selection, not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
     def test_w4a16_mxfp4(self) -> None:
         """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
@@ -573,7 +576,18 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
             moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.25, tokens_per_block=64),
+            # use_kv_cache_manager_v2=False: the VL wrapper inherits K2.5's
+            # V2 cache-manager preference, but the qualified K3 MMMU
+            # configuration ran V1, and under V2 this test's long-generation
+            # shape (max_seq_len 24576, 16k-token outputs) stalled with all
+            # GPUs idle in QA validation (the GSM8K legs' shorter shape runs
+            # fine under V2). Pin V1 until the V2 x KDA-hybrid path is
+            # qualified at this shape.
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=0.25,
+                tokens_per_block=64,
+                use_kv_cache_manager_v2=False,
+            ),
         ) as llm:
             # Reference-key contract: the K3 checkpoint carries its
             # quantization as nested text_config.quantization_config
