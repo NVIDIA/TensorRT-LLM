@@ -457,13 +457,13 @@ def test_dspark_target_layer_ids_order_mismatch_rejected(tmp_path):
 
 @pytest.mark.cpu_only
 def test_dspark_requires_speculative_model():
-    # The DSpark draft weights live in the checkpoint's mtp.* namespace, so an
-    # unset speculative_model must fail fast at config validation instead of
-    # raising an opaque TypeError deep inside engine construction.
+    # Unset speculative_model means "load the draft from the target", as it
+    # does for MTP. /tmp/dummy_model carries no mtp.* draft weights, so that
+    # must fail fast at config validation instead of raising an opaque
+    # TypeError deep inside engine construction.
     spec_cfg = DSparkDecodingConfig(max_draft_len=5)
 
-    with pytest.raises(ValueError,
-                       match="requires speculative_config.speculative_model"):
+    with pytest.raises(ValueError, match="speculative_model is unset"):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             skip_tokenizer_init=True,

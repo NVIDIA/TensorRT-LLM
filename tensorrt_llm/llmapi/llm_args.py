@@ -6054,19 +6054,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 if not spec_cfg.max_draft_len:
                     raise ValueError("DSpark max_draft_len must be > 0; got "
                                      f"{spec_cfg.max_draft_len}")
-                # The DSpark draft weights live in the ``mtp.*`` namespace of a
-                # local checkpoint directory; without ``speculative_model``
-                # neither the draft weights nor the ``dspark_*`` config
-                # defaults can be located, and engine construction would fail
-                # much later with an opaque error.
+                # Same convention as MTP (see resolve_mtp_checkpoint_source):
+                # an unset speculative_model means "the draft lives in the
+                # target checkpoint". For DSpark that is the embedded
+                # DeepSeek-V4-Pro flavour, whose draft is the target's mtp.*
+                # namespace. Defaulting rather than rejecting keeps the
+                # spec-dec API consistent across algorithms; pointing
+                # speculative_model at the target explicitly is equivalent.
                 if spec_cfg.speculative_model is None:
-                    raise ValueError(
-                        "DSpark requires speculative_config.speculative_model "
-                        "to point at the drafter's checkpoint directory: a "
-                        "standalone DSpark drafter repository, or -- for the "
-                        "embedded DeepSeek-V4-Pro flavour, whose draft weights "
-                        "live in the mtp.* namespace -- the target checkpoint "
-                        "directory itself.")
+                    spec_cfg.speculative_model = self.model
+                    if not spec_cfg.draft_is_embedded_in_target:
+                        raise ValueError(
+                            "speculative_config.speculative_model is unset, "
+                            "which means 'load the draft from the target "
+                            "checkpoint', but the target has no mtp.* draft "
+                            "weights. Point speculative_model at a standalone "
+                            "DSpark drafter checkpoint directory.")
                 # Warm the embedded-vs-standalone probe here, while we are in
                 # the main process and the checkpoint path is known local. The
                 # flag then travels with the config, so no rank repeats the
