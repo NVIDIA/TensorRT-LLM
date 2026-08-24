@@ -17,7 +17,7 @@
 #   Attention                			  @NVIDIA/trt-llm-torch-attention-devs
 #   MoE                      			  @NVIDIA/trt-llm-moe-devs
 #   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
-#   Scaffolding              			  @WeiHaocheng
+#   Scaffolding              			  @WeiHaocheng @dc3671
 #   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
 #
 # New handles (trt-llm-devs / doc / agent / runtime / models / perf / moe / kernels / multi-gpu-ci-review)
@@ -32,7 +32,8 @@
 /tensorrt_llm/evaluate @NVIDIA/trt-llm-devs
 /tensorrt_llm/tools @NVIDIA/trt-llm-devs
 /tests/integration/test_lists/test-db @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
-/tests/integration/test_lists/waives.txt @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
+# Waiver updates follow the repository's normal review requirements.
+/tests/integration/test_lists/waives.txt
 /tests/test_common @NVIDIA/trt-llm-devs
 /tests/unittest @NVIDIA/trt-llm-devs
 
@@ -78,6 +79,7 @@
 /.codex @NVIDIA/trt-llm-agent-devs
 /AGENTS.md @NVIDIA/trt-llm-agent-devs
 /CLAUDE.md @NVIDIA/trt-llm-agent-devs
+/agent-flow @NVIDIA/trt-llm-agent-devs
 /scripts/check_skill_naming_convention.py @NVIDIA/trt-llm-agent-devs
 
 # ===== DOCS / EXAMPLES =====
@@ -117,14 +119,12 @@
 /tensorrt_llm/commands/utils.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/grpc @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs
 /tensorrt_llm/inputs @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/llmapi @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/llmapi/mm_encoder.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
-/tensorrt_llm/lora_helper.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/mapping.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/metrics @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/prompt_adapter_manager.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/sampling_params.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/scheduling_params.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/serve @NVIDIA/trt-llm-runtime-devs
@@ -135,7 +135,7 @@
 /tests/unittest/_torch/custom_ops @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/distributed @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/executor @NVIDIA/trt-llm-runtime-devs
-/tests/unittest/_torch/lora @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/peft @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/misc/test_autotuner.py @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/modules @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/multi_gpu @NVIDIA/trt-llm-runtime-devs
@@ -145,6 +145,7 @@
 /tests/unittest/_torch/speculative @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/speculative_hw_agnostic @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/executor @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs
 /tests/unittest/inputs @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/llmapi @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/llmapi/apps/*multimodal* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
@@ -384,18 +385,19 @@
 /tensorrt_llm/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/_torch/visual_gen/attention_backend @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/_torch/visual_gen/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
+/cpp/tensorrt_llm/thop/*lysses* @NVIDIA/trt-llm-torch-visual-gen-devs
+/cpp/tensorrt_llm/kernels/ulysses* @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/media @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs @NVIDIA/trt-llm-runtime-devs
-/tests/integration/defs/examples/test_visual_gen.py @NVIDIA/trt-llm-torch-visual-gen-devs
+/tests/integration/defs/examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/integration/defs/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/scripts/perf-sanity/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
-/tests/unittest/_torch/thop/parallel_hw_agnostic/test_fused_dit* @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tests/unittest/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 
 # ===== SCAFFOLDING =====
-/tensorrt_llm/scaffolding @WeiHaocheng
-/tests/unittest/scaffolding @WeiHaocheng
+/tensorrt_llm/scaffolding @WeiHaocheng @dc3671
+/tests/unittest/scaffolding @WeiHaocheng @dc3671
 
 # ===== SELF-MANAGED =====
 /docs/source/features/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
@@ -461,6 +463,16 @@
 /tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 
+# ===== COMPATIBILITY FORWARDING MODULES =====
+# Definition-free re-export modules left at a retired import path so external
+# callers keep working through the migration window (Epic TRTLLM-14558).  Each
+# one keeps the owner its pre-move path had -- without these lines the paths
+# fall through to the repository default, which would be an ownership change
+# nobody asked for.  Removed together with the modules themselves.
+/tensorrt_llm/lora_helper.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/prompt_adapter_manager.py @NVIDIA/trt-llm-runtime-devs
+
 # ===== GOVERNANCE / LEGAL GATES =====
 /.github/CODEOWNERS @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /.github/tava_architecture_diagram.md @NVIDIA/trt-llm-TAVA-design-change
@@ -478,6 +490,7 @@
 /jenkins/license_cpp.json @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /pyproject.toml @NVIDIA/trt-llm-oss-compliance
 /requirements-dev.txt @NVIDIA/trt-llm-oss-compliance
+/requirements-grpc-smg.txt @NVIDIA/trt-llm-oss-compliance
 /requirements.txt @NVIDIA/trt-llm-oss-compliance
 /setup.py @NVIDIA/trt-llm-oss-compliance
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee

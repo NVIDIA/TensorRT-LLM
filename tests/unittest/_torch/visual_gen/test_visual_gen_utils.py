@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import base64
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pytest
+from fastapi import UploadFile
 from PIL import Image
 
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
@@ -26,10 +29,13 @@ from tensorrt_llm.serve.visual_gen_utils import (
 )
 from tensorrt_llm.visual_gen import VisualGenParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _StubExtraParamSpec:
-    def __init__(self, default: Any = None) -> None:
+    def __init__(self, default: Any = None, type: str = "str") -> None:
         self.default = default
+        self.type = type
 
 
 class _StubVisualGen:
@@ -273,7 +279,7 @@ class TestInputReferenceMaterialization:
             request, "vid-1", generator, media_storage_path=str(tmp_path)
         )
         assert params.image is not None
-        assert str(params.image).endswith("vid-1_reference.png")
+        assert str(params.image).endswith("vid-1_reference")
         # The decoded image is identical to what we passed in.
         with open(params.image, "rb") as f:
             decoded = Image.open(f).convert("RGB")
@@ -288,6 +294,275 @@ class TestInputReferenceMaterialization:
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         with pytest.raises(ValueError, match="media_storage_path"):
             parse_visual_gen_params(request, "vid-2", generator, media_storage_path=None)
+
+    _TEST_DATA = Path(__file__).parent / "test_data"
+
+    @staticmethod
+    def _mp4_bytes() -> bytes:
+        """9-frame H.264-in-MP4 fixture (provenance: test_data/README.md)."""
+        return (
+            TestInputReferenceMaterialization._TEST_DATA / "cosmos3_v2v_ref_9f_bframes.mp4"
+        ).read_bytes()
+
+    @staticmethod
+    def _avi_bytes() -> bytes:
+        """Same 9 frames as H.264-in-AVI (provenance: test_data/README.md)."""
+        return (
+            TestInputReferenceMaterialization._TEST_DATA / "cosmos3_v2v_ref_9f_bframes.avi"
+        ).read_bytes()
+
+    def test_multipart_avi_reference_routes_to_video(self, tmp_path):
+        # The AVI container signature must survive the real boundary: routed
+        # to the ``video`` extra param as untouched encoded bytes.
+        generator = _StubVisualGen()
+        payload = self._avi_bytes()
+        upload = UploadFile(file=BytesIO(payload), filename="clip.avi")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        params = parse_visual_gen_params(
+            request, "vid-avi", generator, media_storage_path=str(tmp_path)
+        )
+        assert params.image is None
+        assert params.extra_params["video"] == payload
+
+    def test_multipart_video_reference_routes_to_extra_params_bytes(self, tmp_path):
+        generator = _StubVisualGen()
+        payload = self._mp4_bytes()
+        upload = UploadFile(file=BytesIO(payload), filename="clip.mp4")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        params = parse_visual_gen_params(
+            request, "vid-3", generator, media_storage_path=str(tmp_path)
+        )
+        # Video content rides the model-specific ``video`` extra param as the
+        # encoded payload, byte-identical — the boundary never decodes video;
+        # the worker demuxes/NVDEC-decodes the conditioning window.
+        assert params.image is None
+        assert params.extra_params["video"] == payload
+        # Nothing lands in media storage for video references.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_video_reference_needs_no_media_storage(self):
+        # Video bytes pass through in memory, so V2V works without a storage
+        # path at all (only image references persist a file for the worker).
+        generator = _StubVisualGen()
+        b64 = base64.b64encode(self._mp4_bytes()).decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        params = parse_visual_gen_params(request, "vid-9", generator, media_storage_path=None)
+        assert params.extra_params["video"] == self._mp4_bytes()
+
+    def test_base64_video_reference_routes_to_extra_params_bytes(self, tmp_path):
+        # Routing is signature-based, so the JSON/base64 path can carry video
+        # even though it has no content-type or filename.
+        generator = _StubVisualGen()
+        payload = self._mp4_bytes()
+        b64 = base64.b64encode(payload).decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        params = parse_visual_gen_params(
+            request, "vid-4", generator, media_storage_path=str(tmp_path)
+        )
+        assert params.image is None
+        assert params.extra_params["video"] == payload
+
+    def test_video_reference_bytes_survive_real_specs(self):
+        """With the real cosmos3 specs loaded, parsing leaves the encoded
+        payload byte-identical in ``extra_params['video']`` — the boundary
+        never transforms video content; the worker decodes the window."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        generator = _StubVisualGen(extra_param_specs=COSMOS3_EXTRA_SPECS)
+        payload = self._mp4_bytes()
+        b64 = base64.b64encode(payload).decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        params = parse_visual_gen_params(request, "vid-10", generator, media_storage_path=None)
+        assert params.extra_params["video"] == payload
+
+    def test_multipart_image_reference_routes_to_image(self, tmp_path):
+        # JPEG upload: content sniffing classifies it as an image and routes
+        # to params.image. The stored file has no type-suffix (PIL identifies
+        # by content, not name).
+        generator = _StubVisualGen()
+        img = Image.new("RGB", (4, 4), (10, 20, 30))
+        buf = BytesIO()
+        img.save(buf, format="JPEG")
+        buf.seek(0)
+        upload = UploadFile(file=buf, filename="ref.jpg")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        params = parse_visual_gen_params(
+            request, "vid-5", generator, media_storage_path=str(tmp_path)
+        )
+        assert params.extra_params is None
+        assert str(params.image).endswith("vid-5_reference")
+
+    def test_undecodable_reference_raises_and_cleans_up(self, tmp_path):
+        generator = _StubVisualGen()
+        b64 = base64.b64encode(b"neither an image nor a video").decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        with pytest.raises(ValueError, match="not a recognized media container"):
+            parse_visual_gen_params(request, "vid-6", generator, media_storage_path=str(tmp_path))
+        # Classification runs on the bytes; rejected content never touches disk.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_malformed_base64_reference_raises_and_cleans_up(self, tmp_path):
+        generator = _StubVisualGen()
+        # "ABC" survives the lenient alphabet filter but has an invalid
+        # length, so b64decode raises.
+        request = VideoGenerationRequest(prompt="x", input_reference="ABC")
+        with pytest.raises(ValueError, match="not valid base64"):
+            parse_visual_gen_params(request, "vid-7", generator, media_storage_path=str(tmp_path))
+        assert list(tmp_path.iterdir()) == []
+
+    def test_upload_stream_failure_cleans_up_tmp(self, tmp_path):
+        generator = _StubVisualGen()
+
+        class _BrokenStream:
+            def read(self, *args, **kwargs):
+                raise OSError("client went away")
+
+        upload = UploadFile(file=_BrokenStream(), filename="clip.mp4")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        # I/O failures keep their server-error semantics (no 400 masking) …
+        with pytest.raises(OSError, match="client went away"):
+            parse_visual_gen_params(request, "vid-8", generator, media_storage_path=str(tmp_path))
+        # … but the partial materialization must not leak.
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestMediaBytesProbes:
+    """The in-memory signature probes the serve boundary routes on."""
+
+    def test_sniff_media_kind(self):
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        png = BytesIO()
+        Image.new("RGB", (2, 2)).save(png, format="PNG")
+        jpg = BytesIO()
+        Image.new("RGB", (2, 2)).save(jpg, format="JPEG")
+        assert sniff_media_kind(png.getvalue()) == "image"
+        assert sniff_media_kind(jpg.getvalue()) == "image"
+        assert sniff_media_kind(TestInputReferenceMaterialization._mp4_bytes()) == "video"
+        assert sniff_media_kind(TestInputReferenceMaterialization._avi_bytes()) == "video"
+        assert sniff_media_kind(b"plain text, not media") is None
+        assert sniff_media_kind(b"") is None
+        # RIFF alone is not AVI (e.g. WAV audio is RIFF too).
+        assert sniff_media_kind(b"RIFF\x00\x00\x00\x00WAVEfmt ") is None
+
+    @staticmethod
+    def _ftyp(major: bytes, compatible: tuple = (), *, size: int = None) -> bytes:
+        """Build an ISO-BMFF `ftyp` box: size|'ftyp'|major|minor|compatible*."""
+        body = major + b"\x00\x00\x00\x00" + b"".join(compatible)
+        declared = len(body) + 8 if size is None else size
+        return declared.to_bytes(4, "big") + b"ftyp" + body
+
+    @staticmethod
+    def _ftyp_ext(major: bytes, compatible: tuple = (), *, largesize: int = None) -> bytes:
+        """Build a 64-bit `ftyp` box: 1|'ftyp'|largesize|major|minor|compat*.
+
+        ``size == 1`` inserts an 8-byte largesize between the type and the
+        brands, so the major brand lives at [16:20], not [8:12].
+        """
+        body = major + b"\x00\x00\x00\x00" + b"".join(compatible)
+        declared = len(body) + 16 if largesize is None else largesize
+        return (1).to_bytes(4, "big") + b"ftyp" + declared.to_bytes(8, "big") + body
+
+    def test_sniff_isobmff_still_images_are_not_video(self):
+        """`ftyp` marks the ISO-BMFF family, not video: HEIF/AVIF photos share
+        it with MP4. Routing them to the video slot would hand a still image to
+        NVDEC; they must classify as image instead."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        # HEIC as major brand (the iOS camera default).
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1", b"heic"))) == "image"
+        # `mif1` major with `heic` compatible.
+        assert sniff_media_kind(self._ftyp(b"mif1", (b"heic",))) == "image"
+        # AVIF: the spec requires avif/avis among the COMPATIBLE brands, so a
+        # major-brand-only check would miss this one.
+        assert sniff_media_kind(self._ftyp(b"iso8", (b"avif", b"mif1"))) == "image"
+        assert sniff_media_kind(self._ftyp(b"avis", (b"avif",))) == "image"
+        # HEVC image sequence brands.
+        for brand in (b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs"):
+            assert sniff_media_kind(self._ftyp(brand)) == "image", brand
+        # Ordinary video ISO-BMFF stays video.
+        assert sniff_media_kind(self._ftyp(b"mp42", (b"isom", b"mp42"))) == "video"
+        assert sniff_media_kind(self._ftyp(b"isom", (b"iso2", b"avc1"))) == "video"
+        assert sniff_media_kind(self._ftyp(b"qt  ")) == "video"
+
+    def test_sniff_ftyp_reads_the_whole_declared_box(self):
+        """A brand list longer than a fixed peek window must still be seen —
+        an `avif` brand at the tail decides image-vs-video."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        # 21 compatible brands = a 100-byte box; `avif` sits past byte 64.
+        padded = tuple([b"free"] * 20 + [b"avif"])
+        box = self._ftyp(b"isom", padded)
+        assert len(box) > 64 and box.index(b"avif") > 64
+        assert sniff_media_kind(box) == "image"
+
+    def test_sniff_ftyp_extended_size_shifts_the_brands(self):
+        """`size == 1` puts a 64-bit largesize at [8:16]; a parser that reads
+        the major brand at [8:12] sees half of that integer instead."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        assert sniff_media_kind(self._ftyp_ext(b"heic", (b"mif1",))) == "image"
+        assert sniff_media_kind(self._ftyp_ext(b"isom", (b"avif",))) == "image"
+        assert sniff_media_kind(self._ftyp_ext(b"mp42", (b"isom",))) == "video"
+
+    def test_sniff_ftyp_bounds_are_checked(self):
+        """An `ftyp` box we cannot read in full is unclassifiable: guessing
+        "video" off a partial scan is how a HEIC reaches NVDEC."""
+        from tensorrt_llm.inputs.media_io import sniff_media_kind
+
+        # Declared size larger than the payload (truncated file).
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=4096)) is None
+        # Declared size 0 means "box runs to EOF" — readable, so classify.
+        assert sniff_media_kind(self._ftyp(b"iso8", (b"avif",), size=0)) == "image"
+        # Nonsense small size: no room for even a major brand.
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=8)) is None
+        assert sniff_media_kind(self._ftyp(b"mp42", (b"avif",), size=8)) is None
+        # `minor_version` is mandatory, so a box is at least 16 bytes (24 with
+        # the largesize escape); stopping at the major brand is malformed.
+        assert sniff_media_kind(self._ftyp(b"heic", (b"mif1",), size=12)) is None
+        assert sniff_media_kind(self._ftyp_ext(b"heic", (b"mif1",), largesize=20)) is None
+        # Compatible-brand area must hold whole four-byte brands.
+        assert sniff_media_kind(self._ftyp(b"mp42", (b"isom",), size=18) + b"\x00\x00") is None
+        # Past the scan bound: bounded rather than scanned.
+        assert sniff_media_kind(self._ftyp(b"mp42", tuple([b"free"] * 2000))) is None
+        # Header shorter than a brand.
+        assert sniff_media_kind(b"\x00\x00\x00\x18ftyp") is None
+
+    def test_heif_reference_rejected_with_actionable_message(self):
+        """A HEIC upload is a valid file we simply do not support — the 400
+        must say so, not claim the file is corrupt."""
+        generator = _StubVisualGen()
+        heic = self._ftyp(b"heic", (b"mif1", b"heic")) + b"\x00" * 64
+        request = VideoGenerationRequest(
+            prompt="x", input_reference=base64.b64encode(heic).decode()
+        )
+        with pytest.raises(ValueError, match="HEIF/AVIF"):
+            parse_visual_gen_params(request, "vid-heic", generator, media_storage_path=None)
+
+    def test_truncated_image_reference_is_routed_not_decoded(self, tmp_path):
+        """The boundary routes on signature and never decodes.
+
+        A truncated PNG reaches the image slot; the worker's load is what
+        rejects it (as a client error). Decoding here would put unbounded,
+        client-controlled CPU on an async request path and duplicate work
+        the worker repeats anyway.
+        """
+        rng_pixels = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+        buf = BytesIO()
+        Image.fromarray(rng_pixels).save(buf, format="PNG")
+        whole = buf.getvalue()
+        truncated = whole[: len(whole) // 2]
+        with pytest.raises(OSError):
+            Image.open(BytesIO(truncated)).load()  # sanity: it really is broken
+
+        generator = _StubVisualGen()
+        request = VideoGenerationRequest(
+            prompt="x", input_reference=base64.b64encode(truncated).decode()
+        )
+        params = parse_visual_gen_params(
+            request, "vid-12", generator, media_storage_path=str(tmp_path)
+        )
+        assert Path(params.image).read_bytes() == truncated
 
 
 # =============================================================================
@@ -341,3 +616,56 @@ class TestMergeExtraParams:
         params = self._make_params()
         _merge_extra_params(params, request_extras=None, extra_param_specs={})
         assert params.extra_params is None
+
+
+# =============================================================================
+# Inline binary extra params — base64 in, bytes out
+# =============================================================================
+
+
+class TestInlineMediaDecoding:
+    """A pipeline that declares a ``bytes`` extra param must receive bytes.
+
+    JSON has no byte type, so an HTTP client can only inline binary as base64.
+    Decoding happens here rather than in the pipeline, which keeps a
+    bytes-only contract. Cosmos3 transfer's precomputed controls
+    (`depth`/`seg`/`wsm`) are unreachable over serving without it.
+    """
+
+    def _generator(self):
+        return _StubVisualGen(
+            extra_param_specs={
+                "video": _StubExtraParamSpec(type="bytes"),
+                "edge": _StubExtraParamSpec(type="bool_or_bytes_or_dict"),
+                "resolution": _StubExtraParamSpec(type="str"),
+            }
+        )
+
+    def test_base64_extra_param_reaches_the_pipeline_as_bytes(self):
+        request = VideoGenerationRequest(
+            prompt="storm",
+            extra_params={"video": base64.b64encode(b"\x00mp4").decode()},
+        )
+        params = parse_visual_gen_params(request, "id-b64", self._generator())
+        assert params.extra_params["video"] == b"\x00mp4"
+
+    def test_nested_control_reaches_the_pipeline_as_bytes(self):
+        request = VideoGenerationRequest(
+            prompt="storm",
+            extra_params={"edge": {"control": base64.b64encode(b"\x00ctrl").decode()}},
+        )
+        params = parse_visual_gen_params(request, "id-nested", self._generator())
+        assert params.extra_params["edge"]["control"] == b"\x00ctrl"
+
+    def test_non_media_params_are_untouched(self):
+        request = VideoGenerationRequest(
+            prompt="storm", extra_params={"resolution": "720", "edge": True}
+        )
+        params = parse_visual_gen_params(request, "id-plain", self._generator())
+        assert params.extra_params["resolution"] == "720"
+        assert params.extra_params["edge"] is True
+
+    def test_malformed_base64_is_a_client_error(self):
+        request = VideoGenerationRequest(prompt="storm", extra_params={"video": "not!b64!"})
+        with pytest.raises(ValueError, match="not valid base64"):
+            parse_visual_gen_params(request, "id-bad", self._generator())

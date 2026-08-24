@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,7 +11,15 @@ import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
+from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
 from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
+from tensorrt_llm._torch.speculative.utils import (
+    get_num_extra_kv_tokens,
+    get_num_spec_layers,
+    update_spec_config_from_model_config,
+    uses_mtp_head_checkpoint,
+)
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -1731,6 +1740,68 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
 
         torch.testing.assert_close(draft_inputs["input_ids"], ref_input_ids)
         torch.testing.assert_close(draft_inputs["hidden_states"], ref_previous_hidden_states)
+
+
+@pytest.mark.parametrize("uses_external_draft_model", [True, False])
+def test_mtp_checkpoint_type_config(uses_external_draft_model):
+    class TargetModel:
+        if uses_external_draft_model:
+            build_mtp_draft_model_from_config = True
+
+    spec_config = MTPDecodingConfig(
+        max_draft_len=3,
+        speculative_model="/tmp/assistant",
+    )
+    model_config = SimpleNamespace(
+        architectures=["Gemma4ForCausalLM" if uses_external_draft_model else "TargetModel"],
+        num_nextn_predict_layers=1,
+    )
+
+    update_spec_config_from_model_config(spec_config, model_config, TargetModel)
+
+    assert spec_config._use_shared_kv_cache is uses_external_draft_model
+    assert spec_config.uses_external_draft_model is uses_external_draft_model
+    assert uses_mtp_head_checkpoint(spec_config) is not uses_external_draft_model
+    assert spec_config.needs_separate_draft_weights
+    if uses_external_draft_model:
+        assert get_num_spec_layers(spec_config) == 0
+        assert get_num_extra_kv_tokens(spec_config) == 0
+        assert not should_use_separate_draft_kv_cache(spec_config)
+
+
+def test_mtp_shared_kv_draft_inputs():
+    spec_config = MTPDecodingConfig(
+        max_draft_len=3,
+        speculative_model="/tmp/assistant",
+        mtp_eagle_one_model=True,
+    )
+    spec_config._use_shared_kv_cache = True
+    worker = MTPEagleWorker(spec_config)
+    accepted_tokens = torch.tensor(
+        [
+            [10, 11, 12],
+            [20, 21, 22],
+            [30, 31, 32],
+        ],
+        dtype=torch.int32,
+    )
+
+    draft_ids, recurrent_hidden, draft_positions = worker._prepare_shared_kv_draft_inputs(
+        accepted_tokens=accepted_tokens,
+        num_accepted_tokens=torch.tensor([1, 2, 3]),
+        hidden_states=torch.arange(20, dtype=torch.float32).unsqueeze(1),
+        position_ids=torch.arange(10, dtype=torch.int32).unsqueeze(0),
+        sequence_lengths=torch.tensor([2, 4, 4]),
+        num_contexts=1,
+        batch_indices=torch.arange(3),
+    )
+
+    torch.testing.assert_close(draft_ids, torch.tensor([10, 21, 32], dtype=torch.int32))
+    torch.testing.assert_close(recurrent_hidden.squeeze(1), torch.tensor([1.0, 3.0, 8.0]))
+    torch.testing.assert_close(
+        draft_positions,
+        torch.tensor([[2, 4, 9]], dtype=torch.int32),
+    )
 
 
 @pytest.mark.high_cuda_memory

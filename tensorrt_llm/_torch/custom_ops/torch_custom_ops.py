@@ -48,7 +48,7 @@ from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2)
+                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
@@ -752,7 +752,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
 
 class MarlinNVFP4Runner(TunableRunner):
-    """Marlin-based NVFP4 GEMM for SM90 (Hopper).
+    """Marlin-based NVFP4 GEMM for SM89 (Ada, e.g. L40S) and SM90 (Hopper).
 
     Weights are eagerly repacked to Marlin tiled format during
     ``get_valid_tactics`` (before CUDA graph capture) so that ``forward()`` does
@@ -761,8 +761,6 @@ class MarlinNVFP4Runner(TunableRunner):
 
     tuning_config = TuningConfig()  # single tactic, no tuning
 
-    MIN_SM_VERSION = 90
-    MAX_SM_VERSION = 99  # SM90-series only (Hopper)
     NVFP4_SCALE_VECTOR_SIZE = 16
 
     def __init__(self, output_buffer_kind: int, output_dtype: torch.dtype):
@@ -774,9 +772,7 @@ class MarlinNVFP4Runner(TunableRunner):
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         if not torch.cuda.is_available():
             return []
-        capability = torch.cuda.get_device_capability(torch.device('cuda:0'))
-        sm_version = capability[0] * 10 + capability[1]
-        if sm_version < self.MIN_SM_VERSION or sm_version > self.MAX_SM_VERSION:
+        if not is_nvfp4_marlin_supported_sm():
             return []
 
         # Eagerly prepare Marlin weights so that forward() never allocates
@@ -1024,7 +1020,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         tactics = []
         act_fp4, weight, act_sf, weight_scale, alpha = inputs
 
-        # Add Marlin tactics (SM90 Hopper only) — users must opt-in explicitly
+        # Add Marlin tactics (SM89 Ada / SM90 Hopper) — users must opt-in explicitly
         # by listing "marlin" in ``allowed_backends``.
         if self._is_backend_allowed("marlin"):
             marlin_runner = MarlinNVFP4Runner(self.output_buffer_kind,
@@ -1036,7 +1032,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             elif self._is_only_backend("marlin"):
                 sm_version = get_sm_version()
                 raise ValueError(
-                    f"Marlin backend requires SM 90-99 (Hopper), but got SM "
+                    f"Marlin backend requires SM 89-99 (Ada L40S or Hopper), but got SM "
                     f"{sm_version}. Please add other backends to "
                     "allowed_backends.")
 
@@ -1153,12 +1149,12 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
     ) -> torch.Tensor:
         # Handle fallback tactic on cache miss
         if tactic == -1:
-            # Prefer marlin on Hopper (SM90) when explicitly allowed, cutlass
+            # Prefer marlin on Ada/Hopper (SM89-99) when explicitly allowed, cutlass
             # otherwise, falling back to whatever backend is available.
             assert len(
                 self.allowed_backends) > 0, "No allowed backends available"
-            sm_version = get_sm_version()
-            if "marlin" in self.allowed_backends and 90 <= sm_version <= 99:
+            if ("marlin" in self.allowed_backends
+                    and is_nvfp4_marlin_supported_sm()):
                 tactic = ("marlin", -1)
             elif "cutlass" in self.allowed_backends:
                 tactic = ("cutlass", -1)
@@ -1219,7 +1215,7 @@ def nvfp4_gemm(
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
     - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
-    - Marlin: Hopper W4A16 NVFP4 implementation (requires SM 90-99)
+    - Marlin: Ada/Hopper W4A16 NVFP4 implementation (requires SM 89-99)
 
     The AutoTuner profiles all available backends during the first run and caches
     the best choice for each input shape. Subsequent calls use the cached selection
@@ -1236,7 +1232,7 @@ def nvfp4_gemm(
         allowed_backends: Comma-separated list of backends to consider for auto-selection.
             Default: "cutlass,cublaslt,cuda_core" (excludes cutedsl for faster build)
             Add 'cutedsl' for extreme performance at the cost of longer build time.
-            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'.
+            Valid backends: 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin'.
 
     Returns:
         Output tensor [m, n] with dtype=output_dtype
@@ -2098,6 +2094,8 @@ class AllReduceRunner(TunableRunner):
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
     _prealloc_dtype: ClassVar[Optional[torch.dtype]] = None
+    # Keep these buckets synchronized with kAllReduceTuningBuckets in
+    # cpp/tensorrt_llm/thop/allreduceOp.cpp.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -2110,6 +2108,7 @@ class AllReduceRunner(TunableRunner):
         self,
         tp_size: int,
         group: List[int],
+        input_dtype: torch.dtype,
         op: int,
         eps: float,
         trigger_completion_at_end: bool,
@@ -2118,13 +2117,18 @@ class AllReduceRunner(TunableRunner):
         self.tp_size = tp_size
         self.op = op
         self.group = group
+        self.input_dtype = input_dtype
         self.eps = eps
         self.trigger_completion_at_end = trigger_completion_at_end
         self.input_uses_nccl_window = input_uses_nccl_window
 
-    def unique_id(self):
+    def unique_id(self) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool]:
         return (
             self.tp_size,
+            # Keep Python cache entries aligned with the native tactic cache:
+            # groups with the same size can use distinct communicators/topologies.
+            tuple(self.group),
+            self.input_dtype,
             self.op,
             self.input_uses_nccl_window,
         )
@@ -2209,6 +2213,51 @@ class AllReduceRunner(TunableRunner):
             valid_strategies.append(AllReduceStrategy.TWOSHOT.value)
 
         return valid_strategies
+
+    def _register_native_tactics(self, inputs: List[torch.Tensor]) -> None:
+        input, residual, norm_weight, scale, bias, workspace = inputs
+        custom_op = "trtllm::tunable_allreduce::allreduce"
+        tuning_buckets = self.tuning_config.dynamic_tensor_specs[
+            0].gen_tuning_buckets
+        # Avoid a module-import cycle during custom-op registration.
+        from tensorrt_llm._torch.distributed.ops import \
+            disable_native_allreduce_autotuner
+
+        if not hasattr(torch.ops.trtllm, "validate_allreduce_tuning_buckets"):
+            disable_native_allreduce_autotuner(
+                "native extension does not expose bucket validation")
+            return
+        try:
+            torch.ops.trtllm.validate_allreduce_tuning_buckets(tuning_buckets)
+        except RuntimeError as error:
+            if "AllReduce autotuner bucket mismatch" not in str(error):
+                raise
+            disable_native_allreduce_autotuner(str(error))
+            return
+        tuner = AutoTuner.get()
+        cache = tuner.profiling_cache
+        input_shapes = tuple(tuner._get_input_sizes(inputs))
+        # Look up the fixed set of allreduce buckets directly instead of
+        # scanning unrelated custom-op and profile entries in the full cache.
+        for bucket in tuning_buckets:
+            bucket_input_shapes = list(input_shapes)
+            bucket_input_shapes[0] = torch.Size((bucket, *input_shapes[0][1:]))
+            cache_key = cache.get_cache_key(
+                custom_op,
+                self,
+                tuple(bucket_input_shapes),
+                self.tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            cache_entry = cache.cache.get(cache_key)
+            if cache_entry is None:
+                continue
+            _, tactic, _ = cache_entry
+            torch.ops.trtllm.register_allreduce_tactic(input, residual,
+                                                       norm_weight, scale, bias,
+                                                       workspace, self.group,
+                                                       self.op, bucket,
+                                                       int(tactic))
 
     def forward(
         self,
@@ -2303,6 +2352,7 @@ def tunable_allreduce(
     allreduce_runner = AllReduceRunner(
         len(group),
         group,
+        input.dtype,
         op,
         eps,
         trigger_completion_at_end,
@@ -2341,6 +2391,8 @@ def tunable_allreduce(
         tuning_config,
         [input, residual, norm_weight, scale, bias, workspace],
     )
+    allreduce_runner._register_native_tactics(
+        [input, residual, norm_weight, scale, bias, workspace])
 
     return allreduce_runner(
         [input, residual, norm_weight, scale, bias, workspace],

@@ -6,18 +6,22 @@ import pathlib
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from typing import NamedTuple, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -26,7 +30,6 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1,
@@ -421,6 +424,19 @@ class TestResourceManager(unittest.TestCase):
         self.assertTrue(peft_cache_manager.impl.enabled)
         self.assertGreaterEqual(peft_cache_manager.impl.max_host_pages, 1)
         self.assertGreaterEqual(peft_cache_manager.impl.max_device_pages, 1)
+
+    def test_initial_fp8_data_type_configures_cache(self):
+        if (not torch.cuda.is_available()
+                or torch.cuda.get_device_capability() != (9, 0)):
+            self.skipTest("Requires SM90 FP8 support")
+        peft_cache_manager = PeftCacheManager(
+            peft_cache_config=self.create_peft_cache_config(),
+            lora_config=LoraConfig(),
+            model_config=self.model_config,
+            initial_data_type=torch.float8_e4m3fn,
+        )
+
+        self.assertEqual(peft_cache_manager.data_type, torch.float8_e4m3fn)
 
     def test_add_request_peft_empty_weights_config(self):
         """Test adding a request with empty LoRA task."""
@@ -959,6 +975,47 @@ class TestResourceManager(unittest.TestCase):
         finally:
             kv_cache_manager.shutdown()
 
+    def test_add_dummy_requests_failure_frees_partial_allocation(self):
+        """A partial add_dummy_requests failure must free every block it
+        allocated (TRTLLM-14903): leaked blocks on the minimal pool built for
+        cache-size estimation starve the estimation requests and hang startup.
+        """
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=1024,
+            max_batch_size=2,
+            mapping=Mapping(),
+        )
+        try:
+            total_free = kv_cache_manager.get_num_free_blocks()
+            self.assertEqual(total_free, 4)
+            # Both sequences fit in one block each, but the per-request draft
+            # add_token loop needs two more blocks per request: request 0
+            # drains the pool and request 1's first add_token raises, after
+            # three of the four blocks were already allocated.
+            with self.assertRaises(Exception):
+                kv_cache_manager.add_dummy_requests([0, 1],
+                                                    token_nums=[64, 64],
+                                                    is_gen=True,
+                                                    max_num_draft_tokens=128)
+            self.assertEqual(kv_cache_manager._preprepared_dummy_request_ids,
+                             set())
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+            # The freed pool must serve follow-up allocations.
+            requests = kv_cache_manager.add_dummy_requests([2], token_nums=[64])
+            self.assertIsNotNone(requests)
+            kv_cache_manager.free_resources(requests[0])
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self):
         """
         Test that KVCacheManager uses the provided execution_stream.
@@ -1047,6 +1104,77 @@ class TestResourceManager(unittest.TestCase):
         self.assertTrue(peft_cache_manager.impl.enabled)
 
 
+@pytest.mark.cpu_only
+class TestKVCacheManagerPrepreparedDummies(unittest.TestCase):
+
+    @staticmethod
+    def _make_manager(is_draft: bool = False) -> KVCacheManager:
+        manager = KVCacheManager.__new__(KVCacheManager)
+        manager.mapping = Mapping()
+        manager.impl = MagicMock()
+        manager.impl.get_kv_cache_stats.return_value = SimpleNamespace(
+            free_num_blocks=8)
+        manager.is_linear_attention = False
+        manager.is_vswa = False
+        manager.num_extra_kv_tokens = 0
+        manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        manager.is_draft = is_draft
+        manager.kv_connector_manager = None
+        manager._kv_reserve_draft_tokens = 0
+        manager._preprepared_dummy_request_ids = set()
+        return manager
+
+    @staticmethod
+    def _context_batch(request: LlmRequest) -> ScheduledRequests:
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        return batch
+
+    def test_context_dummy_is_registered_once_and_id_can_be_reused(self):
+        manager = self._make_manager()
+
+        requests = manager.add_dummy_requests([0], token_nums=[64])
+        self.assertIsNotNone(requests)
+        request = requests[0]
+        self.assertEqual(manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 1)
+
+        manager.prepare_resources(self._context_batch(request))
+
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 1)
+
+        manager.free_resources(request)
+        self.assertEqual(manager._preprepared_dummy_request_ids, set())
+
+        manager.add_dummy_requests([0], token_nums=[64])
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 2)
+
+    def test_preprepared_dummy_ownership_is_manager_local(self):
+        target_manager = self._make_manager()
+        draft_manager = self._make_manager(is_draft=True)
+        other_manager = self._make_manager()
+
+        requests = target_manager.add_dummy_requests(
+            [0],
+            token_nums=[64],
+            draft_kv_cache_manager=draft_manager,
+        )
+        self.assertIsNotNone(requests)
+        request = requests[0]
+        self.assertEqual(target_manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(draft_manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(other_manager._preprepared_dummy_request_ids, set())
+
+        target_manager.prepare_resources(self._context_batch(request))
+        draft_manager.prepare_resources(self._context_batch(request))
+        other_manager.prepare_resources(self._context_batch(request))
+
+        self.assertEqual(target_manager.impl.add_sequence_batch.call_count, 1)
+        self.assertEqual(draft_manager.impl.add_sequence_batch.call_count, 1)
+        self.assertEqual(other_manager.impl.add_sequence_batch.call_count, 1)
+
+
+@pytest.mark.cpu_only
 class TestKVCacheManagerConfigForwarding(unittest.TestCase):
 
     def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):

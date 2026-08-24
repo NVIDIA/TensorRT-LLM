@@ -98,4 +98,4 @@ worker_config:
       max_tokens_in_buffer: 4096
       backend: NIXL
       transceiver_runtime: PYTHON
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false

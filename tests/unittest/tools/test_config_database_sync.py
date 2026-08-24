@@ -24,6 +24,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+pytestmark = pytest.mark.cpu_only
+
+
 REPO_ROOT = Path(__file__).parent.parent.parent.parent.resolve()
 EXPECTED_MODEL_METADATA = {
     "deepseek-ai/DeepSeek-R1-0528": {

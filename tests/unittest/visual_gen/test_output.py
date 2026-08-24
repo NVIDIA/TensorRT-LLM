@@ -18,6 +18,9 @@ from tensorrt_llm._torch.visual_gen.output import (
 )
 from tensorrt_llm.visual_gen import VisualGenMetrics, VisualGenOutput
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # VisualGenOutput shape and re-exports
 # ---------------------------------------------------------------------------
@@ -785,3 +788,62 @@ def test_media_output_unimportable():
     """``MediaOutput`` is not importable from any path."""
     with pytest.raises(ImportError):
         from tensorrt_llm._torch.visual_gen.output import MediaOutput  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# Single-prompt failure classes reach the caller as distinct exception types
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error_type, expected",
+    [
+        ("client", ValueError),
+        ("capacity", MemoryError),
+        (None, RuntimeError),
+    ],
+    ids=["client", "capacity", "unclassified"],
+)
+def test_single_prompt_failure_raises_by_error_class(error_type, expected):
+    """The worker's failure class survives to the public API as a built-in.
+
+    Asserts the *exact* type: the routes map these three to 400 / 503 / 500,
+    so a subclass relationship creeping back in would silently collapse two
+    of the cases into one.
+    """
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+    resp = DiffusionResponse(request_id=20, error_msg="boom", error_type=error_type)
+    fx = _FakeExecutor(resp)
+    try:
+        handle = VisualGenResult(request_id=20, executor=fx, batch_size=None)
+        with pytest.raises(expected) as excinfo:
+            handle.result(timeout=5.0)
+        assert type(excinfo.value) is expected
+        assert "boom" in str(excinfo.value)
+    finally:
+        fx.stop()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    ["client", "capacity", None],
+    ids=["client", "capacity", "unclassified"],
+)
+def test_batch_failure_never_raises_regardless_of_error_class(error_type):
+    """Batch handles keep Option B semantics for every failure class.
+
+    Per-item ``error`` is set and nothing raises, unlike the single-prompt
+    path which raises by class.
+    """
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+    resp = DiffusionResponse(request_id=21, error_msg="boom", error_type=error_type)
+    fx = _FakeExecutor(resp)
+    try:
+        handle = VisualGenResult(request_id=21, executor=fx, batch_size=2)
+        outs = handle.result(timeout=5.0)
+        assert len(outs) == 2
+        assert all(o.error is not None for o in outs)
+    finally:
+        fx.stop()

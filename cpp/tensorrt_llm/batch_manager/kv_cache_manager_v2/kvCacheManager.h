@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventSink.h"
@@ -36,24 +37,6 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
-
-// ---------------------------------------------------------------------------
-// PoolDesc / PoolGroupDesc — describe GPU memory pool layout.
-// ---------------------------------------------------------------------------
-struct PoolDesc
-{
-    PoolIndex poolIndex{0};
-    MemAddress baseAddress = 0;
-    size_t slotBytes = 0;
-};
-
-struct PoolGroupDesc
-{
-    PoolGroupIndex poolGroupIndex{0};
-    SlotCount numSlots = 0;
-    SlotDesc slotDesc;
-    TypedVec<PoolIndex, PoolDesc> pools;
-};
 
 // ---------------------------------------------------------------------------
 // ExpandedBuffer / AggregatedPageDesc — returned by getAggregatedPages().
@@ -117,7 +100,10 @@ struct PageIndexConverter
 class KvCacheManager : public std::enable_shared_from_this<KvCacheManager>
 {
 public:
-    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr);
+    // coldPageCodec is consumed when construction is invoked, including when construction throws; nullptr selects
+    // the default lossless codec.
+    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr,
+        std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec = nullptr);
     ~KvCacheManager();
 
     KvCacheManager(KvCacheManager const&) = delete;
@@ -133,15 +119,28 @@ public:
     // ---- KvCache creation -------------------------------------------------
 
     // Create a new KvCache. Returned cache is SUSPENDED; call activate() with a stream.
-    // input_tokens: optional sequence to match against existing cached blocks.
-    // priorityCb:   optional priority override per block.
-    std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {},
+    // input_tokens:         optional sequence to match against existing cached blocks.
+    // priorityCb:           optional priority override per block.
+    // expectedPromptLength: token count marking the prefill->generation boundary; once
+    //                       historyLength reaches it, later capacity growth is recorded as
+    //                       generation-phase allocation stats (defaults to inputTokens.size()).
+    //                       Stats-only: no effect on allocation, reuse, or correctness.
+    // textOnly:             per-sequence override of the text-only (digest-free) guarantee;
+    //                       nullopt inherits the manager config default.
+    // enableRequestStats:   collect request-local allocation and reuse statistics even when
+    //                       manager-level statistics are disabled.
+    // inputTokens is a non-owning view; the caller must keep the underlying buffer alive for the
+    // duration of the call (matching reads it but never stores it).
+    std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
-        std::optional<int> expectedPromptLength = std::nullopt);
+        std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
+        bool enableRequestStats = false);
 
+    // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
+    // Defaults false (safe: the scanning path is taken).
     BlockRadixTree::ReuseMatch matchReuse(
-        ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens) const;
-    int probeReuse(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {}) const;
+        ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
+    int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
     // ---- Memory pool queries -----------------------------------------------
 
@@ -173,6 +172,12 @@ public:
     bool commitMinSnapshot() const noexcept
     {
         return mConfig.commitMinSnapshot;
+    }
+
+    // Deployment-level text-only guarantee (see KVCacheManagerConfig::textOnly).
+    bool textOnly() const noexcept
+    {
+        return mConfig.textOnly;
     }
 
     bool isSwaScratchReuseEnabled() const noexcept
@@ -298,24 +303,28 @@ public:
     friend class KvCacheIntrospection;
 
 private:
+    // Throw unless every KvCache has been closed. `api` names the caller so the message
+    // points at the mistake rather than at whatever breaks later.
+    void _checkNoLivingKvCaches(char const* api) const;
+
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherPersistentPages() const;
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
 
     PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);
     void _updateIterationPeakNumBlocks();
 
-    // Current per-pool-group GPU utilization ratios.
-    TypedVec<PoolGroupIndex, float> _currentGpuRatio() const;
-    TypedVec<PoolGroupIndex, float> _currentOtherRatios() const;
+    // Current per-pool-group utilization ratios for the hot and cold representations.
+    TypedVec<PoolGroupIndex, float> _currentHotRatio() const;
+    TypedVec<PoolGroupIndex, float> _currentColdRatios() const;
 
     KVCacheManagerConfig mConfig;
     LifeCycleRegistry mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
-    std::shared_ptr<BlockRadixTree> mRadixTree;
     std::shared_ptr<StorageManager> mStorage;
+    std::shared_ptr<BlockRadixTree> mRadixTree;
 
     // Weak references to all living KvCaches.
     std::set<KvCache*> mLivingKvCaches;
@@ -325,8 +334,8 @@ private:
     MovingAverage mAvgSqrCapacity;
     MovingAverage mAvgSqrHistoryLength;
 
-    TypedVec<PoolGroupIndex, float> mTargetRatioListGpu;
-    TypedVec<PoolGroupIndex, float> mTargetRatioListOther;
+    TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
+    TypedVec<PoolGroupIndex, float> mTargetRatioListCold;
 
     int mNumCreatedKvCaches{0};
     int mNumSampledKvCaches{0};

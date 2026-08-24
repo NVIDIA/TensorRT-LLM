@@ -31,15 +31,18 @@ from torch import nn
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MiniMaxM3HfWeightMapper,
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3Model,
     _build_swiglu_oai_dense_mlp,
     _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
+    _validate_sparse_attention_runtime_config,
     _wrap_dict_as_config,
     get_moe_layer_ids,
     get_sparse_disable_index_value_layer_ids,
@@ -53,6 +56,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM3MoeRoutingMethod,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
@@ -63,6 +67,41 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+@pytest.mark.parametrize(
+    "sparse_attention_config",
+    [None, RocketSparseAttentionConfig()],
+)
+def test_validate_sparse_attention_runtime_config_rejects_wrong_backend(
+    sparse_attention_config: MiniMaxM3SparseAttentionConfig | RocketSparseAttentionConfig | None,
+) -> None:
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=sparse_attention_config,
+    )
+
+    with pytest.raises(ValueError, match="algorithm='minimax_m3'"):
+        _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
+    )
+
+    _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_model_init_validates_sparse_attention_runtime_config() -> None:
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=None,
+    )
+
+    with pytest.raises(ValueError, match="algorithm='minimax_m3'"):
+        MiniMaxM3Model(model_config)
 
 
 def _make_text_config():
@@ -755,6 +794,31 @@ def test_minimax_m3_fused_qk_norm_rope_index_matches_separate():
 
     torch.testing.assert_close(iq_f.contiguous(), iq_s.contiguous(), rtol=5e-2, atol=1e-1)
     torch.testing.assert_close(ik_f.contiguous(), ik_s.contiguous(), rtol=5e-2, atol=1e-1)
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons() -> None:
+    """The fused kernel has one epsilon, so Q/K norms must agree."""
+    attn = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    nn.Module.__init__(attn)
+    backend = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    backend.indexer_kv_dtype = "fp8"
+    attn.attn = backend
+    attn.rotary_emb = object()
+    attn.pos_embd_params = SimpleNamespace(
+        rope=SimpleNamespace(dim=64, theta=5000000.0),
+        is_neox=True,
+    )
+    attn.use_gemma_norm = True
+    attn.index_q_norm = SimpleNamespace(variance_epsilon=1e-6)
+    attn.index_k_norm = SimpleNamespace(variance_epsilon=1e-5)
+
+    with pytest.raises(ValueError, match=r"identical index Q/K RMSNorm epsilon"):
+        attn._fused_fp8_index_qk_norm_rope(
+            torch.empty(1, 640, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.int32),
+            SimpleNamespace(),
+        )
 
 
 @pytest.mark.gpu

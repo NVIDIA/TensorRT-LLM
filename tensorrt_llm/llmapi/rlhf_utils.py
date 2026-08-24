@@ -8,10 +8,10 @@ from typing import Iterator, Optional
 
 import torch
 
-from tensorrt_llm import serialization
-from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
+from tensorrt_llm.llmapi import serialization
 from tensorrt_llm.logger import logger
 
 
@@ -128,7 +128,7 @@ class WorkerExtension:
                 serialized_handles = ipc_handles[device_uuid]
                 if isinstance(serialized_handles, str):
                     # Data is base64-encoded pickled bytes - deserialize it
-                    # using restricted unpickler from tensorrt_llm.serialization
+                    # using restricted unpickler from tensorrt_llm.llmapi.serialization
                     logger.info("Deserializing base64-encoded weight handles")
                     decoded_data = base64.b64decode(serialized_handles)
                     disallowed_imports = {
@@ -208,8 +208,14 @@ class WorkerExtension:
             logger.error("Encountered an error in update_weights")
             raise e
 
+    @control_action_decorator
     def reset_prefix_cache(self) -> None:
-        """Invalidate the KV cache prefix reuse state after weight updates."""
+        """Invalidate the KV cache prefix reuse state after weight updates.
+
+        Drains in-flight requests first, like update_weights(): clearing the reuse state
+        detaches the whole radix tree, and a request that is still holding blocks from it
+        would go on committing into the detached subtree.
+        """
         self.engine.reset_prefix_cache()
 
     @control_action_decorator

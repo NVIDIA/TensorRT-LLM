@@ -26,6 +26,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, ContextChunkingPolicy
 from tensorrt_llm.quantization import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _DummyCalibrator:
     """Mock calibrator for testing that bypasses actual calibration logic."""
@@ -210,6 +212,7 @@ def _run_create_py_executor(
     *,
     sm_version,
     kv_cache_quant_algo,
+    attn_backend="TRTLLM",
     cache_transceiver_config=None,
     enable_flash_mla=False,
     model_max_seq_len=128,
@@ -227,6 +230,7 @@ def _run_create_py_executor(
         monkeypatch: pytest fixture for mocking.
         sm_version: CUDA SM version to simulate (e.g., 89, 90).
         kv_cache_quant_algo: Quantization algorithm to use (e.g., NO_QUANT, INT8).
+        attn_backend: Attention backend to configure.
         cache_transceiver_config: Optional transceiver configuration to mutate.
         enable_flash_mla: Whether to emulate the FlashMLA block-size override.
         model_max_seq_len: Effective sequence length reported by the model engine.
@@ -239,6 +243,7 @@ def _run_create_py_executor(
         runtime_chunked_prefill_flag) from created executor.
     """
     llm_args = _make_llm_args()
+    llm_args.attn_backend = attn_backend
     llm_args.cache_transceiver_config = cache_transceiver_config
     llm_args.enable_chunked_prefill = enable_chunked_prefill
     fake_mapping = SimpleNamespace(
@@ -380,6 +385,19 @@ def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch, sm_versi
         monkeypatch,
         sm_version=sm_version,
         kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+    )
+
+    assert kv_cache_reuse is True
+    assert runtime_cache_reuse is True
+
+
+def test_flashinfer_preserves_cache_reuse(monkeypatch):
+    """Verify the FlashInfer backend preserves requested cache reuse."""
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
+        monkeypatch,
+        sm_version=100,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        attn_backend="FLASHINFER",
     )
 
     assert kv_cache_reuse is True

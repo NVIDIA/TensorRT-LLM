@@ -40,7 +40,8 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear, is_minimax_m3
+from .config_utils import (is_hybrid_linear, is_minimax_m3,
+                           uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -417,8 +418,18 @@ def create_py_executor(
     ) = llm_args.get_runtime_sizes()
 
     tokens_per_block = kv_cache_config.tokens_per_block
-    if llm_args.attn_backend == "VANILLA":
+
+    # RocketKV's Vanilla path keeps its landmark (KT) cache in a single block per
+    # sequence: RocketVanillaAttention writes the whole sequence into
+    # kt_cache_block_offsets[0], and kt_tokens_per_block is derived from
+    # tokens_per_block. It does not support a paged KT cache, so force one block
+    # per sequence for it. Plain Vanilla attention supports paged KV cache and is
+    # left untouched.
+    sparse_config = llm_args.sparse_attention_config
+    if (llm_args.attn_backend == "VANILLA" and sparse_config is not None
+            and getattr(sparse_config, "algorithm", None) == "rocket"):
         tokens_per_block = max_num_tokens
+        kv_cache_config.tokens_per_block = tokens_per_block
 
     # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
     # of 32.
@@ -426,18 +437,6 @@ def create_py_executor(
     if is_minimax_m3(m3_sparse_config):
         tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
         kv_cache_config.tokens_per_block = tokens_per_block
-
-    if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
-        # Workaround for flashinfer and star attention
-        if kv_cache_config.enable_block_reuse:
-            logger.warning(
-                f"Disabling block reuse for {llm_args.attn_backend} backend")
-            kv_cache_config.enable_block_reuse = False
-
-    if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
-        logger.warning(
-            f"Disabling chunked context for {llm_args.attn_backend} backend")
-        enable_chunked_context = False
 
     spec_config = llm_args.speculative_config
     if spec_config is not None and spec_config.decoding_type == "AUTO":
@@ -451,14 +450,12 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-        # Check FLASHINFER compatibility with one-engine speculative decoding
-        if llm_args.attn_backend == "FLASHINFER":
-            raise ValueError(
-                f"FLASHINFER attention backend is not supported with one-engine speculative "
-                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
-                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
-                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
-                f"backend instead by setting attn_backend='TRTLLM'.")
+    if (spec_config is not None and llm_args.attn_backend == "FLASHINFER"
+            and spec_config.spec_dec_mode.use_one_engine()
+            and not spec_config._use_shared_kv_cache):
+        raise ValueError(
+            "FLASHINFER attention backend supports one-engine speculative "
+            "decoding only when the draft model shares the target KV cache.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -526,10 +523,34 @@ def create_py_executor(
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
-    # Initialize DWDP Manager (only for context workers in disaggregated serving)
+    # Initialize DWDP Manager.
+    #
+    # DWDP needs every global MPI rank to be a complete, unsharded model replica
+    # owning one expert slice -- `dwdp_rank = global_mpi_rank() % dwdp_size` is
+    # only meaningful under that bijection. Disaggregated context workers satisfy
+    # this with TP=1, aggregated serving with full attention DP; everything that
+    # shards a replica across ranks is rejected. Pipeline and context parallelism
+    # are rejected even under attention DP, since pairing ranks that hold
+    # different layers as DWDP peers gives wrong expert weights rather than an
+    # error. The TP check tests `dp_size == tp_size` rather than
+    # `enable_attention_dp` so a future partial attention DP cannot slip through.
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
-        assert mapping.tp_size == 1 and llm_args.dwdp_config.dwdp_size > 1, "DWDP requires TP=1 and dwdp_size > 1"
+        if llm_args.dwdp_config.dwdp_size <= 1:
+            raise ValueError(
+                f"DWDP requires dwdp_size > 1, got {llm_args.dwdp_config.dwdp_size}."
+            )
+        if mapping.pp_size > 1 or mapping.cp_size > 1:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica, so "
+                "pipeline and context parallelism are not supported, but got "
+                f"pp_size={mapping.pp_size}, cp_size={mapping.cp_size}.")
+        if mapping.tp_size > 1 and mapping.dp_size != mapping.tp_size:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica: use "
+                "tp_size=1 (disaggregated context worker) or "
+                "enable_attention_dp=True (aggregated serving), but got "
+                f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
@@ -776,12 +797,13 @@ def create_py_executor(
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
                 guided_decoder_slots = (max_num_seq_slots if getattr(
-                    model_engine, "_enable_dsv4_overlap_headroom", False) else
-                                        max_batch_size)
+                    model_engine, "_enable_disagg_adp_overlap_headroom", False)
+                                        else max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The scoped DeepSeek-V4 path follows the expanded slot
-                    # pool. Other configurations retain max_batch_size.
+                    # The disaggregated attention-DP overlap path follows the
+                    # expanded slot pool. Other configurations retain
+                    # max_batch_size.
                     "max_num_sequences": guided_decoder_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
@@ -834,8 +856,7 @@ def create_py_executor(
             )
 
         max_attention_window = kv_cache_config.max_attention_window
-        if max_attention_window is not None and len(
-                set(max_attention_window)) > 1:
+        if uses_vswa_kv_cache_layout(max_attention_window):
             raise NotImplementedError(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )

@@ -138,8 +138,8 @@ def parse_arguments() -> argparse.Namespace:
                         type=str,
                         default='CUTLASS',
                         choices=[
-                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
+                            'CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM',
+                            'CUTEDSL', 'TRITON'
                         ])
     parser.add_argument('--tp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)

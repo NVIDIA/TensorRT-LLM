@@ -15,8 +15,9 @@
 import json
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields
-from typing import List, NamedTuple, Optional, Tuple, Union
+from typing import Any, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
@@ -26,6 +27,19 @@ from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
 MAX_TOP_LOGPROBS = 100
+
+_GENERATION_CONFIG_SAMPLING_FIELDS = frozenset(
+    {
+        "early_stopping",
+        "length_penalty",
+        "min_p",
+        "no_repeat_ngram_size",
+        "repetition_penalty",
+        "temperature",
+        "top_k",
+        "top_p",
+    }
+)
 
 
 def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
@@ -220,16 +234,16 @@ class SamplingParams:
             If top_p < 1 and/or top_k > 1 are specified, sampling will proceed accordingly and temperature will default to temperature = 1.
             Setting temperature = 0 results in greedy sampling.
         min_tokens (int, optional): Lower bound on the number of tokens to generate. Values < 1 have no effect. None means using C++ runtime default 1. Defaults to None.
-        beam_search_diversity_rate (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
+        beam_search_diversity_rate (float, optional): Encourages beams to diverge from each other by adding diversity_rate * source_beam_index to each candidate's ranking score during beam expansion, boosting candidates that expand from lower-ranked beams. Here source_beam_index is the rank of the beam a candidate expands from among the current step's input beams, ordered by cumulative log-probability (0 for the strongest beam). None means using C++ runtime default 0.f (disabled). Defaults to None.
         repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
         presence_penalty (float, optional): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
         frequency_penalty (float, optional): Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
         prompt_ignore_length (int, optional): Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have no effect. Values > input (prompt) length will be clamped. None means using C++ runtime default 0. Defaults to None.
-        length_penalty (float, optional): Controls how to penalize longer sequences in beam search. None means using C++ runtime default 0.f. Defaults to None.
-        early_stopping (int, optional): Controls whether the generation process finishes once beamWidth sentences are generated (ends with end_token).  None means using C++ runtime default 1. Defaults to None.
+        length_penalty (float, optional): Beam-search length penalty exponent. Beams are ranked by cum_log_prob / length**length_penalty, where length counts generated tokens only; the returned cumulative_logprob stays unnormalized. Must be >= 0. 0 disables the normalization. None means using C++ runtime default 0.f. Defaults to None.
+        early_stopping (int, optional): Three-state, following HuggingFace. 1 stops as soon as best_of finished candidates exist. 0 and 2 are exhaustive: they keep a pool of finished candidates and continue while an unfinished beam could still outscore the worst of them, 0 bounding attainability with the beams' current length and 2 ("never") with max_seq_len when length_penalty > 0. Any other integer is treated as 2. None means using C++ runtime default 1. Defaults to None.
         no_repeat_ngram_size (int, optional): Forbids repeating any n-gram of this size: a token is excluded from sampling if it would recreate an n-gram that already occurs in the sequence (prompt included). None or 0 disables the restriction. Defaults to None.
         min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
-        beam_width_array (List[int], optional): The array of beam width using in Variable-Beam-Width-Search. Defaults to None.
+        beam_width_array (List[int], optional): Per-iteration beam widths for Variable-Beam-Width-Search; decoding past the end of the array holds its last entry. Must be non-decreasing -- a narrowing schedule is rejected. beam_width is raised to the array's maximum, which is the number of beams returned. Defaults to None.
 
         logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
                                   When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
@@ -349,6 +363,10 @@ class SamplingParams:
     # Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.
     # TODO: make this a per-request parameter.
     _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
+    # None identifies direct LLM API SamplingParams, where non-None values are
+    # request-provided. Serving adapters set this to preserve which fields were
+    # explicitly present before they materialize their protocol defaults.
+    _request_provided_fields: Optional[frozenset[str]] = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.pad_id is None:
@@ -372,13 +390,18 @@ class SamplingParams:
         For instance, while the greedy decoding with n > 1 is capable in the
         Executor class of C++ runtime, the LLM API disallows such combination.
         """
-        if self.top_p is not None and (self.top_p < 0 or self.top_p > 1):
+        # These bounds are written as negated range checks rather than as
+        # `value < low or value > high`, so that NaN is rejected too: every
+        # comparison against NaN is False, which lets it slip through the
+        # positive form. The top_p_decay / top_p_min checks below already use
+        # this form.
+        if self.top_p is not None and not 0 <= self.top_p <= 1:
             raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
         if self.top_k is not None and self.top_k < 0:
             raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
-        if self.min_p is not None and (self.min_p < 0 or self.min_p > 1):
+        if self.min_p is not None and not 0 <= self.min_p <= 1:
             raise ValueError(f"require 0 <= min_p <= 1, got min_p={self.min_p}")
-        if self.temperature is not None and self.temperature < 0:
+        if self.temperature is not None and not self.temperature >= 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
 
         # Top-p decay param ranges mirror the hard checks in the
@@ -442,6 +465,43 @@ class SamplingParams:
             )
         if self.logprobs_simple_format and self.use_beam_search:
             raise ValueError("logprobs_simple_format is not supported with beam search")
+
+    def _set_request_provided_fields(self, field_names: Iterable[str]) -> None:
+        """Record sampler fields explicitly supplied by a serving request."""
+        self._request_provided_fields = frozenset(field_names) & _GENERATION_CONFIG_SAMPLING_FIELDS
+
+    def _apply_generation_config_defaults(self, generation_config: Mapping[str, Any]) -> None:
+        """Apply compatible model defaults without overriding request values."""
+        for field_name in _GENERATION_CONFIG_SAMPLING_FIELDS:
+            if field_name not in generation_config:
+                continue
+
+            # Direct LLM API calls preserve None as the unset sentinel. Serving
+            # adapters materialize protocol defaults, so they instead record
+            # which fields the request explicitly supplied.
+            if self._request_provided_fields is None:
+                request_provided = getattr(self, field_name) is not None
+            else:
+                request_provided = field_name in self._request_provided_fields
+            if request_provided:
+                continue
+
+            # A JSON null is also unset and must fall through to the existing
+            # TRT-LLM or serving default.
+            value = generation_config[field_name]
+            if value is None:
+                continue
+            # Hugging Face also permits "never", which the TRT-LLM integer
+            # early-stopping setting cannot represent.
+            if field_name == "early_stopping" and not isinstance(value, (bool, int)):
+                logger.warning(
+                    "Ignoring unsupported generation_config.json early_stopping value "
+                    f"{value!r}; TRT-LLM supports only boolean or integer values."
+                )
+                continue
+            setattr(self, field_name, value)
+
+        self._validate()
 
     # NB: The predicates below are static because downstream code (e.g.
     #     sampler_strategy.resolve_sampling_strategy) only holds instances of

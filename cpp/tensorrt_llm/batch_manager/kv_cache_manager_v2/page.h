@@ -95,11 +95,23 @@ class CommittedPage : public Page
 public:
     Block* block;
 
+    // Token count recorded for this page. It is usually block->tokens.size(), but a
+    // snapshot taken at an earlier token boundary may live in a block that spans more
+    // tokens — see addOrGetExistingBlock() and KvCache::_snapshotPartialBlockToTree().
+    //
+    // Attention and SSM life cycles interpret it differently:
+    //   * for attention pages, it is the number of leading tokens with valid per-token KV,
+    //     so the page is reusable for any prefix up to that count (compare with `>=`);
+    //   * for an SSM page, it is the exact recurrent-state checkpoint, so reuse must be
+    //     truncated to exactly that boundary.
+    int numTokensInBlock;
+
     // Number of outstanding PlannedDropHandles that intend to drop this page.
     // Mirrors Python's CommittedPage.planned_drop_count.
     int plannedDropCount{0};
 
-    CommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio);
+    CommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, int numTokensInBlock,
+        Priority prio);
 
     ~CommittedPage() override;
 
@@ -107,22 +119,6 @@ public:
     {
         return true;
     }
-};
-
-// ---------------------------------------------------------------------------
-// SsmCommittedPage — a committed SSM snapshot page.
-//
-// Unlike attention CommittedPages (which always cover a full block), an SSM
-// snapshot may cover only a prefix of its block. `numTokensInBlock` records how
-// many tokens of the block this snapshot is reusable for.
-// ---------------------------------------------------------------------------
-class SsmCommittedPage : public CommittedPage
-{
-public:
-    int numTokensInBlock;
-
-    SsmCommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio,
-        int numTokensInBlock);
 };
 
 // ---------------------------------------------------------------------------
@@ -134,7 +130,6 @@ public:
     KvCache* kvCache;
     BlockOrdinal ordinal;
     BeamIndex beamIndex;
-    std::vector<TokenIdExt> tokens;
 
     UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc, CacheLevel level, BeamIndex bi = kDefaultBeamIndex);
 
@@ -147,11 +142,10 @@ public:
 
     // Convert this UncommittedPage into a CommittedPage and attach to `block`.
     // The UncommittedPage becomes invalid (slot transferred to CommittedPage).
-    SharedPtr<CommittedPage> convertToCommitted(SharedPtr<Block> block, CachedCudaEvent readyEvent);
-
-    // Convert this UncommittedPage into an SsmCommittedPage covering
-    // `numTokensInBlock` tokens and attach to `block`. Invalidates this page.
-    SharedPtr<SsmCommittedPage> convertToSsmCommitted(
+    //
+    // `numTokensInBlock` records the page's token count. See
+    // CommittedPage::numTokensInBlock for its attention and SSM interpretations.
+    SharedPtr<CommittedPage> convertToCommitted(
         SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock);
 };
 

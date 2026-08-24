@@ -24,6 +24,8 @@ from tensorrt_llm._torch.models.modeling_nemotron_h import (
     _get_layer_moe_param,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @dataclass
 class _MambaBlock:

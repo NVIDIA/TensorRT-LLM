@@ -42,6 +42,9 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 FETCH_CACHE = REPO_ROOT / "3rdparty" / "fetch_cache.py"
 

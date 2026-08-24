@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import torch
 from torch import nn
@@ -399,6 +399,13 @@ class MiniMaxM2Model(DecoderModel):
 
 @register_auto_model("MiniMaxM2ForCausalLM")
 class MiniMaxM2ForCausalLM(DecoderModelForCausalLM[MiniMaxM2Model, PretrainedConfig]):
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax M2."""
+        return "V2"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(
             MiniMaxM2Model(model_config),

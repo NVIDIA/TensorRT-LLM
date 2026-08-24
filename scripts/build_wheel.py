@@ -21,6 +21,7 @@ import shutil
 import sys
 import sysconfig
 import tempfile
+import time
 import warnings
 from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
@@ -28,13 +29,16 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
-from subprocess import DEVNULL, CalledProcessError, check_output, run
+from subprocess import (DEVNULL, PIPE, CalledProcessError, Popen, check_output,
+                        run)
 from typing import Optional, Sequence
 
 try:
     from packaging.requirements import Requirement
+    from packaging.version import Version
 except (ImportError, ModuleNotFoundError):
     from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.version import Version
 
 build_run = partial(run, shell=True, check=True)
 
@@ -67,14 +71,48 @@ def get_project_dir():
     return Path(__file__).parent.resolve().parent
 
 
+def apply_version_override(project_dir: Path,
+                           version_override: Optional[str]) -> None:
+    """Apply the requested package version before building the wheel."""
+    if not version_override:
+        return
+
+    version_file = project_dir / "tensorrt_llm" / "version.py"
+    version_content = version_file.read_text()
+    version_match = re.search(r'(?m)^__version__ = "([^"]+)"$', version_content)
+    current_version = version_match.group(1)
+
+    resolved_version = version_override
+    if version_override.startswith((".", "+")):
+        resolved_version = current_version
+        if not current_version.endswith(version_override):
+            resolved_version += version_override
+    resolved_version = str(Version(resolved_version))
+    version_file.write_text(
+        version_content.replace(f'__version__ = "{current_version}"',
+                                f'__version__ = "{resolved_version}"', 1))
+
+
 def get_source_dir():
     return get_project_dir() / "cpp"
 
 
-def get_build_dir(build_dir, build_type):
+def get_build_dir(build_dir, build_type, build_root=None, out_of_tree=False):
     if build_dir is None:
-        build_dir = get_source_dir() / ("build" if build_type == "Release" else
-                                        f"build_{build_type}")
+        dir_name = "build" if build_type == "Release" else f"build_{build_type}"
+        if build_root is not None:
+            # Isolate out-of-tree build state in its own CMake directory so
+            # that toggling --out-of-tree against an existing conventional
+            # build under the same --build_root always triggers a fresh
+            # configure (first_build) instead of reusing a CMakeCache whose
+            # redirected FMHA/version.h paths don't match the mode. Without
+            # this, switching modes without --clean/--configure_cmake would
+            # skip configure and silently write into the checkout despite
+            # --out-of-tree.
+            suffix = "-oot" if out_of_tree else ""
+            build_dir = Path(build_root).resolve() / f"cpp-{dir_name}{suffix}"
+        else:
+            build_dir = get_source_dir() / dir_name
     else:
         build_dir = Path(build_dir).resolve()
     return build_dir
@@ -111,10 +149,9 @@ def sysconfig_scheme(override_vars=None):
     return {key: value.format(**vars_) for key, value in scheme.items()}
 
 
-def create_venv(project_dir: Path):
+def create_venv(venv_prefix: Path):
     py_major = sys.version_info.major
     py_minor = sys.version_info.minor
-    venv_prefix = project_dir / f".venv-{py_major}.{py_minor}"
     print(
         f"-- Using virtual environment at: {venv_prefix} (Python {py_major}.{py_minor})"
     )
@@ -138,13 +175,16 @@ def create_venv(project_dir: Path):
 def setup_venv(project_dir: Path,
                requirements_file: Path,
                no_venv: bool,
-               yes: bool = False) -> tuple[Path, Path]:
+               yes: bool = False,
+               build_root: Optional[Path] = None) -> tuple[Path, Path]:
     """Creates/updates a venv and installs requirements.
 
     Args:
         project_dir: The root directory of the project.
         requirements_file: Path to the requirements file.
         no_venv: Use current Python environment as is.
+        build_root: Directory for out-of-tree build state; when set, the venv
+            is created there instead of inside the checkout.
 
     Returns:
         Tuple[Path, Path]: Paths to the python and conan executables in the venv.
@@ -154,7 +194,12 @@ def setup_venv(project_dir: Path,
         print(f"-- {reason}, using environment {sys.prefix} as is.")
         venv_prefix = Path(sys.prefix)
     else:
-        venv_prefix = create_venv(project_dir)
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        if build_root is not None:
+            venv_prefix = build_root / f"venv-{py_version}"
+        else:
+            venv_prefix = project_dir / f".venv-{py_version}"
+        venv_prefix = create_venv(venv_prefix)
 
     scheme = sysconfig_scheme({'base': venv_prefix})
     # Determine venv executable paths
@@ -272,12 +317,38 @@ def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
     return fmha_v2_cu_dir / ".generation_complete"
 
 
-def generate_fmha_cu(project_dir, venv_python):
-    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+def get_fmha_gen_dirs(project_dir, gen_root=None):
+    """Return (fmha_v2_cu_dir, cubin_dir) for generated FMHA sources.
+
+    gen_root=None keeps the historical in-source locations; otherwise both
+    live under gen_root (consumed by CMake via TRTLLM_FMHA_GEN_DIR).
+    """
+    base = (project_dir /
+            "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention"
+            if gen_root is None else gen_root)
+    return base / "fmha_v2_cu", base / "cubin"
+
+
+def generate_fmha_cu(project_dir, venv_python, gen_root=None):
+    fmha_v2_cu_dir, cubin_dir = get_fmha_gen_dirs(project_dir, gen_root)
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
+    cubin_dir.mkdir(parents=True, exist_ok=True)
     _fmha_generation_stamp(fmha_v2_cu_dir).unlink(missing_ok=True)
 
     fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
+    if gen_root is not None:
+        # The generator writes ./generated, ./temp and ./obj relative to its
+        # own directory; run it from a scratch copy so a (possibly read-only)
+        # checkout is never written.
+        work_dir = gen_root / "fmha_v2-work"
+        if work_dir.exists():
+            rmtree(work_dir)
+        copytree(fmha_v2_dir,
+                 work_dir,
+                 symlinks=False,
+                 ignore=shutil.ignore_patterns("generated", "temp", "obj",
+                                               "__pycache__"))
+        fmha_v2_dir = work_dir
 
     env = os.environ.copy()
     env.update({
@@ -310,7 +381,6 @@ def generate_fmha_cu(project_dir, venv_python):
             shutil.move(src, dst)
 
     # Copy generated header file when cu path is active and cubins are deleted.
-    cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
     move_if_updated(fmha_v2_dir / "generated/fmha_cubin.h",
                     cubin_dir / "fmha_cubin.h")
 
@@ -460,10 +530,19 @@ def generate_python_stubs_windows(venv_python: Path, pkg_dir: Path,
     exit(1)
 
 
-def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
+def build_kv_cache_manager_v2(project_dir,
+                              venv_python,
+                              use_mypyc=False,
+                              build_root=None):
     print("-- Building kv_cache_manager_v2...")
     kv_cache_mgr_dir = project_dir / "tensorrt_llm/runtime/kv_cache_manager_v2"
     runtime_dir = project_dir / "tensorrt_llm/runtime"
+
+    # The produced .so files always land in-place (they are final artifacts);
+    # only the intermediate object files are redirected out of the checkout.
+    build_temp_arg = ""
+    if build_root is not None:
+        build_temp_arg = f' --build-temp "{build_root / "kv_cache_manager_v2-temp"}"'
 
     # Clean up any existing mypyc artifacts in runtime directory to prevent stale inclusion
     # when switching from --mypyc to standard build
@@ -480,7 +559,8 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
     # Build rawref
     print("-- Building kv_cache_manager_v2 rawref extension...", end=" ")
     rawref_dir = kv_cache_mgr_dir / "rawref"
-    build_run(f'"{venv_python}" setup.py build_ext --inplace', cwd=rawref_dir)
+    build_run(f'"{venv_python}" setup.py build_ext --inplace{build_temp_arg}',
+              cwd=rawref_dir)
     print("Done")
 
     if use_mypyc:
@@ -488,8 +568,9 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
         print("-- Building kv_cache_manager_v2 mypyc extensions...", end=" ")
         # setup_mypyc.py is in kv_cache_manager_v2 but executed from runtime dir
         setup_mypyc = kv_cache_mgr_dir / "setup_mypyc.py"
-        build_run(f'"{venv_python}" "{setup_mypyc}" build_ext --inplace',
-                  cwd=runtime_dir)
+        build_run(
+            f'"{venv_python}" "{setup_mypyc}" build_ext --inplace{build_temp_arg}',
+            cwd=runtime_dir)
 
         # Verify that the shared library was generated
         if not list(runtime_dir.glob("*__mypyc*.so")):
@@ -500,24 +581,213 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
     print("-- Done building kv_cache_manager_v2.")
 
 
+def _tar_pipe_copy(src: Path, dst: Path) -> bool:
+    """Populate dst from src as one streamed tar pipeline.
+
+    A single reader/writer pair with kernel-buffered pipe I/O is much faster
+    than per-file copies on network filesystems. Dereferences symlinks (-h)
+    and preserves mtimes, matching copytree(symlinks=False) + copystat.
+    Returns False if tar is unavailable or fails, so callers can fall back.
+    """
+    tar_bin = shutil.which("tar")
+    if tar_bin is None:
+        return False
+    dst.mkdir(parents=True, exist_ok=True)
+    # posix (pax) format keeps sub-second mtimes; the gnu default truncates
+    # to whole seconds, which would defeat sync_tree's mtime comparison.
+    #
+    # Chain the producer and consumer tars directly through an OS pipe rather
+    # than a shell string. Checking both return codes reports a failing
+    # producer (e.g. an unreadable source file) that a shell pipeline would
+    # mask behind the consumer's exit status, without depending on a bash that
+    # supports `set -o pipefail`; it also avoids shell quoting entirely.
+    producer = Popen(
+        [tar_bin, "--format=posix", "-C",
+         str(src), "-chf", "-", "."],
+        stdout=PIPE)
+    consumer = Popen([tar_bin, "-C", str(dst), "-xf", "-"],
+                     stdin=producer.stdout)
+    # Close our copy of the write end so the consumer sees EOF when the
+    # producer exits (and the producer gets SIGPIPE if the consumer dies).
+    producer.stdout.close()
+    consumer.wait()
+    producer.wait()
+    return producer.returncode == 0 and consumer.returncode == 0
+
+
+# How recently a source file must have been written for its mtime to be
+# untrustworthy as a change marker. Inode timestamps come from a coarse clock
+# (one timer tick on Linux) and some filesystems store whole seconds, so a file
+# rewritten shortly after being copied can still report the mtime the copy
+# recorded. A size+mtime comparison would then call it unchanged and leave a
+# stale copy behind. Two seconds covers a whole-second-granularity destination
+# (which can make an mtime look up to a second older than it is) on top of the
+# tick granularity of the source.
+_MTIME_RACE_WINDOW = 2.0
+
+
+def _demote_racy_mtime(dst_file: Path, src_stat: Optional[os.stat_result],
+                       now: float) -> None:
+    """Break the mtime match for a copy whose source was just written.
+
+    A copy normally records the source's mtime so the next sync can skip it.
+    That is only sound once the source mtime has aged out of the window above;
+    before that the source can change again without its mtime moving. Backdating
+    the copy makes the next sync's comparison mismatch, so the file is re-copied
+    instead of silently kept stale. It costs one extra copy of files written
+    right before a sync, and converges: the re-copy records the real mtime.
+    """
+    if src_stat is None or src_stat.st_mtime <= now - _MTIME_RACE_WINDOW:
+        return
+    try:
+        os.utime(dst_file,
+                 (src_stat.st_atime, src_stat.st_mtime - _MTIME_RACE_WINDOW))
+    except OSError:
+        pass
+
+
+def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
+    """Mirror the src directory into dst, touching only what changed.
+
+    Replaces the rmtree+copytree pattern for artifact copy-back: files are
+    rewritten only when size or mtime differs and entries missing from src
+    are deleted, so incremental rebuilds cause almost no I/O on the
+    destination (which may be a slow network filesystem). A missing dst is
+    populated via a streamed tar pipeline instead of per-file copies.
+    Symlinks are dereferenced like copytree(symlinks=False); mtimes are
+    preserved so the next sync can compare against them, except for sources
+    written within _MTIME_RACE_WINDOW of the copy, whose mtimes cannot yet
+    prove the content settled. exclude lists fnmatch patterns for entry names
+    to skip.
+    """
+    import fnmatch
+
+    src = Path(src).resolve()
+    dst = Path(dst)
+    now = time.time()
+
+    def excluded(name: str) -> bool:
+        return any(fnmatch.fnmatch(name, pat) for pat in exclude)
+
+    def demote_racy_mtimes() -> None:
+        # A cold populate (tar or copytree) copies source mtimes verbatim, so
+        # apply the same guard the incremental path applies per file. Walk the
+        # source rather than the freshly written destination: the source is
+        # local and warm, and only the few racy entries need a write.
+        for root, dirs, files in os.walk(src, followlinks=True):
+            dirs[:] = [d for d in dirs if not excluded(d)]
+            rel = Path(root).relative_to(src)
+            for name in files:
+                if excluded(name):
+                    continue
+                try:
+                    src_stat = (Path(root) / name).stat()
+                except OSError:
+                    continue
+                _demote_racy_mtime(dst / rel / name, src_stat, now)
+
+    if dst.is_symlink():
+        dst.unlink()
+    elif dst.exists() and src == dst.resolve():
+        return
+
+    if not dst.exists():
+        if not exclude and _tar_pipe_copy(src, dst):
+            demote_racy_mtimes()
+            return
+        copytree(src,
+                 dst,
+                 symlinks=False,
+                 ignore=shutil.ignore_patterns(*exclude) if exclude else None)
+        demote_racy_mtimes()
+        return
+
+    for root, dirs, files in os.walk(src, followlinks=True):
+        rel = Path(root).relative_to(src)
+        dirs[:] = [d for d in dirs if not excluded(d)]
+        files = [f for f in files if not excluded(f)]
+        dst_root = dst / rel
+        if dst_root.exists() and not dst_root.is_dir():
+            dst_root.unlink()
+        dst_root.mkdir(exist_ok=True)
+        keep = set(dirs) | set(files)
+        for stale in os.listdir(dst_root):
+            if stale not in keep:
+                stale_path = dst_root / stale
+                if stale_path.is_dir() and not stale_path.is_symlink():
+                    rmtree(stale_path)
+                else:
+                    stale_path.unlink()
+        for name in files:
+            src_file = Path(root) / name
+            dst_file = dst_root / name
+            src_stat = None
+            try:
+                src_stat = src_file.stat()
+                dst_stat = dst_file.stat()
+                # Trust the match only once the source mtime has aged past the
+                # race window; a just-written source can be rewritten again
+                # without the mtime moving, which would strand a stale copy.
+                if (src_stat.st_size == dst_stat.st_size
+                        and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3
+                        and src_stat.st_mtime <= now - _MTIME_RACE_WINDOW):
+                    continue
+            except OSError:
+                pass
+            if dst_file.is_dir() and not dst_file.is_symlink():
+                rmtree(dst_file)
+            # copy2: mtime must survive for the next sync's comparison.
+            shutil.copy2(src_file, dst_file)
+            _demote_racy_mtime(dst_file, src_stat, now)
+
+
+def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
+    """Copy the sources setup.py packages into an out-of-tree staging project.
+
+    Out-of-tree builds install compiled artifacts into this staging tree and
+    build the wheel from it, so nothing is ever written into the checkout.
+    """
+    print(f"-- Staging python package sources into {staging_dir} ...")
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    # examples: setup.py's root-level find_packages() ships the
+    # examples.configs.database package from it.
+    for tree in ("tensorrt_llm", "triton_kernels", "examples"):
+        sync_tree(project_dir / tree,
+                  staging_dir / tree,
+                  exclude=("__pycache__", "*.pyc"))
+    top_level_files = [
+        "setup.py", "pyproject.toml", "requirements.txt",
+        "requirements-dev.txt", "constraints.txt", "LICENSE", "README.md"
+    ]
+    top_level_files += [
+        f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
+    ]
+    for name in top_level_files:
+        src = project_dir / name
+        if src.exists():
+            copy(src, staging_dir / name)
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
-         build_dir: Path = None,
-         dist_dir: Path = None,
-         cuda_architectures: str = None,
-         job_count: int = None,
+         build_root: Optional[Path] = None,
+         build_dir: Optional[Path] = None,
+         dist_dir: Optional[Path] = None,
+         cuda_architectures: Optional[str] = None,
+         job_count: Optional[int] = None,
          extra_cmake_vars: Sequence[str] = tuple(),
          extra_make_targets: str = "",
-         nccl_root: str = None,
-         nixl_root: str = None,
-         mooncake_root: str = None,
-         internal_cutlass_kernels_root: str = None,
+         nccl_root: Optional[str] = None,
+         nixl_root: Optional[str] = None,
+         mooncake_root: Optional[str] = None,
+         internal_cutlass_kernels_root: Optional[str] = None,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
          configure_only: bool = False,
          use_ccache: bool = False,
+         out_of_tree: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
@@ -533,24 +803,52 @@ def main(*,
          mypyc: bool = False,
          require_dynamic_attributions: bool = False,
          plat_name: Optional[str] = None,
-         yes: bool = False):
+         yes: bool = False,
+         version_override: Optional[str] = None):
 
     if clean:
         clean_wheel = True
 
     project_dir = get_project_dir()
+
+    # Out-of-tree build state: everything metadata-heavy (venv, wheel
+    # staging, ccache, intermediate objects) goes under build_root, keeping
+    # the checkout free of high-churn I/O (important on network filesystems).
+    # Resolve before chdir so a relative path stays anchored to the caller's
+    # working directory.
+    if build_root is None and os.environ.get("TRTLLM_BUILD_ROOT"):
+        build_root = Path(os.environ["TRTLLM_BUILD_ROOT"])
+    if build_root is not None:
+        build_root = build_root.resolve()
+        build_root.mkdir(parents=True, exist_ok=True)
+        print(f"-- Out-of-tree build state under: {build_root}")
+        # setup.py redirects the setuptools staging tree and *.egg-info
+        # to this directory; an explicit env var set by the user wins.
+        os.environ.setdefault("TRTLLM_WHEEL_STAGING_DIR",
+                              str(build_root / "wheel-staging"))
+
+    if out_of_tree:
+        # Out-of-tree: never write into the checkout; the wheel is assembled in
+        # an out-of-tree staging project. Validated by building with the
+        # checkout mounted read-only.
+        if build_root is None:
+            raise RuntimeError("--out-of-tree requires --build_root")
+        if platform.system() == "Windows":
+            raise RuntimeError("--out-of-tree is not supported on Windows")
+        if skip_building_wheel or linking_install_binary or install:
+            raise RuntimeError(
+                "--out-of-tree is incompatible with --skip_building_wheel, "
+                "--linking_install_binary and --install: editable installs "
+                "import compiled artifacts from the checkout, which a "
+                "out-of-tree build never writes.")
+        if version_override:
+            raise RuntimeError(
+                "--out-of-tree does not support --version-override (it would "
+                "modify tensorrt_llm/version.py in the checkout)")
+
+    apply_version_override(project_dir, version_override)
     os.chdir(project_dir)
 
-    # Get all submodules and check their folder exists. If not,
-    # invoke git submodule update
-    with open(project_dir / ".gitmodules", "r") as submodules_f:
-        submodules = [
-            l.split("=")[1].strip() for l in submodules_f.readlines()
-            if "path = " in l
-        ]
-    if any(not (project_dir / submodule / ".git").exists()
-           for submodule in submodules):
-        build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
 
@@ -558,7 +856,8 @@ def main(*,
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename,
                                          no_venv,
-                                         yes=yes)
+                                         yes=yes,
+                                         build_root=build_root)
 
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
@@ -626,7 +925,7 @@ def main(*,
             raise RuntimeError("Mooncake is not supported on Windows.")
         cmake_def_args.append(f"-DMOONCAKE_ROOT={mooncake_root}")
 
-    build_dir = get_build_dir(build_dir, build_type)
+    build_dir = get_build_dir(build_dir, build_type, build_root, out_of_tree)
     first_build = not Path(build_dir, "CMakeFiles").exists()
 
     if clean and build_dir.exists():
@@ -634,6 +933,14 @@ def main(*,
     build_dir.mkdir(parents=True, exist_ok=True)
 
     if use_ccache:
+        if build_root is not None and "CCACHE_DIR" not in os.environ:
+            # Default the cache next to the rest of the out-of-tree build
+            # state. Point CCACHE_DIR at persistent storage instead to keep
+            # compile results across ephemeral nodes/containers.
+            ccache_dir = build_root / "ccache"
+            ccache_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["CCACHE_DIR"] = str(ccache_dir)
+            print(f"-- ccache directory: {ccache_dir}")
         cmake_def_args.append(
             f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"
         )
@@ -697,15 +1004,30 @@ def main(*,
 
     source_dir = get_source_dir()
 
-    fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
+    fmha_gen_root = build_root / "fmha-gen" if out_of_tree else None
+    fmha_v2_cu_dir, _ = get_fmha_gen_dirs(project_dir, fmha_gen_root)
     if (clean or generate_fmha
             or not _fmha_generation_stamp(fmha_v2_cu_dir).exists()):
-        generate_fmha_cu(project_dir, venv_python)
+        generate_fmha_cu(project_dir, venv_python, fmha_gen_root)
+
+    if out_of_tree:
+        cmake_def_args.append(f"-DTRTLLM_FMHA_GEN_DIR={fmha_gen_root}")
+        # Write the configured executor/version.h into the build tree
+        # instead of cpp/include (the checkout may be read-only).
+        cmake_def_args.append(
+            f"-DTRTLLM_VERSION_H_INCLUDE_DIR={build_dir}/generated-include")
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:
+            # Conan writes a CMakeUserPresets.json convenience file next to
+            # cpp/CMakeLists.txt; with out-of-tree build state it would be
+            # the only build file left in the checkout (and would point at a
+            # possibly ephemeral location), so skip generating it.
+            conan_extra_args = (
+                " -c tools.cmake.cmaketoolchain:user_presets=False"
+                if build_root is not None else "")
             build_run(
-                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}'{conan_extra_args} {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
@@ -742,16 +1064,25 @@ def main(*,
         assert not install, "Installing is not supported for cpp_only builds"
         return
 
-    pkg_dir = project_dir / "tensorrt_llm"
+    if out_of_tree:
+        # Assemble the wheel in an out-of-tree staging project; the checkout
+        # is only read from this point on.
+        wheel_project_dir = build_root / "package"
+        stage_python_package(project_dir, wheel_project_dir)
+    else:
+        wheel_project_dir = project_dir
+
+    pkg_dir = wheel_project_dir / "tensorrt_llm"
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
     lib_dir = pkg_dir / "libs"
     include_dir = pkg_dir / "include"
     if lib_dir.exists():
         clear_folder(lib_dir)
-    if include_dir.exists():
-        clear_folder(include_dir)
+    # include_dir is not cleared: its subtrees are synced with deletion of
+    # extraneous entries (sync_tree) or guarded by generation stamps, so
+    # incremental rebuilds skip the ~10k-file rewrite of the include tree.
     # Remove auto-generated attributions file from previous builds
-    auto_attr_file = project_dir / "ATTRIBUTIONS.md"
+    auto_attr_file = wheel_project_dir / "ATTRIBUTIONS.md"
     if auto_attr_file.exists():
         os.remove(auto_attr_file)
 
@@ -783,21 +1114,7 @@ def main(*,
 
     install_file = safe_copy
 
-    # Wrapper for copytree that checks if source and destination are the same
-    def safe_copytree(src, dst, dirs_exist_ok=True):
-        """Copy tree, but skip if source and destination resolve to the same directory."""
-        src_path = Path(src).resolve()
-        dst_path = Path(dst)
-        if dst_path.is_symlink():
-            dst_path.unlink()
-        elif src_path == dst_path.resolve():
-            # Source and destination are the same, skip copying
-            return
-        if dst_path.exists() and dirs_exist_ok:
-            rmtree(dst_path)
-        copytree(src_path, dst_path, dirs_exist_ok=dirs_exist_ok)
-
-    install_tree = safe_copytree
+    install_tree = sync_tree
     if skip_building_wheel and linking_install_binary:
 
         def symlink_remove_dst(src, dst):
@@ -811,10 +1128,12 @@ def main(*,
 
         install_file = symlink_remove_dst
 
-        def symlink_remove_dst_tree(src, dst, dirs_exist_ok=True):
+        def symlink_remove_dst_tree(src, dst):
             src = os.path.abspath(src)
             dst = os.path.abspath(dst)
-            if dirs_exist_ok and os.path.lexists(dst):
+            if os.path.isdir(dst) and not os.path.islink(dst):
+                rmtree(dst)  # left behind by a previous copy-mode build
+            elif os.path.lexists(dst):
                 os.remove(dst)
             os.symlink(src, dst)
 
@@ -823,8 +1142,7 @@ def main(*,
     lib_dir.mkdir(parents=True, exist_ok=True)
     include_dir.mkdir(parents=True, exist_ok=True)
     install_tree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
-                 include_dir / "deep_gemm",
-                 dirs_exist_ok=True)
+                 include_dir / "deep_gemm")
 
     # Copy FMHA kernel generation headers for JIT compilation
     fmha_build_dir = build_dir / "tensorrt_llm" / "kernels" / "trtllmGenKernels" / "fmha"
@@ -959,7 +1277,7 @@ def main(*,
                 ucx_dir = lib_dir / "ucx"
                 if ucx_dir.exists():
                     clear_folder(ucx_dir)
-                install_tree("/usr/local/ucx/lib", ucx_dir, dirs_exist_ok=True)
+                install_tree("/usr/local/ucx/lib", ucx_dir)
                 build_run(
                     f"find {ucx_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/ucx:$ORIGIN/../\' {{}} \\;"
                 )
@@ -981,7 +1299,7 @@ def main(*,
                     nixl_lib_path = "/opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu"
                 if not os.path.exists(nixl_lib_path):
                     nixl_lib_path = "/opt/nvidia/nvda_nixl/lib64"
-                install_tree(nixl_lib_path, nixl_dir, dirs_exist_ok=True)
+                install_tree(nixl_lib_path, nixl_dir)
                 build_run(
                     f"find {nixl_dir} -type f -name '*.so*' -exec patchelf --set-rpath \'$ORIGIN:$ORIGIN/plugins:$ORIGIN/../:$ORIGIN/../ucx/:$ORIGIN/../../ucx/\' {{}} \\;"
                 )
@@ -991,9 +1309,8 @@ def main(*,
         agent_binding_so = list(
             nixl_utils_dir.glob("tensorrt_llm_transfer_agent_binding*.so"))
         if agent_binding_so:
-            trtllm_dir = project_dir / "tensorrt_llm"
             install_file(agent_binding_so[0],
-                         trtllm_dir / agent_binding_so[0].name)
+                         pkg_dir / agent_binding_so[0].name)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/mooncake_utils/libtensorrt_llm_mooncake_wrapper.so"
@@ -1013,20 +1330,11 @@ def main(*,
         install_file(build_dir / "tensorrt_llm/runtime/utils/libpg_utils.so",
                      lib_dir / "libpg_utils.so")
 
+    # deep_ep/deep_gemm are synced in place below (sync_tree removes stale
+    # entries); deep_ep is deleted explicitly when this build does not
+    # produce it.
     deep_ep_dir = pkg_dir / "deep_ep"
-    if deep_ep_dir.is_symlink():
-        deep_ep_dir.unlink()
-    elif deep_ep_dir.is_dir():
-        clear_folder(deep_ep_dir)
-        deep_ep_dir.rmdir()
-
-    # Handle deep_gemm installation
     deep_gemm_dir = pkg_dir / "deep_gemm"
-    if deep_gemm_dir.is_symlink():
-        deep_gemm_dir.unlink()
-    elif deep_gemm_dir.is_dir():
-        clear_folder(deep_gemm_dir)
-        deep_gemm_dir.rmdir()
 
     scripts_dir = pkg_dir / "scripts"
     if scripts_dir.exists():
@@ -1053,13 +1361,17 @@ def main(*,
         with (build_dir / "tensorrt_llm" / "deep_ep" /
               "cuda_architectures.txt").open() as f:
             deep_ep_cuda_architectures = f.read().strip().strip(";")
+        if not deep_ep_cuda_architectures and deep_ep_dir.exists():
+            if deep_ep_dir.is_symlink():
+                deep_ep_dir.unlink()
+            else:
+                rmtree(deep_ep_dir)
         if deep_ep_cuda_architectures:
             install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"),
                          pkg_dir)
-            install_tree(build_dir / "tensorrt_llm" / "deep_ep" / "python" /
-                         "deep_ep",
-                         deep_ep_dir,
-                         dirs_exist_ok=True)
+            install_tree(
+                build_dir / "tensorrt_llm" / "deep_ep" / "python" / "deep_ep",
+                deep_ep_dir)
             (lib_dir / "nvshmem").mkdir(exist_ok=True)
             install_file(
                 build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
@@ -1075,10 +1387,9 @@ def main(*,
 
         install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
                      pkg_dir)
-        install_tree(build_dir / "tensorrt_llm" / "deep_gemm" / "python" /
-                     "deep_gemm",
-                     deep_gemm_dir,
-                     dirs_exist_ok=True)
+        install_tree(
+            build_dir / "tensorrt_llm" / "deep_gemm" / "python" / "deep_gemm",
+            deep_gemm_dir)
 
         with (build_dir / "tensorrt_llm" / "flash_mla" /
               "cuda_architectures.txt").open() as f:
@@ -1086,10 +1397,38 @@ def main(*,
         if flash_mla_cuda_architectures:
             install_file(get_binding_lib("flash_mla", "flash_mla_cpp_tllm"),
                          pkg_dir)
-            install_tree(build_dir / "tensorrt_llm" / "flash_mla" / "python" /
-                         "flash_mla",
-                         pkg_dir / "flash_mla",
-                         dirs_exist_ok=True)
+            install_tree(
+                build_dir / "tensorrt_llm" / "flash_mla" / "python" /
+                "flash_mla", pkg_dir / "flash_mla")
+
+        # Stage the FetchContent-patched MSA package for setup.py packaging.
+        msa_src = build_dir / "_deps" / "msa-src" / "python" / "fmha_sm100"
+        cutlass_src = build_dir / "_deps" / "cutlass-src"
+        msa_dst = wheel_project_dir / "3rdparty" / "fmha_sm100"
+        if not (msa_src / "cute" / "interface.py").is_file():
+            raise FileNotFoundError(
+                f"MSA package missing at {msa_src}; CMake FetchContent for msa "
+                "did not populate the expected sources.")
+        if msa_dst.is_symlink():
+            msa_dst.unlink()
+        elif msa_dst.exists():
+            rmtree(msa_dst)
+        msa_dst.mkdir(parents=True)
+        for python_source in msa_src.glob("*.py"):
+            install_file(python_source, msa_dst)
+        for source_dir, relative_dir in (
+            (msa_src / "csrc", Path("csrc")),
+            (msa_src / "cute", Path("cute")),
+            (cutlass_src / "include", Path("cutlass/include")),
+            (cutlass_src / "tools/util/include",
+             Path("cutlass/tools/util/include")),
+        ):
+            (msa_dst / relative_dir).parent.mkdir(parents=True, exist_ok=True)
+            install_tree(
+                source_dir,
+                msa_dst / relative_dir,
+            )
+        install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
 
         if not skip_stubs:
             with working_directory(pkg_dir):
@@ -1102,11 +1441,14 @@ def main(*,
                         nixl_root is not None or mooncake_root is not None,
                         binding_lib_file_name)
 
-    build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=mypyc)
+    build_kv_cache_manager_v2(wheel_project_dir,
+                              venv_python,
+                              use_mypyc=mypyc,
+                              build_root=build_root)
 
     if not skip_building_wheel:
         if dist_dir is None:
-            dist_dir = project_dir / "build"
+            dist_dir = build_root / "dist" if out_of_tree else project_dir / "build"
         else:
             dist_dir = Path(dist_dir)
 
@@ -1120,6 +1462,17 @@ def main(*,
             # This breaks the Windows CI/CD pipeline when building
             # and validating python changes in the whl.
             clear_folder(dist_dir)
+            # Without --build_root the setuptools staging tree (build_base)
+            # lives at project_dir/build == dist_dir, so the clear above
+            # already wipes it. With --build_root it moves under
+            # TRTLLM_WHEEL_STAGING_DIR, so clearing dist_dir alone would
+            # leave stale copies of deleted package files there to be
+            # re-packed into the next "clean" wheel. Clear it too.
+            staging_dir = os.environ.get("TRTLLM_WHEEL_STAGING_DIR")
+            if staging_dir:
+                staging_build = Path(staging_dir) / "build"
+                if staging_build.exists():
+                    clear_folder(staging_build)
 
         extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
         plat_name_arg = ""
@@ -1154,14 +1507,11 @@ def main(*,
 
         # Copy auto-generated ATTRIBUTIONS.md to project root for wheel packaging
         if auto_attr.exists():
-            install_file(auto_attr, project_dir / "ATTRIBUTIONS.md")
+            install_file(auto_attr, wheel_project_dir / "ATTRIBUTIONS.md")
             print(
-                f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
+                f"Copied auto-generated attributions to {wheel_project_dir / 'ATTRIBUTIONS.md'}"
             )
 
-        build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
-        )
         env = os.environ.copy()
         if mypyc:
             env["TRTLLM_ENABLE_MYPYC"] = "1"
@@ -1169,7 +1519,7 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {wheel_project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
@@ -1274,11 +1624,32 @@ def add_arguments(parser: ArgumentParser):
         "Directory containing internal_cutlass_kernels sources. If specified, the internal_cutlass_kernels and NVRTC wrapper libraries will be built from source."
     )
     parser.add_argument(
+        "--build_root",
+        type=Path,
+        help=
+        "Directory for all out-of-tree build state (also via TRTLLM_BUILD_ROOT env var). "
+        "When set, the CMake build dir, build venv, wheel staging, intermediate "
+        "objects and (with --use_ccache) the ccache directory default under this "
+        "directory instead of the checkout. Point it at fast local storage (e.g. "
+        "/tmp) when the checkout lives on a network filesystem. Individual "
+        "options like --build_dir and CCACHE_DIR still override their piece.")
+    parser.add_argument(
+        "--out-of-tree",
+        action="store_true",
+        help=
+        "Never write into the checkout: generated FMHA sources and version.h "
+        "go to the build tree, and the wheel is assembled from an out-of-tree "
+        "staging copy of the Python package (default wheel output: "
+        "<build_root>/dist). Requires --build_root; the checkout may be "
+        "mounted read-only. Incompatible with editable-install workflows "
+        "(--skip_building_wheel, --linking_install_binary, --install) and "
+        "with --version-override (it edits tensorrt_llm/version.py in place).")
+    parser.add_argument(
         "--build_dir",
         type=Path,
         help=
-        "Directory where C++ sources are built (default: cpp/build or cpp/build_<build_type>)"
-    )
+        "Directory where C++ sources are built (default: cpp/build or cpp/build_<build_type>, "
+        "or <build_root>/cpp-build* when --build_root is set)")
     parser.add_argument(
         "--dist_dir",
         type=Path,
@@ -1345,6 +1716,11 @@ def add_arguments(parser: ArgumentParser):
         default=False,
         help=
         "Skip interactive confirmation prompts (useful for non-interactive builds)",
+    )
+    parser.add_argument(
+        "--version-override",
+        help="Package version override. A leading '.' or '+' appends to the "
+        "current version; any other value replaces it.",
     )
 
 

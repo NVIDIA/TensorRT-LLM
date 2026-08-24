@@ -194,6 +194,39 @@ def inplace_info():
         "minimax_m3_attn_custom_op_inplace": {
             1: "output"
         },
+        "fused_sigmoid_mul_inplace": {
+            1: "attention_output"
+        },
+        "flashinfer_gemma_fused_add_rmsnorm": {
+            1: "input",
+            2: "residual"
+        },
+        "bmm_out": {
+            1: "out"
+        },
+        "fp8_block_scaling_bmm_out": {
+            1: "out"
+        },
+        "gate_forward": {
+            1: "out_weights",
+            2: "out_indices"
+        },
+        "group_rms_norm_base": {
+            1: "outputs"
+        },
+        "group_rms_norm_large_batch": {
+            1: "outputs"
+        },
+        "group_rms_norm_heuristic": {
+            1: "outputs"
+        },
+        "mla_rope_inplace": {
+            1: "data"
+        },
+        "mla_rope_generation": {
+            1: "fused_q",
+            2: "q_pe"
+        },
     }
     for op_name, mutates_args in optional_inplace_infos.items():
         op = get_optional_trtllm_op(op_name)

@@ -72,6 +72,61 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
+# The install lock in slurm_install.sh lives under $resourcePathNode (/tmp), so it
+# is node-local: its wait loop only fences $SLURM_LOCALID peers on the same node,
+# and a node can never observe another node's lock. Nothing else stops one node
+# from reaching `eval $pytestCommand` below while another is still installing, and
+# the per-rank work above skews the ranks further (non-zero ranks cover the
+# coverage-config write with a blind `sleep 30`, and slurm_setup_runtime_env shells
+# out to pip3). Pytest's first action is `import tensorrt_llm`, whose module-scope
+# MPI collective must be entered by every rank; under --mpi=pmix -- added exactly
+# when nodeCount > 1 -- that collective has a 300s fence timeout, so the skew
+# aborts every rank instead of merely running late. Fence every rank on the shared
+# $jobWorkspace so they enter pytest together.
+slurm_wait_all_ranks() {
+    local numRanks="${SLURM_NTASKS:-1}"
+    if [ "$numRanks" -le 1 ] || [ -z "${jobWorkspace:-}" ]; then
+        return 0
+    fi
+
+    # Keyed per job *and* per step: $jobWorkspace outlives a single step, so
+    # markers from another job, or from an earlier step of this job, must not
+    # satisfy the count. Slurm assigns one step id per step across all of its
+    # nodes, so every rank of a step agrees on this path.
+    local readyDir="$jobWorkspace/run_ready_job_${SLURM_JOB_ID:-local}_step_${SLURM_STEP_ID:-0}"
+    mkdir -p "$readyDir"
+    touch "$readyDir/rank_${SLURM_PROCID}.ready"
+
+    # Bounded so a dead rank fails the stage loudly instead of hanging until the
+    # partition walltime kills it; the ceiling exceeds the 2700s pip3 retry budget
+    # in slurm_install.sh so a merely slow rank still releases the barrier.
+    local timeoutSecs=3600
+    local deadline=$((SECONDS + timeoutSecs))
+    local markers ready
+    while true; do
+        # Counted with a glob rather than `ls | wc -l`: under `set -Eeuo pipefail` a
+        # failing `ls` propagates into the assignment and fires the ERR trap. The
+        # touch above guarantees at least one match, so no nullglob is needed.
+        markers=("$readyDir"/*.ready)
+        ready=${#markers[@]}
+        if [ "$ready" -ge "$numRanks" ]; then
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "ERROR: rank ${SLURM_PROCID} timed out after ${timeoutSecs}s waiting for" \
+                 "all $numRanks ranks to be ready; ready: $ready/$numRanks"
+            return 1
+        fi
+        # One rank reports progress; all of them would spam the log every 10s.
+        if [ "$SLURM_PROCID" -eq 0 ]; then
+            echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
+        fi
+        sleep 10
+    done
+}
+
+slurm_wait_all_ranks
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
@@ -82,6 +137,8 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
+python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+    --drain-spool "$jobWorkspace" || true
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved

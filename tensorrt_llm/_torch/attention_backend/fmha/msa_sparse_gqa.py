@@ -5,7 +5,7 @@
 MsaSparseGqaFmha wraps the fmha_sm100 paged sparse GQA kernel and
 participates in the standard TrtllmAttention.forward dispatch loop. The
 owning MiniMax-M3 MSA attention layer runs an MsaIndexer to select the
-per-query KV blocks and publishes them on forward_args.sparse_prediction;
+per-query KV blocks and publishes them on forward_args.sparse_runtime_params;
 this class attends over them.
 """
 
@@ -173,7 +173,7 @@ class MsaSparseGqaFmha(Fmha):
     """SM100 paged GQA FMHA powered by MSA's fmha_sm100 kernel.
 
     Handles every MiniMax-M3 MSA layer. Sparse layers pass the indexer's
-    selected KV block indices on forward_args.sparse_prediction.sparse_attn_indices
+    selected KV block indices on forward_args.sparse_runtime_params.sparse_attn_indices
     and attend those blocks; dense layers leave the indices None and attend the
     full page table.
 
@@ -186,8 +186,8 @@ class MsaSparseGqaFmha(Fmha):
 
     @classmethod
     def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
-        # fmha_sm100 runs only on the SM100 family and ships in the MSA git
-        # submodule, so it is unavailable off SM100 or without the package.
+        # fmha_sm100 runs only on the SM100 family and is packaged in the
+        # wheel, so it is unavailable off SM100 or without the wheel.
         # Imported lazily because the minimax_m3 package init imports the trtllm
         # attention classes, which a module-scope import here would cycle with.
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
@@ -216,12 +216,15 @@ class MsaSparseGqaFmha(Fmha):
         # Sparse layers attend the per-query top-k blocks with the sparse plan;
         # dense layers leave the indices None and attend the full page table
         # with the dense plan.
-        kv_block_indexes = forward_args.sparse_prediction.sparse_attn_indices
-        plan = (
-            metadata.msa_decode_gqa_plan
-            if kv_block_indexes is not None
-            else metadata.msa_decode_dense_plan
-        )
+        kv_block_indexes = forward_args.sparse_runtime_params.sparse_attn_indices
+        if kv_block_indexes is not None:
+            plan = metadata.msa_decode_gqa_plan
+            if plan is None:
+                plan = getattr(metadata, "msa_eager_gqa_plan", None)
+        else:
+            plan = metadata.msa_decode_dense_plan
+            if plan is None:
+                plan = getattr(metadata, "msa_eager_dense_plan", None)
         run_msa_paged_gqa(
             self.attn,
             q,

@@ -42,6 +42,9 @@ from tensorrt_llm.inputs.utils import (
     load_base64_video,
 )
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ──────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────

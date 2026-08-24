@@ -40,7 +40,8 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             ToolDescription, load_harmony_encoding)
 from transformers import AutoProcessor, PretrainedConfig
 
-from tensorrt_llm.bindings import steady_clock_now
+from tensorrt_llm._utils import \
+    get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
@@ -111,10 +112,6 @@ def _decode_tokens(
     if tokenizer is not None:
         return tokenizer.decode(tokens)
     return _get_encoding().decode(tokens)
-
-
-def get_steady_clock_now_in_seconds() -> float:
-    return steady_clock_now().total_seconds()
 
 
 def _parse_response_input(
@@ -257,9 +254,6 @@ class ConversationHistoryStore:
 
                 conversation_id = self.response_to_conversation[prev_resp_id]
                 self.conversations[conversation_id].extend(resp_msgs)
-                while len(self.conversations[conversation_id]
-                          ) > self.conversation_capacity:
-                    self._pop_conversation(resp_id)
             else:
                 conversation_id = _random_uuid()
                 self.conversations[conversation_id] = resp_msgs
@@ -269,6 +263,7 @@ class ConversationHistoryStore:
 
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
+            self._trim_conversation(conversation_id)
             self._update_visited_conversation(conversation_id)
 
     async def pop_response(self, resp_id: Optional[str] = None) -> bool:
@@ -307,12 +302,10 @@ class ConversationHistoryStore:
             _responses_debug_log(
                 f" * storing at conversation: {conversation_id}")
             self.conversations[conversation_id] = msgs
-            if len(self.conversations[conversation_id]
-                   ) > self.conversation_capacity:
-                self._pop_conversation(resp_id)
 
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
+            self._trim_conversation(conversation_id)
             self._update_visited_conversation(conversation_id)
 
     async def get_conversation_history(
@@ -372,8 +365,20 @@ class ConversationHistoryStore:
         if conversation_id is None:
             return
 
-        conversation = self.conversations[conversation_id]
-        if len(conversation) == 0:
+        self._pop_conversation_by_conversation_id(conversation_id)
+
+    def _trim_conversation(self, conversation_id: str) -> None:
+        conversation = self.conversations.get(conversation_id)
+        if conversation is None:
+            return
+
+        while len(conversation) > self.conversation_capacity:
+            self._pop_conversation_by_conversation_id(conversation_id)
+
+    def _pop_conversation_by_conversation_id(self,
+                                             conversation_id: str) -> None:
+        conversation = self.conversations.get(conversation_id)
+        if conversation is None or len(conversation) == 0:
             return
 
         is_harmony_conversation = isinstance(conversation[0], Message)

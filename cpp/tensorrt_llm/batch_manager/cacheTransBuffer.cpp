@@ -275,37 +275,39 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
     {
         TLLM_CHECK(maxNumTokens.value() % tokensPerBlock == 0);
         auto const dataSize = common::getDTypeSize(dataType);
-        SizeType32 indexerCacheByteSizePerTokenPerLayer = 0;
         if (transferIndexerKCache)
         {
-            indexerCacheByteSizePerTokenPerLayer
-                = cacheManager->getIndexerKCachePool()->getDimension<-1>() * dataSize / tokensPerBlock;
+            // The (possibly masked) indexer pool holds one row per full-indexer layer; size
+            // the buffer from the pool's actual layer count instead of the attention layer
+            // count.
+            auto const indexerPool = cacheManager->getIndexerKCachePool();
+            auto const indexerCacheByteSizePerTokenPerLayer
+                = indexerPool->getDimension<-1>() * dataSize / tokensPerBlock;
+            auto const numIndexerLayers = static_cast<SizeType32>(indexerPool->getDimension<1>());
+            auto const validTokenNum = maxNumTokens.value() + tokensPerBlock; // add one more block
+            bufferSizeFromMaxNumToken = validTokenNum * indexerCacheByteSizePerTokenPerLayer * numIndexerLayers;
         }
-        for (auto layerId = 0; layerId < blockManager.getNumLayers(); layerId++)
+        else
         {
-            auto const poolIdx = blockManager.getLayerPoolIdx(layerId);
-            auto const encodedWindowSize = blockManager.getPoolWindowSize(poolIdx);
-            if (!transferIndexerKCache && hasAttentionCachePool
-                && LinearAttentionMetadata::hasLinearCache(encodedWindowSize))
+            for (auto layerId = 0; layerId < blockManager.getNumLayers(); layerId++)
             {
-                continue;
-            }
+                auto const poolIdx = blockManager.getLayerPoolIdx(layerId);
+                auto const encodedWindowSize = blockManager.getPoolWindowSize(poolIdx);
+                if (hasAttentionCachePool && LinearAttentionMetadata::hasLinearCache(encodedWindowSize))
+                {
+                    continue;
+                }
 
-            auto const windowSize = static_cast<size_t>(encodedWindowSize);
-            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
-            auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
-            if (common::getEnvKVCacheTransferAllBlocksForWindow())
-            {
-                validTokenNum = maxNumTokens.value();
-            }
-            validTokenNum += tokensPerBlock; // add one more block
+                auto const windowSize = static_cast<size_t>(encodedWindowSize);
+                auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+                auto validTokenNum
+                    = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+                if (common::getEnvKVCacheTransferAllBlocksForWindow())
+                {
+                    validTokenNum = maxNumTokens.value();
+                }
+                validTokenNum += tokensPerBlock; // add one more block
 
-            if (transferIndexerKCache)
-            {
-                bufferSizeFromMaxNumToken += validTokenNum * indexerCacheByteSizePerTokenPerLayer;
-            }
-            else
-            {
                 auto const primaryPool = blockManager.getPrimaryPool(poolIdx);
                 auto const kvCacheByteSizePerTokenPerLayer
                     = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;

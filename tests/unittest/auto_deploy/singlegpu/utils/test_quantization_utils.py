@@ -76,6 +76,7 @@ def test_fp4_global_scale():
     assert input_scale == torch.tensor(1.0, dtype=torch.float)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("amax, expected_scale", [(FP8_MAX, 1.0), (FP8_MAX / 2.0, 0.5)])
 def test_fp8_convert_amax_hook(amax, expected_scale):
     config = TransformConfig(stage="pattern_matcher")
@@ -89,6 +90,7 @@ def test_fp8_convert_amax_hook(amax, expected_scale):
     assert mock_state_dict["scale"] == expected_scale
 
 
+@pytest.mark.cpu_only
 def test_fp8_load_hook_maps_prequantized_scales():
     config = TransformConfig(stage="pattern_matcher")
     fp8_imp = FP8LinearQuantizationFromConfig(config)
@@ -108,6 +110,7 @@ def test_fp8_load_hook_maps_prequantized_scales():
     assert "layer.proj.weight_scale_inv" not in mock_state_dict
 
 
+@pytest.mark.cpu_only
 def test_fp8_load_hook_maps_prequantized_scales_with_prefix():
     config = TransformConfig(stage="pattern_matcher")
     fp8_imp = FP8LinearQuantizationFromConfig(config)

@@ -31,7 +31,7 @@
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -52,7 +52,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention_backend.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -68,15 +68,14 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.fused_moe import (
     CutlassFusedMoE,
     DeepSeekV4MoeRoutingMethod,
-    MoE,
     MoEWeightLoadingMode,
     TritonFusedMoE,
     TRTLLMGenFusedMoE,
     create_moe,
-    get_moe_cls,
+    is_moe_weight_owner,
+    resolve_moe_cls,
 )
 from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -560,6 +559,15 @@ class DeepseekV4WeightLoader:
         self.is_draft_model = is_draft_model
 
     def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        # Opt-in WAR (TRTLLM_PINNED_WEIGHT_STAGING=1) for drivers where
+        # pageable H2D copies stall during weight loading; staging buffers
+        # are freed on scope exit. See pinned_weight_staging.py.
+        from tensorrt_llm._torch import pinned_weight_staging
+
+        with pinned_weight_staging.staging_scope():
+            return self._load_weights_impl(weights, skip_modules=skip_modules)
+
+    def _load_weights_impl(self, weights: Dict, skip_modules: List[str] = []):
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by
@@ -1086,7 +1094,7 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
-                elif names[-1] == "backend" and isinstance(module, MoE):
+                elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
@@ -1316,7 +1324,7 @@ class DeepseekV4Attention(MLA):
         self,
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
@@ -1348,15 +1356,12 @@ class DeepseekV4Attention(MLA):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
             num_groups=config.o_groups,
             o_lora_rank=config.o_lora_rank,
             mapping_with_cp=mapping_with_cp,
             reduce_output=reduce_output,
         )
-
-        self.indexer = getattr(self.mqa, "indexer", None)
-        self.compressor = getattr(self.mqa, "compressor", None)
 
 
 class DeepseekV4Gate(nn.Module):
@@ -1498,15 +1503,26 @@ class DeepseekV4MoE(nn.Module):
         moe_swiglu_limit = None
         if swiglu_limit is not None:
             # `create_moe` only accepts swiglu_limit for these MoE classes;
-            # resolve via get_moe_cls so backend-string fallbacks (e.g.
-            # TRTLLM/CUTEDSL/DENSEGEMM dropping back to CutlassFusedMoE on
-            # unsupported quant) are handled correctly.
-            moe_cls = get_moe_cls(model_config, override_quant_config=experts_quant_config)
+            # ask the resolver rather than the backend string so that a
+            # degradation (e.g. TRTLLM/CUTEDSL/DENSEGEMM dropping back to
+            # CutlassFusedMoE on unsupported quant) is accounted for here too.
+            moe_cls = resolve_moe_cls(
+                model_config,
+                override_quant_config=experts_quant_config,
+                dtype=dtype,
+                # Same routing object as create_moe below.
+                routing=self.gate.routing_method,
+                # create_moe below passes no bias and no swiglu alpha/beta, so
+                # it resolves with the plain SwiGLU package. Say so here too:
+                # leaving this unknown lets gates abstain that create_moe
+                # rejects, and the two calls would pick different backends.
+                swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
+            )
             supports_swiglu_limit = moe_cls in (
                 CutlassFusedMoE,
                 TritonFusedMoE,
                 TRTLLMGenFusedMoE,
-                WideEPMoE,
                 DeepGemmFusedMoE,
             )
             # NVFP4 routed-expert path: the TRTLLM-Gen fp4-block-scale fused-MoE
@@ -1514,8 +1530,7 @@ class DeepseekV4MoE(nn.Module):
             # swiglu_limit is supplied; drop the limit there until the cubin
             # gains a no-bias clamp variant. MXFP4 variants are unaffected.
             kernel_requires_bias_for_swiglu_limit = (
-                moe_cls in (TRTLLMGenFusedMoE, WideEPMoE)
-                and experts_quant_config.quant_mode.has_nvfp4()
+                moe_cls is TRTLLMGenFusedMoE and experts_quant_config.quant_mode.has_nvfp4()
             )
             # DeepSeek-V4 supplies a uniform scalar limit. The TRTLLM-Gen FP8
             # path consumes it directly and rejects the redundant tensor.
@@ -1681,7 +1696,6 @@ class DeepseekV4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({"alltoall_result_do_sum": False} if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output
@@ -1783,7 +1797,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         self.self_attn = DeepseekV4Attention(
             model_config,
             layer_idx=attention_layer_idx,
-            aux_stream=aux_stream_dict[AuxStreamType.Attention],
+            aux_stream_dict=aux_stream_dict,
             reduce_output=not self.enable_attention_dp and self.mapping.tp_size > 1,
         )
 
@@ -2355,6 +2369,9 @@ class DeepseekV4Model(DecoderModel):
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
         self.hc_mult = config.hc_mult
+        # Attention-phase and MoE-phase lanes are sequential within a layer, so the
+        # Mla* roles reuse the Moe* slots. Engram keeps its own: it precomputes
+        # across the layer rather than inside the MoE phase.
         aux_stream_list = [torch.cuda.Stream() for _ in range(5)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
@@ -2363,6 +2380,9 @@ class DeepseekV4Model(DecoderModel):
             AuxStreamType.MoeBalancer: aux_stream_list[2],
             AuxStreamType.MoeOutputMemset: aux_stream_list[3],
             AuxStreamType.EngramPrecompute: aux_stream_list[4],
+            AuxStreamType.MlaCompressor: aux_stream_list[1],
+            AuxStreamType.MlaIndexer: aux_stream_list[2],
+            AuxStreamType.MlaIndexerAux: aux_stream_list[3],
         }
 
         self.embed_tokens = Embedding(
@@ -2524,13 +2544,33 @@ class DeepseekV4Model(DecoderModel):
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        return {
-            "kv_cache_config": {
-                "tokens_per_block": 128,
-                "use_kv_cache_manager_v2": True,
-                "enable_swa_scratch_reuse": True,
-            }
+        kv_cache_defaults = {
+            "tokens_per_block": 128,
+            "enable_swa_scratch_reuse": True,
         }
+        if llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
+            kv_cache_defaults["tokens_per_block"] = 256
+        return {"kv_cache_config": kv_cache_defaults}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for DeepSeek-V4."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        DeepSeek-V4 runs DeepseekV4CacheManager, a KVCacheManagerV2
+        subclass that the C++ transceiver cannot drive; the disaggregated
+        tests pin NIXL + PYTHON for the same reason. This routes the
+        fully-'auto' path to that combination.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         model_config = _normalize_deepseek_v4_nvfp4_mixed_precision_config(model_config)

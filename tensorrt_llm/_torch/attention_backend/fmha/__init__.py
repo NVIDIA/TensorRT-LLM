@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
+from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
 from .msa_sparse_gqa import MsaSparseGqaFmha
@@ -23,7 +25,9 @@ from .registry import DEFAULT_FMHA_LIBS, FMHA_LIBS, FmhaCls, get_enabled_fmha_li
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
+    "CuteDslMlaFmha",
     "FallbackFmha",
+    "FlashInferSparseMlaFmha",
     "FlashInferTrtllmGenFmha",
     "Fmha",
     "FmhaCls",

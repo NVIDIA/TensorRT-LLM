@@ -28,6 +28,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
+pytestmark = pytest.mark.cpu_only
+
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 mpi4py.MPI.pickle.__init__(
     cloudpickle.dumps,

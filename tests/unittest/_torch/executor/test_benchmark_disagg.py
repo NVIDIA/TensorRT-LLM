@@ -31,7 +31,10 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler import RequestScheduler, ScheduledRequests
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,13 +48,22 @@ def _make_active_request(
 ) -> Mock:
     """Create an active request stub with disagg state flags."""
     req = Mock()
-    req.state_value = LlmRequestState.GENERATION_IN_PROGRESS.value
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
-    req.state = (
-        LlmRequestState.DISAGG_TRANS_ERROR if in_error else LlmRequestState.GENERATION_IN_PROGRESS
-    )
+    if in_error:
+        req.state = LlmRequestState.DISAGG_TRANS_ERROR
+    elif in_transfer:
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    elif in_init:
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+    else:
+        req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.state_value = req.state.value
     req.is_attention_dp_dummy = False
+    req.is_encoder_init_state = False
+    req.is_context_init_state = False
+    req.is_generation_in_progress_state = req.state == LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_encoder_output_ready_event = None
     return req
 
 
@@ -101,6 +113,15 @@ class MockBenchmarkExecutor:
         self.dist.tp_size = tp_size
         self.dist.world_size = tp_size
 
+        # State the gate's stall bound reads. 0 disables the bound, which is
+        # what these tests want twice over: they assert retry semantics, not
+        # the deadline (that is test_disagg_fill_gate_stall_bound.py's job),
+        # and they patch the whole `time` module -- so an enabled bound would
+        # do arithmetic on a Mock. `timeout_s <= 0` returns before the clock
+        # is read, so the patched module is never touched.
+        self._benchmark_fill_stall_since = None
+        self._benchmark_fill_stall_timeout_sec = 0.0
+
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     _dist_size = staticmethod(PyExecutor._dist_size)
@@ -109,6 +130,7 @@ class MockBenchmarkExecutor:
     _configure_benchmark_req_queues_size = PyExecutor._configure_benchmark_req_queues_size
     _is_benchmark_disagg_fill_complete = PyExecutor._is_benchmark_disagg_fill_complete
     _check_benchmark_disagg_gate = PyExecutor._check_benchmark_disagg_gate
+    _fail_if_fill_gate_stalled = PyExecutor._fail_if_fill_gate_stalled
 
 
 # ---------------------------------------------------------------------------
@@ -585,16 +607,35 @@ class MockPadDummyExecutor:
         self.max_total_draft_tokens = 0
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
-        self._enable_dsv4_adp_dummy_fixes = True
+        self._enable_adp_dummy_fixes = True
+        self._enable_scheduler_aware_adp_dummy = True
+        self._enable_non_overlap_adp_forward_intent = True
         self.max_num_tokens = None
 
         self.dist = Mock()
         self.dist.tp_size = tp_size
         self.dist.tp_allgather.side_effect = lambda value: [value]
+        # Simulate a peer rank with generation compute after the fill gate
+        # opens, so an empty local rank needs a generation dummy.
+        self.dist.tp_allreduce.side_effect = lambda value, op: max(
+            value, int(self._ADPForwardIntent.GENERATION)
+        )
+
+        self.scheduler = Mock()
+        self.scheduler.scheduling_state_range = (
+            LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_TO_COMPLETE,
+        )
+        self.scheduler.is_request_in_schedulable_state.side_effect = (
+            lambda request: RequestScheduler.is_request_in_schedulable_state(
+                self.scheduler, request
+            )
+        )
 
         self.kv_cache_manager = Mock()
         self.kv_cache_manager.mapping.has_cp_helix.return_value = False
         self.kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        self.kv_cache_manager.is_linear_attention = False
         dummy_req = Mock()
         dummy_req.is_attention_dp_dummy = True
         self.kv_cache_manager.add_dummy_requests.return_value = [dummy_req]
@@ -602,10 +643,11 @@ class MockPadDummyExecutor:
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
 
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _ADPForwardIntent
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
     _count_schedulable_active_requests = PyExecutor._count_schedulable_active_requests
+    _get_non_overlap_adp_forward_intent = PyExecutor._get_non_overlap_adp_forward_intent
     _has_adp_dummy_kv_capacity = PyExecutor._has_adp_dummy_kv_capacity
     _should_skip_dummy_for_benchmark_disagg = PyExecutor._should_skip_dummy_for_benchmark_disagg
 
@@ -1151,7 +1193,7 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
-    def test_partial_transfer_admission_uses_only_admitted_requests(self):
+    def test_partial_transfer_admission_uses_only_admitted_requests(self) -> None:
         """The admitted subset is prepared and passed to the idle check."""
         admitted_req = _make_active_request(in_init=True)
         deferred_req = _make_active_request(in_init=True)
@@ -1166,7 +1208,7 @@ class TestFailFastDuringBenchmarkFill:
         ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
         ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
         ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
-            0, [admitted_req], False, False
+            0, [admitted_req], False, False, is_idle=True
         )
         ex._handle_errors.assert_not_called()
 

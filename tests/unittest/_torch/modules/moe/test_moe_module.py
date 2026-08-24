@@ -30,7 +30,6 @@ import functools
 import logging
 import os
 import pickle
-import socket
 import sys
 import tempfile
 import traceback
@@ -109,7 +108,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
-from tensorrt_llm._utils import get_sm_version, mpi_rank
+from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -122,13 +121,6 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
-
-
-def _get_free_tcp_port() -> int:
-    """Return a local TCP port for MPI-worker torch.distributed rendezvous."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:
@@ -147,13 +139,49 @@ def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> No
         pytest.skip("CUDA required for MegaMoE tests")
     if dist.is_initialized():
         return
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29561")
+    if world_size == 1:
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend="nccl",
+            store=dist.HashStore(),
+            rank=rank,
+            world_size=world_size,
+        )
+        return
+    master_addr = "127.0.0.1"
+    store = None
+    if rank == 0:
+        # Bind before publishing the OS-selected port. wait_for_workers must be
+        # false because clients cannot connect until the port is broadcast.
+        store = dist.TCPStore(
+            host_name=master_addr,
+            port=0,
+            world_size=world_size,
+            is_master=True,
+            wait_for_workers=False,
+        )
+    master_port = mpi_comm().bcast(store.port if store is not None else None, root=0)
+    if store is None:
+        store = dist.TCPStore(
+            host_name=master_addr,
+            port=master_port,
+            world_size=world_size,
+            is_master=False,
+            wait_for_workers=False,
+        )
+
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
     torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        backend="nccl",
+        store=store,
+        rank=rank,
+        world_size=world_size,
+    )
 
 
 def _create_mapping_for_parallel_mode(world_size, parallel_mode):
@@ -264,7 +292,7 @@ def _create_model_config(
     # CUTE_DSL_B12X is an internal-only MoeBackendType — it has no
     # corresponding user-facing MoeConfig.backend literal. Route through
     # "CUTEDSL" so the test exercises the cuteDSL-family selection path that
-    # users hit on SM120/121 + NVFP4 (where get_moe_cls returns the hybrid
+    # users hit on SM120/121 + NVFP4 (where resolve_moe_impl picks the hybrid
     # CuteDslB12xFusedMoE backend when flashinfer is importable).
     if moe_backend == MoeBackendType.CUTE_DSL_B12X.value:
         moe_backend = MoeBackendType.CUTEDSL.value
@@ -747,17 +775,11 @@ def _test_moe_worker_impl(
 # ---------------------------------------------------------------------------
 
 
-def _moe_init_worker(custom_paths, master_port):
+def _moe_init_worker(custom_paths):
     # Align worker sys.path with the main process for submodule import.
     for custom_path in custom_paths:
         if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
             sys.path.append(custom_path)
-    # Force the local loopback rendezvous: master_port is probed on 127.0.0.1
-    # (see _get_free_tcp_port), so MASTER_ADDR must match it and not an inherited
-    # cluster hostname, otherwise the loopback-probed port may bind a different
-    # interface. All workers share one node here, so loopback is always reachable.
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(master_port)
 
 
 def _reset_moe_comm_state():
@@ -814,10 +836,9 @@ def moe_multi_gpu_executor():
     mpi_pool_executor users, test_moe_a2a / test_autotuner). world_size is 4.
     """
     world_size = 4
-    master_port = _get_free_tcp_port()
     with MPIPoolExecutor(
         initializer=_moe_init_worker,
-        initargs=(sys.path, master_port),
+        initargs=(sys.path,),
         max_workers=world_size,
     ) as executor:
         yield executor
@@ -1270,6 +1291,7 @@ def generate_multi_gpu_test_params(
                         model_config=model_config,
                         moe_tp_size=moe_tp_size,
                         dtype=dtype,
+                        swiglu_gptoss_style=swiglu_gptoss_style,
                     ),
                     should_skip_cutedsl(
                         backend_type,

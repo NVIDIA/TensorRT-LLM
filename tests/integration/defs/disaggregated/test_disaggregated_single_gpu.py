@@ -29,8 +29,22 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
+    if sm == 90:
+        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
+        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
+        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
+        return "^gdr_copy"
     return "^ib,gdr_copy"
 
+
+# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
+# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
+# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
+# address handles to cross-rail peers and time out, hanging the workers.
+# Drop it at import time so worker environments (copied from os.environ)
+# fall back to standard GID-based address resolution; no-op when absent.
+if get_sm_version() == 90:
+    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -998,8 +1012,10 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
         KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
         for _ in range(2)
     ]
+    # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
+        for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
@@ -1156,8 +1172,10 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
         KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
         for _ in range(2)
     ]
+    # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
+        for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]

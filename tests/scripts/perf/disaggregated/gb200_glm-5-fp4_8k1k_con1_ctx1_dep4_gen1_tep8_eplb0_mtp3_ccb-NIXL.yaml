@@ -72,7 +72,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: MTP
       num_nextn_predict_layers: 3
@@ -100,5 +100,5 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     speculative_config: *id001

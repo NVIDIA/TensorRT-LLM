@@ -1,0 +1,111 @@
+version: 0.0.1
+l0_cpu:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 0
+        lte: 0
+    wildcards:
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: generic
+      orchestrator: mpi
+  tests:
+  - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
+  - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
+  - disaggregated/test_aiperf_gate.py::test_missing_export_raises
+  - disaggregated/test_aiperf_gate.py::test_empty_export_fails
+  - disaggregated/test_aiperf_gate.py::test_all_cancelled_fails
+  - disaggregated/test_aiperf_gate.py::test_corrupt_export_fails
+  - disaggregated/test_aiperf_gate.py::test_single_truncated_line_tolerated
+  - disaggregated/test_aiperf_gate.py::test_incomplete_accounting_fails
+  - disaggregated/test_aiperf_gate.py::test_gate_disabled_paths_not_affected
+  - disaggregated/test_aiperf_gate.py::test_was_cancelled_metadata_fallback
+  - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
+  - unittest/_torch/attention
+  - unittest/_torch/auto_deploy
+  - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
+  - unittest/_torch/distributed
+  - unittest/_torch/executor
+  - unittest/_torch/peft
+  - unittest/_torch/memory
+  - unittest/_torch/modeling
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
+  - unittest/_torch/models/checkpoints
+  - unittest/_torch/modules
+  - unittest/_torch/multimodal
+  - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
+  - unittest/_torch/speculative/hw_agnostic
+  - unittest/_torch/test_mmap_utils.py
+  - unittest/_torch/test_model_config.py
+  - unittest/_torch/thop/parallel_hw_agnostic
+  - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
+  - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
+  - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
+  - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_cache_dit.py
+  - unittest/_torch/visual_gen/test_flux_infer.py
+  - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_ltx2_transformer.py
+  - unittest/_torch/visual_gen/test_quant_static_guard.py
+  - unittest/_torch/visual_gen/test_teacache.py
+  - unittest/_torch/visual_gen/test_tensor_payload.py
+  - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
+  - unittest/_torch/visual_gen/test_visual_gen_args.py
+  - unittest/_torch/visual_gen/test_visual_gen_params.py
+  - unittest/_torch/visual_gen/test_visual_gen_utils.py
+  - unittest/_torch/weight_sharing
+  - unittest/api_stability
+  - unittest/auto_deploy/multigpu
+  - unittest/auto_deploy/singlegpu
+  - unittest/auto_deploy/standalone
+  - unittest/bindings
+  - unittest/disaggregated
+  - unittest/dynamo
+  - unittest/executor/test_base_worker.py ISOLATION
+  - unittest/executor/test_fatal_error_health_check.py
+  - unittest/executor/test_ipc.py
+  - unittest/executor/test_rpc.py
+  - unittest/executor/test_multi_frontend_routing.py
+  - unittest/executor/test_event_loop_error_broadcast.py
+  - unittest/executor/test_rpc_worker_mixin.py
+  - unittest/executor/test_stats_serializer.py
+  - unittest/executor/test_spec_dec_perf_metrics.py
+  - unittest/executor/test_ray_stub.py
+  - unittest/inputs
+  - unittest/kv_cache_manager_v2_tests
+  - unittest/llmapi/apps/test_chat_utils.py
+  - unittest/llmapi/apps/test_harmony_channel_validation.py
+  - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
+  - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
+  - unittest/llmapi/apps/test_tool_parsers.py
+  - unittest/llmapi/test_bench_async.py
+  - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
+  - unittest/llmapi/test_executor.py
+  - unittest/llmapi/test_gc_utils.py
+  - unittest/llmapi/test_whisper_suppress_tokens_processor.py
+  - unittest/llmapi/test_kv_cache_dtype_override.py
+  - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_llm_quant.py
+  - unittest/llmapi/test_llm_telemetry.py
+  - unittest/llmapi/test_llm_utils.py
+  - unittest/llmapi/test_mpi_session.py ISOLATION
+  - unittest/llmapi/test_reasoning_parser.py
+  - unittest/llmapi/test_request_priority.py
+  - unittest/llmapi/test_sampling_params.py
+  - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_serve_report_addr.py
+  - unittest/llmapi/test_session_prefetcher.py
+  - unittest/llmapi/test_utils.py
+  - unittest/metrics/test_collector.py
+  - unittest/models/test_quant_config_utils.py
+  - unittest/others
+  - unittest/quantization/test_mode.py
+  - unittest/scaffolding
+  - unittest/scripts
+  - unittest/tools
+  - unittest/usage
+  - unittest/utils/test_logger.py
+  - unittest/utils/test_confidential_compute.py
+  - unittest/visual_gen/test_output.py

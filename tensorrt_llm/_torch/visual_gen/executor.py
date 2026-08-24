@@ -254,6 +254,11 @@ class DiffusionResponse:
             model-specific fields populated. Set to ``None`` on the error
             path; on the READY signal it carries a ``dict`` instead.
         error_msg: Error message if generation failed.
+        error_type: Failure class when ``error_msg`` is set: ``"client"``
+            (unusable request content → 400 / ``ValueError``), ``"capacity"``
+            (valid request does not fit the deployment → 503 /
+            ``MemoryError``), or ``None`` for unclassified runtime failures
+            (500 / ``RuntimeError``).
         generation: Wall-clock time the executor measured around request
             preparation and the engine's inference call (host
             ``time.perf_counter()``), in seconds. Default ``0.0`` so the
@@ -264,6 +269,7 @@ class DiffusionResponse:
     request_id: int
     output: Optional[PipelineOutput] = None
     error_msg: Optional[str] = None
+    error_type: Optional[str] = None
     generation: float = 0.0
 
 
@@ -363,6 +369,7 @@ class DiffusionExecutor:
                         "status": "READY",
                         "default_generation_params": self.pipeline.default_generation_params,
                         "extra_param_specs": self.pipeline.extra_param_specs,
+                        "supports_image_edit": self.pipeline.supports_image_edit,
                     },
                 )
             )
@@ -412,6 +419,12 @@ class DiffusionExecutor:
                 ):
                     continue
                 setattr(params, field_name, default_value)
+                # Marks it as a pipeline default rather than caller intent, so
+                # request-dependent defaults stay re-resolvable; assigning the
+                # field re-marks it.
+                # Assumes model_fields_set is the live __pydantic_fields_set__, not a
+                # copy; TestDefaultMarksThroughRealPath fails loudly if that changes.
+                params.model_fields_set.discard(field_name)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
         specs = self.pipeline.extra_param_specs
@@ -462,7 +475,11 @@ class DiffusionExecutor:
             logger.error(traceback.format_exc())
             if self.rank == 0:
                 self.response_queue.put(
-                    DiffusionResponse(request_id=req.request_id, error_msg=str(e))
+                    DiffusionResponse(
+                        request_id=req.request_id,
+                        error_msg=str(e),
+                        error_type=self.pipeline.classify_request_failure(e),
+                    )
                 )
 
 
@@ -663,6 +680,7 @@ class DiffusionRemoteClient:
         # Pipeline metadata — populated by _wait_ready from the READY signal.
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
+        self.supports_image_edit: bool = False
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1018,6 +1036,7 @@ class DiffusionRemoteClient:
                             "default_generation_params", {}
                         )
                         self.extra_param_specs = payload.get("extra_param_specs", {})
+                        self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return

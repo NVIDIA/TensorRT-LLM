@@ -41,6 +41,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 )
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
+pytestmark = pytest.mark.cpu_only
+
 
 @dataclass
 class MockPrefixReuseSummary:
@@ -2415,6 +2417,7 @@ class TestSimpleUnifiedScheduler:
         assert hasattr(output, "paused_requests")
         assert hasattr(output, "fitting_disagg_gen_init_requests")
         assert hasattr(output, "num_fitting_requests")
+        assert len(output.recompute_paused_requests) == 0
         assert len(output.context_requests) == 1
         assert len(output.generation_requests) == 1
         assert len(output.encoder_requests) == 0

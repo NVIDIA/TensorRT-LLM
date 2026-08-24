@@ -20,7 +20,11 @@ This field carries per-request kwargs to the multimodal HF processor
 dispatch, so the request schema is the authoritative contract.
 """
 
+import pytest
+
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _base_request(**extra):

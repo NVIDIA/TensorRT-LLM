@@ -28,7 +28,10 @@ from ...peft.lora.layer import (MOE_LORA_MODULE_NAMES,
 from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
-from .interface import MoE
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
+                            MoEProblem, MoERejectReason, MoERunContext,
+                            MoEStaticCapability, require_comm_plan)
+from .interface import MoE, _reject
 from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
@@ -85,6 +88,13 @@ class CutlassFusedMoE(MoE):
             equals to: dynamic quant + routing(topK, etc.) [+ fp4_allgather] + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute [no allreduce] + reducescatter
     """
 
+    # Routed-expert MoE LoRA is fused into this backend's op only; the
+    # subclasses below each restate ``supports_moe_lora=False``.
+    capabilities = MoEStaticCapability(supports_moe_lora=True)
+
+    # Inherited by every subclass, matching the isinstance check this replaces.
+    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+
     # Quantization algorithm support table for can_implement()
     # Format: quant_algo -> {sm_constraint, dtypes}
     # sm_constraint types:
@@ -111,6 +121,13 @@ class CutlassFusedMoE(MoE):
         QuantAlgo.NVFP4: {
             "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+        },
+        # W4A16_NVFP4: weights stay NVFP4 but are dequantized to the activation
+        # dtype every forward, so what finally runs is the unquantized kernel --
+        # this entry tracks that path's limits, not NVFP4 tensor-core support.
+        QuantAlgo.W4A16_NVFP4: {
+            "sm_constraint": ("min", 80),
+            "dtypes": {torch.float16, torch.bfloat16},
         },
         # W4A8_AWQ: SM in {89, 90} only
         QuantAlgo.W4A8_AWQ: {
@@ -145,62 +162,58 @@ class CutlassFusedMoE(MoE):
         },
     }
 
-    _GPTOSS_SUPPORTED_ALGOS = {QuantAlgo.W4A8_MXFP4_MXFP8}
-    """set[QuantAlgo]: Quantization algorithms that support swiglu_gptoss_style."""
+    _GPTOSS_SUPPORTED_ALGOS: frozenset[Optional[QuantAlgo]] = frozenset({
+        None,
+        QuantAlgo.NVFP4,
+        QuantAlgo.W4A16_MXFP4,
+        QuantAlgo.W4A8_MXFP4_FP8,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+    })
+    """Algorithms whose weight methods can serve gpt-oss / MiniMax SwiGLU.
+
+    Unquantized and the MXFP4 family can load a 1-D gpt-oss expert bias.
+    NVFP4 is included for MiniMax-style SwigluBias without expert bias.
+    ``can_implement`` still rejects NVFP4 when ``p.bias is True`` because the
+    NVFP4 weight pad only accepts 2-D tensors.
+    """
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Cutlass grouped-GEMM MoE: the widest quant and SM coverage there is.
+
+        Per-algorithm SM and dtype support lives in ``_QUANT_SUPPORT_TABLE``;
+        this method is only the interpreter for it.
         """
-        Check if CutlassFusedMoE can implement the given quantization algorithm.
-
-        CutlassFusedMoE supports:
-        - Unquantized (FP16/BF16): SM >= 80
-        - FP8 per-tensor (QDQ): SM >= 89
-        - FP8_BLOCK_SCALES: SM in {90, 120}
-        - NVFP4: SM in {100, 103, 120, 121}
-        - W4A8_AWQ: SM in {89, 90} only
-        - W8A16: SM >= 80
-        - W4A16_MXFP4: SM == 90 only
-        - W4A8_MXFP4_FP8: SM in {100, 103}
-        - W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation input data type (before quantization).
-                Supported dtypes vary by quantization mode:
-                - Unquantized: float16, bfloat16
-                - FP8/FP8_BLOCK_SCALES/W4A8_MXFP4_FP8: float16, bfloat16, float32
-                - NVFP4: float16, bfloat16, float8_e4m3fn
-                - W4A16_MXFP4/W4A8_AWQ/W8A16/W4A8_MXFP4_MXFP8: float16, bfloat16
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                CutlassFusedMoE only supports swiglu_gptoss_style for W4A8_MXFP4_MXFP8 quantization.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-        """
-        from .interface import _warn_and_return
-
-        sm_version = get_sm_version()
+        sm_version = d.env.sm
+        quant_algo = p.quant_algo
 
         # Check minimum SM version for Cutlass backend
         if sm_version < 80:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
                 f"CutlassFusedMoE requires SM >= 80, got SM{sm_version}")
 
-        # Check swiglu_gptoss_style support
-        if swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
-            return _warn_and_return(
-                f"CutlassFusedMoE swiglu_gptoss_style only supports W4A8_MXFP4_MXFP8 "
-                f"(got quant_algo={quant_algo})")
+        if p.swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+            supported = sorted("unquantized" if a is None else a.name
+                               for a in cls._GPTOSS_SUPPORTED_ALGOS)
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"CutlassFusedMoE cannot load a gpt-oss bias for "
+                f"quant_algo={quant_algo}; supported: {supported}")
+
+        # NVFP4 can run SwigluBias, but cannot pad a 1-D gpt-oss expert bias.
+        if (p.swiglu_gptoss_style and quant_algo == QuantAlgo.NVFP4
+                and p.bias is True):
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "CutlassFusedMoE NVFP4 cannot load a 1-D gpt-oss expert bias "
+                "(weight-pad assert is 2-D); MiniMax-style SwigluBias without "
+                "bias is eligible")
 
         # Check if quant_algo is supported
         if quant_algo not in cls._QUANT_SUPPORT_TABLE:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
                 f"CutlassFusedMoE does not support quant_algo={quant_algo}")
 
         support_info = cls._QUANT_SUPPORT_TABLE[quant_algo]
@@ -211,30 +224,42 @@ class CutlassFusedMoE(MoE):
 
         if constraint_type == "min":
             if sm_version < constraint_value:
-                return _warn_and_return(
+                return _reject(
+                    MoERejectReason.SM_UNSUPPORTED,
                     f"CutlassFusedMoE {algo_name} requires SM >= {constraint_value}, "
                     f"got SM{sm_version}")
         elif constraint_type == "exact":
             if sm_version != constraint_value:
-                return _warn_and_return(
+                return _reject(
+                    MoERejectReason.SM_UNSUPPORTED,
                     f"CutlassFusedMoE {algo_name} only supports SM{constraint_value}, "
                     f"got SM{sm_version}")
         elif constraint_type == "in":
             if sm_version not in constraint_value:
                 sm_list = "/".join(f"SM{v}" for v in sorted(constraint_value))
-                return _warn_and_return(
+                return _reject(
+                    MoERejectReason.SM_UNSUPPORTED,
                     f"CutlassFusedMoE {algo_name} only supports {sm_list}, "
                     f"got SM{sm_version}")
 
-        # Check dtype_activation
+        # Check activation dtype
         supported_dtypes = support_info["dtypes"]
-        if dtype_activation not in supported_dtypes:
-            dtype_list = ", ".join(str(d) for d in supported_dtypes)
-            return _warn_and_return(
+        if p.dtype_act not in supported_dtypes:
+            dtype_list = ", ".join(str(dtype) for dtype in supported_dtypes)
+            return _reject(
+                MoERejectReason.DTYPE_UNSUPPORTED,
                 f"CutlassFusedMoE {algo_name} requires {dtype_list}, "
-                f"got {dtype_activation}")
+                f"got {p.dtype_act}")
 
-        return True, None
+        # Routed-expert MoE LoRA supports unquantized fp16/bf16 or per-tensor FP8 only.
+        if d.moe_lora_enabled and quant_algo not in (None, QuantAlgo.FP8):
+            return _reject(
+                MoERejectReason.LORA_UNSUPPORTED,
+                "CutlassFusedMoE MoE LoRA only supports unquantized "
+                f"fp16/bf16 or per-tensor FP8 (qdq); got quant_algo={quant_algo}"
+            )
+
+        return MoEEligibility.ok()
 
     def __init__(
         self,
@@ -813,6 +838,8 @@ class CutlassFusedMoE(MoE):
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
+            elif self.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+                return W4A16NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
@@ -848,19 +875,30 @@ class CutlassFusedMoE(MoE):
     def supports_moe_output_in_alltoall_workspace(self):
         return True
 
+    def _tuner_shapes(
+        self,
+        ctx: MoERunContext,
+        enable_alltoall: Optional[bool],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Token/top-k shapes the profiling tuner should key on.
+
+        Only meaningful under alltoall: the tuner must see pre-alltoall token
+        counts so tactics cached during the no-alltoall warmup still apply at
+        runtime. Without alltoall the kernel derives both from ``x`` itself.
+        """
+        if not enable_alltoall:
+            return None, None
+        if ctx.all_rank_num_tokens is not None:
+            tuner_num_tokens = sum(ctx.all_rank_num_tokens)
+        else:
+            tuner_num_tokens = ctx.x.shape[0] * self.mapping.tp_size
+        return tuner_num_tokens, self.routing_method.top_k
+
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
-        is_sf_swizzled: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        tuner_num_tokens: Optional[int] = None,
-        tuner_top_k: Optional[int] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
-        lora_params: Optional[Dict] = None,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with Cutlass backend.
@@ -868,22 +906,22 @@ class CutlassFusedMoE(MoE):
         This method encapsulates the core MoE computation logic, handling different
         quantization schemes.
 
-        Args:
-            x: Input hidden states (may be pre-quantized)
-            token_selected_experts: Expert IDs or expert slots [num_tokens, top_k]
-                                   If EPLB is enabled, represents expert slots; otherwise expert IDs
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors (optional, for certain quantization schemes)
-            is_sf_swizzled: Whether scaling factors are swizzled
-            output_dtype: Output data type (optional)
-            tuner_num_tokens: Number of tokens for profiling tuner (optional)
-            tuner_top_k: Top-k value for profiling tuner (optional)
-            moe_output: Pre-allocated output buffer (optional)
-            enable_alltoall: Whether alltoall communication is enabled (optional). If None, defaults to self.enable_alltoall.
-
         Returns:
             final_hidden_states: Output tensor from MoE computation
         """
+        del workspace  # Cutlass allocates its own intermediates.
+        plan = require_comm_plan(self, ctx)
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        output_dtype = ctx.output_dtype
+        lora_params = ctx.lora_params
+        is_sf_swizzled = plan.input_sf_swizzled
+        moe_output = plan.moe_output
+        enable_alltoall = plan.enable_alltoall
+        tuner_num_tokens, tuner_top_k = self._tuner_shapes(ctx, enable_alltoall)
+
         # W4A16 NVFP4 fallback (SM<100).
         if isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod):
             return self._run_moe_w4a16_nvfp4(
@@ -902,8 +940,7 @@ class CutlassFusedMoE(MoE):
         if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
             from .fused_moe_triton_fp8_block_scale import \
                 run_triton_fp8_block_scale_moe
-            _use_alltoall = (enable_alltoall if enable_alltoall is not None else
-                             self.enable_alltoall)
+
             # forward_chunk sets token_final_scales=None when
             # apply_router_weight_on_input=True (weights already folded into x);
             # substitute ones so the Triton kernel's per-token scaling is a no-op.
@@ -916,7 +953,7 @@ class CutlassFusedMoE(MoE):
             # (0 .. expert_size_per_partition-1), so remap and zero-scale any
             # non-local token-expert pairs to suppress their contribution.
             local_n = self.expert_size_per_partition
-            if _use_alltoall:
+            if enable_alltoall:
                 # After alltoall dispatch, IDs are already local; padding = local_n
                 local_ids = token_selected_experts.clamp(0, local_n - 1)
                 is_local = token_selected_experts < local_n
@@ -956,9 +993,6 @@ class CutlassFusedMoE(MoE):
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 weight_dtype = torch.uint8
-
-        if enable_alltoall is None:
-            enable_alltoall = self.enable_alltoall
 
         use_dynamic_fc2_scale = (self.has_nvfp4 and getattr(
             self, 'force_dynamic_quantization', False)
@@ -1032,16 +1066,20 @@ class CutlassFusedMoE(MoE):
         tuner_num_tokens: Optional[int] = None,
         tuner_top_k: Optional[int] = None,
         moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
+        *,
+        enable_alltoall: bool,
     ) -> torch.Tensor:
         """W4A16 fallback for NVFP4 MoE on SM<100. Active-mask dequant into
         a static [E_total, N, K] bf16 workspace, then bf16 fused_moe with the
         original (global) token_selected_experts. CUDA-graph capturable.
+
+        ``enable_alltoall`` has no default because it picks the expert-id remap
+        below, and either default is silently wrong for half the callers: the
+        ids are local after an alltoall dispatch and global otherwise, so a
+        wrong guess shifts every id by ``slot_start`` without failing.
         """
         assert isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod)
 
-        if enable_alltoall is None:
-            enable_alltoall = self.enable_alltoall
         if output_dtype is None:
             output_dtype = x.dtype
 

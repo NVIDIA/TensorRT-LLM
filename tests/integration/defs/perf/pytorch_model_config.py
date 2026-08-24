@@ -84,7 +84,7 @@ def get_model_yaml_config(model_label: str,
     pattern_configs = [
         # Deepseek default cases
         {
-            'patterns': ['deepseek_r1', 'kimi_k2_nvfp4'],
+            'patterns': ['deepseek_r1'],
             'config': {
                 'enable_attention_dp': True,
             }
@@ -141,17 +141,154 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Model-specific cases with attention_dp disabled to prevent hangs
+        # DeepSeek V4 Pro throughput knobs, from
+        # examples/configs/curated/deepseek-v4-pro-throughput.yaml (ADP + EP,
+        # small per-rank batch). MTP-1 matches the checkpoint's
+        # num_nextn_predict_layers and the curated throughput recipe.
         {
             'patterns': [
-                'deepseek_r1_distill_llama_70b',
-                'llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8',
-                'llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-float8',
-                'llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16'
+                'deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:32-maxnt:8448',
             ],
             'config': {
-                # True causes hang, needs model-specific fix.
+                'enable_attention_dp': True,
+                'enable_lm_head_tp_in_adp': True,
+                'attention_dp_config': {
+                    'enable_balance': True,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.6,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'batch_sizes': [1, 2, 4, 8, 16, 24, 32],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 1,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # DeepSeek V4 Pro latency knobs, from
+        # examples/configs/curated/deepseek-v4-pro-latency.yaml (pure TP, no
+        # attention DP, deeper MTP, larger KV fraction).
+        {
+            'patterns': [
+                'deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:128-maxnt:8448',
+            ],
+            'config': {
                 'enable_attention_dp': False,
+                'enable_lm_head_tp_in_adp': False,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.9,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding':
+                    True,
+                    'batch_sizes': [
+                        1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96,
+                        104, 112, 120, 128
+                    ],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
+        # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
+        # backend (see accuracy/test_llm_api_pytorch.py::TestGLM52).
+        # Spec decoding is intentionally left off so the sweep measures kernel
+        # time rather than MTP acceptance rate.
+        {
+            'patterns': ['glm_5.2_fp4'],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+                'max_seq_len': 10240,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.7,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 128,
+                },
+            }
+        },
+        # MiniMax-M3 NVFP4 (MXFP8 base layers with NVFP4 routed experts, run on
+        # the CUTLASS MoE backend). Scoped to the NVFP4 checkpoint only; the
+        # MXFP8 checkpoint has its own block below and must not inherit the
+        # 'msa' implementation.
+        # The block-sparse attention path is mandatory (there is no dense
+        # fallback), it does not support KV-cache block reuse, and max_seq_len
+        # must be capped just above ISL+OSL -- left at the checkpoint default
+        # (1M) the CUDA-graph warmup decode allocates gigabyte-scale temporaries
+        # and capture fails with cudaErrorStreamCaptureUnsupported. Every NVFP4
+        # case keeps ISL+OSL <= 2048. See
+        # docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md
+        {
+            'patterns': ['minimax_m3_fp4'],
+            'config': {
+                'trust_remote_code': True,
+                'enable_attention_dp': True,
+                'max_seq_len': 2560,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'sparse_attention_config': {
+                    'algorithm': 'minimax_m3',
+                    # 'msa' is the fmha_sm100 path that the MiniMax-M3 perf
+                    # work targets ('triton' is the reference implementation);
+                    # it requires SM100/SM103, so these cases are Blackwell-only.
+                    'implementation': 'msa',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.6,
+                    # The MSA path runs an FP8 KV cache.
+                    'dtype': 'fp8',
+                },
+                'stream_interval': 10,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # Gemma 4 NVFP4: VSWA (1024-token sliding window) plus per-layer
+        # head_dim 256/512. The FLASHINFER backend is selected by the model's
+        # own get_model_defaults(), so it is not repeated here. KV-cache reuse
+        # is disabled to match the validated accuracy configuration.
+        {
+            'patterns': ['gemma_4_'],
+            'config': {
+                'enable_chunked_prefill': True,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'enable_partial_reuse': False,
+                    'free_gpu_memory_fraction': 0.6,
+                },
             }
         },
         # Qwen3 models with fp4 quantization on B200 and fp8 quantization on H200/H20
@@ -175,16 +312,6 @@ def get_model_yaml_config(model_label: str,
                 'kv_cache_config': {
                     'enable_block_reuse': False,
                 },
-            }
-        },
-        # MiniMax-M2.5 FP8: every perf case must route MoE through attention DP.
-        # TP=8: intermediate_size=1536 is not block-scale divisible (1536/8=192, %128!=0).
-        # TP=4: trtllm-gen FP8 block-scale MoE kernel IMAs during CUDA-graph warmup
-        # on the 1536/4=384 N-shard (Blackwell B200/B300).
-        {
-            'patterns': ['minimax_m2.5_fp8'],
-            'config': {
-                'enable_attention_dp': True,
             }
         },
         # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
@@ -464,6 +591,17 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Disable iter logs for long-running cases to reduce storage.
+        {
+            'patterns': [
+                'nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32',
+                'deepseek_r1_0528_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:8000,1000-reqs:20000-ep:8-gpus:8',
+                'deepseek_r1_0528_fp4-bench-pytorch-float4-maxbs:1000-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:20000-ep:4-gpus:4',
+            ],
+            'config': {
+                'print_iter_log': False,
+            }
+        },
     ]
 
     # Apply pattern-based configurations on top of base config
@@ -504,19 +642,6 @@ def get_model_yaml_config(model_label: str,
                 'max_cpu_loras': lora_count,
             }
         }
-        if 'phi_4_multimodal_instruct' in model_label:
-            lora_config['lora_config']['lora_target_modules'] = [
-                "attn_qkv", "attn_dense", "mlp_gate_up", "mlp_4h_to_h"
-            ]
-            lora_config['lora_config']['trtllm_modules_to_hf_modules'] = {
-                "attn_qkv": "qkv_proj",
-                "attn_dense": "o_proj",
-                "mlp_gate_up": "gate_up_proj",
-                "mlp_4h_to_h": "down_proj"
-            }
-            lora_config['lora_config']['max_lora_rank'] = 320
-            lora_config['lora_config'][
-                'swap_gate_up_proj_lora_b_weight'] = False
         base_config.update(lora_config)
 
     kv_cache_config = base_config.get('kv_cache_config', {})

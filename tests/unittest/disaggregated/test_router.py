@@ -23,7 +23,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ConversationParams,
                                                 DisaggregatedParams,
                                                 FunctionDefinition)
-from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
+from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
+                                       KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
                                        KV_CACHE_HASH_ALGO_V2_SHA256_64,
                                        BlockHashMixin, ConversationRouter,
@@ -34,6 +35,8 @@ from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
                                        block_key_hasher, create_router)
 
 # yapf: enable
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_native_block_key_hasher_matches_python_v1():
@@ -111,6 +114,89 @@ async def test_coordinator_finish_retry_is_bounded():
     assert sleep.await_count == 2
     assert all(call.kwargs["timeout"] == 5
                for call in session.post.call_args_list)
+
+
+def _msgpack_response(status, body):
+    """A mocked ``session.post(...)`` ctx manager over a msgpack body."""
+    response = mock.AsyncMock()
+    response.status = status
+    response.read = mock.AsyncMock(
+        return_value=msgpack.packb(body, use_bin_type=True))
+    context = mock.AsyncMock()
+    context.__aenter__ = mock.AsyncMock(return_value=response)
+    context.__aexit__ = mock.AsyncMock(return_value=False)
+    return context
+
+
+def _delegating_router():
+    local_router = RoundRobinRouter(server_role=None, servers=["server1"])
+    return CoordinatorDelegatingRouter("http://coordinator", local_router,
+                                       "generation")
+
+
+@pytest.mark.asyncio
+async def test_coordinator_select_retries_transport_error():
+    """A connection the coordinator closed first must not become a 500.
+
+    Reusing a pooled connection the peer already closed fails instantly with
+    BrokenPipeError/ConnectionResetError. /select is idempotent per req_id, so
+    the blip is retried instead of failing a live request.
+    """
+    router = _delegating_router()
+
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(side_effect=[
+        aiohttp.ClientOSError(32, "Broken pipe"),
+        _msgpack_response(200, {
+            "server": "server1",
+            "info": {}
+        }),
+    ])
+    session.close = mock.AsyncMock()
+    router._session = session
+
+    with mock.patch("tensorrt_llm.serve.router.asyncio.sleep",
+                    new_callable=mock.AsyncMock) as sleep:
+        body = await router._post_select({"role": "generation"})
+
+    assert body["server"] == "server1"
+    assert session.post.call_count == 2
+    assert sleep.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinator_select_retry_is_bounded():
+    router = _delegating_router()
+
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(
+        side_effect=aiohttp.ClientOSError(32, "Broken pipe"))
+    session.close = mock.AsyncMock()
+    router._session = session
+
+    with mock.patch("tensorrt_llm.serve.router.asyncio.sleep",
+                    new_callable=mock.AsyncMock):
+        with pytest.raises(aiohttp.ClientOSError):
+            await router._post_select({"role": "generation"})
+
+    assert session.post.call_count == COORDINATOR_SELECT_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_coordinator_select_does_not_retry_error_status():
+    """A placement failure is real -- retrying it would only hide the cause."""
+    router = _delegating_router()
+
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(
+        side_effect=[_msgpack_response(503, {"error": "no servers"})])
+    session.close = mock.AsyncMock()
+    router._session = session
+
+    with pytest.raises(ValueError, match="coordinator /select returned 503"):
+        await router._post_select({"role": "generation"})
+
+    assert session.post.call_count == 1
 
 
 @pytest.mark.asyncio

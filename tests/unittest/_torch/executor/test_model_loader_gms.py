@@ -22,9 +22,13 @@ from tensorrt_llm._torch.weight_sharing import (
     ArtifactIdentity,
     PostTransformProfile,
     PostTransformProfileRegistry,
+    PostTransformRuntimeConstraints,
     PostTransformTransferScope,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+pytestmark = pytest.mark.cpu_only
+
 
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
@@ -113,7 +117,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         )
     )
 
-    monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(model_loader_mod, "timing_metric", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
     # These tests stub ModelConfig, while SourceIdentity has dedicated
@@ -148,11 +152,7 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     )
     monkeypatch.setattr(model_loader_mod, "get_rank_model_storage", lambda _model: 0)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda: SimpleNamespace(synchronize=lambda: None),
-    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     return loader
 
 
@@ -201,7 +201,7 @@ class _PostTransformMxLoader:
 
 def _spec_config_needing_draft_weights():
     return SimpleNamespace(
-        spec_dec_mode=SimpleNamespace(need_load_draft_weights=lambda: True),
+        needs_separate_draft_weights=True,
         speculative_model="/draft",
     )
 
@@ -218,6 +218,7 @@ def _tiny_profile_registry() -> PostTransformProfileRegistry:
                 protocol_version=(ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
                 transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                 transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+                runtime_constraints=PostTransformRuntimeConstraints(),
             ),
         )
     )

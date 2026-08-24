@@ -300,6 +300,7 @@ def _write_config(path, ctx_url, gen_url, public_port, num_workers=1):
         "hostname": "127.0.0.1",
         "port": public_port,
         "num_workers": num_workers,
+        "internal_request_auth_key": "test-internal-disagg-auth-key",
         "context_servers": {
             "num_instances": 1,
             "urls": [ctx_url],

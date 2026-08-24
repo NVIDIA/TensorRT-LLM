@@ -24,7 +24,7 @@ RoutingMethods, etc.).
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
@@ -108,9 +108,23 @@ class ModelSpec:
     routing_method: str
     n_group: Optional[int] = None
     topk_group: Optional[int] = None
+    n_shared_experts: int = 0
+    # How shared experts are realized when n_shared_experts > 0:
+    #   "fused"   -> fold them into the routed-expert grouped GEMM (PR #11143).
+    #   "unfused" -> routed MoE (no fusion) + a separate shared GatedMLP, summed
+    #                (the pre-fusion baseline, for measuring fusion's net benefit).
+    shared_expert_mode: Literal["fused", "unfused"] = "fused"
     swiglu_alpha: float = 1.0
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
+
+    def __post_init__(self) -> None:
+        if self.n_shared_experts < 0:
+            raise ValueError(f"n_shared_experts must be >= 0, got {self.n_shared_experts}.")
+        if self.shared_expert_mode not in ("fused", "unfused"):
+            raise ValueError(
+                f"shared_expert_mode must be 'fused' or 'unfused', got {self.shared_expert_mode!r}."
+            )
 
     @property
     def routing_method_cls(self) -> type:
@@ -300,6 +314,17 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         n_group=8,
         topk_group=4,
     ),
+    "deepseek_r1": ModelSpec(
+        name="deepseek_r1",
+        num_experts=256,
+        top_k=8,
+        hidden_size=7168,
+        intermediate_size=2048,
+        quant_algo="FP8_BLOCK_SCALES",
+        routing_method="DEEPSEEK_V3",
+        n_group=8,
+        topk_group=4,
+    ),
     "kimi_k2": ModelSpec(
         name="kimi_k2",
         num_experts=384,
@@ -347,15 +372,6 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         hidden_size=4096,
         intermediate_size=2048,
         quant_algo=None,
-        routing_method="RENORMALIZE",
-    ),
-    "mixtral_8x7b": ModelSpec(
-        name="mixtral_8x7b",
-        num_experts=8,
-        top_k=2,
-        hidden_size=4096,
-        intermediate_size=14336,
-        quant_algo="FP8",
         routing_method="RENORMALIZE",
     ),
     "gpt_oss_120b": ModelSpec(

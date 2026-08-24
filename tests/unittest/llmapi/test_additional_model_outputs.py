@@ -135,6 +135,7 @@ class DummyConfigLoader(BaseConfigLoader):
         return ModelConfig(pretrained_config=DummyConfig())
 
 
+@pytest.mark.cpu_only
 @pytest.mark.gpu1
 def test_additional_model_outputs_sampling_params():
     """Test that additional_model_outputs can be configured in SamplingParams."""
@@ -153,6 +154,7 @@ def test_additional_model_outputs_sampling_params():
     assert sampling_params.additional_model_outputs[1] == "generation_output"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.gpu1
 def test_additional_model_outputs_no_outputs():
     """Test that no additional outputs are returned when not requested."""

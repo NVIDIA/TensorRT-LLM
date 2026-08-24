@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import importlib
 import inspect
 import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Dict, Generic, List, Literal, Optional, Tuple, Type,
-                    TypeVar, Union)
+from typing import (Any, Dict, Generic, Iterator, List, Literal, Optional,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -16,8 +17,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
@@ -27,19 +28,24 @@ from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import MoE, VanillaMoE
+from ..modules.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
+from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
 
 
 @contextlib.contextmanager
-def timing(message: str):
-    start = time.time()
-    yield
-    end = time.time()
-    print(f"{message} -- {(end-start):.2f}s")
+def timing_metric(metric_name: str, metric_dict: dict[str,
+                                                      float]) -> Iterator[None]:
+    """Accumulate elapsed time under ``metric_name`` across invocations."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        metric_dict[metric_name] = (metric_dict.get(metric_name, 0.0) +
+                                    time.perf_counter() - start)
 
 
 @dataclass
@@ -113,7 +119,10 @@ def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
 
     # bias
     if weight.ndim == 1:
-        return weight.repeat_interleave(reps)
+        assert weight.shape[0] % num_kv_heads == 0
+        size_per_kv_head = weight.shape[0] // num_kv_heads
+        return weight.reshape(num_kv_heads, size_per_kv_head).repeat_interleave(
+            reps, dim=0).reshape(-1)
 
     # weight and scale
     assert weight.shape[0] % num_kv_heads == 0
@@ -622,16 +631,10 @@ class DecoderModelForCausalLM(nn.Module,
                         # Reset _weights_created so create_weights() in
                         # __post_init__ will re-create this module's weights
                         # with the updated (non-quantized) config. Some
-                        # wrappers (e.g. ConfigurableMoE) expose
-                        # _weights_created as a read-only property that
-                        # delegates to a child backend module — that backend
-                        # is itself an nn.Module child and will be visited
-                        # separately, so swallow the resulting AttributeError.
+                        # Wrappers such as ConfigurableMoE delegate this state
+                        # update to their child backend.
                         if hasattr(module, '_weights_created'):
-                            try:
-                                module._weights_created = False
-                            except AttributeError:
-                                pass
+                            module._weights_created = False
 
     def __post_init__(self):
         self.apply_layerwise_quant_config()
@@ -668,6 +671,23 @@ class DecoderModelForCausalLM(nn.Module,
         :meth:`get_preferred_transceiver_runtime` instead.
         """
         return {}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+            cls,
+            pretrained_config: Any = None) -> Optional[Literal["V1", "V2"]]:
+        """Return the model's preferred KV cache manager version.
+
+        The preference is adopted only when the user leaves
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Return
+        ``None`` to use the built-in V1 fallback.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config. Shared model
+                implementations can inspect it to select a preference for the
+                original checkpoint architecture.
+        """
+        return None
 
     @classmethod
     def get_preferred_transceiver_runtime(
@@ -790,11 +810,40 @@ class DecoderModelForCausalLM(nn.Module,
         )
 
     def load_weights(self,
-                     weights: Dict,
+                     weights: dict[str, torch.Tensor],
                      weight_mapper: Optional["BaseWeightMapper"] = None,
-                     skip_modules: List[str] = [],
-                     params_map: Optional[Dict[str, str]] = None,
-                     allow_partial_loading: bool = False):
+                     skip_modules: list[str] = [],
+                     params_map: dict[str, str] | None = None,
+                     allow_partial_loading: bool = False) -> None:
+        """Load checkpoint weights into this model.
+
+        Basic function for an LLM class to load weights from a dict of weight
+        tensors.
+        The function walks the model's named modules, select matching tensors
+        from `weights`, and either call each module's `load_weights` method
+        if available, or copy tensors into parameters directly.
+        If `weight_mapper` is not None, uses it to perform custom weight mapping
+        before loading weights to each module; otherwise, perform hardcoded
+        weight fusion for some modules during loading.
+
+        Args:
+            weights: dict[str, Tensor], mapping from checkpoint/state-dict keys
+                to tensors. If the key string does not match LLM class's child
+                module names, you need to use `params_map` or `weight_mapper` to
+                remap them.
+            weight_mapper: Optional mapper initialized for this model and
+                checkpoint format. When provided, it controls model-specific key
+                filtering, fused-module mappings, special module handling, and
+                manual parameter copies.
+            skip_modules: list[str], skip modules which contain these substrings.
+                This is used for LLM classes who have some child modules (e.g.
+                speculative decoding modules) that should be loaded from a
+                different function later.
+            params_map: Optional regex replacement map applied before loading
+                to rename checkpoint keys into the model's expected key space.
+            allow_partial_loading: if true, accept `weights` as an incomplete
+                weight dict and update only the parameters present.
+        """
         # TODO smor- this solution is a temporary solution to load weights while we are still using
         # the old checkpoint format loading process. Once checkpoint format is unified
         # this method will be removed.
@@ -855,13 +904,113 @@ MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
 CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
 
 
+# Registration priority under lazy loading: on main the built-in zoo imported
+# first and external code (--custom_module_dirs, user modules) overrode it
+# later. With the zoo imported lazily, built-in modules may run their
+# decorators *after* an external registration, so every registry applies one
+# rule: built-in registrations only fill empty slots, never overwrite.
+# Anything already present outranks a built-in — it is either an external
+# registration (which must keep its main-order priority) or another built-in
+# (no architecture is double-registered among built-ins, so filling empty
+# slots is equivalent to main). External registrations always overwrite.
+def _is_builtin_model_class(cls) -> bool:
+    return is_builtin_zoo_module(getattr(cls, "__module__", ""))
+
+
+# Architecture names each decorated class declared via ``register_auto_model``,
+# kept per class (``cls.__dict__``, never inherited). Recorded even when the
+# class loses the ``MODEL_CLASS_MAPPING`` slot to an external registration, so
+# stacked decorators (``register_vision_encoder``) can still map the class to
+# its architectures instead of scanning the mapping by identity.
+_REGISTERED_ARCHS_ATTR = "_registered_architectures"
+
+
 def register_auto_model(name: str):
 
     def decorator(cls):
+        archs = cls.__dict__.get(_REGISTERED_ARCHS_ATTR)
+        if archs is None:
+            archs = set()
+            setattr(cls, _REGISTERED_ARCHS_ATTR, archs)
+        archs.add(name)
+
+        existing = MODEL_CLASS_MAPPING.get(name)
+        if (existing is not None and existing is not cls
+                and _is_builtin_model_class(cls)):
+            logger.info(
+                f"Keeping existing registration "
+                f"{existing.__module__}.{existing.__name__} for architecture "
+                f"{name}; built-in {cls.__module__}.{cls.__name__} not "
+                f"registered.")
+            return cls
         MODEL_CLASS_MAPPING[name] = cls
         return cls
 
     return decorator
+
+
+def _ensure_model_registered(model_arch: str) -> None:
+    """Import the module that provides ``model_arch``, if it isn't loaded yet.
+
+    Model implementations register themselves in ``MODEL_CLASS_MAPPING`` (and
+    the sibling registries) as an import side effect. With the model zoo
+    imported lazily, this is the hook that turns an architecture name into
+    "the decorators have run". Architectures missing from the static index
+    (e.g. registered dynamically by user code) are left to the caller's
+    normal missing-architecture handling.
+
+    Internal: consumers go through ``get_registered_model_class`` /
+    ``get_registered_vision_encoder`` instead of pairing this with a raw
+    registry read. Each resolver short-circuits on *its own* registry only:
+    an external registration satisfies the model-class lookup without
+    importing the built-in provider, but a lookup in a sibling registry
+    (vision encoder, placeholder metadata) still triggers the import when
+    its slot is empty. Priority on that import is enforced inside each
+    registration decorator; the import itself is idempotent via
+    ``sys.modules``.
+    """
+    module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+    if module_name is None:
+        return
+    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    try:
+        importlib.import_module(full_name)
+    except ModuleNotFoundError as e:
+        # Only swallow "the providing module itself is missing" (stale index
+        # entry); a missing dependency *inside* the module is a real error
+        # and must not be masked as "unknown architecture".
+        if e.name != full_name:
+            raise
+        logger.warning(f"Lazy import of {module_name} for architecture "
+                       f"{model_arch} failed: {e!r}")
+
+
+def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
+    """Resolve ``model_arch`` to its registered model class, or ``None``.
+
+    The single entry point for architecture lookups: the model zoo is
+    imported lazily, so this resolves the built-in provider on demand before
+    reading the registry. Do not read ``MODEL_CLASS_MAPPING`` directly for
+    lookups — a raw ``.get()`` silently misses every not-yet-imported
+    built-in model.
+    """
+    if model_arch not in MODEL_CLASS_MAPPING:
+        _ensure_model_registered(model_arch)
+    return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def get_registered_vision_encoder(
+        model_arch: str) -> Optional[Tuple[Type[nn.Module], Optional[Type]]]:
+    """Resolve ``model_arch`` to its ``(vision_encoder_cls, vlm_base_model)``.
+
+    Same on-demand resolution as ``get_registered_model_class``, for the
+    vision-encoder sibling registry: the provider import triggers when
+    *this* registry misses, even if an external class holds the
+    model-class slot.
+    """
+    if model_arch not in MODEL_CLASS_VISION_ENCODER_MAPPING:
+        _ensure_model_registered(model_arch)
+    return MODEL_CLASS_VISION_ENCODER_MAPPING.get(model_arch)
 
 
 def register_vision_encoder(
@@ -880,17 +1029,34 @@ def register_vision_encoder(
     """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
-        registered = False
-        for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
-            if registered_cls is model_cls:
-                MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
-                    vision_encoder_cls, vlm_base_model)
-                registered = True
-        if not registered:
+        # The architectures this class declared via register_auto_model. Do
+        # not scan MODEL_CLASS_MAPPING by identity: a built-in class may have
+        # lost its mapping slot to an external registration, and its module
+        # must still import cleanly.
+        archs = model_cls.__dict__.get(_REGISTERED_ARCHS_ATTR)
+        if not archs:
+            # Fallback for classes placed into the mapping directly instead
+            # of via the register_auto_model decorator.
+            archs = {
+                arch_name
+                for arch_name, registered_cls in MODEL_CLASS_MAPPING.items()
+                if registered_cls is model_cls
+            }
+        if not archs:
             raise ValueError(
                 f"register_vision_encoder: model class {model_cls.__name__} is not registered "
                 f"via register_auto_model; decorator order must ensure registration occurs first."
             )
+        for arch_name in archs:
+            if (arch_name in MODEL_CLASS_VISION_ENCODER_MAPPING
+                    and _is_builtin_model_class(model_cls)):
+                # Built-in registrations only fill empty slots (see the
+                # priority rule above register_auto_model).
+                logger.info(f"Keeping existing vision encoder registration for "
+                            f"architecture {arch_name}.")
+                continue
+            MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (vision_encoder_cls,
+                                                             vlm_base_model)
 
         return model_cls
 
@@ -962,7 +1128,7 @@ def get_model_architecture(
     cls = None
     if model_config.architectures is not None and len(
             model_config.architectures) > 0:
-        cls = MODEL_CLASS_MAPPING.get(model_config.architectures[0])
+        cls = get_registered_model_class(model_config.architectures[0])
     else:
         raise RuntimeError("Model architecture is not provided.")
 
@@ -1038,6 +1204,48 @@ def filter_weights(prefix, weights: Dict):
             new_k = k[len(prefix) + 1:]
             result[new_k] = v
     return result
+
+
+def _get_load_weights_num_workers() -> Optional[int]:
+    """Return the per-rank module-loading worker limit, or None for the default.
+
+    Weight loading runs one ThreadPoolExecutor per rank, which without an
+    explicit limit defaults to as many as 32 workers (CPython's
+    ``min(32, cpu_count + 4)``; the count is the machine's, not the rank's
+    share of it). The limit is per rank, so four ranks on a node can have four
+    times that many module loads in flight. Each one holds its own host-side
+    working set while it stages and transforms a module's weights, and every
+    rank's is charged to the same host-memory cgroup -- which is how a large
+    checkpoint exhausts host memory while the GPUs are nowhere near full.
+
+    ``TLLM_LOAD_WEIGHTS_NUM_WORKERS`` bounds that overlap. Unset or blank keeps
+    the executor default; a positive integer trades loading parallelism for
+    host-memory headroom; anything else raises, so a typo cannot look like it
+    took effect. ``TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL`` takes precedence
+    and skips the pool entirely -- this variable is the range in between.
+
+    Set it when ranks share a constrained cgroup. Tune it against node
+    ``memory.peak`` and the slowest rank's init time, not per-process RSS,
+    which does not see shared page cache. ``4`` measured well on a four-rank
+    node but is a starting point, not a default; retune per checkpoint and
+    topology.
+    """
+    env_name = "TLLM_LOAD_WEIGHTS_NUM_WORKERS"
+    value = os.environ.get(env_name)
+    if value is None or not value.strip():
+        return None
+
+    try:
+        num_workers = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}") from error
+    if num_workers <= 0:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}")
+    logger.info(
+        f"Limiting concurrent module weight loading to {num_workers} workers")
+    return num_workers
 
 
 def run_concurrently(func,
@@ -1137,7 +1345,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             # and weights loading is done in the backend, so module name includes '.backend'.
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 name = '.'.join(names[:-1])
                 names = name.split('.')
 
@@ -1238,7 +1446,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=_get_load_weights_num_workers())
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
@@ -1258,79 +1469,87 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
 
     def load_single_module(name, module):
         torch.cuda.set_device(device_id)
-        if len(module._parameters) > 0:
-            if weight_mapper.should_skip_module(name):
-                return
+        if len(module._parameters) == 0 or weight_mapper.should_skip_module(
+                name):
+            return
 
+        names = name.split('.')
+
+        # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+        # Currently saved MoE weights don't include 'backend' in their names.
+        # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+        # and weights loading is done in the backend, so module name includes '.backend'.
+        # We need to use parent module name (without .backend) to match saved weight names.
+        # After MoE refactoring is fully complete, all paths will follow this branch.
+        if names[-1] == "backend" and is_moe_weight_owner(module):
+            name = '.'.join(names[:-1])
             names = name.split('.')
 
-            # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
-            # Currently saved MoE weights don't include 'backend' in their names.
-            # After MoE refactoring, ConfigurableMoE now has a backend submodule,
-            # and weights loading is done in the backend, so module name includes '.backend'.
-            # We need to use parent module name (without .backend) to match saved weight names.
-            # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
-                name = '.'.join(names[:-1])
-                names = name.split('.')
+        module_names_breakdown, module_name = names[:-1], names[-1]
 
-            module_names_breakdown, module_name = names[:-1], names[-1]
-
-            if weight_mapper.does_require_special_handling(module_name):
-                module_weights = weight_mapper.apply_callbacks(
+        # check if the module has non-default weight loading, like fusing some weight
+        # tensors together.
+        if weight_mapper.does_require_special_handling(module_name):
+            # Process the weights, e.g. duplicating kv heads to match query heads after
+            # slicing for tensor parallelism.
+            module_weights: list[dict[
+                str, torch.Tensor]] = weight_mapper.apply_callbacks(
                     module, module_name, module_names_breakdown, weights)
-                module.load_weights(weights=module_weights,
-                                    allow_partial_loading=allow_partial_loading)
+            # Call module's custom `load_weights()` to process weight, e.g. fusing
+            # several GEMM matrices together
+            module.load_weights(weights=module_weights,
+                                allow_partial_loading=allow_partial_loading)
 
-                # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
-                if hasattr(weights, 'mark_consumed'):
-                    for src_name in weight_mapper._mapping.get(module_name, []):
-                        prefix = '.'.join(module_names_breakdown + [src_name])
-                        weights.mark_consumed(prefix)
+            # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
+            if hasattr(weights, 'mark_consumed'):
+                for src_name in weight_mapper.mapping.get(module_name, []):
+                    prefix = '.'.join(module_names_breakdown + [src_name])
+                    weights.mark_consumed(prefix)
+            return
+        module_weights: dict[str, torch.Tensor] = weight_mapper.filter_weights(
+            name, weights)
+        # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
+        if not module_weights:
+            return
+        if weight_mapper.is_special_instance_module(module):
+            weight_mapper.handle_special_instance_module(
+                module,
+                module_name,
+                module_weights,
+                allow_partial_loading=allow_partial_loading)
+            # Handed the full subtree, like the `load_weights` case.
+            loaded_own_params = None
+        elif hasattr(module, 'load_weights'):
+            if "linear_attn.conv1d" in name:
+                module_weights['weight'] = module_weights['weight'].squeeze(
+                    dim=1)
+            args = inspect.getfullargspec(module.load_weights).args
+            if "allow_partial_loading" not in args:
+                assert not allow_partial_loading, "allow_partial_loading is not supported for this model"
+                module.load_weights(weights=[module_weights])
             else:
-                module_weights = weight_mapper.filter_weights(name, weights)
-                # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
-                if module_weights:
-                    if weight_mapper.is_special_instance_module(module):
-                        weight_mapper.handle_special_instance_module(
-                            module,
-                            module_name,
-                            module_weights,
-                            allow_partial_loading=allow_partial_loading)
-                        # Handed the full subtree, like the `load_weights` case.
-                        loaded_own_params = None
-                    elif hasattr(module, 'load_weights'):
-                        if "linear_attn.conv1d" in name:
-                            module_weights['weight'] = module_weights[
-                                'weight'].squeeze(dim=1)
-                        args = inspect.getfullargspec(module.load_weights).args
-                        if "allow_partial_loading" not in args:
-                            assert not allow_partial_loading, "allow_partial_loading is not supported for this model"
-                            module.load_weights(weights=[module_weights])
-                        else:
-                            module.load_weights(
-                                weights=[module_weights],
-                                allow_partial_loading=allow_partial_loading)
-                        loaded_own_params = None
-                    else:
-                        loaded_own_params = []
-                        for n, p in module.named_parameters(recurse=False):
-                            weight_mapper.handle_manual_copy(
-                                module_name,
-                                module_weights,
-                                n,
-                                p,
-                                allow_partial_loading=allow_partial_loading)
-                            loaded_own_params.append(n)
+                module.load_weights(weights=[module_weights],
+                                    allow_partial_loading=allow_partial_loading)
+            loaded_own_params = None
+        else:
+            loaded_own_params = []
+            for n, p in module.named_parameters(recurse=False):
+                weight_mapper.handle_manual_copy(
+                    module_name,
+                    module_weights,
+                    n,
+                    p,
+                    allow_partial_loading=allow_partial_loading)
+                loaded_own_params.append(n)
 
-                    # Consume precisely what was loaded; see the matching
-                    # comment in `_load_weights_impl`.
-                    if hasattr(weights, 'mark_consumed'):
-                        if loaded_own_params is None:
-                            weights.mark_consumed(name)
-                        elif loaded_own_params:
-                            weights.mark_consumed_keys(
-                                f'{name}.{n}' for n in loaded_own_params)
+        # Consume precisely what was loaded; see the matching comment in
+        # `_load_weights_impl`.
+        if hasattr(weights, 'mark_consumed'):
+            if loaded_own_params is None:
+                weights.mark_consumed(name)
+            elif loaded_own_params:
+                weights.mark_consumed_keys(f'{name}.{n}'
+                                           for n in loaded_own_params)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
@@ -1363,4 +1582,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=_get_load_weights_num_workers())

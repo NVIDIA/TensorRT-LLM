@@ -40,6 +40,8 @@ Disabled under pytest-xdist workers (parallel tests would multiply live pools).
 import os
 import sys
 import threading
+import time
+from typing import Protocol
 
 # The spawn snapshot is shared with the session-prefetch layer (both hand a
 # live pool to a test that did not spawn it — same invariant).
@@ -67,8 +69,16 @@ _WEIGHT_CACHE_ENV = {
 }
 
 
-_RETIRE_THREADS: list = []
+_RETIRE_THREADS: list[threading.Thread] = []
 _RETIRE_LOCK = threading.Lock()
+
+
+class _PoolSession(Protocol):
+    _reuse_worker_pids: tuple[tuple[int, bytes | None], ...]
+
+    def shutdown(self) -> None: ...
+
+    def release_exit_joins(self) -> None: ...
 
 
 def _reap_retires(timeout: float = 60.0) -> None:
@@ -92,6 +102,58 @@ def _reap_retires(timeout: float = 60.0) -> None:
                 "[session-reuse] WARNING: pool retirement did not finish within 60s",
                 flush=True,
             )
+
+
+def _worker_start_time(pid: int) -> bytes | None:
+    """Read a worker's kernel start time without loading TRT-LLM eagerly."""
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    return _process_start_time(pid)
+
+
+def _kill_recorded_workers(real: _PoolSession) -> int:
+    """SIGKILL this pool's recorded workers, guarded against PID reuse.
+
+    Where the kernel supports it, the signal goes through a pidfd. Opening the
+    pidfd binds this loop to one exact process, so the start-time recheck below
+    it can no longer be invalidated by the PID being recycled before the signal
+    lands. Without pidfd the start-time recheck alone still guards the kill: that
+    leaves a microsecond-wide window, but this is the path that reaps wedged
+    workers, so refusing to signal at all would strand them on exactly the
+    platforms the reaper exists for.
+    """
+    import signal
+
+    send_via_pidfd = getattr(signal, "pidfd_send_signal", None)
+    open_pidfd = getattr(os, "pidfd_open", None)
+
+    killed = 0
+    for pid, start_time in getattr(real, "_reuse_worker_pids", ()):
+        if start_time is None:
+            continue
+        handle = None
+        if send_via_pidfd is not None and open_pidfd is not None:
+            try:
+                handle = open_pidfd(pid)
+            except (OSError, ValueError):
+                handle = None
+        try:
+            # Recheck identity AFTER pinning the handle: only kill if the
+            # process at this PID is still the worker recorded at spawn.
+            if _worker_start_time(pid) != start_time:
+                continue
+            try:
+                if handle is not None:
+                    send_via_pidfd(handle, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        finally:
+            if handle is not None:
+                os.close(handle)
+    return killed
 
 
 def _prefetcher():
@@ -193,7 +255,7 @@ class SessionReuseCache:
         return int(os.environ.get("TRTLLM_TEST_REUSE_MAX_USES", "16"))
 
     @staticmethod
-    def _retire(real, broken: bool = False):
+    def _retire(real: _PoolSession, broken: bool = False) -> None:
         """Dispose of a pool in the background without blocking the test.
 
         Healthy retires (lifetime cap, stale env snapshot, duplicate cache
@@ -209,23 +271,10 @@ class SessionReuseCache:
         needs no graceful stop; the driver reclaims GPU memory on process
         death) and then reap the client side.
         """
-        pids = getattr(real, "_reuse_worker_pids", ()) if broken else ()
 
-        def _dispose():
-            import signal
-
-            # Lazy: only runs when a pool exists, so tensorrt_llm is loaded.
-            from tensorrt_llm.llmapi.mpi_session import _process_start_time
-
-            for pid, start_time in pids:
-                # Guard against PID recycling: only kill if the process at
-                # this PID is still the worker we recorded at spawn.
-                if start_time is None or _process_start_time(pid) != start_time:
-                    continue
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+        def _dispose() -> None:
+            if broken:
+                _kill_recorded_workers(real)
             try:
                 real.shutdown()
             except Exception:
@@ -311,7 +360,10 @@ class SessionReuseCache:
                 print(
                     "[session-reuse] retiring cached pool: "
                     + _describe_mismatch(
-                        real._reuse_spawn_snapshot, snap, real._reuse_uses, self.max_uses
+                        real._reuse_spawn_snapshot,
+                        snap,
+                        real._reuse_uses,
+                        self.max_uses,
                     ),
                     flush=True,
                 )
@@ -410,7 +462,7 @@ class SessionReuseCache:
         """Bypass the cache for the current test (private_mpi_session)."""
         self._suspended = suspended
 
-    def drain(self) -> None:
+    def drain(self, timeout: float = 60.0) -> None:
         """Shut down all cached pools in parallel (frees GPU/CPU footprint).
 
         Also reaps in-flight retire threads: drain runs at natural rendezvous
@@ -423,6 +475,7 @@ class SessionReuseCache:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:
             return
+
         threads = [
             # daemon: a wedged pool shutdown must not keep the interpreter
             # alive at exit (a non-daemon thread would hang the CI stage).
@@ -431,16 +484,54 @@ class SessionReuseCache:
         ]
         for t in threads:
             t.start()
+
+        # Bound the whole parallel drain, rather than waiting ``timeout`` for
+        # every pool in sequence. A healthy shutdown remains graceful.
+        deadline = time.monotonic() + timeout
         for t in threads:
-            # Bounded wait: one wedged pool shutdown must not turn a drain at
-            # a shared seam (sessionfinish / RPC construction) into a
-            # suite-wide hang; a leaked wedged pool is the lesser evil.
-            t.join(timeout=60)
-            if t.is_alive():
-                print(
-                    "[session-reuse] WARNING: pool shutdown did not finish within 60s", flush=True
-                )
-        print(f"[session-reuse] drained {len(pools)} cached pool(s)", flush=True)
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        wedged = [(pool, thread) for pool, thread in zip(pools, threads) if thread.is_alive()]
+        for pool, _ in wedged:
+            killed = _kill_recorded_workers(pool)
+            print(
+                "[session-reuse] WARNING: pool shutdown did not finish within "
+                f"{timeout:g}s; sent SIGKILL to {killed} recorded worker(s)",
+                flush=True,
+            )
+
+        # Killing a wedged worker should release its GPU allocation and let
+        # the already-running shutdown return. Give that original thread a
+        # short bounded reap window; never start a concurrent second shutdown.
+        reap_deadline = time.monotonic() + min(max(timeout, 1.0), 5.0)
+        for _, t in wedged:
+            t.join(timeout=max(0.0, reap_deadline - time.monotonic()))
+
+        still_alive = [(pool, thread) for pool, thread in wedged if thread.is_alive()]
+        for pool, _ in still_alive:
+            pool.release_exit_joins()
+
+        # release_exit_joins() *unblocks* the wedged shutdown (it drops the
+        # exit joins the thread is parked on) rather than merely marking it
+        # abandoned, so the thread normally finishes just after. Join it here
+        # instead of returning immediately: drain runs inside a test (RPC
+        # construction seam, opt-out setup, failure fence), so a thread that
+        # terminates a moment later takes its transport threads with it across
+        # the test boundary, and pytest-threadleak charges the leak to whatever
+        # test happens to be running next.
+        release_deadline = time.monotonic() + min(max(timeout, 1.0), 30.0)
+        for _, t in still_alive:
+            t.join(timeout=max(0.0, release_deadline - time.monotonic()))
+
+        leaked = [pool for pool, thread in still_alive if thread.is_alive()]
+        if leaked:
+            print(
+                f"[session-reuse] WARNING: {len(leaked)} pool shutdown thread(s) "
+                "remain after worker termination",
+                flush=True,
+            )
+        else:
+            print(f"[session-reuse] drained {len(pools)} cached pool(s)", flush=True)
 
 
 REUSE = SessionReuseCache()

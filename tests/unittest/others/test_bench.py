@@ -18,7 +18,7 @@ from unittest import mock
 
 import pytest
 
-from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
+from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.utils.data import (
@@ -38,6 +38,26 @@ class _FakeTokenizer:
 
     def encode(self, text, **kwargs):
         return list(range(len(text.split())))
+
+
+def test_format_startup_metrics() -> None:
+    output = ReportUtility._format_startup_metrics(
+        {
+            "executor_startup_seconds": 0.5,
+            "model_loader": {
+                "checkpoint_preparation_seconds": 1.25,
+                "weight_loading": {
+                    "total_model_loading_seconds": 2.5,
+                },
+            },
+        }
+    )
+
+    assert "= STARTUP METRICS\n" in output
+    assert "executor_startup_seconds: 0.5000\n" in output
+    assert "model_loader.checkpoint_preparation_seconds: 1.2500\n" in output
+    assert "model_loader.weight_loading.total_model_loading_seconds: 2.5000\n" in output
+    assert ReportUtility._format_startup_metrics({}) == ""
 
 
 def test_empty_stream_raises_dataset_format_error():
@@ -77,6 +97,9 @@ def test_int8_not_offered_as_bench_quant_choice() -> None:
     # INT8 is unsupported by the build path, so it must not be advertised as a
     # trtllm-bench --quantization choice (issue #7091).
     assert f"{QuantAlgo.INT8}" not in get_args(VALID_QUANT_ALGOS)
+
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(

@@ -12,20 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Shared utilities for MoE test files (test_moe_backend.py and test_moe_module.py).
-
-This module contains common code extracted from both test files:
-- MoeBackendType enum and get_backend_class()
-- MoeModelConfig dataclass
-- Skip logic functions (should_skip_trtllm, should_skip_cutedsl, should_skip_routing_method, etc.)
-- get_quick_skip_reason() - unified version supporting both backend and module tests
-- supports_autotuner_capture()
-- replay_tactics_and_check()
-- module_timer fixture
-- create_test_param() helper
-- Common test parameter constants
-"""
+"""Shared MoE test utilities."""
 
 import logging
 import os
@@ -48,6 +35,12 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+    MoEDeployment,
+    MoEProblem,
+    canonical_quant,
+)
+from tensorrt_llm._torch.modules.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl import (
@@ -70,12 +63,7 @@ class MoeBackendType(str, Enum):
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
-    # Two MegaMoE variants live side by side: the DeepGemm path and the
-    # CuteDSL path. Keep both keys explicit so ``value -> member`` lookup
-    # and grep are unambiguous (avoid an asymmetric pair where one variant
-    # has an alias and the other does not). The legacy
-    # ``MoeBackendType.MEGAMOE`` alias was removed; all call sites must
-    # spell out the variant explicitly.
+    # Keep the two MegaMoE variants explicit.
     MEGAMOE_DEEPGEMM = "MEGAMOE_DEEPGEMM"
     MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
     CUTE_DSL_B12X = "CUTE_DSL_B12X"
@@ -719,6 +707,7 @@ def should_skip_cutlass(
     model_config: "MoeModelConfig" = None,
     moe_tp_size: int = 1,
     dtype=None,
+    swiglu_gptoss_style: bool = False,
 ) -> Optional[str]:
     """
     Check CUTLASS backend specific constraints for multi-GPU tests.
@@ -728,6 +717,19 @@ def should_skip_cutlass(
     """
     if backend_type != MoeBackendType.CUTLASS:
         return None
+
+    # W4A16_MXFP4 is the SM90 member of the MXFP4 family, and the family is the
+    # only one CutlassFusedMoE accepts for gpt-oss SwiGLU. Real gpt-oss
+    # checkpoints load fine on this path, but this harness's synthetic MXFP4
+    # weights build a w3_w1 bias of 4 * intermediate_size while the loader
+    # supplies 2 * intermediate_size, so the copy raises a size mismatch. That
+    # is a pre-existing weight-generation gap, unrelated to backend selection.
+    if swiglu_gptoss_style and quant_algo == QuantAlgo.W4A16_MXFP4:
+        return (
+            "CutlassFusedMoE W4A16_MXFP4 + gpt-oss SwiGLU: harness "
+            "synthetic MXFP4 bias shape mismatch (4x vs 2x "
+            "intermediate_size)"
+        )
 
     # TP per-shard alignment: W8A16, NVFP4, W4A8_AWQ, and MXFP8 require
     # 128-aligned per-shard intermediate_size. W8A16 fails in
@@ -935,13 +937,7 @@ def should_skip_cute_dsl_b12x(
     moe_tp_size: int = 1,
     parallel_mode: Optional[str] = None,
 ) -> Optional[str]:
-    """Check CuteDslB12xFusedMoE constraints not covered by can_implement().
-
-    can_implement() already gates SM version, quant_algo, dtype_activation, and
-    swiglu_gptoss_style. This helper covers the additional EP / alltoall hard
-    rejects enforced in __init__ (b12x has no expert-parallel dispatch/combine
-    kernel).
-    """
+    """Check multi-rank constraints omitted from the capability query."""
     if backend_type != MoeBackendType.CUTE_DSL_B12X:
         return None
 
@@ -1170,17 +1166,7 @@ def get_quick_skip_reason(
     swiglu_gptoss_style: bool = False,
     seq_len: Optional[int] = None,
 ) -> Optional[str]:
-    """
-    Fast skip check that calls backend's can_implement() method.
-
-    Unified version supporting both backend-level and module-level tests:
-    - routing_method_cls: Used by test_moe_module.py for routing method compatibility checks
-    - swiglu_gptoss_style: Used by test_moe_backend.py for SwiGLU parameter checks
-    - seq_len: Optional sequence length for seq_len-sensitive skip checks
-
-    Returns:
-        Skip reason string if test should be skipped, None otherwise
-    """
+    """Return the first reason a test configuration is unsupported."""
     import logging as _logging
 
     # Suppress logger warnings during parameter generation
@@ -1189,24 +1175,29 @@ def get_quick_skip_reason(
     trtllm_logger.setLevel(_logging.ERROR)
 
     try:
-        # Call backend's can_implement for dtype/quant_algo checks
         backend_cls = get_backend_class(backend_type)
-        can_impl_kwargs = {"dtype_activation": dtype}
-        if swiglu_gptoss_style:
-            can_impl_kwargs["swiglu_gptoss_style"] = swiglu_gptoss_style
-        if (
-            backend_type
-            in (
-                MoeBackendType.MEGAMOE_DEEPGEMM,
-                MoeBackendType.MEGAMOE_CUTEDSL,
-            )
-            and model_config is not None
-        ):
-            can_impl_kwargs["hidden_size"] = model_config.hidden_size
-            can_impl_kwargs["intermediate_size"] = model_config.intermediate_size
-        can_impl, skip_reason = backend_cls.can_implement(quant_algo, **can_impl_kwargs)
-        if not can_impl:
-            return skip_reason
+        problem = MoEProblem(
+            quant=canonical_quant(quant_algo),
+            dtype_act=dtype,
+            hidden_size=None if model_config is None else model_config.hidden_size,
+            intermediate_size=None if model_config is None else model_config.intermediate_size,
+            num_experts=None if model_config is None else model_config.num_experts,
+            top_k=None if model_config is None else model_config.top_k,
+            swiglu_gptoss_style=swiglu_gptoss_style,
+            bias=swiglu_gptoss_style,
+        )
+        # Multi-rank constraints are checked by the helpers below.
+        deployment = MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=0 if model_config is None else model_config.num_experts,
+            env=collect_moe_environment(),
+        )
+        verdict = backend_cls.can_implement(problem, deployment)
+        if not verdict.eligible:
+            return f"{verdict.reject_reason.value}: {verdict.detail}"
 
         # Chain skip checks: routing method, then per-backend constraints
         skip_checks = [
@@ -1220,7 +1211,11 @@ def get_quick_skip_reason(
                 seq_len=seq_len,
             ),
             lambda: should_skip_cutlass(
-                backend_type, quant_algo=quant_algo, model_config=model_config, dtype=dtype
+                backend_type,
+                quant_algo=quant_algo,
+                model_config=model_config,
+                dtype=dtype,
+                swiglu_gptoss_style=swiglu_gptoss_style,
             ),
             lambda: should_skip_cutedsl(
                 backend_type, quant_algo, model_config, routing_method_cls=routing_method_cls
@@ -1426,7 +1421,7 @@ def should_skip_to_accelerate_ci(
     Rules applied (in order):
     0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
        unquantized coverage enabled.
-    0a. MARLIN backend: only NVFP4 on Hopper (SM90); skip all other
+    0a. MARLIN backend: only NVFP4 on Ada/Hopper (SM89-SM99); skip all other
         quant_algo / architecture combinations.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
@@ -1462,15 +1457,16 @@ def should_skip_to_accelerate_ci(
     ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
-    # --- Rule 0a: MARLIN backend only runs NVFP4 on Hopper (SM90) ---
+    # --- Rule 0a: MARLIN backend only runs NVFP4 on Ada/Hopper (SM89-SM99) ---
     if backend_type == MoeBackendType.MARLIN:
+        from tensorrt_llm._torch.utils import is_nvfp4_marlin_supported_sm
         from tensorrt_llm._utils import get_sm_version
 
         if quant_algo != QuantAlgo.NVFP4:
             return f"[CI accel] MARLIN only tests NVFP4 in CI (got {quant_algo})"
         sm_version = get_sm_version()
-        if sm_version != 90:
-            return f"[CI accel] MARLIN only runs on Hopper (SM90) in CI (got SM{sm_version})"
+        if not is_nvfp4_marlin_supported_sm(sm_version):
+            return f"[CI accel] MARLIN only runs on Ada/Hopper (SM89-99) in CI (got SM{sm_version})"
 
     # Any e256-class model_config triggers CI Rule-1 minimal coverage:
     # the full dtype x seq_len x swiglu x routing matrix on e256 models

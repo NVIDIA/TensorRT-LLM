@@ -20,12 +20,28 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
 from .transformer_qwen_image import QwenImageTransformer2DModel
+
+# TeaCache polynomial coefficients for Qwen-Image.
+# Reference: https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/cache/teacache/config.py#L30
+QWEN_IMAGE_TEACACHE_COEFFICIENTS = {
+    "qwen": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
+}
 
 # ``self.prompt_template_encode`` from diffusers.QwenImagePipeline.
 _PROMPT_TEMPLATE = (
@@ -239,6 +255,38 @@ class QwenImagePipeline(BasePipeline):
             # and FP32 scales keep the dtypes created by Linear.load_weights().
             self.transformer.to_inference_dtype().eval()
         self._target_dtype = self.pipeline_config.torch_dtype
+
+    @staticmethod
+    def _compute_qwen_image_timestep_embedding(module, hidden_states=None, timestep=None, **kwargs):
+        """Compute modulated timestep embedding for TeaCache distance calculation.
+
+        Mirrors the first three steps of QwenImageTransformer2DModel.forward():
+        project image tokens → cast dtype → compute time_text_embed (temb).
+        """
+        hidden_states = module.img_in(hidden_states)
+        timestep = timestep.to(hidden_states.dtype)
+        return module.time_text_embed(timestep, hidden_states)
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.transformer is not None:
+            register_extractor_from_config(
+                ExtractorConfig(
+                    model_class_name="QwenImageTransformer2DModel",
+                    timestep_embed_fn=self._compute_qwen_image_timestep_embedding,
+                    forward_params=[
+                        "hidden_states",
+                        "encoder_hidden_states",
+                        "encoder_hidden_states_mask",
+                        "timestep",
+                        "img_shapes",
+                        "txt_seq_lens",
+                        "return_dict",
+                    ],
+                    return_dict_default=False,
+                )
+            )
+            self._apply_teacache_coefficients(QWEN_IMAGE_TEACACHE_COEFFICIENTS)
 
     # ------------------------------------------------------------------
     # Prompt encoding (Qwen2.5-VL chat template).
@@ -568,9 +616,20 @@ class QwenImagePipeline(BasePipeline):
         timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
         cuda_graph_enabled = self.pipeline_config.cuda_graph.enable
+
+        cache_acc = getattr(self, "cache_accelerator", None)
+        # Cache-DiT counts steps by call parity when enable_separate_cfg=True.
+        # Sequential non-parallel CFG makes 2 transformer calls per step; all
+        # other modes make 1. Pass the actual count so the step counter is correct.
+        if cache_acc is not None and cache_acc.is_enabled():
+            separate_cfg = use_negative_prompt_cfg and not do_cfg_parallel
+            cache_acc.refresh(len(timesteps), separate_cfg=separate_cfg)
+
         for i, t in self._profile_denoise_steps(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             if do_cfg_parallel:
+                if cache_acc is not None:
+                    self.transformer._cache_branch = "cond" if cfg_rank == 0 else "uncond"
                 local_embeds, local_mask = self._select_cfg_inputs(
                     cfg_rank,
                     prompt_embeds,
@@ -592,6 +651,8 @@ class QwenImagePipeline(BasePipeline):
                     gather_list[0], gather_list[1], negative_prompt_cfg_scale
                 )
             else:
+                if cache_acc is not None:
+                    self.transformer._cache_branch = None
                 noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
@@ -601,35 +662,51 @@ class QwenImagePipeline(BasePipeline):
                     return_dict=False,
                 )[0]
 
-            if use_negative_prompt_cfg and not do_cfg_parallel:
-                if cuda_graph_enabled:
-                    # CUDA graph outputs are graph-owned buffers; the negative CFG
-                    # replay may reuse the same pool before guidance consumes this one.
-                    noise_pred = noise_pred.clone()
-
-                neg_noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    encoder_hidden_states_mask=neg_prompt_embeds_mask,
-                    encoder_hidden_states=neg_prompt_embeds,
-                    img_shapes=img_shapes,
-                    return_dict=False,
-                )[0]
-                noise_pred = self._combine_negative_prompt_cfg(
-                    noise_pred, neg_noise_pred, negative_prompt_cfg_scale
-                )
+                if use_negative_prompt_cfg:
+                    if cuda_graph_enabled:
+                        # CUDA graph outputs are graph-owned buffers; the negative CFG
+                        # replay may reuse the same pool before guidance consumes this one.
+                        noise_pred = noise_pred.clone()
+                    if cache_acc is not None:
+                        self.transformer._cache_branch = "uncond"
+                    neg_noise_pred = self.transformer(
+                        hidden_states=latents,
+                        timestep=timestep / 1000,
+                        encoder_hidden_states_mask=neg_prompt_embeds_mask,
+                        encoder_hidden_states=neg_prompt_embeds,
+                        img_shapes=img_shapes,
+                        return_dict=False,
+                    )[0]
+                    if cache_acc is not None:
+                        self.transformer._cache_branch = None
+                    noise_pred = self._combine_negative_prompt_cfg(
+                        noise_pred, neg_noise_pred, negative_prompt_cfg_scale
+                    )
 
             latents_dtype = latents.dtype
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
 
+        if getattr(self, "rank", 0) == 0:
+            if cache_acc is not None and cache_acc.is_enabled():
+                stats = cache_acc.get_stats()
+                if stats:
+                    if self.pipeline_config.cache_backend == "cache_dit":
+                        logger.info(f"Cache-DiT stats: {stats}")
+                    elif self.pipeline_config.cache_backend == "teacache":
+                        if "hit_rate" in stats:
+                            logger.info(
+                                f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                                f"({stats['cached']}/{stats['total']} steps)"
+                            )
+
         timer.mark_post_start()
         logger.info("Decoding...")
         image = self._decode_latents(latents, height, width)
 
         if getattr(self, "rank", 0) == 0:
-            logger.info("Pipeline total: %.2fs", time.time() - pipeline_start)
+            logger.info(f"Pipeline total: {time.time() - pipeline_start:.2f}s")
 
         timer.mark_end()
         return timer.fill(PipelineOutput(image=image))

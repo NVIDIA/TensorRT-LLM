@@ -19,7 +19,7 @@ import torch
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
     fused_qkv_gemma_rmsnorm_rope_gate,
-    fused_sigmoid_mul,
+    fused_sigmoid_mul_inplace,
 )
 
 
@@ -144,8 +144,7 @@ def test_fused_qkv_gemma_rmsnorm_rope_gate_matches_reference(
     torch.testing.assert_close(actual_qkv[:, q_size + kv_size :], qkv[:, 2 * q_size + kv_size :])
 
 
-@pytest.mark.parametrize("inplace", (False, True))
-def test_fused_sigmoid_mul_supports_strided_gate(inplace):
+def test_fused_sigmoid_mul_inplace_supports_strided_gate():
     torch.manual_seed(7)
     num_tokens, num_heads, head_dim = 17, 8, 128
     attention = torch.randn((num_tokens, num_heads * head_dim), dtype=torch.bfloat16, device="cuda")
@@ -154,7 +153,8 @@ def test_fused_sigmoid_mul_supports_strided_gate(inplace):
     )
     gate = gate_storage[..., :head_dim]
     expected = attention.float() * torch.sigmoid(gate.reshape(num_tokens, -1).float())
-    actual = fused_sigmoid_mul(attention.clone(), gate, inplace=inplace)
+    actual = attention.clone()
+    fused_sigmoid_mul_inplace(actual, gate)
     torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
 
 
@@ -285,10 +285,74 @@ def test_output_gate_fallback_flattens_fused_gate():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-def test_fused_sigmoid_mul_supports_flat_gate():
+def test_fused_sigmoid_mul_inplace_supports_flat_gate():
     torch.manual_seed(11)
     attention = torch.randn((9, 512), dtype=torch.float16, device="cuda")
     gate = torch.randn_like(attention)
     expected = attention.float() * torch.sigmoid(gate.float())
-    actual = fused_sigmoid_mul(attention, gate)
+    actual = attention.clone()
+    fused_sigmoid_mul_inplace(actual, gate)
     torch.testing.assert_close(actual.float(), expected, atol=0.005, rtol=0.005)
+
+
+def test_fused_qkv_gemma_rmsnorm_rope_gate_supports_torch_compile():
+    torch.manual_seed(2027)
+    num_tokens, num_q_heads, num_kv_heads = 7, 8, 2
+    head_dim, rotary_dim = 128, 128
+    q_size = num_q_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    qkv = torch.randn(
+        (num_tokens, 2 * q_size + 2 * kv_size),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q_weight = torch.randn((head_dim,), dtype=torch.bfloat16, device="cuda") * 0.1
+    k_weight = torch.randn((head_dim,), dtype=torch.bfloat16, device="cuda") * 0.1
+    cos_sin = _make_cos_sin(128, rotary_dim)
+    positions = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+
+    compiled = torch.compile(
+        fused_qkv_gemma_rmsnorm_rope_gate,
+        backend="eager",
+        fullgraph=True,
+    )
+    actual = compiled(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        1e-6,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+    )
+    expected = fused_qkv_gemma_rmsnorm_rope_gate(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        1e-6,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_fused_sigmoid_mul_inplace_supports_torch_compile():
+    attention = torch.randn((7, 512), dtype=torch.bfloat16, device="cuda")
+    gate = torch.randn((7, 4, 128), dtype=torch.bfloat16, device="cuda")
+    expected = attention.clone()
+    fused_sigmoid_mul_inplace(expected, gate)
+
+    def apply_gate(attention_output, gate_input):
+        fused_sigmoid_mul_inplace(attention_output, gate_input)
+        return attention_output
+
+    compiled = torch.compile(apply_gate, backend="eager", fullgraph=True)
+    actual = compiled(attention.clone(), gate)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
