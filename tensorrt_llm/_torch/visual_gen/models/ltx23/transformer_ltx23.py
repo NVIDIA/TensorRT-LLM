@@ -24,6 +24,7 @@ the surrounding gate-residual kernels instead of taking a standalone pass.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -44,9 +45,22 @@ from ..ltx2.transformer_ltx2 import (
 )
 from .text_conditioning_ltx23 import LTX23TextConditioning
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+
 _get_ada_table_ts_pairs = BasicAVTransformerBlock._get_ada_table_ts_pairs
 _get_av_ca_ada_table_ts_pairs = BasicAVTransformerBlock._get_av_ca_ada_table_ts_pairs
 _make_mlp = BasicAVTransformerBlock._make_mlp
+
+
+def _without_quantized_attention(
+    model_config: "DiffusionModelConfig | None",
+) -> "DiffusionModelConfig | None":
+    """Copy a model config while retaining its dense attention backend."""
+    if model_config is None or model_config.attention.quant_attention_config is None:
+        return model_config
+    attention = model_config.attention.model_copy(update={"quant_attention_config": None})
+    return model_config.model_copy(update={"attention": attention})
 
 
 class LTX23TransformerBlock(nn.Module):
@@ -67,8 +81,9 @@ class LTX23TransformerBlock(nn.Module):
         self._fuse_adaln = (video is None or is_fused_adaln_supported_dim(video.dim)) and (
             audio is None or is_fused_adaln_supported_dim(audio.dim)
         )
+        dense_config = _without_quantized_attention(config)
 
-        def attn(name, query_dim, context_dim, kv, gated):
+        def attn(name, query_dim, context_dim, kv, gated, model_config=dense_config):
             return LTX2Attention(
                 query_dim=query_dim,
                 context_dim=context_dim,
@@ -77,7 +92,7 @@ class LTX23TransformerBlock(nn.Module):
                 rope_type=rope_type,
                 norm_eps=norm_eps,
                 apply_gated_attention=gated,
-                config=config,
+                config=model_config,
                 layer_idx=idx,
                 module_name=f"transformer_blocks.{idx}.{name}",
                 enable_sequence_parallel=False,
@@ -85,7 +100,9 @@ class LTX23TransformerBlock(nn.Module):
 
         if video is not None:
             gated_v = video.apply_gated_attention
-            self.attn1 = attn("attn1", video.dim, None, video, gated_v)
+            # FlashInfer quantized attention requires equal Q/KV sequence
+            # lengths, so only video self-attention uses the quantized path.
+            self.attn1 = attn("attn1", video.dim, None, video, gated_v, config)
             self.attn2 = attn("attn2", video.dim, video.context_dim, video, gated_v)
             self.ff = _make_mlp(video, config, idx)
             self.scale_shift_table = nn.Parameter(torch.empty(9, video.dim))

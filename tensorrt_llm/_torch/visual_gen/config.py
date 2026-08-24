@@ -501,6 +501,11 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         if "workflow" in resolved_pipeline_config:
             extra_attrs["workflow"] = resolved_pipeline_config["workflow"]
 
+        if "retake_fp8_linear_steps" in resolved_pipeline_config:
+            extra_attrs["retake_fp8_linear_steps"] = resolved_pipeline_config[
+                "retake_fp8_linear_steps"
+            ]
+
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
         component_config_dicts: Dict[str, Dict[str, Any]] = {}

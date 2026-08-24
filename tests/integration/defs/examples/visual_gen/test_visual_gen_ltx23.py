@@ -221,8 +221,14 @@ def test_ltx23_example(tmp_path, config_name):
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
-def _generate_ltx23_retake_native_bf16_video(llm_root, llm_venv, tmp_path, output_path):
-    """Run the native delete-disfluency retake example and return its output."""
+def _generate_ltx23_retake_video(
+    llm_root,
+    llm_venv,
+    tmp_path,
+    output_path,
+    config_filename="ltx23-retake-1gpu.yaml",
+):
+    """Run the delete-disfluency retake example and return its output."""
     source = _golden_media_path(
         tmp_path,
         "ltx2_retake_lpips_input_video.mp4",
@@ -242,13 +248,11 @@ def _generate_ltx23_retake_native_bf16_video(llm_root, llm_venv, tmp_path, outpu
     )
     _skip_if_missing(lora, "TalkVid retake LoRA")
     example = os.path.join(llm_root, "examples", "visual_gen", "models", "ltx23_retake.py")
-    base_config = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "ltx23-retake-1gpu.yaml"
-    )
+    base_config = os.path.join(llm_root, "examples", "visual_gen", "configs", config_filename)
     with open(base_config, encoding="utf-8") as config_file:
         config_data = yaml.safe_load(config_file)
     config_data["runtime_lora_config"] = {"path": lora}
-    config = tmp_path / "ltx23-retake-1gpu.yaml"
+    config = tmp_path / config_filename
     with open(config, "w", encoding="utf-8") as config_file:
         yaml.safe_dump(config_data, config_file, sort_keys=False)
     venv_check_call(
@@ -296,7 +300,7 @@ def ltx23_retake_bf16_video_path(_ltx23_retake_deps, llm_root, llm_venv, tmp_pat
     if os.path.isfile(output_path):
         return output_path
     work_dir = tmp_path_factory.mktemp("ltx23_retake")
-    return _generate_ltx23_retake_native_bf16_video(llm_root, llm_venv, work_dir, output_path)
+    return _generate_ltx23_retake_video(llm_root, llm_venv, work_dir, output_path)
 
 
 def test_ltx23_retake_native_bf16_smoke(ltx23_retake_bf16_video_path):
@@ -354,5 +358,55 @@ def test_ltx23_retake_native_bf16_lpips(
         LTX23_RETAKE_LPIPS_THRESHOLD,
         ltx23_retake_bf16_video_path,
         "ltx23_retake_generated.mp4",
+    )
+    _assert_lpips_below_threshold(score, LTX23_RETAKE_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    ("case_id", "config_filename"),
+    (
+        pytest.param("fp8", "ltx23-retake-fp8-1gpu.yaml", id="fp8"),
+        pytest.param("nvfp4", "ltx23-retake-fp4-1gpu.yaml", id="nvfp4"),
+    ),
+)
+def test_ltx23_retake_quantized_lpips(
+    request,
+    tmp_path,
+    _ltx23_retake_deps,
+    llm_root,
+    llm_venv,
+    _visual_gen_lpips_scorer,
+    case_id,
+    config_filename,
+):
+    output_path = _visual_gen_output_path(llm_venv, f"ltx23_retake_{case_id}")
+    if not os.path.isfile(output_path):
+        _generate_ltx23_retake_video(
+            llm_root,
+            llm_venv,
+            tmp_path,
+            output_path,
+            config_filename,
+        )
+    golden_path = _golden_media_path(
+        tmp_path,
+        "ltx2_retake_lpips_golden_video.mp4",
+        "LTX-2.3 retake LPIPS golden video",
+    )
+    score = _run_reusable_video_lpips_eval(
+        f"ltx23_retake_{case_id}",
+        golden_path,
+        output_path,
+        _visual_gen_lpips_scorer,
+        frame_start=LTX23_RETAKE_LPIPS_FRAME_START,
+        frame_stop=LTX23_RETAKE_LPIPS_FRAME_STOP,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX23_RETAKE_LPIPS_THRESHOLD,
+        output_path,
+        f"ltx23_retake_{case_id}_generated.mp4",
     )
     _assert_lpips_below_threshold(score, LTX23_RETAKE_LPIPS_THRESHOLD)

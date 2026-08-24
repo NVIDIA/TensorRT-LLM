@@ -9,17 +9,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.patchifier import VideoLatentPatchifier
 from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23 import LTX23Pipeline
 from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23_retake import (
     LTX23RetakePipeline,
     _init_retake_patchified_latents,
+    _normalize_fp8_step_indices,
     _retake_conditioned_latent_ranges,
     _retake_pixel_window,
 )
+from tensorrt_llm._torch.visual_gen.models.ltx23.transformer_ltx23 import (
+    _without_quantized_attention,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
-from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -99,6 +104,34 @@ def test_retake_initial_noise_preserves_conditioned_tokens() -> None:
     assert torch.equal(initialized[:, regenerated], noise[:, regenerated])
 
 
+def test_retake_fp8_step_indices_are_validated() -> None:
+    assert _normalize_fp8_step_indices([7, 4, 4]) == frozenset({4, 7})
+    with pytest.raises(TypeError, match="sequence of integer"):
+        _normalize_fp8_step_indices("4,7")
+    with pytest.raises(ValueError, match=r"\[0, 8\)"):
+        _normalize_fp8_step_indices([8])
+
+
+def test_retake_quantizes_only_video_self_attention() -> None:
+    model_config = DiffusionModelConfig(
+        attention=AttentionConfig(
+            backend="FLASHINFER",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4",
+                v_dtype="nvfp4",
+            ),
+        )
+    )
+
+    dense_config = _without_quantized_attention(model_config)
+
+    assert dense_config is not None
+    assert dense_config is not model_config
+    assert dense_config.attention.backend == "FLASHINFER"
+    assert dense_config.attention.quant_attention_config is None
+    assert model_config.attention.quant_attention_config is not None
+
+
 def test_retake_pipeline_registration_and_config_schema(monkeypatch) -> None:
     retake_entry = PIPELINE_REGISTRY["LTX23RetakePipeline"]
     assert retake_entry.pipeline_cls is LTX23RetakePipeline
@@ -106,6 +139,7 @@ def test_retake_pipeline_registration_and_config_schema(monkeypatch) -> None:
 
     ltx23_defaults = PIPELINE_REGISTRY["LTX23Pipeline"].defaults
     assert ltx23_defaults["workflow"] == "generation"
+    assert ltx23_defaults["retake_fp8_linear_steps"] is None
 
     monkeypatch.setattr(AutoPipeline, "_detect_from_checkpoint", lambda _: "LTX23Pipeline")
 
@@ -123,3 +157,18 @@ def test_retake_pipeline_registration_and_config_schema(monkeypatch) -> None:
     recipe_args = VisualGenArgs.from_yaml(config_dir / "ltx23-retake-1gpu.yaml")
     assert getattr(recipe_args.quant_config, "quant_algo", None) is None
     assert recipe_args.pipeline_config == {"workflow": "retake"}
+
+    fp8_args = VisualGenArgs.from_yaml(config_dir / "ltx23-retake-fp8-1gpu.yaml")
+    assert fp8_args.pipeline_config == {"workflow": "retake"}
+    assert fp8_args.quant_config == {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
+    assert fp8_args.attention_config.backend == "FLASHINFER"
+    assert fp8_args.attention_config.quant_attention_config is None
+
+    fp4_args = VisualGenArgs.from_yaml(config_dir / "ltx23-retake-fp4-1gpu.yaml")
+    assert fp4_args.quant_config == {"quant_algo": "NVFP4", "dynamic": True}
+    assert fp4_args.pipeline_config["workflow"] == "retake"
+    assert fp4_args.pipeline_config["retake_fp8_linear_steps"] == [4, 7]
+    assert fp4_args.attention_config.backend == "FLASHINFER"
+    assert fp4_args.attention_config.quant_attention_config is not None
+    assert fp4_args.attention_config.quant_attention_config.qk_dtype == "nvfp4"
+    assert fp4_args.attention_config.quant_attention_config.v_dtype == "nvfp4"

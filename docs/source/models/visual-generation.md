@@ -64,7 +64,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FastWan 2.2** | Yes | Yes | No | No | No [^7] | No | No | Yes | Yes | Yes | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes [^4] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
-| **LTX-2.3 Retake** [^8] | No | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
+| **LTX-2.3 Retake** [^8] | Yes | Yes | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
@@ -84,7 +84,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
 
-[^8]: LTX-2.3 Retake currently supports BF16 inference on one GPU. Quantized execution, cache acceleration, CUDA Graph, parallel VAE, and distributed parallelism are not enabled yet.
+[^8]: LTX-2.3 Retake supports BF16, FP8 block-scale, and NVFP4 inference on one GPU. FlashInfer NVFP4 attention uses FP8 V on SM100/SM103 and NVFP4 V on SM120/SM121. Cache acceleration, CUDA Graph, parallel VAE, and distributed parallelism are not enabled yet.
 
 ## Quick Start
 

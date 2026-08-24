@@ -47,8 +47,9 @@ from .media_io import (
     get_videostream_metadata,
     pad_audio_to_video_duration,
 )
-from .pipeline_ltx23 import LTX23Pipeline
+from .pipeline_ltx23 import LTX23Pipeline, _build_ltx23_transformer
 from .text_conditioning_ltx23 import LTX23TextConditioning
+from .transformer_ltx23 import LTX23Model
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
@@ -117,6 +118,30 @@ def _load_prompt_conditioning(path: str) -> tuple[torch.Tensor, torch.Tensor, to
             f"mask={tuple(connector_mask.shape)}"
         )
     return video_embeds, audio_embeds, connector_mask
+
+
+def _normalize_fp8_step_indices(steps: Any) -> frozenset[int]:
+    """Validate FP8 fallback steps against the fixed Retake schedule."""
+    if steps is None:
+        return frozenset()
+    if isinstance(steps, (str, bytes)):
+        raise TypeError("retake_fp8_linear_steps must be a sequence of integer step indices.")
+    try:
+        values = list(steps)
+    except TypeError as exc:
+        raise TypeError(
+            "retake_fp8_linear_steps must be a sequence of integer step indices."
+        ) from exc
+    invalid_types = [step for step in values if isinstance(step, bool) or not isinstance(step, int)]
+    if invalid_types:
+        raise TypeError(f"retake_fp8_linear_steps entries must be integers; got {invalid_types!r}.")
+    invalid_range = [step for step in values if not 0 <= step < _RETAKE_NUM_INFERENCE_STEPS]
+    if invalid_range:
+        raise ValueError(
+            "retake_fp8_linear_steps entries must be in "
+            f"[0, {_RETAKE_NUM_INFERENCE_STEPS}); got {invalid_range!r}."
+        )
+    return frozenset(values)
 
 
 def _retake_pixel_window(
@@ -272,6 +297,12 @@ class LTX23RetakePipeline(LTX23Pipeline):
             raise NotImplementedError("LTX-2.3 retake currently supports a single GPU only.")
         if pipeline_config.cuda_graph.enable:
             raise NotImplementedError("LTX-2.3 retake currently requires cuda_graph.enable=false.")
+        self._fp8_step_transformer: LTX23Model | None = None
+        self._fp8_step_indices = _normalize_fp8_step_indices(
+            pipeline_config.extra_attrs.get("retake_fp8_linear_steps")
+        )
+        self._fp8_step_text_cache: LTX23TextConditioning | None = None
+        self._checkpoint_dir: str | None = None
         super().__init__(pipeline_config)
 
     @property
@@ -378,13 +409,6 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 mask[:, start * tokens_per_frame : stop * tokens_per_frame] = 0.0
         return mask
 
-    def _init_transformer(self) -> None:
-        model_config = self.pipeline_config.model_configs["transformer"]
-        quant_config = getattr(model_config, "quant_config", None)
-        if quant_config is not None and getattr(quant_config, "quant_algo", None) is not None:
-            raise NotImplementedError("LTX-2.3 retake currently supports only BF16.")
-        super()._init_transformer()
-
     def _masked_transformer_step(
         self,
         video_latents: torch.Tensor,
@@ -426,10 +450,18 @@ class LTX23RetakePipeline(LTX23Pipeline):
                 cross_modality_sigma=sigma,
             )
 
-        velocity_video, _ = self.transformer(
+        transformer = self.transformer
+        active_text_cache = text_cache
+        if step_index in self._fp8_step_indices:
+            if self._fp8_step_transformer is None or self._fp8_step_text_cache is None:
+                raise RuntimeError("The configured FP8 Retake transformer is not ready.")
+            transformer = self._fp8_step_transformer
+            active_text_cache = self._fp8_step_text_cache
+
+        velocity_video, _ = transformer(
             video=video,
             audio=audio,
-            text_cache=text_cache,
+            text_cache=active_text_cache,
             timestep=timestep.new_tensor(float(step_index) / num_steps),
             step_index=step_index,
         )
@@ -444,6 +476,45 @@ class LTX23RetakePipeline(LTX23Pipeline):
             self.dtype
         )
 
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        self._build_fp8_step_transformer()
+
+    def _build_fp8_step_transformer(self) -> None:
+        """Build the resident FP8 transformer used by selected NVFP4 steps."""
+        if not self._fp8_step_indices or self.transformer is None:
+            return
+        if self._checkpoint_dir is None:
+            raise RuntimeError(
+                "The Retake checkpoint path is unavailable for FP8 fallback loading."
+            )
+
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+        fp8_quant_config, _, dynamic_weight_quant, _ = (
+            DiffusionPipelineConfig.load_diffusion_quant_config(
+                {"quant_algo": "FP8", "dynamic": True}
+            )
+        )
+        base_model_config = self.pipeline_config.model_configs["transformer"]
+        fp8_model_config = copy.deepcopy(base_model_config)
+        fp8_model_config.quant_config = fp8_quant_config
+        fp8_model_config.dynamic_weight_quant = dynamic_weight_quant
+        fp8_model_config.force_dynamic_quantization = True
+        fp8_pipeline_config = copy.copy(self.pipeline_config)
+        fp8_pipeline_config.model_configs = dict(self.pipeline_config.model_configs)
+        fp8_pipeline_config.model_configs["transformer"] = fp8_model_config
+
+        logger.info(
+            "LTX-2.3 Retake: building a resident FP8 transformer for steps "
+            f"{sorted(self._fp8_step_indices)}"
+        )
+        transformer = _build_ltx23_transformer(fp8_pipeline_config)
+        transformer_weights = self.load_transformer_weights(self._checkpoint_dir)
+        transformer.load_weights(transformer_weights)
+        transformer.post_load_weights()
+        self._fp8_step_transformer = transformer.to(self._device)
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -453,6 +524,7 @@ class LTX23RetakePipeline(LTX23Pipeline):
         text_encoder_path: str = "",
         **kwargs: Any,
     ) -> None:
+        self._checkpoint_dir = checkpoint_dir
         native_skip_components = list(skip_components or [])
         native_skip_components += [PipelineComponent.SCHEDULER, "audio_decoder", "vocoder"]
         if not text_encoder_path:
@@ -530,6 +602,10 @@ class LTX23RetakePipeline(LTX23Pipeline):
         text_encoder = getattr(self, "text_encoder", None)
         if text_encoder is None:
             raise RuntimeError("Gemma is not loaded for LTX-2.3 retake prompt encoding.")
+        if isinstance(text_encoder, torch.nn.Module):
+            parameter = next(text_encoder.parameters(), None)
+            if parameter is not None and parameter.device != self.device:
+                text_encoder.to(self.device)
         prompt_embeds, prompt_attention_mask = self._encode_prompt(
             prompt,
             max_sequence_length=max_sequence_length,
@@ -683,6 +759,22 @@ class LTX23RetakePipeline(LTX23Pipeline):
             audio_positions=audio_positions,
             dtype=dtype,
         )
+
+        self._fp8_step_text_cache = None
+        if self._fp8_step_transformer is not None:
+            self._fp8_step_text_cache = self._fp8_step_transformer.prepare_text_cache(
+                video_context=video_embeds,
+                video_context_mask=connector_mask,
+                video_positions=video_positions,
+                audio_context=audio_embeds,
+                audio_context_mask=connector_mask if audio_embeds is not None else None,
+                audio_positions=audio_positions,
+                dtype=dtype,
+            )
+            text_encoder = getattr(self, "text_encoder", None)
+            if isinstance(text_encoder, torch.nn.Module):
+                text_encoder.to("cpu")
+                torch.cuda.empty_cache()
 
         # ---- 5. Native masked video denoise (distilled, non-guided) --------
         scheduler = NativeSchedulerAdapter()

@@ -36,6 +36,8 @@ python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
 python models/ltx2.py --model_type ltx23 --visual_gen_args configs/ltx23-t2v-bf16-1gpu.yaml
 python models/ltx2.py --model_type ltx23 --visual_gen_args configs/ltx23-t2v-fp8-1gpu.yaml
 python models/ltx23_retake.py --model /path/to/ltx-2.3 --source /path/to/retake_input.mp4 --text_encoder_path /path/to/gemma-3-12b-it
+python models/ltx23_retake.py --visual_gen_args configs/ltx23-retake-fp8-1gpu.yaml --model /path/to/ltx-2.3 --source /path/to/retake_input.mp4 --text_encoder_path /path/to/gemma-3-12b-it
+python models/ltx23_retake.py --visual_gen_args configs/ltx23-retake-fp4-1gpu.yaml --model /path/to/ltx-2.3 --source /path/to/retake_input.mp4 --text_encoder_path /path/to/gemma-3-12b-it
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
 python models/cosmos3_ti2v.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"

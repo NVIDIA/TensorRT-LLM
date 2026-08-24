@@ -188,10 +188,56 @@ def detect_native_ltx_pipeline(config: dict) -> str:
     return "LTX23Pipeline"
 
 
+def _build_ltx23_transformer(pipeline_config) -> LTX23Model:
+    model_config = pipeline_config.model_configs["transformer"]
+    cfg = model_config.pretrained_config
+    rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
+    double_precision_rope = getattr(cfg, "frequencies_precision", False) == "float64"
+    apply_gated_attention = getattr(cfg, "apply_gated_attention", False)
+
+    logger.info(
+        f"LTX-2.3 transformer config: rope_type={rope_type.value}, "
+        f"double_precision_rope={double_precision_rope}, "
+        f"apply_gated_attention={apply_gated_attention} (AudioVideo)"
+    )
+    transformer = LTX23Model(
+        model_type=LTXModelType.AudioVideo,
+        num_attention_heads=getattr(cfg, "num_attention_heads", 32),
+        attention_head_dim=getattr(cfg, "attention_head_dim", 128),
+        in_channels=getattr(cfg, "in_channels", 128),
+        out_channels=getattr(cfg, "out_channels", 128),
+        num_layers=getattr(cfg, "num_layers", 48),
+        cross_attention_dim=getattr(cfg, "cross_attention_dim", 4096),
+        audio_num_attention_heads=getattr(cfg, "audio_num_attention_heads", 32),
+        audio_attention_head_dim=getattr(cfg, "audio_attention_head_dim", 64),
+        audio_in_channels=getattr(cfg, "audio_in_channels", 128),
+        audio_out_channels=getattr(cfg, "audio_out_channels", 128),
+        audio_cross_attention_dim=getattr(cfg, "audio_cross_attention_dim", 2048),
+        audio_positional_embedding_max_pos=getattr(cfg, "audio_positional_embedding_max_pos", [20]),
+        norm_eps=float(getattr(cfg, "norm_eps", 1e-6)),
+        caption_channels=getattr(cfg, "caption_channels", 3840),
+        positional_embedding_theta=float(getattr(cfg, "positional_embedding_theta", 10000.0)),
+        positional_embedding_max_pos=getattr(cfg, "positional_embedding_max_pos", [20, 2048, 2048]),
+        timestep_scale_multiplier=getattr(cfg, "timestep_scale_multiplier", 1000),
+        av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
+        use_middle_indices_grid=getattr(cfg, "use_middle_indices_grid", True),
+        rope_type=rope_type,
+        double_precision_rope=double_precision_rope,
+        apply_gated_attention=apply_gated_attention,
+        model_config=model_config,
+    )
+    transformer._transformer_config = vars(cfg)
+    return transformer
+
+
 @register_pipeline(
     "LTX23Pipeline",
     hf_ids=["Lightricks/LTX-2.3"],
-    defaults={"text_encoder_path": "google/gemma-3-12b-it", "workflow": "generation"},
+    defaults={
+        "text_encoder_path": "google/gemma-3-12b-it",
+        "workflow": "generation",
+        "retake_fp8_linear_steps": None,
+    },
     doc="Lightricks LTX-2.3 text-to-video generation and retake with audio.",
 )
 class LTX23Pipeline(BasePipeline):
@@ -286,58 +332,11 @@ class LTX23Pipeline(BasePipeline):
         LTX2Pipeline._setup_cuda_graphs(self)
 
     def _init_transformer(self) -> None:
-        attn_cfg = getattr(self.pipeline_config, "attention", None)
-        if attn_cfg is not None and getattr(attn_cfg, "quant_attention_config", None) is not None:
-            raise NotImplementedError("Quantized attention is not yet supported for LTX-2.3.")
-
-        model_config = self.pipeline_config.model_configs["transformer"]
-        cfg = model_config.pretrained_config
-
-        rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
-        double_precision_rope = getattr(cfg, "frequencies_precision", False) == "float64"
-        apply_gated_attention = getattr(cfg, "apply_gated_attention", False)
-
+        cfg = self.pipeline_config.model_configs["transformer"].pretrained_config
         self.transformer_in_channels = getattr(cfg, "in_channels", 128)
         self.audio_in_channels = getattr(cfg, "audio_in_channels", 128)
         self.audio_out_channels = getattr(cfg, "audio_out_channels", 128)
-
-        logger.info(
-            f"LTX-2.3 transformer config: rope_type={rope_type.value}, "
-            f"double_precision_rope={double_precision_rope}, "
-            f"apply_gated_attention={apply_gated_attention} (AudioVideo)"
-        )
-
-        self.transformer = LTX23Model(
-            model_type=LTXModelType.AudioVideo,
-            num_attention_heads=getattr(cfg, "num_attention_heads", 32),
-            attention_head_dim=getattr(cfg, "attention_head_dim", 128),
-            in_channels=self.transformer_in_channels,
-            out_channels=getattr(cfg, "out_channels", 128),
-            num_layers=getattr(cfg, "num_layers", 48),
-            cross_attention_dim=getattr(cfg, "cross_attention_dim", 4096),
-            audio_num_attention_heads=getattr(cfg, "audio_num_attention_heads", 32),
-            audio_attention_head_dim=getattr(cfg, "audio_attention_head_dim", 64),
-            audio_in_channels=self.audio_in_channels,
-            audio_out_channels=self.audio_out_channels,
-            audio_cross_attention_dim=getattr(cfg, "audio_cross_attention_dim", 2048),
-            audio_positional_embedding_max_pos=getattr(
-                cfg, "audio_positional_embedding_max_pos", [20]
-            ),
-            norm_eps=float(getattr(cfg, "norm_eps", 1e-6)),
-            caption_channels=getattr(cfg, "caption_channels", 3840),
-            positional_embedding_theta=float(getattr(cfg, "positional_embedding_theta", 10000.0)),
-            positional_embedding_max_pos=getattr(
-                cfg, "positional_embedding_max_pos", [20, 2048, 2048]
-            ),
-            timestep_scale_multiplier=getattr(cfg, "timestep_scale_multiplier", 1000),
-            av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
-            use_middle_indices_grid=getattr(cfg, "use_middle_indices_grid", True),
-            rope_type=rope_type,
-            double_precision_rope=double_precision_rope,
-            apply_gated_attention=apply_gated_attention,
-            model_config=model_config,
-        )
-        self.transformer._transformer_config = vars(cfg)
+        self.transformer = _build_ltx23_transformer(self.pipeline_config)
 
     def load_transformer_weights(self, checkpoint_dir: str) -> Dict[str, torch.Tensor]:
         logger.info("Loading LTX-2.3 transformer weights (native checkpoint)")
