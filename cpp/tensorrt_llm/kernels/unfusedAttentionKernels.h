@@ -399,10 +399,8 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
 #else
         TLLM_THROW("FP8-K/NVFP4-V cache requires FP8 and FP4 support.");
 #endif
-        return;
     }
-
-    if (params.cache_type == KvCacheDataType::INT8)
+    else if (params.cache_type == KvCacheDataType::INT8)
     {
         invokeApplyBiasRopeUpdateKVCacheDispatch<T, int8_t, KVCacheBuffer>(params, stream);
     }
