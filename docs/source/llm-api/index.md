@@ -91,7 +91,8 @@ estimation creates a temporary PyExecutor before constructing the final PyExecut
 `final_model_engine` appears. The model-engine dictionaries are promoted alongside `py_executor` in
 the startup metrics payload so callers do not need to traverse another nesting level. Legacy
 two-model speculative decoding can likewise produce `initial_draft_model_engine` and
-`final_draft_model_engine`.
+`final_draft_model_engine`. When estimation is enabled, each pass performs a complete model-engine
+warmup, so both the initial and final dictionaries include the cost of a full warmup.
 
 Executor scope names describe the constructed component rather than the internal memory-category
 enum. The initial KV cache and PyExecutor scopes are temporary resources used for KV cache capacity
@@ -99,6 +100,7 @@ estimation; their final counterparts are the resources retained for serving.
 
 | PyExecutor metric | Scope |
 |-----------------|-------|
+| `config_and_checkpoint_loader_initialization_seconds` | Load the model configuration and initialize the checkpoint loader. |
 | `model_engine_creation_seconds` | Construct and load the main model engine. |
 | `draft_model_engine_creation_seconds` | Construct and load the separate draft model engine, when used. |
 | `guided_decoder_creation_seconds` | Construct guided-decoding resources. |
