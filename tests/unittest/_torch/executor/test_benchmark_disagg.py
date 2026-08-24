@@ -113,6 +113,15 @@ class MockBenchmarkExecutor:
         self.dist.tp_size = tp_size
         self.dist.world_size = tp_size
 
+        # State the gate's stall bound reads. 0 disables the bound, which is
+        # what these tests want twice over: they assert retry semantics, not
+        # the deadline (that is test_disagg_fill_gate_stall_bound.py's job),
+        # and they patch the whole `time` module -- so an enabled bound would
+        # do arithmetic on a Mock. `timeout_s <= 0` returns before the clock
+        # is read, so the patched module is never touched.
+        self._benchmark_fill_stall_since = None
+        self._benchmark_fill_stall_timeout_sec = 0.0
+
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     _dist_size = staticmethod(PyExecutor._dist_size)
@@ -121,6 +130,7 @@ class MockBenchmarkExecutor:
     _configure_benchmark_req_queues_size = PyExecutor._configure_benchmark_req_queues_size
     _is_benchmark_disagg_fill_complete = PyExecutor._is_benchmark_disagg_fill_complete
     _check_benchmark_disagg_gate = PyExecutor._check_benchmark_disagg_gate
+    _fail_if_fill_gate_stalled = PyExecutor._fail_if_fill_gate_stalled
 
 
 # ---------------------------------------------------------------------------
