@@ -328,3 +328,33 @@ def test_unsupported_prefill_implementation_raises() -> None:
             row_starts=torch.zeros(1, dtype=torch.int32),
             row_ends=torch.ones(1, dtype=torch.int32),
         )
+
+
+def test_gvr_emission_reset_parks_reused_slots(monkeypatch) -> None:
+    """Cold-started rows must carry non-finite lines.
+
+    Slot turnover under continuous batching can hand a request another
+    request's emission state. Exactness never rides on the lines - the
+    consumer admits on the counts the emitter measures for the current
+    query - but a reset row must park onto the stock path rather than
+    inherit finite thresholds, so the closed loop restarts cleanly.
+    """
+    gvr = Mock(side_effect=lambda *args, **kwargs: args[3].zero_())
+    monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    prior_indices = torch.zeros(4, 2, dtype=torch.int32)
+
+    top_k.prepare_gvr_emission(4, 1 << 17, 148, prior_indices)
+    state = top_k._gvr_emission_state
+    # emulate a warmed closed loop: every slot carries finite lines
+    state.xstate[:, 0] = 1.0
+    state.seed_row[:, :3] = torch.tensor([1.0, 2.0, 3.0])
+
+    top_k.reset_gvr_emission_rows(slice(1, 3))
+    top_k.prepare_gvr_emission(4, 1 << 17, 148, prior_indices)
+
+    lines = state.seed_row[:, 0]
+    assert torch.isinf(lines[1:3]).all(), "reset rows must park on non-finite lines"
+    assert torch.isfinite(lines[0]) and torch.isfinite(lines[3]), (
+        "untouched slots must keep their closed-loop state"
+    )
