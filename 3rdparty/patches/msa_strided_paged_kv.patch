@@ -900,119 +900,27 @@ index 0fdcbfa..c577f34 100644
 diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
 --- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
 +++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
-@@ -216,4 +216,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
+@@ -216,6 +216,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
    CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
 -// #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 -//     asm volatile("griddepcontrol.wait;");
 -// #endif
+-
 +#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-+    // FMHA::run launches this kernel with programmatic stream serialization.
-+    // The immediately preceding sparse block selector produces
-+    // kv_block_indexes, so no global input is safe to consume until the PDL
-+    // dependency has completed and its writes are visible.
++    // PDL may start FMHA before its stream predecessor flushes selector output.
 +    cudaGridDependencySynchronize();
 +#endif
-diff --git a/tests/regression/test_noncontiguous_sparse_block_indexes.py b/tests/regression/test_noncontiguous_sparse_block_indexes.py
-new file mode 100644
-index 0000000..6a162b0
---- /dev/null
-+++ b/tests/regression/test_noncontiguous_sparse_block_indexes.py
-@@ -0,0 +1,85 @@
-+#!/usr/bin/env python3
-+# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
-+# SPDX-License-Identifier: MIT
 +
-+"""Regression for sparse attention consuming a head-major selector view."""
-+
-+import torch
-+
-+from fmha_sm100.api import fmha_sm100, fmha_sm100_plan
-+
-+
-+def _run_attention(q, k, v, plan, kv_indices, selected):
-+    out = torch.empty_like(q)
-+    returned, _ = fmha_sm100(
-+        q,
-+        k,
-+        v,
-+        plan,
-+        kv_indices=kv_indices,
-+        kv_block_indexes=selected,
-+        out=out,
-+        sm_scale=128.0**-0.5,
-+        output_maxscore=False,
-+    )
-+    torch.cuda.synchronize()
-+    assert returned.data_ptr() == out.data_ptr()
-+    assert torch.isfinite(out).all()
-+    return out
-+
-+
-+def _check_query_length(query_len, num_kv_splits):
-+    device = torch.device("cuda", 0)
-+    total_selector_rows = query_len + 2
-+    q = torch.zeros((query_len, 32, 128), dtype=torch.bfloat16, device=device)
-+    k = torch.zeros((8, 2, 128, 128), dtype=torch.bfloat16, device=device)
-+    v = torch.empty_like(k)
-+    for page in range(8):
-+        v[page].fill_(page + 1)
-+    kv_indices = torch.arange(8, dtype=torch.int32, device=device)
-+
-+    intended = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
-+    poison = torch.tensor([4, 5, 6, 7], dtype=torch.int32, device=device)
-+    logical = intended.expand(total_selector_rows, 2, 4).clone()
-+    # These rows are outside the logical slice but occupy addresses reached by
-+    # a pointer-only contiguous read for later query/head pairs.
-+    logical[:2, 1, :] = poison
-+    backing = logical.permute(1, 0, 2).contiguous()
-+    selected_strided = backing.permute(1, 0, 2)[-query_len:]
-+    selected_contiguous = logical[-query_len:].contiguous()
-+
-+    assert torch.equal(selected_strided, selected_contiguous)
-+    assert not selected_strided.is_contiguous()
-+
-+    plan = fmha_sm100_plan(
-+        torch.tensor([query_len], dtype=torch.int32),
-+        torch.tensor([1024], dtype=torch.int32),
-+        32,
-+        num_kv_heads=2,
-+        qo_offset=torch.tensor([1024 - query_len], dtype=torch.int32),
-+        num_kv_splits=num_kv_splits,
-+        page_size=128,
-+        output_maxscore=False,
-+        kv_block_num=4,
-+        causal=True,
-+        device=device,
-+    )
-+    assert plan[3]["MM-SA-Nv"] is False
-+
-+    expected = _run_attention(
-+        q, k, v, plan, kv_indices, selected_contiguous
-+    )
-+    actual = _run_attention(q, k, v, plan, kv_indices, selected_strided)
-+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-+
-+
-+def test_noncontiguous_sparse_block_indexes():
-+    torch.cuda.set_device(0)
-+    for query_len in (1, 5):
-+        for num_kv_splits in (1, 2):
-+            _check_query_length(query_len, num_kv_splits)
-+
-+
-+if __name__ == "__main__":
-+    test_noncontiguous_sparse_block_indexes()
-+    print("MSA_NONCONTIGUOUS_SPARSE_BLOCK_INDEX_REGRESSION=PASS")
+     GPU_TRACE_INIT;
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
-index fa63a02..9fb2104 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -11,0 +12 @@ To recompile after kernel changes: scripts/clear_fmha_cache.sh
 +import hashlib
-@@ -24,0 +26,12 @@ logger = logging.getLogger(__name__)
-+
+@@ -43 +44,13 @@
+-CACHE_BASE = _compute_cache_base()
 +def _compute_csrc_fingerprint() -> str:
-+    """Return a stable fingerprint for sources embedded in JIT artifacts."""
++    """Fingerprint sources embedded in cached JIT artifacts."""
 +    csrc_dir = Path(__file__).resolve().parent / "csrc"
 +    digest = hashlib.sha256()
 +    for path in sorted(p for p in csrc_dir.rglob("*") if p.is_file()):
@@ -1022,34 +930,5 @@ index fa63a02..9fb2104 100644
 +    return digest.hexdigest()[:16]
 +
 +
-@@ -28,13 +41,17 @@ def _compute_cache_base():
--        return Path(explicit)
--    base = Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
--    # Different build configs get separate cache dirs to avoid conflicts
--    suffix = ""
--    if os.environ.get("GPU_TRACE") is not None:
--        suffix += "_gpu_trace"
--    if os.environ.get("SM_TIMING") is not None:
--        suffix += "_sm_timing"
--    if os.environ.get("FMHA_GMEM_CHECK") is not None:
--        suffix += "_gmem_check"
--    if suffix:
--        base = base.parent / (base.name + suffix)
--    return base
-+        base = Path(explicit)
-+    else:
-+        base = Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
-+        # Different build configs get separate cache dirs to avoid conflicts
-+        suffix = ""
-+        if os.environ.get("GPU_TRACE") is not None:
-+            suffix += "_gpu_trace"
-+        if os.environ.get("SM_TIMING") is not None:
-+            suffix += "_sm_timing"
-+        if os.environ.get("FMHA_GMEM_CHECK") is not None:
-+            suffix += "_gmem_check"
-+        if suffix:
-+            base = base.parent / (base.name + suffix)
-+    # A source-qualified namespace prevents an upgraded package from silently
-+    # loading stale cubins compiled from older headers.  This matters for
-+    # correctness fixes as well as for ordinary kernel changes.
-+    return base / f"source-{_compute_csrc_fingerprint()}"
++# A package upgrade must not load cubins compiled from older headers.
++CACHE_BASE = _compute_cache_base() / f"source-{_compute_csrc_fingerprint()}"
