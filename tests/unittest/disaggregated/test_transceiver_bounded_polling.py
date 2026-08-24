@@ -33,6 +33,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import CtxTransferStatus, GenTransferStatus
 from tensorrt_llm.bindings import LlmRequestState
 
 
@@ -189,7 +190,9 @@ def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued(
         Mock(),
     )
 
-    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=1)
+    status = transceiver.check_context_transfer_status(at_least_request_num=1)
+    assert isinstance(status, CtxTransferStatus)
+    completed, failed = status
 
     assert completed == []
     assert failed == []
@@ -350,7 +353,9 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
     transceiver._close_failed_sessions = Mock()
 
-    completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
+    status = transceiver.check_gen_transfer_status(at_least_request_num=0)
+    assert isinstance(status, GenTransferStatus)
+    completed, failed, cancelled = status
 
     assert completed == []
     assert failed == []
