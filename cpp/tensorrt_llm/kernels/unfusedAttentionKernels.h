@@ -67,12 +67,15 @@ enum class KvCacheDataType
     BASE = 0,
     INT8,
     FP8,
-    NVFP4
+    NVFP4,
+    FP8_K_NVFP4_V
 };
 
 inline KvCacheDataType cacheTypeFromQuantMode(common::QuantMode quantMode)
 {
-    if (quantMode.hasInt8KvCache())
+    if (quantMode.hasFp8KNvfp4VKvCache())
+        return KvCacheDataType::FP8_K_NVFP4_V;
+    else if (quantMode.hasInt8KvCache())
         return KvCacheDataType::INT8;
     else if (quantMode.hasFp8KvCache())
         return KvCacheDataType::FP8;
@@ -384,6 +387,29 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
         invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
     }
 #endif // ENABLE_FP8
+#if defined(ENABLE_FP8) && defined(ENABLE_FP4)
+    else if (params.cache_type == KvCacheDataType::FP8_K_NVFP4_V)
+    {
+        if constexpr (!std::is_same_v<KVCacheBuffer, MixedKVBlockArray>)
+        {
+            TLLM_THROW("FP8-K/NVFP4-V requires asymmetric paged cache buffers.");
+        }
+        else if constexpr (std::is_same_v<T, float>)
+        {
+            TLLM_THROW("FP8-K/NVFP4-V cache does not support FP32 model inputs.");
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(params.kv_cache_block_scales_buffer.data != nullptr,
+                "Cannot append to FP8-K/NVFP4-V cache without a V block-scale pool.");
+            TLLM_CHECK_WITH_INFO(params.qkv_scale_orig_quant != nullptr && params.qkv_scale_quant_orig != nullptr,
+                "FP8-K/NVFP4-V cache requires separate Q/K/V quantization scales.");
+            TLLM_CHECK_WITH_INFO(params.quantized_fp8_output,
+                "FP8-K/NVFP4-V attention requires an FP8 query output from QKV preprocessing.");
+            invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
+        }
+    }
+#endif
 #ifdef ENABLE_FP4
     else if (params.cache_type == KvCacheDataType::NVFP4)
     {

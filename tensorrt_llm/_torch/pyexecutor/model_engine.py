@@ -1083,7 +1083,9 @@ class PyTorchModelEngine(ModelEngine):
         Returns the size (in bytes) occupied by kv cache type.
         """
         layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
-        if layer_quant_mode.has_fp4_kv_cache():
+        if layer_quant_mode.has_fp8_k_nvfp4_v_kv_cache():
+            return 3 / 4
+        elif layer_quant_mode.has_fp4_kv_cache():
             return 1 / 2
         elif layer_quant_mode.has_fp8_kv_cache(
         ) or layer_quant_mode.has_int8_kv_cache():

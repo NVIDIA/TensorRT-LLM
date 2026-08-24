@@ -63,6 +63,21 @@ def test_flashinfer_preserves_legacy_pool_scaling() -> None:
     assert _get_total_num_blocks(manager, kv_factor=2) == 1024 * 36 * 2
 
 
+def test_mixed_kv_uses_shared_block_table_for_selected_pool() -> None:
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: SimpleNamespace(local_layer_idx=1)
+    tables = torch.arange(2 * 4 * 3, dtype=torch.int32).view(2, 4, 3)
+    metadata = SimpleNamespace(
+        mixed_kv_cache_block_offsets=tables,
+        host_kv_cache_pool_mapping=torch.tensor([[0, 0], [1, 0]], dtype=torch.int32),
+    )
+
+    selected = fmha._get_mixed_block_tables(metadata, batch_start=1, batch_size=2)
+
+    assert torch.equal(selected, tables[1, 1:3])
+    assert selected.is_contiguous()
+
+
 def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:
     # The kernel keeps one counter per head per decoder sequence. Sizing off the
     # request count alone under-allocates under beam search, but only once the

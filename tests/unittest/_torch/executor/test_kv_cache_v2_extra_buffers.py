@@ -157,6 +157,59 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
             mgr.shutdown()
             del mgr
 
+    def test_fp8_k_nvfp4_v_uses_asymmetric_buffers(self):
+        kwargs = _make_kwargs(
+            dtype=DataType.NVFP4,
+            num_layers=1,
+            num_kv_heads=4,
+            head_dim=128,
+            tokens_per_block=64,
+            max_tokens=1024,
+        )
+        kwargs["kv_cache_config"] = KvCacheConfigV2(
+            max_tokens=1024,
+            enable_block_reuse=False,
+            dtype="fp8_k_nvfp4_v",
+        )
+        mgr = KVCacheManagerV2(**kwargs)
+        try:
+            layer = mgr.kv_cache_manager_py_config.layers[0]
+            self.assertEqual(
+                [buffer.role for buffer in layer.buffers],
+                [Role.KEY, Role.VALUE, Role.VALUE_BLOCK_SCALE],
+            )
+
+            # Four 128-wide heads require 512 B for FP8 K, 256 B for
+            # packed NVFP4 V, and 32 B for one E4M3 scale per 16 V values.
+            self.assertEqual(mgr.get_layer_bytes_per_token(0, Role.KEY), 512)
+            self.assertEqual(mgr.get_layer_bytes_per_token(0, Role.VALUE), 256)
+            self.assertEqual(mgr.get_layer_bytes_per_token(0, Role.VALUE_BLOCK_SCALE), 32)
+            self.assertEqual(mgr.get_layer_bytes_per_token(0, Role.ALL), 800)
+
+            buffers = mgr.get_fp8_k_nvfp4_v_buffers(0)
+            self.assertEqual(buffers.key.dtype, torch.float8_e4m3fn)
+            self.assertEqual(buffers.value.dtype, torch.uint8)
+            self.assertEqual(buffers.value_scale.dtype, torch.float8_e4m3fn)
+            self.assertEqual(tuple(buffers.key.shape[1:]), (4, 64, 128))
+            self.assertEqual(tuple(buffers.value.shape[1:]), (4, 64, 64))
+            self.assertEqual(tuple(buffers.value_scale.shape[1:]), (4, 64, 8))
+
+            converters = [
+                mgr.impl.get_page_index_converter(0, role)
+                for role in (Role.KEY, Role.VALUE, Role.VALUE_BLOCK_SCALE)
+            ]
+            self.assertTrue(all(converter.expansion == 1 for converter in converters))
+            self.assertTrue(
+                all(
+                    converter.scale == converters[0].scale
+                    and converter.layer_offset == converters[0].layer_offset
+                    for converter in converters[1:]
+                )
+            )
+        finally:
+            mgr.shutdown()
+            del mgr
+
     def test_page_table_uses_physical_pool_representative(self):
         mgr = KVCacheManagerV2(**_make_kwargs(head_dim=[64, 192, 64, 192]))
         real_impl = mgr.impl

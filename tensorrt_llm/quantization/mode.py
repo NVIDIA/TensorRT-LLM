@@ -40,6 +40,7 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
     INT8 = auto()
     MIXED_PRECISION = auto()
     NVFP4 = auto()
+    FP8_K_NVFP4_V = auto()
     W4A8_NVFP4_FP8 = auto()
     W4A8_MXFP4_FP8 = auto()
     W4A8_MXFP4_MXFP8 = auto()
@@ -52,7 +53,12 @@ class QuantAlgo(StrEnum, metaclass=BaseEnumMeta):
 
 
 QUANT_ALGO_LIST = list(set(QuantAlgo) - {QuantAlgo.INT8})
-KV_CACHE_QUANT_ALGO_LIST = [QuantAlgo.FP8, QuantAlgo.INT8, QuantAlgo.NVFP4]
+KV_CACHE_QUANT_ALGO_LIST = [
+    QuantAlgo.FP8,
+    QuantAlgo.INT8,
+    QuantAlgo.NVFP4,
+    QuantAlgo.FP8_K_NVFP4_V,
+]
 W8A8_SQ_PLUGIN_LIST = [
     QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN,
     QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN,
@@ -103,6 +109,8 @@ class QuantMode(IntFlag):
     W4A16_MXFP4 = auto()
     # MXFP8 weights (e4m3 + UE8M0 1x32 block scales) with MXFP8 dynamic activations (W8A8).
     MXFP8 = auto()
+    # FP8 key cache with an NVFP4 value cache.
+    FP8_K_NVFP4_V_KV_CACHE = auto()
 
     # The smallest power-of-two that is not used by a flag. Do not call auto() after that line.
     COUNT = auto()
@@ -175,9 +183,12 @@ class QuantMode(IntFlag):
     def has_fp4_kv_cache(self):
         return self._any(self.NVFP4_KV_CACHE)
 
+    def has_fp8_k_nvfp4_v_kv_cache(self):
+        return self._any(self.FP8_K_NVFP4_V_KV_CACHE)
+
     def has_kv_cache_quant(self):
         return (self.has_int8_kv_cache() or self.has_fp8_kv_cache()
-                or self.has_fp4_kv_cache())
+                or self.has_fp4_kv_cache() or self.has_fp8_k_nvfp4_v_kv_cache())
 
     def has_fp8_qdq(self):
         return self._any(self.FP8_QDQ)
@@ -227,7 +238,8 @@ class QuantMode(IntFlag):
             return has_quant
 
         return has_quant | self._any(self.INT8_KV_CACHE | self.FP8_KV_CACHE
-                                     | self.NVFP4_KV_CACHE)
+                                     | self.NVFP4_KV_CACHE
+                                     | self.FP8_K_NVFP4_V_KV_CACHE)
 
     def set_int8_kv_cache(self):
         return self | self.INT8_KV_CACHE
@@ -237,6 +249,9 @@ class QuantMode(IntFlag):
 
     def set_fp4_kv_cache(self):
         return self | self.NVFP4_KV_CACHE
+
+    def set_fp8_k_nvfp4_v_kv_cache(self):
+        return self | self.FP8_K_NVFP4_V_KV_CACHE
 
     def set_fp8_qdq(self):
         return self | self.FP8_QDQ
@@ -452,6 +467,8 @@ class QuantMode(IntFlag):
             quant_mode = quant_mode.set_fp8_kv_cache()
         elif kv_cache_quant_algo == QuantAlgo.NVFP4:
             quant_mode = quant_mode.set_fp4_kv_cache()
+        elif kv_cache_quant_algo == QuantAlgo.FP8_K_NVFP4_V:
+            quant_mode = quant_mode.set_fp8_k_nvfp4_v_kv_cache()
 
         return quant_mode
 

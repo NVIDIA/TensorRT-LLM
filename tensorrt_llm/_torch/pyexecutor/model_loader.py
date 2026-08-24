@@ -53,9 +53,10 @@ _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
+    "fp8_k_nvfp4_v": QuantAlgo.FP8_K_NVFP4_V.value,
     "auto": "auto"
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "fp8_k_nvfp4_v", "auto")
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.

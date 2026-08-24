@@ -213,6 +213,82 @@ private:
     }
 };
 
+// Paged cache view for asymmetric FP8-K/NVFP4-V storage. K and V use
+// independent pools and byte strides while sharing the usual two-lane block
+// table. Active attention pages are always resident in the primary GPU tier.
+struct MixedKVBlockArray
+{
+    using DataType = KVBlockArrayForContextFMHA::DataType;
+
+    int32_t mMaxSeqs{};
+    int32_t mMaxBlocksPerSeq{};
+    int32_t mTokensPerBlock{};
+    int32_t mTokensPerBlockLog2{};
+    int32_t mBytesPerKBlock{};
+    int32_t mBytesPerVBlock{};
+    void* mKPoolPtr{};
+    void* mVPoolPtr{};
+    DataType* data{};
+
+    MixedKVBlockArray() = default;
+
+    MixedKVBlockArray(int32_t batchSize, int32_t maxBlocksPerSeq, int32_t tokensPerBlock, int32_t bytesPerKToken,
+        int32_t bytesPerVToken, void* kPoolPtr, void* vPoolPtr, DataType* blockOffsets)
+        : mMaxSeqs(batchSize)
+        , mMaxBlocksPerSeq(maxBlocksPerSeq)
+        , mTokensPerBlock(tokensPerBlock)
+        , mBytesPerKBlock(tokensPerBlock * bytesPerKToken)
+        , mBytesPerVBlock(tokensPerBlock * bytesPerVToken)
+        , mKPoolPtr(kPoolPtr)
+        , mVPoolPtr(vPoolPtr)
+        , data(blockOffsets)
+    {
+        float const log2TokensPerBlock = log2(mTokensPerBlock);
+        TLLM_CHECK_WITH_INFO(
+            ceil(log2TokensPerBlock) == floor(log2TokensPerBlock), "tokensPerBlock must be a power of two");
+        mTokensPerBlockLog2 = static_cast<int32_t>(log2TokensPerBlock);
+    }
+
+    __host__ __device__ [[nodiscard]] DataType const* getRowPtr(KVIdxType kvIdx, int32_t seqIdx) const
+    {
+        return data + (seqIdx * mMaxBlocksPerSeq * 2 + static_cast<int32_t>(kvIdx) * mMaxBlocksPerSeq);
+    }
+
+    __host__ __device__ [[nodiscard]] void* getBlockPtr(int32_t seqIdx, int32_t tokenIdx, KVIdxType kvIdx) const
+    {
+        auto const pageIndex = getRowPtr(kvIdx, seqIdx)[tokenIdx >> mTokensPerBlockLog2];
+        auto* pool = kvIdx == KVIdxType::K_IDX ? mKPoolPtr : mVPoolPtr;
+        auto const bytesPerBlock = kvIdx == KVIdxType::K_IDX ? mBytesPerKBlock : mBytesPerVBlock;
+        return reinterpret_cast<char*>(pool) + pageIndex.get() * static_cast<uint64_t>(bytesPerBlock);
+    }
+
+    __host__ __device__ [[nodiscard]] void* getKBlockPtr(int32_t seqIdx, int32_t tokenIdx) const
+    {
+        return getBlockPtr(seqIdx, tokenIdx, KVIdxType::K_IDX);
+    }
+
+    __host__ __device__ [[nodiscard]] void* getVBlockPtr(int32_t seqIdx, int32_t tokenIdx) const
+    {
+        return getBlockPtr(seqIdx, tokenIdx, KVIdxType::V_IDX);
+    }
+
+    __host__ __device__ [[nodiscard]] int32_t getKVTokenIdx(int32_t tokenIdx) const
+    {
+        return tokenIdx;
+    }
+
+    __host__ __device__ [[nodiscard]] int32_t getLocalIdx(int32_t tokenIdx) const
+    {
+        return tokenIdx & ((1 << mTokensPerBlockLog2) - 1);
+    }
+
+    __host__ __device__ [[nodiscard]] int32_t getKVLocalIdx(
+        int32_t tokenIdx, int32_t headIdx, int32_t dimsPerHead, int32_t channelIdx) const
+    {
+        return headIdx * mTokensPerBlock * dimsPerHead + getLocalIdx(tokenIdx) * dimsPerHead + channelIdx;
+    }
+};
+
 // Struct operates on contiguous kv cache providing
 // functions for accessing specific elements in K and V caches
 struct KVLinearBuffer

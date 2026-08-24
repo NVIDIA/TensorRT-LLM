@@ -209,6 +209,7 @@ if IS_FLASHINFER_AVAILABLE:
 
 
 _SUPPORTED_MLA_BACKENDS = {"cute-dsl", "trtllm-gen"}
+_FP8_K_NVFP4_V_DTYPE = "fp8_k_nvfp4_v"
 
 
 def _get_mla_backend(backend: str) -> str:
@@ -466,7 +467,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
     # Supported data types
     SUPPORTED_INPUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
-    SUPPORTED_KV_CACHE_DTYPES = {DataType.HALF, DataType.BF16, DataType.FP8, DataType.NVFP4}
+    SUPPORTED_KV_CACHE_DTYPES = {
+        DataType.HALF,
+        DataType.BF16,
+        DataType.FP8,
+        DataType.NVFP4,
+        _FP8_K_NVFP4_V_DTYPE,
+    }
     SUPPORTED_OUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
 
     # Supported Q:KV:O dtype combinations for trtllm-gen kernels
@@ -481,6 +488,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
         (torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
         (torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
+        (torch.float8_e4m3fn, _FP8_K_NVFP4_V_DTYPE, torch.bfloat16),
     }
     SUPPORTED_DTYPE_COMBOS_GENERATION = {
         (torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
@@ -494,6 +502,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (torch.float8_e4m3fn, DataType.NVFP4, torch.float8_e4m3fn),
         (torch.float8_e4m3fn, DataType.NVFP4, torch.float16),
         (torch.float8_e4m3fn, DataType.NVFP4, torch.bfloat16),
+        (torch.float8_e4m3fn, _FP8_K_NVFP4_V_DTYPE, torch.bfloat16),
     }
 
     # 96 is excluded because trtllm-gen does not ship context kernels for it.
@@ -529,6 +538,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         # Lazily set on the first forward() call from the query device.
         self._multi_processor_count: Optional[int] = None
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+        self._mixed_kv_cache_buffers = None
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -595,7 +605,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         ):
             return None, None
 
-        if kv_cache_quant_mode.has_fp4_kv_cache():
+        if (
+            kv_cache_quant_mode.has_fp4_kv_cache()
+            or kv_cache_quant_mode.has_fp8_k_nvfp4_v_kv_cache()
+        ):
             assert kv_scale_orig_quant.size(0) == 3, (
                 f"kv_scale_orig_quant must have size(0)==3 for FP4, got {kv_scale_orig_quant.size(0)}"
             )
@@ -608,11 +621,36 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     @staticmethod
     def _get_kv_cache_dtype(
         meta: "TrtllmAttentionMetadata",
-    ) -> Optional[DataType]:
+    ) -> Optional[DataType | str]:
         kv_cache_manager = meta.kv_cache_manager
         if kv_cache_manager is not None:
+            if getattr(kv_cache_manager, "is_fp8_k_nvfp4_v", False):
+                return _FP8_K_NVFP4_V_DTYPE
             return kv_cache_manager.dtype
         return None
+
+    def _get_mixed_kv_cache(self, meta: "TrtllmAttentionMetadata"):
+        manager = meta.kv_cache_manager
+        if manager is None or not getattr(manager, "is_fp8_k_nvfp4_v", False):
+            return None
+        if self._mixed_kv_cache_buffers is None:
+            self._mixed_kv_cache_buffers = manager.get_fp8_k_nvfp4_v_buffers(
+                self.attn.local_layer_idx
+            )
+        return self._mixed_kv_cache_buffers
+
+    def _get_mixed_block_tables(
+        self,
+        meta: "TrtllmAttentionMetadata",
+        batch_start: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        tables = meta.mixed_kv_cache_block_offsets
+        mapping = meta.host_kv_cache_pool_mapping
+        if tables is None or mapping is None:
+            raise RuntimeError("FP8-K/NVFP4-V requires shared mixed-KV block tables.")
+        pool_index = int(mapping[self.attn.local_layer_idx, 0])
+        return tables[pool_index].narrow(0, batch_start, batch_size)
 
     @staticmethod
     def _get_bmm1_scale(attn: "TrtllmAttention") -> float:
@@ -801,14 +839,22 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         is_fp4_out = output.dtype == torch.uint8
         has_fp8_kv = kv_cache_dtype == DataType.FP8
         has_fp4_kv = kv_cache_dtype == DataType.NVFP4
+        has_mixed_kv = kv_cache_dtype == _FP8_K_NVFP4_V_DTYPE
         fp8_context_fmha = (
-            is_fp8_out or is_fp4_out or has_fp4_kv or (has_fp8_kv and has_context_phase)
+            is_fp8_out
+            or is_fp4_out
+            or has_fp4_kv
+            or has_mixed_kv
+            or (has_fp8_kv and has_context_phase)
         )
-        if has_fp4_kv or fp8_context_fmha:
+        if has_fp4_kv or has_mixed_kv or fp8_context_fmha:
             q_dtype = torch.float8_e4m3fn
 
         if kv_cache_dtype not in self.SUPPORTED_KV_CACHE_DTYPES:
-            return False, f"KV cache dtype {kv_cache_dtype}. Supported: FP16, BF16, FP8, NVFP4."
+            return False, (
+                f"KV cache dtype {kv_cache_dtype}. Supported: FP16, BF16, FP8, "
+                "NVFP4, FP8-K/NVFP4-V."
+            )
         if o_dtype not in self.SUPPORTED_OUT_DTYPES:
             return False, f"output dtype {o_dtype}. Supported: FP16, BF16, FP8."
 
@@ -845,10 +891,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                     f"must be >= {self.MIN_TOKENS_PER_BLOCK}."
                 )
             heads_ratio = attn.num_heads // attn.num_kv_heads
-            if not is_mla_enable and heads_ratio > self.MAX_HEADS_RATIO_GENERATION:
+            max_heads_ratio = 64 if has_mixed_kv else self.MAX_HEADS_RATIO_GENERATION
+            if not is_mla_enable and heads_ratio > max_heads_ratio:
                 return False, (
                     f"[Generation] heads ratio ({heads_ratio}) exceeding maximum "
-                    f"({self.MAX_HEADS_RATIO_GENERATION})."
+                    f"({max_heads_ratio})."
                 )
             if has_alibi:
                 return False, "[Generation] ALiBi."
@@ -881,6 +928,23 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
 
+        if has_mixed_kv:
+            if is_mla_enable or meta.is_cross:
+                return False, "FP8-K/NVFP4-V with MLA or cross attention."
+            if attn.head_dim not in (128, 256):
+                return False, f"FP8-K/NVFP4-V head size {attn.head_dim}; supported: 128, 256."
+            if tokens_per_block != 64:
+                return False, "FP8-K/NVFP4-V requires tokens_per_block=64."
+            if self._get_attention_chunk_size(attn) != 0:
+                return False, "FP8-K/NVFP4-V with chunked attention."
+            if (
+                fwd.attention_window_size is not None
+                and 0 < fwd.attention_window_size < meta.max_seq_len
+            ):
+                return False, "FP8-K/NVFP4-V with sliding-window attention."
+            if fwd.attention_sinks is not None:
+                return False, "FP8-K/NVFP4-V with attention sinks."
+
         return True, ""
 
     @staticmethod
@@ -911,6 +975,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 kv_cache_quant_mode.has_fp8_kv_cache()
                 and attention_input_type != AttentionInputType.generation_only
             )
+            or kv_cache_quant_mode.has_fp8_k_nvfp4_v_kv_cache()
         )
 
     def prepare_workspace(
@@ -1082,6 +1147,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attention_chunk_size = self._get_attention_chunk_size(attn)
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
+        mixed_kv_cache = self._get_mixed_kv_cache(meta)
         (
             q_processed,
             kv_pool,
@@ -1140,12 +1206,17 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             True,  # need_build_kv_cache_metadata
             fwd.cross_kv,  # cross_kv
             params.is_cross,  # is_cross
+            mixed_kv_cache.key if mixed_kv_cache is not None else None,
+            mixed_kv_cache.value if mixed_kv_cache is not None else None,
+            mixed_kv_cache.value_scale if mixed_kv_cache is not None else None,
         )
 
-        has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
+        quant_mode = QuantMode(attn.quant_mode)
+        has_fp4_kv = quant_mode.has_fp4_kv_cache()
+        has_mixed_kv = quant_mode.has_fp8_k_nvfp4_v_kv_cache()
         if has_fp4_kv and kv_scale_pool is None:
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or fp8_context_fmha:
+        if has_fp4_kv or has_mixed_kv or fp8_context_fmha:
             q_processed = (
                 q_processed.view(torch.uint8)
                 .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
@@ -1161,9 +1232,19 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
+        if has_mixed_kv:
+            assert mixed_kv_cache is not None
+            kv_cache = (mixed_kv_cache.key, mixed_kv_cache.value)
+            kv_cache_sf = (None, mixed_kv_cache.value_scale)
+            block_tables = self._get_mixed_block_tables(meta, 0, params.batch_size)
+            uses_shared_paged_kv_idx = True
+        else:
+            kv_cache = (kv_pool, kv_pool)
+            kv_cache_sf = (kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None
+            uses_shared_paged_kv_idx = self.USE_SHARED_PAGED_KV_IDX
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
+            kv_cache=kv_cache,
             workspace_buffer=fmha_workspace,
             block_tables=block_tables,
             seq_lens=params.sequence_lengths,
@@ -1179,8 +1260,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             kv_layout=self._layout,
             enable_pdl=self._enable_pdl,
             sinks=fwd.attention_sinks,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            kv_cache_sf=kv_cache_sf,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             causal=causal,
             multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
@@ -1241,6 +1322,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
         batch_beam = params.num_requests * meta.beam_width
+        mixed_kv_cache = self._get_mixed_kv_cache(meta)
         (
             q_processed,
             kv_pool,
@@ -1298,16 +1380,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.kv_factor,  # kv_factor
             True,  # need_build_kv_cache_metadata
             params.is_cross,  # is_cross
+            mixed_kv_cache.key if mixed_kv_cache is not None else None,
+            mixed_kv_cache.value if mixed_kv_cache is not None else None,
+            mixed_kv_cache.value_scale if mixed_kv_cache is not None else None,
         )
 
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length
         decode_max_q_len = max_q_len if is_multi_token_gen else None
         decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
 
-        has_fp4_kv = QuantMode(attn.quant_mode).has_fp4_kv_cache()
+        quant_mode = QuantMode(attn.quant_mode)
+        has_fp4_kv = quant_mode.has_fp4_kv_cache()
+        has_mixed_kv = quant_mode.has_fp8_k_nvfp4_v_kv_cache()
         if has_fp4_kv and kv_scale_pool is None:
             raise RuntimeError("trtllm-gen FP4 KV cache requires KV scale pool.")
-        if has_fp4_kv or fp8_context_fmha:
+        if has_fp4_kv or has_mixed_kv or fp8_context_fmha:
             q_processed = (
                 q_processed.view(torch.uint8)
                 .flatten()[: params.num_tokens * attn.num_heads * attn.head_dim]
@@ -1319,9 +1406,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         gen_bmm2_scale = bmm2_scale if fp8_context_fmha and bmm2_scale is not None else 1.0
 
+        if has_mixed_kv:
+            assert mixed_kv_cache is not None
+            kv_cache = (mixed_kv_cache.key, mixed_kv_cache.value)
+            kv_cache_sf = (None, mixed_kv_cache.value_scale)
+            block_tables = self._get_mixed_block_tables(meta, params.seq_offset, batch_beam)
+            uses_shared_paged_kv_idx = True
+        else:
+            kv_cache = (kv_pool, kv_pool)
+            kv_cache_sf = (kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None
+            uses_shared_paged_kv_idx = self.USE_SHARED_PAGED_KV_IDX
+
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
+            kv_cache=kv_cache,
             workspace_buffer=fmha_workspace,
             block_tables=block_tables,
             seq_lens=params.sequence_lengths,
@@ -1337,8 +1435,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             q_len_per_req=q_len_per_req,
             max_q_len=decode_max_q_len,
             cum_seq_lens_q=decode_cu_seqlens,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            kv_cache_sf=kv_cache_sf,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             bmm1_scale_log2=(
                 _get_bmm1_scale_log2(gen_bmm1_scale)
                 if isinstance(gen_bmm1_scale, torch.Tensor)

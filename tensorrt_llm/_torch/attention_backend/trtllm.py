@@ -162,6 +162,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     # Block offsets for the target and draft KV caches
     kv_cache_block_offsets: Optional[torch.Tensor] = None
+    mixed_kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
     # Active block-ID buffers, defaulting to the target cache. Separate draft
@@ -395,6 +396,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
+            if getattr(self.kv_cache_manager, "is_fp8_k_nvfp4_v", False):
+                self.mixed_kv_cache_block_offsets = self.get_empty(
+                    buffers,
+                    [
+                        num_attention_op_pools,
+                        self.max_num_sequences,
+                        self.kv_cache_manager.max_blocks_per_seq,
+                    ],
+                    cache_name="mixed_kv_cache_block_offsets",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
+            else:
+                self.mixed_kv_cache_block_offsets = None
             self.host_kv_cache_block_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
@@ -780,6 +795,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.num_contexts,
                 self.num_seqs,
                 max_blocks=max_blocks)
+            if self.mixed_kv_cache_block_offsets is not None:
+                self.mixed_kv_cache_block_offsets[:, :self.num_seqs].copy_(
+                    self.kv_cache_block_offsets[:, :self.num_seqs, 0],
+                    non_blocking=True,
+                )
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
@@ -846,6 +866,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.num_contexts,
             num_seqs,
             max_blocks=max_blocks)
+        if self.mixed_kv_cache_block_offsets is not None:
+            self.mixed_kv_cache_block_offsets[:, :num_seqs].copy_(
+                self.kv_cache_block_offsets[:, :num_seqs, 0],
+                non_blocking=True,
+            )
         self._bind_runtime_views(
             kv_lens_cuda=self.kv_lens_cuda[:num_seqs],
             kv_lens=kv_lens,

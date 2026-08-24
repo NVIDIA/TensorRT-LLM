@@ -136,6 +136,12 @@ class Role:
     ALL = DataRole("all")
 
 
+class MixedKvCacheBuffers(NamedTuple):
+    key: torch.Tensor
+    value: torch.Tensor
+    value_scale: torch.Tensor
+
+
 class BlockReusePolicy(StrEnum):
     ALL_REUSABLE = "all_reusable"
     PER_REQUEST = "per_request"
@@ -361,6 +367,10 @@ def _get_static_cache_size_layer_components(
         layer_size = cache_size_per_token
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
         layer_size = math.ceil(cache_size_per_token / 2) + math.ceil(cache_size_per_token / 16)
+    elif quant_config is not None and quant_config.quant_mode.has_fp8_k_nvfp4_v_kv_cache():
+        key_elements = head_dim
+        value_elements = head_dim
+        layer_size = key_elements + math.ceil(value_elements / 2) + math.ceil(value_elements / 16)
     else:
         assert quant_config is None or (not quant_config.quant_mode.has_kv_cache_quant()), (
             "Quantized kv cache is not expected"
@@ -803,6 +813,7 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self.is_fp8_k_nvfp4_v = kv_cache_config.dtype == "fp8_k_nvfp4_v"
         self.is_disagg = is_disagg
 
         assert kv_connector_manager is None, (
@@ -874,7 +885,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
-        self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
+        self.kv_factor = (
+            1 if kv_cache_type == CacheTypeCpp.SELFKONLY or self.is_fp8_k_nvfp4_v else 2
+        )
         from ..speculative import get_num_extra_kv_tokens
 
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
@@ -1276,6 +1289,41 @@ class KVCacheManagerV2(BaseResourceManager):
         An overridable hook for subclasses whose pools coalesce extra
         per-layer buffers alongside K/V.
         """
+        if self.is_fp8_k_nvfp4_v:
+            # Mixed cache tensors are exposed directly through
+            # get_fp8_k_nvfp4_v_buffers(). Keep the legacy pointer metadata
+            # valid for scheduler plumbing, but do not pretend K and V share
+            # one scalar pool layout.
+            pool_pointers = []
+            for pool_id in range(self.num_pools):
+                layer_id = self._pool_layer_ids_by_role[(pool_id, Role.KEY)]
+                pool_pointers.append(
+                    [
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY, PageIndexMode.SHARED
+                        ),
+                        0,
+                    ]
+                )
+            pool_mapping = [
+                [self.impl.get_layer_group_id(LayerId(layer_id)), 0]
+                for layer_id in range(self.num_local_layers)
+            ]
+            return (
+                torch.tensor(
+                    pool_pointers,
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                ),
+                torch.tensor(
+                    pool_mapping,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                ),
+            )
+
         kv_cache_pool_pointers_list = []
         kv_cache_pool_mapping_list = []
         block_scale_pool_pointers_list = []
@@ -1422,8 +1470,36 @@ class KVCacheManagerV2(BaseResourceManager):
         for pool_id in range(self.num_pools):
             role_a, role_b = self._get_pool_roles(pool_id)
             layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
-            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, role_a)
-            if role_b is not None:
+            key_converter = self.impl.get_page_index_converter(layer_id, role_a)
+            if key_converter.expansion != 1:
+                raise NotImplementedError(
+                    "Attention block tables do not support expanded K page indices."
+                )
+            self.index_scales[pool_id] = key_converter.scale
+            if self.is_fp8_k_nvfp4_v:
+                assert role_b is not None
+                value_layer_id = self._pool_layer_ids_by_role[(pool_id, role_b)]
+                value_converter = self.impl.get_page_index_converter(value_layer_id, role_b)
+                scale_layer_id = self._pool_layer_ids_by_role[(pool_id, Role.VALUE_BLOCK_SCALE)]
+                scale_converter = self.impl.get_page_index_converter(
+                    scale_layer_id, Role.VALUE_BLOCK_SCALE
+                )
+                converters = (key_converter, value_converter, scale_converter)
+                if any(converter.expansion != 1 for converter in converters):
+                    raise NotImplementedError(
+                        "Mixed KV cache does not support expanded page indices."
+                    )
+                if any(
+                    converter.scale != key_converter.scale
+                    or converter.layer_offset != key_converter.layer_offset
+                    for converter in converters[1:]
+                ):
+                    raise RuntimeError(
+                        "FP8-K/NVFP4-V requires K, V, and V-scale buffers to "
+                        "share one page-index conversion."
+                    )
+                self.kv_offset[pool_id] = 0
+            elif role_b is not None:
                 self.kv_offset[pool_id] = exact_div(
                     self.impl.get_mem_pool_base_address(layer_id, role_b, PageIndexMode.SHARED)
                     - self.impl.get_mem_pool_base_address(layer_id, role_a, PageIndexMode.SHARED),
@@ -1913,7 +1989,16 @@ class KVCacheManagerV2(BaseResourceManager):
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             buffer_type.append(Role.VALUE)
-        if kv_cache_config.dtype == "nvfp4":
+        if self.is_fp8_k_nvfp4_v:
+            if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
+                raise NotImplementedError("FP8-K/NVFP4-V does not support K-only caches.")
+            for layer_idx, hd in enumerate(self.head_dim_per_layer):
+                assert hd % 16 == 0, (
+                    "head_dim must be divisible by 16 for FP8-K/NVFP4-V, "
+                    f"but layer {layer_idx} has head_dim={hd}"
+                )
+            buffer_type.append(Role.VALUE_BLOCK_SCALE)
+        elif kv_cache_config.dtype == "nvfp4":
             for layer_idx, hd in enumerate(self.head_dim_per_layer):
                 assert hd % 2 == 0, (
                     f"head_dim must be divisible by 2 for nvfp4 kv cache, but layer {layer_idx} has head_dim={hd}"
@@ -2044,6 +2129,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.impl.get_page_index_upper_bound(0, Role.KEY)
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        if self.is_fp8_k_nvfp4_v:
+            raise RuntimeError(
+                "FP8-K/NVFP4-V uses independent cache tensors; call get_fp8_k_nvfp4_v_buffers()."
+            )
         layer_offset = self.layer_offsets[layer_idx]
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -2087,6 +2176,60 @@ class KVCacheManagerV2(BaseResourceManager):
                 dtype,
                 shape,
             )
+        )
+
+    def _get_mixed_role_buffer(
+        self,
+        layer_idx: int,
+        role: DataRole,
+        dtype: torch.dtype,
+        container_head_dim: int,
+    ) -> torch.Tensor:
+        layer_offset = self.layer_offsets[layer_idx]
+        addr = self.impl.get_mem_pool_base_address(layer_offset, role, PageIndexMode.SHARED)
+        page_stride = self.impl.get_page_stride(layer_offset, role)
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, role)
+        expected_stride = (
+            self.num_kv_heads_per_layer[layer_offset]
+            * self.tokens_per_block
+            * container_head_dim
+            * torch.empty((), dtype=dtype).element_size()
+        )
+        assert page_stride == expected_stride, (
+            f"Mixed KV page stride mismatch for layer {layer_idx}, role={role}: "
+            f"expected {expected_stride}, got {page_stride}"
+        )
+        shape = [
+            page_upper,
+            self.num_kv_heads_per_layer[layer_offset],
+            self.tokens_per_block,
+            container_head_dim,
+        ]
+        return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
+
+    def get_fp8_k_nvfp4_v_buffers(self, layer_idx: int) -> MixedKvCacheBuffers:
+        if not self.is_fp8_k_nvfp4_v:
+            raise RuntimeError("KV cache is not configured as FP8-K/NVFP4-V.")
+        layer_offset = self.layer_offsets[layer_idx]
+        head_dim = self.head_dim_per_layer[layer_offset]
+        key_converter = self.impl.get_page_index_converter(layer_offset, Role.KEY)
+        value_converter = self.impl.get_page_index_converter(layer_offset, Role.VALUE)
+        scale_converter = self.impl.get_page_index_converter(layer_offset, Role.VALUE_BLOCK_SCALE)
+        assert (
+            key_converter.scale == value_converter.scale == scale_converter.scale
+            and key_converter.layer_offset
+            == value_converter.layer_offset
+            == scale_converter.layer_offset
+        ), "Mixed K, V, and V scales must use identical page indices"
+        return MixedKvCacheBuffers(
+            key=self._get_mixed_role_buffer(layer_idx, Role.KEY, torch.float8_e4m3fn, head_dim),
+            value=self._get_mixed_role_buffer(layer_idx, Role.VALUE, torch.uint8, head_dim // 2),
+            value_scale=self._get_mixed_role_buffer(
+                layer_idx,
+                Role.VALUE_BLOCK_SCALE,
+                torch.float8_e4m3fn,
+                head_dim // 16,
+            ),
         )
 
     def get_index_k_buffer(
@@ -3669,7 +3812,9 @@ class KVCacheManagerV2(BaseResourceManager):
         data_roles = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
             data_roles.append(Role.VALUE)
-        if self.dtype == DataType.NVFP4:
+        if self.is_fp8_k_nvfp4_v:
+            data_roles.append(Role.VALUE_BLOCK_SCALE)
+        elif self.dtype == DataType.NVFP4:
             data_roles.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 data_roles.append(Role.VALUE_BLOCK_SCALE)
@@ -3689,6 +3834,28 @@ class KVCacheManagerV2(BaseResourceManager):
             DataType.NVFP4,
         ):
             raise ValueError(f"Cannot support {self.dtype} KV cache.")
+
+        if self.is_fp8_k_nvfp4_v:
+            elements = (
+                self.num_kv_heads_per_layer[local_layer_idx]
+                * self.head_dim_per_layer[local_layer_idx]
+            )
+            if data_role == Role.KEY:
+                return get_size_in_bytes(elements, DataType.FP8)
+            if data_role == Role.VALUE:
+                return get_size_in_bytes(elements, DataType.NVFP4)
+            if data_role == Role.VALUE_BLOCK_SCALE:
+                return self.calculate_scaling_factor_size_bytes(
+                    elements,
+                    quant_vector_size=16,
+                    scaling_factor_dtype=DataType.FP8,
+                )
+            if data_role == Role.ALL:
+                return sum(
+                    self.get_layer_bytes_per_token(local_layer_idx, role)
+                    for role in (Role.KEY, Role.VALUE, Role.VALUE_BLOCK_SCALE)
+                )
+            raise ValueError(f"Invalid mixed KV data role: {data_role}")
 
         if data_role == Role.ALL:
             kv_factor = self.kv_factor
@@ -3741,6 +3908,13 @@ class KVCacheManagerV2(BaseResourceManager):
         return get_size_in_bytes(cache_size // quant_vector_size, scaling_factor_dtype)
 
     def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
+        if self.is_fp8_k_nvfp4_v:
+            for layer_id in self.layer_offsets:
+                buffers = self.get_fp8_k_nvfp4_v_buffers(layer_id)
+                yield buffers.key
+                yield buffers.value
+                yield buffers.value_scale
+            return
         pool_handled = set()
         for layer_id, layer_offset in self.layer_offsets.items():
             pool_id = self.layer_to_pool_mapping_dict[layer_offset]

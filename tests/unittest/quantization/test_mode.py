@@ -16,7 +16,7 @@ import unittest
 
 import pytest
 
-from tensorrt_llm.quantization import QuantMode
+from tensorrt_llm.quantization import QuantAlgo, QuantMode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -46,7 +46,14 @@ class TestQuantMode(unittest.TestCase):
 
     def test_count(self):
         # Make sure the COUNT value is as expected - change that test if you add a new flag.
-        self.assertEqual(QuantMode.COUNT.value, 1 << 19)
+        self.assertEqual(QuantMode.COUNT.value, 1 << 20)
+
+    def test_fp8_k_nvfp4_v_kv_cache(self):
+        qm = QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.FP8_K_NVFP4_V)
+        self.assertTrue(qm.has_fp8_k_nvfp4_v_kv_cache())
+        self.assertTrue(qm.has_kv_cache_quant())
+        self.assertFalse(qm.has_fp8_kv_cache())
+        self.assertFalse(qm.has_fp4_kv_cache())
 
     def test_from_description(self):
         # Test weight only.

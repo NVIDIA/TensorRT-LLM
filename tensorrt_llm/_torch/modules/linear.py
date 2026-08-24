@@ -555,12 +555,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         weight_shape = (out_features, in_features)
         module.weight = Parameter(torch.empty(weight_shape, dtype=dtype),
                                   requires_grad=False)
-        if (module.quant_config is not None
-                and module.quant_config.layer_quant_mode.has_fp4_kv_cache()
+        if (module.quant_config is not None and
+            (module.quant_config.layer_quant_mode.has_fp4_kv_cache() or
+             module.quant_config.layer_quant_mode.has_fp8_k_nvfp4_v_kv_cache())
                 and module.weights_loading_config.weight_mode
                 == WeightMode.FUSED_QKV_LINEAR):
-            # KV-only FP4 cache override can run with unquantized fused QKV weights.
-            # Attention still expects KV cache scales in this mode.
+            # Quantized V-cache overrides can run with unquantized fused QKV
+            # weights. Attention still expects Q/K/V cache scales in this mode.
             module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                          requires_grad=False)
             module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
