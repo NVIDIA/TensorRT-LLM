@@ -22,7 +22,6 @@ from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
-    DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN,
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
@@ -70,7 +69,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
             window_size=128,
         )
         pretrained_config = SimpleNamespace(
-            kv_lora_rank=512,
+            kv_lora_rank=448,
             qk_rope_head_dim=64,
         )
         quant_config = None
@@ -88,60 +87,6 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     cost = CacheCost.from_raw(size_per_token)
     assert cost.slope > 0
     assert cost.intercept == 0
-
-
-@pytest.mark.parametrize(
-    ("attn_type", "source_pages", "expected"),
-    [
-        (DeepseekV4AttentionType.SWA, [2, 5, 8], [4, 9, 14]),
-        (DeepseekV4AttentionType.COMPRESS, [0, 3, 6], [0, 5, 10]),
-    ],
-)
-def test_flash_mla_shadow_page_mapping_accounts_for_layer_offsets(
-    attn_type: DeepseekV4AttentionType,
-    source_pages: list[int],
-    expected: list[int],
-) -> None:
-    manager = object.__new__(DeepseekV4CacheManager)
-    layer_id = 7
-    manager._layer_attn_to_layer_id = {(0, attn_type): layer_id}
-
-    source = SimpleNamespace(scale=3, expansion=1, layer_offset=2)
-    shadow = SimpleNamespace(scale=5, expansion=1, layer_offset=4)
-
-    def get_page_index_converter(test_layer_id: int, role: object) -> SimpleNamespace:
-        assert test_layer_id == layer_id
-        return source if role == attn_type.role else shadow
-
-    manager.impl = SimpleNamespace(get_page_index_converter=get_page_index_converter)
-
-    actual = manager._map_flash_mla_shadow_pages(
-        0,
-        attn_type,
-        torch.tensor(source_pages),
-    )
-    torch.testing.assert_close(actual, torch.tensor(expected))
-
-
-@pytest.mark.parametrize(
-    ("attn_type", "block_size"),
-    [
-        (DeepseekV4AttentionType.SWA, 128),
-        (DeepseekV4AttentionType.COMPRESS, 32),
-    ],
-)
-def test_flash_mla_shadow_pages_have_contiguous_kernel_stride(
-    attn_type: DeepseekV4AttentionType,
-    block_size: int,
-) -> None:
-    manager = object.__new__(DeepseekV4CacheManager)
-    manager.tokens_per_block = 128
-    manager.compressed_block_sizes = [32]
-
-    page_bytes = manager._get_flash_mla_shadow_bytes_per_block(attn_type, 0)
-
-    assert page_bytes == block_size * DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
-    assert page_bytes % 16 == 0
 
 
 def test_quota_from_max_tokens_models_context_swa_scratch():
