@@ -278,9 +278,11 @@ def _zero_mamba_states(manager):
         manager.get_ssm_states(layer_idx).zero_()
 
 
-def test_mamba_payload_bytes_matched_tp():
-    """mamba_payload_bytes returns correct size for matched-TP page tables."""
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import mamba_payload_bytes
+def test_mamba_receiver_payload_bytes_matched_tp():
+    """mamba_receiver_payload_bytes returns correct size for matched-TP page tables."""
+    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+        mamba_receiver_payload_bytes,
+    )
     from tensorrt_llm._torch.disaggregation.resource.page import (
         BUFFER_ENTRY_DTYPE,
         MAMBA_CONV_ROLE,
@@ -341,19 +343,8 @@ def test_mamba_payload_bytes_matched_tp():
         ],
     )
 
-    from types import SimpleNamespace
-
-    ri = SimpleNamespace(
-        tp_size=2,
-        tp_rank=0,
-        cp_size=1,
-        cp_rank=0,
-        attention=SimpleNamespace(enable_attention_dp=False),
-    )
-    got = mamba_payload_bytes(
-        sender_page_table=pt, receiver_page_table=pt, dst_slot=3, sender_ri=ri, receiver_ri=ri
-    )
-    # Matched TP: full per-rank slot bytes for 2 layers x (conv + ssm)
+    got = mamba_receiver_payload_bytes(sender_page_table=pt, receiver_page_table=pt, dst_slot=3)
+    # Full per-rank slot bytes for 2 layers x (conv + ssm)
     assert got == 2 * (conv_slot_bytes + ssm_slot_bytes)
 
 

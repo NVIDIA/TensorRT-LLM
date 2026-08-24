@@ -240,7 +240,7 @@ class VmmBounceTransport(BounceTransport):
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers. ``extra_bytes`` is the non-paged payload the sender appends
         to the same coalesced write (mamba/KDA recurrent state, sized by the receiver via
-        ``MambaPolicy.payload_bytes``); the region must cover it or the write would overrun into the
+        ``mamba_receiver_payload_bytes``); the region must cover it or the write would overrun into the
         neighboring slot."""
         total = 0
         has_state_group = False

@@ -57,7 +57,7 @@ import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
-    mamba_payload_bytes,
+    mamba_receiver_payload_bytes,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -227,15 +227,12 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
             i for i, m in enumerate(_KDA_MASK) if m
         ]
 
-        # Matched-parallelism payload: mamba_payload_bytes must equal
+        # Matched-parallelism payload: receiver_payload_bytes must equal
         # NUM_KDA_LAYERS * (conv + ssm) for matched TP.
-        ri = RankInfo.from_kv_cache_manager("kda_test", mgr, device_id=0)
-        payload = mamba_payload_bytes(
+        payload = mamba_receiver_payload_bytes(
             sender_page_table=pt,
             receiver_page_table=pt,
             dst_slot=1,
-            sender_ri=ri,
-            receiver_ri=ri,
         )
         assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:

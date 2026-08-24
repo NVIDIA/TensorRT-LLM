@@ -38,7 +38,7 @@ try:
     from tensorrt_llm._torch.disaggregation.native.bounce import impl as btr
     from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
         MambaPolicy,
-        mamba_payload_bytes,
+        mamba_receiver_payload_bytes,
     )
 
     _HAVE_TRANSPORT = True
@@ -818,40 +818,26 @@ class TestHybridK3Bounce:
         assert t.reserve(_recv_req([2, 1]), num_writers=2, extra_bytes=64) is False
         assert t.reserve(_recv_req([2, 0]), num_writers=2) is True  # no state blocks -> fan-in fine
 
-    def test_mamba_payload_bytes_matches_k3_geometry(self):
-        # Matched-TP replicated KDA state: payload_bytes must reproduce the per-request
-        # per-rank number derived from K3's KDA geometry (constants above) exactly.
+    def test_receiver_payload_bytes_matches_k3_geometry(self):
         pt = _k3_page_table()
-        ri = _k3_rank_info()
-        got = mamba_payload_bytes(
-            sender_page_table=pt, receiver_page_table=pt, dst_slot=3, sender_ri=ri, receiver_ri=ri
-        )
+        got = mamba_receiver_payload_bytes(pt, pt, dst_slot=3)
         assert got == _K3_KDA_PAYLOAD_BYTES
 
-    def test_mamba_payload_bytes_slot_independent(self):
-        # payload_bytes is slot-independent: different slots produce the same total.
+    def test_receiver_payload_bytes_slot_independent(self):
         pt = _k3_page_table()
-        ri = _k3_rank_info()
-        got_3 = mamba_payload_bytes(
-            sender_page_table=pt, receiver_page_table=pt, dst_slot=3, sender_ri=ri, receiver_ri=ri
-        )
-        got_5 = mamba_payload_bytes(
-            sender_page_table=pt, receiver_page_table=pt, dst_slot=5, sender_ri=ri, receiver_ri=ri
-        )
+        got_3 = mamba_receiver_payload_bytes(pt, pt, dst_slot=3)
+        got_5 = mamba_receiver_payload_bytes(pt, pt, dst_slot=5)
         assert got_3 == got_5 > 0
 
-    def test_mamba_payload_bytes_zero_without_slot_or_group(self):
+    def test_receiver_payload_bytes_zero_without_slot_or_group(self):
         pt = _k3_page_table()
-        ri = _k3_rank_info()
-        assert mamba_payload_bytes(pt, pt, dst_slot=None, sender_ri=ri, receiver_ri=ri) == 0
+        assert mamba_receiver_payload_bytes(pt, pt, dst_slot=None) == 0
         pure_attn = KVCachePageTable(
             tokens_per_block=32,
             layer_groups=[pt.layer_groups[0]],
             pool_groups=pt.pool_groups,
         )
-        assert (
-            mamba_payload_bytes(pure_attn, pure_attn, dst_slot=3, sender_ri=ri, receiver_ri=ri) == 0
-        )
+        assert mamba_receiver_payload_bytes(pure_attn, pure_attn, dst_slot=3) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -893,24 +879,14 @@ class TestMambaHelixCP:
                 else:
                     assert not paired, (sender_rank, gen_cp_rank)
 
-    def test_payload_bytes_is_zero_for_unpaired_or_no_slot(self):
-        # mamba_payload_bytes returns 0 when dst_slot is None or sender is
-        # unpaired with the receiver.
-        pt = _k3_page_table()
-        ri = _k3_rank_info()
-        assert mamba_payload_bytes(pt, pt, dst_slot=None, sender_ri=ri, receiver_ri=ri) == 0
-        # Unpaired: sender rank 0, receiver cp_rank 1
+    def test_is_paired_unpaired_vs_paired(self):
+        # Unpaired: sender rank 0 is not paired with receiver cp_rank 1
         sender_ri = _k3_rank_info(tp_size=2, tp_rank=0)
         peer_ri = _k3_rank_info(cp_size=2, cp_rank=1)
-        assert (
-            mamba_payload_bytes(pt, pt, dst_slot=3, sender_ri=sender_ri, receiver_ri=peer_ri) == 0
-        )
-        # Paired sender gets the full payload
+        assert not MambaPolicy.is_paired(sender_ri, peer_ri)
+        # Paired sender
         paired_ri = _k3_rank_info(tp_size=2, tp_rank=1)
-        assert (
-            mamba_payload_bytes(pt, pt, dst_slot=3, sender_ri=paired_ri, receiver_ri=peer_ri)
-            == _K3_KDA_PAYLOAD_BYTES
-        )
+        assert MambaPolicy.is_paired(paired_ri, peer_ri)
 
 
 # --------------------------------------------------------------------------- #

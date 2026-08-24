@@ -557,7 +557,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     Uses KVCacheManagerV2's public ``pool_group_descs`` layout API and
     stamps each PoolView with the manager's native role-name strings
     (``pool_role``) plus the closed-set ``mapper_kind`` discriminator used
-    by ``build_kv_mapper``.
+    by the policy ``build_mapper`` methods.
 
     A physical pool group may be shared by several layer groups (life
     cycles whose coalesced-buffer sizes are identical); each layer group
