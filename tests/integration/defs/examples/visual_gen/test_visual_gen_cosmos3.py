@@ -720,9 +720,17 @@ COSMOS3_NANO_FP8_GOLDEN_IMAGE = "cosmos3_nano_fp8_static_lpips_golden.png"
 COSMOS3_FP8_GOLDEN_HEIGHT = 256
 COSMOS3_FP8_GOLDEN_WIDTH = 256
 COSMOS3_FP8_GOLDEN_STEPS = 4
-# Cross-host kernel drift, not FP8 noise: the same headroom the sibling Cosmos3
-# goldens carry (see _preserve_lpips_candidate_on_failure).
-COSMOS3_FP8_GOLDEN_LPIPS_THRESHOLD = 0.05
+# Cross-architecture kernel drift, not FP8 noise. This golden is cut on B300
+# (sm_103) but scheduled only on B200 (sm_100) via l0_b200.yml, so the gate has
+# to absorb a change of GPU: kernel selection, split-k and reduction order, and
+# autotuner choices all differ across that boundary, and none of them are
+# addressed by _lpips_pinned_fp32_matmul_precision (which removes the fp32-matmul
+# TF32 term only). Same-host self-regeneration distance is 0 -- two renders were
+# bit-identical -- so a threshold calibrated on that would be measuring the wrong
+# thing. 0.1 is a divergence gate, not a quality gate: the feature's real
+# protection is _assert_static_fp8_topology_engaged plus the level-1/2 unit
+# suites, which are deterministic and architecture-independent.
+COSMOS3_FP8_GOLDEN_LPIPS_THRESHOLD = 0.1
 
 
 def _generate_cosmos3_nano_fp8_lpips_image(output_path):
@@ -730,7 +738,9 @@ def _generate_cosmos3_nano_fp8_lpips_image(output_path):
 
     Mirrors _generate_cosmos3_feature_image rather than the BF16 T2I generator:
     a quantized path needs determinism pinned during *generation* for its golden
-    to be reproducible at all.
+    to be reproducible at all, and the same fp32-matmul pin, since Cosmos3 runs
+    fp32 GEMMs inside the denoising loop whose arithmetic otherwise follows the
+    host's torch default (NGC containers "high", PyPI torch "highest").
     """
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
@@ -749,7 +759,7 @@ def _generate_cosmos3_nano_fp8_lpips_image(output_path):
         model_path = _lpips_model_path(*COSMOS3_NANO_FP8_MODEL_SUBPATH)
         _skip_if_missing(model_path, "Cosmos3-Nano-FP8 checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
-        with _lpips_deterministic_algorithms():
+        with _lpips_deterministic_algorithms(), _lpips_pinned_fp32_matmul_precision():
             args = VisualGenArgs(
                 model=model_path,
                 compilation_config=CompilationConfig(skip_warmup=True),
