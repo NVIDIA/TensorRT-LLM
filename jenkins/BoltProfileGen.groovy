@@ -78,6 +78,15 @@ BOLT_ITER_MULT = (params.boltIterMult ?: env.boltIterMult ?: "1").toString()
 
 TRIPLE = TARGET_ARCH
 
+// Branch-keyed Artifactory dir the packaged bundle is promoted to, and that
+// premerge consumption (apply_latest.sh -> artifactory.sh pull-latest) reads
+// back. MUST stay identical to promote_dir() in scripts/bolt/internal/
+// artifactory.sh -- "<REPO>/<PREFIX>/<branch>/<triple>" with the same defaults
+// (BOLT_ARTIFACTORY_REPO, BOLT_PROFILE_PREFIX) -- or promote writes somewhere
+// pull-latest never looks. Combined with URM_ARTIFACTORY_BASE above, this
+// reproduces the URL cmd_pull_latest builds.
+PROFILE_PROMOTE_DIR = "sw-tensorrt-generic/llm-artifacts/bolt-profiles/${BRANCH}/${TRIPLE}"
+
 // SLURM states in which the job is still alive, i.e. no terminal verdict yet.
 // COMPLETING (CG) is the one that bites: the tasks have exited but slurmctld is
 // still running the epilog and reclaiming nodes, which on a large allocation
@@ -105,17 +114,20 @@ BOLT_WORKLOADS = [
     [name: "dsr1_agg_1k1k_c2",     testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_1k1k]"],
     [name: "dsr1_agg_8k1k_c2",     testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_8k1k]"],
     [name: "dsr1_agg_1k1k_c1024",  testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]"],
-    // --- disagg (multi-node): enabled for pipe-cleaning. Disagg gen-worker
-    //     bring-up under BOLT instrumentation was previously flaky (servers hang
-    //     / a gen worker crashes at startup); run these at a LOW BOLT_ITER_MULT
-    //     (=1) first to confirm they complete end-to-end, THEN raise the mult /
-    //     tune profile quality (low-concurrency disagg needs many requests to
-    //     converge -- see BOLT_PROFILE_QUALITY_FINDINGS.md).
-    [name: "dsr1_disagg_128k8k_c1",  testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_128k8k_con1_ctx1_pp8_gen1_tep8_eplb0_mtp3_ccb-NIXL]"],
-    [name: "k2_disagg_1k1k_c4",      testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_kimi-k25-thinking-fp4_1k1k_con4_ctx1_dep4_gen1_tep4_eplb0_mtp0_ccb-NIXL]"],
-    [name: "dsr1_disagg_1k1k_c1",    testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]"],
-    [name: "dsr1_disagg_128k8k_c128",testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-NIXL]"],
-    [name: "dsv32_disagg_32k4k_c1",  testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-v32-fp4_32k4k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]"],
+    // --- disagg (multi-node): OUT OF SCOPE for this PR, left commented out.
+    //     Disagg gen-worker bring-up under BOLT instrumentation is still flaky
+    //     (servers hang / a gen worker crashes at startup), and the fan-out is
+    //     all-or-nothing today: pollSlurm hard-fails on any non-COMPLETED job
+    //     and Merge+Package runs only after every parallel branch succeeds, so
+    //     one occurrence of that hang throws away the GPU-hours of every
+    //     workload that DID finish and produces no bundle. Re-enable together
+    //     with per-workload best-effort collection (merge over whatever .fdata
+    //     landed, failing only if the validated agg set is missing).
+    // [name: "dsr1_disagg_128k8k_c1",  testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_128k8k_con1_ctx1_pp8_gen1_tep8_eplb0_mtp3_ccb-NIXL]"],
+    // [name: "k2_disagg_1k1k_c4",      testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_kimi-k25-thinking-fp4_1k1k_con4_ctx1_dep4_gen1_tep4_eplb0_mtp0_ccb-NIXL]"],
+    // [name: "dsr1_disagg_1k1k_c1",    testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]"],
+    // [name: "dsr1_disagg_128k8k_c128",testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-NIXL]"],
+    // [name: "dsv32_disagg_32k4k_c1",  testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-v32-fp4_32k4k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]"],
 ]
 
 // Lightweight CPU dispatcher pod: it only SSHes to the SLURM frontend and polls
@@ -350,9 +362,16 @@ def submitProfileGen(pipeline)
             pollSlurm(pipeline, remote, mid, "merge")
             pipeline.echo("Merge COMPLETED. Bundle: ${bundle}")
         }
-        // Promote of the packaged bundle to Artifactory is deferred to the
-        // follow-on deployment PR; the upload will be inserted HERE, immediately
-        // before the retention delete below (promote first, then reclaim scratch).
+        // Promote the packaged bundle. Opt-in (PROMOTE defaults false), so a
+        // plain generate-and-consume run publishes nothing. Runs BEFORE the
+        // retention delete below: promote first, then reclaim scratch.
+        if (PROMOTE == "true") {
+            stage("Promote") {
+                promoteBundle(pipeline, remote, bundle)
+            }
+        } else {
+            pipeline.echo("PROMOTE=false: skipping Artifactory promote of ${bundle}")
+        }
 
         // Retention: best-effort purge of workspaces older than 7 days so scratch
         // doesn't grow unbounded across runs. Depth 4 under the bolt-ci root maps

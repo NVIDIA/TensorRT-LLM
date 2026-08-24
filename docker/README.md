@@ -215,5 +215,4 @@ python3 scripts/bolt/apply_bolt.py \
     --output bolt-<tarball>
 ```
 
-See `scripts/bolt/` for the full toolkit and `scripts/bolt/TRTLLM_BOLT_PROFILE_QUALITY.md`
-for background on profile generation.
+See `scripts/bolt/` for the full toolkit.
