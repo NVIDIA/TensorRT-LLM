@@ -148,15 +148,16 @@ class BaseWeightMapper(ABC):
         Returns
         - renamed_weights: Mapping[str, torch.Tensor], weight dict with renamed
           keys and unchanged tensor values. If the input `weights` is a
-          `ConsumableWeightsDict`, the returned object preserved that type.
+          `ConsumableWeightsDict`, the returned object preserves that type and
+          takes the tensors over from it -- the input is emptied, so **the
+          caller must not use `weights` afterwards**. See
+          `ConsumableWeightsDict.take_ownership` for why the transfer is what
+          lets the loader release weights module by module.
         """
         import re
 
         from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
             ConsumableWeightsDict
-
-        # Check if input is a ConsumableWeightsDict to preserve the type
-        is_consumable = isinstance(weights, ConsumableWeightsDict)
 
         # Create a new dictionary to store the renamed weights
         renamed_weights = {}
@@ -180,10 +181,7 @@ class BaseWeightMapper(ABC):
             if key not in matched_keys:
                 renamed_weights[key] = weights[key]
 
-        # Preserve ConsumableWeightsDict type if that's what was passed in
-        if is_consumable:
-            return ConsumableWeightsDict(renamed_weights)
-        return renamed_weights
+        return ConsumableWeightsDict.take_ownership(weights, renamed_weights)
 
     def preprocess_weights(
             self, weights: Mapping[str,
@@ -281,6 +279,15 @@ class BaseWeightMapper(ABC):
         """
         Return only weights that start with the prefix (and with the prefix removed)
         """
+        from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+            ConsumableWeightsDict
+
+        # The loading loop calls this once per module, so on a large
+        # checkpoint the scan below is quadratic; a ConsumableWeightsDict can
+        # answer the same query from its key index instead.
+        if prefix and isinstance(weights, ConsumableWeightsDict):
+            return weights.filter_prefix(prefix)
+
         result = {}
         for k, v in weights.items():
             if k.startswith(prefix):

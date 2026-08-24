@@ -169,6 +169,8 @@ else:
     KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
     KVCacheManager = _cpp.KVCacheManager
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+    IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
+    create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
     # The C++ KVCacheManagerConfig binding replaces the Python @dataclass, but
     # callers (the DeepSeek-V4 cache manager's _build_cache_config and our own
     # host-tier fallback) use dataclasses.replace() on it. dataclasses.replace()
@@ -360,3 +362,6 @@ __all__ = [
     "rawref",
     "typed_range",
 ]
+
+if _BACKEND != "python":
+    __all__.extend(["IKvCacheColdPageCodec", "create_default_kv_cache_cold_page_codec"])

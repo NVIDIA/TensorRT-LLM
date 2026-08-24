@@ -126,7 +126,7 @@ def llm_check_output(llm: LLM,
 
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-mixtral_model_name = "Mixtral-8x7B-v0.1"
+qwen3_tokenizer_model_name = "Qwen3/Qwen3-0.6B"
 
 llama_model_path = get_model_path(default_model_name)
 
@@ -239,7 +239,7 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
-        (get_model_path(mixtral_model_name), False, 0.95),
+        (get_model_path(qwen3_tokenizer_model_name), False, 0.95),
         (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
         (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
