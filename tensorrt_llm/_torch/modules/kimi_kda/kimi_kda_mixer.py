@@ -453,6 +453,7 @@ class KimiKDALinearAttention(nn.Module):
             state_indices=slot_indices,
             has_initial_states=has_init,
             cu_seqlens=cu_seqlens,
+            num_sequences=num_prefills,
             num_tokens=x2d.shape[0],
             chunk_indices=chunk_indices,
         )

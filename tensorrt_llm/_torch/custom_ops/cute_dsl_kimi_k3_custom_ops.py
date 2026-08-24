@@ -1149,6 +1149,8 @@ def _validate_indexed_state_pool(
         raise ValueError("state_indices must have dtype int32 or int64.")
     if not state_indices.is_contiguous():
         raise ValueError("state_indices must be contiguous.")
+    if state_indices.data_ptr() % 16 != 0:
+        raise ValueError("Indexed KDA prefill requires 16-byte-aligned state_indices.")
     for name, tensor in (
         ("q", q),
         ("v", v),

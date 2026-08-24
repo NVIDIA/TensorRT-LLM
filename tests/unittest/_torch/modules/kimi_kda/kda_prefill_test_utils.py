@@ -55,6 +55,7 @@ def run_indexed_prefill(
         state_indices=state_indices,
         has_initial_states=has_initial_states,
         cu_seqlens=cu_seqlens,
+        num_sequences=num_sequences,
         num_tokens=q.shape[1],
     )
     reset_recurrent_state_rows(state_pool, state_indices, has_initial_states)

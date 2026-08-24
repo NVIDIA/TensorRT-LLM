@@ -50,3 +50,36 @@ def test_reset_recurrent_state_rows(index_dtype: torch.dtype) -> None:
     )
     assert torch.count_nonzero(recurrent_states[2]).item() == 0
     torch.testing.assert_close(conv_states, conv_expected)
+
+
+@torch.no_grad()
+def test_reset_recurrent_state_rows_rejects_noncontiguous_rows() -> None:
+    state_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+    has_initial_states = torch.tensor([False], device="cuda")
+    recurrent_states = torch.ones(2, 2, 3, 4, dtype=torch.float32, device="cuda")
+    conv_states = torch.ones(2, 3, 2, dtype=torch.bfloat16, device="cuda")
+
+    noncontiguous_recurrent = torch.ones(
+        2,
+        2,
+        3,
+        8,
+        dtype=torch.float32,
+        device="cuda",
+    )[..., ::2]
+    with pytest.raises(ValueError, match="recurrent state rows must be contiguous"):
+        reset_recurrent_state_rows(
+            noncontiguous_recurrent,
+            state_indices,
+            has_initial_states,
+            conv_states,
+        )
+
+    noncontiguous_conv = torch.ones(2, 3, 4, dtype=torch.bfloat16, device="cuda")[..., ::2]
+    with pytest.raises(ValueError, match="convolution state rows must be contiguous"):
+        reset_recurrent_state_rows(
+            recurrent_states,
+            state_indices,
+            has_initial_states,
+            noncontiguous_conv,
+        )

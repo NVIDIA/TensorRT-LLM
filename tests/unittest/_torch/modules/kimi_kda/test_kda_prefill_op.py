@@ -193,6 +193,70 @@ def test_kda_mixer_empty_prefill():
 
 
 @torch.no_grad()
+def test_indexed_prefill_routing_validates_equal_length_state_indices() -> None:
+    dispatch = _kda_kernels.KDAKernelDispatch(
+        use_optimized_prefill=True,
+        use_optimized_decode=False,
+    )
+    assert dispatch.prefill_kernel_path == "optimized"
+    state_pool = torch.zeros(3, 1, 2, 2, dtype=torch.float32, device="cuda")
+    state_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    has_initial_states = torch.zeros(2, dtype=torch.bool, device="cuda")
+    common = {
+        "state_pool": state_pool,
+        "has_initial_states": has_initial_states,
+        "cu_seqlens": None,
+        "num_tokens": 256,
+    }
+
+    assert dispatch.can_use_indexed_prefill(
+        state_indices=state_indices,
+        num_sequences=2,
+        **common,
+    )
+    assert not dispatch.can_use_indexed_prefill(
+        state_indices=state_indices,
+        num_sequences=1,
+        **common,
+    )
+
+    misaligned_storage = torch.tensor([-1, 0, 1], dtype=torch.int32, device="cuda")
+    misaligned_indices = misaligned_storage[1:]
+    assert misaligned_indices.is_contiguous()
+    assert misaligned_indices.data_ptr() % 16 != 0
+    assert not dispatch.can_use_indexed_prefill(
+        state_indices=misaligned_indices,
+        num_sequences=2,
+        **common,
+    )
+
+
+@torch.no_grad()
+def test_kda_prefill_op_rejects_misaligned_state_indices() -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops  # noqa: F401
+
+    q = torch.zeros(1, 256, 1, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    beta = torch.zeros(1, 256, 1, dtype=torch.float32, device="cuda")
+    state_pool = torch.zeros(1, 1, HEAD_DIM, HEAD_DIM, dtype=torch.float32, device="cuda")
+    index_storage = torch.tensor([-1, 0], dtype=torch.int32, device="cuda")
+    state_indices = index_storage[1:]
+    assert state_indices.is_contiguous()
+    assert state_indices.data_ptr() % 16 != 0
+
+    with pytest.raises(ValueError, match="16-byte-aligned state_indices"):
+        torch.ops.trtllm.kda_prefill(
+            q=q,
+            k=q,
+            v=q,
+            g=q,
+            beta=beta,
+            state_pool=state_pool,
+            state_indices=state_indices,
+            scale=HEAD_DIM**-0.5,
+        )
+
+
+@torch.no_grad()
 def test_kda_prefill_op_partial_final_chunk_large_batch():
     """Regression: varlen batches whose FINAL chunk is partial.
 
@@ -273,9 +337,13 @@ def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_length
     _assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("misaligned_indices", [False, True], ids=["indexed", "fallback"])
 @torch.no_grad()
-def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(monkeypatch):
-    """The indexed pool path matches FLA for prefix and continuation states."""
+def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(
+    monkeypatch: pytest.MonkeyPatch,
+    misaligned_indices: bool,
+) -> None:
+    """Indexed and unsupported-index paths match FLA state handling."""
     torch.manual_seed(3)
     optimized, _ = _make_attention_pair()
     monkeypatch.setattr(_kda_kernels, "is_intree_prefill_available", lambda: False)
@@ -294,6 +362,11 @@ def test_kda_prefill_state_pool_matches_fallback_with_mixed_initial_states(monke
     )
     slots = 5
     slot_indices = torch.tensor([3, 0, 4, 1], dtype=torch.int32, device="cuda")
+    if misaligned_indices:
+        slot_storage = torch.tensor([-1, 3, 0, 4, 1], dtype=torch.int32, device="cuda")
+        slot_indices = slot_storage[1:]
+        assert slot_indices.is_contiguous()
+        assert slot_indices.data_ptr() % 16 != 0
     has_initial_states = torch.tensor([True, False, True, False], device="cuda")
     projection_size = NUM_HEADS * HEAD_DIM
     conv_seed = (

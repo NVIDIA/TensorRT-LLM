@@ -229,6 +229,7 @@ class KDAKernelDispatch:
         state_indices: torch.Tensor,
         has_initial_states: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
+        num_sequences: int,
         num_tokens: int,
         chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
@@ -243,6 +244,8 @@ class KDAKernelDispatch:
                 chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
             if chunk_indices.shape[0] < 4:
                 return False
+            if cu_seqlens.shape[0] - 1 != num_sequences:
+                return False
         if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
             return False
         _, H, V, K = state_pool.shape
@@ -252,13 +255,14 @@ class KDAKernelDispatch:
             return False
         if state_pool.data_ptr() % 16:
             return False
-        num_sequences = state_indices.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
         if (
             state_indices.ndim != 1
             or state_indices.shape[0] != num_sequences
             or state_indices.dtype not in (torch.int32, torch.int64)
             or not state_indices.is_contiguous()
         ):
+            return False
+        if state_indices.data_ptr() % 16:
             return False
         if (
             has_initial_states.ndim != 1
