@@ -296,13 +296,13 @@ class DiffusionRequest:
     params: Optional["VisualGenParams"] = None
     prepared_inputs: Dict[str, Any] = field(default_factory=dict, repr=False)
     # Set only between the two ends of the coordinator -> rank0 hop; see
-    # ``refs_to_handles``.
+    # ``refs_to_shm``.
     ref_handles: Optional[List[Dict[str, Any]]] = field(default=None, repr=False)
     # Set only while the request is in flight on the rank0 -> N-rank hop; see
     # ``refs_detach``.
     ref_sizes: Optional[List[int]] = field(default=None, repr=False)
 
-    def refs_to_handles(self) -> None:
+    def refs_to_shm(self) -> None:
         """Move reference payloads into shared memory, in place (producer side).
 
         Only the coordinator -> rank0 hop travels as handles: rank0 restores the
@@ -331,7 +331,7 @@ class DiffusionRequest:
         if not handles:
             self.ref_handles = None
 
-    def refs_to_bytes(self) -> None:
+    def refs_from_shm(self) -> None:
         """Restore reference payloads from shared memory, in place (consumer side).
 
         Each handle is taken independently: one that cannot be rebuilt must not
@@ -556,7 +556,7 @@ class DiffusionExecutor:
             if self.rank == 0:
                 req = self.requests_ipc.get()
                 if req is not None:
-                    req.refs_to_bytes()
+                    req.refs_from_shm()
                 logger.info(f"Worker {self.device_id}: Request available")
 
             # Broadcast to all ranks. ``req.params.seed`` is already a
@@ -1072,7 +1072,7 @@ class DiffusionRemoteClient:
                 # The request never reached rank0, so nothing downstream will
                 # consume its handles, and an unconsumed handle keeps its
                 # shared-memory block mapped until this process exits.
-                req.refs_to_bytes()
+                req.refs_from_shm()
 
     def _process_responses(self):
         """Poll and process responses."""
@@ -1235,7 +1235,7 @@ class DiffusionRemoteClient:
             except queue.Empty:
                 return
             if req is not None and req.ref_handles:
-                req.refs_to_bytes()
+                req.refs_from_shm()
 
     def shutdown(self):
         """Shutdown client and workers."""

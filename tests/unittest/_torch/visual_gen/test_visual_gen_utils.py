@@ -1065,8 +1065,8 @@ class TestReferenceHandleTransport:
         payloads = (b"\x89PNG\r\n\x1a\n" + os.urandom(4096), os.urandom(1024))
         req = self._request(*payloads)
 
-        req.refs_to_handles()
-        req.refs_to_bytes()
+        req.refs_to_shm()
+        req.refs_from_shm()
 
         assert tuple(r.content for r in req.params.image_reference) == payloads
         assert all(r.format == "bytes" for r in req.params.image_reference)
@@ -1078,7 +1078,7 @@ class TestReferenceHandleTransport:
         req = self._request(payload)
         before = len(pickle.dumps(req))
 
-        req.refs_to_handles()
+        req.refs_to_shm()
         after = len(pickle.dumps(req))
 
         assert after < before - len(payload) // 2
@@ -1089,10 +1089,10 @@ class TestReferenceHandleTransport:
         and rebuilt, which is what the IPC queue does to it."""
         payload = os.urandom(8192)
         req = self._request(payload)
-        req.refs_to_handles()
+        req.refs_to_shm()
 
         received = pickle.loads(pickle.dumps(req))
-        received.refs_to_bytes()
+        received.refs_from_shm()
 
         assert received.params.image_reference[0].content == payload
 
@@ -1102,7 +1102,7 @@ class TestReferenceHandleTransport:
         from tensorrt_llm.visual_gen import VisualGenParams
 
         req = DiffusionRequest(request_id=1, prompt=["x"], params=VisualGenParams())
-        req.refs_to_handles()
+        req.refs_to_shm()
         assert req.ref_handles is None
 
     def test_restore_is_idempotent(self):
@@ -1110,9 +1110,9 @@ class TestReferenceHandleTransport:
         handle that has already been resolved."""
         payload = os.urandom(2048)
         req = self._request(payload)
-        req.refs_to_handles()
-        req.refs_to_bytes()
-        req.refs_to_bytes()
+        req.refs_to_shm()
+        req.refs_from_shm()
+        req.refs_from_shm()
         assert req.params.image_reference[0].content == payload
 
 
@@ -1187,12 +1187,12 @@ class TestReferenceBroadcastSplit:
         import gc
 
         req = self._request(os.urandom(1024 * 1024))
-        req.refs_to_handles()
+        req.refs_to_shm()
         blocks = self._blocks_of(req)
         assert blocks and all(b.exists() for b in blocks)
 
         # What the sender thread does when the request never reaches rank0.
-        req.refs_to_bytes()
+        req.refs_from_shm()
         del req
         gc.collect()
         assert not any(b.exists() for b in blocks)
@@ -1224,13 +1224,13 @@ class TestReferenceBroadcastSplit:
 
         with mock.patch.object(torch, "frombuffer", flaky):
             with pytest.raises(RuntimeError, match="shared memory exhausted"):
-                req.refs_to_handles()
+                req.refs_to_shm()
 
         blocks = self._blocks_of(req)
         assert len(blocks) == 2, "handles taken before the failure must stay reachable"
         assert all(b.exists() for b in blocks)
 
-        req.refs_to_bytes()
+        req.refs_from_shm()
         del req
         gc.collect()
         assert not any(b.exists() for b in blocks)

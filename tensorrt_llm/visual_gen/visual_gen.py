@@ -453,12 +453,12 @@ class VisualGen:
         # through the request pickle, which copies every reference byte to
         # cross one process boundary.
         try:
-            request.refs_to_handles()
+            request.refs_to_shm()
             self.executor.enqueue_requests([request])
         except Exception:
             # The request never reached rank0, so nothing downstream will
             # consume the blocks it already took.
-            request.refs_to_bytes()
+            request.refs_from_shm()
             raise
         return VisualGenResult(req_id, self.executor, batch_size=batch_size)
 

@@ -295,7 +295,7 @@ class TestUnconsumedReferenceBlocks(unittest.TestCase):
         import gc
 
         req = self._request(os.urandom(4096), os.urandom(4096), os.urandom(4096))
-        req.refs_to_handles()
+        req.refs_to_shm()
         blocks = self._blocks_of(req.ref_handles)
         self.assertEqual(len(blocks), 3)
 
@@ -310,7 +310,7 @@ class TestUnconsumedReferenceBlocks(unittest.TestCase):
 
         with mock.patch.object(SharedTensorContainer, "from_dict", staticmethod(flaky)):
             with self.assertRaises(RuntimeError):
-                req.refs_to_bytes()
+                req.refs_from_shm()
 
         self.assertEqual(calls["n"], 3, "a failure must not stop the loop at the bad entry")
         del req
@@ -319,7 +319,7 @@ class TestUnconsumedReferenceBlocks(unittest.TestCase):
 
     def test_blocks_of_a_dead_workers_request_are_released(self):
         req = self._request(os.urandom(64 * 1024), os.urandom(64 * 1024))
-        req.refs_to_handles()
+        req.refs_to_shm()
         blocks = self._blocks_of(req.ref_handles)
         self.assertTrue(all(b.exists() for b in blocks))
 
@@ -329,7 +329,7 @@ class TestUnconsumedReferenceBlocks(unittest.TestCase):
     def test_releasing_twice_is_harmless(self):
         """Reclaim can fire from more than one place; it must not care."""
         req = self._request(os.urandom(4096))
-        req.refs_to_handles()
+        req.refs_to_shm()
 
         self.assertEqual(_release_cpu_ref_blocks(req.ref_handles), 1)
         self.assertEqual(_release_cpu_ref_blocks(req.ref_handles), 0)
