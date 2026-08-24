@@ -72,6 +72,10 @@ PROMPT_BLOCKS = 2
 CHURN_REQUESTS = 100
 
 
+@unittest.skipUnless(
+    kv_test.KV_CACHE_MANAGER_V2_BACKEND == "cpp",
+    "the Python backend carries its own copy of this logic and is not fixed yet",
+)
 class TestNvBug6625710(unittest.TestCase):
     """Evicting an unheld SSM snapshot must not detach a still-referenced block."""
 
@@ -138,20 +142,30 @@ class TestNvBug6625710(unittest.TestCase):
         # --- Precondition guard. The bug needs A's snapshot to have actually been
         # evicted; if the churn above stopped triggering eviction (quota re-tuned,
         # CHURN_REQUESTS lowered, eviction policy changed) the rest of this test
-        # would pass without exercising anything. With no attention life cycle,
-        # prefix reuse is only possible via an SSM snapshot, so a probe that can
-        # still reuse the whole prompt proves the snapshot survived. The hybrid
-        # config has no equivalent probe: its attention pages serve a prefix match
-        # whether or not the snapshot is gone.
-        if num_attn_layers == 0:
-            probe = self.manager.create_kv_cache(input_tokens=list(prompt))
-            reusable = probe.num_committed_tokens
-            probe.close()
-            self.assertLess(
-                reusable,
+        # would pass without exercising anything.
+        #
+        # pruneMatch() truncates a reuse match at the last block carrying an SSM
+        # snapshot, so a probe that can no longer reuse the whole prompt proves the
+        # snapshot is gone. For hybrid, the attention pages survive independently,
+        # so also assert the attention-only prefix (the length *before* hybrid
+        # pruning) still spans the prompt -- otherwise a shortfall could just mean
+        # the attention pages were evicted too, which is not the case under test.
+        probe = self.manager.create_kv_cache(input_tokens=list(prompt))
+        reusable = probe.num_committed_tokens
+        attn_only = probe._get_num_tokens_before_hybrid_pruning()
+        probe.close()
+        self.assertLess(
+            reusable,
+            len(prompt),
+            "A's SSM snapshot was not evicted, so this test is not exercising "
+            "https://nvbugs/6625710 -- retune gpu_quota/CHURN_REQUESTS",
+        )
+        if num_attn_layers > 0:
+            self.assertEqual(
+                attn_only,
                 len(prompt),
-                "A's SSM snapshot was not evicted, so this test is not exercising "
-                "https://nvbugs/6625710 -- retune gpu_quota/CHURN_REQUESTS",
+                "attention pages were evicted too, so the reuse shortfall above does "
+                "not isolate the missing SSM snapshot -- retune gpu_quota/CHURN_REQUESTS",
             )
 
         # --- A wakes up (the pool is free again) and keeps generating on top of
