@@ -42,6 +42,7 @@ from ..pyexecutor.sampler import (
     int_tensor,
 )
 from ..pyexecutor.sampler.penalties import has_occurrence_penalty
+from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
 
 
@@ -270,7 +271,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
-                if TorchSampler._handle_stop_criteria(
+                if handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break
