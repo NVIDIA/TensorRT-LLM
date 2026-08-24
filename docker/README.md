@@ -179,3 +179,41 @@ Since Docker rootless mode remaps the UID/GID and the remapped UIDs and GIDs
  (typically configured in `/etc/subuid` and `/etc/subgid`) generally do not coincide
 with the local UID/GID, both IDs need to be translated using a tool like `bindfs` in order to be able to smoothly share a local working directory with any containers
 started with `LOCAL_USER=1`. In this case, the `SOURCE_DIR` and `HOME_DIR` Makefile variables need to be set to the locations of the translated versions of the TensorRT LLM working copy and the user home directory, respectively.
+
+### Reproduce a BOLT'd build from source
+
+Published TensorRT-LLM images ship with the merged [LLVM BOLT](https://github.com/llvm/llvm-project/tree/main/bolt)
+profile bundle baked in, so you can reproduce a BOLT-optimized build from source
+offline (no internal artifact access required). The bundle is added as a thin
+overlay layer (see [`Dockerfile.bolt`](./Dockerfile.bolt)) by the image-build
+pipeline; it does not change the image otherwise.
+
+- **Location:** the profiles live at `$TRTLLM_BOLT_PROFILES`
+  (`/opt/tensorrt_llm/bolt/profiles`), containing per-library `<lib>.yaml` /
+  `<lib>.fdata` and a `manifest.json`.
+- **Provenance:** the commit the profiles were generated from is recorded in the
+  image label `com.nvidia.trtllm.bolt-profiles-ref`
+  (`docker inspect --format '{{ index .Config.Labels "com.nvidia.trtllm.bolt-profiles-ref" }}' <image>`).
+  Because the bundle is the latest *promoted* bundle, it may come from a slightly
+  different commit than the image; the `.yaml` profiles are function-name-keyed and
+  applied with `-infer-stale-profile`, so they remain applicable across nearby
+  commits.
+
+To produce a BOLT'd build:
+
+1. Build (or install) TensorRT-LLM with `ENABLE_BOLT_COMPATIBLE=ON` so the ELFs
+   carry the relocations BOLT needs (see `scripts/build_wheel.py`).
+2. Install `llvm-bolt` — it is **not** shipped in the image; install it the same
+   way CI does via `scripts/bolt/setup_env.sh`.
+3. Apply the profiles (no recompile):
+
+```bash
+python3 scripts/bolt/apply_bolt.py \
+    --tarball <phase1 BOLT-compatible tarball> \
+    --profiles "$TRTLLM_BOLT_PROFILES" \
+    --manifest "$TRTLLM_BOLT_PROFILES/manifest.json" \
+    --output bolt-<tarball>
+```
+
+See `scripts/bolt/` for the full toolkit and `scripts/bolt/TRTLLM_BOLT_PROFILE_QUALITY.md`
+for background on profile generation.

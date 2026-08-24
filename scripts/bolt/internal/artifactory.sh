@@ -124,13 +124,23 @@ cmd_pull_latest() {
     local url="$base/$(promote_dir "$branch" "$triple")/latest.tar.gz"
     mkdir -p "$dest"
     log "Pulling $url -> $dest"
-    # curl (anonymous, like jenkins/Build.groovy's phase-1 tarball download from
-    # the same sw-tensorrt-generic repo): the read path needs no creds, so this
-    # works in the build pod without a configured `jf`. --retry rides out flaky
-    # links; a missing object 404s -> die (fatal for the premerge consumer).
-    if ! curl -fSL --retry 5 --retry-all-errors --retry-delay 10 \
-              --connect-timeout 60 -o "$dest/latest.tar.gz" "$url"; then
-        die "no promoted bundle at $url (branch may have none yet)"
+    # Anonymous download (like jenkins/Build.groovy's phase-1 tarball from the same
+    # sw-tensorrt-generic repo): the read path needs no creds, so this works in the
+    # build pod without a configured `jf`. Use curl if present, else fall back to
+    # wget -- the image-overlay build pod (BuildDockerImage.overlayBoltBundle) has no
+    # curl, so hard-requiring curl made the overlay fail (curl: command not found)
+    # even though the bundle existed. --retry rides out flaky links; a missing object
+    # 404s -> die (fatal for the premerge consumer).
+    if command -v curl >/dev/null 2>&1; then
+        curl -fSL --retry 5 --retry-all-errors --retry-delay 10 \
+             --connect-timeout 60 -o "$dest/latest.tar.gz" "$url" \
+            || die "no promoted bundle at $url (branch may have none yet)"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --tries=5 --waitretry=10 --timeout=60 \
+             -O "$dest/latest.tar.gz" "$url" \
+            || die "no promoted bundle at $url (branch may have none yet)"
+    else
+        die "neither curl nor wget is available to download $url"
     fi
     tar -xzf "$dest/latest.tar.gz" -C "$dest"
     rm -f "$dest/latest.tar.gz"
