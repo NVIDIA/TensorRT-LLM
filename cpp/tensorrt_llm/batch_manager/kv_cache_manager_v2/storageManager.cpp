@@ -1608,11 +1608,10 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         : lvlStorage.totalQuota();
     auto const minSlots
         = level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
-    size_t minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
+    size_t const minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
     if (quota < minQuota)
     {
-        throw std::invalid_argument("Quota " + std::to_string(quota)
-            + " is insufficient for min_slots constraints (requires at least " + std::to_string(minQuota) + ")");
+        throw InsufficientQuotaError(lvlStorage.cacheTier(), quota, minQuota);
     }
     auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
 
@@ -1914,11 +1913,17 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(Cac
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
     TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
 {
-    CacheTier tier = cacheTierOf(tierConfig);
-    size_t quota = cacheTierQuota(tierConfig);
-    size_t granularity = tier == CacheTier::GPU_MEM ? mGpuPhysMemAllocator->physMemSize()
-                                                    : CacheLevelManager::cacheTierGranularity(tier, quota);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
+    CacheTier const tier = cacheTierOf(tierConfig);
+    size_t const configuredQuota = cacheTierQuota(tierConfig);
+    size_t const granularity = tier == CacheTier::GPU_MEM
+        ? mGpuPhysMemAllocator->physMemSize()
+        : CacheLevelManager::cacheTierGranularity(tier, configuredQuota);
+    size_t const minQuota = minQuotaForLevel(slotSizeLists, granularity, minSlots);
+    size_t const quota = roundUp(configuredQuota, granularity);
+    if (quota < minQuota)
+    {
+        throw InsufficientQuotaError(tier, quota, minQuota);
+    }
     return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
 }
 

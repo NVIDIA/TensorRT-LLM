@@ -17,10 +17,12 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include "tensorrt_llm/common/logger.h"
 
+#include <cstddef>
 #include <cuda.h>
 #include <exception>
 #include <stdexcept>
@@ -107,6 +109,18 @@ class AssertionError : public std::logic_error
 public:
     explicit AssertionError(std::string const& msg)
         : std::logic_error(msg)
+    {
+    }
+};
+
+// A configured tier quota cannot satisfy its minimum storage layout.
+class InsufficientQuotaError : public std::invalid_argument
+{
+public:
+    InsufficientQuotaError(CacheTier tier, size_t configuredQuota, size_t requiredQuota)
+        : std::invalid_argument(std::string(cacheTierName(tier)) + " cache tier quota "
+            + std::to_string(configuredQuota) + " is insufficient for the minimum storage layout (requires at least "
+            + std::to_string(requiredQuota) + ")")
     {
     }
 };

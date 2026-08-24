@@ -44,7 +44,7 @@ from ._config import (
 from ._copy_engine import CopyTask, batched_copy
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
-from ._exceptions import LogicError, OutOfPagesError
+from ._exceptions import LogicError, OutOfPagesError, _make_insufficient_quota_error
 from ._life_cycle_registry import (
     AttnLifeCycle,
     LifeCycleId,
@@ -848,10 +848,7 @@ class StorageManager:
             lvl_storage.slot_size_lists, lvl_storage.pool_size_granularity, min_slots
         )
         if new_quota < min_quota:
-            raise ValueError(
-                f"Quota {new_quota} is insufficient for min_slots constraints "
-                f"(requires at least {min_quota})"
-            )
+            raise _make_insufficient_quota_error(lvl_storage.cache_tier, new_quota, min_quota)
         new_num_slots = lvl_storage.compute_slot_count_list(new_ratio_list, min_slots, new_quota)
         if level != num_cache_levels - 1:
             assert persistent_pages is None, (
@@ -1091,14 +1088,15 @@ class StorageManager:
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute slot counts for a cache level from its tier config and ratio.
 
-        Applies hot constraint floors or a one-slot structural floor on colder levels.
+        Workload constraints and resume headroom apply only to the hot GPU level.
+        Colder levels use a one-slot structural floor per pool group.
         """
         granularity = CacheLevelManager.cache_tier_granularity(tier_config.tier, tier_config.quota)
         min_slots = self._min_slots_for_level(level)
-        quota = max(
-            self._min_quota_for_level(slot_size_lists, granularity, min_slots),
-            round_up(tier_config.quota, granularity),
-        )
+        min_quota = self._min_quota_for_level(slot_size_lists, granularity, min_slots)
+        quota = round_up(tier_config.quota, granularity)
+        if quota < min_quota:
+            raise _make_insufficient_quota_error(tier_config.tier, quota, min_quota)
         return CacheLevelStorage.ratio_to_slot_count_list(
             quota, slot_size_lists, ratio, granularity, min_slots
         )

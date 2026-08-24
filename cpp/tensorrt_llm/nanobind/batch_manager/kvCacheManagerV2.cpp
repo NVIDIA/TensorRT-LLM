@@ -792,6 +792,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
+    static nb::object sInsufficientQuotaError
+        = nb::exception<kv::InsufficientQuotaError>(m, "InsufficientQuotaError", PyExc_ValueError);
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();
 

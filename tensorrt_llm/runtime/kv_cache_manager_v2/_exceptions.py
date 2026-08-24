@@ -15,6 +15,8 @@
 
 import cuda.bindings.driver as drv
 
+from ._common import CacheTier
+
 
 class OutOfMemoryError(Exception):
     pass
@@ -39,6 +41,26 @@ class LogicError(Exception):
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
+
+
+class InsufficientQuotaError(ValueError):
+    """A configured cache-tier quota cannot satisfy its minimum layout."""
+
+    pass
+
+
+def _make_insufficient_quota_error(
+    cache_tier: CacheTier, quota: int, min_quota: int
+) -> InsufficientQuotaError:
+    tier_name = {
+        CacheTier.GPU_MEM: "GPU",
+        CacheTier.HOST_MEM: "host",
+        CacheTier.DISK: "disk",
+    }[cache_tier]
+    return InsufficientQuotaError(
+        f"{tier_name} cache tier quota {quota} is insufficient for the minimum storage layout "
+        f"(requires at least {min_quota})"
+    )
 
 
 class CuError(Exception):

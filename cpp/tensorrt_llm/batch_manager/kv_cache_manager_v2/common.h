@@ -58,6 +58,17 @@ enum class CacheTier : int
     DISK = 2,
 };
 
+inline char const* cacheTierName(CacheTier tier)
+{
+    switch (tier)
+    {
+    case CacheTier::GPU_MEM: return "GPU";
+    case CacheTier::HOST_MEM: return "host";
+    case CacheTier::DISK: return "disk";
+    }
+    return "unknown";
+}
+
 // PageIndexMode — how converted page indices relate to layers within a layer group.
 // Mirrors _common.py::PageIndexMode.
 enum class PageIndexMode : int
