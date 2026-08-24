@@ -37,10 +37,10 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
-from ...lora_helper import LoraConfig
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..peft.lora.config import LoraConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (_is_mm_disagg, find_input_mm_embeds,
                                         fuse_input_embeds,

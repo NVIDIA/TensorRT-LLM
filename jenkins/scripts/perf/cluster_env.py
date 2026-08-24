@@ -44,15 +44,19 @@ UCX_ENV_RULES = [
         "rocep198s0:1,rocep199s0:1,rocep205s0:1,rocep206s0:1"
         " UCX_IB_GID_INDEX=auto UCX_IB_TRAFFIC_CLASS=52 UCX_IB_SL=0",
     ),
-    # oci-aga: avoid transports that fail on this VF fabric, disable DEVX to
-    # avoid UAR allocation failures, and pin the GPU-connected rail VFs.
+    # oci-aga: use TCP over IPv4 alongside the local CUDA/shared-memory
+    # transports.
     (
         "oci-aga*",
         "*",
-        "export UCX_TLS=^tcp,rc_gda,gga UCX_IB_MLX5_DEVX=n "
-        "UCX_NET_DEVICES="
-        "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1 "
-        "UCX_IB_TRAFFIC_CLASS=96 TRTLLM_NIXL_NUM_THREADS=1",
+        "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
+    ),
+    # oci-hsg: UCX picks wrong RDMA devices; pin the usable mlx5 ports and
+    # keep eth0 as the TCP fallback device.
+    (
+        "oci-hsg*",
+        "*",
+        "export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_3:1,mlx5_4:1,eth0",
     ),
     # nsc-svg: UCX picks wrong RDMA devices; pin the usable mlx5 ports.
     (
@@ -61,9 +65,15 @@ UCX_ENV_RULES = [
         "export UCX_NET_DEVICES="
         "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1",
     ),
-    # aws-cmh: UCX transport auto-selection hangs on this fabric; pin the
-    # working transport set explicitly.
-    ("aws-cmh*", "*", "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp"),
+    # aws-cmh: UCX transport/device auto-selection hangs on this fabric; pin
+    # the working transport set and Ethernet/RDMA devices explicitly.
+    (
+        "aws-cmh*",
+        "*",
+        "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp "
+        "UCX_NET_DEVICES=eth0,mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,"
+        "mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1",
+    ),
     # aws-dfw: gdr_copy is broken on this cluster; exclude it.
     ("aws-dfw*", "*", "export UCX_TLS=^gdr_copy"),
     # Default: base unset only.

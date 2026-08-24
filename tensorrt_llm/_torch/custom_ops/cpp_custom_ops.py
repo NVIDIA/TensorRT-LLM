@@ -310,6 +310,17 @@ def _register_fake():
                                 dtype=scores_with_bias.dtype), scores.new_empty(
                                     shape, dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::kimi_k3_noaux_tc_mxfp8_quant")
+    def _(scores, bias, hidden_states, routed_scaling_factor):
+        num_tokens = scores.shape[0]
+        return (
+            scores.new_empty((num_tokens, 16), dtype=torch.int32),
+            scores.new_empty((num_tokens, 16), dtype=torch.bfloat16),
+            hidden_states.new_empty((num_tokens, 3584),
+                                    dtype=torch.float8_e4m3fn),
+            hidden_states.new_empty((num_tokens, 112), dtype=torch.uint8),
+        )
+
     @torch.library.register_fake("trtllm::inplace_slice_copy")
     def _(dest, src, dim1_start, dim1_end):
         pass
@@ -332,6 +343,22 @@ def _register_fake():
           radix_aux_logits=None):
         # In-place operation, no return value (void function)
         pass
+
+    @torch.library.register_fake("trtllm::minimax_m3_select_blocks")
+    def _(
+        scores,
+        n_valid_blocks,
+        topk,
+        init_blocks,
+        local_blocks,
+        head_major_output=False,
+    ):
+        del n_valid_blocks, init_blocks, local_blocks
+        if head_major_output:
+            return scores.new_empty((scores.shape[0], scores.shape[2], topk),
+                                    dtype=torch.int32).permute(1, 0, 2)
+        return scores.new_empty((scores.shape[2], scores.shape[0], topk),
+                                dtype=torch.int32)
 
     @torch.library.register_fake("trtllm::kda_decode")
     def _(x_q: torch.Tensor,
@@ -369,6 +396,26 @@ def _register_fake():
             return output
         # x_q is [1, tokens, H, 128]; the kernel emits one row per token.
         return x_q.new_empty((x_q.size(1), 1, x_v.size(2), x_v.size(3)))
+
+    @torch.library.register_fake("trtllm::minimax_m3_fp8_indexer_qk_norm_rope")
+    def minimax_m3_fp8_indexer_qk_norm_rope_fake(
+        qk: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        num_heads_q: int,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        base: float,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Infer the specialized index-Q result without executing CUDA."""
+        del index_k_cache, out_cache_loc, rotary_dim, eps, q_weight, k_weight
+        del base, position_ids
+        return qk.new_empty((qk.shape[0], num_heads_q, head_dim),
+                            dtype=torch.float8_e4m3fn)
 
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
@@ -634,6 +681,7 @@ def _register_fake():
         ep_size: int,
         max_num_tokens_per_rank: int,
         eplb_stats_num_experts: Optional[int] = None,
+        can_use_cft_counted_writes: bool = False,
     ) -> torch.Tensor:
         return torch.empty((10, ), dtype=torch.int64, device="cpu")
 
@@ -1316,8 +1364,8 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::mla_rope_generation")
     def _(
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
+        fused_q: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
         latent_cache: torch.Tensor,
         rotary_cos_sin: Optional[torch.Tensor],
         cu_q_seqlens: torch.Tensor,
@@ -1354,6 +1402,13 @@ def _register_fake():
         qk_rope_head_dim: int,
         v_head_dim: int,
         rope_append: bool,
+        kv_norm_weight: Optional[torch.Tensor] = None,
+        kv_norm_eps: float = 1e-6,
+        precomputed_cu_seqlens: bool = False,
+        precomputed_fmha_scheduler: bool = False,
+        kv_only: bool = False,
+        kv_done_elsewhere: bool = False,
+        quant_scale_qkv: Optional[torch.Tensor] = None,
     ) -> None:
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place

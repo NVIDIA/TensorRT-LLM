@@ -98,6 +98,7 @@ def _check_collective_rpc_guard(
 
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
+    WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
 
     def __init__(
         self,
@@ -633,6 +634,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             k: v
             for k, v in worker_kwargs.items() if k != 'tokenizer'
         }
+        worker_process_identities_signal = (
+            self.WORKER_PROCESS_IDENTITIES_SIGNAL
+            if self._can_monitor_worker_processes() else None)
 
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
@@ -641,23 +645,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
             ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+            worker_process_identities_signal=worker_process_identities_signal,
         )
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
         self.workers_started = True
 
-        while True:
-            if self.worker_init_status_queue.poll(1):
-                status = self.worker_init_status_queue.get()
-                # Send ACK to the worker
-                self.worker_init_status_queue.put("ACK")
-                logger.info("get signal from executor worker")
-                break
-            if any(fut.done() for fut in self.mpi_futures):
-                logger.error("Executor worker died during initialization.")
-                raise RuntimeError("Executor worker died during initialization")
-            self._handle_background_error()
+        status = self._wait_for_executor_workers_ready()
 
         ready_signal, error_trace = status[:2]
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
@@ -669,7 +664,41 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 
-        self._register_worker_processes(status)
+    def _wait_for_executor_workers_ready(self) -> tuple:
+        """Wait for worker readiness while monitoring published processes."""
+        worker_processes_registered = False
+
+        while True:
+            if self.worker_init_status_queue.poll(1):
+                status = self.worker_init_status_queue.get()
+                # Send ACK to the worker
+                self.worker_init_status_queue.put("ACK")
+                logger.info("get signal from executor worker")
+
+                signal = status[0]
+                if signal == self.WORKER_PROCESS_IDENTITIES_SIGNAL:
+                    if len(status) != 3:
+                        raise RuntimeError(
+                            "Executor worker returned invalid process identities"
+                        )
+                    self._register_worker_processes(status)
+                    worker_processes_registered = True
+                    continue
+
+                # Backward compatibility for workers that only publish their
+                # identities together with READY.
+                if (signal == self.READY_SIGNAL
+                        and not worker_processes_registered):
+                    self._register_worker_processes(status)
+                return status
+
+            if (self._check_mpi_workers() or self._check_remote_worker_death()):
+                error = self._fatal_error or RuntimeError(
+                    "MPI worker exited unexpectedly")
+                message = f"Executor worker died during initialization: {error}"
+                logger.error(message)
+                raise RuntimeError(message) from error
+            self._handle_background_error()
 
     def _register_worker_processes(self, status: tuple) -> None:
         """Register identities returned by locally spawned MPI workers.
@@ -678,11 +707,16 @@ class GenerationExecutorProxy(GenerationExecutor):
         reference with a factory, so identify pool-backed sessions by excluding
         the external communication session types.
         """
-        if not isinstance(
-                self.mpi_session,
-            (MpiCommSession, RemoteMpiCommSessionClient)) and len(status) == 3:
+        if self._can_monitor_worker_processes() and len(status) == 3:
             worker_process_identities: List[WorkerProcessIdentity] = status[2]
             self._worker_process_monitor.register(worker_process_identities)
+
+    def _can_monitor_worker_processes(self) -> bool:
+        """Return whether the session uses locally spawned MPI workers."""
+        return not isinstance(
+            self.mpi_session,
+            (MpiCommSession, RemoteMpiCommSessionClient),
+        )
 
     def _abort_all_requests(self):
         # The results can be finished during this loop, so self._results may be changed.
@@ -963,6 +997,19 @@ class GenerationExecutorProxy(GenerationExecutor):
         except RPCError as e:
             logger.error(f"Error fetching data transceiver state via RPC: {e}")
             raise
+
+    def get_startup_metrics(self) -> dict | None:
+        """Get rank-0 startup metrics, or ``None`` if the RPC is unavailable."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get startup metrics")
+            return None
+        try:
+            metrics = self.rpc_client.get_startup_metrics().remote()
+            return metrics if isinstance(metrics, dict) else None
+        except RPCError as e:
+            logger.warning(f"Error fetching startup metrics via RPC: {e}")
+            return None
 
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).

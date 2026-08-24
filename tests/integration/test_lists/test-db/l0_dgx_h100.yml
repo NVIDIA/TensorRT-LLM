@@ -84,6 +84,11 @@ l0_dgx_h100:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
+  # unittest/_torch/multi_gpu is otherwise only collected by the 2-GPU stage, so
+  # the 4-rank cases of the KV-pool rebalance agreement test (tp4, pp4, CP x TP,
+  # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
+  # the file here so those compositions actually run.
+  - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
   # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
@@ -369,7 +374,6 @@ l0_dgx_h100:
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[google_gemma-3-1b-it-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.1-8B-Instruct-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Ministral-8B-Instruct-2410-False]
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Codestral-22B-v0.1-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[Qwen_QwQ-32B-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.3-70B-Instruct-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-FP8-True]

@@ -24,6 +24,7 @@ import torch
 import torch.distributed as torch_dist
 import torch.multiprocessing as torch_mp
 
+from tensorrt_llm._torch.disaggregation.executor.admission import DisaggTransferAdmissionController
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
@@ -37,7 +38,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
-    DisaggTransferAdmissionController,
     EncoderStepResult,
     PyExecutor,
     _ADPForwardIntent,
@@ -49,6 +49,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -1725,6 +1726,7 @@ class _StubADPExecutor:
         kv_cache_manager = Mock()
         kv_cache_manager.mapping.has_cp_helix.return_value = False
         kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        kv_cache_manager.is_linear_attention = False
         kv_cache_manager.max_seq_len = (
             max_seq_len if kv_manager_max_seq_len is None else kv_manager_max_seq_len
         )
@@ -2876,12 +2878,17 @@ class TestOneModelMTPDraftTokenScheduling:
     forward then builds a uniform ``1 + runtime_draft_len`` per gen request and
     overshoots ``max_num_tokens`` (``total_num_tokens > max_num_tokens``).
 
-    The fix populates ``request.draft_tokens = [0] * max_total_draft_tokens``
-    on every in-progress generation request so scheduling reserves the correct
-    token budget. This test drives ``_prepare_and_schedule_batch`` for a
-    one-model-MTP executor and asserts generation requests get
-    ``num_draft_tokens == max_total_draft_tokens`` while context requests are
-    left untouched.
+    The fix populates both the Python and C++ draft-token representations on
+    every in-progress generation request so both schedulers reserve the
+    correct token budget. This test drives ``_prepare_and_schedule_batch`` for
+    a one-model-MTP executor and asserts generation requests get the full
+    draft-token budget while context requests are left untouched.
+
+    The Python-side fill is placeholder-only: with the overlap scheduler
+    disabled, ``_prepare_tp_inputs`` sources a generation request's draft
+    tokens from ``py_draft_tokens``, which the one-model spec sampler wrote at
+    the end of the previous iteration. Overwriting a populated list here would
+    feed zeros to the target model and collapse the acceptance rate.
 
     NOTE: Like ``test_fetch_called_once_even_in_benchmark_disagg`` in
     ``test_benchmark_disagg.py``, this uses ``object.__new__(PyExecutor)`` to
@@ -2908,7 +2915,11 @@ class TestOneModelMTPDraftTokenScheduling:
         return req
 
     @classmethod
-    def _make_one_model_mtp_executor(cls, active_requests):
+    def _make_one_model_mtp_executor(
+        cls,
+        active_requests: list[LlmRequest],
+        use_rejection_sampling: bool = False,
+    ) -> PyExecutor:
         """Construct a partially-initialised one-model-MTP PyExecutor.
 
         drafter is None (one-model MTP has no separate drafter) and
@@ -2921,11 +2932,23 @@ class TestOneModelMTPDraftTokenScheduling:
         ex = object.__new__(PyExecutor)
         ex.drafter = None
         ex.max_total_draft_tokens = cls.MAX_TOTAL_DRAFT_TOKENS
-        ex.model_engine = Mock(is_spec_decode=True)
+        spec_config = MTPDecodingConfig(
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            mtp_eagle_one_model=True,
+            use_rejection_sampling=use_rejection_sampling,
+            draft_len_schedule={1: cls.MAX_TOTAL_DRAFT_TOKENS},
+        )
+        ex.model_engine = Mock(
+            is_spec_decode=True,
+            spec_config=spec_config,
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            max_total_draft_tokens=cls.MAX_TOTAL_DRAFT_TOKENS,
+        )
         ex.kv_cache_transceiver = None
         ex.is_shutdown = False
         ex.enable_iter_perf_stats = False
         ex.enable_attention_dp = False
+        ex.speculation_permanently_disabled = False
         ex.active_requests = active_requests
         ex.waiting_queue = []
 
@@ -2958,6 +2981,8 @@ class TestOneModelMTPDraftTokenScheduling:
         # Precondition: no draft tokens reserved yet on either gen request.
         assert gen.num_draft_tokens == 0
         assert disagg_gen.num_draft_tokens == 0
+        assert gen.py_draft_tokens == []
+        assert disagg_gen.py_draft_tokens == []
 
         ex = self._make_one_model_mtp_executor([gen, disagg_gen, ctx])
         scheduled_batch, _ = ex._prepare_and_schedule_batch()
@@ -2967,7 +2992,128 @@ class TestOneModelMTPDraftTokenScheduling:
         # full draft-token budget so the micro-batch scheduler reserves
         # beam + max_total_draft_tokens.
         assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
         # Disaggregated case: decode-worker request awaiting KV also normalized.
         assert disagg_gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert disagg_gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
         # Context requests are not generation requests and must be left alone.
         assert ctx.num_draft_tokens == 0
+        assert ctx.py_draft_tokens == []
+
+    def test_one_model_mtp_preserves_zero_proposal_signal_for_rejection(self) -> None:
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen], use_rejection_sampling=True)
+
+        ex._prepare_and_schedule_batch()
+
+        assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_needs_onehot_draft_probs
+
+        batch = ScheduledRequests()
+        batch.append_generation_request(gen)
+        ex._handle_dynamic_draft_len(batch)
+
+        assert ex.model_engine.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_needs_onehot_draft_probs
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
+
+    def test_one_model_mtp_preserves_sampler_draft_tokens(self) -> None:
+        sampler_drafts = [7, 8]
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        gen.py_draft_tokens = list(sampler_drafts)
+
+        ex = self._make_one_model_mtp_executor([gen])
+        ex._prepare_and_schedule_batch()
+
+        assert gen.py_draft_tokens == sampler_drafts
+        assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+
+
+class TestAdpBalanceExcludesPadDummies:
+    """The low-occupancy test must look at real decode work, not batch size.
+
+    `_pad_attention_dp_dummy_request` gives an otherwise idle rank exactly one
+    generation request so attention DP can make progress. Counting that dummy
+    as decode work makes the rank look busy, which is precisely wrong for a
+    check whose job is to notice idle ranks.
+    """
+
+    @staticmethod
+    def _make_executor(per_rank, threshold):
+        """per_rank: list of (num_ctx, num_gen, num_real) as allgathered."""
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock()
+        executor.dist.tp_allgather = Mock(
+            return_value=[[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank]
+        )
+        executor.max_batch_size = 64
+        executor.attention_dp_enable_balance = True
+        executor.attention_dp_time_out_iters = 60
+        executor.attention_dp_batching_wait_iters = 10
+        executor.attention_dp_min_generation_requests = threshold
+        executor.attention_dp_low_occupancy_timeout_iters = 0
+        executor.adp_ctx_waiting_iters_count = 0
+        executor.adp_ctx_batching_wait_iters_count = 0
+        return executor
+
+    @staticmethod
+    def _make_generation_request(is_dummy):
+        request = Mock()
+        request.is_attention_dp_dummy = is_dummy
+        return request
+
+    @staticmethod
+    def _make_context_request(num_tokens=4):
+        request = Mock()
+        request.get_tokens.return_value = [0] * num_tokens
+        return request
+
+    def test_padded_rank_counts_as_under_occupied(self):
+        """A rank holding only a pad dummy has zero real decode work.
+
+        Peer rank is padded: it reports one scheduled generation request and
+        zero real ones. With a threshold of 1 the low-occupancy timeout of 0
+        must be selected so the withheld context is released on this very
+        iteration. Counting the dummy would leave the cross-rank minimum at 1,
+        keep the 60-iteration timeout, and strand the context batch.
+        """
+        context_requests = [self._make_context_request()]
+        # This rank has context and decode work; the peer is padded and has
+        # no context request, so the batch is not aligned and the balancer
+        # takes the timeout branch.
+        executor = self._make_executor([(1, 4, 4), (0, 1, 0)], threshold=1)
+
+        balanced = executor._balance_adp_requests(
+            context_requests, [self._make_generation_request(False)]
+        )
+
+        assert balanced == context_requests
+        assert executor.adp_ctx_waiting_iters_count == 0
+
+    def test_busy_ranks_still_wait(self):
+        """No rank is under-occupied, so the configured timeout still applies."""
+        executor = self._make_executor([(1, 4, 4), (0, 4, 4)], threshold=1)
+
+        balanced = executor._balance_adp_requests(
+            [self._make_context_request()], [self._make_generation_request(False)]
+        )
+
+        assert balanced == []
+        assert executor.adp_ctx_waiting_iters_count == 1
+
+    def test_real_count_excludes_dummies(self):
+        """The allgathered real count must not include the pad dummy."""
+        executor = self._make_executor([(1, 2, 1)], threshold=0)
+
+        executor._balance_adp_requests(
+            [self._make_context_request()],
+            [
+                self._make_generation_request(True),
+                self._make_generation_request(False),
+            ],
+        )
+
+        gathered = executor.dist.tp_allgather.call_args[0][0]
+        assert gathered[1] == 2, "scheduled count keeps counting the dummy"
+        assert gathered[3] == 1, "real count must exclude the dummy"

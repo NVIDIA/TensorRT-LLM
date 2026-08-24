@@ -626,7 +626,7 @@ class GvrTopKKernel:
         # block_count_ge's fast path. ic_local indexes both GMEM
         # (input_row[slice_start + ic_local]) and SMEM (smem_input[ic_local]).
         if self.enable_unroll_4:
-            rng_frag = cute.make_fragment((vec_w,), self.dtype)
+            rng_frag = cute.make_rmem_tensor((vec_w,), self.dtype)
             big_iters = cutlass.Int32(0)
             if slice_len > i_local + cutlass.Int32(vec_w - 1):
                 big_iters = (slice_len - i_local - cutlass.Int32(vec_w)) // cutlass.Int32(
@@ -653,7 +653,7 @@ class GvrTopKKernel:
             i_local = i_local + big_iters * cutlass.Int32(step_elem)
 
         # 1-way tail vec loop (slice_len mod step_elem residual).
-        tail_frag = cute.make_fragment((vec_w,), self.dtype)
+        tail_frag = cute.make_rmem_tensor((vec_w,), self.dtype)
         while i_local + cutlass.Int32(vec_w - 1) < slice_len:
             src_ptr = cute.make_ptr(
                 self.dtype,
@@ -1022,7 +1022,7 @@ class GvrTopKKernel:
         # cum_at). qfracs descending in h => thresholds ascending in m.
         if warp_id == cutlass.Int32(0):
             top = cutlass.Int32(NB - 1) - lane * cutlass.Int32(SEG)
-            seg_frag = cute.make_fragment((SEG,), cutlass.Int32)
+            seg_frag = cute.make_rmem_tensor((SEG,), cutlass.Int32)
             part = cutlass.Int32(0)
             for j in cutlass.range_constexpr(SEG):
                 v8 = smem_hist[top - cutlass.Int32(j)]
@@ -1095,7 +1095,7 @@ class GvrTopKKernel:
 
         if warp_id == cutlass.Int32(0):
             top = cutlass.Int32(NB - 1) - lane * cutlass.Int32(SEG)
-            seg_frag = cute.make_fragment((SEG,), cutlass.Int32)
+            seg_frag = cute.make_rmem_tensor((SEG,), cutlass.Int32)
             part = cutlass.Int32(0)
             for j in cutlass.range_constexpr(SEG):
                 v8 = smem_hist[top - cutlass.Int32(j)]
@@ -1206,7 +1206,7 @@ class GvrTopKKernel:
         # Each iter loads 1 vec_w chunk; LLVM unrolls 4 iters at IR level
         # so 4 LDG.E.* stay in flight.
         if self.enable_unroll_4:
-            rng_frag = cute.make_fragment((vec_w,), self.dtype)
+            rng_frag = cute.make_rmem_tensor((vec_w,), self.dtype)
             # Number of complete vec_w-aligned loads this thread can do:
             #   need: i + k*step_elem + (vec_w - 1) < N
             #   max k: floor((N - i - vec_w) / step_elem)
@@ -1250,7 +1250,7 @@ class GvrTopKKernel:
         # full vec_w-stride or less). i is always vec_w-aligned here (it
         # advanced by multiples of step_elem = num_threads*vec_w), so the
         # same vec_align bytes hold.
-        tail_frag = cute.make_fragment((vec_w,), self.dtype)
+        tail_frag = cute.make_rmem_tensor((vec_w,), self.dtype)
         while i + cutlass.Int32(vec_w - 1) < N:
             if cutlass.const_expr(smem_input is not None):
                 src_ptr = cute.make_ptr(
@@ -1423,8 +1423,8 @@ class GvrTopKKernel:
         copy_atom = self._make_load_copy_atom()
         step_elem = cutlass.const_expr(num_threads * vec_w)
 
-        thr_frag = cute.make_fragment((M,), cutlass.Float32)
-        cnt_frag = cute.make_fragment((M,), cutlass.Int32)
+        thr_frag = cute.make_rmem_tensor((M,), cutlass.Float32)
+        cnt_frag = cute.make_rmem_tensor((M,), cutlass.Int32)
         for m in cutlass.range_constexpr(M):
             thr_frag[m] = s_mt_thr[m]
             cnt_frag[m] = cutlass.Int32(0)
@@ -1436,7 +1436,7 @@ class GvrTopKKernel:
         step = cutlass.Int32(step_elem)
 
         if self.enable_unroll_4:
-            rng_frag = cute.make_fragment((vec_w,), self.dtype)
+            rng_frag = cute.make_rmem_tensor((vec_w,), self.dtype)
             big_iters = cutlass.Int32(0)
             if slice_end > i + cutlass.Int32(vec_w - 1):
                 big_iters = (slice_end - i - cutlass.Int32(vec_w)) // cutlass.Int32(
@@ -1461,7 +1461,7 @@ class GvrTopKKernel:
                         cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vj >= thr_frag[m])
             i = i + big_iters * cutlass.Int32(step_elem)
 
-        tail_frag = cute.make_fragment((vec_w,), self.dtype)
+        tail_frag = cute.make_rmem_tensor((vec_w,), self.dtype)
         while i + cutlass.Int32(vec_w - 1) < slice_end:
             src_ptr = cute.make_ptr(
                 self.dtype,
@@ -2171,7 +2171,7 @@ class GvrTopKKernel:
         if self.enable_phase3_unroll:
             # Fast path: 4-way unrolled vec loop (4 loading instructions in flight).
             if self.enable_unroll_4:
-                rng_frag = cute.make_fragment((vec_w,), self.dtype)
+                rng_frag = cute.make_rmem_tensor((vec_w,), self.dtype)
                 big_iters = cutlass.Int32(0)
                 if N_local > ic + cutlass.Int32(vec_w - 1):
                     big_iters = (N_local - ic - cutlass.Int32(vec_w)) // cutlass.Int32(
@@ -2213,7 +2213,7 @@ class GvrTopKKernel:
                 ic = ic + big_iters * cutlass.Int32(step_elem)
 
         # Tail vec loop: 1-way, handles remainder < 2*step.
-        tail_frag = cute.make_fragment((vec_w,), self.dtype)
+        tail_frag = cute.make_rmem_tensor((vec_w,), self.dtype)
         while ic + cutlass.Int32(vec_w - 1) < N_local:
             if cutlass.const_expr(smem_input is not None):
                 src_ptr = cute.make_ptr(
@@ -2578,7 +2578,7 @@ class GvrTopKKernel:
         # Step 3 (every warp, lane-parallel): lane l owns the contiguous
         # descending positions [l*ppl, (l+1)*ppl) of the target slice.
         ppl = cutlass.const_expr((bins_per_warp + self.WARP_SIZE - 1) // self.WARP_SIZE)
-        cnt_frag = cute.make_fragment((ppl,), cutlass.Int32)
+        cnt_frag = cute.make_rmem_tensor((ppl,), cutlass.Int32)
         my_sum = cutlass.Int32(0)
         for j3 in cutlass.range_constexpr(ppl):
             pos = lane * cutlass.Int32(ppl) + cutlass.Int32(j3)

@@ -1551,8 +1551,8 @@ class FilteredTopKKernelVarlen:
         nvec_per_thread = cutlass.const_expr(
             cute.ceil_div(self.top_k, vecsize_out * self.num_threads_per_cta)
         )
-        topk_vals = cute.make_fragment((vecsize_out, nvec_per_thread), self.dtype)
-        topk_indices = cute.make_fragment((vecsize_out, nvec_per_thread), cutlass.Int32)
+        topk_vals = cute.make_rmem_tensor((vecsize_out, nvec_per_thread), self.dtype)
+        topk_indices = cute.make_rmem_tensor((vecsize_out, nvec_per_thread), cutlass.Int32)
 
         stride = self.num_threads_per_cta * vecsize_out
         for i in cutlass.range(nvec_per_thread, unroll_full=True):
@@ -1706,7 +1706,7 @@ class FilteredTopKKernelVarlen:
             num_bits_per_copy=self.num_copy_bits,
         )
 
-        scan_frag = cute.make_fragment((vec_size,), self.dtype)
+        scan_frag = cute.make_rmem_tensor((vec_size,), self.dtype)
 
         # Trivial case: length <= top_k. In SP multi-CTA cluster mode this
         # per-chunk shortcut is unsafe (a CTA taking it would skip the cluster

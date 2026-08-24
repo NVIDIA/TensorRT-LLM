@@ -13,6 +13,7 @@ class _FakePool:
         self.wait_shutdown = wait_shutdown
         self.env_overrides = dict(env_overrides or {})
         self.shut = False
+        self.exit_joins_released = False
         import os
 
         # What the workers freeze at spawn: TRTLLM* forwarded from the parent
@@ -23,6 +24,9 @@ class _FakePool:
 
     def shutdown(self):
         self.shut = True
+
+    def release_exit_joins(self) -> None:
+        self.exit_joins_released = True
 
     def shutdown_abort(self, *args, **kwargs):
         self.shut = True
@@ -310,6 +314,164 @@ def test_drain_shuts_cached_pools(reuse_cache):
     s.shutdown()
     reuse_cache.drain()
     assert real.shut
+
+
+def test_drain_kills_recorded_worker_when_shutdown_wedges(
+    reuse_cache: SessionReuseCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signal
+    import subprocess
+    import sys
+
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"owned")
+
+    class _WedgedPool(_FakePool):
+        def __init__(
+            self,
+            n_workers: int,
+            wait_shutdown: bool = False,
+            env_overrides: dict | None = None,
+        ) -> None:
+            super().__init__(n_workers, wait_shutdown, env_overrides)
+            self.worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+            self._worker_identities = ((self.worker.pid, b"owned"),)
+
+        def shutdown(self) -> None:
+            self.worker.wait()
+            self.shut = True
+
+    session = reuse_cache.acquire(_WedgedPool, 1)
+    pool = session._real
+    session.shutdown()
+    try:
+        reuse_cache.drain(timeout=0.2)
+        assert pool.worker.returncode == -signal.SIGKILL
+        assert pool.shut
+    finally:
+        if pool.worker.poll() is None:
+            pool.worker.kill()
+        pool.worker.wait()
+
+
+def test_drain_releases_exit_joins_when_shutdown_remains_wedged(
+    reuse_cache: SessionReuseCache,
+) -> None:
+    import threading
+    import time
+
+    class _ManagerWedgedPool(_FakePool):
+        def __init__(
+            self,
+            n_workers: int,
+            wait_shutdown: bool = False,
+            env_overrides: dict | None = None,
+        ) -> None:
+            super().__init__(n_workers, wait_shutdown, env_overrides)
+            self.shutdown_released = threading.Event()
+
+        def shutdown(self) -> None:
+            self.shutdown_released.wait()
+            # Dropping the exit joins only unparks the thread; the real
+            # shutdown still has to unwind (close the transport, reap its
+            # connection threads) before it returns.
+            time.sleep(0.05)
+            self.shut = True
+
+        def release_exit_joins(self) -> None:
+            super().release_exit_joins()
+            self.shutdown_released.set()
+
+    session = reuse_cache.acquire(_ManagerWedgedPool, 1)
+    pool = session._real
+    session.shutdown()
+    reuse_cache.drain(timeout=0.01)
+    assert pool.exit_joins_released
+    assert pool.shutdown_released.is_set()
+    # drain must not return while the released shutdown is still unwinding:
+    # it runs inside a test, so a thread that finishes a moment later drags
+    # its transport threads across the test boundary and pytest-threadleak
+    # blames whichever test runs next.
+    assert pool.shut
+    assert not [t for t in threading.enumerate() if t.name == "session-reuse-drain"]
+
+
+def test_kill_recorded_workers_skips_recycled_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    kills = []
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"recycled")
+    monkeypatch.setattr(session_reuse.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    assert session_reuse._kill_recorded_workers(pool) == 0
+    assert kills == []
+
+
+def test_kill_recorded_workers_signals_through_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pidfd handle is pinned BEFORE the identity recheck, and closed after.
+
+    The ordering is the whole invariant: opening the pidfd first pins the process
+    so the start-time recheck cannot be invalidated by the PID being recycled
+    before the signal lands. One ordered event log is what proves that. Separate
+    per-call lists record only that each call happened, so a regression that
+    rechecks first and opens the handle afterwards still satisfies them.
+    """
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    events: list[tuple] = []
+
+    def _start_time(pid):
+        events.append(("start_time", pid))
+        return b"owned"
+
+    def _pidfd_open(pid):
+        events.append(("open", pid))
+        return 77
+
+    monkeypatch.setattr(session_reuse, "_worker_start_time", _start_time)
+    monkeypatch.setattr(session_reuse.os, "pidfd_open", _pidfd_open, raising=False)
+    monkeypatch.setattr(session_reuse.os, "close", lambda fd: events.append(("close", fd)))
+    monkeypatch.setattr(
+        session_reuse.os,
+        "kill",
+        lambda pid, sig: pytest.fail("os.kill used while pidfd was available"),
+    )
+    import signal as _signal
+
+    monkeypatch.setattr(
+        _signal,
+        "pidfd_send_signal",
+        lambda fd, sig: events.append(("signal", fd, sig)),
+        raising=False,
+    )
+
+    assert session_reuse._kill_recorded_workers(pool) == 1
+    assert events == [
+        ("open", 123),
+        ("start_time", 123),
+        ("signal", 77, _signal.SIGKILL),
+        ("close", 77),
+    ]
+
+
+def test_kill_recorded_workers_falls_back_without_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pidfd support must still reap: the wedged worker is the whole point."""
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    kills = []
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"owned")
+    monkeypatch.delattr(session_reuse.os, "pidfd_open", raising=False)
+    monkeypatch.setattr(session_reuse.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    import signal as _signal
+
+    assert session_reuse._kill_recorded_workers(pool) == 1
+    assert kills == [(123, _signal.SIGKILL)]
 
 
 def test_autodeploy_nodeids_are_private():

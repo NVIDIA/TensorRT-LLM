@@ -961,8 +961,8 @@ class TestFinishReasons:
                 new_tokens=new_tokens,
                 finish_reasons=None,
                 first_finish_reasons=None,
+                single_step_greedy=True,
             ),
-            single_step_greedy=True,
         )
 
         sampler.update_requests(state)
@@ -1986,7 +1986,7 @@ class TestBatchedSampling:
             sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
             host_new_tokens = sample_state.host.new_tokens
-            if sample_state.single_step_greedy:
+            if sample_state.host.single_step_greedy:
                 # The stable greedy path copies one token per active request instead of
                 # the full [step, slot, beam] buffer. This fixture uses dense sequence
                 # slots, so restore that layout before comparing sampling results.

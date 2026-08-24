@@ -2,7 +2,7 @@ from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.modules.fused_moe.weight_owner import is_moe_weight_owner
 
 
 @register_mapper("HF", "ExaoneMoEForCausalLM")
@@ -48,7 +48,7 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                         break
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
-        return isinstance(module, MoE)
+        return is_moe_weight_owner(module)
 
     def handle_special_instance_module(
         self,
@@ -57,7 +57,7 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
-        if isinstance(module, MoE):
+        if is_moe_weight_owner(module):
             config = self.config.pretrained_config
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():

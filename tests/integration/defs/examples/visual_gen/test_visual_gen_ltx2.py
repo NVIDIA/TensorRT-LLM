@@ -430,7 +430,7 @@ def ltx2_two_stage_bf16_video_path(_visual_gen_deps, llm_venv):
 def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/ltx2.py with NVFP4 config end-to-end.
 
-    Validates that the LTX-2 example script and ``configs/ltx2-t2v-fp4-1gpu.yaml``
+    Validates that the LTX-2 example script and ``configs/ltx2-fp4-1gpu.yaml``
     work together as documented. The Gemma3 text encoder is passed separately via
     ``--text_encoder_path`` because the shared YAML intentionally omits it to keep
     the config model-path-agnostic.
@@ -445,9 +445,7 @@ def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     output_path = os.path.join(out_dir, "ltx2_output.mp4")
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "ltx2.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "ltx2-t2v-fp4-1gpu.yaml"
-    )
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "ltx2-fp4-1gpu.yaml")
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
