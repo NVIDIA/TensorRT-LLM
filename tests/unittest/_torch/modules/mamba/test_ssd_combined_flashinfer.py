@@ -18,6 +18,7 @@ import pytest
 import torch
 from utils.torch_ref import ssd_chunk_scan_combined_ref
 
+from tensorrt_llm._torch.flashinfer_utils import FLASHINFER_SSD_COMBINED
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     cu_seqlens_to_chunk_indices_offsets_triton,
 )
@@ -41,6 +42,16 @@ def _flashinfer_available():
 skip_no_flashinfer = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_sm_100f() and _flashinfer_available()),
     reason="FlashInfer SSD requires SM100+ with flashinfer installed",
+)
+
+# The probe above imports the flashinfer package, which cannot speak for
+# SSDCombined: flashinfer exports that class only when its own
+# ``import cutlass.cute`` succeeds. Tests going through
+# mamba_chunk_scan_combined stay covered on such an install because they take
+# the Triton path, so only the test that builds the kernel directly needs this.
+skip_no_flashinfer_ssd_kernel = pytest.mark.skipif(
+    FLASHINFER_SSD_COMBINED is None,
+    reason="flashinfer.mamba does not export SSDCombined without the CuTe DSL",
 )
 
 # Configurations that flashinfer SSD currently lowers cleanly.
@@ -193,6 +204,7 @@ def test_flashinfer_non_varlen(chunk_size, nheads, headdim, ngroups, dstate, bat
 
 
 @skip_no_flashinfer
+@skip_no_flashinfer_ssd_kernel
 def test_flashinfer_kernel_cache_distinguishes_modes():
     # Sharing a cache entry across modes would silently use the wrong kernel.
     chunk_size, nheads, headdim, ngroups, dstate = 128, 4, 64, 1, 128

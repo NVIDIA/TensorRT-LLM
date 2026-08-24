@@ -25,12 +25,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from ...custom_ops import TILE_SIZED_GROUPED_GEMM_RUNNERS
+from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
@@ -327,12 +323,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             return True
 
         for runner, tactic in comb:
-            if isinstance(
-                    runner,
-                (Sm100BlockScaledContiguousGroupedGemmRunner,
-                 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-                 Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
-                 Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)):
+            if isinstance(runner, TILE_SIZED_GROUPED_GEMM_RUNNERS):
                 mma_tiler_mn, *_ = tactic
                 if mma_tiler_mn[0] != tile_size:
                     return False

@@ -43,7 +43,18 @@ __all__ = [
     'matmul_to_ub',
     'IS_CUTLASS_DSL_AVAILABLE',
     'inplace_slice_copy',
+    'TILE_SIZED_GROUPED_GEMM_RUNNERS',
 ]
+
+# Grouped-GEMM runners whose tactic carries an mma_tiler_mn. cute_dsl_custom_ops
+# defines them inside its own ``if IS_CUTLASS_DSL_AVAILABLE:`` block and has no
+# else-branch, so without the DSL the names do not exist and importing them
+# directly raises. Re-exporting here gives consumers a target whose shape does
+# not depend on the environment -- always present, always a tuple, only the
+# length varies -- which matters because create_moe imports every MoE backend
+# eagerly under _torch.models, so one such import failing takes down the whole
+# model-architecture registry rather than just that backend.
+TILE_SIZED_GROUPED_GEMM_RUNNERS: tuple[type, ...] = ()
 
 if IS_FLASHINFER_AVAILABLE:
     from .flashinfer_custom_ops import (
@@ -62,10 +73,22 @@ if IS_FLASHINFER_AVAILABLE:
     ]
 
 if IS_CUTLASS_DSL_AVAILABLE:
+    from . import cute_dsl_custom_ops as _cute_dsl_ops
     from .cute_dsl_custom_ops import (
         cute_dsl_nvfp4_dense_gemm_swiglu_blackwell,
         cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell,
         cute_dsl_nvfp4_gemm_blackwell)
+
+    # Reached through the module, not imported by name: these four are tuple
+    # ingredients rather than re-exports, and binding them would put four more
+    # DSL-only attributes on the package -- the env-dependent surface the tuple
+    # exists to replace.
+    TILE_SIZED_GROUPED_GEMM_RUNNERS = (
+        _cute_dsl_ops.Sm100BlockScaledContiguousGroupedGemmRunner,
+        _cute_dsl_ops.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+        _cute_dsl_ops.Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
+        _cute_dsl_ops.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner
+    )
     __all__ += [
         'cute_dsl_nvfp4_gemm_blackwell',
         'cute_dsl_nvfp4_dense_gemm_swiglu_blackwell',

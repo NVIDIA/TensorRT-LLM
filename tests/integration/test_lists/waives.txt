@@ -82,7 +82,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True] SKIP (https://nvbugs/6606551)
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True] SKIP (https://nvbugs/6625710)
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_cutedsl] SKIP (https://nvbugs/6535779)
-accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash SKIP (https://nvbugs/6640134)
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_bf16[latency] SKIP (https://nvbugs/6412098)
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency] SKIP (https://nvbugs/6566768)
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/6248827)

@@ -364,12 +364,14 @@ def test_indexed_gather_inplace_scatter_matches_triton():
 
 def test_gdn_mixer_resolve_chunk_gated_delta_rule(monkeypatch):
     """gdn_mixer resolves its prefill kernel lazily (``_resolve_chunk_gated_delta_rule``):
-    the FlashInfer wrapper when the env opt-in is set (default) *and* the arch is
-    supported (SM90/SM100/SM103), otherwise the vendored Triton kernel (env
-    opt-out, or an unsupported arch such as SM120).
+    the FlashInfer wrapper when the env opt-in is set (default), the arch is
+    supported (SM90/SM100/SM103), *and* flashinfer actually exports the GDN
+    kernel; otherwise the vendored Triton kernel (env opt-out, an unsupported
+    arch such as SM120, or a flashinfer build without the CuTe DSL).
 
-    The arch predicate is monkeypatched so the routing is checked independent of
-    the actual GPU; only dispatch wiring is exercised (no kernel launch).
+    The arch predicate and the resolved symbol are monkeypatched so the routing
+    is checked independent of the actual GPU and of whether the local flashinfer
+    build shipped the kernel; only dispatch wiring is exercised (no launch).
     """
     import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
     from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule as triton_fn
@@ -377,12 +379,17 @@ def test_gdn_mixer_resolve_chunk_gated_delta_rule(monkeypatch):
         chunk_gated_delta_rule as flashinfer_fn,
     )
 
-    def resolve(env, arch_supported):
+    def resolve(env, arch_supported, kernel_exported=True):
         if env is None:
             monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
         else:
             monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", env)
         monkeypatch.setattr(gdn_mixer, "is_flashinfer_gdn_supported_arch", lambda: arch_supported)
+        monkeypatch.setattr(
+            gdn_mixer,
+            "FLASHINFER_CHUNK_GATED_DELTA_RULE",
+            object() if kernel_exported else None,
+        )
         gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
         return gdn_mixer._resolve_chunk_gated_delta_rule()
 
@@ -394,6 +401,9 @@ def test_gdn_mixer_resolve_chunk_gated_delta_rule(monkeypatch):
     assert resolve("0", True) is triton_fn
     # Unsupported arch (e.g. SM120) -> Triton even with the default opt-in.
     assert resolve(None, False) is triton_fn
+    # flashinfer built without the CuTe DSL does not export the GDN kernel, so
+    # a supported arch alone must not select the wrapper.
+    assert resolve(None, True, kernel_exported=False) is triton_fn
 
     # Clear the cached resolution so later tests re-resolve against the real
     # arch/env (monkeypatch restores the env var and predicate on teardown).

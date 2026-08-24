@@ -22,8 +22,8 @@ import os
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from flashinfer.mamba import SSDCombined
 
+from tensorrt_llm._torch.flashinfer_utils import FLASHINFER_SSD_COMBINED
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
@@ -96,7 +96,7 @@ def _get_flashinfer_ssd_kernel(chunk_size, nheads, headdim, dstate, ngroups,
         f"Using FlashInfer fused SSD kernel for Mamba2 prefill "
         f"(has_varlen={has_varlen})",
         key=f"flashinfer_ssd_prefill_{has_varlen}")
-    return SSDCombined(
+    return FLASHINFER_SSD_COMBINED(
         chunk_size=chunk_size,
         nheads=nheads,
         headdim=headdim,
@@ -471,7 +471,8 @@ def mamba_chunk_scan_combined(
     # MMA tile constraints on (chunk_size, dstate, headdim) aren't met.
     dstate = B.shape[-1]
     headdim = x.shape[-1]
-    flashinfer_eligible = z is None and is_sm_100f() and _use_flashinfer_ssd()
+    flashinfer_eligible = (z is None and FLASHINFER_SSD_COMBINED is not None
+                           and is_sm_100f() and _use_flashinfer_ssd())
     if flashinfer_eligible and _flashinfer_ssd_supported(
             chunk_size, dstate, headdim):
         return _mamba_chunk_scan_flashinfer_fwd(
