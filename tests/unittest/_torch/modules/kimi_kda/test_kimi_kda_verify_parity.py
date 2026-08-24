@@ -287,7 +287,8 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     ref_ssm = cache.temporal.clone()
     ref_outs, ref_conv_steps, ref_ssm_steps = [], [], []
     for t in range(t_steps):
-        out = runtime.forward_decode(x[:, t], ref_conv, ref_ssm, slot_indices)
+        core = runtime.forward_decode(x[:, t], ref_conv, ref_ssm, slot_indices)
+        out = runtime._project_output(core)
         ref_outs.append(out)
         ref_conv_steps.append(ref_conv.index_select(0, slot_indices).clone())
         ref_ssm_steps.append(ref_ssm.index_select(0, slot_indices).clone())
@@ -311,8 +312,8 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
         slot_indices,
         output=verify_core,
     )
-    assert verify_result is None
-    out_verify = runtime.o_proj(verify_core.reshape(batch * t_steps, dim))
+    assert verify_result is verify_core
+    out_verify = runtime._project_output(verify_core)
 
     # Live pools must be untouched by verification.
     torch.testing.assert_close(cache.conv, pristine_conv, rtol=0, atol=0)

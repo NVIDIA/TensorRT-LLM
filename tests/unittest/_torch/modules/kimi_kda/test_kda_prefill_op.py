@@ -128,7 +128,7 @@ def _run_production_prefill(
         state_indices=slot_indices.to(torch.int32),
         query_start_loc=cu_seqlens.to(torch.int32),
     )
-    output = attention.forward_prefill(
+    core = attention.forward_prefill(
         hidden_states.reshape(-1, HIDDEN_SIZE),
         cu_seqlens,
         metadata,
@@ -137,6 +137,7 @@ def _run_production_prefill(
         state_pool,
         slot_indices,
     )
+    output = attention._project_output(core)
     return output.reshape_as(hidden_states)
 
 
