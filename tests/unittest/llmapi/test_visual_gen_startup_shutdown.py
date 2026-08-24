@@ -75,3 +75,34 @@ def test_sigterm_after_visual_gen_startup_shuts_down_model(
     assert exc_info.value.code == 128 + signal.SIGTERM
     model.shutdown.assert_called_once_with()
     assert signal.getsignal(signal.SIGTERM) is original_handler
+
+
+def test_missing_previous_sigterm_handler_restores_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signal_calls = []
+
+    def set_signal_handler(signum, handler):
+        signal_calls.append((signum, handler))
+        return None
+
+    fake_signal = SimpleNamespace(
+        SIGTERM=signal.SIGTERM,
+        SIG_DFL=signal.SIG_DFL,
+        signal=set_signal_handler,
+    )
+    monkeypatch.setattr(serve, "signal", fake_signal)
+
+    def fail_startup(*args, **kwargs) -> None:
+        del args, kwargs
+        raise RuntimeError("startup failed")
+
+    monkeypatch.setattr(visual_gen, "VisualGen", fail_startup)
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        serve.launch_visual_gen_server("127.0.0.1", 0, "test-model")
+
+    assert signal_calls == [
+        (signal.SIGTERM, serve._terminate_visual_gen_startup),
+        (signal.SIGTERM, signal.SIG_DFL),
+    ]

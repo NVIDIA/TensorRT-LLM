@@ -950,6 +950,7 @@ class DiffusionRemoteClient:
         self.event_loop_ready = _Event()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
+        self._shutdown_complete = _Event()
 
         # Start background thread (it will create its own event loop)
         self.background_thread = _Thread(target=self._serve_forever_thread, daemon=True)
@@ -1293,13 +1294,21 @@ class DiffusionRemoteClient:
     def shutdown(self):
         """Shutdown client and workers."""
         previous_signal_mask = _pthread_sigmask(signal.SIG_BLOCK, _SHUTDOWN_SIGNALS)
+        perform_cleanup = False
         worker_owner = None
         reaped_process_ids: Set[int] = set()
         try:
             with self._shutdown_lock:
-                if self._shutdown_started:
-                    return
-                self._shutdown_started = True
+                if not self._shutdown_started:
+                    self._shutdown_started = True
+                    perform_cleanup = True
+
+            if not perform_cleanup:
+                # In particular, keep the atexit callback from falling through
+                # to multiprocessing's timeout-less child joins while another
+                # caller is still reaping the workers.
+                self._shutdown_complete.wait()
+                return
 
             logger.info("DiffusionClient: Shutting down")
 
@@ -1348,6 +1357,11 @@ class DiffusionRemoteClient:
                 if worker_owner is not None:
                     worker_owner.release_after_reap(reaped_process_ids)
         finally:
+            if perform_cleanup:
+                # Publish completion before restoring the signal mask. A
+                # pending termination signal may be delivered by the restore,
+                # but concurrent and atexit callers must already be released.
+                self._shutdown_complete.set()
             _pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
 
     def _wait_ready(self):

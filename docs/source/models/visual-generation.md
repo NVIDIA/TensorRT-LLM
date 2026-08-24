@@ -98,6 +98,8 @@ The `trtllm-serve` command automatically detects diffusion models (by the presen
 
 See [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for server launch instructions, example configurations, and API usage.
 
+Locally spawned VisualGen workers have 3600 seconds by default to load the model and signal readiness. For checkpoints that need longer, set `TLLM_VISUAL_GEN_WORKER_READY_TIMEOUT` to a larger positive, finite number of seconds before creating `VisualGen` or starting `trtllm-serve`. If the timeout expires, the coordinator stops and reaps the workers instead of waiting indefinitely.
+
 ### Serving Endpoints
 
 When served via `trtllm-serve`, the following OpenAI-compatible endpoints are available:

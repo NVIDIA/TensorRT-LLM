@@ -924,8 +924,11 @@ def launch_visual_gen_server(
                 visual_gen_model.shutdown()
             raise SystemExit(128 + e.signum) from None
         finally:
-            if previous_sigterm_handler is not None:
-                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+            signal.signal(
+                signal.SIGTERM,
+                signal.SIG_DFL if previous_sigterm_handler is None else
+                previous_sigterm_handler,
+            )
 
 
 @click.command("serve")

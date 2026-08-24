@@ -540,6 +540,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
+    client._shutdown_complete = threading.Event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -586,6 +587,7 @@ def test_shutdown_bounds_inflight_spawn_and_owner_reaps_late_worker() -> None:
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
+    client._shutdown_complete = threading.Event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -621,6 +623,7 @@ def test_shutdown_skips_registered_process_that_never_started() -> None:
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
+    client._shutdown_complete = threading.Event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -704,6 +707,7 @@ def test_shutdown_is_idempotent() -> None:
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
+    client._shutdown_complete = threading.Event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -721,6 +725,66 @@ def test_shutdown_is_idempotent() -> None:
     worker.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
 
 
+def test_concurrent_shutdown_waits_for_active_reap() -> None:
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+    wait_entered = threading.Event()
+
+    class TrackedEvent:
+        def __init__(self) -> None:
+            self._event = threading.Event()
+
+        def set(self) -> None:
+            self._event.set()
+
+        def wait(self) -> bool:
+            wait_entered.set()
+            return self._event.wait()
+
+        def is_set(self) -> bool:
+            return self._event.is_set()
+
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client._shutdown_lock = threading.Lock()
+    client._shutdown_started = False
+    client._shutdown_complete = TrackedEvent()
+    client.pending_requests = MagicMock()
+    client.background_thread = MagicMock()
+    client.background_thread.is_alive.return_value = False
+
+    def block_active_cleanup(*args, **kwargs) -> None:
+        del args, kwargs
+        cleanup_entered.set()
+        assert release_cleanup.wait(timeout=10.0)
+
+    client.background_thread.join.side_effect = block_active_cleanup
+    worker = MagicMock()
+    worker.pid = 123
+    worker.is_alive.return_value = False
+    client.worker_processes = [worker]
+    client._worker_owner = None
+    client._ext_worker_thread = None
+
+    first_shutdown = threading.Thread(target=client.shutdown)
+    second_shutdown = threading.Thread(target=client.shutdown)
+    first_shutdown.start()
+    assert cleanup_entered.wait(timeout=10.0)
+    second_shutdown.start()
+
+    assert wait_entered.wait(timeout=10.0)
+    assert second_shutdown.is_alive()
+
+    release_cleanup.set()
+    first_shutdown.join(timeout=10.0)
+    second_shutdown.join(timeout=10.0)
+
+    assert not first_shutdown.is_alive()
+    assert not second_shutdown.is_alive()
+    assert client._shutdown_complete.is_set()
+    client.pending_requests.put.assert_called_once_with(None)
+    worker.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
+
+
 def test_shutdown_defers_signals_until_workers_are_reaped() -> None:
     class ShutdownTermination(BaseException):
         pass
@@ -728,6 +792,7 @@ def test_shutdown_defers_signals_until_workers_are_reaped() -> None:
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
+    client._shutdown_complete = threading.Event()
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
@@ -752,5 +817,6 @@ def test_shutdown_defers_signals_until_workers_are_reaped() -> None:
         with pytest.raises(ShutdownTermination):
             client.shutdown()
 
+    assert client._shutdown_complete.is_set()
     worker.terminate.assert_called_once_with()
     worker.kill.assert_called_once_with()
