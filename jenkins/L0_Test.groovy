@@ -71,7 +71,7 @@ ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
+DLFW_IMAGE = "gitlab-master.nvidia.com:5005/dl/dgx/pytorch:26.08-py3.62627010-devel"
 
 MODEL_EXPRESS_VERSION = "0.4.1"
 MODEL_EXPRESS_NIXL_VERSION = "1.3.1"
@@ -6490,6 +6490,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             echo "###### Extra PyTorch CUDA 13.2 install Start ######"
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
+                            // TODO(dlfw-26.08): bump together with requirements.txt's torch/triton pins once
+                            // public torch>=2.13.0 and a matching public triton are released.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
