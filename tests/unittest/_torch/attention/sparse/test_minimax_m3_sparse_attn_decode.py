@@ -26,6 +26,7 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decod
     _sm103_nvfp4_launch_options,
     _sm103_nvfp4_merge_launch_options,
     _sm103_nvfp4_num_topk_chunks,
+    _sm103_nvfp4_use_linear_softmax,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
 )
@@ -806,6 +807,31 @@ def test_sm103_nvfp4_launch_options_rejects_unmeasured_shapes():
     assert (
         _sm103_nvfp4_launch_options(**(common | {"decode_query_len": 1}), capability=(10, 3)) == {}
     )
+
+
+@pytest.mark.parametrize(
+    ("num_kv_heads", "local_batch", "expected"),
+    [
+        (1, 1, False),
+        (1, 2, True),
+        (1, 16, True),
+        (2, 1, True),
+        (2, 16, True),
+        (4, 1, True),
+        (4, 14, True),
+        (8, 14, False),
+    ],
+)
+def test_sm103_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected):
+    common = dict(
+        total_q=local_batch * 4,
+        num_kv_heads=num_kv_heads,
+        gqa_group_size=16,
+        max_topk=16,
+        decode_query_len=4,
+    )
+    assert _sm103_nvfp4_use_linear_softmax(**common, capability=(10, 3)) is expected
+    assert not _sm103_nvfp4_use_linear_softmax(**common, capability=(10, 0))
 
 
 @pytest.mark.parametrize(
