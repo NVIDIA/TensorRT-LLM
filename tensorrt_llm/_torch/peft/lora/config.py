@@ -122,8 +122,7 @@ class LoraConfig(StrictBaseModel):
         description=
         "Whether to capture separate CUDA graphs for batches with and without "
         "active LoRA adapters. Reduces overhead for batches without LoRA at "
-        "the cost of increased warmup time and CUDA graph metadata."
-    )
+        "the cost of increased warmup time and CUDA graph metadata.")
 
     @property
     def missing_qkv_modules(self) -> List[str]:
