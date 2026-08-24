@@ -722,27 +722,27 @@ def find_cross(s_hist, target, tidx, s_res, nb: cutlass.Constexpr):
     BPL = nb // 32  # python int at trace time
     if tidx < cutlass.Int32(32):
         lane = tidx
-        # per-lane span sum with rotated bank-skew indexing (L82-84)
+        # per-lane span sum with rotated bank-skew indexing
         part = cutlass.Int32(0)
         for j in cutlass.range_constexpr(BPL):
             idx = lane * cutlass.Int32(BPL) + ((cutlass.Int32(j) + lane) & cutlass.Int32(BPL - 1))
             part = part + s_hist[idx]
-        # 5-step suffix scan (L85-89): v = sum of part over lanes >= lane
+        # 5-step suffix scan: v = sum of part over lanes >= lane
         v = warp_suffix_scan_add(part, lane)
         if lane == cutlass.Int32(0):
             s_res[RES_TOT] = v
-        # level 1: highest lane whose suffix still reaches target (L91-92)
+        # level 1: highest lane whose suffix still reaches target
         msk = ballot(v >= target)
         L = hi_bit_or_zero(msk)
-        aboveL = cute.arch.shuffle_sync(v - part, L)  # L93
-        # level 2: one bin per lane inside lane L's span (L94-100)
+        aboveL = cute.arch.shuffle_sync(v - part, L)
+        # level 2: one bin per lane inside lane L's span
         h = cutlass.Int32(0)
         if lane < cutlass.Int32(BPL):
             h = s_hist[L * cutlass.Int32(BPL) + lane]
         w = warp_suffix_scan_add(h, lane)
         msk2 = ballot((aboveL + w) >= target)
         J = hi_bit_or_zero(msk2)
-        if lane == J:  # L103-107
+        if lane == J:  # pinning lane
             s_res[RES_B] = L * cutlass.Int32(BPL) + J
             s_res[RES_M] = h
             s_res[RES_ABOVE] = aboveL + (w - h)
@@ -1057,7 +1057,7 @@ def gather_hint(
 ):
     NW = blk // 32
     lane = tidx & cutlass.Int32(31)
-    # batch A: KPT coalesced pre_idx loads, predicated flat (L340)
+    # batch A: KPT coalesced pre_idx loads, predicated flat
     pvs = []
     for t in cutlass.range_constexpr(kpt):
         pv = cutlass.Int32(-1)
@@ -1065,14 +1065,14 @@ def gather_hint(
         if j < k:
             pv = ld_g_i32(p_addr, j)
         pvs.append(pv)
-    # batch B: KPT scattered read-only gathers, predicated flat (L341-343)
+    # batch B: KPT scattered read-only gathers, predicated flat
     xs = []
     for t in cutlass.range_constexpr(kpt):
         xv = cutlass.Float32(0.0)
         if cutlass.Uint32(pvs[t]) < cutlass.Uint32(n):  # (unsigned)p < (unsigned)n
             xv = ldg_f32(x_addr, pvs[t])
         xs.append(xv)
-    # fold (L344-346)
+    # fold
     glmin = cutlass.Uint32(0xFFFFFFFF)
     glmax = cutlass.Uint32(0)
     for t in cutlass.range_constexpr(kpt):
@@ -1082,14 +1082,14 @@ def gather_hint(
                 glmin = u2
             if u2 > glmax:
                 glmax = u2
-    # warp redux + staging (L347-348)
+    # warp redux + staging
     glmin = warp_min_u32(glmin)
     glmax = warp_max_u32(glmax)
     if lane == cutlass.Int32(0):
         s_wmn[tidx >> cutlass.Int32(5)] = glmin
         s_wmx[tidx >> cutlass.Int32(5)] = glmax
-    cute.arch.barrier()  # L349 (barrier 1/2)
-    # cross-warp redux by EVERY thread — block-uniform outputs (L350-355)
+    cute.arch.barrier()  # barrier 1/2
+    # cross-warp redux by EVERY thread — block-uniform outputs
     a2 = cutlass.Uint32(0xFFFFFFFF)
     c2 = cutlass.Uint32(0)
     if lane < cutlass.Int32(NW):
@@ -1097,14 +1097,14 @@ def gather_hint(
         c2 = s_wmx[lane]
     gm = invkey(warp_min_u32(a2))
     gx = invkey(warp_max_u32(c2))
-    # NaN-safe degeneracy guard (L356): !(GM < GX) — NaN compares false
+    # NaN-safe degeneracy guard: !(GM < GX) — NaN compares false
     ok = cutlass.Int32(0)
     if gm < gx:
         ok = cutlass.Int32(1)
     if ok == cutlass.Int32(0):
         gm = cutlass.Float32(SENT_LO)
         gx = cutlass.Float32(SENT_HI)
-    cute.arch.barrier()  # L357 (barrier 2/2)
+    cute.arch.barrier()  # barrier 2/2
     return gm, gx
 
 
@@ -1529,7 +1529,7 @@ class GvrMainKernel:
                 n = nv
                 n4v = n >> cutlass.Int32(2)
                 # Ladder-scalar baselines only: the real SMP/SS2/TGT/TGT2 are
-                # derived by warp0 alone in the P2a block below (bit-identical
+                # derived by warp0 alone in the block below (bit-identical
                 # formulas) and published through s_lad — every thread's local
                 # copies here are overwritten by the post-barrier smem read.
                 SMP = cutlass.Int32(0)
@@ -4740,7 +4740,7 @@ class GvrClusKernel:
         )
         # scan_cross predeclares its second-stage partial as Int32 and reads
         # s_ws inside a dynamic if — a Uint32 ws tensor trips the DSL type-
-        # stability check (frozen sibling; counts < 2^31 so Int32 is exact).
+        # stability check (counts < 2^31 so Int32 is exact).
         s_wmn = smem.allocate_tensor(
             cutlass.Uint32, cute.make_ordered_layout((NW,), order=(0,)), byte_alignment=16
         )
@@ -6381,9 +6381,9 @@ class GvrRegClusKernel:
                                                 cutlass.Int32(1),
                                             )
                                     i = i + cutlass.Int32(BLK)
-                                cute.arch.barrier()  # L2618
+                                cute.arch.barrier()  # level hist
                                 find_cross(s_hist, needC, tid, s_res, nb=NB__regclus)
-                                cute.arch.barrier()  # L2620
+                                cute.arch.barrier()  # level scan
                                 aboveC = aboveC + s_res[RES_ABOVE]
                                 needC = needC - s_res[RES_ABOVE]
                                 mm = s_res[RES_M]
@@ -6398,7 +6398,7 @@ class GvrRegClusKernel:
                                     )
                                 rlo = nlo
                                 lev = lev + cutlass.Int32(1)
-                        cute.arch.barrier()  # L2626
+                        cute.arch.barrier()  # narrowing done
                         nA = k  # tie_m ? above2 : k
                         if tie_m == cutlass.Int32(1):
                             nA = aboveC
@@ -6408,7 +6408,7 @@ class GvrRegClusKernel:
                         lml = cutlass.Int32(cute.arch.lanemask_lt())
                         it2 = (n + cutlass.Int32(self.blk - 1)) // cutlass.Int32(self.blk)
                         it = cutlass.Int32(0)
-                        while it < it2:  # L2628-2645
+                        while it < it2:
                             i = it * cutlass.Int32(BLK) + tid
                             uke = cutlass.Uint32(0)
                             if i < n:
@@ -6442,7 +6442,7 @@ class GvrRegClusKernel:
                                     out_row[nA + p2e] = i
                             it = it + cutlass.Int32(1)
 
-            # ---- P10: FINAL cluster rendezvous (L2648) — ALL ranks reach it;
+            # ---- P10: FINAL cluster rendezvous — ALL ranks reach it;
             # keeps peers resident until rank 0 has read their ck/ci.
             _cluster_sync_aligned()
 
@@ -6534,7 +6534,7 @@ def regclus_topk(logits, pre_idx, n, out, rd=None):
         rd = route(logits.shape[0], int(n), logits.shape[1], pre_idx.shape[1])
     assert rd["kernel"] == "reg_clus", rd["kernel"]
     tpl = tuple(rd["tpl"])
-    assert pre_idx.shape[1] <= tpl[0], "k <= BLK enforced by dispatch L2897"
+    assert pre_idx.shape[1] <= tpl[0], "k <= BLK enforced by dispatch"
     assert rd["smem"] == DYN_SMEM_BYTES
     compiled = get_compiled__regclus(tpl)
     compiled(logits, pre_idx, out, int(n))
