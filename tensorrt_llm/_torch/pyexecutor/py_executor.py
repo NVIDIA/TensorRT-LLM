@@ -1,15 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import base64
 import dataclasses
 import datetime
 import functools
+import json
 import math
 import os
 import sys
 import threading
 import time
 import traceback
+import urllib.parse
+import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
@@ -31,7 +35,8 @@ from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  is_trace_enabled, mpi_comm, mpi_disabled,
                                  nvtx_range, set_thread_local_mpi_comm,
                                  trace_func)
-from tensorrt_llm.bindings.executor import (DisServingRequestStats,
+from tensorrt_llm.bindings.executor import (ContextPhaseParams,
+                                            DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
@@ -105,6 +110,7 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
 _UNBOUNDED_STATS_MAX_LEN = -1
+_DEFAULT_KV_HINT_STATE_PATH = "/v1/data_transceiver_state"
 
 
 class _ADPForwardIntent(IntEnum):
@@ -615,6 +621,12 @@ class PyExecutor:
             self.max_num_active_requests = derived_cap
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        self._pending_kv_hint_state_fetches: Dict[int, Future[bytes]] = {}
+        self.kv_hint_metadata_fetch_executor = (ThreadPoolExecutor(
+            max_workers=int(
+                os.environ.get("TLLM_KV_HINT_METADATA_FETCH_WORKERS", "4")),
+            thread_name_prefix="kv-hint-state")
+            if kv_cache_transceiver is not None else None)
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
         # from _send_kv_async the owning DP rank has a response but the other
@@ -1495,6 +1507,12 @@ class PyExecutor:
         if encoder_launch_executor is not None:
             encoder_launch_executor.shutdown(wait=True)
             self.encoder_launch_executor = None
+
+        if self.kv_hint_metadata_fetch_executor is not None:
+            self.kv_hint_metadata_fetch_executor.shutdown(
+                wait=False, cancel_futures=True)
+            self.kv_hint_metadata_fetch_executor = None
+        self._pending_kv_hint_state_fetches.clear()
 
         self.worker_started = False
         # Release CUDA graphs before resource managers free their GPU memory.
@@ -2592,6 +2610,7 @@ class PyExecutor:
                     self._check_disagg_ctx_schedulable_status(new_requests)
                     self._check_requester_cache_transfer_status()
                     self._check_disagg_gen_transfer_status()
+                    self._check_kv_hint_metadata_fetch_status()
                     self._prepare_context_prefetch_init()
 
                 if self.enable_iter_perf_stats:
@@ -3718,6 +3737,7 @@ class PyExecutor:
             self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_requester_cache_transfer_status()
             self._check_disagg_gen_transfer_status()
+            self._check_kv_hint_metadata_fetch_status()
             self._check_kv_transfer_timeout()
             self._prepare_context_prefetch_init()
 
@@ -5868,8 +5888,113 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
+        for request in validated_requests:
+            self._maybe_prepare_context_prefetch_from_kv_hint(request)
+
         self.active_requests.extend(validated_requests)
         return validated_requests
+
+    def _fetch_kv_hint_data_transceiver_state(
+            self, source_control_endpoint: str) -> bytes:
+        endpoint = source_control_endpoint.strip()
+        if not endpoint.startswith(("http://", "https://")):
+            endpoint = f"http://{endpoint}"
+
+        parsed = urllib.parse.urlsplit(endpoint)
+        path = parsed.path.rstrip("/")
+        url = urllib.parse.urlunsplit(
+            parsed._replace(
+                path=path or _DEFAULT_KV_HINT_STATE_PATH,
+                query="",
+                fragment=""))
+
+        with urllib.request.urlopen(url, timeout=5.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        encoded_state = payload.get("data_transceiver_state")
+        if not isinstance(encoded_state, str) or not encoded_state:
+            raise ValueError(
+                f"No data_transceiver_state field returned by {url}")
+        return base64.b64decode(encoded_state)
+
+    def _maybe_prepare_context_prefetch_from_kv_hint(
+            self, request: LlmRequest) -> None:
+        kv_hint = request.kv_hint
+        if (kv_hint is None or request.state != LlmRequestState.CONTEXT_INIT
+                or request.is_generation_only_request()
+                or getattr(request, "py_disaggregated_params", None) is not None
+                or request.context_phase_params is not None):
+            return
+
+        source_control_endpoint = kv_hint.source_control_endpoint
+        if not isinstance(source_control_endpoint,
+                          str) or not source_control_endpoint.strip():
+            return
+
+        if self.kv_cache_transceiver is None:
+            logger.warning_once(
+                "KV cache transfer hint was provided, but cache transceiver "
+                "is not configured; falling back to local context computation",
+                key="kv_hint_without_cache_transceiver")
+            return
+
+        if self.kv_hint_metadata_fetch_executor is None:
+            logger.warning_once(
+                "KV cache transfer hint was provided, but metadata fetch "
+                "executor is not configured; falling back to local context "
+                "computation",
+                key="kv_hint_without_metadata_fetch_executor")
+            return
+
+        request.state = LlmRequestState.CONTEXT_PREFETCH_INIT
+        try:
+            state_fetch = self.kv_hint_metadata_fetch_executor.submit(
+                self._fetch_kv_hint_data_transceiver_state,
+                source_control_endpoint)
+        except RuntimeError as err:
+            logger.warning(
+                "Failed to start KV cache transfer source-state fetch for "
+                f"request {request.py_request_id}; falling back to local "
+                f"context computation: {err}")
+            request.state = LlmRequestState.CONTEXT_INIT
+            return
+        self._pending_kv_hint_state_fetches[request.py_request_id] = state_fetch
+
+    def _check_kv_hint_metadata_fetch_status(self) -> None:
+        if not self._pending_kv_hint_state_fetches:
+            return
+
+        requests_by_id = {
+            req.py_request_id: req
+            for req in self.active_requests
+            if req.py_request_id is not None
+        }
+        for req_id, future in list(self._pending_kv_hint_state_fetches.items()):
+            if not future.done():
+                continue
+
+            self._pending_kv_hint_state_fetches.pop(req_id, None)
+            req = requests_by_id.get(req_id)
+            if (req is None
+                    or req.state != LlmRequestState.CONTEXT_PREFETCH_INIT
+                    or req.context_phase_params is not None):
+                continue
+
+            try:
+                opaque_state = future.result()
+            except Exception as err:
+                logger.warning(
+                    "Failed to fetch KV cache transfer source state for "
+                    f"request {req.py_request_id}; falling back to local "
+                    f"context computation: {err}")
+                req.clear_context_phase_params()
+                req.state = LlmRequestState.CONTEXT_INIT
+                continue
+
+            logger.debug("Request %s fetched KV source state bytes=%d",
+                         req.py_request_id, len(opaque_state))
+            req.context_phase_params = ContextPhaseParams(
+                [], req.py_request_id, opaque_state, None, None, None)
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -7135,6 +7260,7 @@ class PyExecutor:
         context_prefetch_requests = [
             req for req in self.active_requests
             if req.state == LlmRequestState.CONTEXT_PREFETCH_INIT
+            and req.context_phase_params is not None
         ]
         if not context_prefetch_requests:
             return
@@ -7191,6 +7317,7 @@ class PyExecutor:
             logger.warning(
                 "Context KV cache prefetch cleanup failed for "
                 f"request {req.py_request_id}: {cleanup_err}")
+        req.clear_context_phase_params()
         req.state = LlmRequestState.CONTEXT_INIT
 
     def _finalize_context_prefetch_complete(self):
@@ -7212,6 +7339,7 @@ class PyExecutor:
                     f"context computation: {err}")
                 self._release_context_prefetch_resources(req)
                 continue
+            req.clear_context_phase_params()
             req.py_kv_transfer_start_time = None
             req.py_kv_transfer_timed_out = False
             req.state = LlmRequestState.CONTEXT_INIT
@@ -7665,9 +7793,7 @@ class PyExecutor:
             req = requests_by_id.get(req_id)
             if req is None:
                 continue
-            if req.state == LlmRequestState.CONTEXT_PREFETCH_IN_PROGRESS:
-                req.state = LlmRequestState.CONTEXT_PREFETCH_COMPLETE
-            elif req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+            if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
 
         for req_id in error_req_ids:

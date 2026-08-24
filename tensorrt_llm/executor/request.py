@@ -90,7 +90,12 @@ class PromptAdapterRequest:
 
 @dataclass(slots=True)
 class KvHint:
-    """KV cache transfer hint carried with a generation request."""
+    """KV cache transfer hint carried with a generation request.
+
+    The PyTorch executor treats a URL with a path as the exact
+    transceiver-state endpoint. For host-only URLs, it appends
+    /v1/data_transceiver_state.
+    """
     source_control_endpoint: str
 
     def __post_init__(self):

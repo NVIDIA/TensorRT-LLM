@@ -9,12 +9,17 @@ This module tests:
 
 """
 
+import base64
+import json
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     attach_py_objects_to_requests,
@@ -28,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.executor.request import KvHint
 from tensorrt_llm.mapping import CpType
 
 pytestmark = pytest.mark.cpu_only
@@ -154,6 +160,134 @@ def test_executor_request_to_llm_request_preserves_kv_hint() -> None:
 
     assert llm_request.kv_hint == kv_hint
     assert llm_request.kv_hint.source_control_endpoint == source_control_endpoint
+
+
+def test_fetch_kv_hint_data_transceiver_state(monkeypatch) -> None:
+    expected_state = b"serialized-state"
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "data_transceiver_state": base64.b64encode(
+                        expected_state).decode("utf-8")
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(url, timeout):
+        calls.append((url, timeout))
+        return Response()
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.urllib.request.urlopen",
+        fake_urlopen)
+
+    state = PyExecutor._fetch_kv_hint_data_transceiver_state(
+        SimpleNamespace(), "127.0.0.1:8000")
+    state_from_full_url = PyExecutor._fetch_kv_hint_data_transceiver_state(
+        SimpleNamespace(), "http://127.0.0.1:8000/engine/data_transceiver_state")
+
+    assert state == expected_state
+    assert state_from_full_url == expected_state
+    assert calls == [
+        ("http://127.0.0.1:8000/v1/data_transceiver_state", 5.0),
+        ("http://127.0.0.1:8000/engine/data_transceiver_state", 5.0),
+    ]
+
+
+def test_prepare_context_prefetch_from_kv_hint_is_async(monkeypatch) -> None:
+    class ContextPhaseParamsCapture:
+        def __init__(self, draft_tokens, req_id, opaque_state, *args):
+            self.draft_tokens = draft_tokens
+            self.req_id = req_id
+            self.opaque_state = opaque_state
+            self.args = args
+
+    class MetadataFetchExecutor:
+        def __init__(self):
+            self.calls = []
+            self.future = Future()
+
+        def submit(self, fn, *args):
+            self.calls.append((fn, args))
+            return self.future
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.ContextPhaseParams",
+        ContextPhaseParamsCapture)
+
+    request = SimpleNamespace(
+        kv_hint=KvHint(source_control_endpoint="http://127.0.0.1:8000"),
+        state=LlmRequestState.CONTEXT_INIT,
+        is_generation_only_request=lambda: False,
+        py_disaggregated_params=None,
+        context_phase_params=None,
+        py_request_id=42,
+    )
+    metadata_fetch_executor = MetadataFetchExecutor()
+    executor = SimpleNamespace(
+        active_requests=[request],
+        kv_cache_transceiver=object(),
+        kv_hint_metadata_fetch_executor=metadata_fetch_executor,
+        _pending_kv_hint_state_fetches={},
+        _fetch_kv_hint_data_transceiver_state=lambda endpoint: b"state",
+    )
+
+    PyExecutor._maybe_prepare_context_prefetch_from_kv_hint(executor, request)
+
+    assert request.state == LlmRequestState.CONTEXT_PREFETCH_INIT
+    assert request.context_phase_params is None
+    assert metadata_fetch_executor.calls == [
+        (
+            executor._fetch_kv_hint_data_transceiver_state,
+            ("http://127.0.0.1:8000",),
+        )
+    ]
+    assert executor._pending_kv_hint_state_fetches == {
+        request.py_request_id: metadata_fetch_executor.future
+    }
+
+    metadata_fetch_executor.future.set_result(b"state")
+    PyExecutor._check_kv_hint_metadata_fetch_status(executor)
+
+    assert executor._pending_kv_hint_state_fetches == {}
+    assert request.state == LlmRequestState.CONTEXT_PREFETCH_INIT
+    assert request.context_phase_params.req_id == request.py_request_id
+    assert request.context_phase_params.opaque_state == b"state"
+
+
+def test_prepare_context_prefetch_ignores_empty_bound_kv_hint() -> None:
+    class MetadataFetchExecutor:
+
+        def submit(self, fn, *args):
+            raise AssertionError("empty KV hint should not start metadata fetch")
+
+    request = SimpleNamespace(
+        kv_hint=trtllm.KvHint(),
+        state=LlmRequestState.CONTEXT_INIT,
+        is_generation_only_request=lambda: False,
+        py_disaggregated_params=None,
+        context_phase_params=None,
+        py_request_id=42,
+    )
+    executor = SimpleNamespace(
+        kv_cache_transceiver=object(),
+        kv_hint_metadata_fetch_executor=MetadataFetchExecutor(),
+        _pending_kv_hint_state_fetches={},
+    )
+
+    PyExecutor._maybe_prepare_context_prefetch_from_kv_hint(executor, request)
+
+    assert request.state == LlmRequestState.CONTEXT_INIT
+    assert request.context_phase_params is None
+    assert executor._pending_kv_hint_state_fetches == {}
 
 
 def test_merge_helix_requests_with_padding():

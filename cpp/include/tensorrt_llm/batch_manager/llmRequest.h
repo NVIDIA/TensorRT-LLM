@@ -227,6 +227,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSalt(std::move(cacheSalt))
+        , mKvHint(std::move(kvHint))
         , mAgentHierarchy(std::move(agent_hierarchy))
     {
         if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
@@ -585,6 +586,11 @@ public:
     {
         mContextPhaseParams = std::move(contextPhaseParams);
         adoptContextPhaseDraftTokens();
+    }
+
+    void clearContextPhaseParams() noexcept
+    {
+        mContextPhaseParams.reset();
     }
 
     /// @brief Get the state params of the context
@@ -2264,8 +2270,6 @@ protected:
 
     std::optional<executor::ContextPhaseParams> mContextPhaseParams{std::nullopt};
 
-    std::optional<executor::KvHint> mKvHint{std::nullopt};
-
     std::shared_ptr<ContextProgress> mContextProgress{nullptr};
 
     std::optional<std::shared_ptr<VecTokenExtraIds>> mInputTokenExtraIds{std::nullopt};
@@ -2317,6 +2321,8 @@ protected:
 
     // Cache salt string. Used in BlockKey hashing/matching and surfaced in KV cache events.
     std::optional<std::string> mCacheSalt{std::nullopt};
+
+    std::optional<executor::KvHint> mKvHint{std::nullopt};
 
     std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
