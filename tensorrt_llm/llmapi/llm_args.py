@@ -4991,9 +4991,7 @@ class BaseLlmArgs(StrictBaseModel):
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
 
-        if self.lora_config is not None and self.backend in [
-                'pytorch', '_autodeploy'
-        ]:
+        if self.lora_config is not None and self.backend == 'pytorch':
             if self.lora_config.cuda_graph_specialize_lora and self.enable_attention_dp:
                 raise ValueError(
                     "LoRA CUDA graph specialization cannot be used when attention DP is enabled."
