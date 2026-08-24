@@ -116,7 +116,7 @@ def test_minimax_disagg_role_mapper_kinds(
         num_layers=0,
         sparse_layer_ids=[],
         disable_index_value_layer_ids=[],
-        sparse_attn_config=SimpleNamespace(
+        sparse_attention_config=SimpleNamespace(
             implementation=implementation,
             indexer_kv_dtype="bf16",
         ),
@@ -207,7 +207,7 @@ def _create_manager(
         sparse_layer_ids=sparse_layers if sparse_layers is not None else SPARSE_LAYERS,
         disable_index_value_layer_ids=sparse_layers if sparse_layers is not None else SPARSE_LAYERS,
         sparse_index_dim=INDEX_DIM,
-        sparse_attn_config=SimpleNamespace(
+        sparse_attention_config=SimpleNamespace(
             implementation=implementation,
             indexer_kv_dtype="bf16",
         ),

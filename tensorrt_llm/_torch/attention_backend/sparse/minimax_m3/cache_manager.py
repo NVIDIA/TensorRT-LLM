@@ -168,7 +168,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # authoritative for the cache layout instead of falling back to 128.
         sparse_attention_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
-        implementation = getattr(sparse_attn_config, "implementation", "triton")
+        implementation = getattr(sparse_attention_config, "implementation", "triton")
         self._main_kv_mapper_kind = MapperKind.HND if implementation == "msa" else MapperKind.NHD
 
         if sparse_index_dim is None:
