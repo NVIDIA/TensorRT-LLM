@@ -53,17 +53,18 @@ def test_act_type_enum_values_stable():
     assert ActType.SiTu.value == 3
 
 
-@pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %
-    getSMVersion(),
-)
-@pytest.mark.parametrize("num_tokens", [1, 8, 512])
-def test_mxe4m3_mxe2m1_situ_runner_has_valid_configs(num_tokens):
+def _mxfp4_situ_tactics(num_tokens):
+    """MXFP8 activations x MXFP4 weights: group-32 scales, padded shapes."""
     runner = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(
         ActType.SiTu.value, True)
-    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens, 512, 256)
-    assert tactics, f"No valid SiTu tactic for num_tokens={num_tokens}"
+    return runner.get_valid_configs(2, 512, 256, 8, num_tokens, 512, 256)
+
+
+def _nvfp4_situ_tactics(num_tokens):
+    """NVFP4 in/out: group-16 scales, and no valid hidden/intermediate sizes
+    (padding is absorbed by the padded weight buffers instead)."""
+    runner = torch.classes.trtllm.FP4BlockScaleMoERunner(ActType.SiTu.value)
+    return runner.get_valid_configs(2, 512, 256, 8, num_tokens)
 
 
 @pytest.mark.skipif(
@@ -71,16 +72,20 @@ def test_mxe4m3_mxe2m1_situ_runner_has_valid_configs(num_tokens):
     reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %
     getSMVersion(),
 )
+@pytest.mark.parametrize("get_tactics",
+                         [_mxfp4_situ_tactics, _nvfp4_situ_tactics],
+                         ids=["mxfp4", "nvfp4"])
 @pytest.mark.parametrize("num_tokens", [1, 8, 512])
-def test_e2m1_e2m1_situ_runner_has_valid_configs(num_tokens):
-    """NVFP4 twin of the MXFP4 check above.
+def test_situ_runner_has_valid_configs(num_tokens, get_tactics):
+    """Both fused SiTu FC1 cubin families must be reachable through tactic
+    selection. There is no standalone SiTu activation kernel, so an empty
+    tactic list here means the whole path is unreachable.
 
-    Numerics for this path live in
-    tests/unittest/_torch/modules/moe/test_nvfp4_situ_moe.py.
+    Numerics and launch evidence for both families live in
+    tests/unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py.
     """
-    runner = torch.classes.trtllm.FP4BlockScaleMoERunner(ActType.SiTu.value)
-    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens)
-    assert tactics, f"No valid NVFP4 SiTu tactic for num_tokens={num_tokens}"
+    assert get_tactics(
+        num_tokens), f"No valid SiTu tactic for num_tokens={num_tokens}"
 
 
 class moe_args:
