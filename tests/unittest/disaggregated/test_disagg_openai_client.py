@@ -64,6 +64,27 @@ def test_adjusted_steady_clock_uses_reference_domain():
     assert clock.now() == 7.0
 
 
+@pytest.mark.asyncio
+async def test_worker_clock_calibration_uses_global_clock():
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    server = object.__new__(OpenAIServer)
+    global_clock = Mock(side_effect=[10.0, 10.2])
+    delay = AsyncMock()
+    with patch(
+        "tensorrt_llm.serve.openai_server.get_global_steady_clock_now_in_seconds",
+        global_clock,
+    ), patch("tensorrt_llm.serve.openai_server.asyncio.sleep", delay):
+        response = await server.get_steady_clock_offset()
+
+    assert json.loads(response.body) == {
+        "receive_ts": 10.0,
+        "transmit_ts": 10.2,
+    }
+    assert global_clock.call_count == 2
+    delay.assert_awaited_once_with(0.2)
+
+
 @pytest.fixture
 def mock_router():
     """Create a mock router."""

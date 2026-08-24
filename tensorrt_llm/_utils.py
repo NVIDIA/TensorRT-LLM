@@ -113,8 +113,9 @@ def numpy_to_torch(x):
 def get_steady_clock_now_in_seconds() -> float:
     """Time from the C++ runtime's steady clock, in seconds.
 
-    Use this raw clock for elapsed durations and clock-sync calibration. For
-    absolute metrics timestamps, use AdjustedSteadyClock.
+    Use this raw clock for elapsed durations. For absolute metrics timestamps
+    and rank-adjusted clock calibration, use AdjustedSteadyClock or
+    get_global_steady_clock_now_in_seconds.
     """
     return steady_clock_now().total_seconds()
 

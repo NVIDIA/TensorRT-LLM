@@ -99,7 +99,6 @@ from tensorrt_llm.serve.responses_utils import (ConversationHistoryStore,
                                                 ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -112,7 +111,8 @@ from tensorrt_llm.serve.visual_gen_utils import (
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
-from .._utils import (AdjustedSteadyClock, nvtx_mark,
+from .._utils import (AdjustedSteadyClock,
+                      get_global_steady_clock_now_in_seconds, nvtx_mark,
                       set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
@@ -1749,9 +1749,12 @@ class OpenAIServer(_VideoRoutesMixin):
         return Response(status_code=200)
 
     async def get_steady_clock_offset(self) -> JSONResponse:
-        receive_ts = get_steady_clock_now_in_seconds()
+        # The calibrated offset is applied to AdjustedSteadyClock, whose source
+        # is the rank-adjusted global clock. Sample that same clock here so a
+        # process-global offset is not counted twice in emitted metrics.
+        receive_ts = get_global_steady_clock_now_in_seconds()
         await asyncio.sleep(0.2)
-        transmit_ts = get_steady_clock_now_in_seconds()
+        transmit_ts = get_global_steady_clock_now_in_seconds()
         return JSONResponse(content={
             "receive_ts": receive_ts,
             "transmit_ts": transmit_ts
