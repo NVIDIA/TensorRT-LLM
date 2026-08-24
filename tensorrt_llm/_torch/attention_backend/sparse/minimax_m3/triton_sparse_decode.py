@@ -383,6 +383,352 @@ def _gqa_sparse_decode_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_H": lambda args: max(
+            16,
+            triton.next_power_of_2(args["gqa_group_size"] * args["QUERY_GROUP_SIZE"]),
+        ),
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    }
+)
+@triton.jit(do_not_specialize=["decode_query_len"])
+def _gqa_sparse_decode_pair_kernel(
+    q_ptr,  # [total_q, num_heads, head_dim]
+    k_ptr,  # paged K: [num_pages, num_kv_heads, page_size, head_dim (or /2 packed)]
+    v_ptr,  # paged V: same layout as K
+    kv_scale_ptr,  # scalar dequant scale, or a dummy when USE_SCALE is False
+    k_sc_ptr,  # paged K block scales: [num_pages, num_kv_heads, page_size, D/16]
+    v_sc_ptr,  # paged V block scales: same shape, 4x4 token-quad order
+    k_gs_ptr,  # NVFP4 per-tensor K dequant scale, one fp32
+    v_gs_ptr,  # NVFP4 per-tensor V dequant scale, one fp32
+    t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+    o_ptr,  # partial out, or final [total_q, num_heads, head_dim] when DIRECT_OUTPUT
+    lse_ptr,  # partial lse (log2), unused when DIRECT_OUTPUT
+    block_table_ptr,  # [num_reqs, max_blocks]
+    seq_lens,  # [num_reqs]
+    total_q,
+    gqa_group_size,
+    head_dim,
+    max_topk,
+    sm_scale,
+    decode_query_len,
+    stride_qn,
+    stride_qh,
+    stride_qd,
+    stride_k_blk,
+    stride_k_h,
+    stride_k_pos,
+    stride_k_d,
+    stride_v_blk,
+    stride_v_h,
+    stride_v_pos,
+    stride_v_d,
+    stride_ksc_blk,
+    stride_ksc_h,
+    stride_vsc_blk,
+    stride_vsc_h,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
+    stride_bt_b,
+    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    NUM_TOPK_CHUNKS: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    USE_SCALE: tl.constexpr,  # apply the scalar dequant scale to an fp8 cache
+    WIDEN_Q: tl.constexpr,  # q arrives FP8 and is widened in-register
+    COMPUTE_DTYPE: tl.constexpr,  # dtype q is widened to; drives the QK/PV math
+    USE_PDL: tl.constexpr,
+    KV_NVFP4: tl.constexpr,  # cache holds packed E2M1 plus E4M3 block scales
+    USE_LINEAR_SOFTMAX: tl.constexpr,  # measured NVFP4 online-softmax recurrence
+    QUERY_GROUP_SIZE: tl.constexpr,  # consecutive Eagle queries sharing one block set
+    MAX_TOPK: tl.constexpr,
+    SCALE_COLS: tl.constexpr,  # head_dim // NVFP4_SF_VEC_SIZE, NVFP4 only
+    DIRECT_OUTPUT: tl.constexpr,  # one chunk needs neither FP32 scratch nor a merge
+):
+    sm_scale_log2e = sm_scale * 1.4426950409
+    if KV_NVFP4:
+        # Both per-tensor dequant scales factor out of the inner loop: QK is
+        # linear in K, and V's scale commutes with the softmax weights. Reading
+        # them from device memory keeps the launch free of a host sync, so
+        # CUDA-graph capture stays unconstrained.
+        sm_scale_log2e = sm_scale_log2e * tl.load(k_gs_ptr)
+        v_global_scale = tl.load(v_gs_ptr)
+    # Split-K over the topk dimension: pid(0) folds (query group, chunk).
+    pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
+    num_query_groups = total_q // QUERY_GROUP_SIZE
+    pid_g = pid_bc % num_query_groups
+    pid_c = pid_bc // num_query_groups
+    groups_per_req = decode_query_len // QUERY_GROUP_SIZE
+    req_id = pid_g // groups_per_req
+    q_group_offset = (pid_g - req_id * groups_per_req) * QUERY_GROUP_SIZE
+    pid_b = req_id * decode_query_len + q_group_offset
+    pid_h = pid_kh * gqa_group_size
+    chunk_size_topk = (max_topk + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
+    chunk_start = pid_c * chunk_size_topk
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    seq_len = tl.load(seq_lens + req_id)
+    # Query rows are flattened as [query-in-group, GQA head].
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    q_lane = off_h // gqa_group_size
+    h_lane = off_h - q_lane * gqa_group_size
+    h_mask = off_h < gqa_group_size * QUERY_GROUP_SIZE
+    q_token = pid_b + q_lane
+    query_pos = seq_len - decode_query_len + q_group_offset + q_lane
+    # Full-CG padding uses zero-length request rows. Clamp to an empty
+    # attention range instead of letting padded rows produce negative lengths.
+    kv_len = tl.maximum(query_pos + 1, 0)
+    kv_len_max = tl.max(tl.where(h_mask, kv_len, 0), axis=0)
+
+    # Each query can have a different valid-block count at a page boundary.
+    # The selector puts those valid entries first and pads only the tail.
+    kv_len_0 = tl.maximum(seq_len - decode_query_len + q_group_offset + 1, 0)
+    num_blocks_0 = (kv_len_0 + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    real_topk_0 = tl.minimum(max_topk, num_blocks_0)
+    chunk_end_0 = tl.minimum(chunk_start + chunk_size_topk, real_topk_0)
+    if QUERY_GROUP_SIZE == 2:
+        kv_len_1 = tl.maximum(seq_len - decode_query_len + q_group_offset + 2, 0)
+        num_blocks_1 = (kv_len_1 + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+        real_topk_1 = tl.minimum(max_topk, num_blocks_1)
+        chunk_end_1 = tl.minimum(chunk_start + chunk_size_topk, real_topk_1)
+
+    off_n = tl.arange(0, BLOCK_SIZE_K)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    if KV_NVFP4:
+        # Packed byte column and block-scale column. The NVFP4 path runs only at
+        # head_dim == BLOCK_SIZE_D (128), so neither needs a tail mask.
+        off_dp = tl.arange(0, BLOCK_SIZE_D // 2)
+        off_s = tl.arange(0, SCALE_COLS)
+    d_mask = off_d < head_dim
+    hd_mask = h_mask[:, None] & d_mask[None, :]
+    bt_row = block_table_ptr + req_id * stride_bt_b
+
+    m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    if USE_LINEAR_SOFTMAX:
+        # Keep the linear softmax denominator and reuse the producer's alpha.
+        # This removes one exp2 plus one log2 from every visited KV page; only
+        # the final LSE written for split-K merging still needs a logarithm.
+        l_i = tl.zeros((BLOCK_SIZE_H,), dtype=tl.float32)
+    else:
+        lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
+    q = tl.load(
+        q_ptr
+        + q_token[:, None] * stride_qn
+        + (pid_h + h_lane[:, None]) * stride_qh
+        + off_d[None, :] * stride_qd,
+        mask=hd_mask,
+        other=0.0,
+    )
+    # Widen before anything reads q.dtype: K, V and p are all cast to it below,
+    # so leaving q narrow would silently run the whole attention in FP8 and
+    # quantize the softmax probabilities. E4M3 -> BF16 is exact, so this
+    # reproduces the values the caller's standalone widening kernel produced.
+    if WIDEN_Q:
+        q = q.to(COMPUTE_DTYPE)
+    kv_scale = tl.load(kv_scale_ptr) if USE_SCALE else 1.0
+
+    idx_ptr_0 = t_ptr + pid_kh * stride_th + pid_b * stride_tn + chunk_start * stride_tk
+    if QUERY_GROUP_SIZE == 2:
+        idx_ptr_1 = idx_ptr_0 + stride_tn
+        idx_0 = chunk_start
+        idx_1 = chunk_start
+        count_0 = chunk_end_0 - chunk_start
+        count_1 = chunk_end_1 - chunk_start
+        chunk_capacity: tl.constexpr = (MAX_TOPK + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
+        chunk_offsets = tl.arange(0, chunk_capacity)
+        sentinel = 2147483647
+        blocks_0 = tl.load(
+            idx_ptr_0 + chunk_offsets * stride_tk,
+            mask=chunk_offsets < count_0,
+            other=sentinel,
+        )
+        blocks_1 = tl.load(
+            idx_ptr_1 + chunk_offsets * stride_tk,
+            mask=chunk_offsets < count_1,
+            other=sentinel,
+        )
+        chunk_equal = tl.sum(blocks_0 != blocks_1, axis=0) == 0
+        # Equal chunks take the measured shared-page loop. A divergent chunk
+        # walks the sorted union, bounded by the sum of both row lengths.
+        num_candidates = tl.where(chunk_equal, count_0, count_0 + count_1)
+    else:
+        num_candidates = chunk_end_0 - chunk_start
+
+    for _ in tl.range(0, num_candidates):
+        if QUERY_GROUP_SIZE == 2:
+            if chunk_equal:
+                has_block = True
+                blk = tl.load(idx_ptr_0)
+                idx_ptr_0 += stride_tk
+                query_active = h_mask
+            else:
+                valid_0 = idx_0 < chunk_end_0
+                valid_1 = idx_1 < chunk_end_1
+                blk_0 = tl.load(idx_ptr_0, mask=valid_0, other=sentinel)
+                blk_1 = tl.load(idx_ptr_1, mask=valid_1, other=sentinel)
+                use_0 = valid_0 & (blk_0 <= blk_1)
+                use_1 = valid_1 & (blk_1 <= blk_0)
+                has_block = use_0 | use_1
+                blk = tl.minimum(blk_0, blk_1)
+                idx_0 += use_0.to(tl.int32)
+                idx_1 += use_1.to(tl.int32)
+                idx_ptr_0 += use_0.to(tl.int64) * stride_tk
+                idx_ptr_1 += use_1.to(tl.int64) * stride_tk
+                query_active = h_mask & (((q_lane == 0) & use_0) | ((q_lane == 1) & use_1))
+        else:
+            has_block = True
+            blk = tl.load(idx_ptr_0)
+            idx_ptr_0 += stride_tk
+            query_active = h_mask
+
+        if has_block:
+            # int64 page offsets: a large cache overflows int32 well before the
+            # per-page block offsets do.
+            page = tl.load(bt_row + blk).to(tl.int64)
+            pos_mask = blk * BLOCK_SIZE_K + off_n < kv_len_max
+            q_pos_mask = blk * BLOCK_SIZE_K + off_n[None, :] < kv_len[:, None]
+            if KV_NVFP4:
+                # K scales are token-major linear within the page-head region;
+                # see _fused_nvfp4_paged_scatter_kernel in msa_scatter.
+                k_deq = _dequant_nvfp4_rows(
+                    tl.load(
+                        k_ptr
+                        + page * stride_k_blk
+                        + pid_kh * stride_k_h
+                        + off_n[:, None] * stride_k_pos
+                        + off_dp[None, :] * stride_k_d,
+                        mask=pos_mask[:, None],
+                        other=0,
+                    ),
+                    tl.load(
+                        k_sc_ptr
+                        + page * stride_ksc_blk
+                        + pid_kh * stride_ksc_h
+                        + off_n[:, None] * SCALE_COLS
+                        + off_s[None, :],
+                        mask=pos_mask[:, None],
+                        other=0,
+                    ),
+                    BLOCK_N=BLOCK_SIZE_K,
+                    D=BLOCK_SIZE_D,
+                    SCALE_COLS=SCALE_COLS,
+                    SF_VEC=BLOCK_SIZE_D // SCALE_COLS,
+                )
+                k = tl.trans(k_deq).to(q.dtype)
+            else:
+                k = tl.load(
+                    k_ptr
+                    + page * stride_k_blk
+                    + pid_kh * stride_k_h
+                    + off_n[None, :] * stride_k_pos
+                    + off_d[:, None] * stride_k_d,
+                    mask=d_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                ).to(q.dtype)
+                if USE_SCALE:
+                    k = (k * kv_scale).to(q.dtype)
+            active_pos = query_active[:, None] & q_pos_mask
+            qk = tl.where(active_pos, 0.0, float("-inf"))
+            qk += tl.dot(q, k) * sm_scale_log2e
+            m_ij = tl.where(query_active, tl.maximum(m_i, tl.max(qk, axis=1)), m_i)
+            p = tl.where(active_pos, tl.exp2(qk - m_ij[:, None]), 0.0)
+            l_ij = tl.sum(p, axis=1)
+            alpha = tl.where(query_active, tl.exp2(m_i - m_ij), 1.0)
+            acc_o = acc_o * alpha[:, None]
+            if KV_NVFP4:
+                # V scales use vLLM's 4x4 token-quad order rather than K's
+                # linear one: [token // 4, scale_col, token % 4].
+                v = _dequant_nvfp4_rows(
+                    tl.load(
+                        v_ptr
+                        + page * stride_v_blk
+                        + pid_kh * stride_v_h
+                        + off_n[:, None] * stride_v_pos
+                        + off_dp[None, :] * stride_v_d,
+                        mask=pos_mask[:, None],
+                        other=0,
+                    ),
+                    tl.load(
+                        v_sc_ptr
+                        + page * stride_vsc_blk
+                        + pid_kh * stride_vsc_h
+                        + (off_n[:, None] // 4) * (4 * SCALE_COLS)
+                        + 4 * off_s[None, :]
+                        + (off_n[:, None] % 4),
+                        mask=pos_mask[:, None],
+                        other=0,
+                    ),
+                    BLOCK_N=BLOCK_SIZE_K,
+                    D=BLOCK_SIZE_D,
+                    SCALE_COLS=SCALE_COLS,
+                    SF_VEC=BLOCK_SIZE_D // SCALE_COLS,
+                ).to(q.dtype)
+            else:
+                v = tl.load(
+                    v_ptr
+                    + page * stride_v_blk
+                    + pid_kh * stride_v_h
+                    + off_n[:, None] * stride_v_pos
+                    + off_d[None, :] * stride_v_d,
+                    mask=pos_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                ).to(q.dtype)
+                if USE_SCALE:
+                    v = (v * kv_scale).to(q.dtype)
+            acc_o += tl.dot(p.to(v.dtype), v)
+            if USE_LINEAR_SOFTMAX:
+                l_i = tl.where(query_active, l_i * alpha + l_ij, l_i)
+            else:
+                lse_ij = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+                lse_i = tl.where(query_active, lse_ij, lse_i)
+            m_i = m_ij
+
+    # An empty chunk of an active row must store zero, or the merge hits 0 * NaN.
+    if USE_LINEAR_SOFTMAX:
+        scale = tl.where(l_i > 0.0, 1.0 / l_i, 0.0)
+        lse_out = tl.where(l_i > 0.0, m_i + tl.log2(l_i), float("-inf"))
+    else:
+        scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), 0.0)
+        lse_out = lse_i
+    if KV_NVFP4:
+        # Applying V's scale per partial is exact: the merge is a weighted
+        # average whose weights sum to one, so a constant survives it.
+        scale = scale * v_global_scale
+    acc_o = acc_o * scale[:, None]
+    tl.store(
+        o_ptr
+        + pid_c * stride_o_c
+        + q_token[:, None] * stride_o_b
+        + (pid_h + h_lane[:, None]) * stride_o_h
+        + off_d[None, :] * stride_o_d,
+        acc_o.to(o_ptr.dtype.element_ty),
+        mask=hd_mask,
+    )
+    if not DIRECT_OUTPUT:
+        tl.store(
+            lse_ptr + pid_c * stride_l_c + q_token * stride_l_b + (pid_h + h_lane) * stride_l_h,
+            lse_out,
+            mask=h_mask,
+        )
+
+    # After the stores, never before: this releases either the merge grid or,
+    # for direct output, the next PDL-enabled consumer of the final tensor.
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
 @triton.heuristics({"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])})
 @triton.jit
 def _merge_topk_attn_out_kernel(
@@ -513,6 +859,33 @@ def _sm103_nvfp4_use_linear_softmax(
     # log-domain recurrence; every other measured DEP8/16/32 bucket is neutral
     # or faster with the linear denominator.
     return not (num_kv_heads == 1 and local_batch == 1)
+
+
+def _sm103_nvfp4_query_group_size(
+    *,
+    total_q: int,
+    num_kv_heads: int,
+    gqa_group_size: int,
+    max_topk: int,
+    decode_query_len: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Group measured Eagle queries that benefit from shared packed pages."""
+    if capability is None:
+        capability = torch.cuda.get_device_capability()
+    if (
+        capability != (10, 3)
+        or num_kv_heads != 4
+        or gqa_group_size != 16
+        or max_topk != 16
+        or decode_query_len != 4
+        or total_q % decode_query_len != 0
+    ):
+        return 1
+    # The sorted-union kernel is 6.5%, 1.6%, and 24.2% faster at local batches
+    # 11, 12, and 14 with split-K 8. Other measured buckets are neutral or
+    # slower and retain the single-query producer.
+    return 2 if total_q // decode_query_len in (11, 12, 14) else 1
 
 
 def _sm103_nvfp4_launch_options(
@@ -708,18 +1081,32 @@ def minimax_m3_sparse_attn_decode(
     else:
         compute_dtype = tl.float32
 
-    if num_topk_chunks is None:
-        measured_chunks = (
-            _sm103_nvfp4_num_topk_chunks(
-                total_q=total_q,
-                num_kv_heads=num_kv_heads,
-                gqa_group_size=gqa_group_size,
-                max_topk=max_topk,
-                decode_query_len=decode_query_len,
-            )
-            if kv_nvfp4
-            else None
+    query_group_size = (
+        _sm103_nvfp4_query_group_size(
+            total_q=total_q,
+            num_kv_heads=num_kv_heads,
+            gqa_group_size=gqa_group_size,
+            max_topk=max_topk,
+            decode_query_len=decode_query_len,
         )
+        if kv_nvfp4
+        else 1
+    )
+    if num_topk_chunks is None:
+        if query_group_size == 2:
+            measured_chunks = 8
+        else:
+            measured_chunks = (
+                _sm103_nvfp4_num_topk_chunks(
+                    total_q=total_q,
+                    num_kv_heads=num_kv_heads,
+                    gqa_group_size=gqa_group_size,
+                    max_topk=max_topk,
+                    decode_query_len=decode_query_len,
+                )
+                if kv_nvfp4
+                else None
+            )
         num_topk_chunks = (
             measured_chunks
             if measured_chunks is not None
@@ -766,19 +1153,42 @@ def minimax_m3_sparse_attn_decode(
         max_topk=max_topk,
         decode_query_len=decode_query_len,
     )
-    launch_options = (
-        _sm103_nvfp4_launch_options(
-            total_q=total_q,
-            num_kv_heads=num_kv_heads,
-            gqa_group_size=gqa_group_size,
-            max_topk=max_topk,
-            decode_query_len=decode_query_len,
+    if query_group_size == 2:
+        launch_options = {"num_warps": 4, "num_stages": 1}
+    else:
+        launch_options = (
+            _sm103_nvfp4_launch_options(
+                total_q=total_q,
+                num_kv_heads=num_kv_heads,
+                gqa_group_size=gqa_group_size,
+                max_topk=max_topk,
+                decode_query_len=decode_query_len,
+            )
+            if kv_nvfp4
+            else {}
         )
-        if kv_nvfp4
+
+    # The pair path merges the two sorted selector rows on device. Equal blocks
+    # share one K/V dequantization; divergent blocks update only their owning
+    # query, so the optimization does not rely on runtime selection equality.
+    if total_q % query_group_size or decode_query_len % query_group_size:
+        raise ValueError(
+            f"query group {query_group_size} must divide total_q={total_q} and "
+            f"decode_query_len={decode_query_len}."
+        )
+
+    producer_kernel = (
+        _gqa_sparse_decode_pair_kernel if query_group_size == 2 else _gqa_sparse_decode_kernel
+    )
+    pair_kernel_options = (
+        {"QUERY_GROUP_SIZE": query_group_size, "MAX_TOPK": max_topk}
+        if query_group_size == 2
         else {}
     )
-
-    _gqa_sparse_decode_kernel[(total_q * num_topk_chunks, num_kv_heads)](
+    producer_kernel[
+        (total_q // query_group_size) * num_topk_chunks,
+        num_kv_heads,
+    ](
         q,
         k_paged,
         v_paged,
@@ -829,6 +1239,7 @@ def minimax_m3_sparse_attn_decode(
         USE_LINEAR_SOFTMAX=use_linear_softmax,
         SCALE_COLS=scale_cols,
         DIRECT_OUTPUT=direct_output,
+        **pair_kernel_options,
         **pdl_launch,
         **launch_options,
     )
@@ -866,6 +1277,7 @@ __all__ = [
     "SPARSE_BLOCK_SIZE",
     "_sm103_nvfp4_merge_launch_options",
     "_sm103_nvfp4_num_topk_chunks",
+    "_sm103_nvfp4_query_group_size",
     "_sm103_nvfp4_use_linear_softmax",
     "minimax_m3_sparse_attn_decode",
     "resolve_num_topk_chunks",
