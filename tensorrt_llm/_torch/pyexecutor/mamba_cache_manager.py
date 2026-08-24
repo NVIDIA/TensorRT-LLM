@@ -2749,9 +2749,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(
-            is_dummy if requests is
-            self.requests else [req.is_dummy for req in self.requests])
+        self._refresh_dummy_request_mask(is_dummy)
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
