@@ -1191,6 +1191,10 @@ class SpecMetadata:
         """
         if not self.spec_dec_mode.use_one_engine():
             return
+        # The synchronized group decision belongs to the previous iteration.
+        # Clear it before deriving this iteration's local flag; the caller
+        # immediately recomputes the group decision before graph-key lookup.
+        self.group_all_greedy_sample = None
         self._scan_one_model_sampling(requests)
 
     def populate_sampling_params_for_one_model(

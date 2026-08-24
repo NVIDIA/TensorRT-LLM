@@ -33,9 +33,6 @@ def get_attention_backend(
         if sparse_params is not None:
             return get_flashinfer_sparse_attn_attention_backend(sparse_params)
         return FlashInferAttention
-    elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
-        from .star_flashinfer import StarAttention
-        return StarAttention
 
     logger.warning("Falling back to TRTLLM attention backend")
     return TrtllmAttention
@@ -64,6 +61,7 @@ def create_attention(
     sparse_params: Optional[SparseParams] = None,
     dtype: Optional[torch.dtype] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
+    kv_cache_dtype: str = "auto",
     flashinfer_mla_backend: Optional[str] = None,
 ) -> AttentionBackend:
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
@@ -99,6 +97,7 @@ def create_attention(
         dtype=dtype,
         aux_stream=aux_stream,
         sparse_params=sparse_params,
+        kv_cache_dtype=kv_cache_dtype,
     )
     if flashinfer_mla_backend is not None:
         # Only TrtllmAttention understands this selector. Raise instead of

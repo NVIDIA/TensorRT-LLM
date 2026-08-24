@@ -11,9 +11,7 @@ This guide covers the TRT-LLM PyTorch attention stack:
 
 Use it when modifying the current implementation or adding a new model's
 attention behavior. It covers standard `Attention`, Multi-head Latent
-Attention (MLA), dense backends, and sparse backends. It does not cover
-`tensorrt_llm/_torch/attention_backend/star_flashinfer.py`, which is planned
-for deprecation.
+Attention (MLA), dense backends, and sparse backends.
 
 ## Glossary
 
@@ -301,13 +299,17 @@ The main differences across backends:
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
 libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+`FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
+DeepSeek-V4 and DSA,
 `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
 the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
-or `TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_trtllm_gen` to force the fallback
+`cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
+use `TLLM_FMHA_LIBS=fallback` or
+`TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
+to force the fallback
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
 
@@ -342,6 +344,8 @@ The FMHA package is split by role:
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
   requests and dispatches them to phase-specific hooks.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
+  MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
