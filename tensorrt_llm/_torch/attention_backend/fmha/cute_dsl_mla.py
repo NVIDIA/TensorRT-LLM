@@ -287,8 +287,6 @@ class CuteDslMlaFmha(PhasedFmha):
         # configuration after K3's 96-to-128 head padding was removed.
         if (meta.num_contexts != 0 and attn.num_heads != 96) or meta.num_generations <= 0:
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
-        if meta.helix_position_offsets is not None:
-            return False, "CuTe DSL MLA FMHA does not support Helix parallelism."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
         # Linear-chain MTP / spec-decode (seq_len_q > 1) IS supported: the
@@ -305,6 +303,23 @@ class CuteDslMlaFmha(PhasedFmha):
             return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
+        if meta.helix_position_offsets is not None:
+            if seq_len_q != 1:
+                return False, "CuTe DSL MLA FMHA only supports single-token decode with Helix."
+            softmax_stats = fwd.softmax_stats_tensor
+            if softmax_stats is None:
+                return False, "CuTe DSL MLA FMHA requires softmax_stats_tensor with Helix."
+            expected_stats_shape = (q.shape[0], attn.num_heads, 2)
+            if softmax_stats.shape != expected_stats_shape:
+                return False, (
+                    "CuTe DSL MLA FMHA requires Helix softmax stats with shape "
+                    f"{expected_stats_shape}, got {tuple(softmax_stats.shape)}."
+                )
+            if softmax_stats.dtype != torch.float32 or not softmax_stats.is_contiguous():
+                return False, (
+                    "CuTe DSL MLA FMHA requires contiguous float32 Helix softmax stats, "
+                    f"got dtype={softmax_stats.dtype}, contiguous={softmax_stats.is_contiguous()}."
+                )
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
@@ -492,6 +507,7 @@ class CuteDslMlaFmha(PhasedFmha):
             output_scale,
             # Max batch size for the AutoTuner to profile.
             int(meta.max_num_requests),
+            params.fwd.softmax_stats_tensor,
         )
 
     def run_mla_generation(

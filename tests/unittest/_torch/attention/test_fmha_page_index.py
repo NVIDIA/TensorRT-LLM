@@ -14,7 +14,9 @@ from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
     _get_multi_ctas_kv_counter_size,
 )
 from tensorrt_llm._torch.attention_backend.fmha.interface import _CuteDslMlaStagingKey
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.autotuner import AutoTuner
 
 
 class _AttentionStub:
@@ -144,6 +146,95 @@ def test_standalone_cute_dsl_mla_defers_to_explicit_flashinfer_backend(
     )
 
     assert not CuteDslMlaFmha.is_available(attn)
+
+
+def _cute_dsl_mla_helix_support(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    seq_len_q: int = 1,
+    softmax_stats: torch.Tensor | None,
+) -> tuple[bool, str]:
+    batch_size, num_heads = 2, 96
+    q = torch.empty(
+        (batch_size * seq_len_q, num_heads * (512 + 64)),
+        dtype=torch.bfloat16,
+    )
+    output = torch.empty(
+        (batch_size * seq_len_q, num_heads * 512),
+        dtype=torch.bfloat16,
+    )
+    attn = SimpleNamespace(
+        num_heads=num_heads,
+        has_fp8_kv_cache=False,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_idx=0,
+    )
+    metadata = SimpleNamespace(
+        num_contexts=0,
+        num_generations=batch_size,
+        beam_width=1,
+        is_spec_dec_tree=False,
+        is_spec_dec_dynamic_tree=False,
+        helix_position_offsets=torch.zeros(batch_size, dtype=torch.int32),
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda _layer_idx: torch.empty(0, dtype=torch.bfloat16)
+        ),
+        tokens_per_block=64,
+    )
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.generation_only,
+        softmax_stats_tensor=softmax_stats,
+    )
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "get",
+        classmethod(lambda _cls: SimpleNamespace(is_tuning_mode=False)),
+    )
+    monkeypatch.setattr(
+        CuteDslMlaFmha,
+        "_kernel_can_implement",
+        staticmethod(lambda *_args: (True, "")),
+    )
+    fmha = object.__new__(CuteDslMlaFmha)
+    return fmha._is_supported_with_reason(q, attn, metadata, forward_args)
+
+
+def test_cute_dsl_mla_accepts_single_token_helix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats = torch.empty((2, 96, 2), dtype=torch.float32)
+
+    supported, reason = _cute_dsl_mla_helix_support(monkeypatch, softmax_stats=stats)
+
+    assert supported, reason
+
+
+@pytest.mark.parametrize(
+    ("seq_len_q", "softmax_stats", "reason"),
+    [
+        (2, torch.empty((4, 96, 2), dtype=torch.float32), "single-token decode"),
+        (1, None, "requires softmax_stats_tensor"),
+        (1, torch.empty((2, 95, 2), dtype=torch.float32), "shape"),
+        (1, torch.empty((2, 96, 2), dtype=torch.bfloat16), "float32"),
+    ],
+)
+def test_cute_dsl_mla_rejects_invalid_helix_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_len_q: int,
+    softmax_stats: torch.Tensor | None,
+    reason: str,
+) -> None:
+    supported, actual_reason = _cute_dsl_mla_helix_support(
+        monkeypatch,
+        seq_len_q=seq_len_q,
+        softmax_stats=softmax_stats,
+    )
+
+    assert not supported
+    assert reason in actual_reason
 
 
 def test_flashinfer_mla_backend_defaults_to_trtllm_gen() -> None:
