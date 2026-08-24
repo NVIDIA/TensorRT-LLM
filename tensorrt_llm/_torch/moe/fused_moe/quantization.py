@@ -537,7 +537,8 @@ class FusedMoEMethodBase(ABC):
                               (UnquantizedFusedMoEMethod, FP8QDQFusedMoEMethod,
                                DeepSeekFP8BlockScalesFusedMoEMethod,
                                DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
-                               NVFP4FusedMoEMethod)):
+                               NVFP4FusedMoEMethod,
+                               MXFP8CutlassFusedMoEMethod)):
                 raise NotImplementedError(
                     f"Partial loading is not supported for {type(self).__name__}"
                 )
@@ -6580,6 +6581,18 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                                        requires_grad=False)
         module.register_parameter("w2_weight_scale", w2_weight_scale)
 
+        # Local slots whose staged UE8M0 bytes still need the CUTLASS swizzle.
+        # The swizzle is deferred to ``process_weights_after_loading`` because
+        # it is a read-modify-write on the destination buffer and therefore
+        # NOT an involution: under partial loading every bucket that touches
+        # this module calls ``load_quant_scales``, so applying it during
+        # staging would re-swizzle slots written by an earlier bucket (e.g. a
+        # down_proj-only bucket following a gate_up bucket) and scramble them.
+        # Tracking slots rather than a single flag keeps expert-sharded
+        # buckets correct, and clearing them makes repeated finalize a no-op.
+        module._mxfp8_w3_w1_sf_pending_slots = set()
+        module._mxfp8_w2_sf_pending_slots = set()
+
         self._online_eplb_not_verified(module)
         self.setup_quant_scales(module)
 
@@ -6610,10 +6623,24 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                 w1_sf = weights[w1_key] if w1_key is not None else None
                 w3_sf = weights[w3_key] if w3_key is not None else None
                 w2_sf = weights[w2_key] if w2_key is not None else None
+            elif (module.weight_loading_mode ==
+                  MoEWeightLoadingMode.FUSED_GATE_UP_PROJ):
+                # Stacked [E, K/32, N] scales, mirroring how the weights
+                # themselves are read in load_expert_weights_to_dst: transpose
+                # into [N, K/32] and split gate/up. Either key may be absent
+                # when a partial bucket carries only one of the projections.
+                w1_sf, w3_sf, w2_sf = None, None, None
+                gate_up_sf = weights.get("gate_up_proj_weight_scale")
+                if gate_up_sf is not None:
+                    w1_w3_sf = gate_up_sf[expert_id].transpose(0, 1).contiguous()
+                    w1_sf, w3_sf = w1_w3_sf.chunk(2, dim=0)
+                down_sf = weights.get("down_proj_weight_scale")
+                if down_sf is not None:
+                    w2_sf = down_sf[expert_id].transpose(0, 1).contiguous()
             else:
                 raise NotImplementedError(
                     f"MXFP8 MoE: weight loading mode {module.weight_loading_mode} "
-                    "not yet supported (only VANILLA today).")
+                    "not supported (VANILLA and FUSED_GATE_UP_PROJ only).")
 
             # View the int32-packed storage as raw uint8 [E_slot, 2*N, K/32]
             # so we can write per-row UE8M0 scales naturally. The byte layout
@@ -6650,25 +6677,47 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                                              device=device)
                 dst_w2_u8.copy_(w2_shard.to(torch.uint8))
 
-            # Swizzle each expert's block scale into the CUTLASS Mxf8f6f4
-            # block-scaled layout expected by the kernel mainloop. The op
-            # operates on the uint8 view; the result is then re-viewed back
-            # to int32 (same bytes, new dtype interpretation matching what
-            # the MoE TMA descriptor reads).
-            orig_w3_w1_int32_shape = module.w3_w1_weight_scale.data[
-                local_slot_id].shape
-            swizzled_w3_w1 = torch.ops.trtllm.block_scale_interleave(
-                dst_w3_w1_u8)
-            module.w3_w1_weight_scale.data[local_slot_id].copy_(
-                swizzled_w3_w1.view(
-                    self.BLOCK_SCALES_DTYPE).reshape(orig_w3_w1_int32_shape))
+            # Only stage raw UE8M0 bytes here and record which slots still owe
+            # the swizzle; process_weights_after_loading applies it exactly
+            # once. Arm a slot only when its bytes actually arrived, so a
+            # bucket that carries no scale for this tensor cannot re-swizzle a
+            # slot that a previous finalize already converted.
+            if w1_sf is not None or w3_sf is not None:
+                module._mxfp8_w3_w1_sf_pending_slots.add(local_slot_id)
+            if w2_sf is not None:
+                module._mxfp8_w2_sf_pending_slots.add(local_slot_id)
 
-            orig_w2_int32_shape = module.w2_weight_scale.data[
-                local_slot_id].shape
-            swizzled_w2 = torch.ops.trtllm.block_scale_interleave(dst_w2_u8)
-            module.w2_weight_scale.data[local_slot_id].copy_(
-                swizzled_w2.view(
-                    self.BLOCK_SCALES_DTYPE).reshape(orig_w2_int32_shape))
+    def _swizzle_slot_scale(self, scale_data: torch.Tensor,
+                            local_slot_id: int) -> None:
+        """Swizzle one slot's block scale into the CUTLASS Mxf8f6f4 layout.
+
+        The op operates on the uint8 view; the result is re-viewed back to
+        int32 (same bytes, new dtype interpretation matching what the MoE TMA
+        descriptor reads).
+        """
+        slot = scale_data[local_slot_id]
+        orig_int32_shape = slot.shape
+        swizzled = torch.ops.trtllm.block_scale_interleave(
+            slot.view(torch.uint8))
+        slot.copy_(
+            swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(orig_int32_shape))
+
+    def process_weights_after_loading(self, module: torch.nn.Module):
+        # Apply the deferred swizzle once per load/refit sequence. Draining the
+        # pending sets keeps the RLHF finalize walk -- which invokes both
+        # process_weights_after_loading and post_load_weights -- from
+        # double-swizzling.
+        for pending_attr, scale_attr in (("_mxfp8_w3_w1_sf_pending_slots",
+                                          "w3_w1_weight_scale"),
+                                         ("_mxfp8_w2_sf_pending_slots",
+                                          "w2_weight_scale")):
+            pending = getattr(module, pending_attr, None)
+            if not pending:
+                continue
+            scale_data = getattr(module, scale_attr).data
+            for local_slot_id in sorted(pending):
+                self._swizzle_slot_scale(scale_data, local_slot_id)
+            pending.clear()
 
 
 # Serializes the duplicate-check + slot-claim step of

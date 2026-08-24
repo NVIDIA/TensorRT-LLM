@@ -202,6 +202,45 @@ def test_mxfp8_quantize_alignment_torch_device(m, k, dtype,
                                   a.cpu().to(torch.float32), 8, 0, 0.999)
 
 
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_tiny_block_is_finite(dtype, is_sf_swizzled_layout):
+    """A near-zero 32-element block must not quantize to NaN.
+
+    The UE8M0 scale bottoms out at 2**-127, which is *subnormal* in fp32.
+    Deriving the output scale as a flush-to-zero reciprocal of that decoded
+    float yields +inf, so every element of the block becomes 0 * inf = NaN.
+    Any block whose amax lands in (0, 448 * 2**-127] hits it -- in practice a
+    near-zero SwiGLU block in an MXFP8 MoE intermediate, which turned a whole
+    token's logits into NaN. The exactly-zero block was already handled, so it
+    is covered here only as the neighbouring case.
+    """
+    block_amax_at_threshold = 448.0 * 2.0**-127
+    amaxes = [
+        0.0,
+        block_amax_at_threshold * 0.1,
+        block_amax_at_threshold * 0.5,
+        block_amax_at_threshold,
+        block_amax_at_threshold * 2.0,
+        1.0,
+    ]
+
+    k = 32 * len(amaxes)
+    a = torch.zeros([1, k], dtype=torch.float)
+    for block, amax in enumerate(amaxes):
+        a[0, block * 32] = amax
+    a = a.to(dtype).cuda().contiguous()
+
+    a_fp8, _ = torch.ops.trtllm.mxfp8_quantize(a, is_sf_swizzled_layout, 32)
+    torch.cuda.synchronize()
+
+    a_f32 = a_fp8.to(torch.float32)
+    assert torch.isfinite(a_f32).all(), (
+        "MXFP8 quantization produced non-finite values for near-zero blocks: "
+        f"{a_f32}")
+
+
 def _run_megamoe_prepare(hidden_states, token_selected_experts,
                          token_final_scales):
     m, k = hidden_states.shape
