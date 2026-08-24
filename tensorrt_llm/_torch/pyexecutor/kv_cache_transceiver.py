@@ -303,6 +303,11 @@ class KvCacheTransceiver(ABC):
         """Whether the send session closed before its final slice."""
         return False
 
+    @property
+    def consumes_transfer_buffer(self) -> bool:
+        """Return whether this runtime consumes the C++ CacheTransBuffer budget."""
+        return True
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest) -> None:
         """Start sending ``req``'s KV cache to the requesting instance.

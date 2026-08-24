@@ -866,6 +866,13 @@ def _make_disagg_transfer_request(
     return req
 
 
+def _set_disagg_transceiver_capability(
+    executor: PyExecutor, *, consumes_transfer_buffer: bool
+) -> None:
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.consumes_transfer_buffer = consumes_transfer_buffer
+
+
 @pytest.fixture
 def _clear_disagg_transfer_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
@@ -939,7 +946,7 @@ class TestDisaggTransferAdmissionController:
 
     def test_apply_reverts_deferred_v2_allocations(self):
         executor = object.__new__(PyExecutor)
-        executor.kv_cache_transceiver = Mock()
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=True)
         executor._is_kv_manager_v2 = True
         executor._revert_ctx_alloc = Mock()
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
@@ -956,22 +963,34 @@ class TestDisaggTransferAdmissionController:
         assert wait_for_progress
         executor._revert_ctx_alloc.assert_called_once_with([candidate])
 
-    def test_apply_missing_controller_preserves_candidates(self):
+    def test_async_python_v2_pp1_bypasses_transfer_budget(self) -> None:
         executor = object.__new__(PyExecutor)
-        executor.kv_cache_transceiver = Mock()
-        executor.active_requests = []
-        candidate = _make_disagg_transfer_request(1, 32)
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=False)
+        executor.dist = Mock(pp_size=1)
+        executor._is_kv_manager_v2 = True
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidates = [
+            _make_disagg_transfer_request(2, 32),
+            _make_disagg_transfer_request(3, 32),
+        ]
 
         admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
-            executor, [candidate]
+            executor, candidates
         )
 
-        assert admitted == [candidate]
+        assert admitted == candidates
         assert not wait_for_progress
+        executor._revert_ctx_alloc.assert_not_called()
 
-    def test_apply_missing_v2_flag_defaults_to_non_v2(self):
+    def test_async_python_v1_pp1_retains_transfer_budget(self) -> None:
         executor = object.__new__(PyExecutor)
-        executor.kv_cache_transceiver = Mock()
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=False)
+        executor.dist = Mock(pp_size=1)
+        executor._is_kv_manager_v2 = False
         executor._revert_ctx_alloc = Mock()
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
         executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
@@ -987,10 +1006,84 @@ class TestDisaggTransferAdmissionController:
         assert wait_for_progress
         executor._revert_ctx_alloc.assert_not_called()
 
-    def test_sync_mode_retains_transfer_budget(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    def test_disabled_transfer_window_is_inactive(self) -> None:
+        executor = object.__new__(PyExecutor)
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=False)
+        executor.dist = Mock(pp_size=1)
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=0, tokens_per_block=32
+        )
+
+        assert not PyExecutor._disagg_transfer_window_is_active(executor)
+
+    def test_transfer_window_without_transceiver_is_inactive(self) -> None:
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = None
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+
+        assert not PyExecutor._disagg_transfer_window_is_active(executor)
+
+    def test_active_window_check_requires_initialized_dist(self) -> None:
+        executor = object.__new__(PyExecutor)
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=False)
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+
+        with pytest.raises(AttributeError):
+            PyExecutor._disagg_transfer_window_is_active(executor)
+
+    def test_active_window_check_requires_pp_size(self) -> None:
+        executor = object.__new__(PyExecutor)
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=False)
+        executor.dist = types.SimpleNamespace()
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+
+        with pytest.raises(AttributeError):
+            PyExecutor._disagg_transfer_window_is_active(executor)
+
+    def test_apply_missing_controller_preserves_candidates(self):
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
+        executor.active_requests = []
+        candidate = _make_disagg_transfer_request(1, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == [candidate]
+        assert not wait_for_progress
+
+    def test_apply_missing_v2_flag_defaults_to_non_v2(self):
+        executor = object.__new__(PyExecutor)
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=True)
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        candidate = _make_disagg_transfer_request(2, 32)
+
+        admitted, wait_for_progress = PyExecutor._apply_disagg_transfer_admission(
+            executor, [candidate]
+        )
+
+        assert admitted == []
+        assert wait_for_progress
+        executor._revert_ctx_alloc.assert_not_called()
+
+    def test_sync_python_runtime_retains_transfer_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=False)
+        executor.dist = Mock(pp_size=1)
         executor._is_kv_manager_v2 = True
         executor._revert_ctx_alloc = Mock()
         executor.active_requests = []
@@ -1310,13 +1403,13 @@ class TestIdleDisaggLoopPacing:
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferAdmissionPP:
-    def test_pp_schedule_applies_gate_before_serializing(self):
+    def test_pp_schedule_applies_gate_before_serializing(self) -> None:
         executor = object.__new__(PyExecutor)
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=True)
         executor.dist = Mock(
             rank=0, is_first_pp_rank=True, is_last_pp_rank=True, tp_size=1, cp_size=1
         )
         executor.enable_attention_dp = False
-        executor.kv_cache_transceiver = Mock()
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
         executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer=32, tokens_per_block=32
@@ -1333,6 +1426,46 @@ class TestDisaggTransferAdmissionPP:
         assert fitting == []
         assert num_fitting == 0
         assert wait_for_progress
+
+    def test_pp_schedule_async_python_retains_transfer_window(self) -> None:
+        executor = object.__new__(PyExecutor)
+        _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=False)
+        executor.dist = Mock(
+            rank=0,
+            is_first_pp_rank=True,
+            is_last_pp_rank=False,
+            tp_size=1,
+            cp_size=1,
+            pp_size=2,
+            next_pp_rank=1,
+        )
+        executor._is_kv_manager_v2 = True
+        executor.enable_attention_dp = False
+        executor.send_schedule_handles = [None]
+        executor.wait_on_pp_send_handles = Mock()
+        executor._revert_ctx_alloc = Mock()
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
+        executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=32, tokens_per_block=32
+        )
+        scheduled_batch = ScheduledRequests()
+        candidate = _make_disagg_transfer_request(2, 32)
+        executor._schedule = Mock(return_value=(scheduled_batch, [candidate], 0))
+
+        scheduled, fitting, num_fitting, wait_for_progress = PyExecutor._pp_schedule_and_propagate(
+            executor, microbatch_id=0
+        )
+
+        assert scheduled is scheduled_batch
+        assert fitting == []
+        assert num_fitting == 0
+        assert wait_for_progress
+        executor._revert_ctx_alloc.assert_called_once_with([candidate])
+        executor.wait_on_pp_send_handles.assert_called_once()
+        wait_args = executor.wait_on_pp_send_handles.call_args.args
+        assert wait_args[0] is executor.send_schedule_handles
+        assert wait_args[1] == 0
+        executor.dist.isend_object.assert_called_once()
 
     def test_pp_schedule_restores_propagated_gate_decision(self):
         executor = object.__new__(PyExecutor)
@@ -1420,6 +1553,69 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
         ("prepare", executor.active_requests),
         ("schedule", executor.active_requests, executor.inflight_req_ids),
     ]
+
+
+def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StopAfterReconciliation(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    executor.dist = Mock(pp_rank=1, rank=1)
+    executor.device_id = 0
+    profiler = MagicMock()
+    profiler.__enter__.return_value = Mock()
+    executor._profiler = Mock(return_value=profiler)
+    executor.hang_detector = MagicMock()
+    executor.enable_iter_perf_stats = False
+    executor._is_kv_manager_v2 = True
+    executor._pp_rebalance_drain_iters = None
+    executor._can_pause_for_rebalance = Mock(return_value=False)
+    executor._handle_disagg_cache_errors_synced = Mock()
+    executor._fetch_and_activate_new_requests = Mock(return_value=[])
+    executor.is_shutdown = False
+    executor._handle_control_request = Mock()
+    executor.kv_cache_transceiver = Mock()
+    executor._check_disagg_ctx_schedulable_status = Mock()
+    executor._check_disagg_gen_transfer_status = Mock()
+    executor._pad_attention_dp_dummy_request = Mock()
+    executor._pp_retry_until_can_schedule = Mock()
+    executor._mm_encoder_item_scheduling_enabled = False
+    executor._terminate_recompute_paused_requests = Mock()
+    executor._pause_recompute_paused_requests = Mock()
+    executor._revert_ctx_alloc = Mock()
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+
+    canonical = _make_disagg_transfer_request(1, 32)
+    local_canonical = _make_disagg_transfer_request(1, 32)
+    local_only = _make_disagg_transfer_request(2, 32)
+    executor.active_requests = [canonical, local_only]
+    scheduled_batch = ScheduledRequests()
+    executor._pp_schedule_and_propagate = Mock(
+        return_value=(scheduled_batch, [canonical], 0, False)
+    )
+    executor.scheduler.schedule_request.return_value = types.SimpleNamespace(
+        fitting_disagg_gen_init_requests=[local_canonical, local_only]
+    )
+    executor._prepare_disagg_gen_init = Mock(side_effect=StopAfterReconciliation)
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device",
+        Mock(),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice",
+        Mock(),
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT", Mock())
+
+    with pytest.raises(StopAfterReconciliation):
+        PyExecutor._executor_loop_pp(executor)
+
+    executor._revert_ctx_alloc.assert_called_once_with([local_only])
 
 
 def test_schedule_prepares_snapshot_points_before_scheduling():

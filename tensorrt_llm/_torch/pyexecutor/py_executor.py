@@ -924,6 +924,16 @@ class PyExecutor:
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
             max_tokens_in_buffer, tokens_per_block)
+        if (self.global_rank == 0
+                and self._disagg_transfer_admission_controller.enabled()
+                and self._is_disagg_transfer_window_bypass_eligible()):
+            logger.warning_once(
+                f"[PyExecutor] Bypassing the executor transfer window "
+                f"configured by max_tokens_in_buffer={max_tokens_in_buffer} "
+                "for asynchronous Python generation with KV cache manager "
+                "V2 and pp_size=1; "
+                "scheduler KV cache capacity admission remains active.",
+                key="disagg_transfer_window_bypass")
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -3645,6 +3655,27 @@ class PyExecutor:
             getattr(kv_cache_manager, "tokens_per_block", None),
         )
 
+    def _is_disagg_transfer_window_bypass_eligible(self) -> bool:
+        """Return whether this runtime may bypass an enabled transfer window."""
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        return (transceiver is not None
+                and transceiver.consumes_transfer_buffer is False
+                and self._uses_async_disagg_gen_transfer()
+                and self.dist.pp_size == 1 and self._uses_kv_manager_v2())
+
+    def _disagg_transfer_window_is_active(self) -> bool:
+        """Return whether the executor-level transfer window is active.
+
+        ``max_tokens_in_buffer`` describes the C++ transceiver's physical
+        buffer. The asynchronous Python transceiver does not consume that
+        buffer. With KV cache manager V2 and PP1, its generation requests
+        remain constrained by inline scheduler KV admission without a second
+        executor-level budget. Other configurations retain the window.
+        """
+        return (getattr(self, "kv_cache_transceiver", None) is not None
+                and self._get_disagg_transfer_admission_controller().enabled()
+                and not self._is_disagg_transfer_window_bypass_eligible())
+
     @staticmethod
     def _is_disagg_gen_only_no_context_benchmark() -> bool:
         """Return whether ``gen_only_no_context`` skips KV transfer."""
@@ -3672,8 +3703,8 @@ class PyExecutor:
             return fitting_disagg_gen_init_requests, False
 
         controller = self._get_disagg_transfer_admission_controller()
-        if not (getattr(self, "kv_cache_transceiver", None)
-                and controller.enabled() and fitting_disagg_gen_init_requests):
+        if not (self._disagg_transfer_window_is_active()
+                and fitting_disagg_gen_init_requests):
             return fitting_disagg_gen_init_requests, False
 
         admission_result = controller.select(self.active_requests,
@@ -3697,6 +3728,13 @@ class PyExecutor:
     def _revert_deferred_disagg_gen_init_alloc(
             self, candidates: List[LlmRequest],
             admitted_requests: List[LlmRequest]) -> None:
+        """Revert Scheduler V2 allocations absent from an admitted request set.
+
+        Scheduler V2 allocates KV while evaluating generation-init requests.
+        This reconciliation is required both after transfer-window admission
+        and when a PP follower's local candidates differ from the canonical
+        schedule propagated by rank 0.
+        """
         if not (self._uses_kv_manager_v2() and candidates):
             return
 
