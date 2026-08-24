@@ -24,6 +24,20 @@ _MON = getattr(sys, "monitoring", None)
 _DEFAULT_TOOL_ID = int(os.environ.get("CBTS_PYSTART_TOOL_ID", "4"))
 
 
+def _product_imports_settled(product_tops: set[str]) -> bool:
+    """Return whether product import started and no product module is still initializing."""
+    product_prefixes = tuple(f"{name}." for name in product_tops)
+    product_seen = False
+    for name, module in tuple(sys.modules.items()):
+        if name not in product_tops and not name.startswith(product_prefixes):
+            continue
+        product_seen = True
+        spec = getattr(module, "__spec__", None) if module is not None else None
+        if getattr(spec, "_initializing", False):
+            return False
+    return product_seen
+
+
 class PyStartTracker:
     """Per-process tracker; one SQLite data file per process, merged (unioned) downstream."""
 
@@ -39,6 +53,9 @@ class PyStartTracker:
         self._file_ok = {}  # co_filename -> bool (cached source-membership)
         self._active = False
         self._save_lock = threading.Lock()  # serialize periodic-thread and atexit saves
+        self._revision = 0
+        # Keyed by live PID so a forked child still emits its own file even if it inherited a clean tracker.
+        self._saved_revisions = {}
         self._new_suffix()
 
     @property
@@ -67,7 +84,11 @@ class PyStartTracker:
             if ok:
                 qual = code.co_qualname
                 if "<locals>" not in qual and qual not in self._SKIP_QUALNAMES:
-                    self._data.setdefault(self._ctx, set()).add((fn, qual))
+                    entries = self._data.setdefault(self._ctx, set())
+                    old_size = len(entries)
+                    entries.add((fn, qual))
+                    if len(entries) != old_size:
+                        self._revision += 1
         except Exception:
             # A tracker fault must never propagate into monitored host code.
             pass
@@ -100,26 +121,38 @@ class PyStartTracker:
 
     def record_outcome(self, nodeid, outcome):
         """Record a test's pytest outcome (passed/failed/skipped) for the completeness signal."""
-        self._outcomes[nodeid or ""] = outcome
+        key = nodeid or ""
+        if self._outcomes.get(key) != outcome:
+            self._outcomes[key] = outcome
+            self._revision += 1
 
     def note_expected_workers(self, nodeid, n):
         """Add to the count of subprocess pool workers the coordinator spawned for a test."""
         key = nodeid or ""
         self._expected[key] = self._expected.get(key, 0) + int(n)
+        self._revision += 1
 
     def save(self):
-        # Write a per-process SQLite the downstream merge reads directly; uploaded compressed only.
-        snap = self._data.copy()  # atomic shallow copy; each set snapshotted below
-        outcomes = dict(self._outcomes)
-        expected = dict(self._expected)
-        if not snap and not outcomes and not expected:
-            return None
         # Serialize saves so the periodic-save thread and the atexit final save never race on the
         # shared temp file (a concurrent os.remove(tmp) mid-write surfaces as a sqlite disk I/O error).
         with self._save_lock:
+            pid = os.getpid()
+            revision = self._revision
+            if self._saved_revisions.get(pid) == revision:
+                return None
+
+            # Snapshot before SQLite releases the GIL. New touches can then advance _revision while this
+            # snapshot is written; leaving _saved_revisions at this revision makes the next save persist them.
+            snap = {ctx: entries.copy() for ctx, entries in self._data.items()}
+            outcomes = dict(self._outcomes)
+            expected = dict(self._expected)
+            if not snap and not outcomes and not expected:
+                self._saved_revisions[pid] = revision
+                return None
+
             os.makedirs(self.data_dir, exist_ok=True)
             path = os.path.join(
-                self.data_dir, f".cbtscov.{self.stage}.{self._suffix}.pid{os.getpid()}.sqlite"
+                self.data_dir, f".cbtscov.{self.stage}.{self._suffix}.pid{pid}.sqlite"
             )
             tmp = path + ".tmp"
             if os.path.exists(tmp):
@@ -127,7 +160,7 @@ class PyStartTracker:
             con = sqlite3.connect(tmp)
             try:
                 con.execute("CREATE TABLE touch (test TEXT, file TEXT, qualname TEXT)")
-                rows = ((ctx, f, q) for ctx, fs in snap.items() for (f, q) in fs.copy())
+                rows = ((ctx, f, q) for ctx, fs in snap.items() for (f, q) in fs)
                 con.executemany("INSERT INTO touch VALUES (?, ?, ?)", rows)
                 # Stage rides in the file content so the merge attributes rows without parsing the filename.
                 con.execute("CREATE TABLE proc_meta (stage TEXT)")
@@ -148,6 +181,7 @@ class PyStartTracker:
             finally:
                 con.close()
             os.replace(tmp, path)
+            self._saved_revisions[pid] = revision
         return path
 
     def stop(self):
