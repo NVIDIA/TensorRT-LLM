@@ -148,10 +148,7 @@ def test_sparse_decode_tunable_runner_dispatches_and_falls_back_to_triton(monkey
         input_layouts=tuple((tensor.dtype, tuple(tensor.stride())) for tensor in inputs),
         sm_scale=head_dim**-0.5,
     )
-    assert (
-        runner.tuning_config.distributed_tuning_strategy
-        == DistributedTuningStrategy.BROADCAST
-    )
+    assert runner.tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.BROADCAST
 
     runner(
         inputs,
