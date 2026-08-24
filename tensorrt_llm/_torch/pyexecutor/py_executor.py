@@ -3794,6 +3794,37 @@ class PyExecutor:
 
         self._check_disagg_ctx_cache_transfer_status(0)
 
+    def _pace_idle_disagg_loop(self) -> None:
+        """Sleep briefly when only a KV transfer completing can make progress.
+
+        Dropping the blocking `atLeastNum=1` wait also dropped the only pacing
+        for the idle-blocked case: `_fetch_and_enqueue_requests` uses a zero
+        timeout while any request is active, so the loop would otherwise re-run
+        the schedule pass and its collectives at full speed until a transfer
+        lands.
+
+        Call this at the end of an iteration that queued nothing, once the pass
+        has drained its ready work. Request updates, KV sends and responses
+        must not be held behind the sleep, and running them first means the
+        pending-transfer check below sees the state they left behind rather
+        than a stale one.
+
+        That check is rank-local. The sleep only paces and never gates a
+        collective, so ranks taking it on different iterations is safe.
+        """
+        if self.kv_cache_transceiver is None:
+            return
+
+        # Context sends are tracked by the transfer manager; generation
+        # receives live in the request state, so both directions are covered.
+        waiting_on_transfer = (
+            self.async_transfer_manager.has_any_inflight_requests()
+            or any(req.is_disagg_generation_init_state
+                   or req.is_disagg_generation_transmission_in_progress
+                   for req in self.active_requests))
+        if waiting_on_transfer:
+            time.sleep(0.001)
+
     def _sync_gen_only_benchmark_has_insufficient_kv(
             self, scheduler_fitting_disagg_gen_init_requests: List[LlmRequest],
             wait_for_disagg_gen_transfer_progress: bool) -> bool:
@@ -4341,11 +4372,6 @@ class PyExecutor:
                 if not can_queue and scheduled_batch.encoder_requests:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
-                if not can_queue:
-                    # Nothing runs this iteration; only a KV transfer completing
-                    # can unblock it, so pace the loop instead of spinning.
-                    time.sleep(0.001)
-
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
@@ -4507,6 +4533,9 @@ class PyExecutor:
                 # Same lockstep guarantee for iter-stats; no-op when
                 # TLLM_METRICS_ALL_RANKS=0.
                 self._flush_iter_stats_synced()
+
+                if not can_queue:
+                    self._pace_idle_disagg_loop()
 
                 self.iter_counter += 1
 
@@ -5177,11 +5206,6 @@ class PyExecutor:
                 if not can_queue and scheduled_batch.encoder_requests:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
-                if not can_queue:
-                    # Nothing runs this iteration; only a KV transfer completing
-                    # can unblock it, so pace the loop instead of spinning.
-                    time.sleep(0.001)
-
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
                 # and let the later iteration to update it.
@@ -5387,6 +5411,9 @@ class PyExecutor:
                     self._check_kv_transfer_timeout()
 
                 self._kv_connector_terminate_requests()
+
+                if not can_queue:
+                    self._pace_idle_disagg_loop()
 
                 self.iter_counter += 1
 
