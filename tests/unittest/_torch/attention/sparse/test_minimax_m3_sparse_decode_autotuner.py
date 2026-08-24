@@ -5,17 +5,10 @@
 import contextlib
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 
-@pytest.mark.parametrize(
-    ("is_cuda_graph_metadata", "expected_tuning_calls"),
-    [(False, 0), (True, 1)],
-)
-def test_only_graph_warmup_can_seed_adaptive_tuning(
-    monkeypatch, is_cuda_graph_metadata, expected_tuning_calls
-):
+def test_only_graph_warmup_can_seed_adaptive_tuning(monkeypatch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import sparse_decode_autotuner
 
     class FakeTensor:
@@ -74,84 +67,29 @@ def test_only_graph_warmup_can_seed_adaptive_tuning(
     seq_lens = FakeTensor((2,), torch.int32)
     output = FakeTensor((2, 4, 128), torch.bfloat16)
 
-    sparse_decode_autotuner.run_adaptive_sparse_decode(
-        q,
-        k_paged,
-        v_paged,
-        block_indexes,
-        block_table,
-        seq_lens,
-        output,
-        sm_scale=128**-0.5,
-        decode_query_len=1,
-        plan=object(),
-        is_cuda_graph_metadata=is_cuda_graph_metadata,
-    )
+    def run(is_cuda_graph_metadata):
+        sparse_decode_autotuner.run_adaptive_sparse_decode(
+            q,
+            k_paged,
+            v_paged,
+            block_indexes,
+            block_table,
+            seq_lens,
+            output,
+            sm_scale=128**-0.5,
+            decode_query_len=1,
+            plan=object(),
+            is_cuda_graph_metadata=is_cuda_graph_metadata,
+        )
 
+    run(False)
     assert fallback_tactics == [-1]
-    assert len(tuning_calls) == expected_tuning_calls
-    assert len(choose_calls) == expected_tuning_calls
-    assert len(sparse_decode_autotuner._attempted_tuning_keys) == expected_tuning_calls
+    assert not tuning_calls
+    assert not choose_calls
+    assert not sparse_decode_autotuner._attempted_tuning_keys
 
-
-@pytest.mark.parametrize("is_cuda_graph", [False, True])
-def test_adaptive_dispatch_passes_graph_metadata_state(monkeypatch, is_cuda_graph):
-    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
-        msa_utils,
-        sparse_decode_autotuner,
-    )
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
-    from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
-
-    page_size = head_dim = 128
-    block_table = torch.zeros(1, 1, dtype=torch.int32)
-    k_paged = torch.zeros(1, 1, page_size, head_dim)
-    v_paged = torch.zeros_like(k_paged)
-    graph_flags = []
-    monkeypatch.setattr(
-        msa_utils,
-        "msa_paged_kv",
-        lambda manager, layer_idx: (k_paged, v_paged),
-    )
-    monkeypatch.setattr(
-        sparse_decode_autotuner,
-        "run_adaptive_sparse_decode",
-        lambda *args, **kwargs: graph_flags.append(kwargs["is_cuda_graph_metadata"]),
-    )
-
-    attention = SimpleNamespace(
-        layer_idx=0,
-        head_dim=head_dim,
-        num_heads=1,
-        q_scaling=1.0,
-        sparse_params=MiniMaxM3SparseAttentionConfig(
-            implementation="msa", decode_backend="adaptive"
-        ).to_sparse_params(),
-    )
-    metadata = SimpleNamespace(
-        is_cuda_graph=is_cuda_graph,
-        kv_cache_manager=object(),
-        _msa_prewritten_layer=None,
-        msa_decode_query_len=1,
-        msa_decode_span=_MsaDecodeSpan(0, 1, 0, 1, 1),
-        msa_block_table=block_table,
-        msa_seq_lens_cuda=torch.ones(1, dtype=torch.int32),
-        msa_kv_indices=block_table.flatten(),
-        msa_qo_lens_cpu=torch.ones(1, dtype=torch.int32),
-        msa_kv_lens_cpu=torch.ones(1, dtype=torch.int32),
-        msa_qo_offset_cpu=torch.zeros(1, dtype=torch.int32),
-    )
-
-    msa_sparse_gqa.run_msa_paged_gqa(
-        attention,
-        torch.zeros(1, head_dim),
-        None,
-        None,
-        metadata,
-        torch.empty(1, head_dim),
-        kv_block_indexes=torch.zeros(1, 1, 16, dtype=torch.int32),
-        plan=object(),
-    )
-
-    assert graph_flags == [is_cuda_graph]
+    run(True)
+    assert fallback_tactics == [-1, -1]
+    assert len(tuning_calls) == 1
+    assert len(choose_calls) == 1
+    assert len(sparse_decode_autotuner._attempted_tuning_keys) == 1

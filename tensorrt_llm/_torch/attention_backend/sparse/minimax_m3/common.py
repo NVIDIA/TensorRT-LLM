@@ -30,21 +30,6 @@ _LOCAL_SCORE = 1e29
 MiniMaxM3DecodeBackend = Literal["default", "msa", "adaptive"]
 
 
-def needs_msa_sparse_decode_plan(decode_backend: MiniMaxM3DecodeBackend) -> bool:
-    """Whether pure sparse decode may need a preplanned MSA kernel.
-
-    ``default`` retains the production Triton decode path, ``msa`` forces MSA,
-    and ``adaptive`` profiles both tactics for each exact CUDA-graph shape.
-    Metadata must prepare the plan for both latter policies before forward so
-    graph capture can safely fix either tactic.
-    """
-    if decode_backend == "default":
-        return False
-    if decode_backend in ("msa", "adaptive"):
-        return True
-    raise ValueError(f"Unsupported MiniMax-M3 decode backend: {decode_backend!r}.")
-
-
 @dataclass(frozen=True)
 class MiniMaxM3SparseParams(SparseParams):
     """Lowered runtime parameters for the MiniMax-M3 sparse backend."""
