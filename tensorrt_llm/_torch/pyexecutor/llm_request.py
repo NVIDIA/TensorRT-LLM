@@ -971,6 +971,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_end_id = self.end_id
         self.py_min_length = self.sampling_config.min_length
         self.py_helix_is_inactive_rank = False
+        # Manager-owned helix decode-step counter; see
+        # KVCacheManagerV2._set_helix_rank_fields.
+        self.py_helix_decode_group_index = 0
         self.py_draft_logits = None
         self.py_target_probs = None
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS

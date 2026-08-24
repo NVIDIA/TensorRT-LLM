@@ -24,6 +24,7 @@ import torch
 import torch.distributed as torch_dist
 import torch.multiprocessing as torch_mp
 
+from tensorrt_llm._torch.disaggregation.executor.admission import DisaggTransferAdmissionController
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
@@ -37,7 +38,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
-    DisaggTransferAdmissionController,
     EncoderStepResult,
     PyExecutor,
     _ADPForwardIntent,

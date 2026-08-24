@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <functional>

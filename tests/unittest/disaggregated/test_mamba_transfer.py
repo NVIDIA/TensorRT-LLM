@@ -25,6 +25,9 @@ import torch
 # injects; see test_kv_transfer.py for the full rationale.
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+# Deliberately do NOT clear UCX_NET_DEVICES: cluster images pin it to a
+# working interface (e.g. eth0), and without the pin UCX tries every
+# interface and dies on unbindable ones (rdma_vf_rail0 IPv6 bind failure).
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -166,14 +169,20 @@ def _run_concurrent(items, fn):
             raise err
 
 
-def _create_transceivers(tp, managers, config):
+def _create_transceivers(tp, managers, config, enable_attention_dp=False):
     shared = {"barrier": threading.Barrier(tp), "lock": threading.Lock()}
     results = [None] * tp
     errors = [None] * tp
 
     def _init(rank):
         try:
-            mapping = Mapping(world_size=tp, rank=rank, tp_size=tp, pp_size=1)
+            mapping = Mapping(
+                world_size=tp,
+                rank=rank,
+                tp_size=tp,
+                pp_size=1,
+                enable_attention_dp=enable_attention_dp,
+            )
             dist = ThreadSafeDistributed(rank, tp, shared)
             results[rank] = KvCacheTransceiverV2(
                 mapping=mapping,
