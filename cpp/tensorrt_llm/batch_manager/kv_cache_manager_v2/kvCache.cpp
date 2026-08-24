@@ -869,6 +869,61 @@ void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCyc
     _copyPageToTreeBlock(treeBlock, ssmLcId, srcPage, numTokensInBlock);
 }
 
+void KvCache::_reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& root)
+{
+    if (lastOrdinal < 0)
+    {
+        return;
+    }
+
+    // Every block at or below `lastOrdinal` is committed, so `treeBlock` is non-null:
+    // the walk below relies on that, since a null treeBlock would stop it early and then
+    // be dereferenced as `prevNode`.
+    auto isDetached = [this](BlockOrdinal ord)
+    {
+        auto const& sb = mBlocks[ord];
+        TLLM_CHECK_DEBUG_WITH_INFO(sb.treeBlock, "committed block must have a tree block");
+        return sb.treeBlock->isOrphan();
+    };
+
+    // Fast path: the block we are about to use as `prev` is still attached.
+    if (!isDetached(lastOrdinal))
+    {
+        return;
+    }
+
+    // Walk back to the deepest ancestor that is still in the tree (or the root).
+    BlockOrdinal first = lastOrdinal;
+    while (first >= 0 && isDetached(first))
+    {
+        --first;
+    }
+
+    NodeBase* prevNode
+        = (first < 0) ? static_cast<NodeBase*>(&root) : static_cast<NodeBase*>(mBlocks[first].treeBlock.get());
+
+    for (BlockOrdinal ord = first + 1; ord <= lastOrdinal; ++ord)
+    {
+        auto& sb = mBlocks[ord];
+
+        // detachNext() only cleared `prev` and the parent's map entry, so ordinal, tokens
+        // and surviving pages are intact -- re-attaching is enough, nothing to rebuild.
+        bool attached = false;
+        SharedPtr<Block> inTree = attachOrGetExistingBlock(prevNode, sb.treeBlock, &attached);
+        TLLM_CHECK_DEBUG(inTree);
+
+        if (attached && inTree->eventSink)
+        {
+            // Balances the addRemovedBlock() from detachNext(). If some other block was
+            // attached instead, it was already announced when it was created.
+            inTree->eventSink->addStoredBlock(*inTree);
+        }
+
+        sb.treeBlock = inTree;
+        prevNode = inTree.get();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // _snapshotPartialBlockToTree: snapshot a partial final block into the radix
 // tree. Mirrors Python's _snapshot_partial_block_to_tree.
@@ -890,22 +945,18 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     }
     else
     {
-        prevNode = _getTreeBlock(BlockOrdinal{ordinal.value() - 1}).get();
+        _reattachOrphanTreeBlocks(ordinal - 1, root);
+        prevNode = _getTreeBlock(ordinal - 1).get();
     }
 
     bool isNew = false;
-    SharedPtr<Block> treeBlock;
-    try
-    {
-        treeBlock = addOrGetExistingBlock(prevNode, tokens, textOnly(), &isNew);
-    }
-    catch (UselessBlockError const& e)
-    {
-        treeBlock = e.block;
-        isNew = false;
-    }
+    SharedPtr<Block> treeBlock = addOrGetExistingBlock(prevNode, tokens, textOnly(), &isNew);
     TLLM_CHECK_DEBUG(treeBlock);
-    TLLM_CHECK_DEBUG(isNew || std::equal(tokens.begin(), tokens.end(), treeBlock->tokens.begin()));
+    // When not new we either matched exactly or were given a longer sibling that covers
+    // these tokens, so our tokens are a prefix of the block we got back either way.
+    TLLM_CHECK_DEBUG(isNew
+        || (treeBlock->tokens.size() >= tokens.size()
+            && std::equal(tokens.begin(), tokens.end(), treeBlock->tokens.begin())));
 
     auto& beamBlock = mBlocks.at(ordinal).pages[kDefaultBeamIndex];
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
@@ -1533,27 +1584,20 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     if (ord > 0)
     {
         TLLM_CHECK_DEBUG_WITH_INFO(mBlocks[BlockOrdinal{ord - 1}].treeBlock, "prev block must be committed");
+        _reattachOrphanTreeBlocks(BlockOrdinal{ord - 1}, root);
         prevNode = mBlocks[BlockOrdinal{ord - 1}].treeBlock.get();
     }
 
-    // Try to find or create a block in the radix tree.
-    // Mirrors Python's try/except UselessBlockError pattern.
-    // TODO: Replace with if-condition once Python is removed and C++ is the primary codebase.
+    // Find or create a block in the radix tree. A non-new result is either an exact match
+    // or a longer sibling that covers these tokens; both are usable here.
     bool blockIsNew = false;
-    SharedPtr<Block> newBlock;
-    try
-    {
-        newBlock = addOrGetExistingBlock(prevNode, tokenBlock, textOnly(), &blockIsNew);
-    }
-    catch (UselessBlockError const& e)
-    {
-        newBlock = e.block;
-        blockIsNew = false;
-    }
+    SharedPtr<Block> newBlock = addOrGetExistingBlock(prevNode, tokenBlock, textOnly(), &blockIsNew);
     TLLM_CHECK_DEBUG(newBlock);
     TLLM_CHECK_DEBUG(newBlock->tokensPerBlock() == mTokensPerBlock);
     // In reuse case, verify token match (mirrors Python: tree_block.tokens[:num_tokens] == tokens).
-    TLLM_CHECK_DEBUG(blockIsNew || std::equal(tokenBlock.begin(), tokenBlock.end(), newBlock->tokens.begin()));
+    TLLM_CHECK_DEBUG(blockIsNew
+        || (newBlock->tokens.size() >= tokenBlock.size()
+            && std::equal(tokenBlock.begin(), tokenBlock.end(), newBlock->tokens.begin())));
 
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     bool didCommit = false;
@@ -2228,10 +2272,10 @@ bool KvCache::_checkSanity() const
                 }
                 else
                 {
-                    if (mStatus == Status::ACTIVE)
-                        TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
-                    else
-                        TLLM_CHECK_DEBUG(std::holds_alternative<SharedPtr<PageHolder>>(bp));
+                    // The page must be present, and locked exactly when the cache is
+                    // active; a suspended cache holds it instead.
+                    TLLM_CHECK_DEBUG(!std::holds_alternative<std::monostate>(bp)
+                        && ((mStatus == Status::ACTIVE) == std::holds_alternative<SharedPageLock>(bp)));
                 }
 
                 if (!blockPageIsNull(bp))
