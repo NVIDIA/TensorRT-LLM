@@ -30,7 +30,7 @@ from tensorrt_llm._torch.distributed.allreduce_helper import \
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
-from tensorrt_llm.quantization.utils import fp8_quantize
+from tensorrt_llm.quantization.utils import fp8_quantize, fp8_utils
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
@@ -1978,6 +1978,16 @@ def _fp8_block_scaling_gemm_sm100_constraint(inputs: List[List[int]]) -> int:
     return inputs[0][0]
 
 
+def _fp8_block_scaling_gemm_sm120_constraint(inputs: List[List[int]]) -> int:
+    # SM120 quantizes via per_token_quant_and_transform, whose scale is
+    # (m, num_scale_groups), so m is dim 0 here but dim 1 on SM100. The kernel
+    # reads get_tma_aligned_size(m) rows (deduce_sfa_layout in sm120_utils.cuh,
+    # over int32 scales), so a probe scale sized to plain m would be short and
+    # the TMA load would run OOB. This mirrors the stride the producer itself
+    # asserts via check_sf_layout.
+    return fp8_utils.get_tma_aligned_size(inputs[0][0], 4)
+
+
 def _fp8_quantize_1x128_sm90_constraint(inputs: List[List[int]]) -> int:
     # The implementation aligns with the fp8_quantize_1x128 custom op.
     pad_m = fp4_utils.pad_up(inputs[0][0], 4)
@@ -1988,7 +1998,10 @@ def _fp8_quantize_1x128_sm90_constraint(inputs: List[List[int]]) -> int:
 @lru_cache(maxsize=None)
 def _get_fp8_block_scaling_gemm_constraint_spec(
         sm_version: int) -> Tuple[ConstraintSpec, ...]:
-    if sm_version >= 100:
+    if sm_version == 120:
+        return (ConstraintSpec(2, 0,
+                               _fp8_block_scaling_gemm_sm120_constraint), )
+    elif sm_version >= 100:
         return (ConstraintSpec(2, 1,
                                _fp8_block_scaling_gemm_sm100_constraint), )
     else:
