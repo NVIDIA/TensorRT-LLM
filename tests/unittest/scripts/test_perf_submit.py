@@ -432,9 +432,7 @@ def _fake_sinfo(monkeypatch, module, gres_out, raises=False):
     monkeypatch.setattr(module.subprocess, "check_output", fake_check_output)
 
 
-def test_partition_gpu_gres_prefers_gpu_row_over_null(
-    local_submit_module: ModuleType, monkeypatch
-):
+def test_partition_gpu_gres_prefers_gpu_row_over_null(local_submit_module: ModuleType, monkeypatch):
     _fake_sinfo(monkeypatch, local_submit_module, "(null)\ngpu:8\n")
     assert local_submit_module.partition_gpu_gres("batch") == "gpu:8"
 
@@ -486,9 +484,7 @@ def test_generate_gpu_request_still_asks_when_sinfo_cannot_answer(
     # Undeterminable must NOT be read as "no GPUs": request --gpus-per-node
     # (but not --gres, which we cannot justify without a GRES reading).
     _fake_sinfo(monkeypatch, local_submit_module, "", raises=True)
-    assert local_submit_module.generate_gpu_request("batch", 8) == [
-        "#SBATCH --gpus-per-node=8"
-    ]
+    assert local_submit_module.generate_gpu_request("batch", 8) == ["#SBATCH --gpus-per-node=8"]
 
 
 def test_default_slurm_partition_picks_the_starred_entry(

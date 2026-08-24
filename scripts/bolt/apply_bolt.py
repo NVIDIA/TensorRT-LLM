@@ -151,9 +151,7 @@ def _record_hash(path: Path) -> str:
     return f"sha256={b64}"
 
 
-def repack_wheel(
-    root: Path, dest: Path, original_infos: dict[str, zipfile.ZipInfo]
-) -> None:
+def repack_wheel(root: Path, dest: Path, original_infos: dict[str, zipfile.ZipInfo]) -> None:
     """Zip <root> into <dest>, re-stamping each member's original ZipInfo.
 
     zf.write() would record the on-disk mode, which extractall() already reduced
