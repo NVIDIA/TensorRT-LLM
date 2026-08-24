@@ -1000,7 +1000,7 @@ class BaseWorker(GenerationExecutor):
                                                         None)
             if model_engine_metrics is not None:
                 startup_metrics[model_engine_stage] = dict(model_engine_metrics)
-        startup_metrics["executor"] = executor_metrics
+        startup_metrics["py_executor"] = executor_metrics
 
         model_engine = getattr(self.engine, "model_engine", None)
         model_loader = getattr(model_engine, "model_loader", None)

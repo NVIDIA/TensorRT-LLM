@@ -63,7 +63,7 @@ A typical result has the following structure:
 
 ```json
 {
-  "executor": {
+  "py_executor": {
     "total_executor_creation_seconds": 12.341,
     "model_engine_creation_seconds": 5.241,
     "final_kv_cache_creation_seconds": 0.421,
@@ -84,11 +84,11 @@ A typical result has the following structure:
 }
 ```
 
-The `executor` object contains the timed scopes in `create_py_executor()`. When KV cache capacity
-estimation creates a temporary executor before constructing the final executor,
+The `py_executor` object contains the timed scopes in `create_py_executor()`. When KV cache capacity
+estimation creates a temporary PyExecutor before constructing the final PyExecutor,
 `initial_model_engine` contains the warmup metrics from the temporary pass and
 `final_model_engine` contains the warmup metrics from the final pass. Without estimation, only
-`final_model_engine` appears. The model-engine dictionaries are promoted alongside `executor` in
+`final_model_engine` appears. The model-engine dictionaries are promoted alongside `py_executor` in
 the startup metrics payload so callers do not need to traverse another nesting level. Legacy
 two-model speculative decoding can likewise produce `initial_draft_model_engine` and
 `final_draft_model_engine`.
@@ -97,7 +97,7 @@ Executor scope names describe the constructed component rather than the internal
 enum. The initial KV cache and PyExecutor scopes are temporary resources used for KV cache capacity
 estimation; their final counterparts are the resources retained for serving.
 
-| Executor metric | Scope |
+| PyExecutor metric | Scope |
 |-----------------|-------|
 | `model_engine_creation_seconds` | Construct and load the main model engine. |
 | `draft_model_engine_creation_seconds` | Construct and load the separate draft model engine, when used. |
@@ -110,7 +110,7 @@ estimation; their final counterparts are the resources retained for serving.
 | `initial_py_executor_creation_seconds_for_kv_cache_estimation` | Construct and warm up the temporary PyExecutor used during KV cache capacity estimation. |
 | `kv_cache_capacity_configuration_seconds` | Determine final KV cache capacity from the temporary executor and available memory. |
 | `final_py_executor_creation_seconds` | Construct and warm up the final PyExecutor retained for serving. |
-| `worker_start_seconds` | Start the final executor worker. |
+| `worker_start_seconds` | Start the final PyExecutor worker. |
 | `total_executor_creation_seconds` | Complete `create_py_executor()` call, including all applicable scopes above. |
 
 The `model_loader` object contains timings for the main LLM weights. If a draft model is used,

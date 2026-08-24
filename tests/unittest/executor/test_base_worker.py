@@ -72,7 +72,7 @@ def test_get_startup_metrics_promotes_model_engine_stages():
         "final_draft_model_engine": {
             "total_warmup_seconds": 1.25
         },
-        "executor": {
+        "py_executor": {
             "worker_start_seconds": 0.5
         },
         "model_loader": {
