@@ -859,14 +859,14 @@ pipeline {
                                 trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                             }
                             def nspect_env = params.nspect_env ? params.nspect_env : "prod"
-                            def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                            def nspectReleaseVersion = params.program_version_name ?: "PostMerge"
                             def cmd = """./nspect/nspect.py \
                                 --env ${nspect_env} \
                                 --nspect_id ${params.nspect_id} \
-                                --program_version_name '${program_version_name}' \
+                                --program_version_name '${nspectReleaseVersion}' \
                                 """
                             if (params.register_images) {
-                                cmd += "--register "
+                                cmd += "--add_version "
                             }
                             if (params.osrb_ticket) {
                                 cmd += "--osrb_ticket ${params.osrb_ticket} "
