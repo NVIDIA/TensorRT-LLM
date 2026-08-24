@@ -549,11 +549,11 @@ class ModelLoader:
                                         config.pretrained_config)
         _validate_and_adjust_mamba_snapshot_config(config, llm_args)
         if original_kv_cache_manager_setting == "auto":
-            logger.info(
-                "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
-                llm_args.kv_cache_config.use_kv_cache_manager_v2,
-                model_cls.__name__
-                if model_cls is not None else "unknown model")
+            model_name = (model_cls.__name__
+                          if model_cls is not None else "unknown model")
+            logger.info("Resolved use_kv_cache_manager_v2='auto' to "
+                        f"{llm_args.kv_cache_config.use_kv_cache_manager_v2} "
+                        f"for {model_name}")
 
         return llm_args
 
