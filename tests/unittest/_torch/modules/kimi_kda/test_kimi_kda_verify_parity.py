@@ -295,14 +295,24 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     # --- Verify path: one call, intermediates into the scratch buffers. ---
     pristine_conv = cache.conv.clone()
     pristine_ssm = cache.temporal.clone()
-    out_verify = runtime.forward_verify(
+    verify_core = torch.empty(
+        batch * t_steps,
+        h,
+        lin["head_dim"],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    verify_result = runtime.forward_verify(
         x.reshape(batch * t_steps, cfg.hidden_size),
         t_steps,
         cache,
         cache.conv,
         cache.temporal,
         slot_indices,
+        output=verify_core,
     )
+    assert verify_result is None
+    out_verify = runtime.o_proj(verify_core.reshape(batch * t_steps, dim))
 
     # Live pools must be untouched by verification.
     torch.testing.assert_close(cache.conv, pristine_conv, rtol=0, atol=0)

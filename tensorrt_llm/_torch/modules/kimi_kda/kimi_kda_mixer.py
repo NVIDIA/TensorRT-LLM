@@ -96,9 +96,7 @@ def _extract_kda_extra_attrs(layer_idx: str):
     kda_layer_ref = kda_layers.get(layer_idx)
     assert kda_layer_ref is not None, f"Cannot find KDA layer for layer {layer_idx}"
     kda_layer = kda_layer_ref()
-    assert isinstance(kda_layer, KimiKDALinearAttention), (
-        "KDA layer must be KimiKDALinearAttention"
-    )
+    assert isinstance(kda_layer, KimiKDALinearAttention), "KDA layer must be KimiKDALinearAttention"
     return metadata, kda_layer
 
 
@@ -421,24 +419,20 @@ class KimiKDALinearAttention(nn.Module):
                 # SpeculativeState scratch buffers — never the live pools —
                 # and kv_cache_manager.update_mamba_states() promotes the
                 # accepted step after sampling.
-                if output is not None:
-                    raise NotImplementedError(
-                        "Breakable CUDA graph KDA does not support speculative "
-                        "verification batches yet"
-                    )
                 assert decode_rows % num_decodes == 0, (
                     f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
                 )
-                outputs.append(
-                    self.forward_verify(
-                        hidden_states[num_ctx_tokens:num_tokens],
-                        decode_rows // num_decodes,
-                        layer_cache,
-                        conv_pool,
-                        ssm_pool,
-                        state_indices[num_prefills:],
-                    )
+                verify_out = self.forward_verify(
+                    hidden_states[num_ctx_tokens:num_tokens],
+                    decode_rows // num_decodes,
+                    layer_cache,
+                    conv_pool,
+                    ssm_pool,
+                    state_indices[num_prefills:],
+                    output=(output[num_ctx_tokens:num_tokens] if output is not None else None),
                 )
+                if output is None:
+                    outputs.append(verify_out)
         if output is not None:
             return None
         out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
@@ -929,8 +923,15 @@ class KimiKDALinearAttention(nn.Module):
         return out.squeeze(1)
 
     def forward_verify(
-        self, x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices
-    ) -> torch.Tensor:
+        self,
+        x2d,
+        num_steps,
+        layer_cache,
+        conv_pool,
+        ssm_pool,
+        slot_indices,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Speculative verification: advance each request ``num_steps``
         tokens (1 golden + ``num_steps - 1`` padded drafts).
 
@@ -954,9 +955,17 @@ class KimiKDALinearAttention(nn.Module):
                 "kernel is unavailable; the legacy intermediate buffers "
                 "were not allocated so there is no fallback"
             )
-            return self.forward_verify_fused(x2d, num_steps, layer_cache, ssm_pool, slot_indices)
+            return self.forward_verify_fused(
+                x2d, num_steps, layer_cache, ssm_pool, slot_indices, output=output
+            )
         return self.forward_verify_sequential(
-            x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices
+            x2d,
+            num_steps,
+            layer_cache,
+            conv_pool,
+            ssm_pool,
+            slot_indices,
+            output=output,
         )
 
     def _project_verify_inputs(
@@ -1019,8 +1028,14 @@ class KimiKDALinearAttention(nn.Module):
         return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
 
     def forward_verify_fused(
-        self, x2d, num_steps, layer_cache, ssm_pool, slot_indices
-    ) -> torch.Tensor:
+        self,
+        x2d,
+        num_steps,
+        layer_cache,
+        ssm_pool,
+        slot_indices,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
 
         Token layout: the kernel indexes each request's new tokens at
@@ -1095,7 +1110,7 @@ class KimiKDALinearAttention(nn.Module):
             scale=self.head_k_dim**-0.5,
         )
         o = out.view(num_generations, num_steps, H, self.head_dim)
-        return self._output_gate_and_proj(x, o, onorm_g)
+        return self._output_gate_and_proj(x, o, onorm_g, output=output)
 
     def _build_mtp_conv_weights(self) -> None:
         """Prebuild packed-prefill and fused-verify convolution weights.
@@ -1125,8 +1140,15 @@ class KimiKDALinearAttention(nn.Module):
         return cached
 
     def forward_verify_sequential(
-        self, x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices
-    ) -> torch.Tensor:
+        self,
+        x2d,
+        num_steps,
+        layer_cache,
+        conv_pool,
+        ssm_pool,
+        slot_indices,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Sequential per-step FLA verification (legacy intermediate-buffer
         path). Live pools are read-only here; ``update_mamba_states()``
         commits the accepted step's state after sampling.
@@ -1211,7 +1233,7 @@ class KimiKDALinearAttention(nn.Module):
             intermediate_ssm[:num_generations, t] = state.to(intermediate_ssm.dtype)
 
         o = torch.cat(step_outputs, dim=1)  # [B, T, H, V]
-        return self._output_gate_and_proj(x, o, onorm_g)
+        return self._output_gate_and_proj(x, o, onorm_g, output=output)
 
     def _output_gate(
         self, x: torch.Tensor, o: torch.Tensor, onorm_g: Optional[torch.Tensor] = None
@@ -1233,7 +1255,14 @@ class KimiKDALinearAttention(nn.Module):
         return o
 
     def _output_gate_and_proj(
-        self, x: torch.Tensor, o: torch.Tensor, onorm_g: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        o: torch.Tensor,
+        onorm_g: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         o = self._output_gate(x, o, onorm_g)
+        if output is not None:
+            output.copy_(o.reshape(output.shape))
+            return None
         return self.o_proj(o.reshape(-1, self.proj_size))

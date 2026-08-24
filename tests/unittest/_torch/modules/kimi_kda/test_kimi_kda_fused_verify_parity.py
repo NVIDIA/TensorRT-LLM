@@ -231,10 +231,19 @@ def test_fused_vs_sequential_two_rounds():
     out2_seq = rt_seq.forward_verify_sequential(
         x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
     )
+    core2_fused = x2.new_empty(B * T, H, K)
     with with_multi_stream(True):
-        out2_fused = rt_fused.forward_verify(
-            x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+        result2_fused = rt_fused.forward_verify(
+            x2,
+            T,
+            cache_fused,
+            conv_pool_fused,
+            ssm_pool_fused,
+            slot_indices,
+            output=core2_fused,
         )
+    assert result2_fused is None
+    out2_fused = rt_fused.o_proj(core2_fused.reshape(B * T, H * K))
     print("round 2 (mixed replay):")
     ok &= _rep("out", out2_fused, out2_seq)
 
