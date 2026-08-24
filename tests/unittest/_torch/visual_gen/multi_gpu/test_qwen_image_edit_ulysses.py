@@ -31,7 +31,7 @@ from _visual_gen_dist_utils import spawn_with_retry
 # The unit test creates its own torch.distributed NCCL process group. Disable the
 # TRT-LLM MPI bootstrap path so importing tensorrt_llm does not initialize MPI.
 _OLD_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
-os.environ.setdefault("TLLM_DISABLE_MPI", "1")
+os.environ["TLLM_DISABLE_MPI"] = "1"
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 if str(REPO_ROOT) not in sys.path:
