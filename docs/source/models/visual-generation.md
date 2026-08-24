@@ -374,8 +374,12 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.
     - Qwen-Image can use non-`VANILLA` attention backends such as `TRTLLM`,
       `FA4`, and `CUTEDSL` only when `ulysses_size: 1`. With `ulysses_size > 1`,
-      set `attention_config.backend: VANILLA`; Qwen-Image Ulysses sharding needs
-      key-padding-mask support for the padded text and image token streams.
+      set `attention_config.backend: VANILLA`. Qwen-Image Ulysses sharding pads
+      the text and image token streams before splitting them across ranks, and
+      attention must consume a key-padding mask so the padded tokens are ignored.
+      This key-padding-mask path is currently supported only by the `VANILLA`
+      Qwen-Image attention implementation; non-`VANILLA` backends do not support
+      that mask and are rejected for Qwen-Image Ulysses configs.
 - **Parallel VAE** (`parallel_vae_size: N`): Shards the final VAE decode along a spatial axis (constraint: `parallel_vae_size ≤ world_size`; WAN/Cosmos3 only).
 - **Context Parallel (CP)** — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (`FA4` or `CUTEDSL`). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = `cp_size · ulysses_size`. The CP degree depends on the implementation below:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
