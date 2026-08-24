@@ -56,19 +56,6 @@ from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
-# Fallbacks for pre-release K-EXAONE2 checkpoints whose config predates the
-# explicit `swiglu_limits` / `sliding_windows` lists. They reproduce the same
-# values the released config encodes.
-_K_EXAONE2_LEGACY_SWIGLU_LIMIT = 7.0
-_K_EXAONE2_LEGACY_SWIGLU_FIRST_LAYER = 62
-_K_EXAONE2_LEGACY_WIDE_WINDOW_LAYER = 1
-_K_EXAONE2_LEGACY_WIDE_WINDOW = 4096
-
-
-def is_k_exaone2(config: ExaoneMoeConfig) -> bool:
-    """Return whether the checkpoint uses the K-EXAONE2 architecture contract."""
-    return "ExaoneMoeForCausalLM" in (getattr(config, "architectures", None) or [])
-
 
 def _per_layer_list(config: ExaoneMoeConfig, name: str, layer_idx: int):
     """Return `config.<name>` when it is a list long enough to cover `layer_idx`.
@@ -84,12 +71,10 @@ def _per_layer_list(config: ExaoneMoeConfig, name: str, layer_idx: int):
 
 
 def get_exaone_swiglu_limit(config: ExaoneMoeConfig, layer_idx: int) -> Optional[float]:
-    """Return the per-layer SwiGLU clamp used by K-EXAONE2."""
+    """Return the configured per-layer SwiGLU clamp."""
     limits = _per_layer_list(config, "swiglu_limits", layer_idx)
     if limits is not None:
         return float(limits[layer_idx]) or None
-    if is_k_exaone2(config) and layer_idx >= _K_EXAONE2_LEGACY_SWIGLU_FIRST_LAYER:
-        return _K_EXAONE2_LEGACY_SWIGLU_LIMIT
     return None
 
 
@@ -98,21 +83,21 @@ def get_exaone_attention_window(
 ) -> Optional[int]:
     """Return the effective attention window for an EXAONE-MoE layer."""
     if is_mtp_layer:
-        # K-EXAONE2's MTP block is sliding; earlier EXAONE-MoE MTP is global.
-        mtp_layer_types = getattr(config, "mtp_layer_types", None)
-        if mtp_layer_types:
-            if mtp_layer_types[0] != "sliding_attention":
-                return None
-        elif not is_k_exaone2(config):
+        mtp_layer_idx = layer_idx - config.num_hidden_layers
+        if mtp_layer_idx < 0:
             return None
-        return config.sliding_window
+        mtp_layer_types = _per_layer_list(config, "mtp_layer_types", mtp_layer_idx)
+        if mtp_layer_types is None or mtp_layer_types[mtp_layer_idx] != "sliding_attention":
+            return None
+        mtp_windows = _per_layer_list(config, "mtp_sliding_windows", mtp_layer_idx)
+        if mtp_windows is None:
+            return None
+        return int(mtp_windows[mtp_layer_idx]) or None
     if config.layer_types[layer_idx] != "sliding_attention":
         return None
     windows = _per_layer_list(config, "sliding_windows", layer_idx)
     if windows is not None:
         return int(windows[layer_idx]) or None
-    if is_k_exaone2(config) and layer_idx == _K_EXAONE2_LEGACY_WIDE_WINDOW_LAYER:
-        return _K_EXAONE2_LEGACY_WIDE_WINDOW
     return config.sliding_window
 
 
@@ -712,7 +697,6 @@ class ExaoneMoeModel(DecoderModel):
 
 
 @register_auto_model("ExaoneMoeForCausalLM")
-@register_auto_model("ExaoneMoEForCausalLM")
 class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoeConfig]):
     def __init__(
         self,
