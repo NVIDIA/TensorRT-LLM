@@ -22,7 +22,14 @@ long session keeps appending turns until it overflows the context window.
 
 from types import SimpleNamespace
 
+import pytest
+
 from tensorrt_llm.serve.responses_utils import _create_usage
+
+# The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
+# test in the file is deselected, which pytest reports as exit code 5 and the
+# stage reports as a failure.
+pytestmark = pytest.mark.cpu_only
 
 
 def _generation(prompt_tokens=7, completion_tokens=3, cached_tokens=0):

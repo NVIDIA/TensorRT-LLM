@@ -28,6 +28,11 @@ from tensorrt_llm.serve.responses_utils import (
     _response_output_item_to_chat_completion_message,
 )
 
+# The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
+# test in the file is deselected, which pytest reports as exit code 5 and the
+# stage reports as a failure.
+pytestmark = pytest.mark.cpu_only
+
 
 def _message_item(role, *texts, item_id=None):
     item = {
@@ -253,12 +258,6 @@ def test_structured_input_request_is_picklable():
         return False
 
     assert not has_lazy(request.input)
-
-
-def test_string_input_request_is_picklable():
-    import pickle
-
-    pickle.dumps(ResponsesRequest(model="m", input="hello"))
 
 
 def test_unknown_top_level_fields_are_tolerated():

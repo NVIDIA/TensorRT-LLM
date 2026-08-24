@@ -21,7 +21,14 @@ Codex CLI drops an entire turn - printing nothing - if a delta arrives with
 an id it has not seen opened.
 """
 
+import pytest
+
 from tensorrt_llm.serve.responses_utils import ResponsesStreamingEventsHelper
+
+# The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
+# test in the file is deselected, which pytest reports as exit code 5 and the
+# stage reports as a failure.
+pytestmark = pytest.mark.cpu_only
 
 
 def _helper():

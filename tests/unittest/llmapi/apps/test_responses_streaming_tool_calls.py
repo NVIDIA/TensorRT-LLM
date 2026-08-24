@@ -15,7 +15,10 @@
 
 """Unit tests for Responses API streaming tool call emission (TRTLLM-9605)."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingEventsHelper,
@@ -23,6 +26,11 @@ from tensorrt_llm.serve.responses_utils import (
     _should_send_done_events,
 )
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
+
+# The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
+# test in the file is deselected, which pytest reports as exit code 5 and the
+# stage reports as a failure.
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_mock_output(index: int = 0, text: str = "", text_diff: str = ""):
@@ -39,12 +47,13 @@ def _make_mock_output(index: int = 0, text: str = "", text_diff: str = ""):
 
 
 def _make_mock_request(tools: list | None = None):
-    """Create a minimal ResponsesRequest-like object with .tools."""
+    """Create a minimal ResponsesRequest-like object with .tools.
 
-    class MockRequest:
-        tools = tools or []
-
-    return MockRequest()
+    SimpleNamespace rather than a nested class: a class body does not close over
+    the enclosing function's locals (unlike a nested function), so
+    ``tools = tools or []`` inside one raises NameError on the right-hand name.
+    """
+    return SimpleNamespace(tools=tools or [])
 
 
 class TestShouldSendDoneEventsToolCalls:
@@ -90,8 +99,14 @@ class TestShouldSendDoneEventsToolCalls:
         assert done_tool_calls[0].name == "get_weather"
         assert done_tool_calls[0].parameters == '{"location":"SF"}'
 
-    def test_returns_empty_tool_calls_when_no_tool_calls(self):
-        """When full text but no tool_calls, 5th return is empty list."""
+    def test_plain_text_completion_sends_text_done_and_no_tool_calls(self):
+        """The no-tool-call branch must still finish the text item.
+
+        Asserting only that the tool-call list comes back empty would be
+        asserting on the patched parser's own return value; what this branch
+        actually has to get right is that plain text still reaches the client
+        as a completed text item.
+        """
         output = _make_mock_output(index=0, text="Just plain text", text_diff="")
         helper = ResponsesStreamingEventsHelper()
         helper.is_text_sent = True
@@ -114,7 +129,11 @@ class TestShouldSendDoneEventsToolCalls:
                 finished_generation=True,
             )
 
-        _, _, _, _, done_tool_calls = result
+        (_, should_send_text_done, _, text_content, done_tool_calls) = result
+        # The behaviour this branch owns: generation finished with text already
+        # streamed and no tool calls, so the text item must be closed out.
+        assert should_send_text_done is True
+        assert text_content == "Just plain text"
         assert done_tool_calls == []
 
 

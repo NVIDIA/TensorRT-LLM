@@ -33,6 +33,11 @@ from tensorrt_llm.serve.web_search import (
     resolve_web_search,
 )
 
+# The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
+# test in the file is deselected, which pytest reports as exit code 5 and the
+# stage reports as a failure.
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch):
