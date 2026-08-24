@@ -9,12 +9,7 @@ import torch
 
 @dataclass
 class LTX23TextConditioning:
-    """Step-invariant, connector-processed text conditioning.
-
-    LTX-2's TextCache without its video_kv / audio_kv fields: LTX-2.3 modulates
-    the text cross-attention K/V with a sigma-derived prompt_timestep, so it is
-    reprojected every step instead of pre-projected once.
-    """
+    """Connector-processed text conditioning without static per-block K/V."""
 
     video_context: torch.Tensor | None = None
     video_mask: torch.Tensor | None = None

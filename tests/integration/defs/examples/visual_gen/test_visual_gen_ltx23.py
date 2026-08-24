@@ -14,16 +14,8 @@
 # limitations under the License.
 """End-to-end golden-media tests for LTX-2.3.
 
-The counterpart to the test_ltx2_lpips_against_golden family in test_visual_gen.py.
-
-LTX-2.3 emits audio and video, so quality is gated on two axes: decoded pixels
-against a golden MP4 via the shared LPIPS eval script, and the audio waveform
-against a golden WAV via a librosa log-mel L1 distance. Generation is
-deterministic (fixed seed, deterministic algorithms, forced eager) so a matching
-kernel stack reproduces the goldens within the threshold margins.
-
-Paths resolve through the CI harness and are overridable with LTX23_MODEL_PATH,
-LTX23_TEXT_ENCODER_PATH and LTX23_GOLDEN_DIR.
+Video LPIPS and audio log-mel L1 against goldens. Override paths with
+LTX23_MODEL_PATH, LTX23_TEXT_ENCODER_PATH, and LTX23_GOLDEN_DIR.
 """
 
 import contextlib
@@ -58,8 +50,6 @@ LTX23_GOLDEN_DIR = os.environ.get(
 LTX23_GOLDEN_VIDEO = os.path.join(LTX23_GOLDEN_DIR, "ltx23_lpips_golden_video.mp4")
 LTX23_GOLDEN_AUDIO = os.path.join(LTX23_GOLDEN_DIR, "ltx23_audio_golden.wav")
 
-# Reduced render, mirroring LTX-2's LPIPS setting: cheap to reproduce while still
-# exercising the full A/V decode plus vocoder and BWE path.
 LTX23_LPIPS_PROMPT = (
     "A cinematic close-up of a golden retriever puppy running through a sunlit "
     "meadow of wildflowers, gentle breeze, birds chirping"
@@ -72,9 +62,6 @@ LTX23_LPIPS_GUIDANCE_SCALE = 5.0
 LTX23_LPIPS_FRAME_RATE = 24.0
 LTX23_LPIPS_SEED = 42
 
-# The video gate matches every other visual_gen model and absorbs the ~0.04
-# cross-host kernel drift. The audio gate is mean absolute log-mel difference in
-# dB; deterministic same-host reruns land near zero.
 LTX23_LPIPS_THRESHOLD = 0.05
 LTX23_AUDIO_MEL_L1_THRESHOLD = float(os.environ.get("LTX23_AUDIO_MEL_L1_THRESHOLD", "0.45"))
 
@@ -136,12 +123,11 @@ def _run_lpips_eval(tmp_dir, sample_id, prompt, reference_path, generated_path):
             indent=2,
         )
 
-    env = os.environ.copy()
-    env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    env["PYTHONPATH"] = (
-        f"{REPO_ROOT}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else REPO_ROOT
-    )
     with _lpips_deterministic_algorithms():
+        env = os.environ.copy()
+        env["PYTHONPATH"] = (
+            f"{REPO_ROOT}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else REPO_ROOT
+        )
         result = subprocess.run(
             [
                 sys.executable,
@@ -176,11 +162,7 @@ def _save_wav(audio, path, sample_rate):
 
 
 def _audio_mel_l1_distance(generated_path, reference_path):
-    """Mean absolute log-mel dB difference between two WAVs.
-
-    power_to_db floors each clip at top_db below its peak, so PCM noise in
-    near-silent bins cannot dominate the distance.
-    """
+    """Mean absolute log-mel dB difference between two WAVs."""
     generated, gen_rate = librosa.load(str(generated_path), sr=None, mono=True)
     reference, ref_rate = librosa.load(str(reference_path), sr=None, mono=True)
     if gen_rate != ref_rate:
@@ -193,11 +175,15 @@ def _audio_mel_l1_distance(generated_path, reference_path):
         return librosa.power_to_db(mel, top_db=80.0)
 
     gen_mel, ref_mel = _log_mel(generated, gen_rate), _log_mel(reference, ref_rate)
-    n = min(gen_mel.shape[1], ref_mel.shape[1])
-    if n == 0:
-        raise ValueError("Empty audio: one of the clips decoded to zero frames")
-    distance = float(np.abs(gen_mel[:, :n] - ref_mel[:, :n]).mean())
-    print(f"[E2E audio log-mel L1] distance: {distance:.6f} dB (frames compared: {n})")
+    if gen_mel.shape[1] != ref_mel.shape[1]:
+        raise ValueError(
+            f"Audio length mismatch: generated {gen_mel.shape[1]} mel frames vs "
+            f"golden {ref_mel.shape[1]}"
+        )
+    if gen_mel.shape[1] == 0:
+        raise ValueError("Empty audio: both clips decoded to zero frames")
+    distance = float(np.abs(gen_mel - ref_mel).mean())
+    print(f"[E2E audio log-mel L1] distance: {distance:.6f} dB (frames: {gen_mel.shape[1]})")
     return distance
 
 
@@ -209,8 +195,7 @@ def _generate_ltx23_av(video_out_path, audio_out_path):
     _skip_if_missing(LTX23_MODEL_PATH, "LTX-2.3 checkpoint", is_dir=True)
     _skip_if_missing(LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (gemma-3-12b-it)", is_dir=True)
 
-    # Nested @torch.compile decorators are not suppressed by
-    # TorchCompileConfig(enable=False) alone, so force eager over the whole render.
+    # Force eager: nested @torch.compile is not turned off by TorchCompileConfig.
     with _lpips_deterministic_algorithms(), torch.compiler.set_stance("force_eager"):
         args = VisualGenArgs(
             model=LTX23_MODEL_PATH,

@@ -1,25 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2.3 transformer.
-
-Ported from LTX-2 (LTXModel / BasicAVTransformerBlock) with these changes:
-
-- 9-slot per-block AdaLN (MSA [0:3], MLP [3:6], text-cross-attn [6:9]) plus a
-  per-block prompt_scale_shift_table [2, dim] that modulates the text context
-  K/V from a sigma-derived prompt_timestep.
-- adaln_single embedding_coefficient 6 -> 9, and a new prompt_adaln_single
-  (coeff 2) that produces prompt_timestep from sigma.
-- caption_projection becomes nn.Identity, since LTX-2.3 projects to inner_dim in
-  the text_embedding_projection feature extractor before the connector.
-- Text K/V is projected per denoise step from the prompt-modulated context,
-  rather than cached per block as in LTX-2.
-- Audio/video cross-attention is unchanged from LTX-2 and reused as-is.
-
-Conditioning runs through the same fused AdaLN ops as LTX-2: the text
-cross-attention query shift/scale (slots 6, 7) and output gate (slot 8) fold into
-the surrounding gate-residual kernels instead of taking a standalone pass.
-"""
+"""LTX-2.3 transformer: 9-slot AdaLN, prompt AdaLN, Identity caption projection."""
 
 from __future__ import annotations
 
@@ -44,10 +26,6 @@ from ..ltx2.transformer_ltx2 import (
 )
 from .text_conditioning_ltx23 import LTX23TextConditioning
 
-# Slicing a scale/shift table plus its embedded timestep is the same math
-# whatever the slot count, so these are bound from the LTX-2 block rather than
-# reimplemented. The pair form returns (table_slice, ts_slice) so the fused
-# kernels can fold the broadcast-add and cast internally.
 _get_ada_table_ts_pairs = BasicAVTransformerBlock._get_ada_table_ts_pairs
 _get_av_ca_ada_table_ts_pairs = BasicAVTransformerBlock._get_av_ca_ada_table_ts_pairs
 _make_mlp = BasicAVTransformerBlock._make_mlp
@@ -68,9 +46,6 @@ class LTX23TransformerBlock(nn.Module):
         super().__init__()
         self.idx = idx
         self.norm_eps = norm_eps
-
-        # Matches LTX-2's per-block gate: on unsupported inner dims the helpers
-        # fall back to the numerically identical eager path.
         self._fuse_adaln = (video is None or is_fused_adaln_supported_dim(video.dim)) and (
             audio is None or is_fused_adaln_supported_dim(audio.dim)
         )
@@ -107,8 +82,6 @@ class LTX23TransformerBlock(nn.Module):
             self.audio_prompt_scale_shift_table = nn.Parameter(torch.empty(2, audio.dim))
 
         if audio is not None and video is not None:
-            # AV cross-attention keys/values come from the audio head geometry in
-            # both directions, as in LTX-2.
             self.audio_to_video_attn = attn(
                 "audio_to_video_attn", video.dim, audio.dim, audio, video.apply_gated_attention
             )
@@ -127,18 +100,7 @@ class LTX23TransformerBlock(nn.Module):
         timestep: torch.Tensor,
         prompt_timestep: torch.Tensor,
     ) -> torch.Tensor:
-        """LTX-2.3 text cross-attention with sigma-driven K/V modulation.
-
-        Mirrors ltx-core apply_cross_attention_adaln:
-          attn_input = x_normed * (1 + scale_q) + shift_q          # slots [6:9]
-          enc        = context  * (1 + scale_kv) + shift_kv        # prompt table
-          out        = attn(attn_input, K/V from enc) * gate
-
-        Only the middle line lives here: the query arrives pre-modulated and the
-        output is returned ungated, both folded into the caller's fused kernels.
-        The K/V modulation stays eager because it has no adjacent norm or
-        residual to absorb it.
-        """
+        """Query is pre-modulated by the caller; K/V are shifted from prompt_timestep."""
         batch_size = attn_input.shape[0]
         shift_kv, scale_kv = (
             prompt_scale_shift_table[None, None].to(
@@ -147,9 +109,66 @@ class LTX23TransformerBlock(nn.Module):
             + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
         ).unbind(dim=2)
         enc = apply_shift_scale(context, scale_kv, shift_kv)
-        # Project K/V from the modulated context this step (no static cache).
         k, v = attn.project_kv(enc)
         return attn(attn_input, context=enc, pre_projected_kv=(k, v), timestep=timestep)
+
+    def _self_attn_and_text_ca(
+        self,
+        x,
+        stream,
+        attn1,
+        attn2,
+        scale_shift_table,
+        prompt_table,
+        prompt_timestep,
+    ):
+        shift_msa, scale_msa, gate_msa = _get_ada_table_ts_pairs(
+            scale_shift_table, x.shape[0], stream.timesteps, slice(0, 3)
+        )
+        shift_ca, scale_ca, gate_ca = _get_ada_table_ts_pairs(
+            scale_shift_table, x.shape[0], stream.timesteps, slice(6, 9)
+        )
+        norm_x = apply_fused_rmsnorm_shift_scale(
+            x,
+            scale_msa[0],
+            scale_msa[1],
+            shift_msa[0],
+            shift_msa[1],
+            self.norm_eps,
+            self._fuse_adaln,
+        )
+        msa = attn1(norm_x, pe=stream.positional_embeddings, timestep=stream.timesteps)
+        x, q_input = apply_fused_gate_resid_rmsnorm_shift_scale(
+            x,
+            msa,
+            gate_msa[0],
+            gate_msa[1],
+            scale_ca[0],
+            scale_ca[1],
+            shift_ca[0],
+            shift_ca[1],
+            self.norm_eps,
+            self._fuse_adaln,
+        )
+        ca = self._text_cross_attention(
+            q_input, stream.context, attn2, prompt_table, stream.timesteps, prompt_timestep
+        )
+        return apply_fused_gate_resid(x, ca, gate_ca[0], gate_ca[1], self._fuse_adaln)
+
+    def _ffn(self, x, stream, ff, scale_shift_table):
+        shift, scale, gate = _get_ada_table_ts_pairs(
+            scale_shift_table, x.shape[0], stream.timesteps, slice(3, 6)
+        )
+        scaled = apply_fused_rmsnorm_shift_scale(
+            x,
+            scale[0],
+            scale[1],
+            shift[0],
+            shift[1],
+            self.norm_eps,
+            self._fuse_adaln,
+        )
+        return apply_fused_gate_resid(x, ff(scaled), gate[0], gate[1], self._fuse_adaln)
 
     def forward(
         self,
@@ -165,92 +184,27 @@ class LTX23TransformerBlock(nn.Module):
         run_a2v = run_vx and audio is not None and ax is not None and ax.numel() > 0
         run_v2a = run_ax and video is not None and vx is not None and vx.numel() > 0
 
-        # --- Video self-attention + text cross-attention ---
         if run_vx:
-            # MSA modulators: slot 0 = shift, 1 = scale, 2 = gate.
-            vshift_msa, vscale_msa, vgate_msa = _get_ada_table_ts_pairs(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
-            )
-            # Text cross-attn modulators: slot 6 = shift_q, 7 = scale_q, 8 = gate.
-            vshift_ca, vscale_ca, vgate_ca = _get_ada_table_ts_pairs(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(6, 9)
-            )
-            norm_vx = apply_fused_rmsnorm_shift_scale(
+            vx = self._self_attn_and_text_ca(
                 vx,
-                vscale_msa[0],
-                vscale_msa[1],
-                vshift_msa[0],
-                vshift_msa[1],
-                self.norm_eps,
-                self._fuse_adaln,
-            )
-            v_msa = self.attn1(norm_vx, pe=video.positional_embeddings, timestep=video.timesteps)
-            # vx <- vx + v_msa * gate_msa, rms_norm, then the query modulation.
-            vx, attn2_q_input = apply_fused_gate_resid_rmsnorm_shift_scale(
-                vx,
-                v_msa,
-                vgate_msa[0],
-                vgate_msa[1],
-                vscale_ca[0],
-                vscale_ca[1],
-                vshift_ca[0],
-                vshift_ca[1],
-                self.norm_eps,
-                self._fuse_adaln,
-            )
-            v_ca = self._text_cross_attention(
-                attn2_q_input,
-                video.context,
+                video,
+                self.attn1,
                 self.attn2,
+                self.scale_shift_table,
                 self.prompt_scale_shift_table,
-                video.timesteps,
                 video_prompt_timestep,
             )
-            vx = apply_fused_gate_resid(vx, v_ca, vgate_ca[0], vgate_ca[1], self._fuse_adaln)
-
-        # --- Audio self-attention + text cross-attention ---
         if run_ax:
-            ashift_msa, ascale_msa, agate_msa = _get_ada_table_ts_pairs(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
-            )
-            ashift_ca, ascale_ca, agate_ca = _get_ada_table_ts_pairs(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(6, 9)
-            )
-            norm_ax = apply_fused_rmsnorm_shift_scale(
+            ax = self._self_attn_and_text_ca(
                 ax,
-                ascale_msa[0],
-                ascale_msa[1],
-                ashift_msa[0],
-                ashift_msa[1],
-                self.norm_eps,
-                self._fuse_adaln,
-            )
-            a_msa = self.audio_attn1(
-                norm_ax, pe=audio.positional_embeddings, timestep=audio.timesteps
-            )
-            ax, audio_attn2_q_input = apply_fused_gate_resid_rmsnorm_shift_scale(
-                ax,
-                a_msa,
-                agate_msa[0],
-                agate_msa[1],
-                ascale_ca[0],
-                ascale_ca[1],
-                ashift_ca[0],
-                ashift_ca[1],
-                self.norm_eps,
-                self._fuse_adaln,
-            )
-            a_ca = self._text_cross_attention(
-                audio_attn2_q_input,
-                audio.context,
+                audio,
+                self.audio_attn1,
                 self.audio_attn2,
+                self.audio_scale_shift_table,
                 self.audio_prompt_scale_shift_table,
-                audio.timesteps,
                 audio_prompt_timestep,
             )
-            ax = apply_fused_gate_resid(ax, a_ca, agate_ca[0], agate_ca[1], self._fuse_adaln)
 
-        # --- Bidirectional audio <-> video cross-attention (identical to LTX-2) ---
         if run_a2v or run_v2a:
             vx_pre, ax_pre = vx, ax
             if run_a2v:
@@ -337,41 +291,10 @@ class LTX23TransformerBlock(nn.Module):
                 )
                 ax = apply_fused_gate_resid(ax, v2a_out, gate_v2a[0], gate_v2a[1], self._fuse_adaln)
 
-        # --- Video FFN ---
         if run_vx:
-            vshift_mlp, vscale_mlp, vgate_mlp = _get_ada_table_ts_pairs(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
-            )
-            vx_scaled = apply_fused_rmsnorm_shift_scale(
-                vx,
-                vscale_mlp[0],
-                vscale_mlp[1],
-                vshift_mlp[0],
-                vshift_mlp[1],
-                self.norm_eps,
-                self._fuse_adaln,
-            )
-            vx = apply_fused_gate_resid(
-                vx, self.ff(vx_scaled), vgate_mlp[0], vgate_mlp[1], self._fuse_adaln
-            )
-
-        # --- Audio FFN ---
+            vx = self._ffn(vx, video, self.ff, self.scale_shift_table)
         if run_ax:
-            ashift_mlp, ascale_mlp, agate_mlp = _get_ada_table_ts_pairs(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
-            )
-            ax_scaled = apply_fused_rmsnorm_shift_scale(
-                ax,
-                ascale_mlp[0],
-                ascale_mlp[1],
-                ashift_mlp[0],
-                ashift_mlp[1],
-                self.norm_eps,
-                self._fuse_adaln,
-            )
-            ax = apply_fused_gate_resid(
-                ax, self.audio_ff(ax_scaled), agate_mlp[0], agate_mlp[1], self._fuse_adaln
-            )
+            ax = self._ffn(ax, audio, self.audio_ff, self.audio_scale_shift_table)
 
         return (
             replace(video, x=vx) if video is not None else None,
@@ -380,14 +303,7 @@ class LTX23TransformerBlock(nn.Module):
 
 
 class LTX23Model(LTXModel):
-    """LTX-2.3 transformer, overriding only the parts that differ from LTXModel.
-
-    As in LTX-2, the embeddings connectors and the split feature extractor are
-    pipeline-level components excluded from the transformer weight load, so this
-    model receives already-connector-processed text context.
-    """
-
-    # -- Init overrides ------------------------------------------------------
+    """LTX-2.3 transformer: 9-slot AdaLN, prompt AdaLN, Identity caption projection."""
 
     def _init_video(self, in_channels, out_channels, caption_channels, norm_eps):
         self.patchify_proj = self._make_linear(in_channels, self.inner_dim)
@@ -397,7 +313,6 @@ class LTX23Model(LTXModel):
         self.prompt_adaln_single = AdaLayerNormSingle(
             self.inner_dim, embedding_coefficient=2, make_linear=self._make_linear
         )
-        # Caption projection happens before the connector, so bypass it here.
         self.caption_projection = nn.Identity()
         self.scale_shift_table = nn.Parameter(torch.empty(2, self.inner_dim))
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
@@ -464,8 +379,6 @@ class LTX23Model(LTXModel):
             ]
         )
 
-    # -- Text conditioning (no static K/V) -----------------------------------
-
     def _compute_prompt_timestep(self, adaln, sigma, batch_size, dtype):
         """prompt_timestep from the global sigma (drives context K/V modulation)."""
         sigma_scaled = sigma * self.timestep_scale_multiplier
@@ -483,11 +396,7 @@ class LTX23Model(LTXModel):
         audio_positions: torch.Tensor | None = None,
         dtype: torch.dtype,
     ) -> LTX23TextConditioning:
-        """Compute step-invariant text conditioning, with no per-block K/V.
-
-        The context arguments are connector outputs: the pipeline runs the split
-        feature extractor and the two embeddings connectors before calling this.
-        """
+        """Step-invariant text conditioning; K/V is not cached per block."""
         out = LTX23TextConditioning()
 
         if video_context is not None:
@@ -509,8 +418,7 @@ class LTX23Model(LTXModel):
         else:
             a_pe = a_cross_pe = None
 
-        # One-time reshape/shard into the form the attention consumer expects, so
-        # the denoise loop has no PE work. Identical to LTX-2.
+        # One-time PE reshape/shard so the denoise loop has no PE work.
         fuse_video = self.transformer_blocks[0].attn1.fuse_qk_norm_rope
         fuse_audio = (
             self.transformer_blocks[0].audio_attn1.fuse_qk_norm_rope
@@ -524,8 +432,6 @@ class LTX23Model(LTXModel):
             out.audio_pe = self._make_pe_local(a_pe, is_audio=True, fuse=fuse_audio)
             out.audio_cross_pe = self._make_pe_local(a_cross_pe, is_audio=True, fuse=fuse_audio)
         return out
-
-    # -- Forward -------------------------------------------------------------
 
     def forward(
         self,

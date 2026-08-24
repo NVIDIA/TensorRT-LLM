@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU LTX-2.3 text-to-video with audio, BF16. Multi-GPU runs reuse the
-# precision-agnostic ltx2-*.yaml configs.
-# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+# 1-GPU LTX-2.3 text-to-video with audio, BF16.
 attention_config:
   backend: VANILLA
 parallel_config:

@@ -1,13 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2.3 core components ported from the official LTX-2 repository.
+"""LTX-2.3-only core components."""
 
-Only the components whose architecture differs from LTX-2 live here; everything
-else is imported from models/ltx2/ltx2_core.
+from .audio_vae import LTX23VocoderConfigurator, VocoderWithBWE
+from .connector import (
+    LTX23AudioConnectorConfigurator,
+    LTX23GemmaFeaturesExtractor,
+    LTX23VideoConnectorConfigurator,
+)
+from .modality import LTX23Modality
+from .video_vae_ltx23 import LTX23VideoDecoder, LTX23VideoDecoderConfigurator
 
-- connector.py: split video/audio feature extractor and gated 8-layer connectors.
-- modality.py: adds the global sigma alongside the LTX-2 fields.
-- video_vae_ltx23.py: LTX2VideoDecoder subclass with the LTX-2.3 channel recipe.
-- vocoder_ltx23.py: BigVGAN-v2 AMP1 vocoder plus fp32 bandwidth extension.
-"""
+__all__ = [
+    "LTX23AudioConnectorConfigurator",
+    "LTX23GemmaFeaturesExtractor",
+    "LTX23Modality",
+    "LTX23VideoConnectorConfigurator",
+    "LTX23VideoDecoder",
+    "LTX23VideoDecoderConfigurator",
+    "LTX23VocoderConfigurator",
+    "VocoderWithBWE",
+]

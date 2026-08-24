@@ -1,10 +1,21 @@
 """Unit tests for the LTX-2.3 transformer and its model-specific components."""
 
+import math
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
+
+# Reduced vs the checkpoint (3840 caption, 4096/2048 streams) for fast CI.
 _CAPTION_CHANNELS = 8
 _NUM_STATES = 3
 _VIDEO_DIM = 32
@@ -40,13 +51,6 @@ _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _model_config():
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-    from tensorrt_llm.mapping import Mapping
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.visual_gen.args import AttentionConfig
-
     return DiffusionModelConfig(
         pretrained_config=SimpleNamespace(),
         quant_config=QuantConfig(),
@@ -158,12 +162,6 @@ class TestLTX23TextFeatures(unittest.TestCase):
         self.assertTrue(torch.allclose(rms, torch.ones_like(rms), atol=1e-2))
 
     def test_projections_apply_modality_rescale(self):
-        # Dims give v_scale = sqrt(32/8) = 2.0 and a_scale = sqrt(2/8) = 0.5, so a
-        # plain Linear(x) is numerically wrong for both streams.
-        import math
-
-        import torch.nn.functional as F
-
         fe = self._extractor()
         x = torch.randn(2, 4, _CAPTION_CHANNELS * _NUM_STATES)
         with torch.no_grad():
@@ -226,11 +224,9 @@ class TestLTX23Connectors(unittest.TestCase):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestLTX23ModelStructure(unittest.TestCase):
-    """9-slot AdaLN plus the sigma-driven prompt AdaLN that LTX-2 does not have."""
+    """9-slot AdaLN plus the sigma-driven prompt AdaLN."""
 
     def test_adaln_slots_and_prompt_adaln(self):
-        import torch.nn as nn
-
         model = _build_model("AudioVideo", _AUDIO_VIDEO_CONFIG)
         block = model.transformer_blocks[0]
 
@@ -255,7 +251,6 @@ class TestLTX23ModelStructure(unittest.TestCase):
             self.assertEqual(tuple(table.shape), (9, dim))
             self.assertEqual(tuple(prompt_table.shape), (2, dim))
 
-        # LTX-2.3 projects the caption in the feature extractor, before the connector.
         self.assertIsInstance(model.caption_projection, nn.Identity)
 
 
@@ -281,11 +276,9 @@ class TestLTX23Forward(unittest.TestCase):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestLTX23SigmaTextConditioning(unittest.TestCase):
-    """Text K/V is modulated by sigma and re-projected every step, unlike LTX-2."""
+    """Text K/V is modulated by sigma and re-projected every step."""
 
     def test_sigma_changes_output(self):
-        from dataclasses import replace
-
         torch.manual_seed(7)
         cfg = _AUDIO_VIDEO_CONFIG
         model = _build_model("AudioVideo", cfg)
@@ -306,7 +299,7 @@ class TestLTX23SigmaTextConditioning(unittest.TestCase):
 
 
 class TestLTX23VideoDecoderChannels(unittest.TestCase):
-    """compress_time and compress_space reduce channels in LTX-2.3, unlike LTX-2.
+    """compress_time and compress_space reduce channels in LTX-2.3.
 
     Built at latent_channels=16 (real checkpoint uses 128), so every width is
     1/8 of the real one and the ratios are unchanged.
@@ -347,10 +340,8 @@ class TestLTX23VideoDecoderChannels(unittest.TestCase):
 
     def test_conv_in_uses_every_compress_multiplier(self):
         dec = self._build()
-        # conv_in widens by the product of all four multipliers (2*2*1*2 = 8).
         self.assertEqual(dec.conv_in.conv.weight.shape[1], self._LATENT)
         self.assertEqual(dec.conv_in.conv.weight.shape[0], self._LATENT * 8)
-        # compress_space and compress_time each halve on the way back down.
         self.assertEqual(dec.up_blocks[5].conv.conv.weight.shape[0], 64)
         self.assertEqual(dec.up_blocks[7].conv.conv.weight.shape[0], 64)
 
@@ -359,7 +350,7 @@ class TestLTX23Vocoder(unittest.TestCase):
     """BigVGAN-v2 generator plus the bandwidth-extension wrapper to 48 kHz."""
 
     def test_configurator_builds_48khz_bwe(self):
-        from tensorrt_llm._torch.visual_gen.models.ltx23.ltx23_core.vocoder_ltx23 import (
+        from tensorrt_llm._torch.visual_gen.models.ltx23.ltx23_core.audio_vae import (
             LTX23VocoderConfigurator,
             VocoderWithBWE,
         )
@@ -408,12 +399,14 @@ class TestLTX23PipelineDetection(unittest.TestCase):
     }
 
     def test_detection(self):
-        from tensorrt_llm._torch.visual_gen.pipeline_registry import _detect_native_ltx_pipeline
+        from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23 import (
+            detect_native_ltx_pipeline,
+        )
 
         self.assertEqual(
-            _detect_native_ltx_pipeline({"transformer": dict(self._LTX23_TRANSFORMER)}),
+            detect_native_ltx_pipeline({"transformer": dict(self._LTX23_TRANSFORMER)}),
             "LTX23Pipeline",
         )
-        self.assertEqual(_detect_native_ltx_pipeline({"transformer": {}}), "LTX2Pipeline")
+        self.assertEqual(detect_native_ltx_pipeline({"transformer": {}}), "LTX2Pipeline")
         with self.assertRaises(ValueError):
-            _detect_native_ltx_pipeline({"transformer": {"cross_attention_adaln": True}})
+            detect_native_ltx_pipeline({"transformer": {"cross_attention_adaln": True}})

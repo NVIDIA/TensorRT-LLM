@@ -101,9 +101,6 @@ def main():
     model = args.model or defaults["model"]
     output_path = args.output_path or defaults["output_path"]
 
-    # Both generations require pipeline_config.text_encoder_path for the Gemma3
-    # text encoder. The YAML path is preferred for production configs; the default
-    # below keeps this script runnable as a minimal offline example.
     extra_args = (
         VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else VisualGenArgs()
     )
@@ -126,8 +123,6 @@ def main():
             extra_args.pipeline_config = {**extra_args.pipeline_config, key: value}
     visual_gen = VisualGen(model=model, args=extra_args)
 
-    # --- Model-specific: T2V request construction ---
-    # Start from the pipeline defaults and override the main request shape explicitly.
     params = visual_gen.default_params
     params.height = 512
     params.width = 768
@@ -140,6 +135,17 @@ def main():
         inputs="A cinematic shot of a cat walking through a field of flowers",
         params=params,
     )
+
+    m = output.metrics
+    if m is not None:
+        print(
+            f"latency: generation={m.generation:.3f}s "
+            f"pre_denoise={m.pre_denoise:.3f}s "
+            f"denoise={m.denoise:.3f}s "
+            f"post_denoise={m.post_denoise:.3f}s"
+        )
+    else:
+        print("latency: metrics not populated")
 
     output.save(output_path)
     print(f"Saved: {output_path}")

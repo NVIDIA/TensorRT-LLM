@@ -3,19 +3,12 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 """LTX-2.3 video VAE decoder.
 
-LTX-2.3 reuses LTX-2's VAE primitives and forward/tiled-decode machinery, but
-its channel recipe differs: compress_time and compress_space reduce channels by
-their multiplier, where LTX-2 only did that for compress_all. conv_in is
-therefore latent_channels times the product of every multiplier, not just the
-compress_all ones -- 128 * (2*1*2*2) = 1024 for the checkpoint recipe.
-
-This subclasses LTX-2's VideoDecoder to inherit that machinery unchanged and
-rebuilds only the channel-bearing modules with the corrected flow.
+compress_time and compress_space reduce channels by their multiplier (LTX-2
+only did that for compress_all), so conv_in is 128 * (2*1*2*2) = 1024.
 """
 
 from typing import List, Tuple, Union
 
-import torch
 import torch.nn as nn
 
 from ...ltx2.ltx2_core.normalization import PixelNorm
@@ -45,35 +38,34 @@ def _make_ltx23_decoder_block(
     block_name: str,
     block_config: dict,
     in_channels: int,
-    dims: int,
+    convolution_dimensions: int,
     norm_layer: NormLayerType,
-    timestep_conditioning: bool,
     norm_num_groups: int,
     spatial_padding_mode: PaddingModeType,
 ) -> Tuple[nn.Module, int]:
-    """Like LTX-2's _make_decoder_block, but compress_time/space reduce channels."""
+    """Like LTX-2's decoder factory, but compress_time/space reduce channels."""
     out_channels = in_channels
     if block_name == "res_x":
         block = UNetMidBlock3D(
-            dims=dims,
+            dims=convolution_dimensions,
             in_channels=in_channels,
             num_layers=block_config["num_layers"],
             resnet_eps=1e-6,
             resnet_groups=norm_num_groups,
             norm_layer=norm_layer,
             inject_noise=block_config.get("inject_noise", False),
-            timestep_conditioning=timestep_conditioning,
+            timestep_conditioning=False,
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "attn_res_x":
         block = UNetMidBlock3D(
-            dims=dims,
+            dims=convolution_dimensions,
             in_channels=in_channels,
             num_layers=block_config["num_layers"],
             resnet_groups=norm_num_groups,
             norm_layer=norm_layer,
             inject_noise=block_config.get("inject_noise", False),
-            timestep_conditioning=timestep_conditioning,
+            timestep_conditioning=False,
             attention_head_dim=block_config["attention_head_dim"],
             spatial_padding_mode=spatial_padding_mode,
         )
@@ -81,7 +73,7 @@ def _make_ltx23_decoder_block(
         multiplier = block_config.get("multiplier", 2)
         out_channels = in_channels // multiplier
         block = ResnetBlock3D(
-            dims=dims,
+            dims=convolution_dimensions,
             in_channels=in_channels,
             out_channels=out_channels,
             eps=1e-6,
@@ -92,11 +84,10 @@ def _make_ltx23_decoder_block(
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name in _COMPRESS_STRIDES:
-        # The internal conv emits in * prod(stride) // multiplier.
         multiplier = block_config.get("multiplier", 1)
         out_channels = in_channels // multiplier
         block = DepthToSpaceUpsample(
-            dims=dims,
+            dims=convolution_dimensions,
             in_channels=in_channels,
             stride=_COMPRESS_STRIDES[block_name],
             residual=block_config.get("residual", False),
@@ -120,11 +111,9 @@ class LTX23VideoDecoder(LTX2VideoDecoder):
         patch_size: int = 4,
         norm_layer: NormLayerType = NormLayerType.PIXEL_NORM,
         causal: bool = False,
-        timestep_conditioning: bool = False,
         spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
     ):
-        # Build the LTX-2 decoder first so every non-block attribute is set up.
-        # Its conv_in and up_blocks are overwritten below.
+
         super().__init__(
             convolution_dimensions=convolution_dimensions,
             in_channels=in_channels,
@@ -133,11 +122,10 @@ class LTX23VideoDecoder(LTX2VideoDecoder):
             patch_size=patch_size,
             norm_layer=norm_layer,
             causal=causal,
-            timestep_conditioning=timestep_conditioning,
+            timestep_conditioning=False,
             decoder_spatial_padding_mode=spatial_padding_mode,
         )
 
-        dims = convolution_dimensions
         patched_out_channels = out_channels * patch_size**2
 
         feature_channels = in_channels
@@ -146,7 +134,7 @@ class LTX23VideoDecoder(LTX2VideoDecoder):
             feature_channels *= _channel_multiplier(block_name, cfg)
 
         self.conv_in = make_conv_nd(
-            dims=dims,
+            dims=convolution_dimensions,
             in_channels=in_channels,
             out_channels=feature_channels,
             kernel_size=3,
@@ -164,9 +152,8 @@ class LTX23VideoDecoder(LTX2VideoDecoder):
                 block_name=block_name,
                 block_config=cfg,
                 in_channels=fc,
-                dims=dims,
+                convolution_dimensions=convolution_dimensions,
                 norm_layer=norm_layer,
-                timestep_conditioning=timestep_conditioning,
                 norm_num_groups=self._norm_num_groups,
                 spatial_padding_mode=spatial_padding_mode,
             )
@@ -181,7 +168,7 @@ class LTX23VideoDecoder(LTX2VideoDecoder):
             self.conv_norm_out = PixelNorm()
         self.conv_act = nn.SiLU()
         self.conv_out = make_conv_nd(
-            dims=dims,
+            dims=convolution_dimensions,
             in_channels=fc,
             out_channels=patched_out_channels,
             kernel_size=3,
@@ -190,18 +177,6 @@ class LTX23VideoDecoder(LTX2VideoDecoder):
             spatial_padding_mode=spatial_padding_mode,
         )
 
-        # Unused by the LTX-2.3 checkpoint, but must be sized to the corrected
-        # final channel count if a config ever enables it.
-        if timestep_conditioning:
-            from ...ltx2.ltx2_core.timestep_embedding import (
-                PixArtAlphaCombinedTimestepSizeEmbeddings,
-            )
-
-            self.last_time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(
-                embedding_dim=fc * 2, size_emb_dim=0
-            )
-            self.last_scale_shift_table = nn.Parameter(torch.empty(2, fc))
-
 
 class LTX23VideoDecoderConfigurator:
     """Create an LTX23VideoDecoder from the native LTX-2.3 config dict."""
@@ -209,7 +184,6 @@ class LTX23VideoDecoderConfigurator:
     @classmethod
     def from_config(cls, config: dict) -> LTX23VideoDecoder:
         vae = config.get("vae", {})
-        # LTX-2.3 uses one shared key where LTX-2 split it per role.
         padding_mode = vae.get(
             "spatial_padding_mode", vae.get("decoder_spatial_padding_mode", "reflect")
         )
@@ -221,6 +195,5 @@ class LTX23VideoDecoderConfigurator:
             patch_size=vae.get("patch_size", 4),
             norm_layer=NormLayerType(vae.get("norm_layer", "pixel_norm")),
             causal=vae.get("causal_decoder", False),
-            timestep_conditioning=vae.get("timestep_conditioning", False),
             spatial_padding_mode=PaddingModeType(padding_mode),
         )

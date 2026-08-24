@@ -14,7 +14,6 @@
 # limitations under the License.
 
 # 1-GPU LTX-2.3 text-to-video with audio, FP8.
-# Shared by offline examples (--visual_gen_args) and trtllm-serve.
 quant_config:
   quant_algo: FP8_BLOCK_SCALES
   dynamic: true

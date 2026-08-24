@@ -1,15 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-"""Integration tests for the LTX-2.3 pipeline.
-
-Mirrors test_ltx2_pipeline.py, with the LTX-2.3 differences: inputs are
-LTX23Modality objects carrying a global sigma, the text context reaching the
-transformer is already cross_attention_dim wide (caption_projection is
-nn.Identity), and the transformer emits (video_out, audio_out).
-
-Requires the LTX-2.3 checkpoint.
-"""
+"""Pipeline tests for LTX-2.3. Requires the LTX-2.3 checkpoint."""
 
 import gc
 import os
@@ -26,8 +18,7 @@ os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
 _MODELS_ROOT = str(llm_models_root(check=False))
 
-# Focus the load on the transformer. The LTX-2.3 native components (audio VAE,
-# vocoder, connectors, video decoder) still load from the checkpoint.
+# Load transformer only; other native components still come from the checkpoint.
 SKIP_COMPONENTS = [
     PipelineComponent.TEXT_ENCODER,
     PipelineComponent.TOKENIZER,
