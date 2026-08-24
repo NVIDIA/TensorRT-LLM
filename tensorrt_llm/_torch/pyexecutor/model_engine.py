@@ -1848,10 +1848,12 @@ class PyTorchModelEngine(ModelEngine):
 
         model_type = getattr(self.model.model_config.pretrained_config,
                              "model_type", None)
-        # Not gated on can_run_general_warmup: Kimi always uses a
-        # MambaHybridCacheManager, which forces that gate False, yet the KDA
-        # pure-K123 prefill warmup is still required.
-        if model_type in ("kimi_k3", "kimi_linear"):
+        # Helix additionally needs this warmup even though
+        # can_run_general_warmup is False there: autotuning the KDA prefill
+        # kernels on a real request re-applies in-place state updates.
+        if (can_run_general_warmup or
+                self.mapping.has_cp_helix()) and model_type in ("kimi_k3",
+                                                                "kimi_linear"):
             # Kimi's one-token context takes the NT < 4 FLA fallback and does
             # not compile the optimized single-sequence K123 variant. A
             # non-aligned five-chunk context enters the pure K123 path.
