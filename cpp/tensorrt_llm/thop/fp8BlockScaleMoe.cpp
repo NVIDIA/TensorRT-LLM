@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -24,9 +25,10 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
+#include <iterator>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -37,6 +39,38 @@ namespace btg = batchedGemm::trtllm::gen;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodType;
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
+
+namespace
+{
+
+// WAR: the small-tile (tileN 8/16) dynB TRTLLM-Gen batched-GEMM cubins flakily hit an illegal
+// memory access (garbage TMA-descriptor pointer, MMU fault in the gemm2 K-loop); tileN >= 32 is
+// unaffected (10/10 clean vs minutes-to-crash baseline on B300 TP=4). The exclusion was originally
+// scoped to the fused shared-expert path, but the defect is in the shared small-tile cubins and is
+// not caused by expert fusion: DeepSeek-R1 FP8 TP=8 (unfused) faults identically during warmup,
+// where the 1/2/8-token shapes are the only ones that can select tileN 8/16 (12288 tokens gets
+// tileN 64/128 and always passes). The tiles stay in mSupportedTileN: the ctor builds one runner
+// per tile and each asserts a non-empty passing-config list, so the exclusion has to happen at
+// tactic-selection time.
+//
+// TLLM_MOE_MIN_TILEN overrides the threshold (0 disables the WAR) for A/B experiments.
+// TLLM_MOE_FUSED_MIN_TILEN is the deprecated original name, still honoured as an alias because the
+// exclusion used to apply only to the fused shared-expert path.
+int32_t moeMinTileN()
+{
+    static int32_t const minTileN = []
+    {
+        auto value = tensorrt_llm::common::getIntEnv("TLLM_MOE_MIN_TILEN");
+        if (!value.has_value())
+        {
+            value = tensorrt_llm::common::getIntEnv("TLLM_MOE_FUSED_MIN_TILEN");
+        }
+        return value.value_or(32);
+    }();
+    return minTileN;
+}
+
+} // namespace
 
 at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logits,
     std::optional<at::Tensor> const& routing_bias, at::Tensor const& hidden_states,
@@ -403,6 +437,13 @@ public:
         {
             mRunners.emplace(tileN, std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tileN));
         }
+        // Tiles the small-tile WAR (see moeMinTileN) allows tactic selection to pick from. Kept as
+        // a separate sorted list so the tileN heuristic only ever proposes an eligible tile.
+        std::copy_if(mSupportedTileN.begin(), mSupportedTileN.end(), std::back_inserter(mEligibleTileN),
+            [](int32_t tileN) { return tileN >= moeMinTileN(); });
+        TORCH_CHECK(!mEligibleTileN.empty(), "The minimum tileN in force (", moeMinTileN(),
+            ") excludes every supported tileN (max ", mSupportedTileN.back(),
+            "). Lower TLLM_MOE_MIN_TILEN or set it to 0 to disable the small-tile WAR.");
     }
 
     [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(int64_t topK,
@@ -412,33 +453,22 @@ public:
         TORCH_CHECK(numFusedSharedExpert.value_or(0) >= 0, "num_fused_shared_experts must be non-negative.");
         int64_t const totalExpertsPerToken = topK + numFusedSharedExpert.value_or(0);
         int64_t const numTotalLocalExperts = numLocalExperts + numFusedSharedExpert.value_or(0);
-        // WAR: the small-tile (tileN 8/16) dynB TRTLLM-Gen batched-GEMM cubins flakily hit an
-        // illegal memory access (garbage TMA-descriptor pointer, MMU fault in the gemm2 K-loop)
-        // when shared experts are fused into the grouped GEMM (num_fused_shared_experts > 0);
-        // tileN >= 32 is unaffected (10/10 clean vs minutes-to-crash baseline on B300 TP=4).
-        // Restrict the fused path to tileN >= 32 until the kernel-side fix lands (nvbug TBD).
-        // TLLM_MOE_FUSED_MIN_TILEN overrides the threshold (0 disables) for A/B experiments.
-        static int const fusedMinTileN = []()
-        {
-            char const* env = std::getenv("TLLM_MOE_FUSED_MIN_TILEN");
-            return env != nullptr ? std::atoi(env) : 32;
-        }();
+        // Only offer tiles the small-tile WAR allows (see moeMinTileN). The heuristic runs on the
+        // eligible list rather than on mSupportedTileN so that excluded tiles do not consume the
+        // neighbourhood computeSelectedTileN returns -- otherwise a small shape whose heuristic
+        // tile is 8 would be left with tileN 32 as its only candidate instead of {32, 64, 128}.
+        auto const chosen = computeSelectedTileN(mEligibleTileN, numTokens, totalExpertsPerToken, numTotalLocalExperts);
         // returns (tileN, config)
         std::vector<std::vector<int64_t>> tactics;
-        for (auto& [tileN, runner] : mRunners)
+        for (auto const tileN : mEligibleTileN)
         {
-            if (numFusedSharedExpert.value_or(0) > 0 && tileN < fusedMinTileN)
-            {
-                continue;
-            }
-            auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, totalExpertsPerToken, numTotalLocalExperts);
             if (chosen.find(tileN) == chosen.end())
             {
                 continue;
             }
-            auto config_indices_per_runner = runner->getValidConfigIndices(
+            auto const config_indices_per_runner = mRunners.at(tileN)->getValidConfigIndices(
                 totalExpertsPerToken, hiddenSize, intermediateSize, numTotalLocalExperts, numTokens);
-            for (auto cfg : config_indices_per_runner)
+            for (auto const cfg : config_indices_per_runner)
             {
                 tactics.push_back({tileN, cfg});
             }
@@ -472,35 +502,29 @@ public:
 
             float const avg_tokens_per_expert
                 = static_cast<float>(num_tokens * total_experts_per_token) / num_total_local_experts;
-            tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
+            // Snap the heuristic tile up to the smallest eligible one: small warmup batches would
+            // otherwise land on tileN 8/16, which is exactly the path that reaches the defective
+            // small-tile cubins (see moeMinTileN).
+            auto const heuristicTileN
+                = std::lower_bound(mEligibleTileN.begin(), mEligibleTileN.end(), nextPowerOfTwo(avg_tokens_per_expert));
+            tileN = heuristicTileN == mEligibleTileN.end() ? mEligibleTileN.back() : *heuristicTileN;
 
             if (num_fused_shared_experts.value_or(0) > 0)
             {
-                // getDefaultValidConfigIndex only pairs the per-GEMM "default" indices without
-                // re-validating them against the actual problem size. For the inflated fused
-                // expert/topK counts that can return a config whose kernel is absent (illegal
-                // memory access at launch). Pick an explicitly-validated config instead -- the
-                // same set the autotuner draws from -- searching the heuristic tileN first.
+                // The inflated fused expert/topK counts can leave the heuristic tile without a
+                // valid config, so walk the remaining eligible tiles instead of failing outright.
                 config = -1;
                 std::vector<int32_t> tileN_candidates{static_cast<int32_t>(tileN)};
-                for (auto t : mSupportedTileN)
+                for (auto const t : mEligibleTileN)
                 {
                     if (t != tileN)
-                        tileN_candidates.push_back(t);
-                }
-                // Same small-tile exclusion as getValidConfigs (see the WAR comment there).
-                static int const fusedMinTileNFallback = []()
-                {
-                    char const* env = std::getenv("TLLM_MOE_FUSED_MIN_TILEN");
-                    return env != nullptr ? std::atoi(env) : 32;
-                }();
-                for (auto t : tileN_candidates)
-                {
-                    if (t < fusedMinTileNFallback)
                     {
-                        continue;
+                        tileN_candidates.push_back(t);
                     }
-                    auto valid = mRunners.at(t)->getValidConfigIndices(
+                }
+                for (auto const t : tileN_candidates)
+                {
+                    auto const valid = mRunners.at(t)->getValidConfigIndices(
                         total_experts_per_token, hidden_size, intermediate_size, num_total_local_experts, num_tokens);
                     if (!valid.empty())
                     {
@@ -509,8 +533,12 @@ public:
                         break;
                     }
                 }
-                TLLM_CHECK_WITH_INFO(
-                    config != -1, "No valid TRTLLM-Gen config found for fused shared-expert FP8 block-scale MoE.");
+                TLLM_CHECK_WITH_INFO(config != -1,
+                    "No valid TRTLLM-Gen config found for fused shared-expert FP8 block-scale MoE with num_tokens=%ld, "
+                    "hidden_size=%ld, intermediate_size=%ld, experts_per_token=%ld, local_experts=%ld, min_tileN=%d.",
+                    static_cast<int64_t>(num_tokens), static_cast<int64_t>(hidden_size),
+                    static_cast<int64_t>(intermediate_size), total_experts_per_token, num_total_local_experts,
+                    moeMinTileN());
             }
             else
             {
@@ -529,6 +557,7 @@ private:
     using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 
     std::vector<int32_t> const mSupportedTileN;
+    std::vector<int32_t> mEligibleTileN;
     std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
 
     btg::Dtype mDtypeElt{btg::Dtype::E4m3}; // FP8 runner so hard-coded
