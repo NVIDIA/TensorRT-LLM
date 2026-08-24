@@ -178,3 +178,107 @@ def test_results_render_for_the_model():
 
 def test_empty_results_say_so():
     assert "No results" in SearchOutcome(query="nothing").as_model_text()
+
+
+# ---------------------------------------------------------------------------
+# Routing model-emitted calls back to the right executor
+# ---------------------------------------------------------------------------
+
+
+def test_a_client_tool_named_web_search_is_not_captured_by_the_server():
+    """Regression: routing must not depend on a name the client controls.
+
+    split_web_search_calls decides whether a call runs here or goes back to
+    the client by comparing the function name. If that name were the plain
+    "web_search", a client that declares its own function tool by that name
+    would have its call executed as a server-side search and never handed
+    back - leaving the client waiting on a result that never arrives.
+    """
+    from tensorrt_llm.serve.responses_web_search import (
+        WEB_SEARCH_FUNCTION_NAME,
+        split_web_search_calls,
+    )
+
+    server_calls, client_calls = split_web_search_calls(
+        [
+            {"type": "function_call", "name": WEB_SEARCH_FUNCTION_NAME, "call_id": "a"},
+            {"type": "function_call", "name": "web_search", "call_id": "b"},
+        ]
+    )
+
+    assert [c["call_id"] for c in server_calls] == ["a"]
+    assert [c["call_id"] for c in client_calls] == ["b"]
+
+
+def test_the_internal_tool_name_is_one_a_client_cannot_declare():
+    """The property the routing relies on, pinned directly."""
+    from tensorrt_llm.serve.responses_web_search import (
+        WEB_SEARCH_FUNCTION_NAME,
+        WEB_SEARCH_PUBLIC_NAME,
+    )
+
+    assert WEB_SEARCH_FUNCTION_NAME != WEB_SEARCH_PUBLIC_NAME
+    assert WEB_SEARCH_FUNCTION_NAME.startswith("__")
+
+
+# ---------------------------------------------------------------------------
+# Refusing a server tool this endpoint will not execute
+# ---------------------------------------------------------------------------
+
+
+def _web_search_tool():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(type="web_search_20260209", name=None, filters=None, max_uses=None)
+
+
+def test_no_web_search_tool_means_nothing_to_reject():
+    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+
+    assert web_search_rejection_reason(None) is None
+    assert web_search_rejection_reason([]) is None
+
+
+def test_web_search_without_a_provider_is_rejected_not_dropped():
+    """Dropping would let the model answer as if it had searched.
+
+    The client cannot tell an unsearched answer from a searched one, so a
+    silent drop is the one failure it can never detect. Rejecting is
+    recoverable: drop the tool and retry.
+    """
+    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+
+    reason = web_search_rejection_reason([_web_search_tool()])
+    assert reason is not None
+    assert "no web search provider" in reason
+
+
+def test_a_configured_provider_is_still_rejected_until_the_loop_is_wired(monkeypatch):
+    """A configured provider makes the silent drop worse, not better.
+
+    The operator has asked for live search, so answering without it is a
+    broken promise rather than an unsupported feature.
+    """
+    monkeypatch.setenv("TRTLLM_WEB_SEARCH", "wikipedia")
+    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+
+    reason = web_search_rejection_reason([_web_search_tool()])
+    assert reason is not None
+    assert "not wired" in reason
+
+
+def test_a_real_request_carrying_web_search_is_recognised():
+    """Pins the shape the endpoint guard actually sees.
+
+    The guard reads ``request.tools`` off a validated ResponsesRequest, not a
+    hand-built stub, so the helper has to recognise whatever pydantic turns the
+    client's ``{"type": "web_search"}`` into.
+    """
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+
+    request = ResponsesRequest(model="m", input="hi", tools=[{"type": "web_search"}])
+    assert web_search_rejection_reason(request.tools) is not None
+
+    plain = ResponsesRequest(model="m", input="hi")
+    assert web_search_rejection_reason(plain.tools) is None

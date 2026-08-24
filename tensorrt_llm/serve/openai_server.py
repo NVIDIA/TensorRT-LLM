@@ -101,6 +101,7 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -2290,6 +2291,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     use_harmony=self.use_harmony,
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
+                    num_prompt_tokens=args.num_prompt_tokens,
                 )
 
             await self._extract_metrics(promise, raw_request)
@@ -2326,6 +2328,18 @@ class OpenAIServer(_VideoRoutesMixin):
                     err_type="InvalidRequestError",
                     message=("'previous_response_id' requires response "
                              "storage, which is disabled on this server."),
+                )
+
+            # Same reasoning for the web_search server tool. Dropping it lets
+            # the model answer from memory while the client believes a live
+            # search was folded in - a wrong answer it cannot detect. A 400
+            # is recoverable: drop the tool and retry.
+            web_search_error = web_search_rejection_reason(request.tools)
+            if web_search_error is not None:
+                return self.create_error_response(
+                    err_type="InvalidRequestError",
+                    message=(f"'web_search' cannot be honoured: "
+                             f"{web_search_error}."),
                 )
 
             # Get prev response
@@ -2394,6 +2408,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            if not self.postproc_worker_enabled:
+                # The executor records this on the postprocessing arguments,
+                # but only for the requests whose postprocessing it owns. The
+                # streamed response is assembled here instead, and it needs
+                # the prompt length to report usage.
+                postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if self.postproc_worker_enabled and request.store:
                 logger.warning(

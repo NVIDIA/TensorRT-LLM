@@ -1196,9 +1196,17 @@ class KVCacheTruncateTokensRequest(OpenAIBaseModel):
     num_tokens_to_keep: List[int]
 
 
+# The trailing dict keeps a client's own item types from failing the request
+# outright. Codex multi-agent sessions carry "agent_message" items, which no
+# SDK model describes; without a permissive member the union rejects the whole
+# input and every request from a spawned agent comes back 422, so agent
+# collaboration cannot work at all. Known shapes still match their typed
+# member first; see _response_output_item_to_chat_completion_message for how
+# an unrecognised item is replayed.
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
                                            ResponseReasoningItem,
-                                           ResponseFunctionToolCall]
+                                           ResponseFunctionToolCall, dict[str,
+                                                                          Any]]
 
 # Roles whose message items map to EasyInputMessageParam / Message, both of
 # which forbid ``id``. An assistant message maps to ResponseOutputMessageParam
@@ -1428,6 +1436,12 @@ class ResponsesRequest(OpenAIBaseModel):
 
 class InputTokensDetails(OpenAIBaseModel):
     cached_tokens: int
+    # Required by the openai SDK models that re-validate this payload when it
+    # is embedded in a streaming event. Omitting it fails validation while the
+    # response is being streamed, which truncates the stream with no
+    # terminating event and leaves the client waiting forever. Prompt cache
+    # writes are not tracked separately, so this is reported as zero.
+    cache_write_tokens: int = 0
 
 
 class OutputTokensDetails(OpenAIBaseModel):
