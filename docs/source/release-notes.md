@@ -30,6 +30,10 @@ All published functionality in the Release Notes has been fully tested and verif
 
 - `trtllm-serve`, `trtllm-eval`, `trtllm-bench`: explicit CLI flags now take precedence over values in `--config` / `--extra_llm_api_options` YAML files (was: YAML overrode CLI). Un-set CLI flags continue to fall back to the YAML, then to model-specific and built-in defaults.
 
+- <span style="color: red">**[BREAKING CHANGE] KV Cache Manager V2 `pool_ratio` values are now specified in layer-group ID order, with exactly one normalized hot-tier byte ratio per layer group, instead of hot pool-group order. Cold-tier initialization preserves the implied layer-group slot-count proportions while accounting for cold page sizes.**</span>
+
+- <span style="color: red">**[BREAKING CHANGE] KV Cache Manager V2 reports cold-tier `secondary*` statistics in `kvCacheIterationStatsByColdPoolGroup`. These keys are no longer present in the hot pool-group or window-size views.**</span>
+
 ### Fixed Issues
 
 ### Known Issues
