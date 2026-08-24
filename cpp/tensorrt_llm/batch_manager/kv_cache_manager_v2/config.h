@@ -275,9 +275,11 @@ struct KVCacheManagerConfig
     bool enablePartialReuse = true;
 
     // Constraint-based memory partitioning.
-    std::vector<BatchDesc> constraints;                 // batches that must always be supportable
-    std::optional<BatchDesc> typicalStep;               // typical step for initial ratio computation
-    std::optional<std::vector<float>> initialPoolRatio; // explicit initial ratio, overrides inferred sizing inputs
+    std::vector<BatchDesc> constraints;   // batches that must always be supportable
+    std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
+    // One normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
+    // layer-group slot-count proportions while accounting for cold page sizes.
+    std::optional<std::vector<float>> initialPoolRatio; // overrides inferred sizing inputs
 
     // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
     // Scratch blocks share coalesced slot sub-pages across blocks for the currently executing

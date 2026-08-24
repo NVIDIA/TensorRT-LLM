@@ -127,9 +127,8 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         if (radix_aux_indices.has_value() && radix_aux_logits.has_value())
         {
             // Caller-owned scratch with stable address (CUDA Graph safe;
-            // matches the heuristic_scratch convention noted above). All
-            // in-tree callers under CUDA Graph capture go through dsa.py's
-            // DSAtrtllmAttentionMetadata which always pre-allocates these.
+            // matches the heuristic_scratch convention noted above). The
+            // Python TopK module supplies these from its reusable buffer arena.
             auto const& ai = radix_aux_indices.value();
             auto const& al = radix_aux_logits.value();
             TORCH_CHECK(ai.is_cuda() && al.is_cuda(), "radix_aux_{indices,logits} must be CUDA tensors");
