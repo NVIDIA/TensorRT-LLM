@@ -317,8 +317,9 @@ class DiffusionRequest:
         self.ref_handles = handles = []
         for slot in ("image_reference", "video_reference", "audio_reference"):
             for index, ref in enumerate(getattr(self.params, slot, None) or []):
-                # bytearray() because the shared storage must be writable.
-                buffer = torch.frombuffer(bytearray(ref.content), dtype=torch.uint8)
+                # A read-only view: the one copy happens inside from_tensor(),
+                # which is what moves the payload into shared memory.
+                buffer = torch.frombuffer(ref.content, dtype=torch.uint8)
                 handles.append(
                     {
                         "slot": slot,
@@ -536,8 +537,8 @@ class DiffusionExecutor:
             return None
 
         if self.rank == 0:
-            # bytearray() because a tensor over an immutable buffer is read-only.
-            buffers = [torch.frombuffer(bytearray(p), dtype=torch.uint8) for p in payloads]
+            # Read-only views: the src rank only reads its buffer.
+            buffers = [torch.frombuffer(p, dtype=torch.uint8) for p in payloads]
         else:
             buffers = [torch.empty(n, dtype=torch.uint8) for n in req.ref_sizes or []]
         for buffer in buffers:
