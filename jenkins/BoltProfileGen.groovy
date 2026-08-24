@@ -242,6 +242,18 @@ def b64BashRemoteCmd(String script)
     return "\"echo ${b64} | base64 -d | bash\""
 }
 
+// As above, but for scripts that read their OWN stdin. `base64 -d | bash` makes
+// bash read the script FROM stdin, so any `cat`/`read` inside it would swallow
+// the rest of its own source instead of the caller's pipe. Decode to a file and
+// run that, leaving stdin connected to whatever ssh forwarded. scriptPath is
+// Groovy-interpolated (never a shell variable) so nothing here needs `$`, which
+// would otherwise be eaten by the local shell building the ssh command.
+def b64BashRemoteCmdStdin(String script, String scriptPath)
+{
+    String b64 = script.bytes.encodeBase64().toString()
+    return "\"echo ${b64} | base64 -d > ${scriptPath}; trap 'rm -f ${scriptPath}' EXIT; bash ${scriptPath}\""
+}
+
 // ---------------------------------------------------------------------------
 // SLURM profile generation: fan out perf-harness runs (one per workload, BOLT
 // hook enabled) then a single cross-workload merge (slurm_merge.sh).
@@ -526,15 +538,26 @@ def pollSlurm(pipeline, remote, String jobId, String label)
 // remote->agent download primitive, so uploading in place avoids copying the
 // bundle back to the agent just to re-upload it.
 //
-// Auth: the urm-artifactory-creds Jenkins credential (username/password),
-// injected by withCredentials (masked in the console) and written to a mode-600
-// netrc via `printf` (a shell builtin, so no `ps` exposure) with curl reading
-// --netrc-file (creds never on curl's argv); the netrc is removed on exit,
-// including when the upload fails.
+// Auth: the urm-artifactory-creds Jenkins credential (username/password). The
+// credential MUST NOT be Groovy-interpolated into the script: Utils.exec passes
+// the script to pipeline.sh (which echoes it) and, on any retryable failure,
+// hands the same string to _postExecNVDFEvent, which uploads it to NVDF. Jenkins
+// masks the literal secret in console output, but this script is base64'd for
+// the remote shell, and a base64 blob is not the literal -- so masking would not
+// apply and the value would be recoverable from the build log and the telemetry
+// record.
 //
-// Values are Groovy-interpolated into the script before bashWrappedRemoteCmd
-// wraps it (so the credential never appears as a shell variable). Assumes the
-// credential is shell-safe (no $ " ` ), which holds for the URM service creds.
+// So the credential stays a SHELL variable: printf runs on the agent, where
+// withCredentials has bound $ART_USER/$ART_PASS, and only the rendered netrc
+// travels -- over ssh stdin, which the remote script reads with `cat`. The
+// script string therefore contains the literal text "$ART_PASS", never its
+// value. printf is a shell builtin and the values are %s arguments rather than
+// part of the format string, so there is no `ps` exposure and no risk of a `%`
+// in the password being read as a format specifier. noNVDFEvent is belt and
+// braces for the telemetry path.
+//
+// Note this relies on sshUserCmd forwarding stdin (it does not pass ssh -n);
+// the same "pipe into sshUserCmd" idiom is used inside the shared lib itself.
 // ---------------------------------------------------------------------------
 def promoteBundle(pipeline, remote, String bundle)
 {
@@ -543,23 +566,25 @@ def promoteBundle(pipeline, remote, String bundle)
     def host = URM_ARTIFACTORY_BASE.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
     def netrc = "${bundle}.netrc"
     pipeline.echo("Promoting ${bundleName} -> ${PROFILE_PROMOTE_DIR}/ (versioned + latest)")
+    // Remote side: no credential anywhere in here, just "read it from stdin".
+    // Clean up via trap, not a trailing rm: under `set -e` a failed curl exits
+    // before the rm and would leave the plaintext netrc on shared scratch until
+    // the 7-day retention purge. umask covers the window before the chmod.
+    def promote = """
+        set -e
+        umask 077
+        trap 'rm -f "${netrc}"' EXIT
+        cat > "${netrc}"
+        chmod 600 "${netrc}"
+        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/${bundleName}"
+        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/latest.tar.gz"
+    """.stripIndent()
     pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
             usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
-        def promote = """
-            set -e
-            # Clean up via trap, not a trailing rm: under `set -e` a failed curl
-            # exits before the rm and would leave the plaintext netrc on shared
-            # scratch until the 7-day retention purge. umask covers the window
-            # between creation and chmod, when it would otherwise be readable.
-            umask 077
-            trap 'rm -f "${netrc}"' EXIT
-            printf 'machine ${host} login ${env.ART_USER} password ${env.ART_PASS}\\n' > ${netrc}
-            chmod 600 ${netrc}
-            curl -fsS --netrc-file ${netrc} --retry 5 --retry-all-errors -T ${bundle} ${base}/${bundleName}
-            curl -fsS --netrc-file ${netrc} --retry 5 --retry-all-errors -T ${bundle} ${base}/latest.tar.gz
-        """.stripIndent()
-        Utils.exec(pipeline, timeout: false, numRetries: 2,
-            script: Utils.sshUserCmd(remote, b64BashRemoteCmd(promote)))
+        // \$ART_USER / \$ART_PASS are left for the agent's shell to expand.
+        def feed = "printf 'machine ${host} login %s password %s\\n' \"\$ART_USER\" \"\$ART_PASS\" | "
+        Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
+            script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(promote, "${bundle}.promote.sh")))
     }
     pipeline.echo("Promoted. latest = ${base}/latest.tar.gz")
 }
