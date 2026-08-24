@@ -965,6 +965,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         thread. The returned plain dict can be sent over HTTP unchanged.
         """
         cache_salt_id = self._get_request_cache_salt_id(request)
+        lora_task_id = self._get_request_lora_id(request)
         # Hash for every algo any server might use (usually one).
         algos = ({self._routing_hash_algo}
                  if self._routing_hash_algo is not None else {
@@ -977,7 +978,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 "synchronize it with the coordinator before routing")
         token_lists, block_hashes_by_algo = \
             self._tokenize_and_compute_block_hashes_by_algo(
-                request, algos, cache_salt_id)
+                request, algos, cache_salt_id, lora_task_id)
         return {
             "block_hashes_by_algo": block_hashes_by_algo,
             "conv_key": self._content_affinity_key(request),

@@ -529,13 +529,112 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
 
 
 def test_cache_salt_id_derivation_matches_worker_path():
-    from tensorrt_llm.inputs.utils import \
-        get_cache_salt_id as worker_get_cache_salt_id
+    """Pin the router's salt derivation to the ENGINE's.
 
-    assert get_cache_salt_id("abc") == 3697813978277427044
+    The worker keys its radix tree (and therefore every block hash it
+    publishes in KV cache events) with the salt id derived by
+    ``KVCacheManagerV2._derive_reuse_salt``. The router recomputes those
+    hashes with ``get_cache_salt_id``, so the two derivations must be
+    byte-identical or salted requests silently score zero cache hits.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
+        KVCacheManagerV2
+
+    # sha256("abc")[:8] little-endian; must never drift from the engine.
+    assert get_cache_salt_id("abc") == 16919744041952114874
     assert get_cache_salt_id("tenant-a") == get_cache_salt_id("tenant-a")
     assert get_cache_salt_id("tenant-a") != get_cache_salt_id("tenant-b")
-    assert get_cache_salt_id("tenant-a") == worker_get_cache_salt_id("tenant-a")
+    assert get_cache_salt_id("tenant-a") == \
+        KVCacheManagerV2._derive_reuse_salt("tenant-a")
+    assert KVCacheManagerV2._derive_reuse_salt(None) is None
+
+
+def test_get_request_lora_id_extraction(servers):
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+    assert router._get_request_lora_id(
+        CompletionRequest(model="TinyLlama", prompt=[1, 2, 3])) is None
+    request = SimpleNamespace(lora_request=SimpleNamespace(adapter_id=7))
+    assert router._get_request_lora_id(request) == 7
+    request = SimpleNamespace(lora_request={"lora_int_id": 9})
+    assert router._get_request_lora_id(request) == 9
+
+
+@pytest.mark.parametrize("cache_salt", [None, "tenant-a"])
+@pytest.mark.parametrize("lora_task_id", [None, 7])
+def test_router_block_hashes_round_trip_worker_event_hashes(
+        servers, cache_salt, lora_task_id):
+    """Round trip over {no salt, salt} x {no lora, lora}, all hash algos.
+
+    The block hashes the router computes for a request must equal the block
+    hashes the worker's event path publishes for the same request; otherwise
+    the first-block mismatch makes ``matched_tokens`` return 0 and
+    KV-cache-aware routing silently degrades to load balancing. The v1
+    worker side goes through the real ``KVCacheEventManager`` published-hash
+    code path (``_v1_hash_from_radix_block``) over a radix chain seeded with
+    the worker's ``ReuseScope``.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
+        KVCacheManagerV2
+    from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import \
+        KVCacheEventManager
+
+    tokens_per_block = 4
+    tokens = list(range(1, 34))  # 33 tokens -> 8 blocks (last token dropped)
+    token_lists = [tokens]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=tokens_per_block)
+
+    # Worker side: the engine derives the salt id from the request's
+    # cache_salt string and seeds the radix chain with the full ReuseScope
+    # (kv_cache_manager_v2.py _create_kv_cache).
+    salt_id = KVCacheManagerV2._derive_reuse_salt(cache_salt)
+    scope = ReuseScope(lora_id=lora_task_id, salt=salt_id)
+    chain = [(token_block, block_key)
+             for token_block, block_key in sequence_to_blockchain_keys(
+                 tokens_per_block, scope, tokens[:-1]) if token_block]
+    worker_v2 = [block_key.hex() for _, block_key in chain]
+    worker_v2_64 = [
+        truncate_sha256_hash_to_int64(block_key) for _, block_key in chain
+    ]
+    # v1 event hashes via the real event-manager code path over a fake radix
+    # chain (block.prev / .tokens / .key; the root carries the ReuseScope).
+    manager = KVCacheEventManager(max_kv_event_entries=64,
+                                  hash_algo=KV_CACHE_HASH_ALGO_V1)
+    prev = SimpleNamespace(reuse_scope=scope)
+    radix_blocks = []
+    for token_block, block_key in chain:
+        block = SimpleNamespace(prev=prev,
+                                tokens=list(token_block),
+                                key=block_key)
+        radix_blocks.append(block)
+        prev = block
+    worker_v1 = [
+        manager._v1_hash_from_radix_block(block) for block in radix_blocks
+    ]
+
+    # Router side: derive salt and lora id from the request via the router's
+    # own helpers, so this test fails if either derivation diverges again.
+    request = SimpleNamespace(
+        cache_salt=cache_salt,
+        lora_request=None if lora_task_id is None else SimpleNamespace(
+            adapter_id=lora_task_id))
+    router_salt_id = router._get_request_cache_salt_id(request)
+    router_lora_id = router._get_request_lora_id(request)
+    assert router_salt_id == salt_id
+    assert router_lora_id == lora_task_id
+
+    for hash_algo, expected in ((KV_CACHE_HASH_ALGO_V1,
+                                 worker_v1), (KV_CACHE_HASH_ALGO_V2, worker_v2),
+                                (KV_CACHE_HASH_ALGO_V2_SHA256_64,
+                                 worker_v2_64)):
+        assert router._compute_block_hashes(
+            token_lists,
+            hash_algo=hash_algo,
+            cache_salt_id=router_salt_id,
+            lora_task_id=router_lora_id) == [expected]
 
 
 @pytest.mark.asyncio
