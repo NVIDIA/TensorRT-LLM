@@ -126,6 +126,9 @@ SLURM_MEMORY_LIMIT = "12Gi"
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
+TESTER_CPU_ONLY_CORES = "2"
+TESTER_CPU_ONLY_MEMORY = "12Gi"
+
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
@@ -3401,12 +3404,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     tty: true
                     resources:
                       requests:
-                        cpu: ${TESTER_CORES}
-                        memory: ${TESTER_MEMORY}
+                        cpu: ${TESTER_CPU_ONLY_CORES}
+                        memory: ${TESTER_CPU_ONLY_MEMORY}
                         ephemeral-storage: 300Gi
                       limits:
-                        cpu: ${TESTER_CORES}
-                        memory: ${TESTER_MEMORY}
+                        cpu: ${TESTER_CPU_ONLY_CORES}
+                        memory: ${TESTER_CPU_ONLY_MEMORY}
                         ephemeral-storage: 300Gi
                     imagePullPolicy: Always
                     volumeMounts:
