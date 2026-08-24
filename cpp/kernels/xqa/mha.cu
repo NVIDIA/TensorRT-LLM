@@ -2529,8 +2529,8 @@ CUBIN_EXPORT __global__
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
         if (seqIterInit < nbSeqIters)
         { // otherwise rcpRowSum will be NAN.
-            // The attention sinks are moved to the multi-block reduction part if the multi-block is enabled.
-            if (!isMultiBlock && attentionSinks != nullptr)
+            // In multi-block mode, assign the virtual sink token to exactly one partial CTA.
+            if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
             {
                 // Attention sinks are per head.
                 addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
@@ -2730,11 +2730,6 @@ CUBIN_EXPORT __global__
                         mergedRowSum = mergedRowSum + mbbuf.mergedRowSum[i].loadToReg<false>(warp);
                         assert(std::isfinite(mergedRowSum[0]));
                     }
-                }
-                if (attentionSinks != nullptr)
-                {
-                    // Attention sinks are per head.
-                    addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
                 }
                 __syncthreads();
                 rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
