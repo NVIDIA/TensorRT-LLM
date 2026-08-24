@@ -407,7 +407,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # a graph-external Eagle consumer. Its final capture needs explicit
     # publication; aggregate execution retains the native capture schedule.
     requires_hidden_states_publication: bool = False
-    hidden_states_ready_event: Optional[torch.cuda.Event] = None
+    hidden_states_ready_event: Optional[torch.cuda.Event] = field(default=None,
+                                                                  init=False,
+                                                                  repr=False)
 
     def __post_init__(self):
         if self.layers_to_capture is None:

@@ -8033,11 +8033,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
             # Chat-format acceptance probe — 200 GSM8K questions, chat
             # template, greedy, 512 tokens (drafter-card reference rate 0.839 /
-            # length 3.518). With grouped-HND transfer, complete-window
-            # disaggregated runs measured 0.829-0.842 / 3.487-3.527; the old
-            # mapper, which copied physical rather than logical draft heads,
-            # measured 0.779-0.780 / 3.338-3.339. The floors retain run-to-run
-            # headroom while separating that semantic KV-transfer regression.
+            # length 3.518). Four native-P128 unified-cache validation runs
+            # measured 0.803-0.823 / 3.410-3.468. The floors retain run-to-run
+            # headroom while rejecting the earlier corrupted-draft-KV result
+            # (0.779-0.780 / 3.338-3.339).
             # The disagg fixture has no get_stats, so read the generation
             # worker's bounded iteration-stat window after draining the
             # preceding eval. The dataset loads from the models root so the

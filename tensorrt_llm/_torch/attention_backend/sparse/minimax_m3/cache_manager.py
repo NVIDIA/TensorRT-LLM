@@ -135,9 +135,9 @@ class MiniMaxM3SparseIndexCache:
         buf.index_copy_(0, out_cache_loc.to(torch.long), idx_v.to(buf.dtype))
 
 
-def derive_shared_draft_layout(
+def _derive_shared_draft_layout(
     num_layers: Optional[int],
-    num_kv_heads,
+    num_kv_heads: int | Sequence[Optional[int]] | None,
     num_draft: int,
 ) -> tuple[list[int], Optional[int]]:
     """Locate the appended one-model draft tail in the manager's layer range.
@@ -155,7 +155,7 @@ def derive_shared_draft_layout(
     """
     total = (
         len(num_kv_heads)
-        if isinstance(num_kv_heads, (list, tuple))
+        if isinstance(num_kv_heads, Sequence)
         else (int(num_layers) if num_layers is not None else None)
     )
     if total is None:
@@ -220,7 +220,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # One-model speculative decoding with shared draft layers appends the
         # drafter's layers after the target's (dense, no MSA index cache);
         # ``_create_kv_cache_manager`` passes the appended count explicitly.
-        self._shared_draft_layer_ids, num_target_layers = derive_shared_draft_layout(
+        self._shared_draft_layer_ids, num_target_layers = _derive_shared_draft_layout(
             num_layers, kwargs.get("num_kv_heads"), num_one_model_draft_layers
         )
         if sparse_layer_ids is None:
@@ -638,6 +638,11 @@ class MiniMaxM3DraftKVCacheView:
 
     def __init__(self, manager, draft_layer_ids: Sequence[int]):
         self._manager = manager
+        if len(draft_layer_ids) != 1:
+            raise ValueError(
+                "MiniMax-M3's unified draft KV view supports exactly one "
+                f"draft layer, got {len(draft_layer_ids)}"
+            )
         if manager.tokens_per_block != 128:
             raise ValueError(
                 "MiniMax-M3's unified draft KV view requires tokens_per_block=128, "

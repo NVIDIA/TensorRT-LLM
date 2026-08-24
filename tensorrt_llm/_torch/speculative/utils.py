@@ -180,9 +180,8 @@ def get_spec_metadata(spec_config,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=_is_effective_dynamic_tree(spec_config),
             eagle_choices=spec_config.eagle_choices,
-            requires_hidden_states_publication=getattr(
-                spec_config, '_requires_eagle_hidden_states_publication',
-                False),
+            requires_hidden_states_publication=(
+                spec_config._requires_eagle_hidden_states_publication),
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(

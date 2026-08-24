@@ -22,7 +22,7 @@ import torch
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.cache_manager import (
     MiniMaxM3DraftKVCacheView,
     MiniMaxM3KVCacheManagerV2,
-    derive_shared_draft_layout,
+    _derive_shared_draft_layout,
 )
 
 DRAFT_LAYER = 60
@@ -143,6 +143,11 @@ def test_view_rejects_non_p128_manager():
         MiniMaxM3DraftKVCacheView(manager, [DRAFT_LAYER])
 
 
+def test_view_rejects_multiple_draft_layers():
+    with pytest.raises(ValueError, match="exactly one draft layer"):
+        MiniMaxM3DraftKVCacheView(_FakeManager(), [DRAFT_LAYER, DRAFT_LAYER + 1])
+
+
 def test_view_rejects_draft_layer_outside_pool_zero():
     manager = _FakeManager()
     manager.kv_cache_pool_mapping[DRAFT_LAYER] = torch.tensor([1, 0], dtype=torch.int32)
@@ -152,30 +157,30 @@ def test_view_rejects_draft_layer_outside_pool_zero():
 
 def test_draft_layout_target_only_num_layers():
     heads = [4] * 60 + [64]
-    draft_ids, num_target = derive_shared_draft_layout(60, heads, 1)
+    draft_ids, num_target = _derive_shared_draft_layout(60, heads, 1)
     assert draft_ids == [60]
     assert num_target == 60
 
 
 def test_draft_layout_equal_head_drafter():
-    draft_ids, num_target = derive_shared_draft_layout(60, [4] * 61, 1)
+    draft_ids, num_target = _derive_shared_draft_layout(60, [4] * 61, 1)
     assert draft_ids == [60]
     assert num_target == 60
 
 
 def test_draft_layout_pre_extended_num_layers():
     heads = [4] * 60 + [64]
-    draft_ids, num_target = derive_shared_draft_layout(61, heads, 1)
+    draft_ids, num_target = _derive_shared_draft_layout(61, heads, 1)
     assert draft_ids == [60]
     assert num_target == 60
 
 
 def test_draft_layout_no_draft():
-    draft_ids, num_target = derive_shared_draft_layout(60, [4] * 60, 0)
+    draft_ids, num_target = _derive_shared_draft_layout(60, [4] * 60, 0)
     assert draft_ids == []
     assert num_target == 60
-    assert derive_shared_draft_layout(60, 4, 0) == ([], 60)
+    assert _derive_shared_draft_layout(60, 4, 0) == ([], 60)
 
 
 def test_draft_layout_unpinned_range():
-    assert derive_shared_draft_layout(None, 4, 1) == ([], None)
+    assert _derive_shared_draft_layout(None, 4, 1) == ([], None)

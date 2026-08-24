@@ -503,13 +503,12 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-        # A disaggregated piecewise target graph crosses into an eager
-        # one-model Eagle consumer. Mark only that boundary for publication;
-        # aggregate serving and disaggregated generation keep their historical
-        # graph schedules.
+        # A disaggregated piecewise target graph can hand captured states to an
+        # eager one-model Eagle consumer. Publish only across that boundary.
         compile_config = llm_args.torch_compile_config
         spec_config._requires_eagle_hidden_states_publication = (
-            cache_transceiver_config is not None
+            spec_config.spec_dec_mode.is_eagle3_one_model()
+            and cache_transceiver_config is not None
             and cache_transceiver_config.backend is not None
             and compile_config is not None
             and compile_config.enable_piecewise_cuda_graph
