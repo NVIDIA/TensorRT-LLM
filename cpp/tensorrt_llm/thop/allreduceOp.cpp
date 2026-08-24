@@ -322,9 +322,13 @@ public:
         {
             mNcclComm = getComm(mGroup);
         }
-        if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB)
+        // initGroupTopology() is collective over LOCAL_COMM_SESSION (via getLocalGroup()), so every rank of
+        // the group must agree on whether to call it. mStrategy is resolved per rank -- the autotuner offers
+        // NCCL and NCCL_SYMMETRIC side by side -- so it cannot gate the call. UB is the exception: it is
+        // uniform across ranks (fixed by a compile-time graph pass, never an autotuner tactic) and reads none
+        // of the topology flags.
+        if (mStrategy != AllReduceStrategyType::UB)
         {
-
             initGroupTopology();
         }
 
