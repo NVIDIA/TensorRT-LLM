@@ -630,7 +630,7 @@ class Etcd3ClusterStorage(ClusterStorage):
         watch_handle.set_cancel_event(
             lambda: self.client.cancel_watch(watch_id))
         self._watch_handles[key_prefix] = watch_handle
-        return self._watch_handles[key_prefix]
+        return watch_handle
 
     async def unwatch(self, key_prefix: str) -> None:
         handle = self._watch_handles.pop(key_prefix)
