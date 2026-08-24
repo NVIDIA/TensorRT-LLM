@@ -691,10 +691,16 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout)
     // Write the SF to global memory (STG.8).
     __nv_fp8_e8m0 tmpSFVal;
     tmpSFVal.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-    SFValue = static_cast<float>(tmpSFVal);
     fp8SFVal = tmpSFVal.__x;
-    // Get the output scale (reciprocal of the SFValue).
-    float outputScale = vecMax != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
+    // Get the output scale (reciprocal of the SF) from the E8M0 exponent rather
+    // than from the decoded float. The smallest E8M0 scale, 2^-127, is
+    // *subnormal* in fp32, and rcp.approx.ftz.f32 flushes subnormal inputs to
+    // zero and so returns +inf: every element of the block then becomes
+    // 0 * inf = NaN. Any block whose amax lands in (0, 448 * 2^-127] hits this
+    // -- e.g. a near-zero SwiGLU block in an MoE intermediate. The `vecMax != 0`
+    // guard only covers the exactly-zero block. This mirrors what the NVFP4
+    // UE8M0 path above already does.
+    float outputScale = vecMax != 0.f ? exp2f_rcp(fp8SFVal) : 0.0f;
 
     // Store one byte per consumer scale slot. For example, a K128 quantization
     // scale is replicated into four K32 slots for an MXFP8 consumer.
