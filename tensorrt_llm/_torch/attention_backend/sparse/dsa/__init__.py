@@ -20,7 +20,6 @@ from .indexer import (
     rotate_activation,
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
-    warmup_heuristic_topk_decode,
 )
 from .metadata import DSAtrtllmAttentionMetadata, build_req_idx_per_token
 from .params import DSABackendForwardArgs, DSAMetadataParams, DSAParams
@@ -49,5 +48,4 @@ __all__ = [
     "rotate_activation",
     "split_prefill_chunks",
     "transform_local_topk_and_prepare_pool_view",
-    "warmup_heuristic_topk_decode",
 ]

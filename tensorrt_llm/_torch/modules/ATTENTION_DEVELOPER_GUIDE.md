@@ -311,6 +311,31 @@ or `TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_trtllm_gen` to forc
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
 
+The `TrtllmAttention` constructor's optional `flashinfer_mla_backend` argument
+explicitly selects the MLA generation kernel inside
+`FlashInferTrtllmGenFmha` for that attention instance. It accepts
+`trtllm-gen` or `cute-dsl`; the latter uses the monolithic CuTeDSL decode
+implementation. When the argument is `None`, the ordered FMHA-library
+dispatch is preserved and FlashInfer uses `trtllm-gen` if reached. When it is
+set, the standalone `CuteDslMlaFmha` defers to the explicit FlashInfer
+selection. Selecting `cute-dsl` for an MLA layer using FP8 KV cache raises an
+exception because the current CuTeDSL kernel does not accept the
+device-resident BMM scale tensors produced for FP8 KV.
+
+`TrtllmAttention.mla_backend_policy` is an optional per-batch override hook:
+model code may install a callable
+`(static_backend, metadata, num_gen_tokens) -> backend` on an attention
+instance to adjust the selection to the batch composition.
+
+Kimi K3 defaults its absorbed-generation MLA backend to `cute-dsl` for BF16 KV
+cache (override with `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen`; other values are
+rejected at model build). FP8 KV cache forces `trtllm-gen`. K3 also installs a
+per-batch policy that falls back to `trtllm-gen` for mixed
+context/generation batches and multi-token generation (speculative
+verification), keeping `cute-dsl` for plain one-token-per-request decode. A
+mixed H=96 batch remains on `cute-dsl`: TRTLLM-Gen may select a 64-head Q tile,
+which does not divide 96 after K3's head padding removal.
+
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
