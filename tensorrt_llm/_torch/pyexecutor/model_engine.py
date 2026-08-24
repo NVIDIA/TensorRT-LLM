@@ -1247,22 +1247,20 @@ class PyTorchModelEngine(ModelEngine):
         """
 
         @functools.wraps(method)
-        def wrapper(self,
-                    resource_manager: Optional[ResourceManager] = None,
-                    *args,
-                    **kwargs):
-            result = method(self, resource_manager, *args, **kwargs)
-            with timing_metric("kv_cache_cleanup_seconds", self._metrics):
-                kv_cache_manager = (resource_manager.get_resource_manager(
-                    self.kv_cache_manager_key)
-                                    if resource_manager is not None else None)
-                if kv_cache_manager is not None:
-                    has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
-                        fill_with_zero=True)
-                    if has_invalid_values:
-                        logger.warning(
-                            "NaNs/Infs have been introduced to KVCache during warmup, KVCache was filled with zeros to avoid potential issues"
-                        )
+        def wrapper(self, resource_manager: Optional[ResourceManager] = None, *args, **kwargs):
+            with timing_metric("total_warmup_seconds", self._metrics):
+                result = method(self, resource_manager, *args, **kwargs)
+                with timing_metric("kv_cache_cleanup_seconds", self._metrics):
+                    kv_cache_manager = (resource_manager.get_resource_manager(
+                        self.kv_cache_manager_key)
+                                        if resource_manager is not None else None)
+                    if kv_cache_manager is not None:
+                        has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
+                            fill_with_zero=True)
+                        if has_invalid_values:
+                            logger.warning(
+                                "NaNs/Infs have been introduced to KVCache during warmup, KVCache was filled with zeros to avoid potential issues"
+                            )
             return result
 
         return wrapper
@@ -1384,8 +1382,7 @@ class PyTorchModelEngine(ModelEngine):
     @warmup_with_kv_cache_cleanup
     def warmup(self, resource_manager: Optional[ResourceManager] = None) -> None:
         """Run model warmup and record its total wall-clock duration."""
-        with timing_metric("total_warmup_seconds", self._metrics):
-            self._warmup_impl(resource_manager)
+        self._warmup_impl(resource_manager)
 
     def _warmup_impl(self, resource_manager: Optional[ResourceManager] = None) -> None:
         """
