@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <functional>
@@ -171,7 +172,7 @@ public:
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
         std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt);
+        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false);
 
     ~KvCache();
 
@@ -481,6 +482,8 @@ private:
 
     bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);
+    bool _shouldRecordManagerStats() const;
+    bool _shouldRecordRequestStats() const;
     bool _shouldRecordStats() const;
     void _refreshStatsDirtyState();
     void _recordDirectIterationStats(LifeCycleId lifeCycle, KVCacheIterationStatsDelta const& iterationStats);
@@ -589,6 +592,7 @@ private:
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
     int mNumTokensBeforeHybridPruning;
+    bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
     int mTokensPerBlock;

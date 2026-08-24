@@ -37,7 +37,8 @@ from tensorrt_llm.llmapi.llm_args import (
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
-from tensorrt_llm._torch.peft.lora.manager import load_torch_lora
+from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
+                                                   supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -87,6 +88,16 @@ GB = 1 << 30
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _get_initial_lora_data_type(
+    configured_lora_data_type: Optional[torch.dtype],
+) -> Optional[torch.dtype]:
+    if configured_lora_data_type != torch.float8_e4m3fn:
+        return None
+    if supports_native_fp8_lora(torch.cuda.get_device_capability()):
+        return configured_lora_data_type
+    return None
 
 
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
@@ -531,6 +542,12 @@ def _derive_draft_max_attention_window(
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
+    # Byte budgets that back an offload tier reserved in full at manager
+    # construction: the host tier is prefaulted and page-locked, the disk tier
+    # is preallocated. Every live manager reserves its own, so these budgets
+    # must be divided rather than handed out whole.
+    _OFFLOAD_TIER_BUDGET_ATTRS = ("host_cache_size", "disk_cache_size")
+
     def __init__(
         self,
         *,
@@ -635,16 +652,12 @@ class KvCacheCreator:
         # (e.g. ``MiniMaxM3KVCacheManagerV2`` from the sparse-attention path)
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+            sparse_attn_config = model_config.sparse_attention_config
             incompat: List[str] = []
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
-            sparse_attn_config = model_config.sparse_attention_config
-            if (sparse_attn_config is not None
-                    and sparse_attn_config.algorithm == "dsa"
-                    and self._mapping.cp_config.get("cp_type") == CpType.STAR):
-                incompat.append("STAR context parallelism")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Never silently replace a sparse V2 manager with V1. Some
@@ -1029,6 +1042,14 @@ class KvCacheCreator:
             logger.info(
                 "KV cache size estimation is not supported for context parallelism, disable it."
             )
+            if (self._is_kv_cache_manager_v2
+                    and self._mapping.cp_config.get('cp_type') == CpType.HELIX):
+                # Promote like the encoder-decoder case so build_managers
+                # runs configure_kv_cache_capacity(), which sets the quota
+                # KVCacheManagerV2 requires at construction (V1 stays local).
+                # HELIX only: configure_kv_cache_capacity has no sizing path
+                # for other CP types and would hit its assertion.
+                self._skip_est = True
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
             estimating_kv_cache = False
@@ -1071,6 +1092,41 @@ class KvCacheCreator:
                 self._kv_cache_config.max_tokens = max_tokens
         return estimating_kv_cache
 
+    def _configure_helix_kv_cache_capacity(self) -> None:
+        """Set the helix KV quota without profiling (not CP-aware).
+
+        Explicit quotas pass through; otherwise fraction sizing sets
+        ``max_gpu_total_bytes`` (a rank-local byte cap the manager consumes
+        as-is). Setting ``max_tokens`` here would overshoot the fraction:
+        the manager inflates that knob by 1 / max_util_for_resume.
+        """
+        if (self._kv_cache_config.max_tokens is not None
+                and self._kv_cache_config.max_tokens <= 0):
+            raise ValueError(
+                "Helix CP: kv_cache_config.max_tokens must be positive when "
+                f"set, got {self._kv_cache_config.max_tokens}.")
+        if (self._kv_cache_config.max_gpu_total_bytes or 0) > 0 or \
+                (self._kv_cache_config.max_tokens or 0) > 0:
+            logger.info("Helix CP: skipping KV cache capacity profiling; using "
+                        "the explicitly configured quota.")
+            return
+        fraction = self._kv_cache_config.free_gpu_memory_fraction
+        free_mem, _total = torch.cuda.mem_get_info()
+        budget_bytes = int(free_mem * fraction)
+        if budget_bytes <= 0:
+            raise ValueError(
+                "Helix CP: fraction-based KV sizing found no usable free "
+                "memory; set kv_cache_config.max_tokens or "
+                "max_gpu_total_bytes.")
+        logger.warning(
+            "Helix CP: capacity profiling is unsupported; sizing the KV "
+            f"cache as fraction {fraction} of free memory -> "
+            f"max_gpu_total_bytes={budget_bytes} (rank-local byte cap; the "
+            "manager min-syncs across ranks and converts to global tokens). "
+            "Set kv_cache_config.max_tokens or max_gpu_total_bytes to "
+            "override.")
+        self._kv_cache_config.max_gpu_total_bytes = budget_bytes
+
     def configure_kv_cache_capacity(self,
                                     py_executor: PyExecutor = None) -> None:
         """Perform KV cache capacity estimation.
@@ -1081,6 +1137,16 @@ class KvCacheCreator:
         mapping = self._mapping
 
         # TODO: support CP by generating dummy requests for it.
+        if mapping.cp_config.get('cp_type') == CpType.HELIX:
+            if not self._is_kv_cache_manager_v2:
+                # The helix sizing below emits V2 ledger (global) quotas;
+                # V1 reads max_tokens as rank-local. Reject explicitly.
+                raise NotImplementedError(
+                    "TRTLLM_SKIP_KV_CACHE_ESTIMATION with helix CP requires "
+                    "the V2 KV cache manager "
+                    "(kv_cache_config.use_kv_cache_manager_v2=True).")
+            self._configure_helix_kv_cache_capacity()
+            return
         assert 'cp_type' not in mapping.cp_config
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction
@@ -1469,15 +1535,15 @@ class KvCacheCreator:
         if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
-            # pool_ratio describes one manager's pool-group layout. The
+            # pool_ratio describes one manager's layer-group layout. The
             # target hybrid manager may have separate recurrent-state and
-            # attention groups, while a non-VSWA draft manager has one
-            # attention group. Reusing the target's ratios fails its arity
+            # attention layer groups, while a non-VSWA draft manager has one
+            # attention layer group. Reusing the target's ratios fails its arity
             # check.
             logger.info(
                 "Normalizing the separate one-model draft KV cache pool_ratio "
                 f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
-                "pool group.")
+                "layer group.")
             draft_kv_config.pool_ratio = [1.0]
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
@@ -1908,6 +1974,28 @@ class KvCacheCreator:
             max_seq_len, kv_cache_config)
         return uses_vswa_kv_cache_layout(draft_windows)
 
+    @classmethod
+    def _drop_explicit_offload_tier_budgets(
+            cls, kv_cache_config: Optional[KvCacheConfig]
+    ) -> Optional[KvCacheConfig]:
+        """Return a copy of the config with explicit offload budgets unset.
+
+        Host sizing then falls to the V2 auto host tier policy, which matches
+        the tier to the manager's own device quota; V1 builds no secondary pool.
+        The disk tier is V2 only and has no auto policy, so dropping its budget
+        leaves the tier out.
+        """
+        if kv_cache_config is None:
+            return kv_cache_config
+        dropped = {
+            attr: None
+            for attr in cls._OFFLOAD_TIER_BUDGET_ATTRS
+            if getattr(kv_cache_config, attr)
+        }
+        if not dropped:
+            return kv_cache_config
+        return kv_cache_config.model_copy(update=dropped)
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
@@ -1926,30 +2014,37 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
-        # Split combined KV cache budgets before creating managers. Skip during
-        # estimation — estimation uses max_tokens-based logic and must not
-        # mutate the config.
+        # Estimation managers are throwaway probes whose pools only hold dummy
+        # requests, so an explicit offload tier would reserve capacity the probe
+        # cannot fill. Encoder-decoder runs skip estimation, so dropping the
+        # cross budgets is defensive.
+        if estimating_kv_cache:
+            self_kv_cache_config = self._drop_explicit_offload_tier_budgets(
+                self_kv_cache_config)
+            cross_kv_cache_config = self._drop_explicit_offload_tier_budgets(
+                cross_kv_cache_config)
+
+        # Split combined KV cache budgets before creating managers.
         has_draft = (
             self._draft_model_engine is not None  # two-model
             or self._should_create_separate_draft_kv_cache())  # one-model
         draft_kv_cache_config = None
-        if not estimating_kv_cache and has_draft:
-            # Used when each manager sizes pools from max_gpu_total_bytes (V2
-            # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
-            if self._needs_gpu_kv_cache_budget_split(original_max_seq_len,
-                                                     self_kv_cache_config):
+        if has_draft:
+            # The GPU split applies when each manager sizes its pools from
+            # max_gpu_total_bytes (V2 and V1 VSWA). V1 non-VSWA and estimation
+            # size GPU pools from a shared max_tokens instead.
+            needs_gpu_split = (not estimating_kv_cache
+                               and self._needs_gpu_kv_cache_budget_split(
+                                   original_max_seq_len, self_kv_cache_config))
+            if needs_gpu_split:
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
                         "max_gpu_total_bytes", self_kv_cache_config,
                         draft_kv_cache_config))
-            # KVCacheManagerV2 does not support two-model draft budget splitting.
-            v2_two_model = (self._is_kv_cache_manager_v2
-                            and self._draft_model_engine is not None)
-            if not v2_two_model:
-                # Each manager sizes its host pool from host_cache_size directly.
+            for budget_attr in self._OFFLOAD_TIER_BUDGET_ATTRS:
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
-                        "host_cache_size", self_kv_cache_config,
+                        budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
 
         kv_cache_manager = self._create_kv_cache_manager(
@@ -1976,10 +2071,14 @@ class KvCacheCreator:
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
-            if self._is_kv_cache_manager_v2:
-                assert draft_kv_cache_config is None, (
-                    "KVCacheManagerV2 does not support two-model speculative "
-                    "decoding with separate draft KV cache budget splitting.")
+            if (self._is_kv_cache_manager_v2
+                    and draft_kv_cache_config is not None):
+                # Offload budgets are divided per manager, GPU budgets are not.
+                assert (draft_kv_cache_config.max_gpu_total_bytes ==
+                        self_kv_cache_config.max_gpu_total_bytes), (
+                            "KVCacheManagerV2 does not support two-model "
+                            "speculative decoding with separate draft GPU "
+                            "budgets.")
             draft_kv_cache_manager = self._create_kv_cache_manager(
                 self._draft_model_engine,
                 estimating_kv_cache,
@@ -2323,6 +2422,7 @@ def _create_kv_cache_manager(
             head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2465,6 +2565,7 @@ def _create_kv_cache_manager(
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2572,6 +2673,7 @@ def _create_kv_cache_manager(
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             is_draft=is_draft,
             max_batch_size=max_batch_size,
             mapping=mapping,
@@ -2819,10 +2921,8 @@ def create_py_executor_instance(
         initial_lora_data_type = None
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
-            configured_lora_data_type = load_torch_lora(lora_config)
-            if (configured_lora_data_type == torch.float8_e4m3fn
-                    and torch.cuda.get_device_capability() == (9, 0)):
-                initial_lora_data_type = configured_lora_data_type
+            initial_lora_data_type = _get_initial_lora_data_type(
+                load_torch_lora(lora_config))
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -3256,9 +3356,6 @@ def instantiate_sampler(
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
-    if mapping.cp_config.get('cp_type') == CpType.STAR:
-        assert llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)

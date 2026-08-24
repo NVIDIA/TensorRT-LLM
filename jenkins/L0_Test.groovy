@@ -126,6 +126,9 @@ SLURM_MEMORY_LIMIT = "12Gi"
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
+TESTER_CPU_ONLY_CORES = "2"
+TESTER_CPU_ONLY_MEMORY = "12Gi"
+
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
@@ -3401,12 +3404,12 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     tty: true
                     resources:
                       requests:
-                        cpu: ${TESTER_CORES}
-                        memory: ${TESTER_MEMORY}
+                        cpu: ${TESTER_CPU_ONLY_CORES}
+                        memory: ${TESTER_CPU_ONLY_MEMORY}
                         ephemeral-storage: 300Gi
                       limits:
-                        cpu: ${TESTER_CORES}
-                        memory: ${TESTER_MEMORY}
+                        cpu: ${TESTER_CPU_ONLY_CORES}
+                        memory: ${TESTER_CPU_ONLY_MEMORY}
                         ephemeral-storage: 300Gi
                     imagePullPolicy: Always
                     volumeMounts:
@@ -5823,8 +5826,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
         "RTXPro6000D-PyTorch-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
         "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
-        "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
-        "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        // Disable RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1 and RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2 due to some nodes are offline temporarily.
+        // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)

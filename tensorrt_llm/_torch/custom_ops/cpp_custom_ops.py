@@ -344,6 +344,22 @@ def _register_fake():
         # In-place operation, no return value (void function)
         pass
 
+    @torch.library.register_fake("trtllm::minimax_m3_select_blocks")
+    def _(
+        scores,
+        n_valid_blocks,
+        topk,
+        init_blocks,
+        local_blocks,
+        head_major_output=False,
+    ):
+        del n_valid_blocks, init_blocks, local_blocks
+        if head_major_output:
+            return scores.new_empty((scores.shape[0], scores.shape[2], topk),
+                                    dtype=torch.int32).permute(1, 0, 2)
+        return scores.new_empty((scores.shape[2], scores.shape[0], topk),
+                                dtype=torch.int32)
+
     @torch.library.register_fake("trtllm::kda_decode")
     def _(x_q: torch.Tensor,
           x_k: torch.Tensor,
@@ -380,6 +396,26 @@ def _register_fake():
             return output
         # x_q is [1, tokens, H, 128]; the kernel emits one row per token.
         return x_q.new_empty((x_q.size(1), 1, x_v.size(2), x_v.size(3)))
+
+    @torch.library.register_fake("trtllm::minimax_m3_fp8_indexer_qk_norm_rope")
+    def minimax_m3_fp8_indexer_qk_norm_rope_fake(
+        qk: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        num_heads_q: int,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        base: float,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Infer the specialized index-Q result without executing CUDA."""
+        del index_k_cache, out_cache_loc, rotary_dim, eps, q_weight, k_weight
+        del base, position_ids
+        return qk.new_empty((qk.shape[0], num_heads_q, head_dim),
+                            dtype=torch.float8_e4m3fn)
 
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):

@@ -374,15 +374,6 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         quant_algo=None,
         routing_method="RENORMALIZE",
     ),
-    "mixtral_8x7b": ModelSpec(
-        name="mixtral_8x7b",
-        num_experts=8,
-        top_k=2,
-        hidden_size=4096,
-        intermediate_size=14336,
-        quant_algo="FP8",
-        routing_method="RENORMALIZE",
-    ),
     "gpt_oss_120b": ModelSpec(
         name="gpt_oss_120b",
         num_experts=128,

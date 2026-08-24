@@ -18,12 +18,16 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 
 from .interface import Fmha
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention_backend.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
 
 # ``AttentionForwardArgs`` fields that this backend does not consume.
@@ -48,6 +52,16 @@ _THOP_LITERALS: dict = {}
 
 class FallbackFmha(Fmha):
     """Fallback FMHA implementation using the fused TRT-LLM thop attention op."""
+
+    @classmethod
+    def is_available(cls, attn: "TrtllmAttention") -> bool:
+        sparse_algorithm = getattr(attn.sparse_params, "algorithm", None)
+        if sparse_algorithm in ("deepseek_v4", "dsa"):
+            if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla":
+                return False
+            if get_sm_version() in (120, 121):
+                return False
+        return True
 
     def forward(
         self,

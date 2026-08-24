@@ -437,16 +437,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 1,
         },
     },
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "intermediate_size": 256,
-            "hidden_size": 64,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "num_local_experts": 2,
-        },
-    },
     "Qwen/Qwen3-30B-A3B": {
         "model_kwargs": {
             "num_hidden_layers": 2,
