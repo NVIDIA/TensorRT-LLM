@@ -2099,7 +2099,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # retry, and fail closed if cluster policy overrides --no-requeue.
                     echo "\${SLURM_JOB_NODELIST:-\${SLURM_NODELIST:-UNKNOWN}}" >> "${jobWorkspace}/slurm_node_list.txt"
                     if [ "\${SLURM_RESTART_COUNT:-0}" -gt 0 ]; then
-                        echo "\${SLURM_RESTART_COUNT}" > "${jobWorkspace}/slurm_restart_count.txt"
+                        echo "\${SLURM_RESTART_COUNT}" > "${jobWorkspace}/slurm_restart_count.txt.tmp"
+                        mv -f "${jobWorkspace}/slurm_restart_count.txt.tmp" "${jobWorkspace}/slurm_restart_count.txt"
                         echo "[INFRA-RETRY] Refusing to resume non-checkpointable test batch after Slurm restart \${SLURM_RESTART_COUNT}."
                         exit 75
                     fi
@@ -2495,8 +2496,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     // A forced restart means the controller ignored --no-requeue.
                     // The launch guard stopped before touching partial test state;
                     // retry as a fresh job through the existing node-avoiding loop.
-                    def slurmRestartCount = readSlurmWorkspaceFile(
-                        pipeline, remote, "${jobWorkspace}/slurm_restart_count.txt", stageName)
+                    // Here "" is a verdict ("no restart happened"), not just absent
+                    // metadata, so an unreadable marker must not silently fall through
+                    // to the generic test-failure path: retry the read, then treat a
+                    // still-unreadable marker as infra.
+                    def restartMarker = readSlurmWorkspaceFileResult(
+                        pipeline, remote, "${jobWorkspace}/slurm_restart_count.txt", stageName, 3)
+                    if (!restartMarker.readable) {
+                        throw new InfraFailure(
+                            "SLURM job ${slurmJobId} for ${stageName} ended in state ${slurmState} and its " +
+                            "in-place-restart marker was unreadable, so a restart over partial test state cannot " +
+                            "be ruled out; retrying as a fresh job.",
+                            null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-restart-marker-unreadable>")
+                    }
+                    def slurmRestartCount = restartMarker.value
                     if (slurmRestartCount) {
                         throw new InfraFailure(
                             "SLURM job ${slurmJobId} for ${stageName} was restarted in place " +
@@ -3067,7 +3080,11 @@ def rememberAvoidedSlurmNodeLists(Map avoidedNodeListsByCluster, String clusterN
     echo "[INFRA-RETRY] ${stageName}: recorded SLURM node list(s) for retry avoidance on ${clusterName}: ${nodeLists.join(', ')}"
 }
 
-def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageName, int numRetries=1)
+// Returns [readable: <false only when the read itself failed>, value: <first
+// non-empty line, "" when the file is absent or empty>]. A caller that cannot
+// treat an unreadable file as an absent one -- one where "" carries a decision,
+// not just missing metadata -- reads through this instead of the String wrapper.
+def readSlurmWorkspaceFileResult(def pipeline, Map remote, String path, String stageName, int numRetries=1)
 {
     try {
         def value = Utils.exec(
@@ -3079,20 +3096,27 @@ def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageNa
             returnStdout: true,
             numRetries: numRetries
         ).trim()
-        return value.readLines().collect { it.trim() }.find { it } ?: ""
+        return [readable: true, value: value.readLines().collect { it.trim() }.find { it } ?: ""]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         // A dead frontend must propagate so the enclosing withSlurmFrontendFailover
-        // fails over to another remote; swallowing it as "" would strand the stage on
-        // the unreachable frontend. Any other read failure (missing file, transient)
-        // is non-fatal -- the metadata is best-effort, so return "" and carry on.
+        // fails over to another remote; swallowing it would strand the stage on the
+        // unreachable frontend.
         if (CloudManager.isSlurmFrontendConnectionFailure(e)) {
             throw e
         }
         echo "[INFRA-RETRY] ${stageName}: unable to read SLURM metadata file ${path}: ${e.toString()}"
-        return ""
+        return [readable: false, value: ""]
     }
+}
+
+// Best-effort String view: an absent file and a failed read both read as "".
+// Correct for verdict/job-ID/node-list metadata, whose callers already handle
+// "unknown" and must not fail a stage over missing metadata.
+def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageName, int numRetries=1)
+{
+    return readSlurmWorkspaceFileResult(pipeline, remote, path, stageName, numRetries).value
 }
 
 // State flows through the mutated placementContext map (read by the retry
