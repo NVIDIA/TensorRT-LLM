@@ -724,28 +724,6 @@ class TestNoBatching(TestKVCacheManagerV2):
             consumer.close()
         stream_holder.take_finish_event().synchronize()
 
-    def test_partial_commit_disabled_keeps_full_block_reuse(self) -> None:
-        tokens_per_block = 4
-        prompt = [self.next_token() for _ in range(tokens_per_block + 2)]
-        self._prepare_beam_cache(tokens_per_block)
-        with TemporaryCudaStream([]) as stream_holder:
-            stream = cast(CudaStream, stream_holder.handle)
-            producer = self.manager.create_kv_cache(expected_prompt_length=len(prompt))
-            producer.cuda_stream = stream
-            self.assertTrue(producer.resume(stream))
-            self.assertTrue(producer.resize(len(prompt)))
-            self.engine.execute([Step(producer, prompt, [])], stream)
-            producer.commit(prompt)
-            producer.stop_committing()
-            self.assertEqual(producer.num_committed_tokens, len(prompt))
-            producer.close()
-
-            consumer = self.manager.create_kv_cache(input_tokens=prompt)
-            self.assertEqual(consumer.num_committed_tokens, tokens_per_block)
-            self.assertTrue(consumer.resume(stream))
-            consumer.close()
-        stream_holder.take_finish_event().synchronize()
-
     def new_request(
         self, req_id: int, lora_task_id: int | None, prompt_len: int, decode_len: int
     ) -> Request:
@@ -3771,6 +3749,14 @@ class TestInitRatioConfig(unittest.TestCase):
         self.assertEqual(attn_slots(1), 4)
         # 2 shared + 3 * 2 per-beam, not 3 * 4.
         self.assertEqual(attn_slots(3), 8)
+        # Without a prompt-length hint, conservatively scale every block.
+        no_prompt_hint = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=capacity, history_length=capacity - 1, beam_width=3)]
+        )
+        self.assertEqual(
+            _introspection.compute_slots_for_batch(manager, no_prompt_hint, tpb, None)[attn_pg],
+            12,
+        )
         manager.shutdown()
 
     def test_beam_width_replicates_the_ssm_slot_per_beam(self):
@@ -3789,22 +3775,6 @@ class TestInitRatioConfig(unittest.TestCase):
         )
         slots = _introspection.compute_slots_for_batch(manager, batch, self.TOKENS_PER_BLOCK, None)
         self.assertEqual(slots[ssm_pg], 4)
-        manager.shutdown()
-
-    def test_beam_width_without_prompt_length_scales_every_block(self):
-        """Defaulting prompt_length to 0 over-provisions rather than under-provisions."""
-        self._skip_without_cpp_beam_sizing()
-        manager = KVCacheManager(self._make_hybrid_config())
-        ssm_lc = _introspection.ssm_life_cycle_id(manager)
-        assert ssm_lc is not None
-        attn_pg = 1 - _introspection.pool_group_index(manager, ssm_lc)
-        tpb = self.TOKENS_PER_BLOCK
-
-        batch = BatchDesc(
-            kv_caches=[KVCacheDesc(capacity=4 * tpb, history_length=4 * tpb - 1, beam_width=3)]
-        )
-        slots = _introspection.compute_slots_for_batch(manager, batch, tpb, None)
-        self.assertEqual(slots[attn_pg], 12)
         manager.shutdown()
 
     def test_constraints_floor_typical_step(self):

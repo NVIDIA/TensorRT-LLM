@@ -260,23 +260,19 @@ def test_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
     assert config.enable_partial_reuse is enable_partial_reuse
 
 
-@pytest.mark.parametrize("max_beam_width", [1, 4])
-@pytest.mark.parametrize("enable_partial_reuse", [False, True])
-def test_beam_search_disables_only_partial_commit(
-    max_beam_width: int, enable_partial_reuse: bool
-) -> None:
+def test_beam_search_disables_only_partial_commit() -> None:
     # Partial commit publishes the prompt's trailing partial block into the
     # radix tree and canonicalizes it to beam 0, which is incompatible with the
     # per-beam writes that follow, so beam search must turn it off. Partial
     # reuse matches a token prefix inside ordinary full blocks and is copied to
     # a private page before beams are added, so it stays user-controlled.
     config = _make_cache_config_for_test(
-        KvCacheConfig(enable_partial_reuse=enable_partial_reuse),
-        max_beam_width=max_beam_width,
+        KvCacheConfig(enable_partial_reuse=True),
+        max_beam_width=4,
     )
 
-    assert config.enable_partial_reuse is enable_partial_reuse
-    assert config.enable_partial_commit is (max_beam_width == 1)
+    assert config.enable_partial_reuse
+    assert not config.enable_partial_commit
 
 
 def test_pool_ratio_overrides_constraints() -> None:

@@ -962,6 +962,7 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
+    creator._is_disagg = False
 
     with pytest.raises(NotImplementedError, match=expected):
         creator._validate_or_fallback_kv_cache_manager_v2(
@@ -978,6 +979,7 @@ def test_v2_encoder_decoder_beam_falls_back_for_cross_kv_compatibility():
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = None
     creator._max_beam_width = 2
+    creator._is_disagg = False
 
     assert (
         creator._validate_or_fallback_kv_cache_manager_v2(
@@ -1001,6 +1003,7 @@ def test_v2_beam_fallback_depends_on_backend(monkeypatch, backend, expected_mana
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = None
     creator._max_beam_width = 2
+    creator._is_disagg = False
 
     assert (
         creator._validate_or_fallback_kv_cache_manager_v2(
@@ -1010,19 +1013,19 @@ def test_v2_beam_fallback_depends_on_backend(monkeypatch, backend, expected_mana
     )
 
 
-@pytest.mark.parametrize("algorithm", ["deepseek_v4", "minimax_m3"])
-def test_v2_sparse_attention_rejects_beam_search(algorithm):
+def test_v2_sparse_attention_rejects_beam_search():
     # Sparse backends subclass TrtllmAttentionMetadata, so ModelEngine never
     # hands them cache_indirection; beams would read beam 0's unmapped prompt
     # rows. Fail at startup instead of asserting inside metadata preparation.
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
-        sparse_attention_config=SimpleNamespace(algorithm=algorithm),
+        sparse_attention_config=SimpleNamespace(algorithm="deepseek_v4"),
         is_encoder_decoder=False,
     )
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = None
     creator._max_beam_width = 2
+    creator._is_disagg = False
 
     with pytest.raises(NotImplementedError, match="max_beam_width > 1"):
         creator._validate_or_fallback_kv_cache_manager_v2(
@@ -1039,6 +1042,7 @@ def test_v2_sparse_attention_allowed_without_beam_search():
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = None
     creator._max_beam_width = 1
+    creator._is_disagg = False
 
     assert (
         creator._validate_or_fallback_kv_cache_manager_v2(

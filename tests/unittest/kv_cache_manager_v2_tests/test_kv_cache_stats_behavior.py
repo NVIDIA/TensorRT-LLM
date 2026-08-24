@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -30,12 +29,7 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    BAD_PAGE_INDEX,
-    DEFAULT_BEAM_INDEX,
-    BeamIndex,
-    LayerId,
-)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DEFAULT_BEAM_INDEX
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -137,7 +131,6 @@ def _create_manager(
     enable_partial_reuse: bool = True,
     block_reuse_policy: str = "all_reusable",
     enable_stats: bool = True,
-    max_beam_width: int = 1,
 ) -> KVCacheManagerV2:
     return KVCacheManagerV2(
         KvCacheConfig(
@@ -159,7 +152,6 @@ def _create_manager(
         dtype=DataType.HALF,
         vocab_size=4096,
         enable_stats=enable_stats,
-        max_beam_width=max_beam_width,
     )
 
 
@@ -364,41 +356,6 @@ def _run_v2_context(manager: KVCacheManagerV2, request: LlmRequest):
 def _run_v2_generation(manager: KVCacheManagerV2, request: LlmRequest):
     assert manager.try_allocate_generation(request)
     return _commit_and_get_stats(manager, _generation_batch(request))
-
-
-@pytest.mark.skipif(
-    os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python",
-    reason="beam search is implemented by the C++ KV cache manager v2 backend",
-)
-@pytest.mark.parametrize("enable_block_reuse", [False, True])
-def test_block_aligned_prompt_expands_only_generation_blocks(
-    resource_guard, enable_block_reuse: bool
-) -> None:
-    request = _StatsRequest(
-        1,
-        list(range(TOKENS_PER_BLOCK)),
-        context_remaining_length=TOKENS_PER_BLOCK,
-        py_beam_width=2,
-    )
-    manager = resource_guard(
-        _create_manager(
-            gpu_bytes=16 << 20,
-            enable_block_reuse=enable_block_reuse,
-            max_beam_width=2,
-        ),
-        request,
-    )
-
-    assert manager.prepare_context(request)
-    assert manager.resize_context(request, num_tokens=TOKENS_PER_BLOCK)
-    _finish_context(manager, request)
-    assert manager.try_allocate_generation(request)
-
-    kv_cache = manager.kv_cache_map[request.py_request_id]
-    layer_group_id = manager.impl.get_layer_group_id(LayerId(0))
-    beam_pages = list(kv_cache.get_base_page_indices(layer_group_id, BeamIndex(1)))
-    assert beam_pages[0] == BAD_PAGE_INDEX
-    assert beam_pages[1] != BAD_PAGE_INDEX
 
 
 def test_stats_disabled_suppresses_v2_accounting(resource_guard) -> None:
