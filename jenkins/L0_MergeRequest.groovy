@@ -732,7 +732,8 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT ||
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file list to empty list.")
@@ -768,7 +769,8 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     // Note: This function intentionally propagates exceptions to the caller.
     // If there is an error to get the changed file diff, skip merging the waive list.
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT ||
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file diff to empty string.")

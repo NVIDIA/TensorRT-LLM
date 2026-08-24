@@ -73,6 +73,21 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("parallelJobs.failFast = effectiveFailFast", L0_PARENT)
         self.assertIn("collectTestResults(this, testFilter, globalVars)", L0_PARENT)
 
+    def test_dry_run_skips_merge_request_diff_lookups(self) -> None:
+        infra_dry_run_check = "(params.InfraDryRun?.toString()?.toBoolean() ?: false)"
+        changed_files = _function_body(
+            L0_PARENT, "getMergeRequestChangedFileList", "getMergeRequestOneFileChanges"
+        )
+        one_file_diff = _function_body(
+            L0_PARENT, "getMergeRequestOneFileChanges", "getAutoTriggerTagList"
+        )
+
+        for body, empty_result in ((changed_files, "return []"), (one_file_diff, 'return ""')):
+            with self.subTest(empty_result=empty_result):
+                self.assertIn(f"if ({infra_dry_run_check} ||", body)
+                self.assertLess(body.index(infra_dry_run_check), body.index("def githubPrApiUrl"))
+                self.assertLess(body.index(empty_result), body.index("def githubPrApiUrl"))
+
     def test_docs_skip_junit_after_a_successful_build(self) -> None:
         self.assertIn(
             'cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, '
