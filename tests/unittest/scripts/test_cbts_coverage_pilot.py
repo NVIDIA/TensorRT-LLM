@@ -146,7 +146,7 @@ def test_check_pilot_eligibility_fails_closed_on_api_error(
 def test_main_reads_bot_trigger_payload(
     pilot_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
 ) -> None:
     trigger_phrase = json.dumps({"github_pr_api_url": PR_API_URL})
     monkeypatch.setenv("gitlabTriggerPhrase", trigger_phrase)
@@ -164,6 +164,6 @@ def test_main_reads_bot_trigger_payload(
     monkeypatch.setattr(pilot_module, "check_pilot_eligibility", check_pilot_eligibility)
 
     assert pilot_module.main([]) == 0
-    captured = capsys.readouterr()
+    captured = capfd.readouterr()
     assert captured.out == "true\n"
     assert "pr_author=pilot-user, eligible=true" in captured.err
