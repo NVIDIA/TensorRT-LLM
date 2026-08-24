@@ -26,13 +26,14 @@ import tempfile
 import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Optional, Union
 
 import openai
 import pytest
 import requests
 import yaml
 from defs.common import wait_for_reported_addr
+from pytest_mock import MockerFixture
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
@@ -2333,7 +2334,7 @@ class TestQwen3_5_397B_A17B_NVFP4_V2(LlmapiAccuracyTestHarness):
 
     MODEL_NAME = "nvidia/Qwen3.5-397B-A17B-NVFP4-V2"
     MODEL_PATH = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4-V2"
-    EXTRA_EVALUATOR_KWARGS = {
+    EXTRA_EVALUATOR_KWARGS: ClassVar[Dict[type, Dict[str, Any]]] = {
         GSM8K: {
             "apply_chat_template": True,
             "fewshot_as_multiturn": True,
@@ -2400,7 +2401,8 @@ class TestQwen3_5_397B_A17B_NVFP4_V2(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("use_py_transceiver", [True])
-    def test_auto_dtype(self, use_py_transceiver: bool, mocker) -> None:
+    def test_auto_dtype(self, use_py_transceiver: bool,
+                        mocker: MockerFixture) -> None:
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
         with launch_disaggregated_llm(
