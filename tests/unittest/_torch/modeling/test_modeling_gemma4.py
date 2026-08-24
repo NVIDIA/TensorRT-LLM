@@ -45,6 +45,8 @@ from tensorrt_llm._torch.models.modeling_gemma4 import (
     Gemma4TextModel,
     Gemma4TextScaledWordEmbedding,
 )
+from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
@@ -380,6 +382,26 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         expected_dim = int(config.global_head_dim * 0.25)
         self.assertEqual(rope.dim, expected_dim)
 
+    def test_rope_params_include_speculative_headroom(self):
+        """RoPE must cover draft positions beyond the logical sequence limit."""
+        model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
+        spec_config = MTPDecodingConfig(max_draft_len=3)
+        spec_config._use_shared_kv_cache = True
+        model_config.spec_config = spec_config
+        model_config.attn_backend = "FLASHINFER"
+
+        expected_max_positions = GEMMA4_SMALL_CONFIG["max_position_embeddings"] + 2 * 4
+        for layer_idx, is_sliding in ((0, True), (5, False)):
+            with self.subTest(is_sliding=is_sliding):
+                attn = Gemma4Attention(
+                    model_config,
+                    layer_idx=layer_idx,
+                    is_sliding=is_sliding,
+                )
+                self.assertEqual(attn.pos_embd_params.rope.max_positions, expected_max_positions)
+                self.assertEqual(attn.rotary_emb.max_positions, expected_max_positions)
+                self.assertEqual(attn.rotary_emb.rotary_cos_sin.shape[0], expected_max_positions)
+
     def test_num_kv_heads_per_layer_type(self):
         """Sliding layers use num_key_value_heads, full use num_global_key_value_heads."""
         model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
@@ -617,9 +639,24 @@ class TestGemma4Assistant(unittest.TestCase):
         torch.testing.assert_close(actual, expected)
 
     def test_assistant_uses_target_kv_sources(self):
-        assistant = Gemma4AssistantForCausalLM(_make_assistant_model_config())
+        model_config = _make_assistant_model_config()
+        model_config.extra_attrs["_speculative_position_headroom"] = 2 * 4
+        assistant = Gemma4AssistantForCausalLM(model_config)
         self.assertEqual(len(assistant.model.layers), 4)
         self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
+        self.assertEqual(
+            assistant.model.model_config.pretrained_config.max_position_embeddings,
+            GEMMA4_SMALL_CONFIG["max_position_embeddings"] + 2 * 4,
+        )
+        self.assertEqual(
+            model_config.pretrained_config.text_config.max_position_embeddings,
+            GEMMA4_SMALL_CONFIG["max_position_embeddings"],
+        )
+        for layer in assistant.model.layers:
+            self.assertEqual(
+                layer.self_attn.pos_embd_params.rope.max_positions,
+                GEMMA4_SMALL_CONFIG["max_position_embeddings"] + 2 * 4,
+            )
 
         target_config = {
             **GEMMA4_SMALL_CONFIG,
@@ -2410,8 +2447,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
             "FLASHINFER must dispatch to FlashInferAttention",
         )
 
-    def test_all_layers_use_trtllm_gen(self):
-        """All Gemma4 layers use trtllm-gen backend uniformly.
+    @unittest.mock.patch("tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=True)
+    def test_all_layers_use_trtllm_gen_on_sm100f(self, _mock_is_sm_100f):
+        """All Gemma4 layers use trtllm-gen uniformly on datacenter Blackwell.
 
         trtllm-gen has pre-compiled cubins for H256+H512, both BF16 and
         FP8 dtypes.  For FP8 KV cache (NVFP4), the FlashInfer backend
@@ -2424,12 +2462,33 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=config)
 
         for i in range(config.num_hidden_layers):
-            attn = Gemma4Attention(model_config, i)
+            attn = Gemma4Attention(
+                model_config,
+                i,
+                is_sliding=config.layer_types[i] == "sliding_attention",
+            )
             self.assertEqual(
                 attn.attn.flashinfer_backend,
                 "trtllm-gen",
                 f"Layer {i} should use trtllm-gen",
             )
+
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f", return_value=False
+    )
+    def test_non_sm100f_layers_use_fa2(self, _mock_is_sm_100f):
+        """Gemma4 uses FlashInfer FA2 where trtllm-gen kernels are unavailable."""
+        config_dict = deepcopy(GEMMA4_SMALL_CONFIG)
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config)
+
+        for layer_idx in range(config.num_hidden_layers):
+            attn = Gemma4Attention(
+                model_config,
+                layer_idx=layer_idx,
+                is_sliding=config.layer_types[layer_idx] == "sliding_attention",
+            )
+            self.assertEqual(attn.attn.flashinfer_backend, "fa2")
 
 
 class TestGemma4CUDAGraph(unittest.TestCase):
@@ -3388,8 +3447,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         layers = []
         for info in layers_info:
             kwargs = {}
-            # head_dim>256 needs trtllm-gen (fa2 JIT doesn't support it)
-            if info["head_dim"] > 256:
+            if info["head_dim"] > 256 and is_sm_100f():
                 kwargs["flashinfer_backend"] = "trtllm-gen"
             layers.append(
                 FlashInferAttention(

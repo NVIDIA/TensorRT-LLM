@@ -80,8 +80,19 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             name="await_response_thread")
 
     def start_thread(self, thread: ManagedThread):
-        if self.engine.can_enqueue_requests() and not thread.is_alive():
-            thread.start()
+        if not self.engine.can_enqueue_requests():
+            return
+        if thread.is_alive():
+            return
+        if thread.ident is not None:
+            # Already exited: either stop() at shutdown (nothing to surface) or
+            # an engine event-loop crash, where restarting masks it into a peer
+            # MPI-collective hang. Wrap, since start() runs on every submit().
+            err = getattr(self.engine, "_event_loop_error", None)
+            if err is not None:
+                raise RequestError(str(err)) from err
+            return
+        thread.start()
 
     def await_response_task(self) -> bool:
         return self._await_response_helper()
@@ -170,6 +181,7 @@ def worker_main(
     _torch_model_class_mapping: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
     ready_signal: Optional[str] = None,
+    worker_process_identities_signal: Optional[bytes] = None,
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     hf_model_dir: Optional[Path] = None,
@@ -227,7 +239,8 @@ def worker_main(
         set_global_tracer(tracer)
 
     if _torch_model_class_mapping is not None:
-        from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
         MODEL_CLASS_MAPPING.update(**_torch_model_class_mapping)
 
     set_mpi_session_cpp(mpi_comm())
@@ -329,6 +342,21 @@ def worker_main(
     mpi_comm().barrier()
     worker_process_identities = mpi_comm().allgather(
         capture_worker_process_identity(mpi_rank()))
+
+    # Publish the process identities before backend construction begins. Model
+    # construction can load weights for several minutes, and an externally
+    # killed worker may not complete its MPI future. Registering the workers at
+    # this point lets the proxy observe such a death while it is still waiting
+    # for the READY signal.
+    if is_leader and worker_process_identities_signal is not None:
+        identities_msg = (worker_process_identities_signal, None,
+                          worker_process_identities)
+        if not worker_init_status_queue.notify_with_retry(identities_msg):
+            # The failed status queue cannot report its own failure. Let this
+            # escape through the MPI future so the proxy can observe it.
+            raise RuntimeError(
+                "Failed to deliver worker process identities to proxy")
+
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:

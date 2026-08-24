@@ -25,7 +25,9 @@ from diffusers.models.embeddings import TimestepEmbedding
 from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, WeightMode
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -39,6 +41,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 PRETRAINED_CONFIG_COMPAT_DEFAULTS = {
     "position_embedding_type": "unified_3d_mrope",
     "max_position_embeddings": 262144,
+    "temporal_compression_factor": 4,
     "temporal_compression_factor_sound": 1,
 }
 
@@ -54,6 +57,138 @@ def apply_pretrained_config_compat_defaults(
         if getattr(pretrained_config, key, None) is None:
             setattr(pretrained_config, key, value)
     return pretrained_config
+
+
+COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+
+
+def resolve_rope_axes_dim(pretrained_config) -> list:
+    """MRoPE axes: the explicit top-level ``rope_axes_dim`` wins (diffusers
+    precedence); the legacy ``rope_scaling["mrope_section"]`` is the fallback.
+    Both-declared-but-contradictory, wrong length, or a sum that does not
+    cover half the head dim are config errors.
+    """
+    top_level = getattr(pretrained_config, "rope_axes_dim", None)
+    rope_scaling = getattr(pretrained_config, "rope_scaling", None) or {}
+    nested = rope_scaling.get("mrope_section")
+
+    if top_level is not None and nested is not None and list(top_level) != list(nested):
+        raise ValueError(
+            f"Cosmos3 config declares contradictory MRoPE axes: rope_axes_dim="
+            f"{list(top_level)} vs rope_scaling.mrope_section={list(nested)}."
+        )
+    axes = top_level if top_level is not None else nested
+    if axes is None:
+        raise ValueError(
+            "Cosmos3 config declares neither rope_axes_dim nor rope_scaling.mrope_section."
+        )
+    axes = list(axes)
+    half_head_dim = pretrained_config.head_dim // 2
+    if len(axes) != 3 or sum(axes) != half_head_dim:
+        raise ValueError(
+            f"Cosmos3 MRoPE axes {axes} must have 3 entries summing to "
+            f"head_dim/2 = {half_head_dim}."
+        )
+    return axes
+
+
+@dataclass(frozen=True)
+class Cosmos3ArchRecipe:
+    """Complete architecture combination selected by ``backbone_type``.
+
+    Module construction derives from the recipe, never from individual config
+    flags, so a mixed config cannot half-apply.
+    """
+
+    name: str
+    gated_mlp: bool
+    und_qk_norm: bool
+    use_und_k_norm_for_gen: bool
+    nemotron_norms: bool
+
+
+QWEN3_RECIPE = Cosmos3ArchRecipe(
+    name="qwen3",
+    gated_mlp=True,
+    und_qk_norm=True,
+    use_und_k_norm_for_gen=False,
+    nemotron_norms=False,
+)
+
+NEMOTRON_DENSE_RECIPE = Cosmos3ArchRecipe(
+    name="nemotron_dense",
+    gated_mlp=False,
+    und_qk_norm=False,
+    use_und_k_norm_for_gen=True,
+    nemotron_norms=True,
+)
+
+
+def resolve_arch_recipe(pretrained_config) -> Cosmos3ArchRecipe:
+    """Select and validate the architecture recipe declared by the config."""
+    backbone_type = getattr(pretrained_config, "backbone_type", None)
+    if backbone_type is None:
+        recipe = QWEN3_RECIPE
+        expected_flags = {
+            "hidden_act": (None, "silu"),
+            "qk_norm_for_text": (None, True),
+            "use_und_k_norm_for_gen": (None, False),
+        }
+    elif backbone_type == COSMOS3_EDGE_BACKBONE_TYPE:
+        recipe = NEMOTRON_DENSE_RECIPE
+        expected_flags = {
+            "hidden_act": ("relu2",),
+            "qk_norm_for_text": (False,),
+            "use_und_k_norm_for_gen": (True,),
+            "sound_gen": (False,),
+            "attention_bias": (False,),
+            "rms_norm_eps": (1e-5,),
+        }
+    else:
+        raise ValueError(
+            f"Unsupported Cosmos3 transformer backbone_type={backbone_type!r}; "
+            f"supported: absent (Qwen3 family) or {COSMOS3_EDGE_BACKBONE_TYPE!r}."
+        )
+
+    for key, allowed in expected_flags.items():
+        actual = getattr(pretrained_config, key, None)
+        if actual not in allowed:
+            raise ValueError(
+                f"Cosmos3 config contradicts the {recipe.name!r} recipe: "
+                f"{key}={actual!r}, expected one of {allowed}."
+            )
+
+    # Latent-geometry invariants are validated for the Edge recipe only: every
+    # published Edge checkpoint declares 48/2, so a different value means a
+    # wrong or corrupt config. The qwen3 recipe is left unchecked because
+    # long-standing reduced-dimension test fixtures build it with tiny latent
+    # channels; real qwen3 checkpoints are protected by weight-shape checks.
+    if recipe is NEMOTRON_DENSE_RECIPE:
+        invariants = {"latent_channel": 48, "latent_patch_size": 2}
+        for key, expected in invariants.items():
+            actual = getattr(pretrained_config, key, None)
+            if actual != expected:
+                raise ValueError(
+                    f"Unsupported Cosmos3 Edge transformer config: {key}={actual!r}, "
+                    f"expected {expected}."
+                )
+
+    # A declared patch_latent_dim must agree with the latent geometry it is
+    # derived from (the transformer recomputes it and would silently ignore an
+    # inconsistent declaration).
+    declared_patch_dim = getattr(pretrained_config, "patch_latent_dim", None)
+    latent_channel = getattr(pretrained_config, "latent_channel", None)
+    latent_patch_size = getattr(pretrained_config, "latent_patch_size", None)
+    if None not in (declared_patch_dim, latent_channel, latent_patch_size):
+        expected_patch_dim = (latent_patch_size**2) * latent_channel
+        if declared_patch_dim != expected_patch_dim:
+            raise ValueError(
+                f"Inconsistent Cosmos3 transformer config: patch_latent_dim="
+                f"{declared_patch_dim}, but latent_patch_size**2 * latent_channel = "
+                f"{expected_patch_dim}."
+            )
+
+    return recipe
 
 
 class Qwen3VLTextRMSNorm(nn.Module):
@@ -78,6 +213,19 @@ class Qwen3VLTextRMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         output = self.weight * hidden_states.to(input_dtype)
         return output
+
+
+class NemotronRMSNorm(Qwen3VLTextRMSNorm):
+    """RMSNorm with the weight multiply in float32 before downcast.
+
+    ``F.rms_norm`` is bit-exact to this flavor for bf16 inputs, unlike the
+    parent's post-downcast bf16 weight multiply.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(
+            hidden_states, (hidden_states.shape[-1],), self.weight, self.variance_epsilon
+        )
 
 
 @dataclass
@@ -253,6 +401,7 @@ class Cosmos3CausalAttention(Attention):
         num_key_value_heads: int,
         head_dim: int,
         model_config: DiffusionModelConfig,
+        recipe: Cosmos3ArchRecipe,
         layer_idx: int = 0,
         module_name: Optional[str] = None,
     ):
@@ -270,14 +419,28 @@ class Cosmos3CausalAttention(Attention):
             module_name=module_name,
             enable_sequence_parallel=False,
         )
-        self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
-        self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
+        # Attention Q/K norms run the fp32-weight-multiply flavor in both
+        # recipes (this path has always been F.rms_norm); only the layernorms
+        # differ per recipe.
+        eps = model_config.pretrained_config.rms_norm_eps
+        if recipe.und_qk_norm:
+            self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+            self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        else:
+            self.norm_q = None
+            self.norm_k = None
+        if recipe.use_und_k_norm_for_gen:
+            self.k_norm_und_for_gen = NemotronRMSNorm(
+                hidden_size=head_dim, eps=eps, dtype=torch.bfloat16
+            )
+        else:
+            self.k_norm_und_for_gen = None
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
-        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
-        return q, k
+        if self.norm_q is None:
+            return q, k
+        return self.norm_q(q), self.norm_k(k)
 
     def forward_with_kv(
         self,
@@ -294,8 +457,19 @@ class Cosmos3CausalAttention(Attention):
         k = k.view(batch_size, seq_len, self.local_num_key_value_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.local_num_key_value_heads, self.head_dim)
 
+        # The gen tower consumes a separately normed view of the raw und keys;
+        # the und self-attention below must not see that norm.
+        k_for_gen = None
+        if self.k_norm_und_for_gen is not None:
+            k_for_gen = self.k_norm_und_for_gen(k)
+
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+
+        if k_for_gen is not None:
+            _, k_for_gen = qwen3_apply_rotary_pos_emb(q, k_for_gen, freqs_cos, freqs_sin)
+        else:
+            k_for_gen = k
 
         out = self._attn_impl(
             q,
@@ -305,7 +479,7 @@ class Cosmos3CausalAttention(Attention):
             timestep=timestep,
         )
 
-        return self.to_out[0](out), k, v
+        return self.to_out[0](out), k_for_gen, v
 
     def forward(self):
         raise NotImplementedError(
@@ -331,6 +505,7 @@ class Cosmos3CrossAttention(Attention):
         num_key_value_heads: int,
         head_dim: int,
         model_config: DiffusionModelConfig,
+        recipe: Cosmos3ArchRecipe,
         layer_idx: int = 0,
         module_name: Optional[str] = None,
     ):
@@ -338,6 +513,13 @@ class Cosmos3CrossAttention(Attention):
         if model_config.attention.backend == "TRTLLM":
             # TRTLLM backend is not supported for Cosmos3CrossAttention
             model_config.attention.backend = "VANILLA"
+            # Warn once per (module class, requested, resolved) triple so the
+            # fallback is visible without per-module-instance log spam.
+            logger.warning_once(
+                f"{type(self).__name__}: requested attention backend {original_backend} is not "
+                f"supported for Cosmos3 cross-attention; falling back to VANILLA.",
+                key=(type(self).__name__, original_backend, "VANILLA"),
+            )
 
         super().__init__(
             hidden_size=hidden_size,
@@ -355,14 +537,15 @@ class Cosmos3CrossAttention(Attention):
         )
         model_config.attention.backend = original_backend
 
-        self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
-        self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, dtype=torch.bfloat16)
+        # Same flavor note as Cosmos3CausalAttention: attention Q/K norms are
+        # fp32-weight-multiply in both recipes.
+        eps = model_config.pretrained_config.rms_norm_eps
+        self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
-        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
-        return q, k
+        return self.norm_q(q), self.norm_k(k)
 
     def forward(
         self,
@@ -427,35 +610,13 @@ class Cosmos3CrossAttention(Attention):
         return self.to_out[0](out)
 
 
-class Cosmos3UndDecoderLayer(nn.Module):
-    """Understanding pathway decoder layer: causal self-attention + MLP."""
-
-    def __init__(self, model_config: DiffusionModelConfig, layer_idx: int):
-        super().__init__()
-        self.layer_idx = layer_idx
-        hidden_size = model_config.pretrained_config.hidden_size
-        intermediate_size = model_config.pretrained_config.intermediate_size
-
-        self.self_attn = Cosmos3CausalAttention(
-            hidden_size=hidden_size,
-            num_attention_heads=model_config.pretrained_config.num_attention_heads,
-            num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
-            head_dim=model_config.pretrained_config.head_dim,
-            model_config=model_config,
-            layer_idx=layer_idx,
-            module_name=f"layers.{layer_idx}.self_attn",
-        )
-        self.input_layernorm = Qwen3VLTextRMSNorm(
-            hidden_size=hidden_size,
-            eps=model_config.pretrained_config.rms_norm_eps,
-            dtype=torch.bfloat16,
-        )
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(
-            hidden_size=hidden_size,
-            eps=model_config.pretrained_config.rms_norm_eps,
-            dtype=torch.bfloat16,
-        )
-        self.mlp = GatedMLP(
+def _build_cosmos3_mlp(
+    model_config: DiffusionModelConfig, recipe: Cosmos3ArchRecipe, layer_idx: int
+) -> nn.Module:
+    hidden_size = model_config.pretrained_config.hidden_size
+    intermediate_size = model_config.pretrained_config.intermediate_size
+    if recipe.gated_mlp:
+        return GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             bias=False,
@@ -464,6 +625,54 @@ class Cosmos3UndDecoderLayer(nn.Module):
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
         )
+    return MLP(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        bias=False,
+        activation=relu2,
+        dtype=torch.bfloat16,
+        config=model_config,
+        layer_idx=layer_idx,
+        reduce_output=model_config.mapping.tp_size > 1,
+    )
+
+
+def _layer_norm_cls(recipe: Cosmos3ArchRecipe):
+    return NemotronRMSNorm if recipe.nemotron_norms else Qwen3VLTextRMSNorm
+
+
+class Cosmos3UndDecoderLayer(nn.Module):
+    """Understanding pathway decoder layer: causal self-attention + MLP."""
+
+    def __init__(
+        self, model_config: DiffusionModelConfig, layer_idx: int, recipe: Cosmos3ArchRecipe
+    ):
+        super().__init__()
+        self.layer_idx = layer_idx
+        hidden_size = model_config.pretrained_config.hidden_size
+
+        self.self_attn = Cosmos3CausalAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=model_config.pretrained_config.num_attention_heads,
+            num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
+            head_dim=model_config.pretrained_config.head_dim,
+            model_config=model_config,
+            recipe=recipe,
+            layer_idx=layer_idx,
+            module_name=f"layers.{layer_idx}.self_attn",
+        )
+        norm_cls = _layer_norm_cls(recipe)
+        self.input_layernorm = norm_cls(
+            hidden_size=hidden_size,
+            eps=model_config.pretrained_config.rms_norm_eps,
+            dtype=torch.bfloat16,
+        )
+        self.post_attention_layernorm = norm_cls(
+            hidden_size=hidden_size,
+            eps=model_config.pretrained_config.rms_norm_eps,
+            dtype=torch.bfloat16,
+        )
+        self.mlp = _build_cosmos3_mlp(model_config, recipe, layer_idx)
 
     def forward(
         self,
@@ -500,11 +709,12 @@ class Cosmos3UndDecoderLayer(nn.Module):
 class Cosmos3GenDecoderLayer(nn.Module):
     """Generation pathway decoder layer: cross-attention (to UND K/V) + MLP."""
 
-    def __init__(self, model_config: DiffusionModelConfig, layer_idx: int):
+    def __init__(
+        self, model_config: DiffusionModelConfig, layer_idx: int, recipe: Cosmos3ArchRecipe
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         hidden_size = model_config.pretrained_config.hidden_size
-        intermediate_size = model_config.pretrained_config.intermediate_size
 
         self.cross_attention = Cosmos3CrossAttention(
             hidden_size=hidden_size,
@@ -512,28 +722,22 @@ class Cosmos3GenDecoderLayer(nn.Module):
             num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
             head_dim=model_config.pretrained_config.head_dim,
             model_config=model_config,
+            recipe=recipe,
             layer_idx=layer_idx,
             module_name=f"layers.{layer_idx}.cross_attention",
         )
-        self.input_layernorm = Qwen3VLTextRMSNorm(
+        norm_cls = _layer_norm_cls(recipe)
+        self.input_layernorm = norm_cls(
             hidden_size=hidden_size,
             eps=model_config.pretrained_config.rms_norm_eps,
             dtype=torch.bfloat16,
         )
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(
+        self.post_attention_layernorm = norm_cls(
             hidden_size=hidden_size,
             eps=model_config.pretrained_config.rms_norm_eps,
             dtype=torch.bfloat16,
         )
-        self.mlp = GatedMLP(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            bias=False,
-            dtype=torch.bfloat16,
-            config=model_config,
-            layer_idx=layer_idx,
-            reduce_output=model_config.mapping.tp_size > 1,
-        )
+        self.mlp = _build_cosmos3_mlp(model_config, recipe, layer_idx)
 
     def forward(
         self,
@@ -614,11 +818,16 @@ def _compute_default_rope_parameters(
 class Qwen3VLTextRotaryEmbedding(nn.Module):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
-        self.rope_type = model_config.pretrained_config.rope_scaling["rope_type"]
+        # Edge checkpoints omit rope_type from rope_scaling, and a checkpoint
+        # declaring the axes via top-level ``rope_axes_dim`` may omit the block
+        # entirely -- ``resolve_rope_axes_dim`` below supports that, so read it
+        # with the same tolerance rather than failing before reaching it.
+        rope_scaling = getattr(model_config.pretrained_config, "rope_scaling", None) or {}
+        self.rope_type = rope_scaling.get("rope_type", "default")
         self.max_seq_len_cached = model_config.pretrained_config.max_position_embeddings
         self.original_max_seq_len = model_config.pretrained_config.max_position_embeddings
 
-        self.mrope_section = model_config.pretrained_config.rope_scaling["mrope_section"]
+        self.mrope_section = resolve_rope_axes_dim(model_config.pretrained_config)
 
         inv_freq, self.attention_scaling = _compute_default_rope_parameters(model_config)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -675,7 +884,7 @@ class Cosmos3LanguageModel(nn.Module):
     computed once and reused across all sampling steps.
     """
 
-    def __init__(self, model_config: DiffusionModelConfig):
+    def __init__(self, model_config: DiffusionModelConfig, recipe: Cosmos3ArchRecipe):
         super().__init__()
         hidden_size = model_config.pretrained_config.hidden_size
         num_hidden_layers = model_config.pretrained_config.num_hidden_layers
@@ -688,7 +897,10 @@ class Cosmos3LanguageModel(nn.Module):
         )
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(model_config)
         self.layers = nn.ModuleList(
-            [Cosmos3UndDecoderLayer(model_config, layer_idx=i) for i in range(num_hidden_layers)]
+            [
+                Cosmos3UndDecoderLayer(model_config, layer_idx=i, recipe=recipe)
+                for i in range(num_hidden_layers)
+            ]
         )
 
     def forward(
@@ -723,9 +935,14 @@ class Cosmos3LanguageModel(nn.Module):
 class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__(model_config)
+        self.temporal_compression_factor_declared = (
+            getattr(model_config.pretrained_config, "temporal_compression_factor", None) is not None
+        )
         pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
+        self.recipe = resolve_arch_recipe(pretrained_config)
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
-        self.action_gen = getattr(pretrained_config, "action_gen", False)
+        # Config fact only: the transformer never constructs action modules.
+        self.has_action_weights = getattr(pretrained_config, "action_gen", False)
 
         self.hidden_size = pretrained_config.hidden_size
         self.num_hidden_layers = pretrained_config.num_hidden_layers
@@ -735,8 +952,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.timestep_scale = pretrained_config.timestep_scale
         self.base_fps = pretrained_config.base_fps
 
-        # Comes from VAE. Updated after VAE is loaded.
-        self.temporal_compression_factor = 4
+        # Config-declared (compat default 4); cross-checked against the VAE
+        # after component loading.
+        self.temporal_compression_factor = pretrained_config.temporal_compression_factor
 
         self.unified_3d_mrope_temporal_modality_margin = (
             pretrained_config.unified_3d_mrope_temporal_modality_margin
@@ -785,7 +1003,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 "Ring parallelism is not supported for Cosmos3 cross-attention."
             )
 
-        self.language_model = Cosmos3LanguageModel(model_config)
+        self.language_model = Cosmos3LanguageModel(model_config, self.recipe)
 
         self.vae2llm = nn.Linear(self.patch_latent_dim, self.hidden_size)
         self.llm2vae = nn.Linear(self.hidden_size, self.patch_latent_dim)
@@ -801,12 +1019,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         self.gen_layers = nn.ModuleList(
             [
-                Cosmos3GenDecoderLayer(model_config, layer_idx=i)
+                Cosmos3GenDecoderLayer(model_config, layer_idx=i, recipe=self.recipe)
                 for i in range(self.num_hidden_layers)
             ]
         )
 
-        self.norm_moe_gen = Qwen3VLTextRMSNorm(
+        self.norm_moe_gen = _layer_norm_cls(self.recipe)(
             hidden_size=self.hidden_size,
             eps=pretrained_config.rms_norm_eps,
         )
@@ -891,6 +1109,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         fps: float | None,
         device: torch.device,
         dtype: torch.dtype,
+        num_vision_items: int = 1,
+        share_vision_temporal_positions: bool = False,
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND (text) and GEN (visual) pathways."""
         B = text_mask.shape[0]
@@ -903,16 +1123,39 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         for b in range(B):
             real_len = int(text_lengths[b].item())
             t_pos, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
-            v_pos, _ = compute_mrope_position_ids_vision(
-                T,
-                Hp,
-                Wp,
-                temporal_offset=t_offset + self.unified_3d_mrope_temporal_modality_margin,
-                fps=effective_fps,
-                base_fps=self.base_fps,
-                temporal_compression_factor=self.temporal_compression_factor,
-                enable_fps_modulation=self.enable_fps_modulation,
-            )
+            media_temporal_offset = t_offset + self.unified_3d_mrope_temporal_modality_margin
+            gen_positions = []
+            if num_vision_items == 1 or share_vision_temporal_positions:
+                v_pos, _ = compute_mrope_position_ids_vision(
+                    T,
+                    Hp,
+                    Wp,
+                    temporal_offset=media_temporal_offset,
+                    fps=effective_fps,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor=self.temporal_compression_factor,
+                    enable_fps_modulation=self.enable_fps_modulation,
+                )
+                gen_positions.extend([v_pos] * num_vision_items)
+            else:
+                vision_offset: int | float = media_temporal_offset
+                for _ in range(num_vision_items):
+                    v_pos, vision_offset = compute_mrope_position_ids_vision(
+                        T,
+                        Hp,
+                        Wp,
+                        temporal_offset=vision_offset,
+                        fps=effective_fps,
+                        base_fps=self.base_fps,
+                        temporal_compression_factor=self.temporal_compression_factor,
+                        enable_fps_modulation=self.enable_fps_modulation,
+                    )
+                    gen_positions.append(v_pos)
+
+            pos_dtype = gen_positions[0].dtype
+            for pos in gen_positions[1:]:
+                pos_dtype = torch.promote_types(pos_dtype, pos.dtype)
+            v_pos = torch.cat([pos.to(pos_dtype) for pos in gen_positions], dim=1)
             if real_len < S_text:
                 t_pos = torch.cat(
                     [t_pos, torch.zeros(3, S_text - real_len, dtype=t_pos.dtype)], dim=1
@@ -1000,6 +1243,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         audio_latents: Optional[torch.Tensor] = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
         **kwargs,
     ) -> "TransformerOutput":
         """
@@ -1023,6 +1268,14 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 When provided, audio tokens are appended to the generation
                 sequence and an audio velocity is returned alongside the video
                 velocity.  Requires ``audio_gen=True`` in the pretrained config.
+            control_latents: Optional transfer-control latents. Controls are
+                clean (un-noised) vision context and are packed before the
+                noisy target; their outputs are discarded.
+            transfer_share_vision_temporal_positions: When True (the default),
+                control tokens reuse the target frames' mRoPE temporal
+                coordinates, so a control patch sits at zero displacement from
+                the output patch it governs and the shared coordinate carries
+                the correspondence. When False they take their own positions.
 
         Returns:
             TransformerOutput with video (and image alias) always set.
@@ -1044,6 +1297,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         with torch.autocast("cuda", enabled=True, dtype=torch.float32):
             time_embed = self.time_embedder((raw_timestep * self.timestep_scale))
         time_embed = time_embed.to(hidden_states.dtype)
+
+        if control_latents is None:
+            control_lantent_list: list[torch.Tensor] = []
+        elif isinstance(control_latents, torch.Tensor):
+            control_lantent_list = [control_latents]
+        else:
+            control_lantent_list = list(control_latents)
 
         if noisy_frame_mask is not None:
             # Build per-token mask from per-frame mask.
@@ -1068,6 +1328,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 fps,
                 hidden_states.device,
                 hidden_states.dtype,
+                num_vision_items=len(control_lantent_list) + 1,
+                share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
             cached_kv_full = self.language_model(
                 text_ids,
@@ -1099,6 +1361,15 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         # --- Audio token injection -------------------------------------------------
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
         T_audio = 0
+        T_control = 0
+        hidden_controls: list[torch.Tensor] = []
+        has_control = len(control_lantent_list) > 0
+
+        if has_control and audio_latents is not None:
+            raise ValueError(
+                "Cosmos3 transfer control latents cannot be combined with sound latents"
+            )
+
         if audio_latents is not None and self.audio_gen:
             T_audio = audio_latents.shape[2]
             hidden_audio = self.pack_audio_latents(audio_latents).to(hidden_gen.dtype)
@@ -1118,6 +1389,22 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 torch.cat([cos_v, cos_a], dim=1),
                 torch.cat([sin_v, sin_a], dim=1),
             )
+        elif has_control:
+            for idx, control in enumerate(control_lantent_list):
+                if control.shape != hidden_states.shape:
+                    raise ValueError(
+                        "Cosmos3 transfer control latent shape must match target latent shape: "
+                        f"control[{idx}]={tuple(control.shape)}, target={tuple(hidden_states.shape)}."
+                    )
+                hidden_control = self.vae2llm(
+                    self.patchify(
+                        control.to(device=hidden_gen.device, dtype=hidden_gen.dtype), T, H, W
+                    )
+                )
+                hidden_controls.append(hidden_control)
+                T_control += hidden_control.shape[1]
+            hidden_gen = torch.cat([*hidden_controls, hidden_gen], dim=1)
+            freqs_gen_combined = self.cached_freqs_gen
         else:
             freqs_gen_combined = self.cached_freqs_gen
         # --------------------------------------------------------------------------
@@ -1156,9 +1443,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
         # --- Decode video velocity ------------------------------------------------
-        video_vel = self.unpatchify(self.llm2vae(hidden_gen[:, :T_vid_tokens]), T, H, W)
+        video_vel = self.unpatchify(
+            self.llm2vae(hidden_gen[:, T_control : T_control + T_vid_tokens]), T, H, W
+        )
 
         # --- Decode audio velocity (if requested) ---------------------------------
+        # Control latents and audio are mutually exclusive (guarded above), so the
+        # audio span always starts right after the video tokens.
         audio_vel = None
         if T_audio > 0 and audio_latents is not None and self.audio_gen:
             # hidden_gen[:, T_vid_tokens:] → [B, T_audio, hidden_size]
@@ -1182,18 +1473,21 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             "action_modality_embed",
             "action_proj_",
         )
+        skipped_keys = []
 
         for key, value in weights.items():
             k = key
 
-            if k.startswith(skip_prefixes):
-                continue
-
-            # Normalize a leading "model." prefix up front so every remap below
-            # matches whether or not the checkpoint namespaces top-level tensors
-            # (e.g. "model.audio_proj_in.weight") under "model.".
+            # Normalize a leading "model." prefix up front so every skip and
+            # remap below matches whether or not the checkpoint namespaces
+            # top-level tensors (e.g. "model.audio_proj_in.weight") under
+            # "model.".
             if k.startswith("model."):
                 k = k[len("model.") :]
+
+            if k.startswith(skip_prefixes):
+                skipped_keys.append(k)
+                continue
 
             if k.startswith("proj_in."):
                 remapped[k.replace("proj_in.", "vae2llm.", 1)] = value
@@ -1221,9 +1515,15 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 remapped[k] = value
                 continue
 
-            # embed_tokens and norm → language_model.*
-            if k.startswith("embed_tokens.") or k.startswith("norm."):
+            # embed_tokens → language_model.*
+            if k.startswith("embed_tokens."):
                 remapped[f"language_model.{k}"] = value
+                continue
+
+            # Und final norm: normalizes the und hidden state consumed only by
+            # lm_head; the generation path uses per-layer und K/V exclusively.
+            if k.startswith("norm."):
+                skipped_keys.append(k)
                 continue
 
             # norm_moe_gen stays at top level
@@ -1252,6 +1552,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 "self_attn.to_out.": f"{und_lp}.self_attn.to_out.0.",
                 "self_attn.norm_q.": f"{und_lp}.self_attn.norm_q.",
                 "self_attn.norm_k.": f"{und_lp}.self_attn.norm_k.",
+                "self_attn.k_norm_und_for_gen.": f"{und_lp}.self_attn.k_norm_und_for_gen.",
             }
 
             # --- GEN attention → gen_layers.{i}.cross_attention.* ---
@@ -1303,35 +1604,78 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         }
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
-        for param_name, param in self._parameters.items():
-            if param is not None and param_name in remapped:
-                param.data.copy_(remapped[param_name].to(param.dtype))
+        # Coverage is default-fail in both directions: every parameter of every
+        # constructed module must receive a checkpoint tensor, and every mapped
+        # checkpoint tensor must land on a parameter. The remap-stage skip list
+        # above is the only source of intentional omissions.
+        missing = []
+        consumed = set()
 
-        loaded_linear = 0
-        loaded_other = 0
-        skipped_modules = []
+        for param_name, param in self._parameters.items():
+            if param is None:
+                continue
+            if param_name in remapped:
+                param.data.copy_(remapped[param_name].to(param.dtype))
+                consumed.add(param_name)
+            else:
+                missing.append(param_name)
+
+        def _linear_source_prefixes(module: Linear, name: str) -> list:
+            weights_config = getattr(module, "weights_loading_config", None)
+            weight_mode = getattr(weights_config, "weight_mode", None)
+            if weight_mode in (WeightMode.FUSED_QKV_LINEAR, WeightMode.FUSED_GATE_UP_LINEAR):
+                parent = name.rsplit(".", 1)[0]
+                for suffix, sources in loader.params_map.items():
+                    if name == suffix or name.endswith("." + suffix):
+                        return [f"{parent}.{source}." for source in sources]
+            return [f"{name}."]
+
         for name, module in self.named_modules():
-            if len(module._parameters) == 0:
+            if not name or len(module._parameters) == 0:
                 continue
 
             if isinstance(module, Linear):
                 weight_dicts = loader.get_linear_weights(module, name, remapped)
-                if weight_dicts:
+                # Fused sources yield one dict each; an empty dict means that
+                # source is absent, so a partially covered fusion also fails.
+                if weight_dicts and all(weight_dicts):
                     loader.load_linear_weights(module, name, weight_dicts)
-                    loaded_linear += 1
+                    prefixes = _linear_source_prefixes(module, name)
+                    consumed.update(k for k in remapped if any(k.startswith(p) for p in prefixes))
                 else:
-                    skipped_modules.append(f"{name}(Linear)")
+                    missing.append(f"{name}(Linear)")
             else:
                 module_weights = loader.filter_weights(name, remapped)
-                if module_weights:
-                    loaded_other += 1
-                else:
-                    has_params = any(p is not None for p in module._parameters.values())
-                    if has_params and name:
-                        skipped_modules.append(f"{name}({type(module).__name__})")
                 for param_name, param in module._parameters.items():
-                    if param is not None and param_name in module_weights:
+                    if param is None:
+                        continue
+                    if param_name in module_weights:
                         param.data.copy_(module_weights[param_name].to(param.dtype))
+                        consumed.add(f"{name}.{param_name}")
+                    else:
+                        missing.append(f"{name}.{param_name}")
+
+        if missing:
+            preview = ", ".join(missing[:10])
+            suffix = " ..." if len(missing) > 10 else ""
+            raise ValueError(
+                f"Cosmos3 checkpoint is missing weights for {len(missing)} constructed "
+                f"parameter(s)/module(s): {preview}{suffix}"
+            )
+        unconsumed = [k for k in remapped if k not in consumed]
+        if unconsumed:
+            preview = ", ".join(unconsumed[:10])
+            suffix = " ..." if len(unconsumed) > 10 else ""
+            logger.warning(
+                f"{len(unconsumed)} mapped checkpoint tensor(s) matched no constructed "
+                f"parameter: {preview}{suffix}"
+            )
+        if skipped_keys:
+            logger.info(
+                f"Skipped {len(skipped_keys)} intentionally unused checkpoint tensors "
+                f"(lm_head / und final norm / action heads): "
+                f"{', '.join(sorted(set(k.split('.')[0] for k in skipped_keys)))}"
+            )
 
     def post_load_weights(self) -> None:
         """Post-load processing: dtype conversion and Linear finalization."""

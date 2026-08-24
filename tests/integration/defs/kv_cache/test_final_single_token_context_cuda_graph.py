@@ -92,6 +92,7 @@ class _CudaGraphExecutionProbe:
         new_tensors_device: SampleStateTensors | None = None,
         spec_resource_manager: BaseResourceManager | None = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
+        peft_cache_data_type: torch.dtype | None = None,
     ) -> tuple[Any | None, Any | None, KeyType | None]:
         # A new decision means the preceding one reached eager execution if it
         # did not call replay. Keep that earlier observation unchanged.
@@ -104,7 +105,8 @@ class _CudaGraphExecutionProbe:
             draft_tokens_cuda,
             new_tensors_device,
             spec_resource_manager,
-            promoted_context_request_ids,
+            promoted_context_request_ids=promoted_context_request_ids,
+            peft_cache_data_type=peft_cache_data_type,
         )
         if promoted_context_request_ids:
             execution = _PromotedContextGraphExecution(

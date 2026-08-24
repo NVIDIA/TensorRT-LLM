@@ -3,11 +3,12 @@
 """Validation helpers for routed-expert (MoE) LoRA.
 
 MoE LoRA is supported only on the Cutlass backend with unquantized fp16/bf16 or
-per-tensor FP8 (qdq) base weights. This module provides a single helper,
-`check_moe_lora_supported`, that callers (typically the MoE factory in
-`create_moe.py`) can invoke at construction time so that unsupported
-combinations fail loudly instead of silently dropping the LoRA contribution at
-runtime.
+per-tensor FP8 (qdq) base weights. Resolution owns that contract at select time:
+``supports_moe_lora`` filters backends, and ``CutlassFusedMoE.can_implement``
+rejects unsupported base-weight quants when ``moe_lora_enabled`` is set.
+
+`check_moe_lora_supported` remains as a standalone assertion for unit tests and
+any caller that wants an explicit ValueError without going through resolution.
 
 Runtime-only rejections (min-latency mode, alltoall, CUDA-graph without slot
 pointers) are enforced in the C++ thop / runtime call paths and are NOT
@@ -16,7 +17,7 @@ re-checked here.
 
 from typing import Iterable, Optional, Set
 
-from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.quantization.mode import QuantMode
 
 # Canonical routed-expert MoE LoRA module names (single source of truth).
@@ -93,7 +94,7 @@ def check_moe_lora_supported(
 
     Args:
         moe_backend_name: The resolved `moe_backend` string (e.g. "CUTLASS",
-            "WIDEEP", "TRTLLM"). Comparison is case-insensitive.
+            "CUTEDSL", "TRTLLM"). Comparison is case-insensitive.
         lora_config: The model's `LoraConfig`, or None.
         quant_config: The model's `QuantConfig`, or None. We only reject when
             the layer is actually quantized (`quant_mode.has_any_quant`).

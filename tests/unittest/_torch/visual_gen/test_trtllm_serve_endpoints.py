@@ -15,6 +15,7 @@ in OpenAIServer.register_visual_gen_routes():
 
 import asyncio
 import base64
+import json
 import os
 from io import BytesIO
 from pathlib import Path
@@ -31,6 +32,9 @@ from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -135,8 +139,13 @@ class MockVisualGen:
         batch_aware: bool = True,
         validation_error: Optional[ValueError] = None,
         generate_error: Optional[BaseException] = None,
+        extra_param_specs: Optional[dict] = None,
+        model: str = "test-model",
+        supports_image_edit: bool = False,
     ):
         from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 
         self._image = image_output
         self._video = video_output
@@ -147,6 +156,8 @@ class MockVisualGen:
         # Raised out of generate(): models an engine-side failure class,
         # where validation_error models a coordinator preflight rejection.
         self._generate_error = generate_error
+        self._extra_param_specs = extra_param_specs or {}
+        self._model = model
         self._healthy = True
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
@@ -161,8 +172,6 @@ class MockVisualGen:
         # reject legitimate width/height/num_frames/... requests;
         # ``extra_param_specs`` lists a single known key so tests can
         # exercise both the accept-known and reject-unknown paths.
-        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
-
         self.executor = SimpleNamespace(
             default_generation_params={
                 "height": 64,
@@ -173,9 +182,9 @@ class MockVisualGen:
                 "num_frames": 8,
                 "frame_rate": 8.0,
             },
-            extra_param_specs={
-                "stg_scale": ExtraParamSchema(type="float", default=1.0),
-            },
+            extra_param_specs=extra_param_specs
+            or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
+            supports_image_edit=supports_image_edit,
         )
 
     def _maybe_batch(self, tensor, n):
@@ -229,7 +238,7 @@ class MockVisualGen:
         seeds request params from this, so it must return a fresh instance."""
         from tensorrt_llm.visual_gen import VisualGenParams
 
-        return VisualGenParams()
+        return VisualGenParams(**self.executor.default_generation_params)
 
     @property
     def extra_param_specs(self):
@@ -237,12 +246,12 @@ class MockVisualGen:
         every request ``extra_params`` key reaches the executor as
         ``unknown_extra_param`` (matches a pipeline with no model-specific
         knobs declared, like Flux or Wan 2.1)."""
-        return {}
+        return self._extra_param_specs
 
     @property
     def model(self):
         """Stand-in for VisualGen.model — used by warn-on-set logic."""
-        return "test-model"
+        return self._model
 
     def _check_health(self) -> bool:
         return self._healthy
@@ -310,13 +319,18 @@ class MockVisualGenResult:
 def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> TestClient:
     """Instantiate an OpenAIServer for VISUAL_GEN with a mocked generator.
 
-    We patch the ``VisualGen`` name inside the ``openai_server`` module so that
-    ``isinstance(generator, VisualGen)`` returns True for our mock.
+    The server detects VisualGen generators via ``_is_visual_gen_instance``
+    (a sys.modules probe, so plain LLM serving never imports visual_gen) and
+    caches the result in ``__init__``; patching the probe during construction
+    makes it recognize our mock.
     """
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
-    with patch("tensorrt_llm.serve.openai_server.VisualGen", MockVisualGen):
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
         server = OpenAIServer(
             generator=generator,
             model=model_name,
@@ -692,38 +706,397 @@ class TestImageGeneration:
 
 
 class TestImageEdit:
-    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+    """``/v1/images/edits`` support is gated by the loaded visual model."""
 
-    No in-tree pipeline implements image editing: Flux/Flux2 are
-    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-    video, not edited images. Restore the full happy-path coverage when an
-    edit-capable pipeline lands.
-    """
+    def _client(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        image_output: Optional[torch.Tensor] = None,
+        extra_param_specs: Optional[dict] = None,
+        model: str = "Qwen/Qwen-Image-Layered",
+        should_fail: bool = False,
+        supports_image_edit: bool = True,
+    ):
+        gen = MockVisualGen(
+            image_output=image_output if image_output is not None else _make_dummy_image_tensor(),
+            extra_param_specs=extra_param_specs,
+            model=model,
+            should_fail=should_fail,
+            supports_image_edit=supports_image_edit,
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        return _create_server(gen, model_name=model), gen
 
-    def test_image_edit_returns_not_implemented(self, image_client):
-        """Valid request body short-circuits to 501 NotImplemented."""
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
+    @pytest.mark.parametrize(
+        ("model", "supports_image_edit", "expected_status"),
+        [
+            ("not-a-canonical-edit-model-id", True, 200),
+            ("Qwen/Qwen-Image-Layered", False, 501),
+        ],
+    )
+    def test_image_edit_support_uses_loaded_pipeline_capability(
+        self, tmp_path, monkeypatch, model, supports_image_edit, expected_status
+    ):
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            model=model,
+            supports_image_edit=supports_image_edit,
+        )
+
+        resp = client.post(
             "/v1/images/edits",
             json={
-                "image": b64_img,
-                "prompt": "Make it blue",
-                "num_inference_steps": 10,
+                "prompt": "Make it red",
+                "image": _b64_white_png_1x1(),
+                "response_format": "b64_json",
             },
         )
-        assert resp.status_code == 501
-        body = resp.json()
-        assert body.get("type") == "NotImplementedError"
-        assert "not supported" in body.get("message", "").lower()
 
-    def test_image_edit_no_body_returns_not_implemented(self, image_client):
-        """The route doesn't parse a typed body; any incoming request still
-        gets 501, including ones that would have failed schema validation
-        before. Restore typed-body coverage when an edit pipeline lands."""
-        resp = image_client.post("/v1/images/edits", json={"prompt": "Edit without image"})
-        assert resp.status_code == 501
+        assert resp.status_code == expected_status
+        if expected_status == 501:
+            assert gen.last_params is None
+
+    def test_image_edit_accepts_json_base64_image(self, tmp_path, monkeypatch):
+        """JSON edit requests materialize inputs and map OpenAI-shaped fields."""
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            image_output=_make_dummy_image_tensor(4, 4),
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            content=json.dumps(
+                {
+                    "prompt": "split layers",
+                    "image": _b64_white_png_1x1(),
+                    "n": 2,
+                    "output_format": "webp",
+                    "response_format": "b64_json",
+                }
+            ),
+            headers={"content-type": "Application/JSON"},
+        )
+
+        assert resp.status_code == 200
+        assert str(gen.last_params.image).startswith(str(tmp_path))
+        assert not os.path.exists(gen.last_params.image)
+        assert gen.last_params.num_images_per_prompt == 2
         body = resp.json()
-        assert body.get("type") == "NotImplementedError"
+        assert body["output_format"] == "webp"
+        assert body["size"] == "4x4"
+        assert len(body["data"]) == 2
+
+    @pytest.mark.parametrize(
+        ("size", "expected_dimensions"),
+        [
+            ("auto", (None, None)),
+            ("32x48", (32, 48)),
+        ],
+    )
+    def test_image_edit_auto_size_allows_reference_size_derivation(
+        self, tmp_path, monkeypatch, size, expected_dimensions
+    ):
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "use reference dimensions",
+                "image": _b64_white_png_1x1(),
+                "size": size,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert (gen.last_params.width, gen.last_params.height) == expected_dimensions
+
+    @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
+    def test_image_edit_default_url_returns_fetchable_output(self, tmp_path, monkeypatch):
+        """The default edit response writes a fetchable image content URL."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        url = body["data"][0]["url"]
+        assert "/v1/images/" in url and "/content" in url
+        assert str(gen.last_params.image).startswith(str(tmp_path))
+        assert not os.path.exists(gen.last_params.image)
+
+        path = url.split("//", 1)[-1].split("/", 1)[1]
+        content = client.get("/" + path)
+        assert content.status_code == 200
+        assert content.content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert content.headers["content-type"] == "image/png"
+
+    def test_image_edit_rejects_json_array_body(self, tmp_path, monkeypatch):
+        """Non-object JSON bodies are client errors, not server errors."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            content=json.dumps(
+                [
+                    {
+                        "prompt": "split layers",
+                        "image": _b64_white_png_1x1(),
+                    }
+                ]
+            ),
+            headers={"content-type": "application/json"},
+        )
+
+        assert resp.status_code == 400
+        assert "must be an object" in resp.json()["message"]
+        assert gen.last_params is None
+
+    def test_image_edit_rejects_file_extra_params(self, tmp_path, monkeypatch):
+        """Multipart extra_params must be a JSON string field."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        image_bytes = BytesIO(base64.b64decode(_b64_white_png_1x1()))
+        resp = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "split layers",
+                "response_format": "b64_json",
+            },
+            files={
+                "image": ("input.png", image_bytes, "image/png"),
+                "extra_params": ("extra.json", b"{}", "application/json"),
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "extra_params" in resp.json()["message"]
+        assert gen.last_params is None
+
+    def test_image_edit_rejects_empty_image_list(self, tmp_path, monkeypatch):
+        """Empty image lists fail request validation before pipeline dispatch."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": [],
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="image")
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_non_image_base64_input(self, tmp_path, monkeypatch):
+        """Decoded image-edit bytes must be a supported image before disk write."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": base64.b64encode(b"not an image").decode("utf-8"),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        _assert_llm_envelope(
+            resp.json(),
+            code=400,
+            message_contains="image edit input is not a PNG/JPEG image",
+        )
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_non_image_upload_input(self, tmp_path, monkeypatch):
+        """Multipart image-edit bytes are sniffed before materialization."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            data={
+                "prompt": "split layers",
+                "response_format": "b64_json",
+            },
+            files={"image": ("input.png", BytesIO(b"not an image"), "image/png")},
+        )
+
+        assert resp.status_code == 400
+        _assert_llm_envelope(
+            resp.json(),
+            code=400,
+            message_contains="image edit input is not a PNG/JPEG image",
+        )
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_mask_with_clear_error(self, tmp_path, monkeypatch):
+        """Mask is OpenAI-shaped but not implemented by TRTLLM image edit yet."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "mask": _b64_white_png_1x1(),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "mask input is not supported" in resp.json()["message"]
+        assert gen.last_params is None
+
+    def test_image_edit_rejects_too_many_input_images(self, tmp_path, monkeypatch):
+        """Input image count is capped before files are materialized."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": [_b64_white_png_1x1()] * 17,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "at most 16 input images" in resp.json()["message"]
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_allows_max_input_images_without_output_fanout(self, tmp_path, monkeypatch):
+        """Multiple edit inputs are joint conditioning, not output fan-out."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": [_b64_white_png_1x1()] * 16,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert len(gen.last_params.image) == 16
+        assert len(resp.json()["data"]) == 1
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_excessive_output_fanout(self, tmp_path, monkeypatch):
+        """Layered output fan-out is capped before files are materialized."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            extra_param_specs={
+                "layers": ExtraParamSchema(type="int", default=4, range=(1, 16)),
+            },
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "n": 5,
+                "extra_params": {"layers": 16},
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "at most 64 output images" in resp.json()["message"]
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_rejects_oversized_base64_image_before_decode(self, tmp_path, monkeypatch):
+        """Base64 image size is capped before allocating decoded bytes."""
+        from tensorrt_llm.serve import visual_gen_utils
+
+        client, gen = self._client(tmp_path, monkeypatch)
+        monkeypatch.setattr(visual_gen_utils, "IMAGE_EDIT_MAX_IMAGE_BYTES", 8)
+        monkeypatch.setattr(
+            visual_gen_utils.base64,
+            "b64decode",
+            lambda *args, **kwargs: pytest.fail("oversized payload was decoded"),
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": "A" * 13,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "per-image byte limit" in resp.json()["message"]
+        assert gen.last_params is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_image_edit_cleans_inputs_when_generation_fails(self, tmp_path, monkeypatch):
+        """Temporary edit inputs are removed even when generation raises."""
+        client, gen = self._client(
+            tmp_path,
+            monkeypatch,
+            should_fail=True,
+        )
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": _b64_white_png_1x1(),
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 500
+        assert gen.last_params is not None
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "image_value",
+        [
+            "/tmp/server-local-image.png",
+            "file:///tmp/server-local-image.png",
+            "https://example.com/server-local-image.png",
+        ],
+    )
+    def test_image_edit_rejects_json_path_or_url_image(self, tmp_path, monkeypatch, image_value):
+        """Serving image-edit input strings must be base64, not server paths or URLs."""
+        client, gen = self._client(tmp_path, monkeypatch)
+
+        resp = client.post(
+            "/v1/images/edits",
+            json={
+                "prompt": "split layers",
+                "image": image_value,
+                "response_format": "b64_json",
+            },
+        )
+
+        assert resp.status_code == 400
+        assert gen.last_params is None
 
 
 # =========================================================================
@@ -1866,6 +2239,7 @@ class TestVideoZeroFrameDerivationRejected:
         declares a ``frame_rate``: the parser must reject the request with
         HTTP 400 instead of silently dropping the duration and returning the
         pipeline's default ``num_frames``."""
+        video_client.mock_gen.executor.default_generation_params.pop("frame_rate", None)
         resp = video_client.post(
             "/v1/videos/generations",
             json={

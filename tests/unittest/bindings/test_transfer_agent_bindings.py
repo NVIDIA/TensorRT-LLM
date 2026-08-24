@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import numpy as np
 import pytest
 
 # Try to import the transfer agent binding module
@@ -165,6 +166,40 @@ def test_memory_descs():
 
 
 @pytest.mark.cpu_only
+def test_memory_descs_from_readonly_arrays():
+    """Test MemoryDescs construction from read-only arrays."""
+    addrs = np.array([0x1000, 0x2000], dtype=np.int64)
+    sizes = np.array([4096, 8192], dtype=np.int64)
+    device_ids = np.array([0, 1], dtype=np.int32)
+    addrs.flags.writeable = False
+    sizes.flags.writeable = False
+    device_ids.flags.writeable = False
+
+    descs = tab.MemoryDescs.from_arrays(tab.MemoryType.VRAM, addrs, sizes, device_ids)
+
+    assert [(desc.addr, desc.len, desc.device_id) for desc in descs.descs] == [
+        (0x1000, 4096, 0),
+        (0x2000, 8192, 1),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_memory_descs_from_readonly_arrays_uniform_device():
+    """Test uniform-device MemoryDescs construction from read-only arrays."""
+    addrs = np.array([0x1000, 0x2000], dtype=np.int64)
+    sizes = np.array([4096, 8192], dtype=np.int64)
+    addrs.flags.writeable = False
+    sizes.flags.writeable = False
+
+    descs = tab.MemoryDescs.from_arrays_uniform_device(tab.MemoryType.VRAM, addrs, sizes, 2)
+
+    assert [(desc.addr, desc.len, desc.device_id) for desc in descs.descs] == [
+        (0x1000, 4096, 2),
+        (0x2000, 8192, 2),
+    ]
+
+
+@pytest.mark.cpu_only
 def test_memory_descs_empty():
     """Test MemoryDescs with empty list."""
     descs = tab.MemoryDescs(tab.MemoryType.DRAM, [])
@@ -258,6 +293,8 @@ def test_base_agent_config_default():
     config = tab.BaseAgentConfig()
     # Default values should be set
     assert config is not None
+    assert config.rank is None
+    assert config.world_size is None
 
 
 @pytest.mark.cpu_only
@@ -269,6 +306,8 @@ def test_base_agent_config_custom():
     use_listen_thread = True
     enable_telemetry = True
     backend_params = {"key1": "value1", "key2": "value2"}
+    rank = 2
+    world_size = 4
 
     config = tab.BaseAgentConfig(
         name=name,
@@ -277,6 +316,8 @@ def test_base_agent_config_custom():
         use_listen_thread=use_listen_thread,
         enable_telemetry=enable_telemetry,
         backend_params=backend_params,
+        rank=rank,
+        world_size=world_size,
     )
 
     assert config.name == name
@@ -285,6 +326,8 @@ def test_base_agent_config_custom():
     assert config.use_listen_thread == use_listen_thread
     assert config.enable_telemetry == enable_telemetry
     assert config.backend_params == backend_params
+    assert config.rank == rank
+    assert config.world_size == world_size
 
 
 @pytest.mark.cpu_only
@@ -309,6 +352,12 @@ def test_base_agent_config_readwrite():
 
     config.backend_params = {"test_key": "test_value"}
     assert config.backend_params == {"test_key": "test_value"}
+
+    config.rank = 1
+    assert config.rank == 1
+
+    config.world_size = 2
+    assert config.world_size == 2
 
 
 @pytest.mark.cpu_only

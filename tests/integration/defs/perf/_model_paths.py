@@ -26,8 +26,6 @@ MODEL_PATH_DICT = {
     "llama_v4_scout_17b_16e_instruct": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
     "llama_v4_scout_17b_16e_instruct_fp8": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
     "llama_v4_scout_17b_16e_instruct_fp4": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
-    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
-    "deepseek_r1_distill_llama_70b": "DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B/",
     "gemma_3_27b_it": "gemma/gemma-3-27b-it",
     "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
     "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
@@ -59,13 +57,6 @@ MODEL_PATH_DICT = {
     "qwen2_5_vl_7b_instruct": "Qwen2.5-VL-7B-Instruct",
     "qwen2_5_vl_7b_instruct_fp8": "multimodals/Qwen2.5-VL-7B-Instruct-FP8",
     "qwen2_5_vl_7b_instruct_fp4": "multimodals/Qwen2.5-VL-7B-Instruct-FP4",
-    "phi_4_reasoning_plus": "Phi-4-reasoning-plus",
-    "phi_4_reasoning_plus_fp8": "nvidia-Phi-4-reasoning-plus-FP8",
-    "phi_4_reasoning_plus_fp4": "nvidia-Phi-4-reasoning-plus-NVFP4",
-    "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
-    "phi_4_multimodal_instruct_fp4": "multimodals/Phi-4-multimodal-instruct-FP4",
-    "phi_4_multimodal_instruct_fp8": "multimodals/Phi-4-multimodal-instruct-FP8",
-    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
     "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b",
@@ -103,6 +94,8 @@ MODEL_PATH_DICT = {
     "minimax_m3_fp4": "MiniMax-M3-NVFP4",
     # Kimi K2.5 NVFP4 (~1T MoE multimodal)
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
+    # Kimi K3 (KDA linear attention + MLA MoE, MXFP4 routed experts)
+    "kimi_k3": "Kimi-K3",
     # Keys below are sanity-side aliases; some point to the same weights as
     # entries above but are kept under sanity's historical naming.
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
@@ -113,6 +106,10 @@ MODEL_PATH_DICT = {
     "super_bf16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
     "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
     "glm_5_nvfp4": "GLM-5-NVFP4",
+    # Nemotron-Ultra-V3 (550B-A55B) mixed NVFP4 weights + FP8 KV + fp16 Mamba
+    # cache. Synced locally under llm_models_root() (llm-models repo) -- distinct
+    # from the HF-download `nemotron_3_ultra_550b_nvfp4` entry in HF_MODEL_PATH.
+    "nemotron_ultra_v3_fp4": "Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k",
 }
 
 # Models loaded directly by HuggingFace repo id (downloaded at runtime, not synced locally).

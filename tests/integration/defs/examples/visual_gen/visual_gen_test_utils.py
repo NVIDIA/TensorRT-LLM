@@ -17,25 +17,20 @@
 import base64
 import contextlib
 import gc
-import glob
 import json
 import multiprocessing
 import os
-import random
 import shutil
 import subprocess
 import sys
-import time
 import traceback
-import urllib.request
 import zipfile
 from dataclasses import dataclass
-from typing import Collection, Literal
+from typing import Collection, Iterator, Literal
 
 import pytest
 import torch
 import torch._inductor.config as inductor_config
-from defs.trt_test_alternative import check_call
 from torch._inductor.async_compile import shutdown_compile_workers
 
 # =============================================================================
@@ -415,6 +410,38 @@ def _cleanup_cuda():
 
 
 @contextlib.contextmanager
+def _lpips_pinned_fp32_matmul_precision() -> Iterator[None]:
+    """Pin fp32-matmul arithmetic so LPIPS goldens are portable across hosts.
+
+    NGC PyTorch containers default matmul TF32 on (``float32_matmul_precision
+    == "high"``); PyPI torch defaults it off (``"highest"``). A model with fp32
+    GEMMs inside its denoising loop (Cosmos3: the RoPE frequency matmul, the
+    fp32 timestep embedder, and the fp32 autocast block in
+    ``transformer_cosmos3.py``) therefore produces a different trajectory under
+    each default, and a golden cut under one fails under the other -- measured
+    LPIPS-to-golden moved 0.132 -> 0.054 from this single flag. Pin "highest"
+    (IEEE fp32, measured bit-stable across torch 2.11/2.12 and B200/B300), and
+    pin cuDNN TF32 to its universal default so the second knob cannot drift.
+    bf16 compute -- all of the heavy kernels -- is unaffected by either knob.
+
+    Applied per generation path rather than from
+    ``_lpips_deterministic_algorithms``: that helper also wraps generation for
+    LTX-2, HunyuanVideo, FLUX, QwenImage and WAN, whose goldens were cut
+    without the pin and are not re-baselined here. Keep the blast radius equal
+    to the goldens a change actually re-cuts.
+    """
+    previous_precision = torch.get_float32_matmul_precision()
+    previous_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cudnn.allow_tf32 = True
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+        torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
+
+
+@contextlib.contextmanager
 def _lpips_deterministic_algorithms(*, fully_eager=False):
     previous_deterministic = torch.are_deterministic_algorithms_enabled()
     previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
@@ -651,232 +678,6 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
 
 
 # =============================================================================
-# VBench setup and score helpers
-# =============================================================================
-
-VBENCH_DIMENSIONS = [
-    "subject_consistency",
-    "background_consistency",
-    "motion_smoothness",
-    "dynamic_degree",
-    "aesthetic_quality",
-    "imaging_quality",
-]
-
-VBENCH_REPO = "https://github.com/Vchitect/VBench.git"
-# Pin to a fixed commit for reproducible shallow-fetch.
-VBENCH_COMMIT = "98b19513678e99c80d8377fda25ba53b81a491a6"
-
-DINO_REPO = "https://github.com/facebookresearch/dino.git"
-DINO_HUB_DIR_NAME = "facebookresearch_dino_main"
-
-AESTHETIC_PREDICTOR_URL = (
-    "https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/sa_0_4_vit_l_14_linear.pth"
-)
-AESTHETIC_PREDICTOR_FILENAME = "sa_0_4_vit_l_14_linear.pth"
-AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "emb_reader")
-
-
-def _prepare_vbench_repo(llm_venv):
-    """Prepare the pinned VBench checkout and dependencies for this venv."""
-    workspace = llm_venv.get_working_directory()
-    repo_path = os.path.join(workspace, "VBench_repo")
-    _precache_dino_for_torch_hub()
-    _precache_aesthetic_predictor()
-    if not os.path.exists(repo_path):
-        # Shallow-fetch only the pinned commit to avoid downloading full history (~350 MB).
-        os.makedirs(repo_path, exist_ok=True)
-        check_call(["git", "init", repo_path], shell=False)
-        check_call(
-            ["git", "-C", repo_path, "remote", "add", "origin", VBENCH_REPO],
-            shell=False,
-        )
-        check_call(
-            ["git", "-C", repo_path, "fetch", "--depth", "1", "origin", VBENCH_COMMIT],
-            shell=False,
-        )
-        check_call(["git", "-C", repo_path, "checkout", "FETCH_HEAD"], shell=False)
-
-    # The checkout persists across sessions, while llm_venv may be new.
-    llm_venv.run_cmd(
-        [
-            "-m",
-            "pip",
-            "install",
-            "tqdm>=4.60.0",
-            "openai-clip>=1.0",
-            "easydict",
-            "decord>=0.6.0",
-            "imageio",
-        ]
-    )
-    llm_venv.run_cmd(["-m", "pip", "install", "--no-deps", "pyiqa>=0.1.0"])
-    return repo_path
-
-
-def _precache_dino_for_torch_hub():
-    """Pre-clone DINO into the torch.hub cache to avoid GitHub API rate limits."""
-    hub_dir = torch.hub.get_dir()
-    os.makedirs(hub_dir, exist_ok=True)
-
-    dino_cache = os.path.join(hub_dir, DINO_HUB_DIR_NAME)
-    if not os.path.isdir(dino_cache):
-        check_call(
-            ["git", "clone", "--depth", "1", "-b", "main", DINO_REPO, dino_cache],
-            shell=False,
-        )
-
-
-def _precache_aesthetic_predictor():
-    """Pre-download LAION aesthetic predictor weights with retry handling."""
-    os.makedirs(AESTHETIC_PREDICTOR_CACHE_DIR, exist_ok=True)
-    cached_path = os.path.join(AESTHETIC_PREDICTOR_CACHE_DIR, AESTHETIC_PREDICTOR_FILENAME)
-    if os.path.isfile(cached_path):
-        return
-
-    max_retries = 8
-    for attempt in range(max_retries):
-        try:
-            req = urllib.request.Request(
-                AESTHETIC_PREDICTOR_URL,
-                headers={"User-Agent": "TensorRT-LLM-CI/1.0"},
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data = resp.read()
-            tmp_path = cached_path + ".tmp"
-            with open(tmp_path, "wb") as f:
-                f.write(data)
-            os.replace(tmp_path, cached_path)
-            return
-        except Exception as exc:
-            if attempt < max_retries - 1:
-                wait = min(10 * 2**attempt, 120) + random.uniform(0, 5)
-                print(
-                    "[precache] Aesthetic predictor download attempt "
-                    f"{attempt + 1}/{max_retries} failed ({exc}), retrying in {wait:.0f}s..."
-                )
-                time.sleep(wait)
-            else:
-                raise RuntimeError(
-                    f"Failed to download aesthetic predictor after {max_retries} attempts: {exc}"
-                ) from exc
-
-
-def _normalize_score(val):
-    """Normalize a VBench score to a zero-to-one scale."""
-    if isinstance(val, bool):
-        return float(val)
-    if isinstance(val, (int, float)) and val > 1.5:
-        return val / 100.0
-    return float(val)
-
-
-def _get_per_video_scores(results, video_path_substr):
-    """Get per-dimension scores for a matching video from VBench results."""
-    scores = {}
-    for dim in VBENCH_DIMENSIONS:
-        dim_result = results[dim]
-        assert isinstance(dim_result, list) and len(dim_result) >= 2, (
-            f"Dimension '{dim}' result must be [overall_score, video_results]; "
-            f"got {type(dim_result)}"
-        )
-        video_results = dim_result[1]
-        for entry in video_results:
-            if video_path_substr in entry.get("video_path", ""):
-                scores[dim] = _normalize_score(entry.get("video_results"))
-                break
-        else:
-            raise AssertionError(
-                f"No video matching '{video_path_substr}' in dimension '{dim}'; "
-                f"paths: {[e.get('video_path') for e in video_results]}"
-            )
-    return scores
-
-
-def _run_vbench_and_report(
-    vbench_repo_root,
-    videos_dir,
-    trtllm_filename,
-    llm_venv,
-    title,
-    golden_scores=None,
-    max_score_diff=0.10,
-):
-    """Run VBench, report scores, and optionally compare against golden values."""
-    output_path = os.path.join(
-        llm_venv.get_working_directory(), "vbench_eval_output", title.replace(" ", "_").lower()
-    )
-    os.makedirs(output_path, exist_ok=True)
-    evaluate_script = os.path.join(vbench_repo_root, "evaluate.py")
-    cmd = [
-        evaluate_script,
-        "--videos_path",
-        videos_dir,
-        "--output_path",
-        output_path,
-        "--mode",
-        "custom_input",
-    ]
-    cmd.extend(["--dimension"] + VBENCH_DIMENSIONS)
-    _venv_check_call(llm_venv, cmd)
-
-    pattern = os.path.join(output_path, "*_eval_results.json")
-    result_files = glob.glob(pattern)
-    assert result_files, (
-        f"No eval results found matching {pattern}; output dir: {os.listdir(output_path)}"
-    )
-    result_file = max(result_files, key=os.path.getmtime)
-    with open(result_file, "r") as f:
-        results = json.load(f)
-    for dim in VBENCH_DIMENSIONS:
-        assert dim in results, (
-            f"Expected dimension '{dim}' in results; keys: {list(results.keys())}"
-        )
-
-    scores_trtllm = _get_per_video_scores(results, trtllm_filename)
-    max_len = max(len(d) for d in VBENCH_DIMENSIONS)
-
-    if golden_scores is not None:
-        header = f"{'Dimension':<{max_len}}  |  {'TRT-LLM':>10}  |  {'Golden':>10}  |  {'Diff':>8}"
-    else:
-        header = f"{'Dimension':<{max_len}}  |  {'TRT-LLM':>10}"
-    separator = "-" * len(header)
-    print("\n" + "=" * len(header))
-    print(f"VBench dimension scores ({title})")
-    print("=" * len(header))
-    print(header)
-    print(separator)
-
-    for dim in VBENCH_DIMENSIONS:
-        trtllm_score = scores_trtllm[dim]
-        if golden_scores is not None:
-            golden_score = golden_scores[dim]
-            print(
-                f"{dim:<{max_len}}  |  {trtllm_score:>10.4f}  |  {golden_score:>10.4f}  |  "
-                f"{abs(trtllm_score - golden_score):>8.4f}"
-            )
-        else:
-            print(f"{dim:<{max_len}}  |  {trtllm_score:>10.4f}")
-    print(separator)
-
-    if golden_scores is None:
-        print("\n** Baseline run — no golden scores to compare against. **")
-        print("** Copy the values above into the GOLDEN_SCORES dict.  **\n")
-        return scores_trtllm
-
-    max_diff_val = max(abs(scores_trtllm[dim] - golden_scores[dim]) for dim in VBENCH_DIMENSIONS)
-    print(f"max_diff={max_diff_val:.4f}  (threshold={max_score_diff})")
-    print("=" * len(header) + "\n")
-    for dim in VBENCH_DIMENSIONS:
-        diff = abs(scores_trtllm[dim] - golden_scores[dim])
-        assert diff < max_score_diff or scores_trtllm[dim] >= golden_scores[dim], (
-            f"Dimension '{dim}' score difference {diff:.4f} >= {max_score_diff} "
-            f"(TRT-LLM={scores_trtllm[dim]:.4f}, golden={golden_scores[dim]:.4f})"
-        )
-    return scores_trtllm
-
-
-# =============================================================================
 # WAN LPIPS configuration and generation helpers
 # =============================================================================
 
@@ -904,6 +705,17 @@ WAN22_LPIPS_NUM_INFERENCE_STEPS = 4
 WAN22_LPIPS_GUIDANCE_SCALE = 4.0
 WAN22_LPIPS_SEED = 42
 WAN22_LPIPS_FRAME_RATE = 16.0
+
+# FastWan 2.2 TI2V-5B (DMD distilled): fixed 3-step, CFG-free (guidance_scale=1.0).
+FASTWAN_LPIPS_PROMPT = "A red fox walking through snow"
+FASTWAN_LPIPS_NEGATIVE_PROMPT = ""
+FASTWAN_LPIPS_HEIGHT = 704
+FASTWAN_LPIPS_WIDTH = 1280
+FASTWAN_LPIPS_NUM_FRAMES = 121
+FASTWAN_LPIPS_NUM_INFERENCE_STEPS = 3
+FASTWAN_LPIPS_GUIDANCE_SCALE = 1.0
+FASTWAN_LPIPS_SEED = 42
+FASTWAN_LPIPS_FRAME_RATE = 24.0
 
 
 def _run_wan_lpips_pipeline(

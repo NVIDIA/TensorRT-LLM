@@ -17,17 +17,19 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/tokenIdExt.h" // TokenId, Digest, TokenIdExt
 #include "kv_cache_manager_v2/utils/typedIndex.h"
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/assert.h"
 
-#include <array>
 #include <cstdint>
 #include <cstring>
-#include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <sys/types.h>
 #include <variant>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -72,99 +74,16 @@ enum class PageIndexMode : int
 // Strongly-typed integer aliases (mirroring Python NewType wrappers).
 // ---------------------------------------------------------------------------
 
-// Index of a cache level (0 = GPU, 1 = host, 2 = disk, ...).
+// Index of a cache level (0 = hot; subsequent levels are colder storage tiers).
 using CacheLevel = StrongIndex<int, struct CacheLevelTag, 0>;
-inline constexpr CacheLevel kGpuLevel{0};
-
-// Vocabulary token identifier (normal tokens only).
-using TokenId = int64_t;
+// The kernel-facing hot level; colder levels may also use GPU memory.
+inline constexpr CacheLevel kHotLevel{0};
 
 // Opaque request identifier shared with the rest of the batch manager.
 using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;
 
 // Opaque LoRA task identifier shared with the rest of the batch manager.
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
-
-// 32-byte aligned to enable SIMD.
-inline constexpr int kDIGEST_LEN = 32;
-
-struct alignas(kDIGEST_LEN) Digest : std::array<std::byte, kDIGEST_LEN>
-{
-    // Custom operator== needed to emit SIMD code
-    bool operator==(Digest const& o) const noexcept
-    {
-        return std::memcmp(this, &o, kDIGEST_LEN) == 0;
-    }
-
-    bool operator!=(Digest const& o) const noexcept
-    {
-        return !(*this == o);
-    }
-};
-
-// Heap-allocated digest token for multi-modal tokens.
-// Copyable (deep-copies the digest) with value-based equality.
-// Digest tokens are rare, so unique_ptr keeps sizeof(TokenIdExt) small.
-class DigestToken
-{
-public:
-    explicit DigestToken(Digest const& d)
-        : mData(std::make_unique<Digest>(d))
-    {
-    }
-
-    explicit DigestToken(std::unique_ptr<Digest> d)
-        : mData(std::move(d))
-    {
-    }
-
-    DigestToken(DigestToken const& o)
-        : mData(std::make_unique<Digest>(*o.mData))
-    {
-    }
-
-    DigestToken(DigestToken&&) noexcept = default;
-
-    DigestToken& operator=(DigestToken const& o)
-    {
-        if (this != &o)
-            mData = std::make_unique<Digest>(*o.mData);
-        return *this;
-    }
-
-    DigestToken& operator=(DigestToken&&) noexcept = default;
-
-    bool operator==(DigestToken const& o) const
-    {
-        return *mData == *o.mData;
-    }
-
-    bool operator!=(DigestToken const& o) const
-    {
-        return !(*this == o);
-    }
-
-    std::byte const* data() const noexcept
-    {
-        return mData->data();
-    }
-
-    size_t size() const noexcept
-    {
-        return mData->size();
-    }
-
-    Digest const& digest() const noexcept
-    {
-        return *mData;
-    }
-
-private:
-    std::unique_ptr<Digest> mData;
-};
-
-// Extended token id: normal TokenId or a heap-allocated digest for multi-modal tokens.
-using TokenIdExt = std::variant<TokenId, DigestToken>;
 
 // Ordinal index of a KV cache block (sequence of tokens).
 using BlockOrdinal = StrongIndex<int, struct BlockOrdinalTag, -1>;
@@ -204,6 +123,69 @@ inline constexpr Priority kPriorityDefault = 35;
 using SlidingWindowSize = std::optional<int>;
 
 // ---------------------------------------------------------------------------
+//! Non-owning view into a contiguous buffer (a C++17 stand-in for std::span).
+//!
+//! The referenced buffer must outlive the view. This remains an aggregate, so
+//! `Span<T>{}` creates an empty view and `Span<T>{ptr, len}` is plain brace-init.
+//! Supports operator[] for uniform access with std::vector<T>.
+// ---------------------------------------------------------------------------
+template <typename T>
+struct Span
+{
+    T* ptr = nullptr;
+    int len = 0;
+
+    T& operator[](int idx)
+    {
+        return ptr[idx];
+    }
+
+    T const& operator[](int idx) const
+    {
+        return ptr[idx];
+    }
+
+    int size() const noexcept
+    {
+        return len;
+    }
+
+    T* data() const noexcept
+    {
+        return ptr;
+    }
+
+    T* begin() const noexcept
+    {
+        return ptr;
+    }
+
+    T* end() const noexcept
+    {
+        return ptr + len;
+    }
+};
+
+//! Create a non-owning const Span over a std::vector.
+//!
+//! The source vector must outlive the returned view and must not reallocate while
+//! the view is in use.
+template <typename T>
+inline Span<T const> toSpan(std::vector<T> const& vec) noexcept
+{
+    TLLM_CHECK_DEBUG(vec.size() <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    return Span<T const>{vec.data(), static_cast<int>(vec.size())};
+}
+
+//! Non-owning view of a token sequence; the source buffer must outlive the view.
+//!
+//! Used on the hot ingest path: a digest-free int32 token buffer can be
+//! reinterpret_cast to TokenIdExt const* and matched/hashed with no per-token
+//! copy. TokenIdExt is 4 bytes and bit-identical to a normal int32 token (see
+//! tokenIdExt.h).
+using TokenSpan = Span<TokenIdExt const>;
+
+// ---------------------------------------------------------------------------
 // Address types
 // ---------------------------------------------------------------------------
 
@@ -228,16 +210,3 @@ using Address = std::variant<MemAddress, DiskAddress>;
 using DataRole = std::string;
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
-
-// std::hash specialization for Digest/BlockKey so unordered_map works without a custom hasher.
-template <>
-struct std::hash<tensorrt_llm::batch_manager::kv_cache_manager_v2::Digest>
-{
-    size_t operator()(tensorrt_llm::batch_manager::kv_cache_manager_v2::Digest const& k) const noexcept
-    {
-        // First 8 bytes of a SHA-256 digest are already well-distributed.
-        uint64_t v;
-        std::memcpy(&v, k.data(), sizeof(v));
-        return static_cast<size_t>(v);
-    }
-};

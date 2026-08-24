@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 import torch
 import triton
-from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from tensorrt_llm._utils import prefer_pinned
@@ -37,6 +36,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
 from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
+from ...modules.top_k import TopK, TopKImplementation
 from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.llm_request import LlmRequestState
 from ...pyexecutor.resource_manager import KVCacheCompressionManager
@@ -51,6 +51,8 @@ from .triattention_kernels import (
 )
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
     from ...pyexecutor.llm_request import LlmRequest
@@ -150,6 +152,8 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         config: "TriAttentionKvCacheCompressionConfig",
         kv_cache_manager: KVCacheManagerV2,
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+        *,
+        pretrained_config: "PretrainedConfig",
     ) -> None:
         super().__init__(config, kv_cache_manager, draft_kv_cache_manager)
         self.budget = config.budget
@@ -159,7 +163,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
             logger.warning("TriAttention union mode enables score normalization")
         self.normalize_scores = self.eviction_mode == "union" or config.normalize_scores
         # Prompt always pinned; budget counts decode tokens only.
-        self.model_path = config.model_path
+        self.pretrained_config = pretrained_config
         self.calibration_path = config.calibration_path
         self._load_calibration()
 
@@ -208,14 +212,10 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
 
     def _resolve_attention_layers(self) -> Tuple[List[int], List[int], Optional[int]]:
         """SWA layers here are stored at full length; the window applies only in the kernel."""
-        model_path = self.model_path
         global_layers = self._global_layers
         num_layers = len(global_layers)
 
-        config = AutoConfig.from_pretrained(
-            model_path, trust_remote_code=True, local_files_only=True
-        )
-        config_values = config.get_text_config().to_dict()
+        config_values = self.pretrained_config.get_text_config().to_dict()
         layer_types = config_values.get("layer_types")
         if not layer_types:
             use_sliding_window = config_values.get("use_sliding_window")
@@ -304,15 +304,18 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
                 )
                 e_q_norm[layer, head] = head_stats["q_abs_mean"].float()
 
-            config = AutoConfig.from_pretrained(
-                self.model_path, trust_remote_code=True
-            ).get_text_config()
-            # transformers >= 5.5 folds rope_theta/rope_type into rope_parameters.
+            config = self.pretrained_config.get_text_config()
+            # transformers >= 5.5 folds rope_theta/rope_type into
+            # rope_parameters, but the executor's config loader clears it for
+            # models with default (unscaled) RoPE and keeps the canonical
+            # value on config.rope_theta.
             rope_params = config.to_dict()["rope_parameters"]
+            if rope_params is None:
+                rope_params = {"rope_type": "default", "rope_theta": config.rope_theta}
             if all(isinstance(value, dict) for value in rope_params.values()):
                 raise ValueError(
                     "TriAttention does not support per-layer-type rope parameters "
-                    f"({self.model_path})"
+                    f"(model_type={config.model_type})"
                 )
             rope_type = rope_params["rope_type"]
             if rope_type == "default":
@@ -630,12 +633,13 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         """Select top-k tokens and settle score ties into kept-ordinal rows."""
         rows = request_count * self._selection_rows_per_request
         # The trailing 1 is next_n: decode scores one query token per request.
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+        self._selection_top_k(
             self._selection_scores_rows[:rows],
-            self._selection_row_lengths[:rows],
             self._provisional_rows[:rows],
-            self.budget,
-            1,
+            is_prefill=False,
+            sequence_lengths=self._selection_row_lengths[:rows],
+            scan_lengths=self._selection_row_lengths[:rows],
+            next_n=1,
         )
         settle_ties(
             self._selection_scores_rows,
@@ -797,6 +801,10 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
 
     def _allocate_selection_buffers(self, device: torch.device, *, tp_size: int) -> None:
         """Allocate fixed manager-lifetime TopK inputs and outputs."""
+        self._selection_top_k = TopK(
+            self.budget,
+            decode_implementation=TopKImplementation.CUTE_DSL_RADIX,
+        )
         request_capacity = self._request_capacity
         selection_width = self._selection_width_capacity
         union = self.eviction_mode == "union"
