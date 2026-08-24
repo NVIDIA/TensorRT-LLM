@@ -76,7 +76,19 @@ class FallbackFmha(Fmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        del q, k, v, phase
+        del k, v, phase
+        # Helix speculative verify groups carry per-token KV ownership (a
+        # group may straddle a page boundary onto two CP ranks) that the
+        # fused thop attention path cannot express: its spec-dec mask and the
+        # per-sequence helix_is_inactive_rank gate both assume the group's
+        # new KV entries are the trailing slots of one rank's kv_len. Running
+        # it would be silently wrong, so reject — with no remaining FMHA
+        # library, dispatch raises loudly instead.
+        if (metadata.helix_position_offsets is not None
+                and getattr(metadata, "_helix_spec_tokens_valid", False)
+                and metadata.num_generations > 0
+                and q.shape[0] > metadata.num_seqs):
+            return False
         return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
             forward_args.update_kv_cache or metadata.is_cross
         )

@@ -3946,27 +3946,30 @@ class PyTorchModelEngine(ModelEngine):
                         num_chunked_contexts=num_chunked_ctx_requests,
                     )
 
-                if self.mapping.has_cp_helix() and getattr(
-                        inputs['attn_metadata'], '_helix_spec_tokens_valid',
-                        False):
-                    md = inputs['attn_metadata']
-                    # The helix position buffer holds the same provisional
-                    # global positions as position_ids (packed from the stale
-                    # base); apply the same accepted-count correction, then
-                    # re-derive every helix quantity (per-token write slots,
-                    # per-token attention bounds, per-seq rank-local kv lens)
-                    # from the corrected positions. The kv_lens override
-                    # below supersedes the generic previous_kv_lens_offsets
-                    # adjustment above, which is not ownership-aware.
-                    md.helix_position_offsets[:previous_batch_tokens] += (
-                        self.previous_pos_id_offsets_cuda[:
-                                                          previous_batch_tokens]
-                    )
-                    md.recompute_helix_spec_buffers(
-                        0, previous_batch_tokens,
-                        self.get_runtime_tokens_per_gen_step(
-                            self.runtime_draft_len))
-                    md.on_update_kv_lens()
+        if self.enable_spec_decode and self.mapping.has_cp_helix():
+            # Helix verify groups: the per-token device buffers (write slots,
+            # attention bounds, rank-local kv lens) must be derived on EVERY
+            # spec step, overlap or not — the append/mask kernels consume
+            # them whenever _helix_spec_tokens_valid is armed. Under overlap
+            # the host packed provisional positions from a stale base, so
+            # first apply the same accepted-count correction position_ids
+            # got above; without overlap the host values are already exact.
+            md = inputs.get('attn_metadata')
+            if (md is not None and md.kv_cache_manager is not None
+                    and getattr(md, '_helix_spec_tokens_valid', False)):
+                helix_gen_tokens = (inputs['input_ids'].shape[0] -
+                                    md.num_ctx_tokens)
+                if not self._disable_overlap_scheduler:
+                    # The kv_lens override in the recompute supersedes the
+                    # generic previous_kv_lens_offsets adjustment above,
+                    # which is not ownership-aware.
+                    md.helix_position_offsets[:helix_gen_tokens] += (
+                        self.previous_pos_id_offsets_cuda[:helix_gen_tokens])
+                md.recompute_helix_spec_buffers(
+                    0, helix_gen_tokens,
+                    self.get_runtime_tokens_per_gen_step(
+                        self.runtime_draft_len))
+                md.on_update_kv_lens()
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -5708,13 +5711,23 @@ class PyTorchModelEngine(ModelEngine):
                     past_seen_token_num - request.py_num_compressed_tokens)
                 request.cached_tokens = past_seen_token_num
                 if _has_cp_helix:
-                    # Verify group [base, base+group): the global positions
-                    # already sit in position_ids above; KV numbers are
-                    # rank-local. This branch has no in-flight predecessor,
-                    # so every value is exact (no device correction needed).
+                    # Verify group [base, base+group) in GLOBAL positions.
+                    # On a helix gen worker the request's token list is the
+                    # rank-LOCAL round-robin subset, so max_beam_num_tokens
+                    # (= local_prompt + generated) must NOT be used as a
+                    # global base; reconstruct it from the global prompt
+                    # length plus the (rank-invariant) generated count. This
+                    # branch has no in-flight predecessor, so every value is
+                    # exact (no device correction needed).
                     group = 1 + num_draft_tokens
-                    base = past_seen_token_num
+                    generated_len = (request.max_beam_num_tokens -
+                                     request.py_prompt_len)
+                    base = request.total_input_len_cp + generated_len - 1
                     helix_position_offsets.extend(range(base, base + group))
+                    # position_ids above were packed from the local base;
+                    # helix uses global position ids (same convention as the
+                    # non-spec helix generation loop below).
+                    position_ids[-group:] = range(base, base + group)
                     helix_is_inactive_rank.append(False)
                     local_cached = _helix_local_len_host(base)
                     helix_owned_new_tokens.append(
@@ -5758,10 +5771,15 @@ class PyTorchModelEngine(ModelEngine):
                     # above — positions are packed from the stale base (the
                     # overlap device correction adds the accepted count) and
                     # KV numbers assume full acceptance (the device recompute
-                    # in recompute_helix_spec_buffers overrides them).
+                    # in recompute_helix_spec_buffers overrides them). The
+                    # base is reconstructed GLOBALLY (see the no-previous
+                    # branch: the token list is rank-local under helix).
                     group = runtime_tokens_per_gen_step
-                    base = past_seen_token_num
+                    generated_len = (request.max_beam_num_tokens -
+                                     request.py_prompt_len)
+                    base = request.total_input_len_cp + generated_len - 1
                     helix_position_offsets.extend(range(base, base + group))
+                    position_ids[-group:] = range(base, base + group)
                     helix_is_inactive_rank.append(False)
                     local_full = _helix_local_len_host(base + group)
                     helix_owned_new_tokens.append(0)

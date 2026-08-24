@@ -9770,6 +9770,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
                                               split_kv_size]
 
+            if kv_bounds is not None and AutoTuner.get().is_tuning_mode:
+                # Profiling rebuilds bucketed cache_seqs but carries
+                # kv_bounds through unchanged (input 9 has no dynamic-dim
+                # spec); re-derive a size-consistent dummy — bound values
+                # only affect masking depth, not the tactic space.
+                if kv_bounds.numel() != batch_size * seq_len_q:
+                    kv_bounds = cache_seqs.repeat_interleave(
+                        seq_len_q).contiguous()
             if kv_bounds is not None:
                 expected_bounds_shape = (batch_size * seq_len_q, )
                 if (kv_bounds.shape != expected_bounds_shape
