@@ -74,6 +74,8 @@ struct MlaRopeGenArgs
     float host_bmm1_scale;
     int32_t const* helix_position_offsets_ptr;
     bool const* helix_is_inactive_rank_ptr;
+    // Per-token KV write slots for speculative verify groups (nullptr otherwise).
+    int32_t const* helix_local_slots_ptr;
     // `kv_norm_weight_ptr` set: `invokeMLAKvNormRopeQuantGeneration` produces the KV
     // half (norm + rope + fp8 + paged write) and the RoPE kernel runs Q-only.
     void const* kv_norm_weight_ptr;
@@ -130,6 +132,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
     mla_params.host_bmm1_scale = args.host_bmm1_scale;
     mla_params.helix_position_offsets = args.helix_position_offsets_ptr;
     mla_params.helix_is_inactive_rank = args.helix_is_inactive_rank_ptr;
+    mla_params.helix_local_slots = args.helix_local_slots_ptr;
 
     mla_params.precomputed_cu_seqlens = args.precomputed_cu_seqlens;
     mla_params.precomputed_fmha_scheduler = args.precomputed_fmha_scheduler;
@@ -182,8 +185,9 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
     TLLM_CHECK_WITH_INFO(num_kv_heads == 1, "num_kv_heads must = 1");
-    TORCH_CHECK(helix_tensor_params.size() == 2,
-        "Expecting 2 tensors for helix_tensor_params: helix_position_offsets and helix_is_inactive_rank.");
+    TORCH_CHECK(helix_tensor_params.size() == 2 || helix_tensor_params.size() == 3,
+        "Expecting 2 or 3 tensors for helix_tensor_params: helix_position_offsets, helix_is_inactive_rank "
+        "and optionally helix_local_slots (per-token KV write slots for speculative verify groups).");
 
     auto stream = at::cuda::getCurrentCUDAStream(latent_cache.get_device());
     auto const kv_cache_quant_mode = tc::QuantMode(uint32_t(quant_mode));
@@ -210,6 +214,14 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
         = helix_position_offsets.has_value() ? helix_position_offsets->data_ptr<int32_t>() : nullptr;
     bool const* helix_is_inactive_rank_ptr
         = helix_is_inactive_rank.has_value() ? helix_is_inactive_rank->data_ptr<bool>() : nullptr;
+    int32_t const* helix_local_slots_ptr = nullptr;
+    if (helix_tensor_params.size() == 3 && helix_tensor_params[2].has_value())
+    {
+        helix_local_slots_ptr = helix_tensor_params[2]->data_ptr<int32_t>();
+        TORCH_CHECK(!kv_norm_weight.has_value(),
+            "helix_local_slots (speculative verify groups) is not supported on the fused "
+            "KV-norm RoPE path: its KV append kernel has no per-token helix gate.");
+    }
 
     int* cu_q_seqlens_ptr = reinterpret_cast<int*>(cu_q_seqlens.data_ptr());
     int* cu_kv_seqlens_ptr = reinterpret_cast<int*>(cu_kv_seqlens.data_ptr());
@@ -308,8 +320,8 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
         block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr, fmha_tile_counter_ptr,
         mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_qkv_ptr, quant_scale_o_ptr,
         kv_scale_orig_quant_ptr, kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr,
-        helix_is_inactive_rank_ptr, kv_norm_weight_ptr, static_cast<float>(kv_norm_eps), latent_row_stride,
-        precomputed_cu_seqlens, precomputed_fmha_scheduler, kv_only, kv_done_elsewhere};
+        helix_is_inactive_rank_ptr, helix_local_slots_ptr, kv_norm_weight_ptr, static_cast<float>(kv_norm_eps),
+        latent_row_stride, precomputed_cu_seqlens, precomputed_fmha_scheduler, kv_only, kv_done_elsewhere};
 
     void* q_pe_ptr = kv_only ? nullptr : q_pe->data_ptr();
     void* fused_q_ptr = kv_only ? nullptr : fused_q->data_ptr();

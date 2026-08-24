@@ -1562,10 +1562,19 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
+        # The standalone drafter is a plain dense model built against the
+        # repurposed mapping under helix (CP ranks become TP ranks; each rank
+        # keeps its full drafter KV). Its paged KV manager must therefore use
+        # the repurposed, CP-free mapping — helix round-robin ledger semantics
+        # apply only to the TARGET KV (and KVCacheManagerV2 rejects
+        # is_draft x helix outright).
+        draft_mapping = self._mapping
+        if draft_mapping.has_cp_helix():
+            draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
-            mapping=self._mapping,
+            mapping=draft_mapping,
             kv_cache_config=draft_kv_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=max_seq_len,

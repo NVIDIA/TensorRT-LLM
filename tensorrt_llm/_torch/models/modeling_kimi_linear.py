@@ -2054,11 +2054,24 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 "per-request locality of KDA recurrent state."
             )
         if spec_config is not None:
-            raise ValueError(
-                "Kimi K3 helix phase 1 does not support speculative "
-                "decoding (round-robin KV bookkeeping assumes one token "
-                "per decode step)."
-            )
+            # Helix speculative decoding allowlist: standalone DSpark linear
+            # chains verified on the V2 superblock ledger (per-token ownership
+            # bookkeeping + CuTe DSL per-token bounds). Everything else stays
+            # loudly rejected — the #16003 review showed unsupported spec
+            # modes silently running wrong under helix.
+            decoding_type = getattr(spec_config, "decoding_type", None)
+            if decoding_type != "DSpark":
+                raise ValueError(
+                    "Kimi K3 helix supports speculative decoding only with "
+                    f"DSpark (standalone drafter); got {decoding_type!r}."
+                )
+            if getattr(spec_config, "draft_is_embedded_in_target", False):
+                raise ValueError(
+                    "Kimi K3 helix supports only the standalone DSpark "
+                    "drafter; the embedded (in-target) flavour shares the "
+                    "target KV bookkeeping in ways the helix ledger does "
+                    "not model."
+                )
         cp = model_config.mapping.cp_size
         repurposed_tp = model_config.mapping.tp_size * cp
         if cfg.num_attention_heads % repurposed_tp != 0:

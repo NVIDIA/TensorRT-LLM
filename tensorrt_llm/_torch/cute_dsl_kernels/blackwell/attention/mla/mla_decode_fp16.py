@@ -311,6 +311,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -391,6 +392,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         stream: cuda.CUstream,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
+
+        kv_bounds (helix speculative verify groups): optional int32 tensor of
+        shape [batch_size * seq_len_q]; entry b*seq_len_q + q gives the number
+        of this rank's local KV entries query token q of sequence b may attend
+        to (committed prefix + owned in-flight group tokens up to and
+        including itself). When present it replaces the implicit causal bound
+        K - (seq_len_q - 1) + q_tok; values are guaranteed to lie in
+        [K - seq_len_q, K], i.e. inside the span the masked phase already
+        covers for the causal case.
 
         The method handles:
         1. Initialization of workspace for temporary split KV buffers
@@ -792,6 +802,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 acc_lse,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 block_split_kvs,
                 softmax_scale_log2,
                 output_scale,
@@ -827,6 +838,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 acc_lse,
                 split_kv,
                 cache_seqs,
+                kv_bounds,
                 block_split_kvs,
                 softmax_scale_log2,
                 output_scale,
@@ -859,6 +871,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     split_kv,
                     cache_seqs,
                     block_split_kvs,
+                    kv_bounds,
                 )
             else:
                 reduction_kernel = self.reduction_kernel(
@@ -938,6 +951,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         mAccLSE: Optional[cute.Tensor],
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -1356,6 +1370,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         mAccO=mAccO,
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
+                        kv_bounds=kv_bounds,
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
@@ -1458,6 +1473,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
+        kv_bounds: Optional[cute.Tensor] = None,
     ):
         """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
         from multiple split_kv blocks into final outputs.
@@ -1528,7 +1544,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             if tidx == 0:
                 mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse
                 if cutlass.const_expr(self.emit_softmax_stats):
-                    if cache_seqs[blk_coord[2]] > 0:
+                    # A rank joins the CP merge only for tokens with at least
+                    # one visible local KV entry. With verify groups that is
+                    # per-token: a straddling group leaves this rank zero
+                    # entries for its leading tokens while later ones have some.
+                    if cutlass.const_expr(kv_bounds is not None):
+                        has_local_kv = kv_bounds[blk_coord[2] * self.seq_len_q +
+                                                 blk_coord[1]] > 0
+                    else:
+                        has_local_kv = cache_seqs[blk_coord[2]] > 0
+                    if has_local_kv:
                         mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
                                       0] = global_lse / LOG2_E
                         mSoftmaxStats[blk_coord[0], blk_coord[1], blk_coord[2],
@@ -2448,8 +2473,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # positions. Min k_bound = K - (S_q-1), which can span up to
         # ceil((seq_len_q-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
         # S_q=1 this reduces to 1 tile -- identical to a plain K-bound check.
+        # With helix per-token bounds the minimum is K - S_q (a rank owning
+        # none of the group's tokens), one position deeper, so widen the span
+        # by one.
         tile_n = self.mma_qk_tiler[1]
-        mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
+        if cutlass.const_expr(common_params.kv_bounds is not None):
+            mask_tile_count = (self.seq_len_q - 1 + tile_n - 1) // tile_n + 1
+        else:
+            mask_tile_count = (self.seq_len_q - 2 + tile_n - 1) // tile_n + 1
 
         # first_mask_tile_idx is the global index of the first tile that may
         # need masking. Runtime because it depends on K (per-batch in
@@ -2777,7 +2808,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                              cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
-                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        # Helix verify groups: per-token rank-local bound
+                        # (committed prefix + owned group tokens <= q_tok);
+                        # subsumes the causal offset and non-owner ranks.
+                        k_bound = common_params.kv_bounds[
+                            common_params.blk_coord[2] * self.seq_len_q +
+                            q_tok]
+                    else:
+                        k_bound = common_params.K - (self.seq_len_q -
+                                                     1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                         k_bound,
@@ -2817,7 +2857,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                              cta_m_rows) // self.num_heads)
                     else:
                         q_tok = common_params.blk_coord[1]
-                    k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
+                    if cutlass.const_expr(common_params.kv_bounds is not None):
+                        # Helix verify groups: per-token rank-local bound
+                        # (see the sm_100 branch above).
+                        k_bound = common_params.kv_bounds[
+                            common_params.blk_coord[2] * self.seq_len_q +
+                            q_tok]
+                    else:
+                        k_bound = common_params.K - (self.seq_len_q -
+                                                     1) + q_tok
                     tTR_rAcc[i] = (tTR_rAcc[i] if cute.elem_less(
                         tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                         k_bound,

@@ -309,6 +309,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         workspace: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: Optional[cute.Tensor],
+        # Signature parity with the fp16 kernel (helix speculative verify
+        # groups); the fp8 kernel does not implement per-token bounds and the
+        # wrapper gate never selects fp8 KV under helix.
+        kv_bounds: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,

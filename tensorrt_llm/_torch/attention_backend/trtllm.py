@@ -160,6 +160,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_is_inactive_rank: Optional[torch.Tensor] = None
     helix_is_inactive_rank_cpu: Optional[torch.Tensor] = None
 
+    # Per-token helix state for speculative verify groups (a 1 + draft_len
+    # group may straddle a ledger-page boundary onto two CP ranks, so the
+    # per-sequence boolean above is insufficient there). See
+    # recompute_helix_spec_buffers for the derivation.
+    helix_local_slots: Optional[torch.Tensor] = None
+    helix_kv_bounds: Optional[torch.Tensor] = None
+    helix_owned_new_tokens_cpu: Optional[torch.Tensor] = None
+    _helix_spec_tokens_valid: bool = False
+
     # Block offsets for the target and draft KV caches
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
@@ -544,6 +553,41 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
+            # Per-token buffers for speculative verify groups under helix.
+            # A group of 1 + draft_len tokens can straddle a ledger-page
+            # boundary, splitting ownership between two CP ranks, so the
+            # per-sequence flag above is not expressive enough:
+            #   helix_local_slots[t]: rank-local KV write slot of gen token t
+            #     on this rank, or -1 when another rank owns its position
+            #     (consumed by the mla_rope_generation append kernel).
+            #   helix_kv_bounds[t]: number of rank-local KV entries token t
+            #     may attend to, i.e. local_len(pos_t + 1) (consumed by the
+            #     CuTe DSL MLA decode mask and the helix stats identity).
+            # Filled by recompute_helix_spec_buffers() on the spec path only.
+            self.helix_local_slots = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="helix_local_slots",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self.helix_kv_bounds = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="helix_kv_bounds",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            # Host-side per-sequence count of this step's new tokens owned by
+            # this rank (spec path; single-token path derives it from the
+            # boolean flag). Consumed by prepare()'s helix kv_lens branch.
+            self.helix_owned_new_tokens_cpu = torch.zeros(
+                (self.max_num_sequences, ),
+                device='cpu',
+                dtype=torch.int,
+                pin_memory=prefer_pinned(),
+            )
+            self._helix_spec_tokens_valid = False
 
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
@@ -573,6 +617,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self,
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
+        helix_owned_new_tokens: Optional[List[int]] = None,
     ) -> None:
         """
         Update helix parameters by copying into static buffers for CUDA graph compatibility.
@@ -580,6 +625,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Args:
             helix_position_offsets: Position offsets for helix parallelism with shape (num_tokens,).
             helix_is_inactive_rank: Whether the current rank is inactive with shape (batch_size,).
+            helix_owned_new_tokens: Per-sequence count of this step's new
+                tokens owned by this rank (speculative verify groups; one
+                group may straddle a page boundary onto two ranks). None on
+                the single-token path, where the boolean flag carries it.
         """
         if helix_position_offsets is not None and self.helix_position_offsets is not None:
             num_tokens = len(helix_position_offsets)
@@ -594,6 +643,107 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
             self.helix_is_inactive_rank[:batch_size].copy_(
                 self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
+
+        self._helix_spec_tokens_valid = False
+        if helix_owned_new_tokens is not None:
+            batch_size = len(helix_owned_new_tokens)
+            self.helix_owned_new_tokens_cpu[:batch_size].copy_(
+                torch.tensor(helix_owned_new_tokens, dtype=torch.int))
+            self._helix_spec_tokens_valid = True
+
+    def helix_local_len_vec(self, global_lens: torch.Tensor) -> torch.Tensor:
+        """Vectorized rank-local prefix length for helix round-robin pages.
+
+        For each global sequence length g, returns the number of the first g
+        tokens whose ledger page lives on this CP rank (page b -> rank
+        b % cp_size). Mirrors KVCacheManagerV2._helix_local_len.
+        """
+        phys = self.kv_cache_manager.tokens_per_block
+        cp_size = self.mapping.cp_size
+        cp_rank = self.mapping.cp_rank
+        ledger = phys * cp_size
+        full = torch.div(global_lens, ledger, rounding_mode='floor')
+        rem = global_lens - full * ledger
+        return full * phys + (rem - cp_rank * phys).clamp_(0, phys)
+
+    def recompute_helix_spec_buffers(self, num_ctx_tokens: int,
+                                     num_gen_tokens: int,
+                                     tokens_per_gen_seq: int) -> None:
+        """Derive per-token helix buffers from (corrected) global positions.
+
+        Called after the overlap-scheduler device correction has been applied
+        to helix_position_offsets, so every derived quantity reflects the
+        real committed length even though the host packed provisional values.
+        Static shapes only; safe under CUDA graph capture.
+        """
+        pos = self.helix_position_offsets[num_ctx_tokens:num_ctx_tokens +
+                                          num_gen_tokens]
+        phys = self.kv_cache_manager.tokens_per_block
+        cp_rank = self.mapping.cp_rank
+        cp_size = self.mapping.cp_size
+        owner = torch.div(pos, phys, rounding_mode='floor') % cp_size
+        active = owner == cp_rank
+        local_before = self.helix_local_len_vec(pos)
+        self.helix_local_slots[num_ctx_tokens:num_ctx_tokens +
+                               num_gen_tokens].copy_(
+                                   torch.where(active, local_before,
+                                               local_before.new_full((), -1)))
+        self.helix_kv_bounds[num_ctx_tokens:num_ctx_tokens +
+                             num_gen_tokens].copy_(
+                                 self.helix_local_len_vec(pos + 1))
+        # Per-sequence rank-local kv length = bound of the sequence's last
+        # token (attention over committed + owned in-flight tokens).
+        assert num_gen_tokens % tokens_per_gen_seq == 0, (
+            f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
+            f"tokens not divisible by group size {tokens_per_gen_seq}")
+        num_gen_seqs = num_gen_tokens // tokens_per_gen_seq
+        last_bounds = self.helix_kv_bounds[num_ctx_tokens:num_ctx_tokens +
+                                           num_gen_tokens].view(
+                                               num_gen_seqs,
+                                               tokens_per_gen_seq)[:, -1]
+        self.kv_lens_cuda[self.num_contexts:self.num_contexts +
+                          num_gen_seqs].copy_(last_bounds)
+
+    def build_ugpu_block_offsets(
+        self,
+        source_block_offsets: Optional[torch.Tensor],
+        buffer_attr: str,
+    ) -> Optional[List[torch.Tensor]]:
+        if (not self.ugpu_enabled or source_block_offsets is None
+                or self.kv_cache_manager is None):
+            return None
+
+        num_ugpus = self.kv_cache_manager.num_ugpus
+        buffers = getattr(self, buffer_attr, None)
+        if buffers is None:
+            buffers = [
+                torch.zeros_like(source_block_offsets) for _ in range(num_ugpus)
+            ]
+            setattr(self, buffer_attr, buffers)
+
+        packed_block_offsets = []
+        num_ctx = self.num_contexts
+        for ugpu_idx in range(num_ugpus):
+            ctx_start = self.ugpu_ctx_req_splits[ugpu_idx]
+            ctx_end = self.ugpu_ctx_req_splits[ugpu_idx + 1]
+            gen_start = num_ctx + self.ugpu_gen_req_splits[ugpu_idx]
+            gen_end = num_ctx + self.ugpu_gen_req_splits[ugpu_idx + 1]
+            num_ctx_reqs = ctx_end - ctx_start
+            num_gen_reqs = gen_end - gen_start
+            num_seqs = num_ctx_reqs + num_gen_reqs
+            block_offsets = buffers[ugpu_idx]
+            block_offsets.zero_()
+            if num_seqs > 0:
+                if num_ctx_reqs > 0:
+                    block_offsets[:, :num_ctx_reqs].copy_(
+                        source_block_offsets[:, ctx_start:ctx_end],
+                        non_blocking=True)
+                if num_gen_reqs > 0:
+                    block_offsets[:, num_ctx_reqs:num_seqs].copy_(
+                        source_block_offsets[:, gen_start:gen_end],
+                        non_blocking=True)
+            packed_block_offsets.append(block_offsets)
+        return packed_block_offsets
 
     def _bind_runtime_views(
         self,
@@ -722,9 +872,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_helix:
             # If helix is inactive, attend to the previously cached tokens only.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
-            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
-            kv_lens = cached_token_lens.clone()
-            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+            if getattr(self, '_helix_spec_tokens_valid', False):
+                # Speculative verify groups: a group may straddle a page
+                # boundary, so ownership of this step's new tokens is a
+                # per-sequence COUNT, not a boolean. Provisional host values;
+                # recompute_helix_spec_buffers overrides the device copy
+                # after the overlap correction.
+                kv_lens = cached_token_lens + \
+                    self.helix_owned_new_tokens_cpu[:self.num_seqs]
+            else:
+                active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
+                kv_lens = cached_token_lens.clone()
+                kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
             kv_lens = cached_token_lens + \
                 self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
@@ -2444,6 +2603,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
+        if getattr(metadata, '_helix_spec_tokens_valid', False):
+            # Speculative verify groups: per-token KV write slots (-1 = this
+            # rank does not own the token's position). The append kernel then
+            # gates and addresses per token instead of per sequence.
+            helix_tensor_params.append(metadata.helix_local_slots)
 
         torch.ops.trtllm.mla_rope_generation(
             fused_q,

@@ -3946,6 +3946,28 @@ class PyTorchModelEngine(ModelEngine):
                         num_chunked_contexts=num_chunked_ctx_requests,
                     )
 
+                if self.mapping.has_cp_helix() and getattr(
+                        inputs['attn_metadata'], '_helix_spec_tokens_valid',
+                        False):
+                    md = inputs['attn_metadata']
+                    # The helix position buffer holds the same provisional
+                    # global positions as position_ids (packed from the stale
+                    # base); apply the same accepted-count correction, then
+                    # re-derive every helix quantity (per-token write slots,
+                    # per-token attention bounds, per-seq rank-local kv lens)
+                    # from the corrected positions. The kv_lens override
+                    # below supersedes the generic previous_kv_lens_offsets
+                    # adjustment above, which is not ownership-aware.
+                    md.helix_position_offsets[:previous_batch_tokens] += (
+                        self.previous_pos_id_offsets_cuda[:
+                                                          previous_batch_tokens]
+                    )
+                    md.recompute_helix_spec_buffers(
+                        0, previous_batch_tokens,
+                        self.get_runtime_tokens_per_gen_step(
+                            self.runtime_draft_len))
+                    md.on_update_kv_lens()
+
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
 
@@ -5595,6 +5617,24 @@ class PyTorchModelEngine(ModelEngine):
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
 
+        # Helix bookkeeping is needed by BOTH the extend (speculative verify
+        # group) and the plain generation packing loops below, so initialize
+        # it ahead of them. Positions are global; KV ownership follows the
+        # round-robin ledger (page b -> rank b % cp), mirrored host-side here
+        # (KVCacheManagerV2._helix_local_len) for provisional packing values.
+        helix_is_inactive_rank, helix_position_offsets = [], []
+        helix_owned_new_tokens = []
+        _has_cp_helix = self.mapping.has_cp_helix()
+        if _has_cp_helix and kv_cache_manager is not None:
+            _helix_phys = kv_cache_manager.tokens_per_block
+            _helix_ledger = _helix_phys * self.mapping.cp_size
+            _helix_rank_off = self.mapping.cp_rank * _helix_phys
+
+            def _helix_local_len_host(global_len: int) -> int:
+                full, rem = divmod(global_len, _helix_ledger)
+                return full * _helix_phys + min(
+                    max(rem - _helix_rank_off, 0), _helix_phys)
+
         spec_config = self.spec_config if self.enable_spec_decode else None
         if not self._disable_overlap_scheduler and spec_config is not None:
             assert spec_config.spec_dec_mode.support_overlap_scheduler(
@@ -5667,6 +5707,21 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num - request.py_num_compressed_tokens)
                 request.cached_tokens = past_seen_token_num
+                if _has_cp_helix:
+                    # Verify group [base, base+group): the global positions
+                    # already sit in position_ids above; KV numbers are
+                    # rank-local. This branch has no in-flight predecessor,
+                    # so every value is exact (no device correction needed).
+                    group = 1 + num_draft_tokens
+                    base = past_seen_token_num
+                    helix_position_offsets.extend(range(base, base + group))
+                    helix_is_inactive_rank.append(False)
+                    local_cached = _helix_local_len_host(base)
+                    helix_owned_new_tokens.append(
+                        _helix_local_len_host(base + group) - local_cached)
+                    num_cached_tokens_per_seq[-1] = (
+                        local_cached - request.py_num_compressed_tokens)
+                    request.cached_tokens = local_cached
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -5698,6 +5753,21 @@ class PyTorchModelEngine(ModelEngine):
                     request.py_num_compressed_tokens)
                 request.cached_tokens = (past_seen_token_num +
                                          runtime_tokens_per_gen_step)
+                if _has_cp_helix:
+                    # In-flight predecessor: mirror the non-helix convention
+                    # above — positions are packed from the stale base (the
+                    # overlap device correction adds the accepted count) and
+                    # KV numbers assume full acceptance (the device recompute
+                    # in recompute_helix_spec_buffers overrides them).
+                    group = runtime_tokens_per_gen_step
+                    base = past_seen_token_num
+                    helix_position_offsets.extend(range(base, base + group))
+                    helix_is_inactive_rank.append(False)
+                    local_full = _helix_local_len_host(base + group)
+                    helix_owned_new_tokens.append(0)
+                    num_cached_tokens_per_seq[-1] = (
+                        local_full - request.py_num_compressed_tokens)
+                    request.cached_tokens = local_full
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -5765,9 +5835,9 @@ class PyTorchModelEngine(ModelEngine):
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
-        helix_is_inactive_rank, helix_position_offsets = [], []
-        # Cache invariant method result to avoid repeated calls per-request
-        _has_cp_helix = self.mapping.has_cp_helix()
+        # (helix lists and _has_cp_helix are initialized ahead of the extend
+        # loop above, which also appends to them for verify groups.)
+
         _n_gen = len(generation_requests)
         # One-shot batch-level flag — True iff any generation request actually
         # carries multimodal payload. Lets the strip_mm_data branch below
@@ -5897,6 +5967,10 @@ class PyTorchModelEngine(ModelEngine):
                         helix_is_inactive_rank.append(
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
+                        # Keep the per-seq owned-count list aligned when the
+                        # spec path is active in the same batch.
+                        helix_owned_new_tokens.append(
+                            0 if request.py_helix_is_inactive_rank else 1)
 
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
@@ -6320,6 +6394,11 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
+                # Per-seq owned counts drive the kv_lens math only on the
+                # speculative path (verify groups); None keeps the
+                # single-token boolean convention.
+                helix_owned_new_tokens=(helix_owned_new_tokens
+                                        if self.enable_spec_decode else None),
             )
 
         if not attn_metadata.is_cuda_graph:
