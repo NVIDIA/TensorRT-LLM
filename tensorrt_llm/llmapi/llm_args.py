@@ -4332,13 +4332,15 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     transceiver_runtime: Optional[Literal["CPP", "PYTHON", "auto"]] = Field(
         default="auto",
         description=
-        "The runtime implementation. 'auto' (default) adopts the model's "
-        "preferred runtime when the effective backend supports it, and falls "
-        "back to the C++ transceiver otherwise. 'CPP' selects the C++ "
-        "transceiver, 'PYTHON' the Python transceiver. None is equivalent to "
-        "'CPP'. The model preference is only consulted on the PyTorch "
-        "backend's standard model-loading path; other paths (e.g. AutoDeploy) "
-        "fall back to the C++ transceiver under 'auto'.")
+        "The runtime implementation. 'auto' (default) selects the Python "
+        "transceiver when the configuration supports it (NIXL backend, no "
+        "context parallelism, and a finite kv_transfer_timeout_ms), and "
+        "falls back to the C++ transceiver otherwise; a model can also opt "
+        "out via its preferred runtime. 'CPP' selects the C++ transceiver, "
+        "'PYTHON' the Python transceiver. None is equivalent to 'CPP'. "
+        "'auto' is only resolved on the PyTorch backend's standard "
+        "model-loading path; other paths (e.g. AutoDeploy) fall back to the "
+        "C++ transceiver.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
