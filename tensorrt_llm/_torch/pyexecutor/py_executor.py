@@ -8473,12 +8473,21 @@ class PyExecutor:
             # defend against anyway.
             return []
 
-    def _terminate_requests(
-            self, requests_to_terminate: Iterable[LlmRequest]) -> None:
+    def _terminate_requests(self,
+                            requests_to_pause: Iterable[LlmRequest]) -> None:
+        """Free the execution resources of requests the V1 scheduler paused.
+
+        A paused request is not finished -- `_pause_requests` puts it back into
+        a context state to replay prefill -- so this must free resources only,
+        never terminate. `_do_terminate_request` would additionally strip
+        `py_multimodal_data`, destroying the encoder inputs the replay needs,
+        and pop `result_wait_queues`, unrouting a request that still owes
+        responses.
+        """
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not updated.
-        for req in requests_to_terminate:
-            self._terminate_request(req)
+        for req in requests_to_pause:
+            self._free_request_resources(req)
 
     def _pause_requests(self, requests_to_pause: Iterable[LlmRequest]) -> None:
         for req in requests_to_pause:

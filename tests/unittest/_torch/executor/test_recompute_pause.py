@@ -108,3 +108,28 @@ def test_terminal_request_does_not_recompute_after_pp_consensus() -> None:
     assert request.py_request_id not in executor._pending_recompute_pause_ids
     assert request.py_request_id not in executor.inflight_req_ids
     assert request.py_request_id not in executor.result_wait_queues
+
+
+def test_v1_pause_keeps_multimodal_replay_inputs_and_response_routing() -> None:
+    """A V1-paused request must keep what its prefill replay needs.
+
+    The extra teardown `_do_terminate_request` does would empty
+    `py_multimodal_data` -- where Nano's EVS merge reads `modality_type` and
+    raised (nvbugs 6628099) -- and pop the request's response queue.
+    """
+    executor = _make_executor(None)
+    request = _StubRequest()
+    # What a multimodal request carries into its prefill replay.
+    mm_data = {"modality_type": "image", "image": {"pixel_values": object()}}
+    request.py_multimodal_data = dict(mm_data)
+    encoder_state = Mock()
+    request.py_mm_encoder_state = encoder_state
+    executor.result_wait_queues[request.py_request_id] = Mock()
+
+    executor._terminate_requests([request])
+
+    # Freeing KV cache is the whole point of pausing, so it must still happen.
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert request.py_multimodal_data == mm_data
+    assert request.py_mm_encoder_state is encoder_state
+    assert request.py_request_id in executor.result_wait_queues

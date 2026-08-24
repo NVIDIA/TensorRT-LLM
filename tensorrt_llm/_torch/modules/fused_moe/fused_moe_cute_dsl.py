@@ -25,12 +25,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
@@ -43,6 +39,22 @@ from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
 from .interface import _reject
 from .quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
+
+# cute_dsl_custom_ops defines these runners inside its own
+# ``if IS_CUTLASS_DSL_AVAILABLE:`` block and has no else-branch, so naming them
+# unconditionally would turn a missing CuteDSL install into an ImportError for
+# every importer of this module -- including create_moe, and therefore anything
+# importing the PyTorch executor. Mirror the exporter's guard instead.
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ...custom_ops import cute_dsl_custom_ops as _dsl_ops
+
+    MMA_TILER_GROUPED_GEMM_RUNNERS = (
+        _dsl_ops.Sm100BlockScaledContiguousGroupedGemmRunner,
+        _dsl_ops.Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+        _dsl_ops.Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
+        _dsl_ops.Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)
+else:
+    MMA_TILER_GROUPED_GEMM_RUNNERS = ()
 
 
 @dataclass
@@ -327,12 +339,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             return True
 
         for runner, tactic in comb:
-            if isinstance(
-                    runner,
-                (Sm100BlockScaledContiguousGroupedGemmRunner,
-                 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-                 Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
-                 Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner)):
+            if isinstance(runner, MMA_TILER_GROUPED_GEMM_RUNNERS):
                 mma_tiler_mn, *_ = tactic
                 if mma_tiler_mn[0] != tile_size:
                     return False
