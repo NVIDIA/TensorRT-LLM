@@ -83,3 +83,29 @@ def test_reset_recurrent_state_rows_rejects_noncontiguous_rows() -> None:
             has_initial_states,
             noncontiguous_conv,
         )
+
+    overlapping_recurrent = torch.as_strided(
+        torch.ones(36, dtype=torch.float32, device="cuda"),
+        size=(2, 2, 3, 4),
+        stride=(12, 12, 4, 1),
+    )
+    with pytest.raises(ValueError, match="recurrent state rows must not overlap"):
+        reset_recurrent_state_rows(
+            overlapping_recurrent,
+            state_indices,
+            has_initial_states,
+            conv_states,
+        )
+
+    overlapping_conv = torch.as_strided(
+        torch.ones(9, dtype=torch.bfloat16, device="cuda"),
+        size=(2, 3, 2),
+        stride=(3, 2, 1),
+    )
+    with pytest.raises(ValueError, match="convolution state rows must not overlap"):
+        reset_recurrent_state_rows(
+            recurrent_states,
+            state_indices,
+            has_initial_states,
+            overlapping_conv,
+        )

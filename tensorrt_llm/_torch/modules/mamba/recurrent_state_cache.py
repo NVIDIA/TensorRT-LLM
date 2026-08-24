@@ -64,13 +64,17 @@ def reset_recurrent_state_rows(
         raise ValueError("recurrent and convolution pools must have the same slot count")
     if has_initial_states.shape != state_indices.shape:
         raise ValueError("has_initial_states and state_indices must have matching shapes")
-    if not recurrent_states[0].is_contiguous():
-        raise ValueError("recurrent state rows must be contiguous")
-    if conv_states is not None and not conv_states[0].is_contiguous():
-        raise ValueError("convolution state rows must be contiguous")
-
     recurrent_state_size = recurrent_states.numel() // recurrent_states.shape[0]
     conv_state_size = conv_states.numel() // conv_states.shape[0] if conv_states is not None else 0
+    if not recurrent_states[0].is_contiguous():
+        raise ValueError("recurrent state rows must be contiguous")
+    if recurrent_states.stride(0) < recurrent_state_size:
+        raise ValueError("recurrent state rows must not overlap")
+    if conv_states is not None and not conv_states[0].is_contiguous():
+        raise ValueError("convolution state rows must be contiguous")
+    if conv_states is not None and conv_states.stride(0) < conv_state_size:
+        raise ValueError("convolution state rows must not overlap")
+
     block_size = 256
     grid = (
         num_requests,
