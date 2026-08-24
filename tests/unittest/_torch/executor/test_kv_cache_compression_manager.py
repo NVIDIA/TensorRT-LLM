@@ -22,6 +22,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheCompressionConfig,
     TriAttentionKvCacheCompressionConfig,
 )
+from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -327,7 +328,7 @@ class TestFactory:
 
 
 class TestKvCacheCreatorLifecycle:
-    def test_estimation_still_creates_triattention_manager(self):
+    def test_estimation_still_creates_triattention_manager(self) -> None:
         config = SimpleNamespace(algorithm="triattention")
         pretrained_config = object()
         expected_manager = SimpleNamespace(provides_cold_page_codec=False)
@@ -360,7 +361,7 @@ class TestKvCacheCreatorLifecycle:
         assert resources[ResourceManagerType.KV_CACHE_MANAGER] is target_manager
         assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is expected_manager
 
-    def test_teardown_pops_and_shuts_down_compression_manager(self):
+    def test_teardown_pops_and_shuts_down_compression_manager(self) -> None:
         creator = object.__new__(util_mod.KvCacheCreator)
         compression_manager = MagicMock()
         resources = {
@@ -380,7 +381,9 @@ class TestKvCacheCreatorLifecycle:
     (True, False),
     ids=("cold-codec", "iteration-manager"),
 )
-def test_build_routes_compression_manager_by_capabilities(provides_cold_page_codec):
+def test_build_routes_compression_manager_by_capabilities(
+    provides_cold_page_codec: bool,
+) -> None:
     creator = object.__new__(util_mod.KvCacheCreator)
     creator._skip_est = False
     creator._max_seq_len = 1024
@@ -482,7 +485,10 @@ class TestCompressionCompatibility:
             TriAttentionKvCacheCompressionConfig(calibration_path="triattention-calibration.pt"),
         ),
     )
-    def test_helix_is_rejected(self, config):
+    def test_helix_is_rejected(
+        self,
+        config: KvCacheCompressionConfig,
+    ) -> None:
         model_engine = SimpleNamespace(
             mapping=SimpleNamespace(has_cp_helix=lambda: True),
             spec_config=None,
@@ -490,6 +496,23 @@ class TestCompressionCompatibility:
         )
         llm_args = SimpleNamespace(
             kv_cache_compression_config=config,
+            kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+        )
+        with pytest.raises(ValueError, match="HELIX"):
+            util_mod.validate_feature_combination(llm_args, model_engine, None)
+
+    def test_helix_is_rejected_before_redundant_cold_quantization(self) -> None:
+        model_engine = SimpleNamespace(
+            mapping=SimpleNamespace(has_cp_helix=lambda: True),
+            spec_config=None,
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+                )
+            ),
+        )
+        llm_args = SimpleNamespace(
+            kv_cache_compression_config=ColdPageQuantizationCompressionConfig(),
             kv_cache_config=SimpleNamespace(enable_block_reuse=False),
         )
         with pytest.raises(ValueError, match="HELIX"):

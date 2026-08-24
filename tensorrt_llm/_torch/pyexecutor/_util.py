@@ -2791,13 +2791,8 @@ def validate_kv_cache_compression_compatibility(
     config: KvCacheCompressionConfig,
     kv_cache_config: KvCacheConfig,
     spec_config: Optional[SpeculativeConfig],
-    mapping: Optional[Mapping] = None,
 ) -> None:
     """Reject unsupported KV-cache compression feature combinations."""
-    if mapping is not None and mapping.has_cp_helix():
-        raise ValueError(
-            "KV-cache compression does not support HELIX context parallelism.")
-
     if config.algorithm == "quantization_for_cold_page":
         from tensorrt_llm.runtime.kv_cache_manager_v2 import _BACKEND
 
@@ -3643,6 +3638,10 @@ def _adjust_torch_mem_fraction():
 def validate_feature_combination(llm_args, model_engine, sampler_type):
     # Validate the flags for features' combination
     compression_config = llm_args.kv_cache_compression_config
+    if (compression_config is not None and model_engine.mapping.has_cp_helix()):
+        # TODO: Revisit after KVCC validates HELIX-sharded Page ownership and migration.
+        raise ValueError(
+            "KV-cache compression does not support HELIX context parallelism.")
     cold_compression_is_redundant = (compression_config is not None
                                      and compression_config.algorithm
                                      == "quantization_for_cold_page"
@@ -3657,7 +3656,6 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
             compression_config,
             llm_args.kv_cache_config,
             model_engine.spec_config,
-            model_engine.mapping,
         )
 
     def init_feature_status(llm_args) -> Dict[str, bool]:

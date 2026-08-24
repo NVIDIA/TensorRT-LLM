@@ -286,7 +286,7 @@ def test_build_capture_manifest_matches_committed_golden():
     _assert_committed_manifest_current(golden_manifest())
 
 
-def test_kv_cache_compression_discriminator_captures_both_algorithms():
+def test_kv_cache_compression_discriminator_captures_both_algorithms() -> None:
     """The shared allowlist captures either compression discriminator."""
     from tensorrt_llm.llmapi.llm_args import (
         ColdPageQuantizationCompressionConfig,
@@ -318,10 +318,16 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms():
         "allowed_values": ["quantization_for_cold_page", "triattention"],
     }
 
+    private_paths = (
+        "/private/modelopt-scales",
+        "/private/triattention.pt",
+    )
     configs = (
-        ColdPageQuantizationCompressionConfig(),
+        ColdPageQuantizationCompressionConfig(
+            scale_checkpoint_path=private_paths[0],
+        ),
         TriAttentionKvCacheCompressionConfig(
-            calibration_path="/triattention.pt",
+            calibration_path=private_paths[1],
         ),
     )
     for config in configs:
@@ -333,6 +339,11 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms():
         captured = json.loads(config_json)
         metadata = json.loads(metadata_json)
         assert captured["kv_cache_compression_config.algorithm"] == config.algorithm
+        assert "kv_cache_compression_config.scale_checkpoint_path" not in captured
+        assert "kv_cache_compression_config.calibration_path" not in captured
+        for private_path in private_paths:
+            assert private_path not in config_json
+            assert private_path not in metadata_json
         assert metadata["capture_succeeded"] is True
 
 
