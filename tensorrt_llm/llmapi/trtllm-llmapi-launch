@@ -83,11 +83,28 @@ function maybe_setup_numa_bind {
         log_stderr "TLLM_NUMA_BIND: no usable NUMA node for local rank ${local_rank} (got '${numa_node}'), running unbound"
         return 0
     fi
+    # A CPU-less node means the GPU's own device memory is exposed as a
+    # NUMA node (e.g. Grace-Blackwell systems, where each GPU's HBM is a
+    # separate node). Bind to the CPUs the PCI device reports as local
+    # instead of the node itself.
+    local cpu_fallback=""
+    if [ -z "$(cat "/sys/devices/system/node/node${numa_node}/cpulist" 2>/dev/null | tr -d '[:space:]')" ]; then
+        cpu_fallback=$(cat "/sys/bus/pci/devices/${bdf:-}/local_cpulist" 2>/dev/null)
+        if [ -z "$cpu_fallback" ]; then
+            log_stderr "TLLM_NUMA_BIND: node ${numa_node} has no CPUs and no PCI local_cpulist for local rank ${local_rank}, running unbound"
+            return 0
+        fi
+    fi
     # Probe with progressively weaker policies (containers may lack the
     # capability for set_mempolicy).
-    local candidate
-    for candidate in "--cpunodebind=${numa_node} --membind=${numa_node}" \
-                     "--cpunodebind=${numa_node}"; do
+    local candidate candidates
+    if [ -n "$cpu_fallback" ]; then
+        candidates=("--physcpubind=${cpu_fallback}")
+    else
+        candidates=("--cpunodebind=${numa_node} --membind=${numa_node}"
+                    "--cpunodebind=${numa_node}")
+    fi
+    for candidate in "${candidates[@]}"; do
         if numactl ${candidate} true 2>/dev/null; then
             numa_bind_prefix=(numactl ${candidate})
             log_stderr "TLLM_NUMA_BIND: local rank ${local_rank} -> ${numa_bind_prefix[*]}"
