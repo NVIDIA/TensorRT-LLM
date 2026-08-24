@@ -26,6 +26,7 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decod
     _sm103_nvfp4_launch_options,
     _sm103_nvfp4_merge_launch_options,
     _sm103_nvfp4_num_topk_chunks,
+    _sm103_nvfp4_query_group_size,
     _sm103_nvfp4_use_linear_softmax,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
@@ -577,6 +578,34 @@ def test_nvfp4_sparse_decode_matches_reference(num_kv_heads, group, decode_query
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
 
 
+@pytest.mark.parametrize("local_batch", [11, 12, 14])
+def test_nvfp4_sparse_decode_eagle_pair_matches_divergent_reference(local_batch):
+    """The paired producer must remain exact when adjacent selections differ."""
+    seq_lens = [131 + 137 * row for row in range(local_batch)]
+    case = _make_nvfp4_inputs(
+        seq_lens,
+        num_kv_heads=4,
+        group=16,
+        decode_query_len=4,
+        seed=113 + local_batch,
+    )
+    case.q = case.q.to(torch.float8_e4m3fn)
+    assert not torch.equal(case.topk_idx[:, 0::4], case.topk_idx[:, 1::4])
+
+    out = _run_nvfp4(case)
+    expected = _reference_sparse_decode(
+        case.q.to(torch.bfloat16),
+        case.k_ref,
+        case.v_ref,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        decode_query_len=case.decode_query_len,
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
+
+
 def test_nvfp4_sparse_decode_fp8_q_matches_reference():
     """Production FP8 q may use FP16 dot operands without changing the cache math."""
     case = _make_nvfp4_inputs([300, 1500, 4097], num_kv_heads=2, group=8, seed=67)
@@ -792,6 +821,23 @@ def test_sm103_nvfp4_num_topk_chunks(local_batch, expected):
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("local_batch", "expected"),
+    [(10, 1), (11, 2), (12, 2), (14, 2), (15, 1)],
+)
+def test_sm103_nvfp4_query_group_size_is_narrowly_scoped(local_batch, expected):
+    common = dict(
+        total_q=local_batch * 4,
+        num_kv_heads=4,
+        gqa_group_size=16,
+        max_topk=16,
+        decode_query_len=4,
+    )
+    assert _sm103_nvfp4_query_group_size(**common, capability=(10, 3)) == expected
+    assert _sm103_nvfp4_query_group_size(**common, capability=(10, 0)) == 1
+    assert _sm103_nvfp4_query_group_size(**(common | {"num_kv_heads": 2}), capability=(10, 3)) == 1
 
 
 def test_sm103_nvfp4_launch_options_rejects_unmeasured_shapes():
