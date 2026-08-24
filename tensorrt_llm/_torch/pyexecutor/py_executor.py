@@ -3081,6 +3081,9 @@ class PyExecutor:
                 if self._uses_kv_manager_v2():
                     self._maybe_finish_pp_rebalance()
 
+                if not can_queue and self._pp_ring_is_drained():
+                    self._pace_idle_disagg_loop()
+
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
                 self.iter_counter += 1
@@ -3824,6 +3827,16 @@ class PyExecutor:
                    for req in self.active_requests))
         if waiting_on_transfer:
             time.sleep(0.001)
+
+    def _pp_ring_is_drained(self) -> bool:
+        """Return whether no microbatch is queued or awaiting handling.
+
+        While microbatches are still in flight `fetch_executed_batches` blocks
+        on the response queue, which paces the loop on its own; sleeping on top
+        of that would only delay their relay.
+        """
+        return (self.unhandled_batch_counter == 0
+                and all(batch is None for batch in self.micro_batches))
 
     def _sync_gen_only_benchmark_has_insufficient_kv(
             self, scheduler_fitting_disagg_gen_init_requests: List[LlmRequest],

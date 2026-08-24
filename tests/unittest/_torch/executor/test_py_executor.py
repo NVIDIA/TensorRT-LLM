@@ -1170,6 +1170,23 @@ class TestIdleDisaggLoopPacing:
 
         assert sleep.called is expect_sleep
 
+    @pytest.mark.parametrize(
+        "unhandled_batches, micro_batches, expected",
+        [
+            pytest.param(0, [None, None], True, id="ring_empty"),
+            pytest.param(1, [None, None], False, id="batch_awaiting_handling"),
+            pytest.param(0, [None, "batch"], False, id="batch_still_queued"),
+        ],
+    )
+    def test_pp_ring_drained_only_when_no_microbatch_is_outstanding(
+        self, unhandled_batches: int, micro_batches: list, expected: bool
+    ) -> None:
+        executor = object.__new__(PyExecutor)
+        executor.unhandled_batch_counter = unhandled_batches
+        executor.micro_batches = micro_batches
+
+        assert PyExecutor._pp_ring_is_drained(executor) is expected
+
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferAdmissionPP:
