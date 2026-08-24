@@ -37,7 +37,10 @@ from .interface import AttentionBackend, AttentionTensorLayout
 _flash_attn_combine_import_error = None
 try:
     from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
-except (ImportError, OSError) as e:
+except (ImportError, OSError, AttributeError) as e:
+    # Same provider and same skew hazard as flash_attn4.py: an importable
+    # flash_attn built against a different CuTe DSL revision raises AttributeError
+    # while executing the import.
     _flash_attn_combine = None
     _flash_attn_combine_import_error = e
 

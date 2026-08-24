@@ -30,7 +30,12 @@ from .interface import AttentionBackend, AttentionTensorLayout
 _flash_attn_fwd_import_error = None
 try:
     from flash_attn.cute.interface import _flash_attn_fwd
-except (ImportError, OSError) as e:
+except (ImportError, OSError, AttributeError) as e:
+    # AttributeError covers a flash_attn built against a different CuTe DSL revision:
+    # its module body annotates against names such as cute.core.ThrMma, so a skew
+    # raises while executing the import. Since attention_backend/__init__ imports this
+    # module unconditionally, letting that escape would abort the whole visual_gen
+    # package import rather than just leaving FA4 unavailable via the None path below.
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e
 

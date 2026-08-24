@@ -494,7 +494,14 @@ def _fixed_nvfp4_quantization_backend(features):
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = previous_flashinfer_available
 
 
-def _feature_generator_process_entry(connection, generator, args):
+def _feature_generator_process_entry(connection, generator, args, tllm_site):
+    # A spawned worker inherits the parent's sys.path but not its sys.modules, so it
+    # re-resolves tensorrt_llm from scratch: the integration `defs` harness puts the
+    # bindings-less source checkout ahead of the installed wheel, so a bare import there
+    # dies on `tensorrt_llm.bindings`. Pin the package directory the parent actually
+    # used, as _distributed_worker in test_visual_gen_multi_gpu.py does for mp.spawn.
+    sys.path[:] = [path for path in sys.path if os.path.realpath(path) != tllm_site]
+    sys.path.insert(0, tllm_site)
     try:
         generator(*args)
     except pytest.skip.Exception as error:
@@ -520,11 +527,16 @@ def _run_single_device_feature_generator(features, generator, *args):
         generator(*args)
         return
 
+    # Resolved from the compiled bindings extension, so the directory handed to the
+    # worker is by construction one whose bindings import cleanly.
+    import tensorrt_llm.bindings as tllm_bindings
+
+    tllm_site = os.path.realpath(os.path.dirname(os.path.dirname(tllm_bindings.__file__)))
     context = multiprocessing.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=False)
     process = context.Process(
         target=_feature_generator_process_entry,
-        args=(child_connection, generator, args),
+        args=(child_connection, generator, args, tllm_site),
     )
     process.start()
     child_connection.close()
