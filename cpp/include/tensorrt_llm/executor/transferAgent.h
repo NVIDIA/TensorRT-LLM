@@ -402,8 +402,8 @@ struct BaseAgentConfig
     std::unordered_map<std::string, std::string> backendParams;
     std::optional<int> rank;
     std::optional<int> worldSize;
-    /// Size in MiB of the agent's staging-buffer (bounce) arena, currently implemented by the
-    /// NIXL agent. 0 (default) disables the fast path; >0 enables it at that arena capacity.
+    /// Size in MiB of the agent's staging (bounce) buffer, currently implemented by the
+    /// NIXL agent. 0 (default) disables the fast path; >0 enables it at that capacity.
     /// Ignored by agents without bounce support (e.g. mooncake).
     size_t agentBufferSizeMb{0};
     /// Expert tuning knobs for the bounce pipeline, keyed by the TRTLLM_NIXL_BOUNCE_*

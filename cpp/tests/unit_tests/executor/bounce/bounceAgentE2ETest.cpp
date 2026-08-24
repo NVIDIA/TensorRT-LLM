@@ -139,7 +139,8 @@ std::unique_ptr<kvc::NixlTransferAgent> tryMakeAgent(kvc::BaseAgentConfig cfg, s
 }
 } // namespace
 
-// BaseAgentConfig::agentBufferSizeMb (from CacheTransceiverConfig's agent_buffer_size_mb) is the
+// BaseAgentConfig::agentBufferSizeMb (derived from CacheTransceiverConfig's
+// agent_bounce_buffer_enable + kv_cache_bounce_size_mb) is the
 // ONLY on/off switch: 0 keeps bounce disabled, >0 enables it. The legacy TRTLLM_NIXL_BOUNCE_ENABLE
 // environment variable must have no effect anymore.
 TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)

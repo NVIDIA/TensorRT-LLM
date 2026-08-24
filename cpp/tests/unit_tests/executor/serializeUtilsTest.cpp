@@ -965,9 +965,7 @@ TEST(SerializeUtilsTest, MethodReturnType)
 TEST(SerializeUtilsTest, CacheTransceiverConfig)
 {
     texec::CacheTransceiverConfig cacheTransceiverConfig(
-        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024, 100, 1000,
-        texec::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs, 512,
-        std::map<std::string, std::string>{{"max_chunk_size", "32MB"}, {"copy_stream_count", "4"}});
+        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024, 100, 1000);
     auto cacheTransceiverConfig2 = serializeDeserialize(cacheTransceiverConfig);
     EXPECT_EQ(cacheTransceiverConfig.getBackendType(), cacheTransceiverConfig2.getBackendType());
     EXPECT_EQ(cacheTransceiverConfig.getMaxTokensInBuffer(), cacheTransceiverConfig2.getMaxTokensInBuffer());
@@ -976,8 +974,6 @@ TEST(SerializeUtilsTest, CacheTransceiverConfig)
         cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
     EXPECT_EQ(
         cacheTransceiverConfig.getKvTransferPollIntervalMs(), cacheTransceiverConfig2.getKvTransferPollIntervalMs());
-    EXPECT_EQ(cacheTransceiverConfig.getAgentBufferSizeMb(), cacheTransceiverConfig2.getAgentBufferSizeMb());
-    EXPECT_EQ(cacheTransceiverConfig.getAgentBounceParams(), cacheTransceiverConfig2.getAgentBounceParams());
 }
 
 TEST(SerializeUtilsTest, BlockKeyBasic)
