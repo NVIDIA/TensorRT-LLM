@@ -75,14 +75,15 @@ API.
 |---|---|---|
 | GPU architecture | SM100 and SM103 | Pre-Blackwell GPUs; SM120 and SM121 |
 | Attention type | MQA (`num_kv_heads == 1`) and GQA | Arbitrary head mappings |
-| Head relationship | `num_q_heads % num_kv_heads == 0`; at most 32 query heads per KV head | Non-divisible Q/KV head counts; MQA/GQA groups larger than 32 |
+| Head relationship | `num_q_heads % num_kv_heads == 0`; at most 32 query heads per KV head; tests cover group sizes `2`, `3`, `4`, `8`, `16`, `24`, `31`, and `32` | Non-divisible Q/KV head counts and groups larger than 32 |
 | Q/K/V dimensions | Equal QK and V head dimensions | Unequal QK/V dimensions (MLA uses a separate sparse path) |
 | Head dimension | `64`, `80`, `128`, or `256` | `512` and other head dimensions |
-| Q/K/V and output dtype | BF16 or FP16 | Quantized Q/output combinations are not covered by this primitive's regression tests |
-| KV cache | Paged KV cache, with the KV dtype matching the input dtype; page size is a power of two and at least 8 tokens | Contiguous KV cache; non-power-of-two pages; pages smaller than 8 tokens |
+| Model Q/K/V input dtype | BF16 or FP16 | FP8 model-input tensors are not wired through this XQA fixed-parameter path |
+| Output dtype | BF16, FP16, or E4M3 FP8 | Other output dtypes |
+| KV-cache dtype and layout | BF16, FP16, or E4M3 FP8 paged KV cache; page size is a power of two and at least 8 tokens | Contiguous cache, non-power-of-two pages, and pages smaller than 8 tokens |
 | Sparse indices | `int32`, token-granular, one list per KV head and query token | A public built-in selector for generic MQA/GQA |
 | Sparse Top-K | Positive multiple of 4; shorter sequences may pad unused entries with `-1` | Top-K values not divisible by 4 |
-| Inference phase | Fresh context and single-token generation | Mixed context/generation batches are not covered by the regression tests |
+| Inference phase | Packed prefill, single-token generation, and linear draft-token generation (`qSeqLen=4` is tested) | Tree-shaped speculative masks are ignored by this static sparse kernel; mixed context/generation batches are not covered |
 | Beam width | `1` | Beam search |
 | Attention mask/window | Causal self-attention with a fixed cache window | ALiBi, arbitrary custom masks, StreamingLLM/sink tokens, and variable cyclic windows |
 
@@ -90,17 +91,29 @@ The current main branch JIT-compiles this path with NVRTC. Its support is
 therefore defined by the current TRTLLM-Gen source checks, not by the set of
 precompiled cubins that was present when the feature was introduced.
 
+Linear draft-token generation is verified with four query tokens per request:
+one target token plus three draft tokens. Each query has its own causal sparse
+index list, including indices for K/V written earlier in the same speculative
+forward. A separate branched-tree probe showed that the static sparse kernel
+matches the unmasked reference rather than the tree-filtered reference, so
+tree-shaped speculative masks are not supported.
+
+For FP8 KV cache, Q is quantized to E4M3 during QKV preprocessing and the XQA
+runner selects E4M3 KV/math types while retaining BF16 or FP16 model input.
+Tests cover both BF16 output with an FP8 KV cache and an E4M3 FP8-output kernel.
+
 The regression tests cover:
 
-- MQA and GQA ratios of 2:1, 4:1, and 8:1;
-- the maximum supported query-head group size of 32 for both MQA and GQA;
+- MQA and GQA group sizes `2`, `3`, `4`, `8`, `16`, `24`, `31`, and `32`;
 - variable batch and sequence lengths;
 - context KV compaction, context sparse computation, and decode sparse
   computation;
 - Top-K values `4`, `64`, and `128`, including Top-K larger than a request's
   current KV length;
 - backing KV-cache page sizes `32` and `64`;
-- all supported equal head dimensions in both BF16 and FP16.
+- all supported equal head dimensions in both BF16 and FP16;
+- linear generation with three draft tokens;
+- E4M3 FP8 KV cache and FP8 output with BF16 model input.
 
 The shared TRTLLM-Gen option validator also admits head dimension `512`, but
 the sparse MQA/GQA path aborts before launch for that configuration on current
@@ -108,11 +121,11 @@ main. It is therefore intentionally excluded from the supported matrix and
 regression tests.
 
 Backend developers can use
-[`test_sparse_attention.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_attention.py)
-as a minimal integration example. `MockSparseParams` and
-`TestSparseAttention` deliberately supply fixed sparse predictions so that the
-test isolates the cache/index layout and kernel computation. They are not
-public application APIs.
+[`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
+as a minimal integration example. `_SparseMqaGqaParams` and
+`_StaticSparseMqaGqaAttention` deliberately supply fixed sparse predictions so
+that the test isolates the cache/index layout and kernel computation. They are
+not public application APIs.
 
 ## Configure Sparse Attention
 
