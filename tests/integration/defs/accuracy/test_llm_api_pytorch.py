@@ -1321,7 +1321,8 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         with LLM(prequantized_model_path,
                  kv_cache_config=kv_cache_config,
                  attn_backend="FLASHINFER",
-                 cuda_graph_config=None) as llm:
+                 cuda_graph_config=None,
+                 max_seq_len=4096) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -4050,6 +4051,28 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_tep_mtp_separate_draft_kv_cache(self):
+        # TEP (attention_dp=False) + one-model MTP exercises the separate draft
+        # KV cache manager path. CUDA graphs cover draft capture and replay.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        dtype="fp8")
+        with LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                moe_config=MoeConfig(backend="TRTLLM"),
+                enable_attention_dp=False,
+                speculative_config=MTPDecodingConfig(max_draft_len=1),
+                max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+                max_seq_len=4096,
+                max_num_tokens=4096,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True),
+                kv_cache_config=kv_cache_config,
+        ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -8214,7 +8237,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                         enable_block_reuse=False,
                                         dtype="fp8" if use_msa else "auto")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
-            implementation="msa" if use_msa else "triton")
+            implementation="msa" if use_msa else "triton",
+            indexer_kv_dtype="fp8" if use_msa else "bf16")
         moe_config = MoeConfig(backend="CUTLASS")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,

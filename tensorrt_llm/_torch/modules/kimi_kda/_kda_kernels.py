@@ -101,10 +101,6 @@ def is_intree_prefill_available() -> bool:
         return False
 
 
-def _load_fla_chunk_kda() -> ModuleType:
-    return importlib.import_module("fla.ops.kda")
-
-
 # ---------------------------------------------------------------------------
 # In-tree KDA multi-token verify op (CuTe DSL, trtllm::kda_mtp_decode).
 # ---------------------------------------------------------------------------
@@ -208,16 +204,6 @@ class KDAKernelDispatch:
                     f"decode={self.decode_kernel_path} "
                     f"verify={self.verify_kernel_path}"
                 )
-
-    def get_prefill_source(self) -> str:
-        if self.prefill_kernel_path == "optimized":
-            return _load_prefill_module().__file__ or "<custom_ops.cute_dsl_kimi_k3>"
-        return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
-
-    def get_decode_source(self) -> str:
-        if self.decode_kernel_path == "optimized":
-            return _kda_decode.__file__ or "<kimi_kda._kda_decode>"
-        return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
 
     def mtp_verify(self, **kwargs) -> torch.Tensor:
         """Run the fused KDA multi-token verify kernel.
@@ -354,7 +340,7 @@ class KDAKernelDispatch:
 
         from fla.ops.kda import chunk_kda
 
-        o, final_state = chunk_kda(
+        return chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -373,7 +359,6 @@ class KDAKernelDispatch:
             state_v_first=True,
             cu_seqlens=cu_seqlens,
         )
-        return o, final_state
 
     def decode_kda(self, **kwargs) -> torch.Tensor:
         """Run the fused KDA single-token decode kernel.
