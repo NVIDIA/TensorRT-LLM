@@ -492,6 +492,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
+        if (
+            getattr(attn, "skip_correction_threshold", 0.0) > 0.0
+            and not cls.supports_skip_correction
+        ):
+            logger.debug(
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: skip-correction is "
+                "enabled and unsupported."
+            )
+            return False
+
         if not IS_FLASHINFER_AVAILABLE:
             logger.debug("FlashInfer TRTLLM-Gen FMHA is unavailable: flashinfer is not installed.")
             return False

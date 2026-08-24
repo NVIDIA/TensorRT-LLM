@@ -1553,6 +1553,9 @@ class ModelLoader:
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
+            skip_correction_threshold=(
+                self.llm_args.mla_skip_correction_threshold
+                if self.llm_args.enable_mla_skip_correction else 0.0),
             moe_backend=self.llm_args.moe_config.backend,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,

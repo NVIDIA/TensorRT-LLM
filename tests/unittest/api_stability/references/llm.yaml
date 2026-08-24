@@ -171,6 +171,14 @@ methods:
         annotation: str
         default: TRTLLM
         status: beta
+      enable_mla_skip_correction:
+        annotation: bool
+        default: False
+        status: prototype
+      mla_skip_correction_threshold:
+        annotation: float
+        default: 8.0
+        status: prototype
       sampler_force_async_worker:
         annotation: bool
         default: False
