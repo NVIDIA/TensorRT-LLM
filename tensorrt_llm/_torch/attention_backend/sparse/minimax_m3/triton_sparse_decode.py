@@ -22,6 +22,8 @@ Differences from upstream:
   nibbles and E4M3 block scales.
 * Partial-output and LSE scratch come from the persistent buffer arena so their
   addresses survive CUDA graph replay.
+* A single top-k chunk writes the final output directly, avoiding scratch and
+  the otherwise redundant LSE merge.
 * The merge kernel zeroes rows whose chunks are all empty instead of letting
   them produce NaN, since CUDA-graph padding rows flow on into the rest of the
   network here.
@@ -64,6 +66,25 @@ def _pdl_enabled() -> bool:
 
 
 @triton.jit
+def _e2m1x2_to_f16x2(packed):
+    """Convert one packed E2M1 byte into its low/high FP16 values."""
+    return tl.inline_asm_elementwise(
+        asm="""{
+        .reg .b8 src;
+        .reg .b32 pair;
+        mov.b32 {src, _, _, _}, $2;
+        cvt.rn.f16x2.e2m1x2 pair, src;
+        mov.b32 {$0, $1}, pair;
+        }""",
+        constraints="=h,=h,r",
+        args=(packed,),
+        dtype=(tl.float16, tl.float16),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _dequant_nvfp4_rows(
     packed,  # [BLOCK_N, D // 2] uint8, two E2M1 nibbles per byte
     scale_bytes,  # [BLOCK_N, SCALE_COLS] uint8, one E4M3 scale per 16 elements
@@ -72,27 +93,19 @@ def _dequant_nvfp4_rows(
     SCALE_COLS: tl.constexpr,
     SF_VEC: tl.constexpr,
 ):
-    """Dequantize one packed NVFP4 [BLOCK_N, D] tile to fp32.
+    """Dequantize one packed NVFP4 [BLOCK_N, D] tile to fp16.
 
     The caller gathers the block scales in whichever layout its role stores
     them, so this handles only the value math and the scale broadcast. The
     per-tensor scale is applied by the caller.
     """
-    # The low nibble holds the lower-indexed element, so interleaving the two
-    # nibble planes along the last axis rebuilds cache element order directly.
-    nib = tl.interleave((packed & 0x0F).to(tl.int32), ((packed >> 4) & 0x0F).to(tl.int32))
-    # E2M1: 1 sign, 2 exponent (bias 1), 1 mantissa. exp==0 is the subnormal
-    # pair {0, 0.5}; otherwise 2^(exp-1) * (1 + m/2). Exact in fp32.
-    exponent = (nib & 7) >> 1
-    mantissa = (nib & 1).to(tl.float32)
-    magnitude = tl.where(
-        exponent == 0,
-        mantissa * 0.5,
-        tl.exp2((exponent - 1).to(tl.float32)) * (1.0 + mantissa * 0.5),
-    )
-    values = tl.where(((nib >> 3) & 1) == 1, -magnitude, magnitude)
+    # Blackwell converts both E2M1 nibbles with one instruction. Joining the
+    # low/high results along a new innermost axis and flattening it rebuilds
+    # the original element order without scalar exponent/sign reconstruction.
+    value_lo, value_hi = _e2m1x2_to_f16x2(packed)
+    values = tl.reshape(tl.join(value_lo, value_hi), (BLOCK_N, D))
 
-    scales = scale_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    scales = scale_bytes.to(tl.float8e4nv, bitcast=True).to(tl.float16)
     scales = tl.reshape(
         tl.broadcast_to(scales[:, :, None], (BLOCK_N, SCALE_COLS, SF_VEC)), (BLOCK_N, D)
     )
@@ -116,8 +129,8 @@ def _gqa_sparse_decode_kernel(
     k_gs_ptr,  # NVFP4 per-tensor K dequant scale, one fp32
     v_gs_ptr,  # NVFP4 per-tensor V dequant scale, one fp32
     t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
-    o_ptr,  # partial out: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
-    lse_ptr,  # partial lse (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
+    o_ptr,  # partial out, or final [total_q, num_heads, head_dim] when DIRECT_OUTPUT
+    lse_ptr,  # partial lse (log2), unused when DIRECT_OUTPUT
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [num_reqs]
     total_q,
@@ -162,6 +175,7 @@ def _gqa_sparse_decode_kernel(
     USE_PDL: tl.constexpr,
     KV_NVFP4: tl.constexpr,  # cache holds packed E2M1 plus E4M3 block scales
     SCALE_COLS: tl.constexpr,  # head_dim // NVFP4_SF_VEC_SIZE, NVFP4 only
+    DIRECT_OUTPUT: tl.constexpr,  # one chunk needs neither FP32 scratch nor a merge
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     if KV_NVFP4:
@@ -340,11 +354,12 @@ def _gqa_sparse_decode_kernel(
         acc_o.to(o_ptr.dtype.element_ty),
         mask=hd_mask,
     )
-    lse_base = lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h
-    tl.store(lse_base + off_h * stride_l_h, lse_i, mask=h_mask)
+    if not DIRECT_OUTPUT:
+        lse_base = lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h
+        tl.store(lse_base + off_h * stride_l_h, lse_i, mask=h_mask)
 
-    # After the stores, never before: the merge grid's gdc_wait() releases on
-    # this trigger, and it reads exactly the partials written above.
+    # After the stores, never before: this releases either the merge grid or,
+    # for direct output, the next PDL-enabled consumer of the final tensor.
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -412,6 +427,109 @@ def resolve_num_topk_chunks(total_q: int, num_kv_heads: int, max_topk: int) -> i
     """
     target = max(1, min(max_topk, _TARGET_GRID // max(1, total_q * num_kv_heads)))
     return 1 << (target.bit_length() - 1)
+
+
+def _sm103_nvfp4_num_topk_chunks(
+    *,
+    total_q: int,
+    num_kv_heads: int,
+    gqa_group_size: int,
+    max_topk: int,
+    decode_query_len: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> Optional[int]:
+    """Select measured split-K factors for M3's SM103 DEP8 decode shape."""
+    if capability is None:
+        capability = torch.cuda.get_device_capability()
+    if (
+        capability != (10, 3)
+        or num_kv_heads != 4
+        or gqa_group_size != 16
+        or max_topk != 16
+        or decode_query_len != 4
+        or total_q % decode_query_len != 0
+    ):
+        return None
+    local_batch = total_q // decode_query_len
+    return {
+        2: 8,
+        3: 8,
+        4: 8,
+        5: 16,
+        6: 4,
+        7: 4,
+        8: 2,
+        9: 2,
+        10: 8,
+        11: 4,
+        12: 2,
+        13: 2,
+        14: 2,
+    }.get(local_batch)
+
+
+def _sm103_nvfp4_launch_options(
+    *,
+    total_q: int,
+    num_kv_heads: int,
+    gqa_group_size: int,
+    max_topk: int,
+    decode_query_len: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> dict[str, int]:
+    """Select measured SM103 native-NVFP4 launch geometry.
+
+    The FP16 QK/PV path is register-sensitive. GB300 dense replay shows four
+    warps/two stages wins through local batch 28, while two warps/one stage
+    avoids the next residency cliff at local batches 29--32. Leave every
+    unmeasured architecture, model geometry, and larger batch on Triton's
+    established defaults.
+    """
+    if capability is None:
+        capability = torch.cuda.get_device_capability()
+    if (
+        capability != (10, 3)
+        or num_kv_heads != 4
+        or gqa_group_size != 16
+        or max_topk != 16
+        or decode_query_len != 4
+    ):
+        return {}
+    local_batch = total_q // decode_query_len
+    if local_batch == 1 or local_batch in (2, 3, 5, 6, 7, 10, 11, 12):
+        return {"num_warps": 4, "num_stages": 1}
+    if local_batch == 4:
+        return {"num_warps": 2, "num_stages": 1}
+    if 8 <= local_batch <= 28:
+        return {"num_warps": 4, "num_stages": 2}
+    if 29 <= local_batch <= 32:
+        return {"num_warps": 2, "num_stages": 1}
+    return {}
+
+
+def _sm103_nvfp4_merge_launch_options(
+    *,
+    total_q: int,
+    num_kv_heads: int,
+    gqa_group_size: int,
+    max_topk: int,
+    decode_query_len: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> dict[str, int]:
+    """Select measured one-warp merge launches for M3's DEP8 graphs."""
+    if capability is None:
+        capability = torch.cuda.get_device_capability()
+    if (
+        capability == (10, 3)
+        and num_kv_heads == 4
+        and gqa_group_size == 16
+        and max_topk == 16
+        and decode_query_len == 4
+        and total_q % decode_query_len == 0
+        and total_q // decode_query_len in (2, 4, 5, 6, 7, 10, 11)
+    ):
+        return {"num_warps": 1}
+    return {}
 
 
 def _check_nvfp4_inputs(
@@ -535,33 +653,76 @@ def minimax_m3_sparse_attn_decode(
             f"MiniMax-M3 sparse decode cannot widen FP8 q into {output.dtype}; "
             f"supported compute dtypes are {sorted(d.__str__() for d in _TL_DTYPES)}."
         )
-    compute_dtype = _TL_DTYPES[output.dtype] if widen_q else tl.float32
+    # Packed NVFP4 dequantizes to FP16. The production producer supplies FP8
+    # q, which widens exactly to FP16, so keep both dot operands there instead
+    # of converting every K/V tile to BF16. Accumulation remains FP32.
+    if widen_q:
+        compute_dtype = tl.float16 if kv_nvfp4 else _TL_DTYPES[output.dtype]
+    else:
+        compute_dtype = tl.float32
 
     if num_topk_chunks is None:
-        num_topk_chunks = resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
+        measured_chunks = (
+            _sm103_nvfp4_num_topk_chunks(
+                total_q=total_q,
+                num_kv_heads=num_kv_heads,
+                gqa_group_size=gqa_group_size,
+                max_topk=max_topk,
+                decode_query_len=decode_query_len,
+            )
+            if kv_nvfp4
+            else None
+        )
+        num_topk_chunks = (
+            measured_chunks
+            if measured_chunks is not None
+            else resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
+        )
     elif num_topk_chunks & (num_topk_chunks - 1):
         raise ValueError(f"num_topk_chunks must be a power of two; got {num_topk_chunks}.")
 
-    # Persistent arena rather than torch.empty, so the partials keep one address
-    # across CUDA graph replays.
-    reserve = torch.cuda.is_current_stream_capturing()
-    # fp32 partials: at decode these are a couple of MB, and keeping them wide
-    # means the split-K factor cannot perturb the merged result.
-    o_partial = get_memory_buffers().get_buffer(
-        [num_topk_chunks, total_q, num_heads, head_dim],
-        torch.float32,
-        buffer_name="m3_sparse_decode_o_partial",
-        reserve_buffer=reserve,
-    )
-    lse_partial = get_memory_buffers().get_buffer(
-        [num_topk_chunks, total_q, num_heads],
-        torch.float32,
-        buffer_name="m3_sparse_decode_lse_partial",
-        reserve_buffer=reserve,
-    )
+    direct_output = num_topk_chunks == 1
+    if direct_output:
+        # With one chunk, acc_o is already normalized and final. Point the
+        # producer at the caller's output and compile away the LSE store.
+        # Keeping a real dummy pointer preserves Triton's pointer contract.
+        o_arg = output
+        lse_arg = output
+        o_strides = (0, output.stride(0), output.stride(1), output.stride(2))
+        lse_strides = (0, 0, 0)
+    else:
+        # Persistent arena rather than torch.empty, so the partials keep one
+        # address across CUDA graph replays. FP32 keeps the split-K factor from
+        # perturbing the merged result.
+        reserve = torch.cuda.is_current_stream_capturing()
+        o_arg = get_memory_buffers().get_buffer(
+            [num_topk_chunks, total_q, num_heads, head_dim],
+            torch.float32,
+            buffer_name="m3_sparse_decode_o_partial",
+            reserve_buffer=reserve,
+        )
+        lse_arg = get_memory_buffers().get_buffer(
+            [num_topk_chunks, total_q, num_heads],
+            torch.float32,
+            buffer_name="m3_sparse_decode_lse_partial",
+            reserve_buffer=reserve,
+        )
+        o_strides = tuple(o_arg.stride())
+        lse_strides = tuple(lse_arg.stride())
 
     use_pdl = _pdl_enabled()
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
+    launch_options = (
+        _sm103_nvfp4_launch_options(
+            total_q=total_q,
+            num_kv_heads=num_kv_heads,
+            gqa_group_size=gqa_group_size,
+            max_topk=max_topk,
+            decode_query_len=decode_query_len,
+        )
+        if kv_nvfp4
+        else {}
+    )
 
     _gqa_sparse_decode_kernel[(total_q * num_topk_chunks, num_kv_heads)](
         q,
@@ -573,8 +734,8 @@ def minimax_m3_sparse_attn_decode(
         k_gs_arg,
         v_gs_arg,
         topk_idx,
-        o_partial,
-        lse_partial,
+        o_arg,
+        lse_arg,
         block_table,
         seq_lens,
         total_q,
@@ -601,13 +762,8 @@ def minimax_m3_sparse_attn_decode(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
-        o_partial.stride(0),
-        o_partial.stride(1),
-        o_partial.stride(2),
-        o_partial.stride(3),
-        lse_partial.stride(0),
-        lse_partial.stride(1),
-        lse_partial.stride(2),
+        *o_strides,
+        *lse_strides,
         block_table.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
@@ -617,32 +773,44 @@ def minimax_m3_sparse_attn_decode(
         USE_PDL=use_pdl,
         KV_NVFP4=kv_nvfp4,
         SCALE_COLS=scale_cols,
+        DIRECT_OUTPUT=direct_output,
         **pdl_launch,
+        **launch_options,
     )
-    _merge_topk_attn_out_kernel[(total_q, num_heads)](
-        o_partial,
-        lse_partial,
-        output,
-        head_dim,
-        o_partial.stride(0),
-        o_partial.stride(1),
-        o_partial.stride(2),
-        o_partial.stride(3),
-        lse_partial.stride(0),
-        lse_partial.stride(1),
-        lse_partial.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        NUM_TOPK_CHUNKS=num_topk_chunks,
-        USE_PDL=use_pdl,
-        **pdl_launch,
-    )
+    if not direct_output:
+        merge_launch_options = (
+            _sm103_nvfp4_merge_launch_options(
+                total_q=total_q,
+                num_kv_heads=num_kv_heads,
+                gqa_group_size=gqa_group_size,
+                max_topk=max_topk,
+                decode_query_len=decode_query_len,
+            )
+            if kv_nvfp4
+            else {}
+        )
+        _merge_topk_attn_out_kernel[(total_q, num_heads)](
+            o_arg,
+            lse_arg,
+            output,
+            head_dim,
+            *o_strides,
+            *lse_strides,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            NUM_TOPK_CHUNKS=num_topk_chunks,
+            USE_PDL=use_pdl,
+            **pdl_launch,
+            **merge_launch_options,
+        )
 
 
 __all__ = [
     "NVFP4_SF_VEC_SIZE",
     "SPARSE_BLOCK_SIZE",
+    "_sm103_nvfp4_merge_launch_options",
+    "_sm103_nvfp4_num_topk_chunks",
     "minimax_m3_sparse_attn_decode",
     "resolve_num_topk_chunks",
 ]

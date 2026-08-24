@@ -23,6 +23,9 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
     NVFP4_SF_VEC_SIZE,
     SPARSE_BLOCK_SIZE,
+    _sm103_nvfp4_launch_options,
+    _sm103_nvfp4_merge_launch_options,
+    _sm103_nvfp4_num_topk_chunks,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
 )
@@ -458,7 +461,8 @@ def test_sparse_decode_accepts_token_major_topk_table():
     assert torch.equal(out_hm, out_tm)
 
 
-def test_sparse_decode_cuda_graph_replay_tracks_inputs():
+@pytest.mark.parametrize("num_topk_chunks", [1, 4], ids=["direct-output", "split-merge"])
+def test_sparse_decode_cuda_graph_replay_tracks_inputs(num_topk_chunks):
     """Replay must recompute from the live buffers, not reuse captured values."""
     seq_lens = [2048, 4097, 900]
     q, k_paged, v_paged, topk_idx, block_table, seq_lens_dev = _make_inputs(
@@ -477,7 +481,7 @@ def test_sparse_decode_cuda_graph_replay_tracks_inputs():
             sm_scale=HEAD_DIM**-0.5,
             output=out,
             decode_query_len=1,
-            num_topk_chunks=4,
+            num_topk_chunks=num_topk_chunks,
         )
 
     # Warm up on a side stream so the Triton JIT and the scratch arena are
@@ -568,6 +572,24 @@ def test_nvfp4_sparse_decode_matches_reference(num_kv_heads, group, decode_query
         case.seq_lens,
         sm_scale=HEAD_DIM**-0.5,
         decode_query_len=decode_query_len,
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
+
+
+def test_nvfp4_sparse_decode_fp8_q_matches_reference():
+    """Production FP8 q may use FP16 dot operands without changing the cache math."""
+    case = _make_nvfp4_inputs([300, 1500, 4097], num_kv_heads=2, group=8, seed=67)
+    case.q = case.q.to(torch.float8_e4m3fn)
+    out = _run_nvfp4(case)
+    expected = _reference_sparse_decode(
+        case.q.to(torch.bfloat16),
+        case.k_ref,
+        case.v_ref,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        decode_query_len=case.decode_query_len,
     )
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
 
@@ -711,3 +733,109 @@ def test_resolve_num_topk_chunks_is_shape_only_power_of_two(total_q, num_kv_head
     assert 1 <= chunks <= max_topk
     assert chunks & (chunks - 1) == 0
     assert chunks == resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
+
+
+@pytest.mark.parametrize(
+    ("local_batch", "expected"),
+    [
+        (1, {"num_warps": 4, "num_stages": 1}),
+        (2, {"num_warps": 4, "num_stages": 1}),
+        (4, {"num_warps": 2, "num_stages": 1}),
+        (8, {"num_warps": 4, "num_stages": 2}),
+        (28, {"num_warps": 4, "num_stages": 2}),
+        (29, {"num_warps": 2, "num_stages": 1}),
+        (32, {"num_warps": 2, "num_stages": 1}),
+        (33, {}),
+    ],
+)
+def test_sm103_nvfp4_launch_options(local_batch, expected):
+    assert (
+        _sm103_nvfp4_launch_options(
+            total_q=local_batch * 4,
+            num_kv_heads=4,
+            gqa_group_size=16,
+            max_topk=16,
+            decode_query_len=4,
+            capability=(10, 3),
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("local_batch", "expected"),
+    [
+        (1, None),
+        (2, 8),
+        (4, 8),
+        (5, 16),
+        (6, 4),
+        (8, 2),
+        (10, 8),
+        (11, 4),
+        (12, 2),
+        (13, 2),
+        (14, 2),
+        (15, None),
+    ],
+)
+def test_sm103_nvfp4_num_topk_chunks(local_batch, expected):
+    assert (
+        _sm103_nvfp4_num_topk_chunks(
+            total_q=local_batch * 4,
+            num_kv_heads=4,
+            gqa_group_size=16,
+            max_topk=16,
+            decode_query_len=4,
+            capability=(10, 3),
+        )
+        == expected
+    )
+
+
+def test_sm103_nvfp4_launch_options_rejects_unmeasured_shapes():
+    common = dict(
+        total_q=32,
+        num_kv_heads=4,
+        gqa_group_size=16,
+        max_topk=16,
+        decode_query_len=4,
+    )
+    assert _sm103_nvfp4_launch_options(**common, capability=(10, 0)) == {}
+    assert _sm103_nvfp4_launch_options(**(common | {"num_kv_heads": 2}), capability=(10, 3)) == {}
+    assert (
+        _sm103_nvfp4_launch_options(**(common | {"decode_query_len": 1}), capability=(10, 3)) == {}
+    )
+
+
+@pytest.mark.parametrize(
+    ("local_batch", "expected"),
+    [
+        (1, {}),
+        (2, {"num_warps": 1}),
+        (3, {}),
+        (4, {"num_warps": 1}),
+        (5, {"num_warps": 1}),
+        (6, {"num_warps": 1}),
+        (7, {"num_warps": 1}),
+        (8, {}),
+        (10, {"num_warps": 1}),
+        (11, {"num_warps": 1}),
+        (12, {}),
+    ],
+)
+def test_sm103_nvfp4_merge_launch_options_is_narrowly_scoped(local_batch, expected):
+    common = dict(
+        num_kv_heads=4,
+        gqa_group_size=16,
+        max_topk=16,
+        decode_query_len=4,
+    )
+    assert (
+        _sm103_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=(10, 3))
+        == expected
+    )
+    assert (
+        _sm103_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=(10, 0))
+        == {}
+    )
