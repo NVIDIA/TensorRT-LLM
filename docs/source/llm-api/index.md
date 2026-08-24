@@ -115,6 +115,24 @@ estimation; their final counterparts are the resources retained for serving.
 | `worker_start_seconds` | Start the final PyExecutor worker. |
 | `total_executor_creation_seconds` | Complete `create_py_executor()` call, including all applicable scopes above. |
 
+The model-engine objects contain the warmup scopes below. Which scopes appear depends on the model
+and configuration; for example, encoder-decoder and context-parallel configurations can skip some
+stages.
+
+| Model-engine metric | Scope |
+|---------------------|-------|
+| `attention_warmup_seconds` | Warm up the attention backend and kernels. |
+| `general_warmup_seconds` | Warm up general input shapes and release temporary workspaces. |
+| `autotuner_warmup_seconds` | Run kernel autotuning warmup. |
+| `mamba_hybrid_warmup_seconds` | Warm up Mamba hybrid kernels, when applicable. |
+| `cuda_graph_warmup_seconds` | Run the warmup-only CUDA graph pass. |
+| `cuda_graph_capture_seconds` | Capture CUDA graphs for serving. |
+| `dg_paged_mqa_warmup_seconds` | Warm up DeepGEMM paged-MQA metadata, when applicable. |
+| `cute_dsl_radix_topk_warmup_seconds` | Warm up the CuTe DSL radix top-k kernel, when applicable. |
+| `memory_pool_prepopulation_seconds` | Pre-populate the memory pool with maximum-shape allocations. |
+| `kv_cache_cleanup_seconds` | Check and clear invalid KV cache values produced during warmup. |
+| `total_warmup_seconds` | Complete model-engine warmup, including KV cache cleanup. |
+
 The `model_loader` object contains timings for the main LLM weights. If a draft model is used,
 additional field `draft_checkpoint_preparation_seconds` and `draft_weight_population_seconds` will appear.
 A `draft_model_loader` object can also appear in deprecated 2-model style MTP setting.
