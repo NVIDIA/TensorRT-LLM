@@ -1310,6 +1310,12 @@ def _red_shared_add1(addr, *, loc=None, ip=None):
     )
 
 
+# Block-skip surviving-block-id list capacity (12 KiB static smem, paid only
+# by bsk compile variants).  Real-capture survival fractions sit well below
+# this bound; overflow degrades to the exact identity walk over all blocks.
+BSK_CAPL = 3072
+
+
 class GvrMainKernel:
     """gvr_main<BLK, U, MINB, NBS, KPT, SPLIT> — streaming self-sampling GVR."""
 
@@ -1326,10 +1332,20 @@ class GvrMainKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         r_const: int = 1,
+        bsk: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
         assert kpt in (1, 2, 4, 8) and minb in (1, 2, 4)
+        # Block-skip fast path: the row pass consumes a per-32-element
+        # block-maxima side tensor (produced by the indexer-GEMM emission
+        # epilogue in production).  A block whose max is below the pass
+        # threshold contributes nothing to any count or segment and is never
+        # read — an exact superset.  bsk=False compiles the original kernel
+        # unchanged.  Batch-uniform entry only for now.
+        self.bsk = bool(bsk)
+        if self.bsk:
+            assert not varlen, "block-skip: batch-uniform entry only"
         self.blk = blk
         self.u = u
         self.minb = minb
@@ -1591,6 +1607,17 @@ class GvrMainKernel:
             s_lad = smem.allocate_tensor(
                 cutlass.Int32, cute.make_ordered_layout((4,), order=(0,)), byte_alignment=16
             )
+        if cutlass.const_expr(self.bsk):
+            # compact surviving-block-id list + its counter (static
+            # allocations — only the bsk compile variant pays them)
+            s_bl = smem.allocate_tensor(
+                cutlass.Int32,
+                cute.make_ordered_layout((BSK_CAPL,), order=(0,)),
+                byte_alignment=16,
+            )
+            s_blc = smem.allocate_tensor(
+                cutlass.Int32, cute.make_ordered_layout((4,), order=(0,)), byte_alignment=16
+            )
         blob = smem.allocate_tensor(  # dynamic-equivalent region
             cutlass.Int8, cute.make_ordered_layout((self.dyn_bytes,), order=(0,)), byte_alignment=16
         )
@@ -1804,6 +1831,15 @@ class GvrMainKernel:
             SS2 = s_lad[1]
             TGT = s_lad[2]
             TGT2 = s_lad[3]
+
+        # block-skip: bmax row coordinates (pure arithmetic, hoisted ahead
+        # of P1 so the sampling phase can overlap the bmax stream)
+        if cutlass.const_expr(self.bsk):
+            bm_base = (
+                cutlass.Int64(cutlass.Uint32(scap_dead)) << cutlass.Int64(32)
+            ) | cutlass.Int64(cutlass.Uint32(cmp_dead))
+            nbm = npad >> cutlass.Int32(5)
+            bm_row = bm_base + cutlass.Int64(row) * cutlass.Int64(nbm) * cutlass.Int64(4)
 
         # ============ P1: sample prefetch (hint gather LAZY) =================
         atom128 = C.g2r_atom_f32(128, invariant=True)
@@ -2100,6 +2136,112 @@ class GvrMainKernel:
             # _pin_i32: stop NVVM re-deriving the ceil-div bound (ld.param n +
             # shr/sel chain) inside the tile-loop condition region per iter
             nIt = _pin_i32(nIt)
+
+            # ==== block-skip row pass (replaces the dense tile loop) ====
+            # bmax[row, npad>>5] fp32 (grain 32).  Exactness: bmax >= max of
+            # its 32 elements, so bmax < TF => no element can pass the TF
+            # predicate — the surviving-block walk applies the SAME
+            # per-element predicates as the dense tile loop (element index in
+            # [c0*4, c1*4) and value >= TF) and stages through the SAME
+            # _emitc/s_scal[0] machinery, so everything downstream (verify
+            # scan, retry ladder, split hand-off) is unchanged.  The list is
+            # rebuilt every attempt (TF drops on retry; the bmax array is
+            # 1/32 of the row).  List overflow degrades to an identity walk
+            # over ALL blocks of the chunk (dense-equivalent, exact).
+            if cutlass.const_expr(self.bsk):
+                nIt = cutlass.Int32(0)  # tile loop off (dead under bsk)
+                if tidx == cutlass.Int32(0):
+                    s_blc[0] = cutlass.Int32(0)
+                cute.arch.barrier()
+                b0b = c0 >> cutlass.Int32(3)
+                b1b = (c1 + cutlass.Int32(7)) >> cutlass.Int32(3)
+                bi = b0b + tidx
+                while bi < b1b:
+                    bv = C.ldg_f32(bm_row, bi)
+                    if bv >= TF:
+                        slb = C.atomic_add_cta(s_blc.iterator, cutlass.Int32(1))
+                        if slb < cutlass.Int32(BSK_CAPL):
+                            s_bl[slb] = bi
+                    bi = bi + cutlass.Int32(BLK)
+                cute.arch.barrier()
+                nbl = s_blc[0]
+                identw = cutlass.Int32(0)
+                if nbl > cutlass.Int32(BSK_CAPL):
+                    identw = cutlass.Int32(1)
+                    nbl = b1b - b0b
+                lo_e = c0 << cutlass.Int32(2)
+                hi_e = c1 << cutlass.Int32(2)
+                wid = tidx >> cutlass.Int32(5)
+                lmlt = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+                fbv = cute.make_rmem_tensor((8,), cutlass.Float32)
+                fbe = cute.make_rmem_tensor((8,), cutlass.Int32)
+                wr = wid * cutlass.Int32(8)
+                while wr < nbl:
+                    # LOAD phase: eight blocks in flight before any claim.
+                    # P10 clamp idiom: invalid lanes load a safe in-chunk
+                    # address unconditionally (their value is masked by
+                    # fbe=-1 in the claim) — branch-wrapped predicated loads
+                    # serialized issue and cost 2.7-4.7k cycles/round.
+                    for _j in cutlass.range_constexpr(8):
+                        li = wr + cutlass.Int32(_j)
+                        bid = cutlass.Int32(-1)
+                        if li < nbl:
+                            if identw != cutlass.Int32(0):
+                                bid = b0b + li
+                            else:
+                                bid = s_bl[li]
+                        ej = (bid << cutlass.Int32(5)) + lane
+                        okj = cutlass.Int32(0)
+                        if bid >= cutlass.Int32(0):
+                            if ej >= lo_e:
+                                if ej < hi_e:
+                                    okj = cutlass.Int32(1)
+                        ejc = ej
+                        if okj == cutlass.Int32(0):
+                            ejc = lo_e
+                        fbv[_j] = C.ldg_f32(x_addr, ejc)
+                        ei = ej
+                        if okj == cutlass.Int32(0):
+                            ei = cutlass.Int32(-1)
+                        fbe[_j] = ei
+                    # CLAIM phase: 8 ballots stored in a rmem ring, ONE atomic
+                    fbm = cute.make_rmem_tensor((8,), cutlass.Uint32)
+                    cnt8 = cutlass.Int32(0)
+                    for _j in cutlass.range_constexpr(8):
+                        pj = cutlass.Int32(0)
+                        if fbe[_j] >= cutlass.Int32(0):
+                            if cutlass.Float32(fbv[_j]) >= TF:
+                                pj = cutlass.Int32(1)
+                        mj = cutlass.Uint32(C.ballot(pj != cutlass.Int32(0)))
+                        fbm[_j] = mj
+                        cnt8 = cnt8 + cutlass.Int32(C.popc(mj))
+                    base4 = cutlass.Int32(0)
+                    if lane == cutlass.Int32(0):
+                        if cnt8 != cutlass.Int32(0):
+                            base4 = C.atomic_add_cta(s_scal.iterator + 0, cnt8)
+                    base4 = cute.arch.shuffle_sync(base4, cutlass.Int32(0))
+                    for _j in cutlass.range_constexpr(8):
+                        mj = cutlass.Uint32(fbm[_j])
+                        pj = cutlass.Int32(0)
+                        if fbe[_j] >= cutlass.Int32(0):
+                            if cutlass.Float32(fbv[_j]) >= TF:
+                                pj = cutlass.Int32(1)
+                        if pj != cutlass.Int32(0):
+                            posj = base4 + cutlass.Int32(C.popc(mj & lmlt))
+                            self._emitc(
+                                cutlass.Float32(fbv[_j]),
+                                fbe[_j],
+                                posj,
+                                TF,
+                                SC,
+                                hb_pin,
+                                cb2_pin,
+                                s_hist,
+                                s_cbuf,
+                                s_cbuf2,
+                            )
+                        base4 = base4 + cutlass.Int32(C.popc(mj))
+                    wr = wr + cutlass.Int32(NW * 8)
 
             it = cutlass.Int32(0)
             while it < nIt:
@@ -2899,6 +3041,7 @@ class GvrMainKernel:
                         out_row[j] = cutlass.Int32(-1)
                         j = j + cutlass.Int32(BLK)
 
+
     # ------------------------------------------------------------------
     # host launcher (grid dim3(R, b); MINB wall via min_blocks_per_mp)
     # ------------------------------------------------------------------
@@ -2960,19 +3103,21 @@ class GvrMainKernel:
 _COMPILE_CACHE = {}
 
 
-def get_compiled(tpl, options_extra: str = ""):
+def get_compiled(tpl, options_extra: str = "", bsk: bool = False):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
     — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
-    machinery in whenever SPLIT and gates it per row at runtime)."""
-    key = (tuple(tpl), options_extra)
+    machinery in whenever SPLIT and gates it per row at runtime).
+    bsk=True (batch-uniform mode only): block-skip row pass consuming a bmax
+    side tensor whose gmem address rides the dead scap/cmp scalar slots."""
+    key = (tuple(tpl), options_extra, bool(bsk))
     hit = _COMPILE_CACHE.get(key)
     if hit is not None:
         return hit
     if len(tpl) == 7:
         blk, u, minb, nbs, kpt, split, tshg = tpl
-        kern = GvrMainKernel(blk, u, minb, nbs, kpt, bool(split), bool(tshg))
+        kern = GvrMainKernel(blk, u, minb, nbs, kpt, bool(split), bool(tshg), bsk=bsk)
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
         kern = GvrMainKernel(
@@ -3062,6 +3207,71 @@ def run(logits, pre_idx, n: int, out, ws):
         rt["SS2"],
         rt["TGT2"],
         _legacy_dummy_kv(pre_idx),  # dummy kv_lens (dead in legacy mode)
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    return r
+
+
+def bsk_gate(b: int, n: int, npad: int, k: int) -> bool:
+    """Shape-only dispatch gate (no data-dependent terms — hit rates are
+    unknowable at dispatch).  Block-skip wins where the skip actually removes
+    DRAM traffic and survival is thin: (1) the working set must exceed L2,
+    else the baseline re-read is already L2-hot and the walk only adds round
+    latency; (2) N/K large enough that the surviving-block fraction stays
+    thin.
+    Full-grid calibration: N/K = 64 boundary cells are layer-dependent coin
+    flips on real captures; 72 keeps the N/K ~ 80 winner band in while both
+    64-bands fall back to the baseline."""
+    return (b * npad * 4 >= 128 * 1024 * 1024) and (n >= 72 * k)
+
+
+def run_bsk(logits, pre_idx, n: int, out, ws, bmax):
+    """Block-skip entry (batch-uniform, main family only).
+    bmax: [b, npad >> 5] fp32 contiguous per-32-element block maxima computed
+    over the SAME padded row bytes the kernel reads (pads included, so the
+    superset property holds whatever the pad convention).  Address rides the
+    dead scap/cmp scalar ABI slots (hi/lo 32-bit halves).
+    Falls back to the baseline run() outside bsk_gate()."""
+    try:
+        from . import gvr_topk_decode_self_sampling_host as ct_dispatch
+    except ImportError:
+        import gvr_topk_decode_self_sampling_host as ct_dispatch
+    b, npad = logits.shape
+    k = pre_idx.shape[1]
+    if not bsk_gate(b, int(n), npad, k):
+        return run(logits, pre_idx, n, out, ws)
+    r = ct_dispatch.route(b, int(n), npad, k)
+    assert r["kernel"] == "main", f"shape routes to {r['kernel']}, not gvr_main"
+    assert ws.numel() * ws.element_size() >= WS_BYTES
+    assert bmax.shape[0] == b and bmax.shape[1] == (npad >> 5) and bmax.is_contiguous()
+    rt = r["rt"]
+    fn = get_compiled(tuple(r["tpl"]), bsk=True)
+    addr = bmax.data_ptr()
+
+    def _s32(v):  # signed-wrap a u32 half into the Int32 scalar ABI slot
+        return v - (1 << 32) if v >= (1 << 31) else v
+
+    fn(
+        logits,
+        pre_idx,
+        out,
+        ws,
+        rt["n"],
+        rt["npad"],
+        rt["k"],
+        _s32((addr >> 32) & 0xFFFFFFFF),
+        _s32(addr & 0xFFFFFFFF),
+        rt["R"],
+        rt["SMP"],
+        rt["TGT"],
+        rt["Q"],
+        rt["SS2"],
+        rt["TGT2"],
+        _legacy_dummy_kv(pre_idx),
         0,
         0,
         0,
