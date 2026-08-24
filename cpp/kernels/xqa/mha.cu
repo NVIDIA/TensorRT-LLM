@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -378,6 +378,8 @@ struct alignas(128) SharedMem
     using Barrier = CtaBarrier;
 
     Barrier qBarrier[ctaShapeInWarps.y];
+    // Handoff from GEMM0 warps to GEMM1 before reusing shared-memory for post-processing and multi-block reduction.
+    Barrier gemm0ToPostProcBarrier;
     // Beside X buffers, also protects warpRowMax and warpRowSum. For CTA_ROW_MAX_BACKWARD_METHOD==1 or 2, also
     // ctaRowMax.
     CtaBarrierPair xBarriers[ctaShapeInWarps.y][ctaShapeInWarps.x];
@@ -1590,6 +1592,10 @@ CUBIN_EXPORT __global__
     {
         init(&smem.qBarrier[ctaThrdId], warp_size * ctaShapeInWarps.x); // be sure to use .noinc
     }
+    if (ctaThrdId == 0)
+    {
+        init(&smem.gemm0ToPostProcBarrier, warp_size * ctaShapeInWarps.x * ctaShapeInWarps.y);
+    }
     constexpr uint32_t cacheVTileSeqStride = cacheVTileSeqLen * gemm1NbWarpGrps;
     constexpr uint32_t nbXTilesPerXIter
         = cacheVTileSeqStride < warpTile.x ? 1 : exactDiv(cacheVTileSeqStride, warpTile.x);
@@ -1958,6 +1964,7 @@ CUBIN_EXPORT __global__
                     {
                         // synchronize k
                         ldgsts::waitGroup<1>();
+                        __syncwarp();
                     }
                     SharedMem::QSmemBuffer const& smemQ = smem.q[warpIdx.y][0];
                     constexpr uint32_t qOffsetPerPart = exactDiv(elemsPerKHeadPart, inputElemsPerGrain);
@@ -2068,6 +2075,12 @@ CUBIN_EXPORT __global__
             smem.warpRowSum[warpIdx.y][warpIdx.x].storeFromReg<false>(warp, regRowSum);
             unused(xBar.produced.arrive());
         }
+        // The initial K prefetch is issued even for an empty multi-block subsequence, where the loop above is skipped.
+        // Drain it (and the final look-ahead prefetch for non-empty subsequences) before publishing GEMM0 completion;
+        // GEMM1 reuses the same shared-memory allocation for output reduction after waiting on this barrier.
+        ldgsts::waitGroup<0>();
+        // Publish completion of GEMM0 warps. GEMM1 waits on this barrier before reusing the K/Q/X storage.
+        unused(smem.gemm0ToPostProcBarrier.arrive());
     }
     else
     {
@@ -2285,6 +2298,8 @@ CUBIN_EXPORT __global__
 #else
             assert(!alreadyComplete);
             ldgsts::waitGroup<nbVBuffers - 1>();
+            // Each lane waits only for its own async-copy groups; synchronize the warp before consuming the V tile.
+            __syncwarp();
 #endif
         };
         auto testVTileLoad = [&](uint32_t idxVBar, ParityOrNone<grpLoadV> parity)
@@ -2480,11 +2495,16 @@ CUBIN_EXPORT __global__
 
         auto const fullRescaleMask = UniformRescaleMask::filled(~0U);
 
+        // Drain speculative V prefetches and wait for GEMM0 warps before reusing shared memory for
+        // global-row merging and output post-processing.
+        ldgsts::waitGroup<0>();
+        smem.gemm0ToPostProcBarrier.wait_parity(false);
+        __syncthreads();
+
         constexpr bool needMergeGlobal = (gemm1NbWarpGrps > 1 && nbXTilesPerXIter > 1);
         if constexpr (needMergeGlobal)
         {
             assert(gemm1NbWarpGrps != 1);
-            __syncthreads();
             smem.warpRowMax[warpIdx.y][warpIdx.x].template storeFromReg<false>(warp, globalRowMax);
             smem.warpRowSum[warpIdx.y][warpIdx.x].template storeFromReg<false>(warp, globalRowSum);
             __syncthreads();
@@ -2628,6 +2648,8 @@ CUBIN_EXPORT __global__
             // merge if we are the last CTA.
             bool const isLastCta = mbsmem.isLastCta;
             writesOutput = isLastCta;
+            // All threads must finish reading the flag before the same shared-memory storage is reused by smemRowMax.
+            __syncthreads();
             if (isLastCta)
             {
                 MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
@@ -2672,6 +2694,8 @@ CUBIN_EXPORT __global__
                     }
                     ldgsts::commitGroup();
                     ldgsts::waitGroup<1>();
+                    // Each lane waits only for its own async-copy groups; synchronize before consuming the merge tile.
+                    __syncwarp();
                     uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
                     WarpAcc tile = toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
                     ThrdRegRowMax const tileRowMax = getTileBuf(mbbuf.tileRowMax, d).loadToReg<false>(warp);
@@ -2682,6 +2706,9 @@ CUBIN_EXPORT __global__
                     assert(std::isfinite(partialMergedRowSum[0]));
                     rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
                     sumAcc = sumAcc + tile;
+                    // The merge tiles form a two-stage circular buffer.  Make every lane finish the current
+                    // ldmatrix/row-stat reads before any lane advances far enough to overwrite this slot.
+                    __syncwarp();
                 }
 
                 ThrdRegRowMax mergedRowSum{};
