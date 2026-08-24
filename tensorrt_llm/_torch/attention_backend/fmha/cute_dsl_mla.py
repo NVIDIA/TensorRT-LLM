@@ -44,6 +44,14 @@ class CuteDslMlaFmha(PhasedFmha):
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
+        if attn.flashinfer_mla_backend is not None:
+            logger.debug(
+                "Standalone CuTe DSL MLA FMHA is unavailable: an explicit "
+                "flashinfer_mla_backend delegates MLA generation to "
+                "FlashInferTrtllmGenFmha."
+            )
+            return False
+
         if not IS_CUTLASS_DSL_AVAILABLE:
             logger.debug("CuTe DSL MLA FMHA is unavailable: nvidia-cutlass-dsl is not installed.")
             return False
@@ -218,24 +226,33 @@ class CuteDslMlaFmha(PhasedFmha):
         critical batch size (``_PERF_MIN_BATCH_FP8``); everything else falls
         back to the next FMHA library.
 
-        bf16/fp16 KV: only num_heads == 16 is admitted.
+        bf16/fp16 KV: admit the measured Kimi K3 DEP/TEP head counts and the
+        existing 16-head path.
 
         ``batch_size=None`` evaluates only the batch-size-independent
         conditions (dtype, num_heads, seq_len_q) and skips the batch floor."""
+        _BF16_FP16_PERF_FAVORABLE_HEAD_COUNTS = (6, 12, 16, 96)
         if kernel_dtype != torch.float8_e4m3fn:
-            if num_heads == 16:
+            if num_heads in _BF16_FP16_PERF_FAVORABLE_HEAD_COUNTS:
                 return True, ""
             return False, (
-                f"CuTe DSL MLA decode on {kernel_dtype} KV is only a perf win "
-                f"for num_heads=16, got num_heads={num_heads}."
+                f"CuTe DSL MLA decode on {kernel_dtype} KV is only enabled "
+                "for num_heads in "
+                f"{list(_BF16_FP16_PERF_FAVORABLE_HEAD_COUNTS)}, "
+                f"got num_heads={num_heads}."
             )
         # Minimum per-rank decode batch size at which the CuteDSL kernel beats
         # the default TRTLLM path on the FP8-KV path, keyed by
         # (num_heads, seq_len_q).
         _PERF_MIN_BATCH_FP8 = {
+            (6, 1): 1,
+            (12, 1): 1,
             (16, 2): 64,
             (16, 4): 32,
             (16, 8): 16,
+            # Keep H=96 off TRTLLM-Gen: its heuristic may select a 64-head
+            # Q tile, which does not divide 96 and produces an invalid config.
+            (96, 1): 1,
             (128, 1): 64,
             (128, 2): 32,
         }
@@ -264,9 +281,11 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
-        # It is to disable mix-batch(context request + generation request) for now.
-        # TODO: Eliminate high host overhead of cutedsl mla to enable mix-batch.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        # Disable mixed context/generation batches until the CuTe DSL host
+        # overhead is reduced. H=96 is exempt: TRTLLM-Gen may select a
+        # 64-head Q tile, which does not divide 96 and produces an invalid
+        # configuration after K3's 96-to-128 head padding was removed.
+        if (meta.num_contexts != 0 and attn.num_heads != 96) or meta.num_generations <= 0:
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.helix_position_offsets is not None:
             return False, "CuTe DSL MLA FMHA does not support Helix parallelism."

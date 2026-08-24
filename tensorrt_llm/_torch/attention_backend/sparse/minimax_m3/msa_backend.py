@@ -797,6 +797,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             head_dim=head_dim,
         )
         self.disable_index_value = bool(sparse_params.disable_index_value)
+        self.indexer_kv_dtype = str(sparse_params.indexer_kv_dtype)
         self._validate_msa_preconditions()
         self.indexer = MsaIndexer(self.m3_config)
 
@@ -830,7 +831,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
     def run_indexer(
         self,
         idx_q: torch.Tensor,
-        idx_k: torch.Tensor,
+        idx_k: Optional[torch.Tensor],
         metadata,
         *,
         idx_sm_scale: Optional[float] = None,
@@ -845,11 +846,41 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])
+        # Preserve split column views without allowing an implicit copy. The
+        # scorer and cache writer below both honor their source strides.
+        head_major_output = (
+            int(metadata.num_contexts or 0) > 0 and int(metadata.num_generations or 0) == 0
+        )
         idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
-        idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
-
-        metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
+        configured_for_fp8 = self.indexer_kv_dtype == "fp8"
+        expected_cache_dtype = torch.float8_e4m3fn if configured_for_fp8 else torch.bfloat16
+        if idx_k_cache.dtype != expected_cache_dtype:
+            raise ValueError(
+                "MiniMax-M3 index-K cache dtype does not match indexer_kv_dtype="
+                f"{self.indexer_kv_dtype!r}: expected {expected_cache_dtype}, "
+                f"got {idx_k_cache.dtype}."
+            )
+        if configured_for_fp8:
+            if idx_q_view.dtype != torch.float8_e4m3fn or idx_k is not None:
+                raise ValueError(
+                    "The MiniMax-M3 FP8 indexer requires fused FP8 index-Q and "
+                    "an already-populated index-K cache (live index-K must be None)."
+                )
+        else:
+            if idx_q_view.dtype != torch.bfloat16 or idx_k is None or idx_k.dtype != torch.bfloat16:
+                live_k_dtype = None if idx_k is None else idx_k.dtype
+                raise ValueError(
+                    "The MiniMax-M3 BF16 indexer requires BF16 index-Q and a live "
+                    f"BF16 index-K tensor; got Q={idx_q_view.dtype}, K={live_k_dtype}."
+                )
+            idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
+            metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
+        # The FP8 indexer mirrors vLLM's unscaled E4M3 contract: normalized
+        # index Q/K are cast directly and the proxy accumulates their QK scores
+        # in FP32. Block ordering is invariant to the omitted positive scale.
+        # The fused production path arrives here with E4M3 Q and an already
+        # populated cache; the BF16 path writes its live K above.
 
         # One selection path. Decode passes the graph-safe proxy plan plus the
         # proxy scratch shaped to the live query count. Prefill and mixed batches
@@ -882,6 +913,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             proxy_plan=proxy_plan,
             max_score=max_score,
             n_valid_blocks=n_valid_blocks,
+            head_major_output=head_major_output,
         )
 
     def sparse_attn_predict(

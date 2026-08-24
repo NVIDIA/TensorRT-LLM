@@ -469,6 +469,28 @@ def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     return cmd + ["--host", host, "--port", str(port)]
 
 
+def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) -> str:
+    """Run a benchmark while streaming its combined output to an artifact log."""
+    benchmark_env = env.copy()
+    benchmark_env.setdefault("PYTHONUNBUFFERED", "1")
+    with open(log_path, "wb") as log_file:
+        result = subprocess.run(
+            cmd,
+            env=benchmark_env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+
+    with open(log_path, "rb") as log_file:
+        raw_output = log_file.read()
+
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=raw_output)
+
+    return raw_output.decode("utf-8", errors="replace")
+
+
 class ServerConfig:
     """Configurations of trtllm-server."""
 
@@ -1085,7 +1107,10 @@ class AggrTestCmds(NamedTuple):
 
     def get_server_logs(self, server_idx) -> List[str]:
         server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
-        return [server_file_path]
+        benchmark_logs = sorted(
+            glob.glob(os.path.join(self.test_output_dir, f"trtllm-benchmark.{server_idx}.*.log"))
+        )
+        return [server_file_path, *benchmark_logs]
 
     def run_cmd(self, server_idx: int) -> List[str]:
         """Run all clients for a server and return outputs.
@@ -1155,14 +1180,11 @@ class AggrTestCmds(NamedTuple):
                     client_env = copy.deepcopy(os.environ)
                     if client_config:
                         client_env.update(client_config.to_env())
-                    output = subprocess.check_output(
+                    output = _run_benchmark_with_log(
                         client_cmd_with_port,
-                        stderr=subprocess.STDOUT,
-                        env=client_env,
-                    ).decode()
-
-                    with open(client_file_path, "w") as client_ctx:
-                        client_ctx.write(output)
+                        client_env,
+                        client_file_path,
+                    )
                     outputs.append(output)
                 else:
                     print_info(
@@ -1439,6 +1461,13 @@ class DisaggTestCmds(NamedTuple):
             os.path.join(self.test_output_dir, f"trtllm-serve.DISAGG_SERVER.{server_idx}.log")
         )
         server_logs.append(os.path.join(self.test_output_dir, "disagg_server.log"))
+        server_logs.extend(
+            sorted(
+                glob.glob(
+                    os.path.join(self.test_output_dir, f"trtllm-benchmark.{server_idx}.*.log")
+                )
+            )
+        )
         return server_logs
 
     @staticmethod
@@ -1607,14 +1636,11 @@ class DisaggTestCmds(NamedTuple):
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
                             bench_env.update(client_config.to_env())
-                        output = subprocess.check_output(
+                        output = _run_benchmark_with_log(
                             client_cmd_with_port,
-                            env=bench_env,
-                            stderr=subprocess.STDOUT,
-                        ).decode()
-
-                        with open(benchmark_file_path, "w") as benchmark_ctx:
-                            benchmark_ctx.write(output)
+                            bench_env,
+                            benchmark_file_path,
+                        )
 
                         outputs.append(output)
                         if collect_device_step_time:

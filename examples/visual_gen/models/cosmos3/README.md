@@ -6,6 +6,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
 - **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local MP4/AVI file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); the encoded bytes pass through and each worker decodes just that window on NVDEC (see [Media I/O dependencies](#media-io-dependencies)). Validated for Nano / Super only.
+- **Transfer** — control-video conditioning (`edge`/`blur`/`depth`/`seg`/`wsm` hints via `--extra_params`). The control constrains structure frame by frame; the prompt supplies appearance. `edge` and `blur` are auto-computed from `--video_path`; any hint also accepts a precomputed control clip (`{"edge": "control.mp4"}` — the example reads it and sends encoded bytes, the same contract as the `video` reference). Multiple hints compose (each adds a full control-token copy of the video sequence); long videos run chunked (93 frames/chunk, stitched on overlap frames) — but only past the first chunk, so raise `num_frames` above the pipeline default to generate one: it bounds how many frames are decoded from the inputs, and so how long the output can be. A single-hint request picks up that hint's tuned sampling preset — guidance scale, control guidance and flow shift — for any of those the request leaves unset; requests with several hints fall back to the generic video defaults. The active hint names are also appended to the prompt as a one-sentence control-adherence directive; pass `"emphasize_control_in_prompt": false` to suppress it for clean baselines or ablations.
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
 
 ## Checkpoints
@@ -60,6 +61,7 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 
 - Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
 - Decoding MP4/AVI reference videos (V2V) happens in the worker processes on NVDEC via PyNvVideoCodec, a declared TensorRT-LLM dependency — nothing extra to install. Tested combinations: H.264 in MP4 and H.264 in AVI; other containers/codecs/profiles depend on the demuxer and the GPU's NVDEC capabilities and are best-effort.
+- Transfer's `edge`/`blur` controls are derived on the GPU from the reference video — nothing extra to install. Precomputed controls (`depth`/`seg`/`wsm`, or a precomputed `edge`/`blur`) are decoded like any other reference video.
 
 ## Deployment configs
 
@@ -112,8 +114,9 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 
 # V2V: video-conditioned video (continues the first frames of --video_path).
 # Best results when the prompt describes the input video — e.g. continue a
-# T2V output reusing its original prompt. Output size is fixed (1280x720
-# default); inputs are center-cropped, not aspect-matched.
+# T2V output reusing its original prompt. Output size follows the source's
+# aspect ratio (the closest supported bucket) unless the request sets
+# height/width; the reference is center-cropped to whatever size is chosen.
 python cosmos3.py --model /path/to/Cosmos3-Nano \
     --prompt_file prompts/v2v.json \
     --video_path /path/to/Cosmos3-Nano/assets/example_i2v_output.mp4 \
@@ -146,6 +149,34 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step \
     --image_path https://example.com/frame.jpg \
     --output_path output.mp4
 
+# Transfer: control-video conditioning — structure from the control video,
+# appearance from the prompt. edge/blur are computed from --video_path.
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt "The same scene rendered as a photorealistic video, sharp detail." \
+    --video_path /path/to/reference.mp4 \
+    --extra_params '{"edge": true}' \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+# Transfer with a fully synthetic control (no assets): generate an edge-map
+# video of a bouncing ball, then let the prompt paint it photoreal.
+# Keep synthetic controls edge-style: the blur hint expects the low
+# frequencies of natural video, and flat synthetic color fields degrade
+# generation. Temporal exposure swings (e.g. pulsing global light) do not
+# transfer — express lighting spatially or in the prompt instead.
+python generate_bouncing_ball_control.py --out_dir ./ball_control
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt "A photorealistic beach ball with colorful panels bouncing between the walls of an enclosed room, studio lighting." \
+    --extra_params '{"edge": "./ball_control/control.mp4"}' \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+# Multi-hint transfer: edge pins the layout, blur pins the palette/lighting.
+# Hints must describe the same underlying video as each other and the prompt.
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt "The same scene, ultra sharp, professional photography." \
+    --video_path /path/to/reference.mp4 \
+    --extra_params '{"edge": true, "blur": true}' \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
 # Cosmos3-Edge image-to-video (480p-native defaults: 832x480 x 121 frames).
 # Reproduces the model-card sample: the checkpoint ships a structured prompt and
 # its own negative prompt alongside the conditioning image. Fetch them with
@@ -156,7 +187,7 @@ python cosmos3.py --model nvidia/Cosmos3-Edge \
     --image_path Cosmos3-Edge/assets/example_i2v_input.jpg \
     --output_path output.mp4
 
-# Inline prompt
+# Inline prompt (--prompt or a JSON file path)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "A cute puppy playing with a ball in a park" \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml

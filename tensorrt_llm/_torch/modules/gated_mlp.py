@@ -10,7 +10,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
 from .linear import (Linear, TensorParallelMode, WeightMode,
                      WeightsLoadingConfig, is_static_nvfp4_input_eligible)
@@ -483,14 +483,13 @@ class GatedMLP(nn.Module):
                 "LoRA is not supported with uneven TP for GatedMLP "
                 "(intermediate_size not divisible by tp_size).")
 
-        h1 = self.gate_up_proj(x)
-
-        h1_lora = self.splitted_gate_up_lora(x, lora_params, self.layer_idx)
-
-        h1 = add_lora_result(h1, h1_lora)
-
-        h1_lora = self.fused_gate_up_lora(x, lora_params, self.layer_idx)
-        h1 = add_lora_result(h1, h1_lora)
+        h1 = LoraLayer.forward_with_base(
+            lambda: self.gate_up_proj(x),
+            (self.splitted_gate_up_lora, self.fused_gate_up_lora),
+            x,
+            lora_params,
+            self.layer_idx,
+        )
 
         h2 = self._apply_activation(h1, has_lora=True)
         output = self.down_proj(h2,
