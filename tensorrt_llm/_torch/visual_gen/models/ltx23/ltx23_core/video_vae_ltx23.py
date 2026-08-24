@@ -3,8 +3,14 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 """LTX-2.3 video VAE decoder.
 
-compress_time and compress_space reduce channels by their multiplier (LTX-2
-only did that for compress_all), so conv_in is 128 * (2*1*2*2) = 1024.
+LTX-2.3 reuses LTX-2's VAE primitives and forward/tiled-decode machinery, but
+its channel recipe differs: compress_time and compress_space reduce channels by
+their multiplier, where LTX-2 only did that for compress_all. conv_in is
+therefore latent_channels times the product of every multiplier, not just the
+compress_all ones -- 128 * (2*1*2*2) = 1024 for the checkpoint recipe.
+
+This subclasses LTX-2's VideoDecoder to inherit that machinery unchanged and
+rebuilds only the channel-bearing modules with the corrected flow.
 """
 
 from typing import List, Tuple, Union

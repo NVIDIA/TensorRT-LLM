@@ -1,7 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""LTX-2.3 transformer: 9-slot AdaLN, prompt AdaLN, Identity caption projection."""
+"""LTX-2.3 transformer.
+
+Ported from LTX-2 (LTXModel / BasicAVTransformerBlock) with these changes:
+
+- 9-slot per-block AdaLN (MSA [0:3], MLP [3:6], text-cross-attn [6:9]) plus a
+  per-block prompt_scale_shift_table [2, dim] that modulates the text context
+  K/V from a sigma-derived prompt_timestep.
+- adaln_single embedding_coefficient 6 -> 9, and a new prompt_adaln_single
+  (coeff 2) that produces prompt_timestep from sigma.
+- caption_projection becomes nn.Identity, since LTX-2.3 projects to inner_dim in
+  the text_embedding_projection feature extractor before the connector.
+- Text K/V is projected per denoise step from the prompt-modulated context,
+  rather than cached per block as in LTX-2.
+- Audio/video cross-attention is unchanged from LTX-2 and reused as-is.
+
+Conditioning runs through the same fused AdaLN ops as LTX-2: the text
+cross-attention query shift/scale (slots 6, 7) and output gate (slot 8) fold into
+the surrounding gate-residual kernels instead of taking a standalone pass.
+"""
 
 from __future__ import annotations
 

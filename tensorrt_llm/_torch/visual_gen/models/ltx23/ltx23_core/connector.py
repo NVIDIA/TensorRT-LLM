@@ -1,7 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
-"""Split Gemma feature extractor and LTX-2.3 connector configurators."""
+"""LTX-2.3 embeddings connector and split feature extractor.
+
+Two differences from LTX-2, both matching the checkpoint weight shapes:
+
+- Feature extraction is split per modality and happens before the connector
+  (caption_proj_before_connector=True): video_aggregate_embed 3840*49 -> 4096
+  and audio_aggregate_embed 3840*49 -> 2048, both biased, where LTX-2 had a
+  single shared unbiased projection to 3840.
+- Two connectors instead of one, video 32x128 and audio 32x64, both 8 layers,
+  gated, 128 registers, where LTX-2 had one 30x128 2-layer ungated connector.
+
+LTX-2's Embeddings1DConnector already takes configurable heads, dims, layers,
+registers and gating, so it is reused as-is and only the LTX-2.3 configurators
+and the split feature extractor live here.
+"""
 
 import math
 
