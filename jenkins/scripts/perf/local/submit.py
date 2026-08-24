@@ -389,7 +389,8 @@ def default_slurm_partition():
     """Name of the cluster's default partition, which sinfo flags as '<name>*'.
 
     Needed when --partition is "unspecified": the job still lands on the default
-    partition, so that is the partition whose GRES we must inspect.
+    partition, so that is the partition whose GRES we must inspect. Returns ""
+    when sinfo cannot answer or no partition is flagged as the default.
     """
     try:
         out = subprocess.check_output(
@@ -397,19 +398,18 @@ def default_slurm_partition():
         )
     except Exception:
         return ""
-    for line in out.split("\n"):
-        name = line.strip()
-        if name.endswith("*"):
-            return name[:-1]
-    return ""
+    names = (line.strip() for line in out.splitlines())
+    return next((name[:-1] for name in names if name.endswith("*")), "")
 
 
 def partition_gpu_gres(partition):
-    """GRES the partition advertises (e.g. 'gpu:4'), or None if undeterminable.
+    """GRES the partition advertises, as a tri-state.
 
-    An empty string means the partition definitively reports no GRES (e.g. EOS,
-    which does not register GPUs as gres at all). None means sinfo could not
-    answer, which callers must not read as "this partition has no GPUs".
+    Returns "gpu:<N>" when the partition advertises GPUs; some other non-empty
+    string ("(null)" on clusters like EOS, which do not register GPUs as a
+    generic resource) when it definitively advertises no GPU GRES; and None when
+    sinfo could not answer, which callers must NOT read as "no GPUs here".
+    generate_gpu_request() needs all three cases to stay distinct.
     """
     if not is_real_slurm_partition(partition):
         return None
@@ -421,12 +421,10 @@ def partition_gpu_gres(partition):
         )
     except Exception:
         return None
-    gres = [line.strip() for line in out.split("\n") if line.strip()]
+    rows = [line.strip() for line in out.splitlines() if line.strip()]
     # One row per node state, so prefer a GPU row over a '(null)' one.
-    for entry in gres:
-        if entry.startswith("gpu:"):
-            return entry
-    return gres[0] if gres else None
+    gpu_rows = (row for row in rows if row.startswith("gpu:"))
+    return next(gpu_rows, rows[0] if rows else None)
 
 
 def generate_gpu_request(partition, gpus_per_node):
