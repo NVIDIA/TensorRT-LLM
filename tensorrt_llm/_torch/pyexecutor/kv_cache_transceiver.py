@@ -529,6 +529,12 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                     f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
                 )
 
+        if (cache_transceiver_config.kv_cache_bounce_size_mb > 0
+                or cache_transceiver_config.agent_bounce_buffer_enable):
+            logger.warning(
+                "bounce is only supported by the Python (v2) transceiver; "
+                "ignored on the C++ transceiver path")
+
         self.impl = CacheTransceiverCpp(
             kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
             tokens_per_block, world_config,

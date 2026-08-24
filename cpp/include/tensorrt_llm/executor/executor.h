@@ -1281,8 +1281,7 @@ public:
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
         std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt,
-        std::optional<int> kvTransferPollIntervalMs = kDefaultKvTransferPollIntervalMs, size_t agentBufferSizeMb = 0,
-        std::map<std::string, std::string> agentBounceParams = {});
+        std::optional<int> kvTransferPollIntervalMs = kDefaultKvTransferPollIntervalMs);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
@@ -1290,16 +1289,12 @@ public:
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
     void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
     void setKvTransferPollIntervalMs(std::optional<int> kvTransferPollIntervalMs);
-    void setAgentBufferSizeMb(size_t agentBufferSizeMb);
-    void setAgentBounceParams(std::map<std::string, std::string> agentBounceParams);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
     [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferPollIntervalMs() const;
-    [[nodiscard]] size_t getAgentBufferSizeMb() const;
-    [[nodiscard]] std::map<std::string, std::string> const& getAgentBounceParams() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1314,15 +1309,6 @@ private:
     // @brief Bounded wait interval in milliseconds for polling KV transfer progress when active transfers block
     // disaggregated admission.
     std::optional<int> mKvTransferPollIntervalMs;
-    // @brief Size in MiB of the transfer agent's staging-buffer (bounce) arena, currently
-    // implemented by the NIXL agent. 0 (default) disables the fast path; >0 enables it at that
-    // arena capacity (one shared arena for the sender and receiver roles).
-    size_t mAgentBufferSizeMb{0};
-    // @brief Expert tuning knobs for the bounce pipeline, keyed by the TRTLLM_NIXL_BOUNCE_*
-    // environment-variable names without the prefix and the trailing _BYTES, lowercased (e.g.
-    // TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES -> "max_chunk_size"). Precedence: this map >
-    // environment variable > built-in default. Ignored when mAgentBufferSizeMb == 0.
-    std::map<std::string, std::string> mAgentBounceParams;
 };
 
 struct KVCacheCreatedData

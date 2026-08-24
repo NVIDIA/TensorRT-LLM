@@ -386,8 +386,7 @@ std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) cons
 
 AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
-    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState, size_t agentBufferSizeMb,
-    std::map<std::string, std::string> const& agentBounceParams)
+    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState)
     : mCacheState(std::move(cacheState))
     , mRnnCacheState(std::move(rnnCacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
@@ -426,11 +425,6 @@ AgentConnectionManager::AgentConnectionManager(
     BaseAgentConfig config{mAgentName, true, false, true};
     config.rank = mRank;
     config.worldSize = mWorldSize;
-    config.agentBufferSizeMb = agentBufferSizeMb;
-    // BaseAgentConfig keeps bounce knobs separate from backendParams (which is forwarded verbatim
-    // to the backend plugin); convert the ordered map from CacheTransceiverConfig here.
-    config.bounceParams
-        = std::unordered_map<std::string, std::string>(agentBounceParams.begin(), agentBounceParams.end());
     m_Agent = makeTransferAgent(backendType, &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     mBufferKinds.reserve(mCacheTransBufferManagers.size());

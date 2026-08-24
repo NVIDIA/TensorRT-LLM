@@ -70,7 +70,8 @@ std::size_t maxChunkSizeBytesForParam(char const* value)
 }
 } // namespace
 
-// The on/off switch and the arena size come ONLY from CacheTransceiverConfig.agent_buffer_size_mb;
+// The on/off switch and the arena size come ONLY from CacheTransceiverConfig
+// (agent_bounce_buffer_enable + kv_cache_bounce_size_mb);
 // the legacy TRTLLM_NIXL_BOUNCE_ENABLE / TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES env vars are dead.
 TEST(BounceConfig, EnableAndArenaAreNotEnvBacked)
 {

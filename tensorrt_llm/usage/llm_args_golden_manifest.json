@@ -147,10 +147,10 @@
     },
     {
       "allowed_values": [],
-      "annotation": "<class 'int'>",
+      "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
-      "path": "cache_transceiver_config.agent_buffer_size_mb"
+      "path": "cache_transceiver_config.agent_bounce_buffer_enable"
     },
     {
       "allowed_values": [

@@ -1027,12 +1027,12 @@ def run_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
-        # Keep the Python-native bounce layer disabled. Dedicated C++ bounce
-        # coverage enables the NIXL agent's bounce v2 through agent_buffer_size_mb
-        # (0 keeps it off) plus agent_bounce_params, which exercises the config
-        # plumbing end-to-end.
-        kv_cache_bounce_size_mb=0,
-        agent_buffer_size_mb=64 if expect_cpp_bounce else 0,
+        # Keep the Python-native bounce layer disabled by default (size 0).
+        # Dedicated C++ bounce coverage enables the NIXL agent's bounce v2 via
+        # agent_bounce_buffer_enable + kv_cache_bounce_size_mb plus
+        # agent_bounce_params, which exercises the config plumbing end-to-end.
+        kv_cache_bounce_size_mb=64 if expect_cpp_bounce else 0,
+        agent_bounce_buffer_enable=expect_cpp_bounce,
         agent_bounce_params={
             "min_descriptor_count": "1",
             "max_average_descriptor_size": "1MB",
@@ -1176,6 +1176,11 @@ def run_transfer_test(
         # bounce v2 transport active, and at least one transfer must have been routed
         # through it (only KV senders submit WRITEs, so we assert on the total).
         if expect_cpp_bounce:
+            # The shared capacity must be routed to exactly one implementation: with
+            # agent_bounce_buffer_enable the Python-native bounce stays off.
+            assert all(tc._transfer_worker._config.bounce is None for tc in ctx_tcs + gen_tcs), (
+                "Python-native bounce must stay disabled when the C++ agent bounce is selected"
+            )
             agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
             assert all(getattr(agent, "bounce_enabled", False) for agent in agents), (
                 "C++ bounce v2 transport is not active on every NIXL agent"
@@ -1635,8 +1640,8 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         {
             _NIXL_BOUNCE_SUBPROCESS_ENV: "1",
             "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
-            # Bounce is enabled (arena size) and tuned (expert knobs) via
-            # CacheTransceiverConfig.agent_buffer_size_mb / agent_bounce_params inside
+            # Bounce is enabled (agent_bounce_buffer_enable + kv_cache_bounce_size_mb)
+            # and tuned (expert knobs) via CacheTransceiverConfig / agent_bounce_params inside
             # run_transfer_test — no TRTLLM_NIXL_BOUNCE_* environment variables —
             # covering the config path end-to-end.
             # Pin the transport deterministically: the child would otherwise inherit

@@ -4578,8 +4578,14 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver. Mutually exclusive with agent_buffer_size_mb."
-    )
+        "Capacity in MiB of the native-disagg KV-cache bounce buffer, which "
+        "coalesces a request's scattered per-block KV for a single multi-rail "
+        "NIXL write. The size doubles as the on/off switch: 0 (default) keeps "
+        "the per-block path, >0 enables bounce at that capacity. With the "
+        "default Python implementation it is per-region (one buffer for send, "
+        "one for recv); with agent_bounce_buffer_enable it is one shared "
+        "buffer. Requires the Python (v2) transceiver (transceiver_runtime); "
+        "the C++ transceiver does not support bounce and ignores this field.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,
@@ -4591,15 +4597,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "reuse disabled or set to all_reusable. Invalid static settings fail at "
         "startup; per-request constraints reject the request.")
 
-    agent_buffer_size_mb: int = Field(
-        default=0,
-        ge=0,
+    agent_bounce_buffer_enable: bool = Field(
+        default=False,
         description=
-        "Size in MiB of the C++ transfer agent's bounce (staging) arena; 0 "
-        "(default) disables the fast path. A single arena shared by send and "
-        "recv, currently implemented by the NIXL agent. Mutually exclusive "
-        "with kv_cache_bounce_size_mb. Configure the context and generation "
-        "instances consistently.")
+        "Use the C++ transfer-agent bounce implementation instead of the "
+        "Python one. kv_cache_bounce_size_mb is then a single buffer shared by "
+        "send and recv (about half the memory footprint of the Python "
+        "per-region pair for the same number). Configure the context and "
+        "generation instances consistently. Requires the Python (v2) "
+        "transceiver (transceiver_runtime); the C++ transceiver does not "
+        "support bounce and ignores this field.")
 
     agent_bounce_params: Optional[Dict[str, str]] = Field(
         default=None,
@@ -4608,7 +4615,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
         "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
         "Precedence: this dict > environment variable > built-in default. "
-        "Requires agent_buffer_size_mb > 0.")
+        "Requires agent_bounce_buffer_enable.")
 
     @field_validator('agent_bounce_params', mode='before')
     @classmethod
@@ -4623,17 +4630,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         return {str(k): str(val) for k, val in v.items()}
 
     @model_validator(mode='after')
-    def validate_bounce_exclusive(self) -> 'CacheTransceiverConfig':
-        if self.agent_buffer_size_mb > 0 and self.kv_cache_bounce_size_mb > 0:
+    def validate_bounce_config(self) -> 'CacheTransceiverConfig':
+        if self.agent_bounce_buffer_enable and self.kv_cache_bounce_size_mb == 0:
             raise ValueError(
-                "agent_buffer_size_mb and kv_cache_bounce_size_mb are mutually "
-                "exclusive bounce implementations; enable only one.")
+                "agent_bounce_buffer_enable selects the C++ transfer-agent "
+                "bounce implementation, but kv_cache_bounce_size_mb is 0 "
+                "(bounce disabled); set a positive capacity.")
         if self.agent_bounce_params:
-            if self.agent_buffer_size_mb == 0:
+            if not self.agent_bounce_buffer_enable:
                 raise ValueError(
-                    "agent_bounce_params requires agent_buffer_size_mb > 0; "
-                    "the bounce fast path is disabled at size 0, so the params "
-                    "would be ignored.")
+                    "agent_bounce_params only applies to the C++ transfer-agent "
+                    "bounce implementation; set agent_bounce_buffer_enable=True "
+                    "or drop the params.")
             # Lazy: importing tensorrt_llm._torch at module scope is circular.
             from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
                 AGENT_BOUNCE_PARAM_KEYS
@@ -4667,9 +4675,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
             kv_transfer_sender_future_timeout_ms=self.
             kv_transfer_sender_future_timeout_ms,
-            kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms,
-            agent_buffer_size_mb=self.agent_buffer_size_mb,
-            agent_bounce_params=self.agent_bounce_params or {})
+            kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms)
 
 
 @dataclass

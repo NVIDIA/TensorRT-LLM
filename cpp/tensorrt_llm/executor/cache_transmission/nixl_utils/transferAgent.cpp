@@ -58,8 +58,8 @@ namespace tensorrt_llm::executor::kv_cache
 {
 
 // ============================================================================
-// Bounce v2 integration (opt-in via CacheTransceiverConfig.agent_buffer_size_mb). When disabled,
-// transfers remain on the standard NIXL path.
+// Bounce v2 integration (opt-in via CacheTransceiverConfig: agent_bounce_buffer_enable +
+// kv_cache_bounce_size_mb). When disabled, transfers remain on the standard NIXL path.
 // ============================================================================
 #ifdef TLLM_BOUNCE_V2
 namespace bounce
@@ -141,7 +141,8 @@ private:
 void NixlTransferAgent::maybeInitBounce(
     std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams)
 {
-    // The size doubles as the on/off switch (CacheTransceiverConfig.agent_buffer_size_mb): 0 keeps
+    // The size doubles as the on/off switch (CacheTransceiverConfig.kv_cache_bounce_size_mb when
+    // agent_bounce_buffer_enable is set, 0 otherwise): 0 keeps
     // bounce disabled, >0 enables it at that arena capacity. The expert knobs resolve as
     // agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_* env var > built-in default.
     // The retired on/off & arena-size env vars no longer do anything — call that out instead of
@@ -152,7 +153,7 @@ void NixlTransferAgent::maybeInitBounce(
         {
             TLLM_LOG_WARNING(
                 "NixlTransferAgent(%s): %s is deprecated and has NO effect; configure bounce via "
-                "CacheTransceiverConfig.agent_buffer_size_mb instead",
+                "CacheTransceiverConfig.agent_bounce_buffer_enable + kv_cache_bounce_size_mb instead",
                 mName.c_str(), legacyEnv);
         }
     }
@@ -161,8 +162,9 @@ void NixlTransferAgent::maybeInitBounce(
         if (!bounceParams.empty())
         {
             TLLM_LOG_WARNING(
-                "NixlTransferAgent(%s): agent_bounce_params set but agent_buffer_size_mb is 0 -> "
-                "bounce stays disabled and the params are ignored",
+                "NixlTransferAgent(%s): agent_bounce_params set but the bounce arena size is 0 "
+                "(agent_bounce_buffer_enable off or kv_cache_bounce_size_mb 0) -> bounce stays "
+                "disabled and the params are ignored",
                 mName.c_str());
         }
         return;
@@ -327,7 +329,9 @@ void NixlTransferAgent::maybeInitBounce(
 {
     if (agentBufferSizeMb > 0)
     {
-        TLLM_LOG_WARNING("agent_buffer_size_mb > 0 requested but bounce support is not built; ignoring");
+        TLLM_LOG_WARNING(
+            "agent_bounce_buffer_enable requested (kv_cache_bounce_size_mb > 0) but bounce support is not built; "
+            "ignoring");
     }
 }
 

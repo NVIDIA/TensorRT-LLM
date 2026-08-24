@@ -23,14 +23,11 @@ namespace tensorrt_llm::executor
 
 CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backendType,
     std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs,
-    std::optional<int> kvTransferSenderFutureTimeoutMs, std::optional<int> kvTransferPollIntervalMs,
-    size_t agentBufferSizeMb, std::map<std::string, std::string> agentBounceParams)
+    std::optional<int> kvTransferSenderFutureTimeoutMs, std::optional<int> kvTransferPollIntervalMs)
     : mBackendType(backendType)
     , mMaxTokensInBuffer(maxNumTokens)
     , mKvTransferTimeoutMs(kvTransferTimeoutMs)
     , mKvTransferSenderFutureTimeoutMs(kvTransferSenderFutureTimeoutMs)
-    , mAgentBufferSizeMb(agentBufferSizeMb)
-    , mAgentBounceParams(std::move(agentBounceParams))
 {
     setKvTransferPollIntervalMs(kvTransferPollIntervalMs);
 }
@@ -40,8 +37,7 @@ bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) con
     return mMaxTokensInBuffer == other.mMaxTokensInBuffer && mBackendType == other.mBackendType
         && mKvTransferTimeoutMs == other.mKvTransferTimeoutMs
         && mKvTransferSenderFutureTimeoutMs == other.mKvTransferSenderFutureTimeoutMs
-        && mKvTransferPollIntervalMs == other.mKvTransferPollIntervalMs
-        && mAgentBufferSizeMb == other.mAgentBufferSizeMb && mAgentBounceParams == other.mAgentBounceParams;
+        && mKvTransferPollIntervalMs == other.mKvTransferPollIntervalMs;
 }
 
 void CacheTransceiverConfig::setBackendType(std::optional<BackendType> backendType)
@@ -104,25 +100,5 @@ std::optional<int> CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs() 
 std::optional<int> CacheTransceiverConfig::getKvTransferPollIntervalMs() const
 {
     return mKvTransferPollIntervalMs;
-}
-
-void CacheTransceiverConfig::setAgentBufferSizeMb(size_t agentBufferSizeMb)
-{
-    mAgentBufferSizeMb = agentBufferSizeMb;
-}
-
-size_t CacheTransceiverConfig::getAgentBufferSizeMb() const
-{
-    return mAgentBufferSizeMb;
-}
-
-void CacheTransceiverConfig::setAgentBounceParams(std::map<std::string, std::string> agentBounceParams)
-{
-    mAgentBounceParams = std::move(agentBounceParams);
-}
-
-std::map<std::string, std::string> const& CacheTransceiverConfig::getAgentBounceParams() const
-{
-    return mAgentBounceParams;
 }
 } // namespace tensorrt_llm::executor
