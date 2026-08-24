@@ -504,7 +504,6 @@ private:
         TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration);
     void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
     static bool _hasReuseSource(BlockPage const& page);
-    void _increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength);
     void _decreaseCapacity(BlockOrdinal newNumBlocks);
     void _truncateBlockBeams(SeqBlock& block, BeamIndex beamWidth);
     void _appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth);

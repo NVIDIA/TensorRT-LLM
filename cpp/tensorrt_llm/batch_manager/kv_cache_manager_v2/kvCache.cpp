@@ -1063,6 +1063,16 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     LifeCycleId numLc = mManager->storage().numLifeCycles();
     auto const& lcs = mManager->lifeCycles();
 
+    // Blocks are only ever appended past oldNumBlocks, and every appended block is
+    // allocated for all mBeamWidth beams. That is only correct while the appended
+    // ordinals all sit in the per-beam tail, i.e. at or after the shared/per-beam
+    // boundary _appendBeams() uses. Beams are added once the prompt is fully
+    // materialized (capacity >= promptLength), which puts oldNumBlocks at or past
+    // that boundary. Widening a beam during prefill would break the invariant and
+    // silently replicate the shared prompt prefix mBeamWidth times.
+    TLLM_CHECK_DEBUG(mBeamWidth == BeamIndex{1}
+        || oldNumBlocks >= BlockOrdinal{mExpectedPromptLength.value_or(0) / mTokensPerBlock});
+
     _checkPageIndexBufferCapacity(newNumBlocks);
 
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
@@ -1349,99 +1359,6 @@ void KvCache::_refreshGenerationAllocReady()
     if (mExpectedPromptLength.has_value() && mHistoryLength >= *mExpectedPromptLength)
     {
         mGenerationAllocReady = true;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Capacity management
-// ---------------------------------------------------------------------------
-
-void KvCache::_increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength)
-{
-    BlockOrdinal curNumBlocks = mBlocks.size();
-    LifeCycleId numLc = mManager->storage().numLifeCycles();
-    auto const& lcs = mManager->lifeCycles();
-    auto ssmLcId = lcs.ssmLifeCycleId();
-
-    // Compute stale ranges using new history length so stale SWA blocks get no pages.
-    TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> staleRanges(numLc);
-    TypedVec<LifeCycleId, SlotCount> numSlotsPerLc(numLc, 0);
-    for (LifeCycleId lc{0}; lc < numLc; ++lc)
-    {
-        // SSM slots are handled separately below — don't allocate block-level slots for SSM.
-        if (ssmLcId.has_value() && lc == *ssmLcId)
-            continue;
-        staleRanges[lc] = _getStaleRange(newHistoryLength, lcs.getLifeCycle(lc));
-        auto [staleBeg, staleEnd] = staleRanges[lc];
-        int numNewBlocks;
-        if (curNumBlocks < staleBeg)
-        {
-            TLLM_CHECK_DEBUG(newNumBlocks >= staleEnd);
-            numNewBlocks = (staleBeg - curNumBlocks) + (newNumBlocks - staleEnd);
-        }
-        else
-        {
-            numNewBlocks = newNumBlocks - std::max(staleEnd, curNumBlocks);
-        }
-        numSlotsPerLc[lc] = static_cast<SlotCount>(numNewBlocks) * mBeamWidth.value();
-    }
-
-    // SSM slots are now allocated lazily in resume() via deferred copy, not here.
-
-    MigrationRecorder const migrationRecorder
-        = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
-              CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
-    DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
-    { _recordDroppedPages(pages, cacheLevel); };
-    auto allSlots = mManager->storage().newGpuSlots(numSlotsPerLc, migrationRecorder, dropRecorder);
-
-    // Assert that internal index buffer sizes match expected old_num_blocks (mirrors Python line ~463).
-    TLLM_CHECK_DEBUG(std::all_of(mBasePageIndices.begin(), mBasePageIndices.end(),
-        [curNumBlocks](auto const& beamIndices)
-        {
-            return std::all_of(beamIndices.begin(), beamIndices.end(),
-                [curNumBlocks](auto const& buf)
-                {
-                    auto const* vec = std::get_if<std::vector<int>>(&buf);
-                    return !vec || vec->size() == toSizeT(curNumBlocks);
-                });
-        }));
-
-    // Create SeqBlocks for the new ordinals.
-    TypedVec<LifeCycleId, size_t> slotCounters(numLc, 0);
-    _resizePageIndexBuffers(newNumBlocks);
-    for (BlockOrdinal ord = curNumBlocks; ord < newNumBlocks; ++ord)
-    {
-        SeqBlock sb;
-        sb.pages.resize(mBeamWidth);
-        for (auto& row : sb.pages)
-            row.resize(numLc); // default-constructs to monostate
-        for (BeamIndex bi{0}; bi < mBeamWidth; ++bi)
-        {
-            for (LifeCycleId lc{0}; lc < numLc; ++lc)
-            {
-                // SSM pages live in mSsmBlocks, not in _blocks.
-                if (ssmLcId.has_value() && lc == *ssmLcId)
-                    continue;
-
-                auto [staleBeg, staleEnd] = staleRanges[lc];
-                if (staleBeg <= ord && ord < staleEnd)
-                    continue; // stale block for this lc — no page allocated
-
-                size_t si = slotCounters[lc]++;
-                auto& slot = allSlots[lc][si];
-                auto page = makeShared<UncommittedPage>(*this, ord, lc, kHotLevel, bi);
-                page->setSlot(slot);
-                sb.pages[bi][lc] = page->lock(*this, bi, ord, lc);
-            }
-        }
-        mBlocks.push_back(std::move(sb));
-    }
-    // Assert all allocated slots were consumed (mirrors Python line ~488).
-    if (TLLM_UNLIKELY(gDebug))
-    {
-        for (LifeCycleId lc{0}; lc < numLc; ++lc)
-            TLLM_CHECK(slotCounters[lc] == allSlots[lc].size());
     }
 }
 
