@@ -56,10 +56,16 @@ while [ ! -f "$PROGRESS_DONE_FILE" ]; do
 
     if [ -n "$SLURM_SSH_STAT_CMD" ]; then
         # SLURM_SSH_STAT_CMD runs ls on the remote dir first to flush the NFS
-        # attribute cache, then stats results.xml. Use grep to extract the
-        # integer mtime so SSH banners cannot pollute the value.
-        m=$(eval "$SLURM_SSH_STAT_CMD" 2>/dev/null | grep -oE '^[0-9]+$' | head -1)
-        [ -z "$m" ] && m=0
+        # attribute cache, then stats results.xml. Capture stderr too (srun/ssh
+        # errors) so a stuck mtime=0 can be diagnosed instead of silently
+        # swallowed; grep still extracts the integer mtime so banners/errors
+        # mixed into the output cannot pollute the parsed value.
+        _stat_raw=$(eval "$SLURM_SSH_STAT_CMD" 2>&1)
+        m=$(printf '%s\n' "$_stat_raw" | grep -oE '^[0-9]+$' | head -1)
+        if [ -z "$m" ]; then
+            m=0
+            echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: stat cmd returned no numeric mtime, raw output: ${_stat_raw}"
+        fi
         echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: poll #${_poll} mtime=${m} last=${last}"
         [ "$m" -le "$last" ] && continue
         # Prime the login node's NFS cache before SCP: the stat above ran on the
