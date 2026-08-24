@@ -25,14 +25,10 @@ from typing import Optional, Tuple
 import torch
 
 from ...attention_backend.interface import PredefinedAttentionMask
+from ._flash_attn_cute import resolve_flash_attn_cute_symbol
 from .interface import AttentionBackend, AttentionTensorLayout
 
-_flash_attn_fwd_import_error = None
-try:
-    from flash_attn.cute.interface import _flash_attn_fwd
-except (ImportError, OSError) as e:
-    _flash_attn_fwd = None
-    _flash_attn_fwd_import_error = e
+_flash_attn_fwd, _flash_attn_fwd_import_error = resolve_flash_attn_cute_symbol("_flash_attn_fwd")
 
 
 class FlashAttn4Attention(AttentionBackend):

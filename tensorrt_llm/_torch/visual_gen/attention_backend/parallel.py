@@ -32,14 +32,12 @@ if TYPE_CHECKING:
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
 from ...attention_backend.interface import PredefinedAttentionMask
+from ._flash_attn_cute import resolve_flash_attn_cute_symbol
 from .interface import AttentionBackend, AttentionTensorLayout
 
-_flash_attn_combine_import_error = None
-try:
-    from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
-except (ImportError, OSError) as e:
-    _flash_attn_combine = None
-    _flash_attn_combine_import_error = e
+_flash_attn_combine, _flash_attn_combine_import_error = resolve_flash_attn_cute_symbol(
+    "flash_attn_combine"
+)
 
 
 def post_permute_5d_to_4d(out_5d, P):
