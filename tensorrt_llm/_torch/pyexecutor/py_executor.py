@@ -686,6 +686,11 @@ class PyExecutor:
         # these requests until their prior execution state is safe to reuse.
         self.inflight_req_ids = ReqIdsSet()
         self._pending_recompute_pause_ids: set[int] = set()
+        # Request ids whose pause-for-replay terminate was deferred to the
+        # disagg PP termination handler. Consumed by `_do_terminate_request`
+        # after PP consensus so the deferred release also keeps the multimodal
+        # replay payload.
+        self._pending_pause_replay_ids: set[int] = set()
 
         # Encoder-decoder models execute the encoder and decoder in separate
         # iterations in both executor loops. PP usage is very rare for these
@@ -7978,6 +7983,8 @@ class PyExecutor:
         # but the dummy ID is reused every iteration).
         if (self._disagg_pp_termination_handler is not None
                 and not request.is_dummy_request):
+            if for_pause:
+                self._pending_pause_replay_ids.add(request.py_request_id)
             self._disagg_pp_termination_handler.terminate(request)
         else:
             self._do_terminate_request(request, for_pause=for_pause)
@@ -7993,6 +8000,11 @@ class PyExecutor:
                               request: LlmRequest,
                               *,
                               for_pause: bool = False) -> None:
+        if request.py_request_id in self._pending_pause_replay_ids:
+            # This terminate resolves a pause-for-replay that was deferred to
+            # the disagg PP termination handler.
+            self._pending_pause_replay_ids.discard(request.py_request_id)
+            for_pause = True
         self._free_request_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
