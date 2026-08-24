@@ -78,6 +78,18 @@ BOLT_ITER_MULT = (params.boltIterMult ?: env.boltIterMult ?: "1").toString()
 
 TRIPLE = TARGET_ARCH
 
+// SLURM states in which the job is still alive, i.e. no terminal verdict yet.
+// COMPLETING (CG) is the one that bites: the tasks have exited but slurmctld is
+// still running the epilog and reclaiming nodes, which on a large allocation
+// outlasts the poll interval below. ExitCode is not final in that window either
+// (accounting lags the state transition), so waiting for a genuinely terminal
+// state is what makes the 0:0 check meaningful.
+// Keep in sync with SLURM_NON_TERMINAL_STATES in jenkins/L0_Test.groovy.
+SLURM_NON_TERMINAL_STATES = [
+    "RUNNING", "PENDING", "CONFIGURING", "COMPLETING",
+    "REQUEUED", "RESIZING", "SUSPENDED", "SIGNALING", "STOPPED",
+]
+
 // Fan-out workload set. Each entry is an EXISTING perf-sanity test id (the
 // cluster-tuned config lives in tests/scripts/perf-sanity/{aggregated,
 // disaggregated}/); the perf harness (jenkins/scripts/perf) runs it, and the
@@ -453,8 +465,19 @@ def pollSlurm(pipeline, remote, String jobId, String label)
             script: Utils.sshUserCmd(remote,
                 "\"sacct -j ${jobId} --format=State,ExitCode -Pn --allocations | head -1\"")).trim()
         pipeline.echo("[${label}] job ${jobId}: ${st}")
-        if (st ==~ /(?i).*(RUNNING|PENDING|CONFIGURING).*/ || st.isEmpty()) { return false }
-        if (!(st ==~ /(?i)COMPLETED\|0:0.*/)) {
+        // Empty: not registered in the accounting DB yet, or a transient blip.
+        if (st.isEmpty()) { return false }
+        // split() drops trailing empties, so an all-empty row yields a 0-length
+        // array; guard it rather than risk an exception failing the stage.
+        def fields = st.split(/\|/)
+        // State can carry a suffix ("CANCELLED by 12345"), so compare the first
+        // token only -- same parse as L0_Test.groovy's `cut -f1 | awk '{print $1}'`.
+        def stateTokens = fields.size() > 0 ? fields[0].trim().toUpperCase().tokenize() : []
+        if (stateTokens.isEmpty()) { return false }
+        def state = stateTokens[0]
+        def exitCode = fields.size() > 1 ? fields[1].trim() : ""
+        if (SLURM_NON_TERMINAL_STATES.contains(state)) { return false }
+        if (state != "COMPLETED" || exitCode != "0:0") {
             error("BoltProfileGen: SLURM job ${jobId} (${label}) did not complete cleanly: ${st}")
         }
         return true
