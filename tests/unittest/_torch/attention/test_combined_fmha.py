@@ -35,6 +35,8 @@ class _TestAttention:
         self.num_heads = 1
         self.num_kv_heads = 1
         self.predicted_tokens_per_seq = 1
+        self.flashinfer_mla_backend = None
+        self.has_fp8_kv_cache = False
 
 
 class _TestPhasedFmha(PhasedFmha):
