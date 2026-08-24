@@ -22,7 +22,6 @@ import os
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from flashinfer.mamba import SSDCombined
 
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
@@ -92,6 +91,15 @@ def _get_flashinfer_ssd_kernel(chunk_size, nheads, headdim, dstate, ngroups,
     has_varlen is in the cache key because flashinfer compiles distinct
     kernels per mode.
     """
+    # Imported here rather than at module scope: flashinfer.mamba exports
+    # SSDCombined only when its own ``import cutlass.cute`` succeeds, so a
+    # module-scope import turns an optional symbol into a hard requirement for
+    # importing this file at all -- and auto_deploy/custom_ops walks every
+    # submodule eagerly and re-raises, so that took down test collection for
+    # unrelated modules. Callers reach this function only on SM100+ with
+    # TRTLLM_USE_MAMBA_FI_SSD=1, i.e. exactly where the symbol is exported.
+    from flashinfer.mamba import SSDCombined
+
     logger.info_once(
         f"Using FlashInfer fused SSD kernel for Mamba2 prefill "
         f"(has_varlen={has_varlen})",
