@@ -669,6 +669,7 @@ def _make_minimal_client_state():
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client.completed_responses = {}
     client._abandoned_request_ids = set()
+    client._sent_ref_handles = {}
     client._iter_stats = _IterationStatsTracker()
     client.pending_requests = queue.Queue()
 
