@@ -363,12 +363,15 @@ class MambaPolicy:
         The core invariant checked is *global* (TP-aggregated) state size:
         for a TP-sharded state, ``per_rank_bytes * mamba_tp`` is
         TP-invariant, so it must match between peers even when their TP
-        sizes differ. Models with *replicated* recurrent state (e.g. Kimi K3
-        KDA, whose per-rank state is pre-scaled to full size when
-        attention-DP is off) violate this invariant under heterogeneous TP —
-        exactly the configuration where the TP-mismatch mappers would
-        compute shard offsets past the end of the slot, silently corrupting
-        the replicated state — and are therefore rejected here.
+        sizes differ. Kimi K3 KDA satisfies it: with attention-DP off the
+        cache manager head-shards the state across tp_size (matching the
+        model's head-sharded KDA compute), so heterogeneous ctx/gen TP
+        passes; under attention-DP the state is replicated and ``_mamba_tp``
+        is 1 on that side. A model that kept a replicated full-size per-rank
+        state while reporting ``mamba_tp > 1`` would violate the invariant
+        under heterogeneous TP — exactly the configuration where the
+        TP-mismatch mappers would compute shard offsets past the end of the
+        slot, silently corrupting the state — and is rejected here.
         """
         self_mlg = MambaPolicy._find_mamba_layer_group(self_page_table)
         peer_mlg = MambaPolicy._find_mamba_layer_group(peer_page_table)
@@ -411,9 +414,9 @@ class MambaPolicy:
                     f"peer {peer_bytes} bytes/rank x mamba_tp={peer_tp}. Per-rank state "
                     "sizes are inconsistent with a TP-sharded layout across the two "
                     "sides; either the state shape/dtype differs, or the model keeps a "
-                    "replicated (non-TP-sharded) recurrent state (e.g. Kimi K3 KDA), "
-                    "which supports heterogeneous ctx/gen TP only with attention-DP "
-                    "enabled on both sides."
+                    "replicated (non-TP-sharded) per-rank recurrent state while "
+                    "reporting mamba_tp > 1, which supports heterogeneous ctx/gen TP "
+                    "only with attention-DP enabled on both sides."
                 )
 
         _check_global(
@@ -443,6 +446,10 @@ class MambaPolicy:
         """
         if ri.attention and ri.attention.enable_attention_dp:
             return 1, 0
+        if ri.cp_size > 1:
+            # Helix repurposes CP ranks as TP for the mamba layers, so the
+            # shard grid is tp*cp with CP-minor flat rank (matches Mapping).
+            return ri.tp_size * ri.cp_size, ri.tp_rank * ri.cp_size + ri.cp_rank
         return ri.tp_size, ri.tp_rank
 
     @staticmethod
@@ -540,6 +547,19 @@ class MambaPolicy:
         peer_mamba_tp, peer_mamba_tp_rank = MambaPolicy._mamba_tp(peer_ri)
         tp_match = self_mamba_tp == peer_mamba_tp
 
+        # Overlap targets are attention-domain (helix: every ctx rank
+        # targets every gen rank) but the mappers below assume corresponding
+        # mamba shards; unpaired senders must send nothing, or they
+        # last-writer-win the receiver's slot with the wrong head range.
+        if self_mamba_tp <= peer_mamba_tp:
+            ratio = peer_mamba_tp // self_mamba_tp
+            paired = (peer_mamba_tp_rank // ratio) == self_mamba_tp_rank
+        else:
+            ratio = self_mamba_tp // peer_mamba_tp
+            paired = (self_mamba_tp_rank // ratio) == peer_mamba_tp_rank
+        if not paired:
+            return [], [], []
+
         src_frags: List[int] = []
         dst_frags: List[int] = []
         kv_sizes: List[int] = []
@@ -591,6 +611,33 @@ class MambaPolicy:
                 kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
 
         return src_frags, dst_frags, kv_sizes
+
+    @staticmethod
+    def receiver_payload_bytes(
+        sender_page_table: KVCachePageTable,
+        receiver_page_table: KVCachePageTable,
+        dst_slot: Optional[int],
+    ) -> int:
+        """Recurrent-state bytes that will land in the receiver's slot.
+
+        Receiver-local invariant: regardless of the sender-side shard
+        pairing, the slot receives exactly the receiver's own per-layer
+        slot bytes over the overlapping mamba layers. A sender-side
+        simulation is not usable here: RankInfoServer runs on ctx rank 0
+        only, so receivers paired with any other sender would compute 0
+        and under-reserve the bounce slot.
+        """
+        if dst_slot is None:
+            return 0
+        self_mlg = MambaPolicy._find_mamba_layer_group(sender_page_table)
+        peer_mlg = MambaPolicy._find_mamba_layer_group(receiver_page_table)
+        if self_mlg is None or peer_mlg is None:
+            return 0
+        overlap = set(self_mlg.mamba_layer_offsets.keys()) & set(
+            peer_mlg.mamba_layer_offsets.keys()
+        )
+        per_layer = peer_mlg.conv_states.slot_bytes + peer_mlg.ssm_states.slot_bytes
+        return len(overlap) * int(per_layer)
 
     @staticmethod
     def payload_bytes(
