@@ -23,7 +23,11 @@ from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     RingAttention,
     UlyssesAttention,
 )
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionModelConfig,
+    DiffusionPipelineConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.models.qwen_image import (
     QwenImagePipeline,
     QwenImageTransformerBlock,
@@ -276,6 +280,25 @@ def test_qwen_joint_attention_wraps_separate_qkv_self_attention(
     assert attention.qkv_mode == QKVMode.SEPARATE_QKV
     assert captured["enable_sequence_parallel"]
     assert captured["use_ulysses"] is expected_use_ulysses
+
+
+@pytest.mark.parametrize("backend", ["TRTLLM", "FA4", "CUTEDSL"])
+def test_qwen_joint_attention_keeps_requested_self_attention_backend(backend):
+    attention = QwenJointAttention(
+        dim=16,
+        num_attention_heads=2,
+        attention_head_dim=8,
+        config=DiffusionModelConfig(
+            attention=AttentionConfig(backend=backend),
+            attention_metadata_state=(
+                create_attention_metadata_state() if backend == "TRTLLM" else None
+            ),
+        ),
+    )
+
+    assert attention.qkv_mode == QKVMode.SEPARATE_QKV
+    assert attention.attn_backend == backend
+    assert not _is_qwen_sequence_parallel_attention(attention.attn)
 
 
 class _FakeTokenBatch:
@@ -686,6 +709,25 @@ def test_qwen_sequence_sharding_rejects_padding_without_key_mask_support():
                 torch.polar(torch.ones(7, 4), torch.randn(7, 4)),
                 torch.polar(torch.ones(4, 4), torch.randn(4, 4)),
             ),
+        )
+
+
+@pytest.mark.parametrize("backend", ["TRTLLM", "FA4", "CUTEDSL"])
+def test_qwen_transformer_rejects_non_vanilla_ulysses_attention_backend(backend):
+    with pytest.raises(ValueError, match="requires attention_config.backend='VANILLA'"):
+        QwenImageTransformer2DModel(
+            model_config=DiffusionModelConfig(
+                attention=AttentionConfig(backend=backend),
+                visual_gen_mapping=SimpleNamespace(ulysses_size=2),
+            ),
+            patch_size=1,
+            in_channels=4,
+            out_channels=4,
+            num_layers=1,
+            attention_head_dim=8,
+            num_attention_heads=2,
+            joint_attention_dim=16,
+            axes_dims_rope=(2, 2, 4),
         )
 
 

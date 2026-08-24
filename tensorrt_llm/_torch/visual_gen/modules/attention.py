@@ -103,8 +103,12 @@ class Attention(nn.Module):
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
 
+        separate_qkv_cross_attention = (
+            self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
+        )
+
         # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
+        if separate_qkv_cross_attention and (base_backend == "TRTLLM" or _is_vsa):
             backend_name = "VANILLA"
             requested = f"{base_backend} (VSA)" if _is_vsa else base_backend
             # Warn once per (module class, requested, resolved) triple so the
