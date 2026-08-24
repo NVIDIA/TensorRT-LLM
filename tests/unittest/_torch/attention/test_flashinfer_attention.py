@@ -147,6 +147,7 @@ class TestFlashInferAttention(unittest.TestCase):
 
         manager.get_batch_cache_indices_flat.assert_called_once_with(
             [7], [1], layer_idx=20)
+
     def test_generation_page_table_uses_reserved_block_count(self):
         manager = SimpleNamespace(get_batch_cache_indices=mock.Mock(
             return_value=[list(range(325))]))
