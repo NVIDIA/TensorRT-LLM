@@ -345,17 +345,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         Mirrors ``warmup_cute_dsl_radix_topk``. The varlen launcher is keyed
         by the exact row count AND the logits row stride: rows cover the
-        eager first-touch tuple (bs=1) plus every configured CUDA-graph
-        batch size, and the stride mirrors what the active paged-MQA
-        producer emits (the DSL arena rounds the row up to 256 elements;
-        DeepGEMM is exact-width) so the warmed keys are the ones dispatch
-        actually looks up. Captured geometries are also compiled by the
-        pre-capture warmup forwards; eager batches outside ``batch_sizes``
-        still compile lazily on first touch. The helper enumerates one
-        representative row per distinct engine compile key (band-aware), so
-        arbitrarily large batch lists warm in bounded time and memory.
-        No-op unless the opt-in gate (TRTLLM_GVR_SELF_SAMPLING=1) selects
-        the engine.
+        small eager batches plus every configured CUDA-graph batch size, and
+        the stride mirrors what the active paged-MQA producer emits, so the
+        warmed keys are the ones dispatch actually looks up. Batches outside
+        this set still compile lazily on first touch. The helper enumerates
+        one representative row per distinct engine compile key, so large
+        batch lists warm in bounded time and memory. No-op unless the opt-in
+        gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
         """
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
             return
@@ -378,24 +374,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         except ImportError:
             return
         nn = int(next_n)
-        # eager warm span: the launcher is keyed by exact row count, so warm
-        # the small-row counts eager mixed batches commonly produce (the
-        # engine-band compiles behind them are deduplicated by the helper);
+        # warm the small row counts eager mixed batches commonly produce;
         # larger eager row counts lazy-JIT on first touch, and CUDA-graph
-        # geometries are covered through ``batch_sizes`` below. 32 was the
-        # old admission-envelope bound; kept as the warm span after the
-        # full-range dispatch removed the envelope itself.
+        # geometries are covered through ``batch_sizes`` below
         eager_warm_rows = 32
         rows = set(range(nn, eager_warm_rows + 1, nn)) or {nn}
         for bs in batch_sizes or ():
             rows.add(int(bs) * nn)
         msl_c = int(self.get_indexer_max_seq_len())
         if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
-            # mirror the DSL paged-MQA arena stride (cute_dsl_custom_ops
-            # CuteDSLPagedMQALogitsRunner: compute_block_kv=128, SPLIT_KV=
-            # 2*128 -> rows round up to 256 elements). A drift here only
-            # degrades warmup to unused keys — dispatch still lazy-JITs the
-            # true key outside capture, so it can never become incorrect.
+            # mirror the DSL paged-MQA arena stride (rows round up to 256
+            # elements). A drift here only degrades warmup to unused keys —
+            # dispatch still lazy-JITs the true key outside capture.
             row_stride = (msl_c + 255) // 256 * 256
         else:
             # DeepGEMM emits exact-width rows; a non-float4 width falls

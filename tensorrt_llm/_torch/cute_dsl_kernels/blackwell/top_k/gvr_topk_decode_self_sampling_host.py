@@ -14,38 +14,34 @@
 
 """Self-sampling GVR top-K decode — host side (dispatch, workspace, entry).
 
-Companion to ``gvr_topk_decode_self_sampling.py`` (the merged device
-module). Three sections, each a rename-only merge of the per-family source
-(fork branch ``GVR-selfsampling-CuTeDSL``):
+Companion to ``gvr_topk_decode_self_sampling.py`` (the device module).
+Three sections:
 
-1. dispatch — bit-exact transcription of the CUDA host dispatch, a pure
-   function ``route(b, n, npad, k)`` (cross-checked against an independent
-   second transcription by a 1,159,168-case boundary+fuzz sweep);
+1. dispatch — the CUDA host dispatch as a pure function
+   ``route(b, n, npad, k)``;
 2. workspace — one zero-initialised per-device slab (20,973,568 B) via the
-   torch caching allocator, keep-alive + double-checked locking semantics
-   mirrored from the CUDA binding;
+   torch caching allocator, with keep-alive + double-checked locking;
 3. operator entry — ``run(logits, pre_idx, n_valid, indices)`` /
-   ``run_ws(..., workspace)`` DPS forms with the CUDA binding's hardening
-   battery, BIND-ONCE launch cache keyed on ``(b, n, npad, k)``.
+   ``run_ws(..., workspace)`` DPS forms with input hardening and a
+   bind-once launch cache keyed on ``(b, n, npad, k)``.
 
-OPERATOR CONTRACT (standalone; not wired into the decode path): ``n_valid``
-is one host python int for the whole batch — every row shares the same
-valid prefix, in COMPRESSED index space (the caller applies any
-``compressRatio`` division). ``pre_idx`` is consumed AS-IS — raw prev-step
-top-K indices, uniformly for DSv3.2 / DSv4 Flash / Pro. This deliberately
-drops the +1 temporal shift ``heuristicTopKDecode.cu`` applies for cr==1:
-hints only steer the sampling ladder (exactness never depends on them), and
-on real V3.2 decode captures raw prev-step hints land on MORE of the current
-top-K than +1-shifted ones (mean overlap 0.773 vs 0.536 across 15 cells x 14
-consecutive step-pairs, the gap widening with ISL), so one offset-free hint
-convention serves all three models. The production per-row contract
-(per-request ``kv_lens`` read on-device, per-row MTP offsets — sync-free and
-CUDA-graph-replay safe with growing KV) is implemented by ``run_varlen``,
-which is the entry the opt-in DSA dispatch seam calls. The batch-uniform
-``run``/``run_ws`` entries keep the original standalone contract (one
-host-side ``n_valid`` for the whole batch), are exercised for unit tests and
-benchmarking only, and must not be substituted for the tiered path under
-continuous batching, MTP (``next_n > 1``), or CUDA-graph capture.
+OPERATOR CONTRACT (batch-uniform entries): ``n_valid`` is one host python
+int for the whole batch — every row shares the same valid prefix, in
+COMPRESSED index space (the caller applies any ``compressRatio`` division).
+``pre_idx`` is consumed as-is — raw prev-step top-K indices, uniformly for
+DSv3.2 / DSv4 Flash / Pro. The +1 temporal shift ``heuristicTopKDecode.cu``
+applies for cr==1 is deliberately dropped: hints only steer the sampling
+ladder (exactness never depends on them), and raw prev-step hints overlap
+the current top-K at least as well as +1-shifted ones on real decode data,
+so one offset-free hint convention serves all three models. The production
+per-row contract (per-request ``kv_lens`` read on-device, per-row MTP
+offsets — sync-free and CUDA-graph-replay safe with growing KV) is
+implemented by ``run_varlen``, which is the entry the opt-in DSA dispatch
+seam calls. The batch-uniform ``run``/``run_ws`` entries keep the simpler
+contract (one host-side ``n_valid`` for the whole batch), are exercised for
+unit tests and benchmarking only, and must not be substituted for
+``run_varlen`` under continuous batching, MTP (``next_n > 1``), or
+CUDA-graph capture.
 """
 
 import math
@@ -72,62 +68,23 @@ def _device():
 
 
 # ===========================================================================
-# ==== dispatch (ct_dispatch.py) ============================================
+# ==== dispatch =============================================================
 # ===========================================================================
-"""Pure-Python transcription of the frozen GVR CUDA dispatch (gvr_topk_launch).
+"""Pure-Python mirror of the GVR CUDA host dispatch (gvr_topk_launch).
 
-Source of truth: ../src_cuda/kernel.cu (3197 lines).  route(b, n, npad, k) is a
-PURE function of its four ints -- no env knobs, no GPU, stdlib only.
-
-Branch map (kernel.cu line citations):
-  constants          NB L16, QUADC L21, SNB L170, CMPC L2372, BLKC L2374
-  reg-block prologue L2757-2822: wide=(b<=148) L2757; n4=n>>2 L2759;
-                     CMP=min(n,2560) L2764; QC=(b>148?1024:QUADC) L2768;
-                     CURE L2775; DEGE L2788; DEG widens CMP to n L2791;
-                     NBSEL L2820; IMGOFF=NBSEL L2821; smem=(NBSEL+2*CMP)*4 L2822
-  LAUNCH_REG2/DEG/REG macros L2823-2847 (KPT ladder 1/2/4; DEG forces KPT=1,
-                     CUR=CURE both places); IMGW/smi/IMGE L2852-2854;
-                     LAUNCH_REGIMG L2861-2863 -> gvr_topk_reg<...,KPT=1,CUR=true,
-                     DEG=false,IMG=true,NBH=2*NB> via launch_regimg L2672-2686
-  n4 rungs           n4<=256 L2864; n4<=512 L2865; n4<=1024 wide/img/else L2866-2884
-  clustered reg path L2897-2940: gate n4>4096 && n4<=8*BLKC*4 && k<=BLKC L2897;
-                     av/amax L2898-2899; two-pass cs=8 co-residency veto
-                     (pass==0 && c==8 && b>15 -> skip) L2917-2923; 64-bit product
-                     (long long)c*BLKC*v < n4 L2919; smc=(3*NB+2*CMPC)*4 L2926;
-                     grid dim3(cs,b) L2666
-  wide 4k fallback   n4<=4096 && wide -> LAUNCH_REG(1024,4,1,2*NB) L2945-2947
-  streaming R        L2959-2975 (b<=32: R=min(148/b, ((n>>2)+1023)/1024));
-                     r11 shallow split b<=74 && n4>=16384 && k<=1024 -> R=2 L2985;
-                     cluster clamp R->pow2, useclus, only if 2<=R<=8 && k<=1024 L2994
-  big/SCAP/CMP       big=(b*R<=148) L2995; SCAP L3009-3010; CMP L3011
-  aim                L3039-3040; sqrt floor r=int(0.5+sqrt(6LL*n)) L3041-3042;
-                     SFAC L3072-3073; amin L3079-3080; clamps L3081-3082
-  sample geometry    small_dense gate L3091 ((k>1024)&&!big&&n<=SCAP&&n>2*k);
-                     PAIR form (sel>>3, half=n4s>>1, SMP*8) L3092-3109;
-                     clus QUAD override (sel>>4, quarter=n4s>>2, SMP*16),
-                     gated n>SCAP only, L3115-3128
-  Q                  Q=(n4s+R-1)/R L3110
-  clus launch        smc=SNB*8+(SCAP+4)*8+CMP*8 L3130; U ladder per=Q>>10
-                     L3132-3142; CS=R in {2,4,8} L3143-3145; grid dim3(CS,b) L2704
-  main launch        smem=(SCAP+4)*((R>1||b<=296)?8:4)+(CMP+1)*8 L3149;
-                     KPT ladder 1/2/4/8 L3150-3169; big: per=Q>>10 U ladder,
-                     SPLIT=(R>1), grid dim3(R,b) L3173-3185 + L2750;
-                     b<=296 -> (512,2,8,false) L3193; else (256,4,8,false) L3194
+route(b, n, npad, k) is a PURE function of its four ints -- no env knobs, no
+GPU, stdlib only.  It returns the kernel family, its compile-time template
+tuple, the runtime scalar pack `rt`, grid/cluster/block geometry, smem size,
+and whether the family needs the workspace.
 
 rt carries the FULL runtime scalar list each kernel receives, in signature
-order, always starting with (n, npad, k) -- every launch site passes them
-(L2666-2667 reg_clus, L2684-2685 regimg, L2704-2705 clus, L2726-2727 reg,
-L2750-2751 main).  [dispatch x-check 2026-08-13: rt previously omitted the
-leading n/npad/k; fixed for full-ABI parity with the independent spec
-transcription.]
+order, always starting with (n, npad, k).
 
-Dead ABI-parity args: gvr_main's 7th/8th params are declared `int SCAP_, int CMP_`
-(kernel.cu L381) and are NEVER read by the kernel body -- it recomputes SCPB/CMPB
-as constexprs of (BLK, SPLIT, KBIG) (L413-424) that mirror the host formulas
-bit-identically.  They are kept in rt under their source names 'SCAP_'/'CMP_'
-purely for ABI parity.  gvr_clus's SCAP/CMP (L1798) are LIVE runtime args.
-`aim` and `SFAC` are host-side intermediates only (never cross the ABI), so they
-do not appear in rt.
+Dead ABI-parity args: gvr_main's `int SCAP_, int CMP_` params are NEVER read
+by the kernel body -- it recomputes them as constexprs that mirror the host
+formulas bit-identically.  They are kept in rt purely for ABI parity.
+gvr_clus's SCAP/CMP are LIVE runtime args.  `aim` and `SFAC` are host-side
+intermediates only (never cross the ABI), so they do not appear in rt.
 
 C-semantics notes encoded here:
   * every `/` on ints is C truncating division -> Python `//` (all operands
@@ -137,41 +94,41 @@ C-semantics notes encoded here:
   * `int r = (int)(0.5 + sqrt((double)(6LL*n)))` truncates toward zero after
     the +0.5 -> `int(0.5 + math.sqrt(float(6*n)))`;
   * `IMGW = (n + 3) & ~3` four-element float4 round-up;
-  * the reg-block CMP (possibly widened to n by DEGE) is scoped to the braces
-    at L2758-2949; the streaming path re-derives its own CMP.
+  * the reg-block CMP (possibly widened to n by DEGE) is scoped to the
+    register-resident block; the streaming path re-derives its own CMP.
 """
 
 
-# ---- constants lifted from kernel.cu ---------------------------------------
-NB = 1024  # L16   register-path histogram bins
-QUADC = 96  # L21   crossing-bin O(mc^2) rank gate (streaming/reg paths)
-SNB = 256  # L170  streaming-path bin count
-CMPC = 4096  # L2372 crossing-bin slots per CTA, clustered register path
-BLKC = 1024  # L2374 CTA size of the clustered register path
+# ---- dispatch constants (must match the device kernels) ---------------------
+NB = 1024  # register-path histogram bins
+QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths)
+SNB = 256  # streaming-path bin count
+CMPC = 4096  # crossing-bin slots per CTA, clustered register path
+BLKC = 1024  # CTA size of the clustered register path
 
 
 def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
-    """Mirror of gvr_topk_launch (kernel.cu L2754-3197). Pure. See module doc."""
+    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
-    wide = b <= 148  # L2757
+    wide = b <= 148
 
-    # ================= register-resident block (L2758-2949) =================
-    n4 = n >> 2  # L2759
-    CMP = n if n < 2560 else 2560  # L2764
-    QC = 1024 if b > 148 else QUADC  # L2768
-    CURE = not (n < 2 * k and b > 148)  # L2775
-    DEGE = (n <= 3 * k) or (n <= 4 * k + 64)  # L2788
-    if DEGE and CMP < n:  # L2791
+    # ======================= register-resident block ========================
+    n4 = n >> 2
+    CMP = n if n < 2560 else 2560
+    QC = 1024 if b > 148 else QUADC
+    CURE = not (n < 2 * k and b > 148)
+    DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
+    if DEGE and CMP < n:
         CMP = n
-    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 1024 and not wide)) else NB  # L2820
-    IMGOFF = NBSEL  # L2821
-    smem_reg = (NBSEL + 2 * CMP) * 4  # L2822
+    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 1024 and not wide)) else NB
+    IMGOFF = NBSEL
+    smem_reg = (NBSEL + 2 * CMP) * 4
 
     def _reg(BLK, VPT, MINB, NBH):
-        # LAUNCH_REG (L2844-2847): DEG wins, else CUR flag; KPT ladder L2823-2834.
+        # DEG wins over the CUR flag; DEG forces KPT=1, else KPT ladder 1/2/4.
         if DEGE:
-            tpl = (BLK, VPT, MINB, 1, CURE, True, False, NBH)  # LAUNCH_DEG L2836-2843
+            tpl = (BLK, VPT, MINB, 1, CURE, True, False, NBH)
         else:
             kpt = 1 if k <= BLK else (2 if k <= 2 * BLK else 4)
             tpl = (BLK, VPT, MINB, kpt, CURE, False, False, NBH)
@@ -181,7 +138,7 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
             "rt": {
                 "n": n,
                 "npad": npad,
-                "k": k,  # L2726-2727 full ABI
+                "k": k,  # full ABI
                 "CMP": CMP,
                 "IMGOFF": IMGOFF,
                 "QC": QC,
@@ -193,26 +150,25 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
             "ws": False,
         }
 
-    IMGW = (n + 3) & ~3  # L2852
-    smi = (NBSEL + (2 * CMP if 2 * CMP > IMGW else IMGW)) * 4  # L2853
-    IMGE = wide and (not DEGE) and k <= 1024  # L2854
+    IMGW = (n + 3) & ~3
+    smi = (NBSEL + (2 * CMP if 2 * CMP > IMGW else IMGW)) * 4
+    IMGE = wide and (not DEGE) and k <= 1024
 
-    if n4 <= 256:  # L2864
+    if n4 <= 256:
         return _reg(256, 1, 8, NB)
-    if n4 <= 512:  # L2865
+    if n4 <= 512:
         return _reg(512, 1, 4, NB)
-    if n4 <= 1024:  # L2866-2884
+    if n4 <= 1024:
         if wide:
-            if IMGE:  # LAUNCH_REGIMG(1024,1,2) L2872
-                # launch_regimg<1024,1,2,NBV=2*NB,KPTV=1> -> gvr_topk_reg
-                # <1024,1,2,1,true,false,true,2048>  (L2672-2686)
+            if IMGE:
+                # regimg launch: gvr_topk_reg<1024,1,2,1,true,false,true,2048>
                 return {
                     "kernel": "regimg",
                     "tpl": (1024, 1, 2, 1, True, False, True, 2 * NB),
                     "rt": {
                         "n": n,
                         "npad": npad,
-                        "k": k,  # L2684-2685 full ABI
+                        "k": k,  # full ABI
                         "CMP": CMP,
                         "IMGOFF": IMGOFF,
                         "QC": QC,
@@ -223,38 +179,36 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
                     "smem": smi,
                     "ws": False,
                 }
-            return _reg(1024, 1, 2, 2 * NB)  # L2872 else-arm
-        return _reg(512, 2, 4, NB)  # L2883
+            return _reg(1024, 1, 2, 2 * NB)
+        return _reg(512, 2, 4, NB)
 
-    # ---- clustered register-resident path (L2897-2940) ----
-    if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:  # L2897
-        av = 148 // (b if b > 0 else 1)  # L2898 truncating
-        amax = 1  # L2899
+    # ---- clustered register-resident path ----
+    if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
+        av = 148 // (b if b > 0 else 1)  # truncating
+        amax = 1
         while (amax << 1) <= av and amax < 8:
             amax <<= 1
         vsel = 0
         cs = 0
-        if amax >= 2:  # L2901
-            # knife5 (layer 9): UNCONDITIONAL cs=8 co-residency veto --
-            # the L2w pass-1 rescue is deleted; 512k b>15 falls through to
-            # streaming, made retry-safe by TSH-floor staging (S1) and the
-            # gvr_clus veto (S2).
+        if amax >= 2:
+            # cs=8 co-residency veto: an 8-CTA cluster with b > 15 exceeds
+            # GPC packing; such shapes fall through to the streaming path.
             for v in (1, 2, 4):
-                c = 1  # 64-bit product
+                c = 1  # 64-bit product in C
                 while c * BLKC * v < n4:
                     c <<= 1
-                if c == 8 and b > 15:  # THE VETO
+                if c == 8 and b > 15:  # the veto
                     continue
                 if c <= amax:
                     vsel = v
                     cs = c
                     break
-        if vsel and cs >= 2:  # L2925
-            smc = (3 * NB + 2 * CMPC) * 4  # L2926
+        if vsel and cs >= 2:
+            smc = (3 * NB + 2 * CMPC) * 4
             return {
                 "kernel": "reg_clus",
                 "tpl": (BLKC, vsel, cs),
-                "rt": {"n": n, "npad": npad, "k": k},  # dims only, L2666-2667
+                "rt": {"n": n, "npad": npad, "k": k},  # dims only
                 "grid": (cs, b),
                 "cluster": cs,
                 "block": BLKC,
@@ -262,129 +216,127 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
                 "ws": False,
             }
 
-    if n4 <= 4096 and wide:  # L2945-2947
+    if n4 <= 4096 and wide:
         return _reg(1024, 4, 1, 2 * NB)
 
-    # ================= streaming / collect path (L2950-3196) =================
-    R = 1  # L2959
-    if b <= 32:  # L2960-2975
+    # ====================== streaming / collect path ========================
+    R = 1
+    if b <= 32:
         r1 = 148 // b
         if r1 < 1:
             r1 = 1
-        r2 = ((n >> 2) + 1023) // 1024  # L2972
+        r2 = ((n >> 2) + 1023) // 1024
         if r2 < 1:
             r2 = 1
         R = r1 if r1 < r2 else r2
         if R < 1:
             R = 1
-    elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:  # L2985 r11 split
+    elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
         R = 2
 
-    useclus = False  # L2993-2994
+    useclus = False
     if 2 <= R <= 8 and k <= 1024:
         p2 = 1
         while (p2 << 1) <= R:
             p2 <<= 1
-        # knife5 (layer 8): gvr_clus cs=8 hits the same GPC packing wall as
-        # the clustered register path; same veto, same b>15 threshold.
+        # gvr_clus cs=8 hits the same GPC packing wall as the clustered
+        # register path; same veto, same b > 15 threshold.
         if p2 == 8 and b > 15:
             p2 = 4
         R = p2
         useclus = True
 
-    big = b * R <= 148  # L2995
-    SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)  # L3009-3010
-    CMP = (4096 if k > 1024 else 2048) if big else 1024  # L3011
+    big = b * R <= 148
+    SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
+    CMP = (4096 if k > 1024 else 2048) if big else 1024
 
     aim = (
         ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
         if big
         else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
-    )  # L3039-3040
-    q = 6 * n  # L3041: 6LL * n
-    r = int(0.5 + math.sqrt(float(q)))  # L3041 C cast trunc
-    if r > aim:  # L3042
+    )
+    q = 6 * n  # 6LL * n
+    r = int(0.5 + math.sqrt(float(q)))  # C cast trunc
+    if r > aim:
         aim = r
-    SFAC = (
-        (32 if R == 2 else (48 if k > 1024 else 16)) if R > 1 else (64 if k >= 1024 else 32)
-    )  # L3072-3073
-    amin = 3 * k if R == 2 else (7 * k) // 2  # L3079
-    if R > 1 and aim < amin:  # L3080
+    SFAC = (32 if R == 2 else (48 if k > 1024 else 16)) if R > 1 else (64 if k >= 1024 else 32)
+    amin = 3 * k if R == 2 else (7 * k) // 2
+    if R > 1 and aim < amin:
         aim = amin
-    if aim > (SCAP >> 1):  # L3081
+    if aim > (SCAP >> 1):
         aim = SCAP >> 1
-    if aim < k:  # L3082
+    if aim < k:
         aim = k
 
-    n4s = n >> 2  # L3084
-    SMP, SS2, TGT, TGT2 = 0, 1, 0, 0  # L3085
-    small_dense = (k > 1024) and (not big) and n <= SCAP and n > 2 * k  # L3091
-    if (n > SCAP or small_dense) and n4s >= 4:  # L3092: PAIR sample
-        sel = SFAC * n // aim  # L3095 64-bit
-        if sel < 256:  # L3096
+    n4s = n >> 2
+    SMP, SS2, TGT, TGT2 = 0, 1, 0, 0
+    small_dense = (k > 1024) and (not big) and n <= SCAP and n > 2 * k
+    if (n > SCAP or small_dense) and n4s >= 4:  # PAIR sample
+        sel = SFAC * n // aim  # 64-bit
+        if sel < 256:
             sel = 256
-        if sel > n // 2:  # L3097
+        if sel > n // 2:
             sel = n // 2
-        pairs = sel >> 3  # L3098
+        pairs = sel >> 3
         if pairs < 1:
             pairs = 1
-        half = n4s >> 1  # L3099
+        half = n4s >> 1
         if half < 1:
             half = 1
-        if pairs > half:  # L3100
+        if pairs > half:
             pairs = half
-        SS2 = half // pairs  # L3101
+        SS2 = half // pairs
         if SS2 < 1:
             SS2 = 1
-        SMP = half // SS2  # L3102
+        SMP = half // SS2
         if SMP < 1:
             SMP = 1
-        TGT = (aim * (SMP * 8)) // n  # L3103 64-bit
-        if TGT < 1:  # L3104
+        TGT = (aim * (SMP * 8)) // n  # 64-bit
+        if TGT < 1:
             TGT = 1
-        TGT2 = (k * (SMP * 8)) // n  # L3107 64-bit
-        if TGT2 < 1:  # L3108
+        TGT2 = (k * (SMP * 8)) // n  # 64-bit
+        if TGT2 < 1:
             TGT2 = 1
-    Q = (n4s + R - 1) // R  # L3110
+    Q = (n4s + R - 1) // R
 
-    if useclus:  # L3111-3147
-        if n > SCAP and n4s >= 4:  # L3115: QUAD override
-            sel = SFAC * n // aim  # L3116
+    if useclus:
+        if n > SCAP and n4s >= 4:  # QUAD override
+            sel = SFAC * n // aim
             if sel < 256:
                 sel = 256
             if sel > n // 2:
                 sel = n // 2
-            quads = sel >> 4  # L3119
+            quads = sel >> 4
             if quads < 1:
                 quads = 1
-            quarter = n4s >> 2  # L3120
+            quarter = n4s >> 2
             if quarter < 1:
                 quarter = 1
-            if quads > quarter:  # L3121
+            if quads > quarter:
                 quads = quarter
-            SS2 = quarter // quads  # L3122
+            SS2 = quarter // quads
             if SS2 < 1:
                 SS2 = 1
-            SMP = quarter // SS2  # L3123
+            SMP = quarter // SS2
             if SMP < 1:
                 SMP = 1
-            TGT = (aim * (SMP * 16)) // n  # L3124
+            TGT = (aim * (SMP * 16)) // n
             if TGT < 1:
                 TGT = 1
-            TGT2 = (k * (SMP * 16)) // n  # L3126
+            TGT2 = (k * (SMP * 16)) // n
             if TGT2 < 1:
                 TGT2 = 1
-        smc = SNB * 8 + (SCAP + 4) * 8 + CMP * 8  # L3130
-        per = Q >> 10  # L3131
-        U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))  # L3134-3141
-        CS = 2 if R == 2 else (4 if R == 4 else 8)  # L3143-3145
+        smc = SNB * 8 + (SCAP + 4) * 8 + CMP * 8
+        per = Q >> 10
+        U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
+        CS = 2 if R == 2 else (4 if R == 4 else 8)
         return {
             "kernel": "clus",
             "tpl": (1024, U, 1, SNB, CS),
             "rt": {
                 "n": n,
                 "npad": npad,
-                "k": k,  # L2704-2705 ABI (live)
+                "k": k,  # ABI (live)
                 "SCAP": SCAP,
                 "CMP": CMP,
                 "SMP": SMP,
@@ -400,26 +352,25 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
             "ws": False,
         }
 
-    smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 296) else 4) + (CMP + 1) * 8  # L3149
+    smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 296) else 4) + (CMP + 1) * 8
 
     def _main(BLK, MINB, U, SPLIT):
-        # LAUNCH_MAIN KPT ladder 1/2/4/8 (L3150-3169); grid dim3(gx=R, gy=b) L2750.
+        # KPT ladder 1/2/4/8; grid = (R, b).
         kpt = 1 if k <= BLK else (2 if k <= 2 * BLK else (4 if k <= 4 * BLK else 8))
-        # knife5 (layer 7) TSH-floor staging gate.  CUDA form: grid-uniform
-        # RUNTIME gate gridDim.y > 15 && k <= 1024 && (n >> 2) <= 32768 with
-        # a dual scan-instantiation branch.  Here: compile-time key -- the
-        # ungated variant IS the pre-knife5 kernel; per-launch semantics are
-        # identical because the gate is uniform over the grid.
+        # TSH-floor staging gate.  The CUDA form is a grid-uniform RUNTIME
+        # gate (gridDim.y > 15 && k <= 1024 && (n >> 2) <= 32768); here it
+        # is a compile-time key -- per-launch semantics are identical
+        # because the gate is uniform over the grid.
         tshg = bool(SPLIT) and b > 15 and k <= 1024 and (n >> 2) <= 32768
         return {
             "kernel": "main",
             "tpl": (BLK, U, MINB, SNB, kpt, SPLIT, tshg),
-            # SCAP_/CMP_ are DEAD ABI-parity args: gvr_main (L381) never reads
-            # them, it uses constexpr SCPB/CMPB (L413-424).  Kept for ABI parity.
+            # SCAP_/CMP_ are dead ABI-parity args: gvr_main never reads them
+            # (it recomputes them as constexprs).
             "rt": {
                 "n": n,
                 "npad": npad,
-                "k": k,  # L2750-2751 full ABI
+                "k": k,  # full ABI
                 "SCAP_": SCAP,
                 "CMP_": CMP,
                 "R": R,
@@ -436,13 +387,13 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
             "ws": True,
         }
 
-    if big:  # L3173-3185
-        per = Q >> 10  # L3174
+    if big:
+        per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
         return _main(1024, 1, U, R > 1)  # SPLIT iff R>1
-    if b <= 296:  # L3193
+    if b <= 296:
         return _main(512, 2, 8, False)
-    return _main(256, 4, 8, False)  # L3194
+    return _main(256, 4, 8, False)
 
 
 if __name__ == "__main__":
@@ -454,14 +405,14 @@ if __name__ == "__main__":
         (64, 4096, 4096, 512),  # regimg wide !DEGE k<=1024
         (64, 4096, 4096, 1024),  # reg   wide but DEGE (n<=4k+64)
         (8, 65536, 65536, 1024),  # reg_clus (vsel=2, cs=8; b<=15 no veto)
-        (16, 131072, 131072, 512),  # knife5: veto fall-through -> SPLIT slab, tshg=True
+        (16, 131072, 131072, 512),  # main  cs=8 veto fall-through -> SPLIT slab, tshg=True
         (64, 16384, 16384, 1024),  # reg   wide 4k fallback (1024,4,1)
-        (64, 262144, 262144, 1024),  # clus  r11 R=2 shallow cluster split
+        (64, 262144, 262144, 1024),  # clus  R=2 shallow cluster split
         (1, 1048576, 1048576, 1024),  # main  deep slab SPLIT R=148
         (20, 262144, 262144, 2048),  # main  k>1024 split (no useclus)
         (512, 131072, 131072, 1024),  # main  b>296 BLK=256
         (256, 6144, 6144, 2048),  # main  small_dense sample gate
-        (256, 262144, 262144, 2048),  # main  v32 KBIG-domain, BLK=512 KPT=4
+        (256, 262144, 262144, 2048),  # main  KBIG-domain (k>1024), BLK=512 KPT=4
     ]
     for shp in smoke:
         print(shp, "->", route(*shp))
@@ -479,10 +430,10 @@ if __name__ == "__main__":
 #       formulas): n, CMP (reg families), the sampling ladder
 #       SMP/TGT/SS2/TGT2/Q (streaming families), and the reg-family smem
 #       footprint.
-# INVARIANT (fuzz-verified): merging route_dynamic back into route_static
-# reproduces route() EXACTLY for every n. The capture-time policy of which n
-# to freeze the static half at (e.g. max_seq_len) is a later, perf-only
-# choice — this split only proves the factorization is lossless.
+# INVARIANT: merging route_dynamic back into route_static reproduces
+# route() EXACTLY for every n. The policy of which n to freeze the static
+# half at (e.g. max_seq_len) is a perf-only choice — the factorization
+# itself is lossless.
 
 _DYN_RT = {
     "reg": ("n", "CMP"),
@@ -509,9 +460,8 @@ def route_static(b: int, n: int, npad: int, k: int) -> dict[str, object]:
 
 def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object], int]:
     """Recompute the redacted n-continuous scalars from (static, n).
-    Returns (rt_updates, smem). Transcribed independently from route() —
-    the factorization fuzz is the equivalence proof, and the device-side
-    per-row engine mirrors exactly these formulas."""
+    Returns (rt_updates, smem). Must stay equivalent to route(); the
+    device-side per-row engine mirrors exactly these formulas."""
     fam = static["kernel"]
     k = static["rt"]["k"]
     if fam in ("reg", "regimg"):
@@ -603,10 +553,9 @@ def route_streaming(
     capture policy: per-row kernels must be picked from the families that are
     correct for ANY row length, so the register-resident specialists are
     skipped even when the envelope n would normally land on them.  Where
-    route() itself lands on main/clus this is IDENTICAL to route() (fuzz:
-    110,003/110,003 agreement).  force_main additionally skips the clus
-    rounding (v1 varlen engine ships the gvr_main port first; the raw
-    min(r1, r2) R then matches the CUDA else-branch exactly)."""
+    route() itself lands on main/clus this is IDENTICAL to route().
+    force_main additionally skips the clus rounding, so the raw
+    min(r1, r2) R matches the CUDA else-branch exactly."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
     R = 1
@@ -731,8 +680,8 @@ _VARLEN_CACHE = {}
 
 
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
-    """Capture-time varlen plan + compiled launcher (v1 = the gvr_main port,
-    universally correct across the envelope; specialist tiers below).  Every
+    """Capture-time varlen plan + compiled launcher.  The gvr_main port is
+    the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
     key = (num_rows, npad, k, n_env, next_n, cr)
@@ -743,12 +692,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     cr_shift = 0 if cr == 1 else 2
     dev = _device()
     # ---- route() parity, family tier 1: clustered register-resident --------
-    # Admit reg_clus exactly where the free route picks it (886-real-capture
-    # grid: this family recovers the deep-layer distribution tail and the
-    # large-N small-rows band; its whole admission window n4 <= 32768 fits
-    # capture-frozen envelopes). The choice is a pure function of this cache
-    # key, so CUDA-graph replay safety is unchanged; per-row n / short-row
-    # handling lives in-kernel (GvrMainKernel varlen discipline).
+    # Admit reg_clus exactly where the free route picks it; its whole
+    # admission window (n4 <= 32768) fits capture-frozen envelopes. The
+    # choice is a pure function of this cache key, so CUDA-graph replay
+    # safety is unchanged; per-row n / short-row handling lives in-kernel.
     plan_free = route(num_rows, n_eff, npad, k)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
@@ -763,7 +710,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # smem are envelope-derived launch constants -- in-kernel they are pure
     # capacity clamps (CMP), a fast-path threshold (QC) and the launch smem
     # size, all safe upper bounds for every per-row n <= envelope; per-row n
-    # / short-row handling lives in-kernel (GvrRegClusKernel discipline).
+    # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
         fn = dev.get_compiled__reg(
             tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
@@ -781,8 +728,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # large-N mid-rows band). SCAP/CMP are launch-stable (pure functions of
     # rows/CS/k — never of n) so the envelope values are the per-row values;
     # the sampling-ladder scalars (SMP/TGT/Q/SS2/TGT2) are dead launch slots,
-    # re-derived per row in-kernel by the route_dynamic clus mirror
-    # (GvrMainKernel discipline). Per-row n / short-row handling in-kernel.
+    # re-derived per row in-kernel by the route_dynamic clus mirror.
+    # Per-row n / short-row handling in-kernel.
     if plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
         fn = dev.get_compiled__clus(
@@ -821,12 +768,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
     sd_en = 1 if (k > 1024 and not big) else 0
-    # TSH-floor staging: gate on SPLIT and K only. The old num_rows > 15
-    # condition stranded small batches (rows <= 15) in SPLIT-main without
-    # the staged floor — a distribution-dependent 6x tail on real deep-layer
-    # captures (v4_pro_512k L46/L52, n4 = 32768, rows 1-8: 142-151 us vs
-    # 25 us with staging; healthy layers and n4 > 32768 rows unaffected —
-    # the kernel gates TSH per row at runtime anyway).
+    # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
+    # num_rows > 15 would strand small batches in SPLIT-main without the
+    # staged floor (a distribution-dependent tail regression); the kernel
+    # gates TSH per row at runtime anyway.
     tsh_en = 1 if (tpl[5] and k <= 1024) else 0
     pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
     tail = (aim_base, sfac, amin, sd_en, tsh_en)
@@ -859,57 +804,55 @@ def route_bands(
 
 
 # ===========================================================================
-# ==== workspace (ct_workspace.py) ==========================================
+# ==== workspace ============================================================
 # ===========================================================================
-"""op46 workspace mirror of src_cuda/main.cpp B2 (L15-37) + run_ws checks
-(L107-114) and kernel.h workspace_bytes contract.
+"""Per-device workspace slab for the multi-CTA SPLIT path.
 
-B2 semantics mirrored exactly:
+Semantics:
   * ONE zero-initialised slab workspace per device, lazily allocated through
-    the torch caching allocator (main.cpp:32-33 `at::zeros(..., kByte)`);
-  * keep-alive store (`ws_keep[GVR_MAX_DEV]`) -> module dict `_ws_keep`
-    (tensor refcount = keep-alive, same as the C static array);
+    the torch caching allocator;
+  * keep-alive store: module dict `_ws_keep` (tensor refcount = keep-alive);
   * double-checked locking: lock-free hot-path load (a GIL-atomic dict get
-    plays the `std::memory_order_acquire` load, main.cpp:26-27), slow path
-    re-checks under a mutex (main.cpp:28-31);
-  * device index bounds `0 <= d < GVR_MAX_DEV` (main.cpp:24-25) -- checked
-    BEFORE the CUDA-ness of the tensor, exactly like the C binding (run()
-    resolves the default workspace before run_impl's B1 checks, so a CPU
-    logits tensor dies here with "device index out of range: -1").
+    plays an acquire load), slow path re-checks under a mutex;
+  * device index bounds `0 <= d < GVR_MAX_DEV` -- checked BEFORE the
+    CUDA-ness of the tensor (run() resolves the default workspace before the
+    input checks, so a CPU logits tensor dies here with "device index out of
+    range: -1").
 
 Concurrent STREAMS on one device that may both take the multi-CTA SPLIT path
-must pass their own workspace via run_ws() (main.cpp:16-17).
+must pass their own workspace via run_ws().
 
-Size: gvr_topk_workspace_bytes() = GVR_WS_BUF_OFF + MAXC*GCAP*sizeof(int2)
-    = 2048 + 160*16384*8 = 20,973,568 B (kernel.cu L44-46).
+Size: workspace_bytes() = GVR_WS_BUF_OFF + MAXC*GCAP*sizeof(int2)
+    = 2048 + 160*16384*8 = 20,973,568 B.
 
-Kernel-facing view: ct_main's compiled signature takes the workspace as a
-1-D contiguous int32 tensor (fake tensor dtype Int32, assumed_align=16 --
-torch caching-allocator bases are 256B-aligned so the default slab always
-satisfies it).  `kernel_view()` reproduces the C binding's raw
-`workspace.data_ptr()` semantics for arbitrary user tensors by aliasing the
-underlying storage at the tensor's byte offset.
+Kernel-facing view: the compiled main-family signature takes the workspace
+as a 1-D contiguous int32 tensor (fake tensor dtype Int32, assumed_align=16
+-- torch caching-allocator bases are 256B-aligned so the default slab always
+satisfies it).  `kernel_view()` reproduces raw `workspace.data_ptr()`
+semantics for arbitrary user tensors by aliasing the underlying storage at
+the tensor's byte offset.
 """
 
 
-GVR_MAX_DEV = 64  # kernel.cu L19 / main.cpp:19
-_MAXC = 160  # kernel.cu L17
-_GCAP = 16384  # kernel.cu L18
-_GVR_WS_BUF_OFF = 2048  # kernel.cu L43
-WS_BYTES = _GVR_WS_BUF_OFF + _MAXC * _GCAP * 8  # 20,973,568 (kernel.cu L44-46)
+# workspace geometry constants -- must match the device kernels
+GVR_MAX_DEV = 64
+_MAXC = 160
+_GCAP = 16384
+_GVR_WS_BUF_OFF = 2048
+WS_BYTES = _GVR_WS_BUF_OFF + _MAXC * _GCAP * 8  # 20,973,568
 assert WS_BYTES == 20_973_568
 
-_mu = threading.Lock()  # main.cpp:28 slow-path mutex
+_mu = threading.Lock()  # slow-path mutex
 _ws_keep = {}  # device index -> keep-alive int32 view
 
 
 def workspace_bytes() -> int:
-    """kernel.h:12 gvr_topk_workspace_bytes()."""
+    """Workspace bytes required by the multi-CTA SPLIT path."""
     return WS_BYTES
 
 
 def default_workspace(ref: torch.Tensor) -> torch.Tensor:
-    """main.cpp:23-37 default_workspace(ref) -> per-device cached slab.
+    """Per-device cached workspace slab.
 
     Returns the kernel-facing 1-D int32 view (zero-initialised on first use;
     the kernel restores the zeros it consumes, so one zeroing suffices for
@@ -924,8 +867,8 @@ def default_workspace(ref: torch.Tensor) -> torch.Tensor:
         ws = _ws_keep.get(d)
         if ws is not None:
             return ws
-        # lazy zeros via the torch caching allocator (at::zeros kByte,
-        # main.cpp:32-33), viewed int32 for the DSL launch signature.
+        # lazy zeros via the torch caching allocator, viewed int32 for the
+        # DSL launch signature.
         buf = torch.zeros(WS_BYTES, dtype=torch.uint8, device=ref.device)
         ws = buf.view(torch.int32)
         _ws_keep[d] = ws  # keep-alive (ws_keep[d] = tensor)
@@ -933,7 +876,7 @@ def default_workspace(ref: torch.Tensor) -> torch.Tensor:
 
 
 def validate_run_ws(workspace: torch.Tensor, logits: torch.Tensor) -> None:
-    """main.cpp:107-114 run_ws() workspace hardening, same predicate order:
+    """run_ws() workspace hardening, in a fixed predicate order:
     CUDA + same device as logits; numel*element_size >= workspace_bytes();
     base 8-byte aligned."""
     if not (workspace.is_cuda and workspace.get_device() == logits.get_device()):
@@ -945,14 +888,14 @@ def validate_run_ws(workspace: torch.Tensor, logits: torch.Tensor) -> None:
 
 
 def kernel_view(workspace: torch.Tensor) -> torch.Tensor:
-    """Raw-pointer semantics of the C binding (main.cpp:115 passes
-    workspace.data_ptr() and nothing else): alias the first WS_BYTES bytes at
-    the tensor's data_ptr() as int32[WS_BYTES/4], ignoring dtype/shape.
+    """Raw-pointer view of a user workspace tensor: alias the first WS_BYTES
+    bytes at the tensor's data_ptr() as int32[WS_BYTES/4], ignoring
+    dtype/shape.
 
     NOTE: the DSL-side fake tensor declares assumed_align=16; a workspace at
-    8-but-not-16-byte alignment passes the C-contract check above but is
+    8-but-not-16-byte alignment passes the validate_run_ws check but is
     rejected by the DSL at conversion -- surfaced as a launch failure with
-    shape context by ct_op (documented in notes/ct_op_NOTES.md)."""
+    shape context."""
     if (
         workspace.dtype is torch.int32
         and workspace.dim() == 1
@@ -978,52 +921,41 @@ def _reset_for_tests() -> None:
 
 
 # ===========================================================================
-# ==== operator entry (ct_op.py) ============================================
+# ==== operator entry =======================================================
 # ===========================================================================
-"""op46 operator entry: CuTeDSL mirror of src_cuda/main.cpp run()/run_ws()/
-workspace_bytes() (spec section 1).
+"""Operator entry: input hardening, dispatch, and bind-once launch cache.
 
-B1 hardening checks run in the SAME ORDER with the SAME PREDICATES as
-main.cpp:43-88 (run_impl):
-  1. all three tensors CUDA (main.cpp:43-44)
-  2. dtypes: logits f32, pre_idx i32, indices i32 (45-47)
-  3. all 2-D (48-49)
-  4. all contiguous (50-51)
-  5. n_valid unwrap (57-67): python-int fast path (strict integral cast, like
-     pybind cast<int64_t>); Tensor path checks
-     torch.cuda.is_current_stream_capturing() FIRST and fails loudly (B1d),
-     else .item() (the D2H sync)
-  6. b/npad from logits, k = pre_idx.size(1) (68-70)
-  7. b == 0 -> early no-op (71, B1f)
-  8. npad % 4 == 0 (74-75, B1e float4 row loads)
-  9. logits base 16-byte aligned (76-78)
- 10. pre_idx/indices batch dims match (79-81)
- 11. indices width >= k (84-85)
- 12. n_valid >= 0 (86)
- 13. n = min(nv, npad) clamped in unbounded ints BEFORE any narrowing (88)
+Hardening checks run in a fixed order with fixed predicates:
+  1. all three tensors CUDA
+  2. dtypes: logits f32, pre_idx i32, indices i32
+  3. all 2-D
+  4. all contiguous
+  5. n_valid unwrap: python-int fast path (strict integral cast); Tensor
+     path checks torch.cuda.is_current_stream_capturing() FIRST and fails
+     loudly, else .item() (the D2H sync)
+  6. b/npad from logits, k = pre_idx.size(1)
+  7. b == 0 -> early no-op
+  8. npad % 4 == 0 (float4 row loads)
+  9. logits base 16-byte aligned
+ 10. pre_idx/indices batch dims match
+ 11. indices width >= k
+ 12. n_valid >= 0
+ 13. n = min(nv, npad) clamped in unbounded ints BEFORE any narrowing
 
-Dispatch: ct_dispatch.route(b, n, npad, k) -> compile-cache keyed on
-(kernel family, constexpr tuple) inside each family module -> BIND-ONCE
-launch cache keyed on the shape key (b, n, npad, k): caches the compiled
-callable + the prebuilt runtime-scalar arg pack as plain Python ints (probe
-P12: plain ints, never pre-wrapped cutlass.Int32; pre-binding removes only
-route()/marshal-prep work -- the tvm-ffi per-argument cost is paid every
-call).  Hot enqueue target ~3-6 us (P12 arg-width tax); measured numbers in
-notes/ct_op_NOTES.md.
+Dispatch: route(b, n, npad, k) -> compile cache keyed on (kernel family,
+constexpr tuple) in the device module -> bind-once launch cache keyed on the
+shape key (b, n, npad, k): caches the compiled callable + the prebuilt
+runtime-scalar arg pack as plain Python ints (never pre-wrapped
+cutlass.Int32 -- the FFI per-argument cost is paid every call regardless;
+pre-binding removes only route()/marshal-prep work).
 
-Error contract (spec 1.4): launch failures surface as exceptions WITH
-(b, n, npad, k) context, mirroring main.cpp:94-95.
+Error contract: launch failures surface as exceptions WITH
+(b, n, npad, k) context.
 
-All four family modules are imported LAZILY (first shape that routes to
-them), so a missing/broken sibling only fails when actually routed to, with
-(b, n, npad, k) context.  Wired compiled ABIs (verified against each
-module's __call__ signature):
-  ct_reg     (logits, pre_idx, out, n, CMP, QC, smem_bytes)
-  ct_main    (logits, pre_idx, out, ws, n, npad, k, SCAP_, CMP_, R, SMP,
-              TGT, Q, SS2, TGT2)             [only family taking workspace]
-  ct_clus    (logits, pre_idx, out, n, npad, k, SCAP, CMP, SMP, TGT, Q,
-              SS2, TGT2)                      [get_compiled keyed +scap/cmp_]
-  ct_regclus (logits, pre_idx, out, n)
+The device module is imported LAZILY (first shape that routes to it), so a
+missing/broken module only fails when actually reached, with (b, n, npad, k)
+context.  The per-family compiled ABIs are documented at each launcher
+builder in _build_launcher; only the main family takes the workspace.
 """
 
 
@@ -1042,9 +974,8 @@ def _dummy_kv(dev_index, device):
     return t
 
 
-# hot-path local bindings (each torch.<attr> lookup costs ~0.1 us; the B1
-# battery runs on EVERY call — mirror of main.cpp's "sub-100ns predicted
-# branches" intent within Python's reach; measured in notes/ct_op_NOTES.md)
+# hot-path local bindings: each torch.<attr> lookup costs ~0.1 us and the
+# validation battery runs on EVERY call
 _F32 = torch.float32
 _I32 = torch.int32
 _TENSOR = torch.Tensor
@@ -1068,7 +999,7 @@ def _build_launcher(b, n, npad, k):
 
         # compiled ABI: (logits, pre_idx, kv_lens, out, n, CMP, QC,
         # smem_total) -- kv_lens is the dead varlen slot in batch-uniform
-        # mode (dummy, gvr_main/reg_clus precedent)
+        # mode (cached dummy tensor)
         def fn(lg, pi, o, *a, _raw=raw):
             _raw(lg, pi, _dummy_kv(lg.get_device(), lg.device), o, *a)
 
@@ -1104,8 +1035,8 @@ def _build_launcher(b, n, npad, k):
         dev = _device()
         # compile key carries the smem-extent scalars (scap/cmp_); compiled
         # ABI: (logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP,
-        #       TGT, Q, SS2, TGT2) -- NO workspace (spec §4c); kv_lens is the
-        # dead varlen slot in batch-uniform mode (dummy, reg_clus precedent)
+        #       TGT, Q, SS2, TGT2) -- NO workspace; kv_lens is the dead
+        # varlen slot in batch-uniform mode (cached dummy tensor)
         fn = dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"])
         args = (
             rt["n"],
@@ -1127,7 +1058,7 @@ def _build_launcher(b, n, npad, k):
     if fam == "reg_clus":
         dev = _device()
         # compiled ABI: (logits, pre_idx, kv_lens, out, n) -- kv_lens is the
-        # dead varlen slot in batch-uniform mode (dummy, gvr_main precedent);
+        # dead varlen slot in batch-uniform mode (cached dummy tensor);
         # smem/k derived in-module
         fn = dev.get_compiled__regclus(tpl)
         n_arg = rt["n"]
@@ -1141,7 +1072,7 @@ def _build_launcher(b, n, npad, k):
 
 
 # ---------------------------------------------------------------------------
-# run_impl mirror (main.cpp:39-96)
+# shared implementation of the batch-uniform entries
 # ---------------------------------------------------------------------------
 def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
     if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
@@ -1158,8 +1089,8 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
     if not (logits.is_contiguous() and pre_idx.is_contiguous() and indices.is_contiguous()):
         raise RuntimeError("tensors must be contiguous")
 
-    # n_valid unwrap (main.cpp:57-67): tensor path = D2H sync, illegal under
-    # CUDA graph capture -- fail loudly instead of crashing the capture (B1d).
+    # n_valid unwrap: tensor path = D2H sync, illegal under CUDA graph
+    # capture -- fail loudly instead of crashing the capture.
     if isinstance(n_valid, _TENSOR):
         if _is_capturing():
             raise RuntimeError(
@@ -1168,12 +1099,12 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
             )
         nv = int(n_valid.item())
     else:
-        # strict integral cast (pybind cast<int64_t> rejects floats/strings)
+        # strict integral cast (rejects floats/strings)
         nv = _index(n_valid)
 
     b, npad = lsh
     k = psh[1]
-    if b == 0:  # empty batch: no-op (main.cpp:71, B1f)
+    if b == 0:  # empty batch: no-op
         return
     if npad & 3:
         raise RuntimeError(f"npad (logits stride) must be a multiple of 4, got {npad}")
@@ -1187,15 +1118,15 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
         raise RuntimeError(f"indices width {ish[1]} < k={k} (k is pre_idx.size(1))")
     if nv < 0:
         raise RuntimeError(f"n_valid must be non-negative, got {nv}")
-    # clamp BEFORE any narrowing (main.cpp:87-88; python ints are unbounded,
-    # so min() is the exact 64-bit clamp)
+    # clamp BEFORE any narrowing (python ints are unbounded, so min() is the
+    # exact 64-bit clamp)
     n = nv if nv < npad else npad
 
-    # CUDA out-indexing mirror: every kernel derives O = out + row*k
-    # (kernel.cu L475/L1309 etc.) -- flat PACKED rows, ignoring the actual
-    # indices width.  The DSL kernels index out[row, :] with the tensor's own
-    # row stride, so a wider `indices` must be re-viewed packed (pure view,
-    # no copy; contiguity already checked).
+    # CUDA out-indexing mirror: every kernel derives O = out + row*k --
+    # flat PACKED rows, ignoring the actual indices width.  The DSL kernels
+    # index out[row, :] with the tensor's own row stride, so a wider
+    # `indices` must be re-viewed packed (pure view, no copy; contiguity
+    # already checked).
     if ish[1] != k:
         indices = indices.reshape(-1)[: b * k].view(b, k)
 
@@ -1219,7 +1150,7 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
         if vsh[1] != k:
             values = values.reshape(-1)[: b * k].view(b, k)
 
-    # ---- n <= k short path (heuristicTopKDecode.cu:72-84) -------------------
+    # ---- n <= k short path (heuristicTopKDecode.cu parity) ------------------
     # Every valid position is in the top-K: emit identity indices and pad the
     # tail with -1 (the production pad convention; downstream treats -1 as
     # invalid). Order is contract-irrelevant — exactness is tie-interchangeable
@@ -1258,7 +1189,7 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
 
 
 # ---------------------------------------------------------------------------
-# exports (main.cpp:98-124)
+# exports
 # ---------------------------------------------------------------------------
 def run(
     logits: torch.Tensor,
@@ -1271,15 +1202,14 @@ def run(
     device kv_lens; this entry assumes one batch-uniform host ``n_valid``,
     which real serving batches do not satisfy).
 
-    Fast 4-arg form: signature-identical to the original candidate.
-    ``values`` (optional DPS output, default None = OFF) mirrors the
-    production values writeback; see _run_impl.
-    Default per-device slab workspace resolved FIRST (main.cpp:99-102 --
-    a CPU logits tensor therefore dies with 'device index out of range').
-    Hot path inlines the C binding's check + atomic-load + cache-hit
-    (main.cpp:24-27); the slow path allocates under ct_workspace's lock."""
+    Fast 4-arg form.  ``values`` (optional DPS output, default None = OFF)
+    mirrors the production values writeback; see _run_impl.
+    The default per-device slab workspace is resolved FIRST (a CPU logits
+    tensor therefore dies with 'device index out of range').
+    Hot path inlines the device check + atomic load + cache hit; the slow
+    path allocates under the workspace lock."""
     d = logits.get_device()
-    if not 0 <= d < _GVR_MAX_DEV:  # main.cpp:25, EVERY call
+    if not 0 <= d < _GVR_MAX_DEV:  # checked on EVERY call
         raise RuntimeError(f"device index out of range: {d}")
     ws = _ws_hot.get(d)
     if ws is None:
@@ -1297,7 +1227,7 @@ def run_ws(
 ) -> None:
     """TESTING/BENCH ONLY — production callers must use ``run_varlen(workspace=...)``.
 
-    Explicit-workspace form for multi-stream callers (main.cpp:105-116)."""
+    Explicit-workspace form for multi-stream callers."""
     validate_run_ws(workspace, logits)
     _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
 
@@ -1341,14 +1271,13 @@ def run_varlen(
 
     KNOWN LIMITATION: on rows containing NaN logits the selected index SET
     can differ from ``heuristicTopKDecode.cu`` (both kernels order NaNs
-    implementation-specifically; inherited from the translation campaign's
-    probe battery). Finite inputs — including +/-inf and denormals — are
-    tie-aware exact.
+    implementation-specifically). Finite inputs — including +/-inf and
+    denormals — are tie-aware exact.
 
-    FULL-RANGE PRODUCTION CONTRACT: correct and dispatched for any
-    ``num_rows`` (BS 1..1024+ x next_n) and any envelope up to 1M kv tokens.
-    Family selection (streaming main / clustered register-resident) is a
-    pure function of the capture-stable launcher key.
+    CONTRACT: correct and dispatched for any ``num_rows``
+    (BS 1..1024+ x next_n) and any envelope up to 1M kv tokens.  Family
+    selection (streaming main / clustered register-resident) is a pure
+    function of the capture-stable launcher key.
     """
     if logits.dtype is not torch.float32:
         raise RuntimeError(
@@ -1396,10 +1325,11 @@ def run_varlen(
 
     if engine == "auto":
         # ---- per-row in-kernel engine (gvr_main varlen port) ----------------
-        # Full B1-style validation battery (the engine bypasses _run_impl —
-        # every check the legacy path enforces is replayed here; the batch-dim
-        # check is CRITICAL: the kernel grid comes from logits.shape[0], so a
-        # short indices/values tensor would be written out of bounds).
+        # Full validation battery (the engine bypasses _run_impl — every
+        # check the batch-uniform path enforces is replayed here; the
+        # batch-dim check is CRITICAL: the kernel grid comes from
+        # logits.shape[0], so a short indices/values tensor would be written
+        # out of bounds).
         if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
             raise RuntimeError("all tensors must be CUDA")
         if logits.dtype is not _F32 or pre_idx.dtype is not _I32 or indices.dtype is not _I32:

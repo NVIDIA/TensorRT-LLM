@@ -119,7 +119,7 @@ def test_selfsampling_topk_exactness(batch_size, top_k, n_valid):
 
 
 # n_valid <= top_k: every valid position is in the top-K. Production short
-# path (heuristicTopKDecode.cu:72-84): identity indices + -1 tail padding.
+# path convention: identity indices + -1 tail padding.
 _SHORT_CASES = [
     (512, 256),
     (512, 511),
@@ -199,7 +199,7 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
     """Hints only steer the sampling ladder — exactness must survive the
     degenerate hint buffers production can produce: the all-zero cold start
     (dsa.py ``heuristic_prev_topk.zero_()`` init corners), fully duplicated
-    hints, and max-index hints (hint-robustness class of PR #17550)."""
+    hints, and max-index hints."""
     logits, _, indices, ref_vals = _make_case(2, n_valid, top_k, seed=n_valid + top_k)
     if hint_kind == "all_zero":
         pre_idx = torch.zeros((2, top_k), dtype=torch.int32, device=_DEV)
@@ -289,9 +289,8 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="aut
         ([131075, 32800, 2000], 1, 4, 512),  # v4-style compressed index space
         ([9000, 5001], 2, 1, 512),  # MTP: n varies per row within a request
         ([65540], 4, 4, 1024),  # MTP: compressed-boundary-crossing rows
-        ([40000, 7003], 3, 4, 512),  # MTP2 (next_n=3): no production config
-        # uses it today, but the window formula must generalize (gap noted
-        # in the PR's MTP-coverage section)
+        ([40000, 7003], 3, 4, 512),  # MTP2 (next_n=3): unused in production
+        # today, but the window formula must generalize
     ],
     ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4", "cr4_mtp3"],
 )
@@ -525,9 +524,9 @@ def test_selfsampling_topk_guards():
 
 
 def test_selfsampling_route_large_batch_domain():
-    """Production num_rows = max_batch_size * next_n can exceed the bench
-    grid's b<=1024 envelope (e.g. 1024 * 4 = 4096 rows). route() is a pure
-    function — assert the full domain stays well-formed up to 8192 rows."""
+    """Production num_rows = max_batch_size * next_n can exceed the b<=1024
+    range the plans were tuned on (e.g. 1024 * 4 = 4096 rows). route() is a
+    pure function — assert the full domain stays well-formed up to 8192 rows."""
     for k in (512, 1024, 2048):
         for n in (k + 1, 4096, 65536, 262144):
             npad = (n + 63) // 64 * 64
