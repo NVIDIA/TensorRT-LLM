@@ -1,7 +1,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
 import json
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
@@ -110,6 +110,34 @@ class BaseToolParser(ABC):
                 return i
         return 0
 
+    def _split_leading_normal_text(self, buffer: str,
+                                   start_tokens: List[str]) -> Tuple[str, str]:
+        """Split a buffer at the earliest tool call start token.
+
+        A streaming increment can carry ordinary content and the opening of a
+        tool call at once. That content precedes the tool call and is not part
+        of it, so it has to be returned to the client as normal text instead of
+        being consumed along with the markup.
+
+        The split is verbatim: no whitespace is trimmed. Trimming here would
+        make the streamed content depend on where increment boundaries happen
+        to fall, since a prefix that arrives in its own increment is emitted by
+        the no-tool-call path, which does not trim either. Non-streaming
+        ``detect_and_parse`` strips the prefix in most parsers, so accumulated
+        streaming content can carry whitespace that the one-shot path drops.
+
+        Returns a ``(normal_text, remainder)`` pair. ``normal_text`` is empty
+        when the buffer starts with a tool call or contains none of the tokens.
+        """
+        indices = [
+            index for index in (buffer.find(token) for token in start_tokens)
+            if index != -1
+        ]
+        if not indices:
+            return "", buffer
+        split_at = min(indices)
+        return buffer[:split_at], buffer[split_at:]
+
     def parse_streaming_increment(self, new_text: str,
                                   tools: List[Tool]) -> StreamingParseResult:
         """
@@ -151,6 +179,14 @@ class BaseToolParser(ABC):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # This increment may hold ordinary text ahead of the tool call. Hand
+        # that text back as content and keep only the markup in the buffer,
+        # otherwise it is consumed along with the tool call and never reaches
+        # the client.
+        normal_text, current_text = self._split_leading_normal_text(
+            current_text, [self.bot_token])
+        self._buffer = current_text
+
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
         try:
@@ -165,7 +201,7 @@ class BaseToolParser(ABC):
                     start_idx = 0
 
                 if start_idx >= len(current_text):
-                    return StreamingParseResult()
+                    return StreamingParseResult(normal_text=normal_text)
 
                 (obj, end_idx) = partial_json_loads(current_text[start_idx:],
                                                     flags)
@@ -183,10 +219,10 @@ class BaseToolParser(ABC):
                 current_tool_call = obj
 
             except MalformedJSON:
-                return StreamingParseResult()
+                return StreamingParseResult(normal_text=normal_text)
 
             if not current_tool_call:
-                return StreamingParseResult()
+                return StreamingParseResult(normal_text=normal_text)
 
             # Case 1: Handle tool name streaming
             # This happens when we encounter a tool but haven't sent its name yet
@@ -284,11 +320,12 @@ class BaseToolParser(ABC):
                 self.prev_tool_call_arr[
                     self.current_tool_id] = current_tool_call
 
+            res.normal_text = normal_text + res.normal_text
             return res
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult()
+            return StreamingParseResult(normal_text=normal_text)
 
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:

@@ -338,6 +338,12 @@ class Glm4ToolParser(BaseToolParser):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # This increment may hold ordinary text ahead of the tool call. Hand that
+        # text back as content and keep only the markup in the buffer, otherwise
+        # it is consumed along with the tool call and never reaches the client.
+        normal_text, current_text = self._split_leading_normal_text(current_text, [self.bot_token])
+        self._buffer = current_text
+
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
@@ -351,7 +357,7 @@ class Glm4ToolParser(BaseToolParser):
                 is_tool_end = partial_match.group(3)
 
                 if func_name_raw is None or not func_name_raw.strip():
-                    return StreamingParseResult(normal_text="", calls=[])
+                    return StreamingParseResult(normal_text=normal_text, calls=[])
 
                 func_name = func_name_raw.strip()
                 func_args_raw = func_args_raw.strip() if func_args_raw else ""
@@ -442,7 +448,7 @@ class Glm4ToolParser(BaseToolParser):
 
                         self._buffer = current_text[partial_match.end(3) :]
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(normal_text=normal_text, calls=calls)
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
@@ -450,11 +456,11 @@ class Glm4ToolParser(BaseToolParser):
                         self._reset_streaming_state()
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def _parse_argument_pairs(
         self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
