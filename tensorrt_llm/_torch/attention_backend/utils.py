@@ -64,7 +64,8 @@ def create_attention(
     sparse_params: Optional[SparseParams] = None,
     dtype: Optional[torch.dtype] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
-):
+    flashinfer_mla_backend: Optional[str] = None,
+) -> AttentionBackend:
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
             f"Backend {backend_name} does not support chunked attention.")
@@ -99,6 +100,16 @@ def create_attention(
         aux_stream=aux_stream,
         sparse_params=sparse_params,
     )
+    if flashinfer_mla_backend is not None:
+        # Only TrtllmAttention understands this selector. Raise instead of
+        # silently dropping it: a model that configured a specific MLA
+        # generation kernel must not run on another backend's default.
+        if not issubclass(attn_cls, TrtllmAttention):
+            raise ValueError(
+                f"flashinfer_mla_backend={flashinfer_mla_backend!r} is only "
+                "supported by the TRTLLM attention backend, but backend "
+                f"{backend_name} resolves to {attn_cls.__name__}.")
+        kwargs["flashinfer_mla_backend"] = flashinfer_mla_backend
 
     return attn_cls(
         layer_idx,
