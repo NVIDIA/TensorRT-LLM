@@ -17,6 +17,7 @@
 import copy
 import fcntl
 import glob
+import math
 import os
 import re
 import secrets
@@ -37,7 +38,7 @@ from defs.trt_test_alternative import print_info
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
-from .perf_regression_utils import process_and_upload_test_results
+from .perf_regression_utils import _percentile, process_and_upload_test_results
 
 # Sanity-side path differs from test_perf for this key; preserve historical value.
 MODEL_PATH_DICT = {
@@ -178,14 +179,48 @@ SPEC_DECODING_PERF_METRIC_LOG_QUERIES = {
     "al": re.compile(r"Mean Avg Decoded Tokens per Iter:\s+(-?[\d\.]+)"),
 }
 
-# gen_only-only metric: appended to each trtllm-benchmark log by
+# gen_only-only metrics: appended to each trtllm-benchmark log by
 # DisaggTestCmds.run_cmd after parsing gen_server_*.log; only forwarded to
 # the database for gen_only mode.
+#
+# The distribution is published, not just the mean, because the mean alone is
+# not self-diagnosing: a single anomalous iteration can move it by >30% while
+# the workload is unchanged (nvbugs 6627789), and the only way a reader can
+# tell that from a real regression is to see the spread next to it. Only the
+# mean is regression-gated (see regression_metrics in the gen_only branch);
+# the other four are uploaded for diagnosis.
+#
+# One statistic per line, and the leading words must stay mutually exclusive:
+# parse_metrics_from_output breaks out of the regex loop on the first match per
+# line, so a shared prefix would silently shadow whichever pattern lost the
+# ordering race.
 GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
     "mean_gen_worker_per_iter_device_step_time": re.compile(
         r"Average Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
     ),
+    "median_gen_worker_per_iter_device_step_time": re.compile(
+        r"Median Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
+    "std_gen_worker_per_iter_device_step_time": re.compile(
+        r"Stdev Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
+    "p75_gen_worker_per_iter_device_step_time": re.compile(
+        r"P75 Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
+    "p99_gen_worker_per_iter_device_step_time": re.compile(
+        r"P99 Per Iter Device Step Time \(ms\):\s+(-?[\d\.]+)"
+    ),
 }
+
+# Every gen_only device-step-time metric, in log-line order. The mean is first
+# because it is the gated one and the only one check_test_failure keys on.
+GEN_ONLY_DEVICE_STEP_TIME_METRICS = (
+    "mean_gen_worker_per_iter_device_step_time",
+    "median_gen_worker_per_iter_device_step_time",
+    "std_gen_worker_per_iter_device_step_time",
+    "p75_gen_worker_per_iter_device_step_time",
+    "p99_gen_worker_per_iter_device_step_time",
+)
 
 # Per-iter prev_device_step_time logged by each gen worker. Example line:
 #   [TRT-LLM] [I] [_torch][RANK 0] iter = 5, global_rank = 0, ...,
@@ -203,6 +238,59 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 # _scan_gen_worker_device_step_time.
 _DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
 _NUM_GEN_TOKENS_RE = re.compile(r"'num_generation_tokens':\s*(\d+)")
+# num_scheduled_requests from the same line. An iteration that scheduled zero
+# requests did no GPU work, so its loop period is pure idle (waiting on KV-cache
+# transfer) -- and because the device runs async that period is reported by the
+# NEXT iteration's prev_device_step_time. Such a row is excluded; see
+# _scan_gen_worker_device_step_time. The ' = ' spelling is what
+# py_executor.py's iteration log actually emits (do not copy the ': ' form in
+# examples/wide_ep/slurm_scripts/process_gen_iterlog.py, which is stale).
+_ITER_NSR_RE = re.compile(r"iter\s*=\s*(\d+),.*?num_scheduled_requests\s*=\s*(\d+)")
+
+# Hard cap on retained per-iteration samples per gen worker. The percentile and
+# stdev statistics need the whole sample, so the scan cannot be O(1) memory the
+# way a streaming mean could. A steady-state run holds ~512 rows per worker
+# (~16 KB), so this bound is ~1000x headroom and exists only to keep a
+# pathological log (a runaway worker, a concatenated log) from growing the
+# scan without limit. Excess rows are dropped, not sampled: truncating the tail
+# keeps the steady-state plateau these statistics describe.
+_MAX_RETAINED_ITER_ROWS = 500_000
+
+
+class _IterRow(NamedTuple):
+    """One usable per-iteration sample from a gen worker log.
+
+    ngen is the line's num_generation_tokens, or None when it did not parse
+    (see _scan_gen_worker_device_step_time for why such rows are retained).
+    """
+
+    ngen: Optional[int]
+    device_step_time: float
+
+
+class _DeviceStepTimeStats(NamedTuple):
+    """Distribution of gen-worker per-iter device step time, in ms."""
+
+    mean: float
+    median: float
+    std: float
+    p75: float
+    p99: float
+
+
+def _stdev(values: List[float]) -> float:
+    """Sample standard deviation (ddof=1). Returns 0.0 for fewer than 2 values.
+
+    ddof=1 because the iterations are a sample of the workload's steady state,
+    not its entire population. A single-sample file reports 0.0 rather than
+    raising: the metric is diagnostic, and a run that produced one usable
+    iteration has bigger problems than its spread.
+    """
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1))
 
 
 def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
@@ -223,36 +311,46 @@ def _scan_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-) -> Tuple[List[Tuple[Dict[int, Tuple[int, float]], int, float]], int]:
+) -> List[List[_IterRow]]:
     """Single-pass scan of the gen logs.
 
-    Returns (per_file_scans, total_count):
-      - per_file_scans: one entry per file that produced >=1 usable row, each
-        a tuple (by_ngen, all_count, all_mean):
-          * by_ngen maps num_generation_tokens -> (count, Welford mean of
-            prev_device_step_time) over rows with iter >= 5, a numeric
-            prev_device_step_time, and a parseable num_generation_tokens on
-            the same line.
-          * all_count / all_mean are the count and Welford mean of
-            prev_device_step_time over ALL iter >= 5 numeric rows in the file,
-            including those whose num_generation_tokens did not parse. This is
-            the fallback aggregate used when a worker never emits a parseable
-            num_generation_tokens (nvbugs 6487036 / 6487040): PR #16298 began
-            requiring num_generation_tokens on every line, so a worker whose
-            states dict renders it as e.g. tensor(256) would drop to no
-            buckets and the metric would wrongly parse to None.
-      - total_count: the number of iter >= 5 rows with a numeric
-        prev_device_step_time across all files.
+    Returns one list of _IterRow per file that produced at least one usable
+    row. A row is usable when iter >= 5, prev_device_step_time is numeric, and
+    the row is not the successor of an empty iteration (below). _IterRow.ngen
+    is None when num_generation_tokens did not parse on that line; such rows
+    are retained rather than dropped so a worker whose states dict renders it
+    unparseably (e.g. tensor(256), nvbugs 6487036 / 6487040) still produces a
+    metric instead of None -- PR #16298 began requiring num_generation_tokens
+    on every line, and dropping those rows would silently lose the metric.
 
-    Memory is O(distinct num_generation_tokens per file), a small constant
-    in practice (steady-state plus a shrinking tail).
+    Empty-iteration successors are excluded. An iteration with
+    num_scheduled_requests == 0 did no GPU work, so its loop period is entirely
+    idle -- typically waiting for KV-cache transfer in a disaggregated run --
+    and because the device runs one step behind, that idle period is what the
+    NEXT iteration reports as prev_device_step_time. Averaging it in credits
+    the GPU with hundreds or thousands of milliseconds of "step time" that no
+    kernel spent, which is how nvbug 6627789 read a +19% regression out of two
+    runs whose steady-state iterations were both ~7.3 ms.
+
+    The row is dropped only when the immediately preceding parsed line is
+    provably the predecessor iteration: pred_iter == cur_iter - 1. If the
+    predecessor is missing, unparseable, or non-adjacent (interleaved ranks
+    writing to a shared log, a restarted iteration counter), the row is KEPT.
+    That is the safe direction to fail: the exclusion is an accuracy
+    improvement on a metric that must keep reporting, so a scan that cannot
+    prove a row is idle-contaminated should behave exactly as it did before.
+    Note the num_scheduled_requests == 0 row itself is kept -- its own
+    prev_device_step_time describes the previous iteration, which did work.
+
+    Memory is O(retained rows), bounded by _MAX_RETAINED_ITER_ROWS per file:
+    the percentile and stdev statistics need the whole sample, unlike the
+    streaming mean this replaced.
 
     errors="replace" guards against invalid UTF-8: tqdm progress bars
     (model load) write partial multibyte sequences that would otherwise raise
     UnicodeDecodeError mid-scan.
     """
-    per_file_scans: List[Tuple[Dict[int, Tuple[int, float]], int, float]] = []
-    total_count = 0
+    per_file_rows: List[List[_IterRow]] = []
     for i in range(num_gen_servers):
         log_path = os.path.join(output_dir, f"gen_server_{i}.log")
         if not os.path.isfile(log_path):
@@ -264,85 +362,123 @@ def _scan_gen_worker_device_step_time(
             else 0
         )
 
-        by_ngen: Dict[int, Tuple[int, float]] = {}
-        all_count = 0
-        all_mean = 0.0
+        rows: List[_IterRow] = []
+        prev_iter: Optional[int] = None
+        prev_nsr: Optional[int] = None
         with open(log_path, errors="replace") as f:
             if seek_to:
                 f.seek(seek_to)
             for line in f:
+                # Every iteration line carries this literal, including the ones
+                # whose value is 'N/A', so this fast-reject cannot skip a line
+                # the num_scheduled_requests tracking below needs to see.
+                if "prev_device_step_time" not in line:
+                    continue
+                # Snapshot the predecessor before this line overwrites it.
+                pred_iter, pred_nsr = prev_iter, prev_nsr
+                nsr_m = _ITER_NSR_RE.search(line)
+                if nsr_m is None:
+                    prev_iter, prev_nsr = None, None
+                else:
+                    prev_iter, prev_nsr = int(nsr_m.group(1)), int(nsr_m.group(2))
+
                 m = _DEVICE_STEP_TIME_RE.search(line)
                 if m is None:
                     continue
-                if int(m.group(1)) < 5:
+                cur_iter = int(m.group(1))
+                # iter 0/1 include KV-cache transfer wait; 2-4 are warmup.
+                if cur_iter < 5:
                     continue
-                total_count += 1
-                dt = float(m.group(2))
-                # All-iter fallback aggregate (every usable row).
-                all_count += 1
-                all_mean += (dt - all_mean) / all_count
-                # Per-ngen bucket (only rows with a parseable ngen).
+                if pred_nsr == 0 and pred_iter is not None and pred_iter == cur_iter - 1:
+                    continue
+                if len(rows) >= _MAX_RETAINED_ITER_ROWS:
+                    continue
                 ngen_m = _NUM_GEN_TOKENS_RE.search(line)
-                if ngen_m is None:
-                    continue
-                ngen = int(ngen_m.group(1))
-                count, mean = by_ngen.get(ngen, (0, 0.0))
-                count += 1
-                mean += (dt - mean) / count
-                by_ngen[ngen] = (count, mean)
-        if all_count:
-            per_file_scans.append((by_ngen, all_count, all_mean))
-    return per_file_scans, total_count
+                rows.append(
+                    _IterRow(
+                        ngen=int(ngen_m.group(1)) if ngen_m is not None else None,
+                        device_step_time=float(m.group(2)),
+                    )
+                )
+        if rows:
+            per_file_rows.append(rows)
+    return per_file_rows
 
 
-def _mean_at_mode_ngen(
-    per_file_scans: List[Tuple[Dict[int, Tuple[int, float]], int, float]],
-) -> Optional[float]:
-    """Aggregate per-file scans into a single mean.
+def _stats_at_mode_ngen(
+    per_file_rows: List[List[_IterRow]],
+) -> Optional[_DeviceStepTimeStats]:
+    """Aggregate per-file rows into one set of distribution statistics.
 
     Within each file pick the num_generation_tokens value with the most
-    iterations (the mode) and take its Welford mean; ties break to the
+    iterations (the mode) and describe only that bucket; ties break to the
     largest ngen because the steady-state plateau is the upper of any tied
-    clusters. Mode is more robust than strict == max — a one-off spike where
+    clusters. Mode is more robust than strict == max -- a one-off spike where
     a single iter's ngen briefly exceeds the sustained batch would otherwise
-    collapse the mean to 1-2 samples. When a file produced usable rows but no
-    parseable num_generation_tokens on any of them, fall back to the file's
-    all-iter mean so a present metric is never lost (nvbugs 6487036 /
-    6487040). Then average the per-file means across workers. Returns None if
-    no file had a usable row.
+    collapse the statistics to 1-2 samples. Iterations near the end of a run
+    have a shrinking num_generation_tokens as sequences finish and land in
+    smaller-ngen buckets, so they do not drag the mean below steady state.
+    When a file produced usable rows but no parseable num_generation_tokens on
+    any of them, fall back to that file's whole sample so a present metric is
+    never lost (nvbugs 6487036 / 6487040).
+
+    Then average each statistic across workers, unweighted -- one vote per
+    worker, matching how the mean has always been combined. Averaging a median
+    or a percentile across workers is not itself a median or a percentile of
+    the pooled sample; these are per-worker statistics summarised across
+    workers, which is the comparison the regression check makes.
+
+    Returns None if no file had a usable row.
     """
-    means: List[float] = []
-    for by_ngen, _all_count, all_mean in per_file_scans:
+    per_file_stats: List[_DeviceStepTimeStats] = []
+    for rows in per_file_rows:
+        by_ngen: Dict[int, List[float]] = {}
+        for row in rows:
+            if row.ngen is not None:
+                by_ngen.setdefault(row.ngen, []).append(row.device_step_time)
         if by_ngen:
-            _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
-            means.append(mean)
+            _mode_ngen, values = max(by_ngen.items(), key=lambda kv: (len(kv[1]), kv[0]))
         else:
-            # No parseable ngen anywhere in this worker; use the all-iter mean.
-            means.append(all_mean)
-    if not means:
+            # No parseable ngen anywhere in this worker; use every row.
+            values = [row.device_step_time for row in rows]
+        if not values:
+            continue
+        per_file_stats.append(
+            _DeviceStepTimeStats(
+                mean=sum(values) / len(values),
+                median=_percentile(values, 50),
+                std=_stdev(values),
+                p75=_percentile(values, 75),
+                p99=_percentile(values, 99),
+            )
+        )
+    if not per_file_stats:
         return None
-    return sum(means) / len(means)
+    num_files = len(per_file_stats)
+    return _DeviceStepTimeStats(*(sum(column) / num_files for column in zip(*per_file_stats)))
 
 
 def parse_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-) -> Optional[float]:
-    """Mean per-iter prev_device_step_time (ms) across all gen workers.
+) -> Optional[_DeviceStepTimeStats]:
+    """Per-iter prev_device_step_time statistics (ms) across all gen workers.
 
-    For each gen_server_{i}.log, bucket iter >= 5 rows by
-    num_generation_tokens, pick the bucket with the most rows (the mode; ties
-    break to the largest ngen), and take that bucket's mean. Then average
-    those per-file means across the num_gen_servers workers. Iterations near
-    the end of a run have a shrinking num_generation_tokens as sequences
-    finish and land in smaller-ngen buckets, so they don't drag the mean
-    below the steady-state cost. Using the mode (rather than strict == max)
-    is robust against a single iter whose ngen briefly spikes above the
-    sustained batch, which would otherwise collapse the mean to 1-2 samples.
-    A worker whose num_generation_tokens never parses falls back to its
-    all-iter mean rather than being dropped to None. Returns None only if no
-    usable line is found in any file.
+    For each gen_server_{i}.log, take the iter >= 5 rows that are not the
+    successor of an empty (num_scheduled_requests == 0) iteration, bucket them
+    by num_generation_tokens, pick the bucket with the most rows (the mode;
+    ties break to the largest ngen), and describe that bucket with mean,
+    median, stdev, P75 and P99. Then average each statistic across the
+    num_gen_servers workers. A worker whose num_generation_tokens never parses
+    falls back to its whole sample rather than being dropped to None. Returns
+    None only if no usable line is found in any file.
+
+    The mean is the regression-gated statistic; the other four are uploaded
+    for diagnosis, because a mean on its own cannot distinguish a slower
+    workload from one anomalous iteration. See
+    _scan_gen_worker_device_step_time for the empty-iteration exclusion and
+    _stats_at_mode_ngen for the bucket selection.
 
     When start_offsets is provided, only the bytes from start_offsets[i] to
     end-of-file are considered for gen_server_{i}.log — used to slice out a
@@ -357,10 +493,8 @@ def parse_gen_worker_device_step_time(
     accept a truncated prefix while the log was still flushing across NFS
     (nvbugs 6487036 / 6487040 / 6487038).
     """
-    per_file_scans, _total_count = _scan_gen_worker_device_step_time(
-        output_dir, num_gen_servers, start_offsets
-    )
-    return _mean_at_mode_ngen(per_file_scans)
+    per_file_rows = _scan_gen_worker_device_step_time(output_dir, num_gen_servers, start_offsets)
+    return _stats_at_mode_ngen(per_file_rows)
 
 
 def add_perf_metric_value(
@@ -374,17 +508,26 @@ def add_perf_metric_value(
     - Always copies every key in PERF_METRIC_LOG_QUERIES as `d_<name>`.
     - Adds `d_al` only when spec_decoding=True; non-spec rows omit it so
       OpenSearch baselines don't blend the two populations.
-    - Adds `d_mean_gen_worker_per_iter_device_step_time` only for the
-      disagg gen_only mode (the only mode whose regression is gated on it).
+    - Adds the `d_*_gen_worker_per_iter_device_step_time` family only for the
+      disagg gen_only mode (the only mode that emits them). Of these only the
+      mean is regression-gated; the rest are uploaded for diagnosis.
+
+    A missing or non-numeric gen_only statistic is omitted rather than
+    forwarded: typeCheckForOpenSearchDB rejects both None and int for a `d_`
+    key, so uploading one would fail the whole row instead of just losing a
+    diagnostic column. check_test_failure separately hard-fails a gen_only run
+    whose mean is absent, before results are uploaded.
     """
     for metric_name in PERF_METRIC_LOG_QUERIES:
         new_data[f"d_{metric_name}"] = metrics[metric_name]
     if spec_decoding:
         new_data["d_al"] = metrics["al"]
     if benchmark_mode == "gen_only":
-        new_data["d_mean_gen_worker_per_iter_device_step_time"] = metrics[
-            "mean_gen_worker_per_iter_device_step_time"
-        ]
+        for metric_name in GEN_ONLY_DEVICE_STEP_TIME_METRICS:
+            value = metrics.get(metric_name)
+            if value is None:
+                continue
+            new_data[f"d_{metric_name}"] = float(value)
 
 
 # Metrics where larger is better
@@ -410,8 +553,16 @@ MINIMIZE_METRICS = [
     "d_mean_e2el",
     "d_median_e2el",
     "d_p99_e2el",
-    # gen_only-only: per-iter device step time averaged across gen workers
+    # gen_only-only: per-iter device step time across gen workers. Lower is
+    # better for all five, including the spread statistics -- a tighter
+    # distribution is a more trustworthy measurement as well as a steadier
+    # workload. Only the mean is listed in regression_metrics; the other four
+    # get baselines but cannot fail a build (see check_regression).
     "d_mean_gen_worker_per_iter_device_step_time",
+    "d_median_gen_worker_per_iter_device_step_time",
+    "d_std_gen_worker_per_iter_device_step_time",
+    "d_p75_gen_worker_per_iter_device_step_time",
+    "d_p99_gen_worker_per_iter_device_step_time",
 ]
 
 # Default key metrics that determine regression (throughput metrics only).
@@ -1420,30 +1571,45 @@ class DisaggTestCmds(NamedTuple):
         pending_device_step_time: List[dict],
         outputs: List[str],
     ) -> None:
-        """Wait for GEN log flush, then append each pending client metric.
+        """Wait for GEN log flush, then append each pending client's metrics.
 
         A sentinel timeout is a bounded teardown fallback, not a reason to
         discard metrics that are already present in the GEN logs. If the
         fallback parse finds no usable metric, check_test_failure still fails
         the gen_only run before results are uploaded.
+
+        Five lines are written, one statistic each -- see
+        GEN_ONLY_PERF_METRIC_LOG_QUERIES for why they must not share a leading
+        word. The mean keeps its original wording and 2 decimals so existing
+        log readers and dashboards are unaffected; the four new lines use 4
+        decimals because the stdev of a healthy run is O(0.1 ms) and would
+        round to two significant figures away at 2.
         """
         if not pending_device_step_time:
             return
 
         self.wait_for_gen_log_sentinels()
         for record in pending_device_step_time:
-            device_step_time_mean = parse_gen_worker_device_step_time(
+            stats = parse_gen_worker_device_step_time(
                 self.test_output_dir,
                 self.num_gen_servers,
                 start_offsets=record["start_offsets"],
             )
-            if device_step_time_mean is None:
+            if stats is None:
                 continue
-            summary_line = f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
+            summary_lines = "\n".join(
+                [
+                    f"Average Per Iter Device Step Time (ms): {stats.mean:.2f}",
+                    f"Median Per Iter Device Step Time (ms): {stats.median:.4f}",
+                    f"Stdev Per Iter Device Step Time (ms): {stats.std:.4f}",
+                    f"P75 Per Iter Device Step Time (ms): {stats.p75:.4f}",
+                    f"P99 Per Iter Device Step Time (ms): {stats.p99:.4f}",
+                ]
+            )
             with open(record["benchmark_file_path"], "a") as benchmark_ctx:
-                benchmark_ctx.write(f"\n{summary_line}\n")
+                benchmark_ctx.write(f"\n{summary_lines}\n")
             idx = record["output_index"]
-            outputs[idx] = f"{outputs[idx]}\n{summary_line}\n"
+            outputs[idx] = f"{outputs[idx]}\n{summary_lines}\n"
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
