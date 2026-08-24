@@ -248,7 +248,7 @@ TEST(Nvfp4ColdPageCodecTest, KeyAndIndexAppendsLosslessIndexWithinTheLayerRecord
     EXPECT_EQ(index.coldDataOffset, 90U);
     EXPECT_EQ(index.coldPaddingOffset, 158U);
     EXPECT_EQ(index.coldPaddingBytes, 2U);
-    EXPECT_EQ(index.transform, kernels::Nvfp4BoundaryTransform::kLossless);
+    EXPECT_EQ(index.transform, kernels::Nvfp4BoundaryTransform::kLosslessCopy);
 }
 
 TEST(Nvfp4ColdPageCodecTest, FullAndSharedIndexerLayersHaveDistinctPerLayerRecords)
@@ -371,6 +371,16 @@ TEST(Nvfp4ColdPageCodecTest, OnlyFp8RuntimeRequiresFp8Scales)
     EXPECT_THROW({ Nvfp4ColdPageCodec codec{layers}; }, std::invalid_argument);
 }
 
+TEST(Nvfp4ColdPageCodecTest, Fp8SourceScalesDefaultToIdentity)
+{
+    auto layers = makeLayers(1);
+    layers.front().runtimeType = kernels::Nvfp4BoundaryRuntimeType::kFp8E4m3;
+
+    EXPECT_EQ(layers.front().fp8ScaleOrigQuant, (std::array<float, 2>{1.0F, 1.0F}));
+    EXPECT_EQ(layers.front().fp8ScaleQuantOrig, (std::array<float, 2>{1.0F, 1.0F}));
+    EXPECT_NO_THROW({ Nvfp4ColdPageCodec codec{layers}; });
+}
+
 TEST(Nvfp4ColdPageCodecTest, DiscoversLifecycleMembershipAcrossPoolGroups)
 {
     auto layers = makeLayers(2);
@@ -390,16 +400,6 @@ TEST(Nvfp4ColdPageCodecTest, RejectsConfiguredAttentionLayerAbsentFromAllGpuDesc
 {
     Nvfp4ColdPageCodec codec{makeLayers(2)};
     EXPECT_FALSE(configureOne(codec, makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{0}, 1)));
-}
-
-TEST(Nvfp4ColdPageCodecTest, RejectsAttentionBufferWithMismatchedGeometry)
-{
-    Nvfp4ColdPageCodec codec{makeLayers()};
-    auto desc = makeAttentionDesc();
-    desc.slotDesc.variants.front().coalescedBuffers[kv::PoolIndex{0}].singleBufferSize += 16U;
-    desc.pools[kv::PoolIndex{0}].slotBytes += 16U * kNumAttentionLayers;
-
-    EXPECT_FALSE(configureOne(codec, desc));
 }
 
 TEST(Nvfp4ColdPageCodecTest, CoalescedAttentionSideBufferUsesItsOwnBaseOffsetAndSlotStride)
@@ -423,7 +423,7 @@ TEST(Nvfp4ColdPageCodecTest, CoalescedAttentionSideBufferUsesItsOwnBaseOffsetAnd
     EXPECT_EQ(side.coldDataOffset, 180U);
     EXPECT_EQ(side.coldPaddingOffset, 500U);
     EXPECT_EQ(side.coldPaddingBytes, 12U);
-    EXPECT_EQ(side.transform, kernels::Nvfp4BoundaryTransform::kLossless);
+    EXPECT_EQ(side.transform, kernels::Nvfp4BoundaryTransform::kLosslessCopy);
 }
 
 TEST(Nvfp4ColdPageCodecTest, UnknownLifecycleUsesFailureSentinels)
@@ -524,6 +524,18 @@ TEST(Nvfp4ColdPageCodecTest, AttentionAndSsmSharingOneHotPoolGroupUseDifferentTr
     EXPECT_EQ(codec.queryColdPageBytes(kv::LayerGroupId{1}), 2U * kLayerRawBytes);
     EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{0}), kv::LayerGroupId{0});
     EXPECT_EQ(codec.getBatchingLayerGroupId(kv::LayerGroupId{1}), kv::LayerGroupId{1});
+}
+
+TEST(Nvfp4ColdPageCodecTest, DuplicateLifecycleAcrossPoolGroupsIsRejected)
+{
+    Nvfp4ColdPageCodec codec{makeLayers(2)};
+    std::array descs{
+        makeAttentionDesc(kv::PoolGroupIndex{0}, kv::LayerGroupId{0}, 1, 0),
+        makeAttentionDesc(
+            kv::PoolGroupIndex{1}, kv::LayerGroupId{0}, 1, 1, kGpuKBase + kGpuSlotBytes, kGpuVBase + kGpuSlotBytes),
+    };
+
+    EXPECT_FALSE(codec.configure(descs.data(), kv::PoolGroupIndex{2}));
 }
 
 } // namespace

@@ -67,15 +67,15 @@ public:
         std::size_t numBasePages, cudaStream_t stream) noexcept override;
 
 private:
-    enum class Transform
+    enum class ColdPageFormat
     {
-        kNvfp4Attention,
-        kLosslessConcat,
+        kNvfp4Kv,  //!< NVFP4 K/V plus byte-exact Attention side buffers.
+        kLossless, //!< Entire lifecycle uses KVCM's default lossless concat.
     };
 
     struct LayerGroupState
     {
-        Transform transform = Transform::kLosslessConcat;
+        ColdPageFormat format = ColdPageFormat::kLossless;
         kernels::Nvfp4BoundaryPreparedPlan preparedPlan;
         std::size_t coldPageBytes = 0;
     };

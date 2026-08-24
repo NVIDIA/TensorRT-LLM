@@ -74,11 +74,6 @@ class TestConfigAndFactory:
         # The factory contract is independent of GPU-owned persistent buffers.
         fake_v2 = _make_fake_v2(enable_block_reuse=True)
         cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
-        validate_kv_cache_compression_compatibility(
-            cfg,
-            SimpleNamespace(enable_block_reuse=True),
-            None,
-        )
         with (
             mock.patch(
                 "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
@@ -88,6 +83,11 @@ class TestConfigAndFactory:
                 TriAttentionCompressionManager, "_initialize_eviction_state"
             ) as initialize,
         ):
+            validate_kv_cache_compression_compatibility(
+                cfg,
+                SimpleNamespace(enable_block_reuse=True),
+                None,
+            )
             mgr = create_kv_cache_compression_manager(
                 cfg,
                 pretrained_config=_make_test_pretrained_config(),
@@ -460,11 +460,15 @@ class TestEvictionLifecycle:
             )
         )
 
-        validate_kv_cache_compression_compatibility(
-            _make_tri_config(budget=8),
-            SimpleNamespace(enable_block_reuse=False),
-            spec_config,
-        )
+        with mock.patch(
+            "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
+            return_value=True,
+        ):
+            validate_kv_cache_compression_compatibility(
+                _make_tri_config(budget=8),
+                SimpleNamespace(enable_block_reuse=False),
+                spec_config,
+            )
 
 
 class TestFixedScoreMetadata:

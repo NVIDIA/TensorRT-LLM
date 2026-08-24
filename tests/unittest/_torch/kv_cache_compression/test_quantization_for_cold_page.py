@@ -10,17 +10,16 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page import (
+from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.quantization_for_cold_page import (
     ColdPageQuantizationCompression,
 )
 from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import update_spec_config_from_model_config
-from tensorrt_llm.llmapi.llm_args import (
-    ColdPageQuantizationCompressionConfig,
-    MTPDecodingConfig,
-)
+from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig, MTPDecodingConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_v2_mod
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
@@ -56,10 +55,7 @@ def _cache_config(*layers):
 
 def _native():
     def layer_config():
-        return SimpleNamespace(
-            fp8_scale_orig_quant=(1.0, 1.0),
-            fp8_scale_quant_orig=(1.0, 1.0),
-        )
+        return SimpleNamespace()
 
     codec = MagicMock()
     module = SimpleNamespace(
@@ -129,8 +125,7 @@ def test_optional_modelopt_scales_map_pp_layers_and_ignore_local_draft_id(tmp_pa
     assert [config.layer_id for config in configs] == [0, 1, 2]
     assert [config.runtime_type for config in configs] == ["native-bf16"] * 3
     assert [
-        (config.nvfp4_scale_orig_quant, config.nvfp4_scale_quant_orig)
-        for config in configs
+        (config.nvfp4_scale_orig_quant, config.nvfp4_scale_quant_orig) for config in configs
     ] == [
         ((2.0, 4.0), (0.5, 0.25)),
         ((8.0, 16.0), (0.125, 0.0625)),
@@ -215,6 +210,24 @@ def test_scale_loader_reduces_duplicate_shards_like_native_qkv_loader(tmp_path):
         filename="model-00002.safetensors",
         prefix="model.language_model",
     )
+    assert _manager(tmp_path)._model_nvfp4_scales[7] == (
+        (2.0, 4.0),
+        (0.5, 0.25),
+    )
+
+
+def test_scale_loader_ignores_multimodal_towers_with_the_same_layer_id(tmp_path):
+    _write_quant_metadata(tmp_path)
+    tensors = {
+        "model.language_model.layers.7.self_attn.k_proj.k_scale": torch.tensor(0.5),
+        "model.language_model.layers.7.self_attn.v_proj.v_scale": torch.tensor(0.25),
+        "model.vision_tower.encoder.layers.7.self_attn.k_proj.k_scale": torch.tensor(4.0),
+        "model.vision_tower.encoder.layers.7.self_attn.v_proj.v_scale": torch.tensor(2.0),
+        "model.audio_tower.layers.7.self_attn.k_proj.k_scale": torch.tensor(8.0),
+        "model.audio_tower.layers.7.self_attn.v_proj.v_scale": torch.tensor(4.0),
+    }
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+
     assert _manager(tmp_path)._model_nvfp4_scales[7] == (
         (2.0, 4.0),
         (0.5, 0.25),
@@ -314,7 +327,7 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
     assert config.nvfp4_scale_orig_quant == config.nvfp4_scale_quant_orig == (1.0, 1.0)
 
 
-def test_fp8_runtime_uses_native_unit_source_scale_default(tmp_path):
+def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
     native, _ = _native()
     _write_scales(tmp_path, {10: (0.5, 0.25)})
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
@@ -327,7 +340,8 @@ def test_fp8_runtime_uses_native_unit_source_scale_default(tmp_path):
         )
 
     config = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
-    assert config.fp8_scale_orig_quant == config.fp8_scale_quant_orig == (1.0, 1.0)
+    assert config.runtime_type == "native-fp8"
+    assert config.nvfp4_scale_orig_quant == (2.0, 4.0)
     assert config.nvfp4_scale_quant_orig == (0.5, 0.25)
 
 
@@ -385,16 +399,12 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():
         creator = object.__new__(util_mod.KvCacheCreator)
         creator._skip_est = False
         creator._max_seq_len = 1024
-        creator._kv_cache_config = SimpleNamespace()
+        creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
         creator._llm_args = SimpleNamespace(
             kv_cache_compression_config=ColdPageQuantizationCompressionConfig()
         )
-        model_config = SimpleNamespace(
-            quant_config=active_kv_quant, pretrained_config=object()
-        )
-        creator._model_engine = SimpleNamespace(
-            model=SimpleNamespace(model_config=model_config)
-        )
+        model_config = SimpleNamespace(quant_config=active_kv_quant, pretrained_config=object())
+        creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
         creator._draft_model_engine = None
         creator._kv_connector_manager = None
         creator._fp8_ctx_mla_kv_len_cap = None
@@ -412,8 +422,6 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():
     assert not manager.uses_iteration_lifecycle
     for kwargs in (
         {"estimating": True},
-        {"active_kv_quant": SimpleNamespace(kv_cache_quant_algo="NVFP4")},
+        {"active_kv_quant": QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)},
     ):
-        assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in build(
-            **kwargs
-        )
+        assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in build(**kwargs)

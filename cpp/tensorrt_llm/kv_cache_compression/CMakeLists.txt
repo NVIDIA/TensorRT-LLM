@@ -6,4 +6,4 @@ target_include_directories(
   kv_cache_compression_src
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 set_property(TARGET kv_cache_compression_src PROPERTY POSITION_INDEPENDENT_CODE
-                                                    ON)
+                                                      ON)

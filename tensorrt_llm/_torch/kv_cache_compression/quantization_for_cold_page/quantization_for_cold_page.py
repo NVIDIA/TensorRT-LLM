@@ -29,8 +29,8 @@ ScalePair = tuple[float, float]
 LayerScales = tuple[ScalePair, ScalePair]
 
 _IDENTITY_NVFP4_SCALES: LayerScales = ((1.0, 1.0), (1.0, 1.0))
-_MODEL_OPT_KV_SCALE_KEY = re.compile(
-    r"(?:^|\.)layers\.(?P<layer_id>\d+)\.self_attn\."
+_MODEL_OPT_LANGUAGE_KV_SCALE_KEY = re.compile(
+    r"^model(?:\.language_model)?\.layers\.(?P<layer_id>\d+)\.self_attn\."
     r"(?P<kind>[kv])_proj\.(?P=kind)_scale$"
 )
 
@@ -78,7 +78,7 @@ def _load_modelopt_nvfp4_scales(
     for file_path in weight_files:
         with safe_open(str(file_path), framework="pt", device="cpu") as checkpoint:
             for tensor_name in checkpoint.keys():
-                match = _MODEL_OPT_KV_SCALE_KEY.search(tensor_name)
+                match = _MODEL_OPT_LANGUAGE_KV_SCALE_KEY.fullmatch(tensor_name)
                 if match is None:
                     continue
                 value = float(checkpoint.get_tensor(tensor_name).reshape([]).item())

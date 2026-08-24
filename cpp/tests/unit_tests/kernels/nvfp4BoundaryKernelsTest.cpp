@@ -113,6 +113,9 @@ public:
         return mStream;
     }
 
+    CudaStream(CudaStream const&) = delete;
+    CudaStream& operator=(CudaStream const&) = delete;
+
 private:
     cudaStream_t mStream{};
 };
@@ -337,24 +340,24 @@ std::uint32_t linearScaleOffset(std::uint32_t row, std::uint32_t scaleInRow, Pag
     return row * scalesPerRow + scaleInRow;
 }
 
+constexpr std::array<float, 8> kE2m1Levels{0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+
 float e2m1Value(std::uint8_t nibble)
 {
-    constexpr std::array<float, 8> levels{0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
-    float const value = levels[nibble & 0x7U];
+    float const value = kE2m1Levels[nibble & 0x7U];
     return (nibble & 0x8U) != 0 ? -value : value;
 }
 
 //! Independent nearest-level oracle; fixtures avoid ties instead of duplicating production tie rules.
 std::uint8_t quantizeE2m1(float value)
 {
-    constexpr std::array<float, 8> levels{0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
     bool const negative = std::signbit(value);
     float const magnitude = std::abs(value);
     std::uint8_t best = 0;
-    float bestDistance = std::abs(magnitude - levels[0]);
-    for (std::uint8_t index = 1; index < levels.size(); ++index)
+    float bestDistance = std::abs(magnitude - kE2m1Levels[0]);
+    for (std::uint8_t index = 1; index < kE2m1Levels.size(); ++index)
     {
-        float const distance = std::abs(magnitude - levels[index]);
+        float const distance = std::abs(magnitude - kE2m1Levels[index]);
         if (distance < bestDistance)
         {
             best = index;
@@ -397,6 +400,7 @@ std::vector<std::uint8_t> makeRawPage(RawKind kind, std::size_t page, std::uint3
         {
             normalizedValue = roundingMarginsPattern[index % roundingMarginsPattern.size()];
         }
+        // kAllZero intentionally keeps the zero initializer.
         if (((page / 32) & 1U) != 0)
         {
             normalizedValue = -normalizedValue;
@@ -919,8 +923,8 @@ void runUnaryMlaWithLosslessSideRoundTrip(RawKind kind)
             {reinterpret_cast<std::uintptr_t>(mla.data()), mlaRawBytes, mlaRawBytes, 0U, mlaPackedBytes,
                 mlaPayloadBytes, static_cast<std::uint32_t>(gapBeforeSide), Nvfp4BoundaryTransform::kNvfp4, params},
             {reinterpret_cast<std::uintptr_t>(side.data()), sideSlotBytes, sideRawBytes, sideColdOffset, 0U,
-                sideColdEnd, static_cast<std::uint32_t>(coldPageBytes - sideColdEnd), Nvfp4BoundaryTransform::kLossless,
-                {}}};
+                sideColdEnd, static_cast<std::uint32_t>(coldPageBytes - sideColdEnd),
+                Nvfp4BoundaryTransform::kLosslessCopy, {}}};
     };
     auto const inputPlan = tensorrt_llm::kernels::prepareNvfp4BoundaryPlan(
         makePlans(mlaInput, sideInput), coldPageBytes, runtimeType(kind));
@@ -1258,8 +1262,9 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidGeometryAndScalesBeforeLaunch)
         "zero FP8 quant scale", [](auto& params) { params.fp8ScaleOrigQuant = 0.0F; },
         Nvfp4BoundaryRuntimeType::kFp8E4m3);
     expectInvalid(
-        "infinite FP8 dequant scale", [](auto& params)
-        { params.fp8ScaleQuantOrig = std::numeric_limits<float>::infinity(); }, Nvfp4BoundaryRuntimeType::kFp8E4m3);
+        "infinite FP8 dequant scale",
+        [](auto& params) { params.fp8ScaleQuantOrig = std::numeric_limits<float>::infinity(); },
+        Nvfp4BoundaryRuntimeType::kFp8E4m3);
 }
 
 TEST(Nvfp4BoundaryValidationTest, RejectsInvalidLaunchDescriptors)
@@ -1297,6 +1302,7 @@ TEST(Nvfp4BoundaryValidationTest, RejectsInvalidLaunchDescriptors)
         tensorrt_llm::kernels::invokeNvfp4BoundaryOffloadCompress({validOffload}, validPlan, nullptr, nullptr));
     expectInvalid("unaligned raw stride", [](auto& buffer) { buffer.rawSlotBytes += alignof(uint4) / 2U; });
     expectInvalid("raw bytes exceed stride", [](auto& buffer) { buffer.rawBytes = buffer.rawSlotBytes + 1U; });
+    expectInvalid("raw bytes mismatch geometry", [](auto& buffer) { buffer.rawBytes -= alignof(uint4); });
     expectInvalid("cold data interval exceeds page", [&](auto& buffer) { buffer.coldDataOffset = coldPageBytes; });
     expectInvalid("cold intervals overlap", [](auto& buffer) { buffer.coldScaleOffset = buffer.coldDataOffset; });
     EXPECT_ANY_THROW(static_cast<void>(prepare(validBuffer, coldPageBytes + alignof(uint4) / 2U)));

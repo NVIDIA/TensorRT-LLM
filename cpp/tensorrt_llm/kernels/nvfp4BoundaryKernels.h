@@ -70,7 +70,8 @@ struct Nvfp4BoundaryKernelParams
 enum class Nvfp4BoundaryTransform : std::uint8_t
 {
     kNvfp4,
-    kLossless,
+    //! Byte-exact copy for an Attention side buffer such as DSA index_key.
+    kLosslessCopy,
 };
 
 //! Immutable transform plan for one hot buffer and its fixed-offset cold record.
@@ -94,7 +95,7 @@ struct Nvfp4BoundaryPreparedPlan
 {
     std::array<Nvfp4BoundaryBufferPlan, kNvfp4BoundaryMaxBuffersPerLaunch> buffers{};
     std::uint32_t numBuffers = 0;
-    std::uint32_t maxTileHalfGroups = 0;
+    std::uint32_t maxHalfGroupsPerTile = 0;
     std::size_t coldPageBytes = 0;
     Nvfp4BoundaryRuntimeType runtimeType = Nvfp4BoundaryRuntimeType::kFloat16;
 };

@@ -3706,10 +3706,17 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
+_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
+    "quantization_for_cold_page", "triattention")
+
+
 class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     """Quantize Host and Disk KV pages without changing the active GPU cache."""
 
-    algorithm: Literal["quantization_for_cold_page"] = "quantization_for_cold_page"
+    algorithm: Literal["quantization_for_cold_page"] = Field(
+        default="quantization_for_cold_page",
+        telemetry=False,
+    )
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
@@ -3722,11 +3729,11 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         "K/V global scales. Omit it to use identity global scales.")
 
     def supports_block_reuse(self) -> bool:
-        # Compression changes representation and residency, not token identity.
+        """Block reuse is unchanged because token identity is preserved."""
         return True
 
     def supports_speculative_decoding(self) -> bool:
-        # Each target or draft KVCM encodes its own pages at the storage boundary.
+        """Target and draft KVCMs encode their own cold pages independently."""
         return True
 
 
@@ -3740,7 +3747,10 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
     changes_physical_kv_length: ClassVar[bool] = True
 
-    algorithm: Literal["triattention"] = "triattention"
+    algorithm: Literal["triattention"] = Field(
+        default="triattention",
+        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
+    )
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
         description=

@@ -17,7 +17,11 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    ColdPageQuantizationCompressionConfig,
+    KvCacheCompressionConfig,
+    TriAttentionKvCacheCompressionConfig,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -285,7 +289,11 @@ class TestFactory:
             patch.object(util_mod, "is_sm_100f", return_value=False),
             pytest.raises(RuntimeError, match="SM100-family"),
         ):
-            create_kv_cache_compression_manager(cfg)
+            util_mod.validate_kv_cache_compression_compatibility(
+                cfg,
+                SimpleNamespace(enable_block_reuse=False),
+                None,
+            )
 
     def test_capabilities_default_false(self):
         config = KvCacheCompressionConfig(algorithm="offload")
@@ -326,7 +334,7 @@ class TestKvCacheCreatorLifecycle:
         creator = object.__new__(util_mod.KvCacheCreator)
         creator._skip_est = False
         creator._max_seq_len = 1024
-        creator._kv_cache_config = SimpleNamespace()
+        creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
         creator._llm_args = SimpleNamespace(kv_cache_compression_config=config)
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=SimpleNamespace(pretrained_config=pretrained_config))
@@ -413,8 +421,7 @@ def test_build_routes_compression_manager_by_capabilities(provides_cold_page_cod
     with patch.object(
         util_mod,
         "create_kv_cache_compression_manager",
-        side_effect=lambda *_args, **_kwargs: build_order.append("factory")
-        or compression_manager,
+        side_effect=lambda *_args, **_kwargs: build_order.append("factory") or compression_manager,
     ) as factory:
         creator.build_managers(resources)
 
@@ -468,6 +475,26 @@ class TestCanonicalImports:
 
 
 class TestCompressionCompatibility:
+    @pytest.mark.parametrize(
+        "config",
+        (
+            ColdPageQuantizationCompressionConfig(),
+            TriAttentionKvCacheCompressionConfig(),
+        ),
+    )
+    def test_helix_is_rejected(self, config):
+        model_engine = SimpleNamespace(
+            mapping=SimpleNamespace(has_cp_helix=lambda: True),
+            spec_config=None,
+            model=SimpleNamespace(model_config=SimpleNamespace(quant_config=None)),
+        )
+        llm_args = SimpleNamespace(
+            kv_cache_compression_config=config,
+            kv_cache_config=SimpleNamespace(enable_block_reuse=False),
+        )
+        with pytest.raises(ValueError, match="HELIX"):
+            util_mod.validate_feature_combination(llm_args, model_engine, None)
+
     def test_raises_when_reuse_on(self):
         config = _compression_config()
         with pytest.raises(ValueError, match="block reuse"):

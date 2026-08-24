@@ -287,7 +287,7 @@ def test_build_capture_manifest_matches_committed_golden():
 
 
 def test_kv_cache_compression_discriminator_captures_both_algorithms():
-    """Flattened telemetry preserves both discriminator Literal values."""
+    """The shared allowlist captures either compression discriminator."""
     from tensorrt_llm.llmapi.llm_args import (
         ColdPageQuantizationCompressionConfig,
         TorchLlmArgs,
@@ -303,23 +303,20 @@ def test_kv_cache_compression_discriminator_captures_both_algorithms():
         for item in build_capture_manifest(TorchLlmArgs)
         if item.path == "kv_cache_compression_config.algorithm"
     )
-    assert repr(entry.annotation) == (
-        "typing.Literal['quantization_for_cold_page', 'triattention']"
-    )
-    assert entry.converter == ""
+    assert repr(entry.annotation) == "typing.Literal['triattention']"
+    assert entry.converter == "allowlist"
     assert set(entry.allowed_values) == {
         "quantization_for_cold_page",
         "triattention",
     }
-    for config_cls, annotation in (
-        (
-            ColdPageQuantizationCompressionConfig,
-            "typing.Literal['quantization_for_cold_page']",
-        ),
-        (TriAttentionKvCacheCompressionConfig, "typing.Literal['triattention']"),
-    ):
-        field = config_cls.model_fields["algorithm"]
-        assert repr(field.annotation) == annotation
+    cold_field = ColdPageQuantizationCompressionConfig.model_fields["algorithm"]
+    assert cold_field.json_schema_extra["telemetry"] == {"exclude": True}
+    tri_field = TriAttentionKvCacheCompressionConfig.model_fields["algorithm"]
+    assert tri_field.json_schema_extra["telemetry"] == {
+        "kind": "categorical",
+        "converter": "allowlist",
+        "allowed_values": ["quantization_for_cold_page", "triattention"],
+    }
 
     configs = (
         ColdPageQuantizationCompressionConfig(),

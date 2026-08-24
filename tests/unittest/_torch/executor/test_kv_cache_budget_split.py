@@ -450,6 +450,7 @@ class TestSplitDiskCacheBudgetForDraft:
         assert target_config is c._kv_cache_config
         assert draft_config is None
 
+
 class TestHostSplitIgnoresGpuFixedCost:
     """The fixed cost models GPU-resident state and is not host memory."""
 
