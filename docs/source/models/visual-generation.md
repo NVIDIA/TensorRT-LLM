@@ -134,6 +134,34 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 
 Omit `quant_config` for BF16/FP16 baseline.
 
+### Runtime LoRA
+
+VisualGen can preload a local LoRA adapter at startup and fuse its deltas into transformer weights before warmup, CUDA graph capture, and cache acceleration setup. Configure this through `VisualGenArgs.runtime_lora_config` in Python or YAML:
+
+```yaml
+runtime_lora_config:
+  path: /path/to/adapter-or-safetensors
+  target_components:
+    - transformer
+```
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen import RuntimeLoRAConfig
+
+args = VisualGenArgs(
+    model="/path/to/model",
+    runtime_lora_config=RuntimeLoRAConfig(
+        path="/path/to/adapter-or-safetensors",
+        target_components=["transformer"],
+    ),
+)
+```
+
+The loader accepts safetensors adapters that use Comfy/Kohya-style `lora_down` / `lora_up` keys or PEFT-style `lora_A` / `lora_B` keys. It applies `.alpha` tensors when present, and reads `lora_alpha` from a colocated `adapter_config.json` for PEFT adapters. `scale` multiplies the resulting alpha/rank factor.
+
+By default, `strict=True` raises when adapter tensors cannot be matched, have unsupported shapes, or partially apply to the selected transformer component. Set `target_components` explicitly for pipelines with multiple transformer components. Runtime LoRA is not supported with VisualGen weight quantization, and startup fusion does not support per-request adapter switching.
+
 ### Quantized Attention
 
 In addition to linear-layer quantization, VisualGen exposes two **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.

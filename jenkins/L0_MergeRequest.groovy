@@ -155,10 +155,6 @@ def DISABLE_CBTS = "disable_cbts"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
-// Rollout switch for pre-merge Tier 2 coverage-based narrowing. Keep collection
-// enabled above while this remains off so a later pilot allowlist has fresh data.
-@Field
-def ENABLE_CBTS_COVERAGE_TIER = false
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
 
@@ -853,9 +849,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Download the touch DB only when Tier 2 is enabled. Tier 1 rules still
-        // run while the coverage tier is disabled during the initial rollout.
-        def coverageDb = _cbtsCoverageDb(pipeline)
+        // Download the touch DB only for PRs in the coverage-tier pilot.
+        def coverageDb = _cbtsCoverageAudit(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -926,18 +921,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Resolve the optional Tier 2 input behind an explicit rollout gate. Keeping
-// this separate makes the follow-up pilot allowlist a small policy change.
-def _cbtsCoverageDb(pipeline)
-{
-    if (!ENABLE_CBTS_COVERAGE_TIER) {
-        pipeline.echo("CBTS: coverage tier disabled — running Tier 1 only")
-        return null
-    }
-    return _cbtsCoverageAudit(pipeline)
-}
-
-// Fetch the touch DB and audit it; artifact.py's {path, meta} verbatim, or null on failure.
+// Check pilot eligibility, then fetch and audit the touch DB; artifact.py's
+// {path, meta} verbatim, or null on failure.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
@@ -946,12 +931,23 @@ def _cbtsCoverageAudit(pipeline)
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
         def readyJson = ""
+        def pilotEligible = false
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
-            readyJson = sh(
-                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+            pilotEligible = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
-            ).trim()
+            ).trim() == "true"
+            if (pilotEligible) {
+                readyJson = sh(
+                    script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                            "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                    returnStdout: true,
+                ).trim()
+            }
+        }
+        if (!pilotEligible) {
+            pipeline.echo("CBTS: coverage tier disabled for this PR — running Tier 1 only")
+            return null
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — skipping Tier 2")
