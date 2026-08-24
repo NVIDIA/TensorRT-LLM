@@ -22,6 +22,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
@@ -165,11 +166,23 @@ def make_kv_cache_manager(
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
     can_evict=False,
+    enable_block_reuse=True,
+    first_new_block_fn=None,
+    is_vswa=False,
+    block_reuse_policy=BlockReusePolicy.ALL_REUSABLE,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
+    mgr.enable_block_reuse = enable_block_reuse
+    mgr.is_vswa = is_vswa
+    # Must be a real policy, not an auto-created Mock attribute: the prefix-aware
+    # skip is gated on ALL_REUSABLE (see _skip_pays_off_under_reuse_policy).
+    mgr.block_reuse_policy = block_reuse_policy
+    # Default: no request contributes a full new block, so the prefix-aware
+    # skip never fires and tests that don't care about it are unaffected.
+    mgr.probe_first_new_block_key.side_effect = first_new_block_fn or (lambda req: None)
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
@@ -2805,3 +2818,294 @@ class TestMultimodalAwareChunkingV2:
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == []
         assert resize_calls == []  # SKIP path: no commit to KV cache
+
+
+class TestPrefixAwareSkip:
+    """Prefix-aware skip — v2 port of v1's ``beneficialToSkip``.
+
+    Requests that would contribute the same not-yet-cached block are admitted
+    one per iteration, so the later ones reuse the block instead of recomputing
+    the shared prefix.
+    """
+
+    @staticmethod
+    def _keyed_manager(keys, **kwargs):
+        """Manager whose probe returns ``keys[request_id]`` (None if absent)."""
+        return make_kv_cache_manager(
+            first_new_block_fn=lambda req: keys.get(req.request_id), **kwargs
+        )
+
+    def test_duplicate_prefix_deferred(self):
+        """Two requests sharing a first new block → only the first is admitted."""
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+
+    def test_deferred_request_admitted_next_iteration(self):
+        """The deferral lasts exactly one iteration: once the contributor is no
+        longer pending, the duplicate goes through."""
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0, req1 = make_ctx_request(0, 500), make_ctx_request(1, 500)
+        assert ids(sched.schedule_request([req0, req1], set()).context_requests) == [0]
+        # Next iteration: req0 is prefilling in-flight, req1 now reuses the
+        # committed block, so its first new block has moved on.
+        mgr.probe_first_new_block_key.side_effect = lambda req: {0: b"blockA", 1: b"blockB"}.get(
+            req.request_id
+        )
+        req0.is_first_context_chunk = False
+        out = sched.schedule_request([req0, req1], {0})
+        assert ids(out.context_requests) == [1]
+
+    def test_distinct_prefixes_not_deferred(self):
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockB"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1]
+
+    def test_three_duplicates_admit_one(self):
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA", 2: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(i, 100) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+
+    def test_no_full_block_never_deferred(self):
+        """A probe of None (partial block / reuse off) never defers anything."""
+        mgr = self._keyed_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1]
+
+    @pytest.mark.parametrize(
+        "policy", [BlockReusePolicy.PER_REQUEST, BlockReusePolicy.PER_CONVERSATION]
+    )
+    def test_non_all_reusable_policy_never_defers(self, policy):
+        """Outside ALL_REUSABLE a deferral cannot be repaid, so it must not happen.
+
+        Hybrid/SSM models are the live case: any mamba layer downgrades the policy
+        to PER_REQUEST, after which blocks are committed only at a snapshot
+        boundary or at the end of the whole context. A duplicate deferred behind
+        such a contributor waits out its entire prefill, and if it diverges before
+        the contributor's end it then reuses nothing at all.
+        """
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"}, block_reuse_policy=policy)
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1]
+
+    @pytest.mark.parametrize(
+        "policy", [BlockReusePolicy.PER_REQUEST, BlockReusePolicy.PER_CONVERSATION]
+    )
+    def test_non_all_reusable_policy_issues_no_probe(self, policy):
+        """The gate is checked before probing, so a gated-off run costs nothing.
+
+        v2 has no block-budget consumer to amortise the radix walk against, so a
+        probe that cannot change a decision is pure overhead per request per
+        iteration.
+        """
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"}, block_reuse_policy=policy)
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        sched.schedule_request([make_ctx_request(0, 500), make_ctx_request(1, 500)], set())
+        mgr.probe_first_new_block_key.assert_not_called()
+
+    def test_all_reusable_policy_still_defers(self):
+        """The gate is a policy check, not a blanket disable."""
+        mgr = self._keyed_manager(
+            {0: b"blockA", 1: b"blockA"}, block_reuse_policy=BlockReusePolicy.ALL_REUSABLE
+        )
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+
+    def test_disabled_by_prefix_aware_flag(self):
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000, enable_prefix_aware_scheduling=False)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1]
+        mgr.probe_first_new_block_key.assert_not_called()
+
+    def test_disabled_without_block_reuse(self):
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"}, enable_block_reuse=False)
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1]
+        mgr.probe_first_new_block_key.assert_not_called()
+
+    def test_vswa_still_skips(self):
+        """No VSWA gate in v2 (unlike v1, whose analyzePrefixReuse asserts on
+        variable-window managers): probe_reuse is window-aware, so the skip is
+        expected to fire here. Guards against re-adding a v1-style gate."""
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"}, is_vswa=True)
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+
+    def test_in_flight_chunked_context_seeds_the_set(self):
+        """A context request already prefilling cannot be skipped, so what it is
+        about to commit defers a fresh duplicate (pre-pass path)."""
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        in_flight = make_ctx_request(0, 500, is_first_context_chunk=False)
+        fresh = make_ctx_request(1, 500)
+        out = sched.schedule_request([in_flight, fresh], {0})
+        assert ids(out.context_requests) == []
+
+    def test_contributor_failure_does_not_defer_duplicate(self):
+        """Phase-3 property, and the v1 bug this port deliberately does not
+        inherit: a request that fails after the check registers nothing, so its
+        duplicate is still admitted in the same iteration."""
+        mgr = self._keyed_manager(
+            {0: b"blockA", 1: b"blockA"},
+            resize_context_fn=lambda req, n: req.request_id != 0,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [1]
+
+    def test_skip_happens_before_prepare_context(self):
+        """A deferral must cost nothing: v2 allocates inline, so the skip has to
+        land ahead of prepare_context/resize_context."""
+        prepared, resized = [], []
+        mgr = self._keyed_manager(
+            {0: b"blockA", 1: b"blockA"},
+            prepare_context_fn=lambda req: prepared.append(req.request_id) or True,
+            resize_context_fn=lambda req, n: resized.append(req.request_id) or True,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        out = sched.schedule_request([make_ctx_request(0, 500), make_ctx_request(1, 500)], set())
+        assert ids(out.context_requests) == [0]
+        assert prepared == [0]
+        assert resized == [0]
+
+    def test_single_candidate_is_not_probed(self):
+        """Cheap early-out: with one candidate and nothing in flight, no probe
+        can change the outcome, so none is issued."""
+        mgr = self._keyed_manager({0: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        out = sched.schedule_request([make_ctx_request(0, 500)], set())
+        assert ids(out.context_requests) == [0]
+        mgr.probe_first_new_block_key.assert_not_called()
+
+    def test_generation_requests_are_not_probed(self):
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        out = sched.schedule_request([make_gen_request(0), make_gen_request(1)], set())
+        assert len(out.generation_requests) == 2
+        mgr.probe_first_new_block_key.assert_not_called()
+
+    def test_chunked_context_duplicate_deferred(self):
+        """Same behaviour under chunked prefill."""
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"}, tokens_per_block=8)
+        sched = make_scheduler(mgr, max_num_tokens=64, ctx_chunk_config=(None, 8))
+        reqs = [make_ctx_request(0, 128), make_ctx_request(1, 128)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+
+    def test_scheduled_chunk_continuation_defers_later_duplicate(self):
+        """A continuation that is not yet in flight registers once scheduled, so
+        a duplicate examined after it still defers."""
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"}, tokens_per_block=8)
+        sched = make_scheduler(mgr, max_num_tokens=10000, ctx_chunk_config=(None, 8))
+        continuation = make_ctx_request(0, 500, is_first_context_chunk=False)
+        duplicate = make_ctx_request(1, 500)
+        out = sched.schedule_request([continuation, duplicate], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_failing_chunk_continuation_does_not_defer_duplicate(self):
+        """The same guarantee as for first-chunk contributors: a continuation
+        that is not in flight and fails to schedule registers nothing."""
+        mgr = self._keyed_manager(
+            {0: b"blockA", 1: b"blockA"},
+            tokens_per_block=8,
+            resize_context_fn=lambda req, n: req.request_id != 0,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=10000, ctx_chunk_config=(None, 8))
+        continuation = make_ctx_request(0, 500, is_first_context_chunk=False)
+        duplicate = make_ctx_request(1, 500)
+        out = sched.schedule_request([continuation, duplicate], set())
+        assert ids(out.context_requests) == [1]
+
+    def test_deferral_never_empties_the_batch_alone(self):
+        """A deferral must not be the reason an iteration schedules nothing --
+        that is what the deadlock detector reports as a hang. Deferring is only
+        allowed behind a contributor that runs this iteration."""
+        mgr = self._keyed_manager(
+            {0: b"blockA", 1: b"blockA"},
+            resize_context_fn=lambda req, n: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(0, 500), make_ctx_request(1, 500)]
+        out = sched.schedule_request(reqs, set())
+        # Both attempted, neither deferred on behalf of a failed contributor.
+        assert ids(out.context_requests) == []
+        assert mgr.resize_context.call_count == 2
+
+    def test_registered_contributor_cannot_be_evicted(self):
+        """Eviction and deferral cannot collide.
+
+        The pre-pass registers only in-flight context requests, and in-flight
+        requests are never eviction victims (``_is_evictable``), so a deferral
+        is never paid to a contributor that this same iteration pauses.
+        """
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] != 1  # first gen alloc fails → forces eviction
+
+        mgr = self._keyed_manager({5: b"blockA", 1: b"blockA"}, try_allocate_generation_fn=alloc_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        contributor = make_ctx_request(5, 100, is_first_context_chunk=False)
+        duplicate = make_ctx_request(1, 500)
+        out = sched.schedule_request(
+            [make_gen_request(0), duplicate, contributor, make_gen_request(99)], {5}
+        )
+        assert ids(out.context_requests) == []  # duplicate deferred behind the contributor
+        assert 5 not in ids(out.paused_requests)  # ... which could not be evicted
+
+    def test_evicted_continuation_does_not_defer_duplicate(self):
+        """A continuation evicted from the tail never reaches Phase 2, so it
+        registers nothing and the duplicate behind it is still admitted."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] != 1
+
+        mgr = self._keyed_manager(
+            {99: b"blockA", 1: b"blockA"}, try_allocate_generation_fn=alloc_fn
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        duplicate = make_ctx_request(1, 500)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+        out = sched.schedule_request([make_gen_request(0), duplicate, victim], set())
+        assert ids(out.paused_requests) == [99]
+        assert ids(out.context_requests) == [1]
+
+    def test_recompute_paused_request_does_not_defer_duplicate(self):
+        """Same guarantee for the recompute-pause path: a request paused for
+        recompute is not in flight, so it never seeds the contributed set."""
+        mgr = self._keyed_manager(
+            {5: b"blockA", 1: b"blockA"},
+            try_allocate_generation_fn=lambda req: False,
+            can_evict=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        duplicate = make_ctx_request(1, 500)
+        paused_candidate = make_ctx_request(5, 100, is_first_context_chunk=False)
+        out = sched.schedule_request([make_gen_request(0), duplicate, paused_candidate], set())
+        # Whatever happened to the gen request, the duplicate was never deferred
+        # on behalf of a request that this iteration paused.
+        assert 1 not in ids(out.paused_requests)
+        assert ids(out.context_requests) in ([1], [])
