@@ -440,26 +440,39 @@ class DeepEPLowLatency(Communication):
         if remove_adapter:
             expert_capacity = hidden_states.shape[1]
             num_rows = hidden_states.shape[0] * expert_capacity
-            cache_key = (hidden_states.device, expert_capacity, final_scales_dtype)
+            num_local_experts = hidden_states.shape[0]
+            cache_key = (hidden_states.device, num_local_experts, final_scales_dtype)
             placeholders = self._adapter_free_placeholder_cache.get(cache_key)
             if placeholders is None:
                 if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
                     raise RuntimeError(
                         "DeepEP adapter-free placeholders must be warmed up before CUDA graph capture"
                     )
-                token_selected_slots = torch.empty(
-                    (num_rows, 1), dtype=torch.int32, device=hidden_states.device
+                max_expert_capacity = self.mapping.moe_ep_size * self.deep_ep_max_num_tokens
+                max_num_rows = num_local_experts * max_expert_capacity
+                token_selected_slots = torch.full(
+                    (max_num_rows, 1), -1, dtype=torch.int32, device=hidden_states.device
                 )
                 token_final_scales = torch.ones(
-                    (num_rows, 1), dtype=final_scales_dtype, device=hidden_states.device
+                    (max_num_rows, 1), dtype=final_scales_dtype, device=hidden_states.device
                 )
                 placeholders = (token_selected_slots, token_final_scales)
                 self._adapter_free_placeholder_cache[cache_key] = placeholders
 
+            if num_rows > placeholders[0].size(0):
+                raise ValueError(
+                    "DeepEP adapter-free output exceeds the configured maximum token capacity"
+                )
+
             hidden_states = hidden_states.view(num_rows, hidden_states.shape[2])
             if hidden_states_sf is not None:
                 hidden_states_sf = hidden_states_sf.view(num_rows, hidden_states_sf.shape[2])
-            return hidden_states, hidden_states_sf, placeholders[0], placeholders[1]
+            return (
+                hidden_states,
+                hidden_states_sf,
+                placeholders[0][:num_rows],
+                placeholders[1][:num_rows],
+            )
 
         mask = torch.arange(
             hidden_states.shape[1], dtype=torch.int32, device=hidden_states.device

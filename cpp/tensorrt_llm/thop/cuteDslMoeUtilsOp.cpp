@@ -135,59 +135,6 @@ std::vector<torch::Tensor> moe_sort(torch::Tensor const& token_selected_experts,
         RoutingMethodType::DeepSeekV3);
 }
 
-std::vector<torch::Tensor> moeMetadataFromExpertCounts(
-    torch::Tensor const& expertCounts, int64_t const capacity, int64_t const tileSize)
-{
-    CHECK_INPUT(expertCounts, torch::kInt32);
-    TORCH_CHECK(expertCounts.dim() == 1, "expert_counts must be 1D.");
-    TORCH_CHECK(expertCounts.numel() > 0, "expert_counts must contain at least one local expert.");
-    TORCH_CHECK(capacity > 0, "capacity must be positive.");
-    TORCH_CHECK(tileSize > 0, "tile_size must be positive.");
-
-    int64_t constexpr kMaxLocalExperts = 4096;
-    int64_t const numLocalExperts = expertCounts.numel();
-    TORCH_CHECK(numLocalExperts <= kMaxLocalExperts, "expert_counts supports at most ", kMaxLocalExperts,
-        " local experts, got ", numLocalExperts, ".");
-    TORCH_CHECK(capacity <= std::numeric_limits<int32_t>::max(), "capacity exceeds int32 range.");
-    TORCH_CHECK(tileSize <= std::numeric_limits<int32_t>::max(), "tile_size exceeds int32 range.");
-    TORCH_CHECK(numLocalExperts <= std::numeric_limits<int32_t>::max() / capacity,
-        "num_local_experts * capacity exceeds int32 range.");
-
-    int64_t const numTokens = numLocalExperts * capacity;
-    int64_t const maxNumTilesBound = numLocalExperts + (numTokens - numLocalExperts) / tileSize;
-    TORCH_CHECK(maxNumTilesBound <= std::numeric_limits<int32_t>::max(), "maximum tile count exceeds int32 range.");
-    TORCH_CHECK(maxNumTilesBound <= std::numeric_limits<int32_t>::max() / tileSize,
-        "maximum permuted token count exceeds int32 range.");
-
-    int64_t const maxNumPaddedTokens
-        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
-            numTokens, 1, numLocalExperts, tileSize);
-    int64_t const maxNumTiles = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
-        numTokens, 1, numLocalExperts, tileSize);
-    TORCH_CHECK(
-        maxNumPaddedTokens <= std::numeric_limits<int32_t>::max(), "maximum permuted token count exceeds int32 range.");
-    TORCH_CHECK(maxNumTiles <= std::numeric_limits<int32_t>::max(), "maximum tile count exceeds int32 range.");
-
-    auto const options = torch::dtype(torch::kInt32).device(expertCounts.device());
-    auto tileIdxToExpertIdx = torch::empty({maxNumTiles}, options);
-    auto tileIdxToMnLimit = torch::empty({maxNumTiles}, options);
-    auto expandedIdxToPermutedIdx = torch::empty({numTokens, 1}, options);
-    auto permutedIdxToExpandedIdx = torch::empty({maxNumPaddedTokens}, options);
-    auto totalNumPaddedTokens = torch::empty({1}, options);
-    auto numNonExitingTiles = torch::empty({1}, options);
-
-    auto const& stream = at::cuda::getCurrentCUDAStream(expertCounts.get_device());
-    tensorrt_llm::kernels::cute_dsl::moeMetadataFromExpertCounts(expertCounts.data_ptr<int32_t>(),
-        tileIdxToExpertIdx.data_ptr<int32_t>(), tileIdxToMnLimit.data_ptr<int32_t>(),
-        expandedIdxToPermutedIdx.data_ptr<int32_t>(), permutedIdxToExpandedIdx.data_ptr<int32_t>(),
-        totalNumPaddedTokens.data_ptr<int32_t>(), numNonExitingTiles.data_ptr<int32_t>(),
-        static_cast<int32_t>(numLocalExperts), static_cast<int32_t>(capacity), static_cast<int32_t>(tileSize),
-        static_cast<int32_t>(maxNumTiles), static_cast<int32_t>(maxNumPaddedTokens), stream);
-
-    return {tileIdxToExpertIdx, tileIdxToMnLimit, expandedIdxToPermutedIdx, permutedIdxToExpandedIdx,
-        totalNumPaddedTokens, numNonExitingTiles};
-}
-
 // Permute
 
 std::tuple<torch::Tensor, torch::optional<torch::Tensor>> moe_permute(torch::Tensor const& input,
@@ -615,7 +562,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_sort(Tensor token_selected_experts, Tensor token_final_scales, int num_experts, int top_k, "
         "int local_expert_offset, int local_num_experts, int tile_tokens_dim) -> Tensor[]");
-    m.def("moe_metadata_from_expert_counts(Tensor expert_counts, int capacity, int tile_size) -> Tensor[]");
     m.def(
         "moe_permute(Tensor input, Tensor? input_sf, Tensor tile_idx_to_mn_limit, Tensor permuted_idx_to_expanded_idx, "
         "Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k) -> (Tensor, Tensor?)");
@@ -645,7 +591,6 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("moe_topk_sort", &tensorrt_llm::torch_ext::moe_topk_sort);
     m.impl("moe_sort", &tensorrt_llm::torch_ext::moe_sort);
-    m.impl("moe_metadata_from_expert_counts", &tensorrt_llm::torch_ext::moeMetadataFromExpertCounts);
     m.impl("moe_permute", &tensorrt_llm::torch_ext::moe_permute);
     m.impl("moe_unpermute_inplace", &tensorrt_llm::torch_ext::moe_unpermute_inplace);
     m.impl("moe_unpermute", &tensorrt_llm::torch_ext::moe_unpermute);

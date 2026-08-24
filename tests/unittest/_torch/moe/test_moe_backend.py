@@ -165,26 +165,21 @@ def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts():
         num_local_experts=8,
         local_expert_offset=0,
         use_direct_expert_metadata=True,
-        use_count_native_expert_metadata=True,
-        deep_ep_expert_capacity=32,
     )
     counts = torch.tensor([0, 1, 31, 32, 7, 0, 16, 2], dtype=torch.int32)
-    inputs = [torch.empty(1) for _ in range(6)] + [counts]
+    inputs = [torch.empty(8 * 32, 1) for _ in range(6)] + [counts]
 
     runner.forward(inputs, tactic=256)
 
-    assert runner.unique_id()[-3:] == (
-        "direct_expert_metadata",
-        32,
-        "count_native_expert_metadata",
-    )
+    assert runner.unique_id()[-1] == "direct_expert_metadata"
     assert runner.get_valid_tactics([], OptimizationProfile()) == [128, 256]
     assert runner.get_tuning_config().inputs_pre_hook is None
     assert forward_impl.call_args.kwargs["recv_expert_count"] is counts
+    assert forward_impl.call_args.kwargs["deep_ep_expert_capacity"] == 32
     assert forward_impl.call_args.kwargs["use_count_native_expert_metadata"] is True
 
 
-def test_cutedsl_direct_metadata_tuning_is_static_and_legacy_remains_dynamic():
+def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens():
     common_kwargs = {
         "forward_impl": MagicMock(),
         "num_experts": 256,
@@ -195,13 +190,13 @@ def test_cutedsl_direct_metadata_tuning_is_static_and_legacy_remains_dynamic():
     direct_runner = CuteDslFusedMoENvfp4Runner(
         **common_kwargs,
         use_direct_expert_metadata=True,
-        deep_ep_expert_capacity=5,
     )
 
     direct_config = direct_runner.get_tuning_config()
-    assert direct_config.dynamic_tensor_specs == ()
-    assert direct_config.constraint_specs == ()
+    assert len(direct_config.dynamic_tensor_specs) == 1
+    assert len(direct_config.constraint_specs) == 4
     assert direct_config.inputs_pre_hook is None
+    assert direct_runner.unique_id()[-1] == "direct_expert_metadata"
 
     legacy_runner = CuteDslFusedMoENvfp4Runner(**common_kwargs)
     legacy_config = legacy_runner.get_tuning_config()
@@ -249,8 +244,9 @@ def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(monkeypatch
     is_capturing = MagicMock(side_effect=AssertionError("CPU path queried CUDA capture state"))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", is_capturing)
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
-    comm.mapping = SimpleNamespace(moe_ep_rank=1)
+    comm.mapping = SimpleNamespace(moe_ep_rank=1, moe_ep_size=2)
     comm.num_slots = 4
+    comm.deep_ep_max_num_tokens = 8
     comm._adapter_free_placeholder_cache = {}
     comm.deep_ep_buffer = object()
 
@@ -285,8 +281,29 @@ def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(monkeypatch
     assert adapter_free[2].shape == (hidden_states.shape[0] * hidden_states.shape[1], 1)
     assert adapter_free[2].dtype == legacy[2].dtype
     torch.testing.assert_close(adapter_free[3], legacy[3])
-    assert adapter_free_reused[2] is adapter_free[2]
-    assert adapter_free_reused[3] is adapter_free[3]
+    assert (
+        adapter_free_reused[2].untyped_storage().data_ptr()
+        == adapter_free[2].untyped_storage().data_ptr()
+    )
+    assert (
+        adapter_free_reused[3].untyped_storage().data_ptr()
+        == adapter_free[3].untyped_storage().data_ptr()
+    )
+    assert torch.all(adapter_free[2] == -1)
+    assert len(comm._adapter_free_placeholder_cache) == 1
+
+    smaller_hidden_states = torch.arange(16, dtype=torch.bfloat16).view(2, 2, 4)
+    smaller_hidden_states_sf = torch.arange(8, dtype=torch.uint8).view(2, 2, 2)
+    smaller = comm._modify_output_to_adapt_fused_moe(
+        smaller_hidden_states,
+        smaller_hidden_states_sf,
+        recv_expert_count,
+        torch.float32,
+        remove_adapter=True,
+    )
+    assert smaller[2].shape == (4, 1)
+    assert smaller[2].untyped_storage().data_ptr() == adapter_free[2].untyped_storage().data_ptr()
+    assert len(comm._adapter_free_placeholder_cache) == 1
     is_capturing.assert_not_called()
 
     comm.destroy()
@@ -327,7 +344,6 @@ def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(monkeypatch):
 def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
     disabled: bool, has_nvfp4: bool, supports_post_quant: bool, expected: bool
 ):
-    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
     backend.disable_deep_ep_direct_metadata = disabled
     backend.use_fused_finalize = True
@@ -337,35 +353,15 @@ def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
             has_nvfp4=MagicMock(return_value=has_nvfp4),
         ),
     )
-    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
-    scheduler.moe = SimpleNamespace(
-        backend=backend,
-        comm=comm,
-        # DeepEP consumes the model's routing top-k and presents one local
-        # placeholder slot per expert-major row to fused MoE.
-        routing_method=SimpleNamespace(experts_per_token=8),
-    )
-
-    assert scheduler._use_cutedsl_deep_ep_direct_metadata(supports_post_quant) is expected
+    assert backend.can_use_deep_ep_direct_metadata(supports_post_quant) is expected
 
 
-def test_scheduler_rejects_direct_metadata_for_other_backend_or_communication():
-    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
-    scheduler.moe = SimpleNamespace(
-        backend=CuteDslFusedMoE.__new__(CuteDslFusedMoE),
-        comm=object(),
-    )
-    assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False
-
-    scheduler.moe = SimpleNamespace(
-        backend=CutlassFusedMoE.__new__(CutlassFusedMoE),
-        comm=DeepEPLowLatency.__new__(DeepEPLowLatency),
-    )
-    assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False
+def test_other_backend_rejects_deep_ep_direct_metadata():
+    backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
+    assert backend.can_use_deep_ep_direct_metadata(True) is False
 
 
-def test_scheduler_rejects_direct_metadata_without_fused_finalize():
-    comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
+def test_cutedsl_rejects_direct_metadata_without_fused_finalize():
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
     backend.disable_deep_ep_direct_metadata = False
     backend.use_fused_finalize = False
@@ -375,14 +371,33 @@ def test_scheduler_rejects_direct_metadata_without_fused_finalize():
             has_nvfp4=MagicMock(return_value=True),
         ),
     )
-    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
-    scheduler.moe = SimpleNamespace(
-        backend=backend,
-        comm=comm,
-        routing_method=SimpleNamespace(experts_per_token=8),
-    )
+    assert backend.can_use_deep_ep_direct_metadata(True) is False
 
-    assert scheduler._use_cutedsl_deep_ep_direct_metadata(True) is False
+
+def test_cutedsl_direct_metadata_request_fails_without_fused_finalize():
+    backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.use_fused_finalize = False
+    backend.hidden_size = 4
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(
+            has_nvfp4=MagicMock(return_value=True),
+        ),
+    )
+    token_selected_experts = torch.full((2, 1), -1, dtype=torch.int32)
+    token_final_scales = torch.ones((2, 1), dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="requires fused finalize"):
+        backend.run_moe_nvfp4(
+            x=torch.empty((2, 2), dtype=torch.uint8),
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            moe_output=torch.empty((2, 4), dtype=torch.bfloat16),
+            weight_view=MagicMock(),
+            recv_expert_count=torch.tensor([2], dtype=torch.int32),
+            deep_ep_expert_capacity=2,
+            use_deep_ep_direct_metadata=True,
+        )
 
 
 @pytest.mark.parametrize("disabled,expected", [(False, True), (True, False)])
@@ -412,7 +427,7 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(disabled: bool, ex
         routing_method=SimpleNamespace(experts_per_token=1),
     )
 
-    use_direct_metadata = scheduler._use_cutedsl_deep_ep_direct_metadata(True)
+    use_direct_metadata = backend.can_use_deep_ep_direct_metadata(True)
     assert use_direct_metadata is expected
 
     plan = scheduler._build_comm_plan(
@@ -421,8 +436,12 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(disabled: bool, ex
         use_deep_ep_direct_metadata=use_direct_metadata,
     )
 
-    assert plan.recv_expert_count is recv_expert_count
-    assert plan.deep_ep_expert_capacity == expert_capacity
+    if expected:
+        assert plan.recv_expert_count is recv_expert_count
+        assert plan.deep_ep_expert_capacity == expert_capacity
+    else:
+        assert plan.recv_expert_count is None
+        assert plan.deep_ep_expert_capacity is None
     assert plan.use_deep_ep_direct_metadata is expected
 
 

@@ -206,7 +206,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         raster_along_m: bool = False,
         use_expert_counts: bool = False,
         num_local_experts: int = 0,
-        expert_capacity: int = 0,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -233,11 +232,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.raster_along_m = raster_along_m
         self.use_expert_counts = use_expert_counts
         self.num_local_experts = num_local_experts
-        self.expert_capacity = expert_capacity
         self.num_tile_info_fields = 6 if self.use_expert_counts else 5
         if self.use_expert_counts:
             assert self.num_local_experts > 0
-            assert self.expert_capacity > 0
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -469,6 +466,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self,
         expert_counts: cute.Tensor,
         tile_idx: cutlass.Int32,
+        expert_capacity: cutlass.Int32,
     ):
         """Resolve a compact tile directly from expert-major receive counts."""
         tile_size = cutlass.Int32(self.mma_tiler[0])
@@ -479,7 +477,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         for candidate_expert in cutlass.range_constexpr(self.num_local_experts):
             count = cutlass.min(
                 cutlass.max(expert_counts[candidate_expert], cutlass.Int32(0)),
-                cutlass.Int32(self.expert_capacity),
+                expert_capacity,
             )
             num_expert_tiles = (count + tile_size - 1) // tile_size
             is_target = (tile_idx >= num_valid_tiles) and (
@@ -497,7 +495,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             cutlass.max(expert_count - row_in_expert, cutlass.Int32(0)),
         )
         mn_limit = tile_idx * tile_size + rows_in_tile
-        expanded_row_start = expert_idx * self.expert_capacity + row_in_expert
+        expanded_row_start = expert_idx * expert_capacity + row_in_expert
         return num_valid_tiles, expert_idx, mn_limit, expanded_row_start
 
     @cute.jit
@@ -512,6 +510,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         num_non_exiting_tiles: cute.Tensor,
         tile_idx_to_mn_limit: cute.Tensor,
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
+        expert_capacity: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         permuted_idx_to_expanded_idx: cute.Tensor,
@@ -813,6 +812,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             alpha_tuple,
             permuted_idx_to_expanded_idx,
             token_final_scales,
+            expert_capacity,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -898,6 +898,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         alpha_tuple: Tuple[cute.Tensor, ...],
         permuted_idx_to_expanded_idx: cute.Tensor,
         token_final_scales: cute.Tensor,
+        expert_capacity: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1245,7 +1246,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
             if cutlass.const_expr(self.use_expert_counts):
                 num_valid_tiles, _, _, _ = self._expert_count_tile_info(
-                    tile_idx_to_expert_idx, cutlass.Int32(0)
+                    tile_idx_to_expert_idx, cutlass.Int32(0), expert_capacity
                 )
             else:
                 num_valid_tiles = num_non_exiting_tiles[0]
@@ -1261,7 +1262,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         if cutlass.const_expr(self.use_expert_counts):
                             _, expert_idx, mn_limit, expanded_mma_row_start = (
                                 self._expert_count_tile_info(
-                                    tile_idx_to_expert_idx, mma_tile_coord_m
+                                    tile_idx_to_expert_idx, mma_tile_coord_m, expert_capacity
                                 )
                             )
                             expanded_row_start = (
@@ -1305,7 +1306,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         if cutlass.const_expr(self.use_expert_counts):
                             _, expert_idx, mn_limit, expanded_mma_row_start = (
                                 self._expert_count_tile_info(
-                                    tile_idx_to_expert_idx, mma_tile_coord_m
+                                    tile_idx_to_expert_idx, mma_tile_coord_m, expert_capacity
                                 )
                             )
                             expanded_row_start = (
@@ -2553,6 +2554,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         l: cutlass.Int64,  # noqa: E741
         num_tokens: cutlass.Int64,
         top_k: cutlass.Int64,
+        expert_capacity: cutlass.Int32,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -2621,6 +2623,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
             alpha,
+            expert_capacity,
             max_active_clusters=max_active_clusters,
             stream=stream,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,

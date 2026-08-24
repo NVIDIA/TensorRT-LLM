@@ -278,7 +278,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         swiglu_limit: cutlass.Float32 = float("inf"),
         use_expert_counts: bool = False,
         num_local_experts: int = 0,
-        expert_capacity: int = 0,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -411,12 +410,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.has_swiglu_limit = swiglu_limit != float("inf")
         self.use_expert_counts = use_expert_counts
         self.num_local_experts = num_local_experts
-        self.expert_capacity = expert_capacity
         self.num_tile_info_fields = 6 if self.use_expert_counts else 5
         if self.use_expert_counts:
             assert self.topk == 1
             assert self.num_local_experts > 0
-            assert self.expert_capacity > 0
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -613,6 +610,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self,
         expert_counts: cute.Tensor,
         tile_idx: cutlass.Int32,
+        expert_capacity: cutlass.Int32,
     ):
         """Resolve a compact tile directly from expert-major receive counts."""
         tile_size = cutlass.Int32(self.mma_tiler[0])
@@ -623,7 +621,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         for candidate_expert in cutlass.range_constexpr(self.num_local_experts):
             count = cutlass.min(
                 cutlass.max(expert_counts[candidate_expert], cutlass.Int32(0)),
-                cutlass.Int32(self.expert_capacity),
+                expert_capacity,
             )
             num_expert_tiles = (count + tile_size - 1) // tile_size
             is_target = (tile_idx >= num_valid_tiles) and (
@@ -641,7 +639,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             cutlass.max(expert_count - row_in_expert, cutlass.Int32(0)),
         )
         mn_limit = tile_idx * tile_size + rows_in_tile
-        expanded_row_start = expert_idx * self.expert_capacity + row_in_expert
+        expanded_row_start = expert_idx * expert_capacity + row_in_expert
         return num_valid_tiles, expert_idx, mn_limit, expanded_row_start
 
     @cute.jit
@@ -659,6 +657,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha: Union[cute.Tensor, Tuple[cute.Tensor, ...]],
+        expert_capacity: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -983,6 +982,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             token_id_mapping_tensor,
             num_non_exiting_tiles,
             alpha_tuple,
+            expert_capacity,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1067,6 +1067,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         token_id_mapping_tensor: cute.Tensor,
         num_non_exiting_tiles: cute.Tensor,
         alpha_tuple: Tuple[cute.Tensor, ...],
+        expert_capacity: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1383,7 +1384,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
             if cutlass.const_expr(self.use_expert_counts):
                 num_non_exiting_tiles_value, _, _, _ = self._expert_count_tile_info(
-                    tile_idx_to_expert_idx, cutlass.Int32(0)
+                    tile_idx_to_expert_idx, cutlass.Int32(0), expert_capacity
                 )
             else:
                 num_non_exiting_tiles_value = num_non_exiting_tiles[0]
@@ -1399,7 +1400,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         if cutlass.const_expr(self.use_expert_counts):
                             _, expert_idx, mn_limit, expanded_mma_row_start = (
                                 self._expert_count_tile_info(
-                                    tile_idx_to_expert_idx, mma_tile_coord_m
+                                    tile_idx_to_expert_idx, mma_tile_coord_m, expert_capacity
                                 )
                             )
                             expanded_row_start = (
@@ -1443,7 +1444,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         if cutlass.const_expr(self.use_expert_counts):
                             _, expert_idx, mn_limit, expanded_mma_row_start = (
                                 self._expert_count_tile_info(
-                                    tile_idx_to_expert_idx, mma_tile_coord_m
+                                    tile_idx_to_expert_idx, mma_tile_coord_m, expert_capacity
                                 )
                             )
                             expanded_row_start = (
@@ -3440,6 +3441,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         n: cutlass.Int64,
         k: cutlass.Int64,
         l: cutlass.Int64,  # noqa: E741
+        expert_capacity: cutlass.Int32,
         tile_size: cutlass.Constexpr,
         scaling_vector_size: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
@@ -3508,6 +3510,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             token_id_mapping,
             num_non_exiting_tiles,
             alpha,
+            expert_capacity,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,

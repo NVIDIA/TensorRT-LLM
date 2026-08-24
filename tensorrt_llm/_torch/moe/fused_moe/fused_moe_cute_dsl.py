@@ -341,8 +341,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  output_dtype: torch.dtype = torch.bfloat16,
                  scaling_vector_size: int = 16,
                  use_direct_expert_metadata: bool = False,
-                 use_count_native_expert_metadata: bool = False,
-                 deep_ep_expert_capacity: Optional[int] = None,
                  workload_identity: Optional[Tuple] = None):
         super().__init__()
         self.forward_impl = forward_impl
@@ -353,11 +351,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         self.enable_finalize_fusion = enable_finalize_fusion
         self.enable_alltoall = enable_alltoall
         self.use_direct_expert_metadata = use_direct_expert_metadata
-        self.use_count_native_expert_metadata = use_count_native_expert_metadata
-        if self.use_count_native_expert_metadata and not self.use_direct_expert_metadata:
-            raise ValueError(
-                "Count-native expert metadata requires direct expert metadata")
-        self.deep_ep_expert_capacity = deep_ep_expert_capacity
 
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
@@ -378,12 +371,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         if self.workload_identity is not None:
             identity += (self.workload_identity, )
         if self.use_direct_expert_metadata:
-            identity += (
-                "direct_expert_metadata",
-                self.deep_ep_expert_capacity,
-            )
-        if self.use_count_native_expert_metadata:
-            identity += ("count_native_expert_metadata", )
+            identity += ("direct_expert_metadata", )
         return identity
 
     def get_valid_tactics(
@@ -405,7 +393,23 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         key = self.unique_id()
         if key not in self.__class__.tuning_config_cache:
             if self.use_direct_expert_metadata:
-                tuning_config = TuningConfig(use_cold_l2_cache=True)
+                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
+                                                 self.num_local_experts,
+                                                 self.local_expert_offset, 128)
+                tuning_config = TuningConfig(
+                    dynamic_tensor_specs=(DynamicTensorSpec(
+                        0, 0, helper.gen_expert_capacity_tuning_buckets,
+                        helper.map_to_expert_capacity_tuning_bucket), ),
+                    constraint_specs=(ConstraintSpec(
+                        1, 0, helper.infer_shape_input0_rows),
+                                      ConstraintSpec(
+                                          2, 0, helper.infer_shape_input0_rows),
+                                      ConstraintSpec(
+                                          3, 0, helper.infer_shape_input0_rows),
+                                      ConstraintSpec(
+                                          4, 0,
+                                          helper.infer_shape_input0_rows)),
+                    use_cold_l2_cache=True)
             else:
                 helper = CuteDslFusedMoENvfp4InputsHelper(
                     self.num_experts, self.top_k, self.num_local_experts,
@@ -455,14 +459,21 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         if self.use_direct_expert_metadata:
             recv_expert_count = inputs[-1]
             forward_inputs = inputs[:-1]
+            num_rows = forward_inputs[0].size(0)
+            if num_rows % self.num_local_experts != 0:
+                raise ValueError(
+                    "Expert-major input rows must be divisible by the number "
+                    "of local experts")
+            deep_ep_expert_capacity = num_rows // self.num_local_experts
+        else:
+            deep_ep_expert_capacity = None
         return self.forward_impl(
             *forward_inputs,
             enable_alltoall=self.enable_alltoall,
             tile_size=tile_size,
             recv_expert_count=recv_expert_count,
-            deep_ep_expert_capacity=self.deep_ep_expert_capacity,
-            use_count_native_expert_metadata=self.
-            use_count_native_expert_metadata)
+            deep_ep_expert_capacity=deep_ep_expert_capacity,
+            use_count_native_expert_metadata=self.use_direct_expert_metadata)
 
     @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
     @staticmethod
@@ -948,6 +959,15 @@ class CuteDslFusedMoE(MoEImplBase):
         return self.has_nvfp4 or (not self.has_any_quant
                                   and get_sm_version() == 107)
 
+    def can_use_deep_ep_direct_metadata(
+            self, supports_post_quant_dispatch: bool) -> bool:
+        """Report complete runtime eligibility for adapter-free DeepEP metadata."""
+        return (self.capabilities.supports_deep_ep_direct_metadata
+                and not self.disable_deep_ep_direct_metadata and self.has_nvfp4
+                and supports_post_quant_dispatch and self.use_fused_finalize
+                and get_sm_version() != 107
+                and getattr(self, "_locality_domain_runtime", None) is None)
+
     def quantize_input(self,
                        x: Union[torch.Tensor, Fp4QuantizedTensor],
                        post_quant_comm: bool = True):
@@ -1039,6 +1059,20 @@ class CuteDslFusedMoE(MoEImplBase):
                     "Rubin locality domain NVFP4 MoE currently supports SwiGLU only"
                 )
 
+        if (recv_expert_count is None) != (deep_ep_expert_capacity is None):
+            raise ValueError(
+                "recv_expert_count and deep_ep_expert_capacity must be provided together"
+            )
+        if use_deep_ep_direct_metadata:
+            if not self.use_fused_finalize:
+                raise RuntimeError(
+                    "DeepEP direct metadata requires fused finalize; falling "
+                    "back would sort adapter-free placeholder expert IDs")
+            if recv_expert_count is None or deep_ep_expert_capacity is None:
+                raise RuntimeError(
+                    "DeepEP direct metadata was requested without dispatch metadata"
+                )
+
         if moe_output is None:
             moe_output = torch.empty(
                 (token_final_scales.size(0), self.hidden_size),
@@ -1056,16 +1090,7 @@ class CuteDslFusedMoE(MoEImplBase):
             return moe_output
 
         effective_top_k = token_selected_experts.size(-1)
-        if (recv_expert_count is None) != (deep_ep_expert_capacity is None):
-            raise ValueError(
-                "recv_expert_count and deep_ep_expert_capacity must be provided together"
-            )
-        use_direct_expert_metadata = (
-            use_deep_ep_direct_metadata
-            and recv_expert_count is not None
-            and self.use_fused_finalize
-            and not use_locality_domain
-            and is_sm_100f())
+        use_direct_expert_metadata = use_deep_ep_direct_metadata
 
         if use_locality_domain:
             forward_impl = self._run_moe_nvfp4_locality_domain
@@ -1103,9 +1128,6 @@ class CuteDslFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
             workload_identity=workload_identity,
             use_direct_expert_metadata=use_direct_expert_metadata,
-            use_count_native_expert_metadata=use_direct_expert_metadata,
-            deep_ep_expert_capacity=(deep_ep_expert_capacity
-                                     if use_direct_expert_metadata else None),
         )
 
         if use_direct_expert_metadata:
@@ -1160,23 +1182,21 @@ class CuteDslFusedMoE(MoEImplBase):
                 raise ValueError(
                     "expert-major DeepEP input has the wrong row count; "
                     f"expected {expected_rows}, got {x.size(0)}")
-            if use_count_native_expert_metadata:
-                # The custom-op schema is shared with the direct-metadata path.
-                # Count-native runners interpret each metadata argument as the
-                # same expert-count tensor and do not materialize adapter arrays.
-                tile_idx_to_expert_idx = recv_expert_count
-                tile_idx_to_mn_limit = recv_expert_count
-                expanded_idx_to_permuted_idx = recv_expert_count
-                permuted_idx_to_expanded_idx = recv_expert_count
-                _total_num_padded_tokens = None
-                num_non_exiting_tiles = recv_expert_count
-            else:
-                tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, _total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_metadata_from_expert_counts(
-                    expert_counts=recv_expert_count,
-                    capacity=deep_ep_expert_capacity,
-                    tile_size=tile_size,
-                )
+            if not use_count_native_expert_metadata:
+                raise RuntimeError(
+                    "Expert-major DeepEP input requires count-native metadata")
+            # Count-native runners interpret each metadata argument as the
+            # same expert-count tensor and do not materialize adapter arrays.
+            tile_idx_to_expert_idx = recv_expert_count
+            tile_idx_to_mn_limit = recv_expert_count
+            expanded_idx_to_permuted_idx = recv_expert_count
+            permuted_idx_to_expanded_idx = recv_expert_count
+            _total_num_padded_tokens = None
+            num_non_exiting_tiles = recv_expert_count
         else:
+            if use_count_native_expert_metadata:
+                raise RuntimeError(
+                    "Count-native metadata requires DeepEP receive counts")
             tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx, permuted_idx_to_expanded_idx, _total_num_padded_tokens, num_non_exiting_tiles = torch.ops.trtllm.moe_sort(
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
