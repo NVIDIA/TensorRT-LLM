@@ -871,6 +871,9 @@ pipeline {
                             if (params.osrb_ticket) {
                                 cmd += "--osrb_ticket ${params.osrb_ticket} "
                             }
+                            if (params.export_compliance_bug) {
+                                cmd += "--export_compliance_bug '${params.export_compliance_bug}' "
+                            }
                             if (params.wait_success_seconds) {
                                 cmd += "--check_launch_api "
                                 cmd += "--wait_success ${params.wait_success_seconds} "
