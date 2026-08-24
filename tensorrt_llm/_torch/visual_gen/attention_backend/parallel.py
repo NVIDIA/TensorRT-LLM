@@ -101,10 +101,15 @@ class UlyssesAttention(AttentionBackend):
         Step 3: All-to-All → [B, S/P, H, D] (restore sequence sharding)
         Output: [B, S/P, H, D] (sequence sharded)
 
-    Two modes (auto-selected via ``inner_backend.support_fused_qkv()``):
-    - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives)
-    - Fused: stacks Q/K/V into [B, S/P, 3, H, D], 1 fused 5D all-to-all
-      + 1 for output (2 collectives total)
+    Three modes:
+    - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives).
+    - Inner-backend fused QKV: selected via ``inner_backend.support_fused_qkv()``.
+      Stacks Q/K/V into [B, S/P, 3, H, D], uses 1 fused 5D all-to-all, then
+      calls the inner backend with packed QKV.
+    - Packed self-attention: selected after fused QKV is unavailable when Q/K/V
+      have the same BF16 CUDA shape and the post-unscatter kernel constraints
+      are satisfied. It uses 1 fused 5D all-to-all, then a native post-unscatter
+      layout conversion before calling the inner backend with separate Q/K/V.
     """
 
     # One side stream shared across all UlyssesAttention instances on the
@@ -204,7 +209,11 @@ class UlyssesAttention(AttentionBackend):
             return False
         if q.shape != k.shape or q.shape != v.shape:
             return False
-        if q.dtype != torch.bfloat16 or q.shape[-1] % 8 != 0:
+        if not q.is_cuda or q.dtype != torch.bfloat16 or q.shape[-1] % 8 != 0:
+            return False
+        # ulysses_packed_qkv_post_unscatter launches one block of
+        # H_local * (D / 8) threads.
+        if (q.shape[2] // self.world_size) * (q.shape[-1] // 8) > 1024:
             return False
         return kwargs.get("gate_compress") is None and kwargs.get("gate_fine") is None
 
