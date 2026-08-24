@@ -1123,6 +1123,16 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     LifeCycleId numLc = mManager->storage().numLifeCycles();
     auto const& lcs = mManager->lifeCycles();
 
+    // Blocks are only ever appended past oldNumBlocks, and every appended block is
+    // allocated for all mBeamWidth beams. That is only correct while the appended
+    // ordinals all sit in the per-beam tail, i.e. at or after the shared/per-beam
+    // boundary _appendBeams() uses. Beams are added once the prompt is fully
+    // materialized (capacity >= promptLength), which puts oldNumBlocks at or past
+    // that boundary. Widening a beam during prefill would break the invariant and
+    // silently replicate the shared prompt prefix mBeamWidth times.
+    TLLM_CHECK_DEBUG(mBeamWidth == BeamIndex{1}
+        || oldNumBlocks >= BlockOrdinal{mExpectedPromptLength.value_or(0) / mTokensPerBlock});
+
     _checkPageIndexBufferCapacity(newNumBlocks);
 
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
@@ -1410,10 +1420,6 @@ void KvCache::_refreshGenerationAllocReady()
         mGenerationAllocReady = true;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Capacity management
-// ---------------------------------------------------------------------------
 
 void KvCache::_decreaseCapacity(BlockOrdinal newNumBlocks)
 {
