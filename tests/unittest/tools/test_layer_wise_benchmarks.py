@@ -16,13 +16,6 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_pre_blackwell
 
 
-def _is_blackwell_capable():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability(0)
-    return major >= 10
-
-
 @pytest.fixture(scope="module", autouse=True)
 def require_nsys_cuda_tracing():
     """Skip all tests in this module when nsys cannot record CUDA kernel activity.
@@ -138,64 +131,17 @@ def require_nsys_cuda_tracing():
         )
 
 
-# Signature the workload emits when it refuses to build a Blackwell-only kernel,
-# e.g. "FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got
-# SM90." or "CuteDSL NVFP4 backend requires SM 100 (B200) or SM 103 (B300)".
-# Anchoring on this keeps a generic Python assertion -- which also exits 1 --
-# from being mistaken for a legitimate kernel rejection.
-_KERNEL_UNAVAILABLE_RE = re.compile(
-    r"requires SM\s*>?=?\s*10\d|is unavailable: requires SM",
-    re.IGNORECASE,
-)
-
-
-def _run_benchmark(cmd, *, cwd, env=None, tolerate_kernel_rejection=True):
-    """Run a benchmark step, allowing only a genuine pre-Blackwell rejection.
-
-    These benchmarks exercise Blackwell-only kernels (NVFP4, FP8 GEN MLA, FMHA
-    D=192,DV=128). On pre-Blackwell the workload's own availability checks
-    legitimately reject the model, and we treat that as PASS so the test list
-    stays stable and the launcher itself is still exercised everywhere.
-
-    Everything else must fail. In particular a bare ``rc == 1`` is NOT accepted
-    on its own: that is also what a generic Python assertion or a real
-    launcher/parse regression returns, so it is honoured only when stderr also
-    carries the kernel-availability signature. Pass
-    ``tolerate_kernel_rejection=False`` for steps that never touch a GPU kernel
-    (parse.py), where any failure is real by construction.
-    """
-    if _is_blackwell_capable() or not tolerate_kernel_rejection:
-        check_call(cmd, cwd=cwd, env=env)
-        return
-
-    proc = subprocess.run(
-        cmd, cwd=cwd, env=env, stderr=subprocess.PIPE, text=True, errors="replace"
-    )
-    if proc.stderr:
-        # Keep the CI log intact -- stderr was captured only so we can inspect it.
-        sys.stderr.write(proc.stderr)
-    if proc.returncode == 0:
-        return
-    # SIGABRT (134) is a C++ TLLM_CHECK abort and SIGKILL (137) an OOM kill;
-    # neither is producible by a plain Python assertion, so they stay tolerated
-    # as-is. A bare exit 1 has to prove itself against the signature.
-    if proc.returncode in (134, 137) or _KERNEL_UNAVAILABLE_RE.search(proc.stderr or ""):
-        return
-    raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=proc.stderr)
-
-
-# The pinned DeepSeek FP4 checkpoint requires SM100+. On pre-Blackwell,
-# `_run_benchmark` converts the workload's own kernel-availability
-# rejection (SIGABRT / assertion / OOM) into a PASS instead of skipping;
-# this keeps the test list stable and validates that the launcher itself
-# still works everywhere.
+# The pinned DeepSeek FP4 checkpoint requires SM100+, so this is guarded with
+# skip_pre_blackwell like its siblings below. https://nvbugs/6337228 was exactly
+# this test aborting (rc 134/1) on the A10 pre-merge stage.
+@skip_pre_blackwell
 @pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_r1_ctx_dep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
     profile_dir = f"profiles/test_deepseek_r1_ctx_dep_{world_size}"
-    _run_benchmark(
+    check_call(
         [
             "./mpi_launch.sh",
             "./run.sh",
@@ -210,25 +156,21 @@ def test_deepseek_r1_ctx_dep(llm_root, world_size):
             "PROFILE_DIR": profile_dir,
         },
     )
-    # parse.py is pure Python over the recorded nsys profile -- it imports no
-    # torch and launches no kernel -- so it can never fail for lack of a
-    # Blackwell kernel. Any non-zero exit here is a real parser regression.
-    _run_benchmark(
+    check_call(
         ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
-        tolerate_kernel_rejection=False,
     )
 
 
-# The pinned DeepSeek FP4 checkpoint requires SM100+; see
-# `test_deepseek_r1_ctx_dep` for how `_run_benchmark` handles pre-Blackwell.
+# The pinned DeepSeek FP4 checkpoint requires SM100+.
+@skip_pre_blackwell
 @pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_r1_ctx_tep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
     profile_dir = f"profiles/test_deepseek_r1_ctx_tep_{world_size}"
-    _run_benchmark(
+    check_call(
         [
             "./mpi_launch.sh",
             "./run.sh",
@@ -245,25 +187,21 @@ def test_deepseek_r1_ctx_tep(llm_root, world_size):
             "PROFILE_DIR": profile_dir,
         },
     )
-    # parse.py is pure Python over the recorded nsys profile -- it imports no
-    # torch and launches no kernel -- so it can never fail for lack of a
-    # Blackwell kernel. Any non-zero exit here is a real parser regression.
-    _run_benchmark(
+    check_call(
         ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
-        tolerate_kernel_rejection=False,
     )
 
 
-# The pinned config (DeepSeek-V3.2 with the DEEPGEMM MoE backend) targets SM100+;
-# see `test_deepseek_r1_ctx_dep` for how `_run_benchmark` handles pre-Blackwell.
+# The pinned config (DeepSeek-V3.2 with the DEEPGEMM MoE backend) targets SM100+.
+@skip_pre_blackwell
 @pytest.mark.parametrize("world_size", [1, 4])
 def test_deepseek_v32_ctx_dep(llm_root, world_size):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size:d} GPUs to run this test")
     model_root = llm_models_root(check=True)
     profile_dir = f"profiles/test_deepseek_v32_ctx_dep_{world_size}"
-    _run_benchmark(
+    check_call(
         [
             "./mpi_launch.sh",
             "./run.sh",
@@ -280,13 +218,9 @@ def test_deepseek_v32_ctx_dep(llm_root, world_size):
             "PROFILE_DIR": profile_dir,
         },
     )
-    # parse.py is pure Python over the recorded nsys profile -- it imports no
-    # torch and launches no kernel -- so it can never fail for lack of a
-    # Blackwell kernel. Any non-zero exit here is a real parser regression.
-    _run_benchmark(
+    check_call(
         ["python3", "parse.py", "--profile-dir", profile_dir, f"--world-size={world_size}"],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
-        tolerate_kernel_rejection=False,
     )
 
 
