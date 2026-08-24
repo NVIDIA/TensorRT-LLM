@@ -302,7 +302,8 @@ class HttpClusterStorageServer(ClusterStorage):
             return {
                 k: "" if keys_only else v.value
                 for k, v in self._storage.items()
-                if k.startswith(key_prefix) and (v.expire_time < 0 or v.expire_time > current_time)
+                if k.startswith(key_prefix) and (
+                    v.expire_time < 0 or v.expire_time > current_time)
             }
 
     async def watch(self, key_prefix: str) -> WatchEventQueue:
@@ -629,7 +630,7 @@ class Etcd3ClusterStorage(ClusterStorage):
         watch_handle.set_cancel_event(
             lambda: self.client.cancel_watch(watch_id))
         self._watch_handles[key_prefix] = watch_handle
-        return watch_handle
+        return self._watch_handles[key_prefix]
 
     async def unwatch(self, key_prefix: str) -> None:
         handle = self._watch_handles.pop(key_prefix)
