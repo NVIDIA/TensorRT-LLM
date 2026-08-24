@@ -377,24 +377,12 @@ template <typename T, typename KVCacheBuffer>
 void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
 {
     params.setCommonParameters();
-    if (params.cache_type == KvCacheDataType::INT8)
+    if constexpr (std::is_same_v<KVCacheBuffer, MixedKVBlockArray>)
     {
-        invokeApplyBiasRopeUpdateKVCacheDispatch<T, int8_t, KVCacheBuffer>(params, stream);
-    }
-#ifdef ENABLE_FP8
-    else if (params.cache_type == KvCacheDataType::FP8)
-    {
-        invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
-    }
-#endif // ENABLE_FP8
 #if defined(ENABLE_FP8) && defined(ENABLE_FP4)
-    else if (params.cache_type == KvCacheDataType::FP8_K_NVFP4_V)
-    {
-        if constexpr (!std::is_same_v<KVCacheBuffer, MixedKVBlockArray>)
-        {
-            TLLM_THROW("FP8-K/NVFP4-V requires asymmetric paged cache buffers.");
-        }
-        else if constexpr (std::is_same_v<T, float>)
+        TLLM_CHECK_WITH_INFO(params.cache_type == KvCacheDataType::FP8_K_NVFP4_V,
+            "Asymmetric paged cache buffers require FP8-K/NVFP4-V cache type.");
+        if constexpr (std::is_same_v<T, float>)
         {
             TLLM_THROW("FP8-K/NVFP4-V cache does not support FP32 model inputs.");
         }
@@ -408,6 +396,26 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
                 "FP8-K/NVFP4-V attention requires an FP8 query output from QKV preprocessing.");
             invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
         }
+#else
+        TLLM_THROW("FP8-K/NVFP4-V cache requires FP8 and FP4 support.");
+#endif
+        return;
+    }
+
+    if (params.cache_type == KvCacheDataType::INT8)
+    {
+        invokeApplyBiasRopeUpdateKVCacheDispatch<T, int8_t, KVCacheBuffer>(params, stream);
+    }
+#ifdef ENABLE_FP8
+    else if (params.cache_type == KvCacheDataType::FP8)
+    {
+        invokeApplyBiasRopeUpdateKVCacheDispatch<T, __nv_fp8_e4m3, KVCacheBuffer>(params, stream);
+    }
+#endif // ENABLE_FP8
+#if defined(ENABLE_FP8) && defined(ENABLE_FP4)
+    else if (params.cache_type == KvCacheDataType::FP8_K_NVFP4_V)
+    {
+        TLLM_THROW("FP8-K/NVFP4-V requires asymmetric paged cache buffers.");
     }
 #endif
 #ifdef ENABLE_FP4
