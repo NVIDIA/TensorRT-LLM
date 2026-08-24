@@ -1,6 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime soundness tests for indexed KDA prefill."""
+"""Runtime-integration soundness tests for indexed optimized KDA prefill.
+
+Covers the two classes of bug that ordinary op-math parity tests cannot see:
+
+1. STREAM soundness. The executor runs the model on a dedicated non-blocking
+   ``torch.cuda.Stream`` (``py_executor.execution_stream``); the CuTe DSL
+   kernels must launch on torch's current stream, not the DSL default stream.
+   A default-stream launch races with the projections producing q/k/v/g/beta
+   and with consumers of the output and mutated state-pool rows — silent,
+   intermittent corruption e2e (GSM8K 68.99 vs 97.01 on the FLA control)
+   while single-stream unit tests all pass.
+   ``test_indexed_prefill_uses_current_stream`` reproduces this
+   deterministically by delaying the execution stream with ``_sleep`` so any
+   kernel launched on the default stream reads not-yet-written inputs.
+
+2. id()-keyed cache soundness under the runtime's fresh-tensor-per-call
+   pattern. CPython recycles an object's address (= its id) as soon as it is
+   freed; the ``_prune_on_gc`` weakref guard must pop the cache entry at
+   dealloc, before a new tensor can alias the key. The recycled-ID test
+   attempts to engineer exactly that aliasing: cache a verdict under id(t1),
+   free t1, re-allocate until a new tensor lands on the same id, refill it
+   with data for which the stale verdict would be WRONG, and parity-check
+   against FLA. ``test_repeated_single_sequence_metadata_matches_fla``
+   additionally covers the Phase 2.1 poisoning case (same cu_seqlens object,
+   two calls).
+"""
 
 import gc
 

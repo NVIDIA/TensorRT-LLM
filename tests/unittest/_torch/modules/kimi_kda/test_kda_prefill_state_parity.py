@@ -1,6 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Indexed KDA prefill state-pool parity against FLA."""
+"""State parity tests: indexed optimized KDA prefill vs FLA, kernel level.
+
+Complements test_kda_prefill_op.py (module outputs, no recurrent-state pool)
+with the cases the executor runtime actually exercises through
+KDAKernelDispatch:
+
+  * selected state-pool row parity in the pool's V-first [N, H, V, K] layout
+    — K == V == 128 for Kimi K3, so a layout mix-up is invisible to shape
+    checks and only caught numerically;
+  * a LARGE carried initial state — the K4 sign error fixed by dev-tech commit
+    e45ae259 (NV = U - W@S, was U + W@S) is masked by tiny/zero initial states
+    and random inputs, and only blows up when a real-magnitude state is
+    carried in;
+  * non-64-aligned varlen (single-sequence pad path and multi-sequence masked
+    path);
+  * fresh input tensors on every call — the runtime never reuses tensor
+    objects, so wrapper and compile-cache behavior sees runtime-style tensor
+    lifetimes instead of benchmark-style stable-object reuse.
+"""
 
 import pytest
 import torch
