@@ -19,12 +19,35 @@
 
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
+#include "tensorrt_llm/common/logger.h"
+
 #include <cuda.h>
+#include <exception>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+template <typename F>
+void terminateOnException(char const* context, F&& func) noexcept
+{
+    try
+    {
+        std::forward<F>(func)();
+    }
+    catch (std::exception const& error)
+    {
+        TLLM_LOG_ERROR("%s: %s", context, error.what());
+        std::terminate();
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("%s: unknown error", context);
+        std::terminate();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Exception hierarchy (mirrors _exceptions.py)

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventManager.h"
@@ -33,6 +34,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <nanobind/nanobind.h>
@@ -52,7 +54,6 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -61,6 +62,163 @@ namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
 
 namespace tensorrt_llm::nanobind::batch_manager
 {
+namespace
+{
+
+// Exposed via introspection sub-module for tests.
+class TestPaddingColdPageCodec final : public kv::IKvCacheColdPageCodec
+{
+public:
+    explicit TestPaddingColdPageCodec(std::map<int, size_t> coldPageBytesByLayer)
+        : mColdPageBytesByLayer(std::move(coldPageBytesByLayer))
+    {
+    }
+
+    bool configure(kv::PoolGroupDesc const* gpuDescs, kv::PoolGroupIndex numGpuDescs) noexcept override
+    {
+        try
+        {
+            if (gpuDescs == nullptr || numGpuDescs <= kv::PoolGroupIndex{0})
+            {
+                return false;
+            }
+
+            kv::LifeCycleId numLifeCycles{0};
+            for (kv::PoolGroupIndex poolGroup{0}; poolGroup < numGpuDescs; ++poolGroup)
+            {
+                for (auto const& variant : gpuDescs[poolGroup.value()].slotDesc.variants)
+                {
+                    if (variant.lifeCycleId.value() < 0)
+                    {
+                        return false;
+                    }
+                    numLifeCycles = std::max(numLifeCycles, kv::LifeCycleId{variant.lifeCycleId.value() + 1});
+                }
+            }
+            mLayouts = kv::TypedVec<kv::LifeCycleId, Layout>(numLifeCycles);
+
+            for (kv::PoolGroupIndex poolGroup{0}; poolGroup < numGpuDescs; ++poolGroup)
+            {
+                auto const& desc = gpuDescs[poolGroup.value()];
+                if (desc.poolGroupIndex != poolGroup || desc.pools.size() != kv::PoolIndex{1})
+                {
+                    return false;
+                }
+                auto const& pool = desc.pools[kv::PoolIndex{0}];
+                for (auto const& variant : desc.slotDesc.variants)
+                {
+                    if (variant.coalescedBuffers.size() != kv::PoolIndex{1})
+                    {
+                        return false;
+                    }
+                    auto const& buffer = variant.coalescedBuffers[kv::PoolIndex{0}];
+                    if (buffer.bufferIds.size() != 1 || buffer.size() != pool.slotBytes)
+                    {
+                        return false;
+                    }
+                    auto const coldBytes = mColdPageBytesByLayer.find(buffer.bufferIds.front().layerId);
+                    if (coldBytes == mColdPageBytesByLayer.end() || coldBytes->second < pool.slotBytes)
+                    {
+                        return false;
+                    }
+                    mLayouts.at(variant.lifeCycleId) = Layout{pool.baseAddress, pool.slotBytes, coldBytes->second};
+                }
+            }
+            return std::all_of(
+                mLayouts.begin(), mLayouts.end(), [](Layout const& layout) { return layout.hotBase != 0; });
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    size_t queryColdPageBytes(kv::LayerGroupId layerGroupId) const noexcept override
+    {
+        auto const* layout = findLayout(layerGroupId);
+        return layout == nullptr ? 0 : layout->coldPageBytes;
+    }
+
+    kv::PageIndexLocation queryPageIndexLocation(kv::LayerGroupId layerGroupId) const noexcept override
+    {
+        return findLayout(layerGroupId) == nullptr ? kv::PageIndexLocation::kBadLocation : kv::PageIndexLocation::kHost;
+    }
+
+    bool encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
+        size_t numBasePages, cudaStream_t stream) noexcept override
+    {
+        return transform(layerGroupId, dstBasePtr, pageIndices, numBasePages, stream, true);
+    }
+
+    bool decode(kv::LayerGroupId layerGroupId, void const* srcBasePtr, kv::PageIndexPair const* pageIndices,
+        size_t numBasePages, cudaStream_t stream) noexcept override
+    {
+        return transform(layerGroupId, srcBasePtr, pageIndices, numBasePages, stream, false);
+    }
+
+private:
+    struct Layout
+    {
+        kv::MemAddress hotBase = 0;
+        size_t hotPageBytes = 0;
+        size_t coldPageBytes = 0;
+    };
+
+    Layout const* findLayout(kv::LayerGroupId layerGroupId) const noexcept
+    {
+        if (layerGroupId.value() < 0 || layerGroupId >= mLayouts.size())
+        {
+            return nullptr;
+        }
+        auto const& layout = mLayouts.at(layerGroupId);
+        return layout.hotBase == 0 ? nullptr : &layout;
+    }
+
+    bool transform(kv::LayerGroupId layerGroupId, void const* coldBasePtr, kv::PageIndexPair const* pageIndices,
+        size_t numBasePages, cudaStream_t stream, bool encode) const noexcept
+    {
+        auto const* layout = findLayout(layerGroupId);
+        if (numBasePages == 0)
+        {
+            return layout != nullptr;
+        }
+        if (layout == nullptr || coldBasePtr == nullptr || pageIndices == nullptr || stream == nullptr)
+        {
+            return false;
+        }
+
+        auto* const coldBase = static_cast<std::byte*>(const_cast<void*>(coldBasePtr));
+        auto* const hotBase = reinterpret_cast<std::byte*>(layout->hotBase);
+        for (size_t page = 0; page < numBasePages; ++page)
+        {
+            auto const [dst, src] = pageIndices[page];
+            if (dst < 0 || src < 0)
+            {
+                return false;
+            }
+            auto* const hotPtr = hotBase + static_cast<size_t>(encode ? src : dst) * layout->hotPageBytes;
+            auto* const coldPtr = coldBase + static_cast<size_t>(encode ? dst : src) * layout->coldPageBytes;
+            if (cudaMemcpyAsync(encode ? coldPtr : hotPtr, encode ? hotPtr : coldPtr, layout->hotPageBytes,
+                    cudaMemcpyDefault, stream)
+                != cudaSuccess)
+            {
+                return false;
+            }
+            size_t const paddingBytes = layout->coldPageBytes - layout->hotPageBytes;
+            if (encode && paddingBytes > 0
+                && cudaMemsetAsync(coldPtr + layout->hotPageBytes, 0, paddingBytes, stream) != cudaSuccess)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::map<int, size_t> mColdPageBytesByLayer;
+    kv::TypedVec<kv::LifeCycleId, Layout> mLayouts;
+};
+
+} // namespace
 
 // Helper: convert a Python iterable of int|bytes to a token vector, and report
 // whether it is digest-free (knownNoDigest). A normal int becomes a 31-bit token id
@@ -627,9 +785,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- Exceptions --------------------------------------------------------
     static nb::object sOutOfMemoryError = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError");
-    static nb::object sHostOOMError = nb::exception<kv::HostOOMError>(m, "HostOOMError");
-    static nb::object sDiskOOMError = nb::exception<kv::DiskOOMError>(m, "DiskOOMError");
-    static nb::object sCuOOMError = nb::exception<kv::CuOOMError>(m, "CuOOMError");
+    static nb::object sHostOOMError = nb::exception<kv::HostOOMError>(m, "HostOOMError", sOutOfMemoryError);
+    static nb::object sDiskOOMError = nb::exception<kv::DiskOOMError>(m, "DiskOOMError", sOutOfMemoryError);
+    static nb::object sCuOOMError = nb::exception<kv::CuOOMError>(m, "CuOOMError", sOutOfMemoryError);
     static nb::object sLogicError = nb::exception<kv::LogicError>(m, "LogicError");
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
@@ -1497,7 +1655,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
-        .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio)
+        .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
+            "One positive, normalized cache-tier quota weight per layer group.")
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
@@ -1680,6 +1839,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- Introspection -------------------------------------------------------
     auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
+    mIntrospection.def(
+        "create_test_padding_cold_page_codec",
+        [](std::map<int, size_t> coldPageBytesByLayer) -> std::unique_ptr<kv::IKvCacheColdPageCodec>
+        { return std::make_unique<TestPaddingColdPageCodec>(std::move(coldPageBytesByLayer)); },
+        nb::arg("cold_page_bytes_by_layer"));
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
     mIntrospection.def(
@@ -1731,7 +1895,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     continue;
                 }
                 auto page = kv::makeShared<kv::CommittedPage>(
-                    &manager.storage(), block, lifeCycle, kv::kGpuLevel, coverage, kv::kPriorityDefault);
+                    &manager.storage(), block, lifeCycle, kv::kHotLevel, coverage, kv::kPriorityDefault);
                 page->setSlot(slots[lifeCycle].front());
                 block->storage[lifeCycle] = page.get();
                 pages.push_back(std::move(page));
@@ -1780,7 +1944,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "current_gpu_ratio",
         [](kv::KvCacheManager& manager)
         {
-            auto ratio = manager.storage().getRatioList(kv::kGpuLevel);
+            auto ratio = manager.storage().getRatioList(kv::kHotLevel);
             return std::move(ratio.raw());
         },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
@@ -1810,20 +1974,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             auto stats = kv::KvCacheIntrospection::storageStatistics(manager, kv::CacheLevel{cacheLevel});
             return std::move(stats.raw());
         },
-        nb::arg("manager"), nb::arg("cache_level") = kv::kGpuLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "life_cycle_pool_group_indices",
-        [](kv::KvCacheManager& manager)
+        [](kv::KvCacheManager& manager, int cacheLevel)
         {
             std::vector<int> result;
             result.reserve(manager.lifeCycles().size().value());
             for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
             {
-                result.push_back(manager.storage().getPoolGroupIndex(lifeCycle).value());
+                result.push_back(manager.storage().getPoolGroupIndex(kv::CacheLevel{cacheLevel}, lifeCycle).value());
             }
             return result;
         },
-        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     // White-box reuse-tree introspection: mirror the Python manager's _life_cycles
     // and _radix_tree attributes so shared tests can inspect reuse state.
     mIntrospection.def(
@@ -1922,9 +2086,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("enable_partial") = false);
     mIntrospection.def(
         "pool_group_index",
-        [](kv::KvCacheManager& manager, int lcId)
-        { return manager.storage().getPoolGroupIndex(kv::LifeCycleId{lcId}).value(); },
-        nb::arg("manager"), nb::arg("lc_id"));
+        [](kv::KvCacheManager& manager, int lcId, int cacheLevel)
+        { return manager.storage().getPoolGroupIndex(kv::CacheLevel{cacheLevel}, kv::LifeCycleId{lcId}).value(); },
+        nb::arg("manager"), nb::arg("lc_id"), nb::arg("cache_level") = kv::kHotLevel.value());
     mIntrospection.def(
         "compute_slots_for_batch",
         [](kv::KvCacheManager& manager, kv::BatchDesc const& batch, int tokensPerBlock,
@@ -1940,7 +2104,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             auto utilization = manager.storage().getUtilization(kv::CacheLevel{cacheLevel});
             return std::move(utilization.raw());
         },
-        nb::arg("manager"), nb::arg("cache_level") = kv::kGpuLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+        nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity)
@@ -1981,21 +2145,60 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
         nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
 
+    // ---- Cold-page codec --------------------------------------------------
+    nb::class_<kv::IKvCacheColdPageCodec>(m, "IKvCacheColdPageCodec");
+    m.def("create_default_kv_cache_cold_page_codec", &kv::createDefaultKvCacheColdPageCodec,
+        "Create the default lossless cold-page codec. Passing cold_page_codec=None to KVCacheManager already selects "
+        "this codec, so normal users do not need to call this factory. It is primarily provided to demonstrate how a "
+        "native codec factory exposes an owning IKvCacheColdPageCodec object for transfer into KVCacheManager. Any "
+        "KVCacheManager construction attempt consumes an explicitly supplied codec, including an attempt that fails.");
+
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
         .def(
             "__init__",
-            [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager)
+            [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager,
+                nb::object codecObject)
             {
                 std::shared_ptr<kv::EventSink> eventSink;
                 if (!eventManager.is_none())
                 {
                     eventSink = nb::cast<std::shared_ptr<kv::EventManager>>(eventManager);
                 }
+
+                std::unique_ptr<kv::IKvCacheColdPageCodec> codec;
+                if (!codecObject.is_none())
+                {
+                    if (!nb::isinstance<kv::IKvCacheColdPageCodec>(codecObject))
+                    {
+                        throw nb::type_error("cold_page_codec must be an IKvCacheColdPageCodec instance or None");
+                    }
+                    try
+                    {
+                        codec = nb::cast<std::unique_ptr<kv::IKvCacheColdPageCodec>>(codecObject);
+                    }
+                    catch (nb::cast_error const&)
+                    {
+                        // A codec is consumed by the construction it is passed to, whether that construction
+                        // succeeds or fails, so reusing the wrapper finds a relinquished nanobind instance.
+                        // Report the Python-conventional TypeError instead of letting nb::cast_error (an alias
+                        // of std::bad_cast) surface as an opaque RuntimeError.
+                        throw nb::type_error(
+                            "cold_page_codec has already been consumed by a KVCacheManager construction attempt and "
+                            "cannot be supplied again");
+                    }
+                    if (!codec)
+                    {
+                        throw std::invalid_argument(
+                            "cold_page_codec must own a non-null IKvCacheColdPageCodec pointer");
+                    }
+                }
+
                 nb::gil_scoped_release release;
-                new (self) kv::KvCacheManager(config, std::move(eventSink));
+                new (self) kv::KvCacheManager(config, std::move(eventSink), std::move(codec));
             },
-            nb::arg("config"), nb::arg("event_manager").none() = nb::none())
+            nb::arg("config"), nb::arg("event_manager").none() = nb::none(),
+            nb::arg("cold_page_codec").none() = nb::none())
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
@@ -2003,7 +2206,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
-                std::optional<int> expectedPromptLength, std::optional<bool> textOnly)
+                std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
@@ -2011,7 +2214,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     nb::gil_scoped_release release;
                     return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
-                        expectedPromptLength, textOnly);
+                        expectedPromptLength, textOnly, enableRequestStats);
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
@@ -2027,13 +2230,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                             promptLen = static_cast<int>(view.size());
                         }
                         nb::gil_scoped_release release;
-                        return self->createKvCache(
-                            std::move(reuseScope), view, id, std::move(priorityCb), promptLen, textOnly);
+                        return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
+                            textOnly, enableRequestStats);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
-            nb::arg("text_only") = std::nullopt)
+            nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)

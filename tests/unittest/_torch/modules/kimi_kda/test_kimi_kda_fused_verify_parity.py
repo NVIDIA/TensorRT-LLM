@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Runtime-level parity: KimiKDARuntime fused verify vs sequential verify.
+"""Runtime-level parity: KimiKDALinearAttention fused verify vs sequential verify.
 
 Simulates two chained speculative-verification rounds through
-``KimiKDARuntime._forward_verify`` in both worlds:
+``KimiKDALinearAttention.forward_verify`` in both worlds:
 
 * Sequential world: the legacy intermediate-buffer path
-  (``_forward_verify_sequential``) plus the manager's legacy promotion
+  (``forward_verify_sequential``) plus the manager's legacy promotion
   (copy the accepted step's conv window / SSM state into the live pools).
 * Fused world: the ``trtllm::kda_mtp_decode`` replay path
-  (``_forward_verify_fused``) with per-slot replay caches, in-place state
+  (``forward_verify_fused``) with per-slot replay caches, in-place state
   commit after the golden token, and only the accepted-draft count
   recorded between rounds.
 
@@ -50,7 +50,7 @@ try:
     # The model module transitively imports the optional deps above, so it
     # must stay behind the guard too or collection fails instead of skipping.
     from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
-    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
+    from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 except ImportError as e:
     _HAVE_DEPS = False
     _DEP_ERR = str(e)
@@ -96,7 +96,7 @@ def _make_runtime(seed, aux_stream=None):
             gate_lower_bound=LB,
         ),
     )
-    rt = KimiKDARuntime(cfg, layer_idx=0, aux_stream=aux_stream).to("cuda")
+    rt = KimiKDALinearAttention(cfg, layer_idx=0, aux_stream=aux_stream).to("cuda")
     gen = torch.Generator(device="cuda").manual_seed(seed)
     for name, p in rt.named_parameters():
         if name.endswith("A_log"):
@@ -209,11 +209,11 @@ def test_fused_vs_sequential_two_rounds():
     ok = True
     # ---- Round 1 (no pending drafts) ----
     x1 = tokens()
-    out1_seq = rt_seq._forward_verify_sequential(
+    out1_seq = rt_seq.forward_verify_sequential(
         x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
     )
     with with_multi_stream(True):
-        out1_fused = rt_fused._forward_verify(
+        out1_fused = rt_fused.forward_verify(
             x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
     print("round 1:")
@@ -226,11 +226,11 @@ def test_fused_vs_sequential_two_rounds():
 
     # ---- Round 2 (fused path replays the accepted drafts) ----
     x2 = tokens()
-    out2_seq = rt_seq._forward_verify_sequential(
+    out2_seq = rt_seq.forward_verify_sequential(
         x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
     )
     with with_multi_stream(True):
-        out2_fused = rt_fused._forward_verify(
+        out2_fused = rt_fused.forward_verify(
             x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
     print("round 2 (mixed replay):")
