@@ -216,7 +216,6 @@ l0_b200:
   # from tests/torch/ which test-db cannot list).
   - unittest/_torch/speculative/test_suffix_automaton.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
-  - unittest/_torch/attention/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
   - unittest/_torch/attention/kernels/serial

@@ -116,7 +116,6 @@ unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=un
 unittest/_torch/misc,NVIDIA Graphics Device,4,B200 Bring Up Board
 unittest/_torch/speculative,NVIDIA Graphics Device,4,B200 Bring Up Board
 unittest/_torch/thop/parallel,NVIDIA Graphics Device,16,B200 Bring Up Board
-unittest/_torch/attention/kernels/parallel,NVIDIA Graphics Device,16,B200 Bring Up Board
 unittest/auto_deploy/singlegpu/compile,NVIDIA B200,4,
 unittest/auto_deploy/singlegpu/custom_ops,NVIDIA B200,4,
 unittest/auto_deploy/singlegpu/models,NVIDIA B200,4,
@@ -127,7 +126,6 @@ unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=un
 unittest/_torch/misc,NVIDIA B200,4,
 unittest/_torch/speculative/test_eagle3.py,NVIDIA B200,4,
 unittest/_torch/thop/parallel,NVIDIA B200,16,
-unittest/_torch/attention/kernels/parallel,NVIDIA B200,16,
 unittest/kv_cache_manager_v2_tests,NVIDIA B200,8,
 unittest/auto_deploy/singlegpu/compile,NVIDIA H100,4,
 unittest/auto_deploy/singlegpu/custom_ops,NVIDIA H100,4,
@@ -138,15 +136,12 @@ unittest/auto_deploy/singlegpu/utils,NVIDIA H100,4,
 unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py,NVIDIA H100,4,
 unittest/_torch/misc,NVIDIA H100,4,
 unittest/_torch/thop/parallel,NVIDIA H100,16,
-unittest/_torch/attention/kernels/parallel,NVIDIA H100,16,
 unittest/_torch/thop/parallel_hw_agnostic,NVIDIA H100,16,
 unittest/_torch/attention/kernels/parallel_hw_agnostic,NVIDIA H100,16,
 unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py,NVIDIA H100 PCIe,1,
 unittest/_torch/attention --ignore=unittest/_torch/attention/kernels --ignore=unittest/_torch/attention/test_mha_helix.py --ignore=unittest/_torch/attention/test_mla_helix.py --ignore=unittest/_torch/attention/test_mla_registry.py,NVIDIA GB300,4,
 unittest/_torch/thop/parallel,NVIDIA GB300,16,
-unittest/_torch/attention/kernels/parallel,NVIDIA GB300,16,
 unittest/_torch/thop/serial,NVIDIA GB300,4,
 unittest/_torch/attention/kernels/serial,NVIDIA GB300,4,
 unittest/_torch/executor,NVIDIA GB300,4,
 unittest/_torch/thop/parallel,NVIDIA B300 SXM6 AC,16,
-unittest/_torch/attention/kernels/parallel,NVIDIA B300 SXM6 AC,16,

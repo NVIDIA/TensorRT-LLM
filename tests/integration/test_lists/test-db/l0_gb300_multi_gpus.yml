@@ -20,7 +20,6 @@ l0_gb300_multi_gpus:
   # import time, so it must not share a pytest process with the attention suite.
   - unittest/_torch/attention/test_mla_helix.py
   - unittest/_torch/thop/parallel
-  - unittest/_torch/attention/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
   - unittest/_torch/attention/kernels/serial

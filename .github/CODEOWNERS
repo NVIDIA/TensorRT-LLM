@@ -328,6 +328,11 @@
 # Also exercises the sliding-block-table op that the sparse cache manager owns,
 # so a change to either side routes to that team as well.
 /tests/unittest/_torch/attention/kernels/test_deepseek_v4_block_table.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-runtime-devs
+# Deliberately still under thop/: the top-k kernel this exercises gained a second
+# production consumer outside Attention (KV-cache compression), so the test's final
+# home is settled together with the kernel's, not by this move. Keeping the explicit
+# rule preserves Attention ownership meanwhile. See TRTLLM-14844.
+/tests/unittest/_torch/thop/parallel/test_indexer_topk.py @NVIDIA/trt-llm-torch-attention-devs
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs

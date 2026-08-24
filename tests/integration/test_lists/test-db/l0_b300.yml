@@ -24,7 +24,6 @@ l0_b300:
   - unittest/_torch/modeling/test_qsa_runtime_wiring.py
   - unittest/_torch/modeling/test_qwen4_exp_support.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
-  - unittest/_torch/attention/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
   - unittest/_torch/attention/kernels/serial
