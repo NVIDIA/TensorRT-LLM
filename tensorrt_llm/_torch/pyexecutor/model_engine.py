@@ -18,6 +18,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
@@ -42,8 +44,6 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend.interface import (AttentionMetadata,
@@ -530,6 +530,7 @@ class PyTorchModelEngine(ModelEngine):
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
+            # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
@@ -1134,6 +1135,7 @@ class PyTorchModelEngine(ModelEngine):
                 max_lora_rank=lora_config.max_lora_rank,
                 model=self.model,
                 lora_model_config=self.lora_model_config,
+                overlap_lora_and_base=lora_config.overlap_lora_and_base,
                 device='cuda',
                 max_tokens_per_seq=max_tokens_per_seq)
 
@@ -3754,6 +3756,16 @@ class PyTorchModelEngine(ModelEngine):
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
+    def _should_use_full_generation_page_table(
+            self, spec_config: Optional[DecodingBaseConfig],
+            attn_metadata: AttentionMetadata) -> bool:
+        """Return whether overlap decode needs every reserved generation page."""
+        # FlashInfer metadata owns the optional device-side KV-length correction used with this
+        # wider page table.
+        return (self.enable_spec_decode and not self._disable_overlap_scheduler
+                and getattr(spec_config, '_use_shared_kv_cache', False)
+                and hasattr(attn_metadata, 'apply_spec_decode_kv_lens_offsets'))
+
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
@@ -3805,6 +3817,17 @@ class PyTorchModelEngine(ModelEngine):
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
                     inputs['attn_metadata'].on_update_kv_lens()
+                # TRTLLM uses `kv_lens_cuda` above; FlashInfer exposes this backend-specific
+                # correction without coupling the engine to its metadata type.
+                elif hasattr(inputs['attn_metadata'],
+                             'apply_spec_decode_kv_lens_offsets'):
+                    inputs['attn_metadata'].apply_spec_decode_kv_lens_offsets(
+                        self.previous_kv_lens_offsets_cuda,
+                        num_gen_requests,
+                        self.get_runtime_tokens_per_gen_step(
+                            self.runtime_draft_len),
+                        num_chunked_contexts=num_chunked_ctx_requests,
+                    )
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -3852,6 +3875,18 @@ class PyTorchModelEngine(ModelEngine):
                                 self.
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
+                # Restore the FlashInfer-specific logical KV lengths through the same optional hook
+                # used by `_preprocess_inputs`.
+                elif hasattr(inputs['attn_metadata'],
+                             'apply_spec_decode_kv_lens_offsets'):
+                    inputs['attn_metadata'].apply_spec_decode_kv_lens_offsets(
+                        self.previous_kv_lens_offsets_cuda,
+                        num_gen_requests,
+                        self.get_runtime_tokens_per_gen_step(
+                            self.runtime_draft_len),
+                        num_chunked_contexts=num_chunked_ctx_requests,
+                        restore=True,
+                    )
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
@@ -4555,7 +4590,10 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            use_full_generation_page_table=(
+                self._should_use_full_generation_page_table(
+                    spec_config, attn_metadata)))
         attn_metadata.kv_cache_manager = kv_cache_manager
         attn_metadata.prepare()
 
@@ -5686,6 +5724,7 @@ class PyTorchModelEngine(ModelEngine):
                     input_ids.append(
                         request.get_tokens(0)[request.context_current_position])
                     past_seen_token_num = request.context_current_position
+                    request_has_previous_tensor = False
                 # The request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -5707,17 +5746,34 @@ class PyTorchModelEngine(ModelEngine):
                             else:
                                 input_ids.append(request.get_last_tokens(beam))
                     past_seen_token_num = request.max_beam_num_tokens - 1
+                    request_has_previous_tensor = False
                 else:
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
+                    request_has_previous_tensor = True
 
                 position_id = past_seen_token_num
                 if _has_cp_helix:
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    if request_has_previous_tensor:
+                        # With the overlap scheduler this batch is prepared
+                        # before the previous iteration's _update_requests has
+                        # advanced py_decoding_iter, so the counter is one
+                        # behind. Compensate exactly like the non-helix path
+                        # above, which uses max_beam_num_tokens *without* the
+                        # -1 in this case. Without this, the position repeats
+                        # once (L, L, L+1, ...) and the new token's K is roped
+                        # at the wrong position before being written to the KV
+                        # cache, corrupting every later step.
+                        # TODO: revisit for helix x speculative decoding -
+                        # the base formula and this +1 both assume exactly
+                        # one new token per step (draft-token modes are
+                        # currently rejected under helix).
+                        position_id += 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
                     else:
@@ -6198,7 +6254,10 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            use_full_generation_page_table=(
+                self._should_use_full_generation_page_table(
+                    spec_config, attn_metadata)))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):

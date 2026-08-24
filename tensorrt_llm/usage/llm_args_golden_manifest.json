@@ -1001,6 +1001,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "lora_config.overlap_lora_and_base"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "lora_config.swap_gate_up_proj_lora_b_weight"
     },
     {
@@ -1064,7 +1071,6 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
-        "WIDEEP",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1074,7 +1080,7 @@
         "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"
@@ -1617,6 +1623,16 @@
       "path": "sparse_attention_config.indexer_k_dtype"
     },
     {
+      "allowed_values": [
+        "bf16",
+        "fp8"
+      ],
+      "annotation": "Literal['bf16', 'fp8']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.indexer_kv_dtype"
+    },
+    {
       "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
@@ -1912,6 +1928,13 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.enable_global_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.enable_penalty"
     },
     {
       "allowed_values": [],

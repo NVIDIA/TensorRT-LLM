@@ -43,9 +43,9 @@ try:
 except ImportError:
     PlacementGroup = None
 
+from tensorrt_llm._torch.peft.lora.config import (
+    LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
-from tensorrt_llm.lora_helper import (LoraConfig,
-                                      get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
@@ -714,12 +714,13 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
-    sparse_num_index_heads: int = Field(
+    sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description="Number of index-attention heads (per TP rank's view).",
     )
     sparse_index_dim: int = Field(
         default=128,
+        gt=0,
         description="Per-head index Q/K dimension.",
     )
     sparse_block_size: int = Field(
@@ -747,6 +748,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    indexer_kv_dtype: Literal["bf16", "fp8"] = Field(
+        default="bf16",
+        description=
+        "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses "
+        "unscaled E4M3 values with FP32 score accumulation and is supported only "
+        "by the MSA implementation.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -769,11 +778,18 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     )
 
     @model_validator(mode="after")
-    def _validate_msa_block_size(self):
+    def _validate_msa_configuration(self):
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "
                 f"128, got {self.sparse_block_size}.")
+        if self.indexer_kv_dtype == "fp8" and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 indexer_kv_dtype='fp8' currently requires the "
+                "'msa' implementation.")
+        if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
+            raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
+                             "sparse_disable_index_value=True.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -796,6 +812,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
+            indexer_kv_dtype=self.indexer_kv_dtype,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1418,8 +1435,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
+        "AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM", "DENSEGEMM",
+        "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"] = Field(
             default='AUTO',
             description="MoE backend to use. "
@@ -1750,6 +1767,15 @@ class AdvancedSamplingMode(StrEnum):
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
 
 
+class _MTPDraftCheckpointType(StrEnum):
+    """Internal description of where a one-model MTP drafter comes from."""
+
+    UNRESOLVED = "unresolved"
+    TARGET = "target"
+    HEAD_REPLACEMENT = "head_replacement"
+    EXTERNAL_DRAFT_MODEL = "external_draft_model"
+
+
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
@@ -1769,9 +1795,9 @@ class DecodingBaseConfig(StrictBaseModel):
         description=
         "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'), "
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory. "
-        "For MTP, when set to a checkpoint other than the target model, loads MTP heads from it instead of any "
-        "embedded mtp.* weights in the target; pointing it at the target model keeps the embedded heads."
-    )
+        "For one-model MTP, a non-target checkpoint provides either replacement MTP heads or a complete external "
+        "draft model, depending on the target model implementation. Pointing it at the target checkpoint uses the "
+        "target's embedded mtp.* weights.")
 
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
@@ -1840,6 +1866,17 @@ class DecodingBaseConfig(StrictBaseModel):
         "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
         "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
 
+    enable_penalty: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, enables the occurrence penalties (repetition / presence / frequency) "
+        "for one-model speculative decoding. Off by default because the penalties need a "
+        "[num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front "
+        "(CUDA graphs capture fixed buffer addresses). While off, a request that asks for "
+        "any of these penalties is rejected at admission rather than silently decoded "
+        "without them.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -1850,9 +1887,10 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
     # If set, the draft model attends directly over the target model KV cache.
     _use_shared_kv_cache: bool = PrivateAttr(False)
-    # If set, speculative_model resolves to the target checkpoint, so one-model
-    # MTP loads its heads from the target weights instead of a separate file.
-    _mtp_heads_in_target_checkpoint: bool = PrivateAttr(False)
+    # Describes whether one-model MTP is embedded in the target, supplied as an MTP head replacement
+    # checkpoint, or supplied as an external draft model.
+    _mtp_draft_checkpoint_type: _MTPDraftCheckpointType = PrivateAttr(
+        default=_MTPDraftCheckpointType.UNRESOLVED)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -1964,28 +2002,30 @@ class DecodingBaseConfig(StrictBaseModel):
         return True
 
     @property
-    def loads_mtp_from_separate_checkpoint(self) -> bool:
-        """Whether one-model MTP heads come from ``speculative_model``.
+    def uses_replacement_heads(self) -> bool:
+        """Whether `speculative_model` contains replacement MTP heads."""
+        if (not self.spec_dec_mode.is_mtp_one_model()
+                or self.speculative_model is None):
+            return False
+        return (self._mtp_draft_checkpoint_type ==
+                _MTPDraftCheckpointType.HEAD_REPLACEMENT)
 
-        False when ``speculative_model`` resolves to the target checkpoint:
-        the heads are then loaded from the target weights, as they were
-        before separate MTP checkpoints were supported.
-        """
+    @property
+    def uses_external_draft_model(self) -> bool:
+        """Whether `speculative_model` contains an external draft model."""
         return (self.spec_dec_mode.is_mtp_one_model()
-                and self.speculative_model is not None
-                and not self._mtp_heads_in_target_checkpoint)
+                and self._mtp_draft_checkpoint_type
+                == _MTPDraftCheckpointType.EXTERNAL_DRAFT_MODEL)
 
     @property
     def needs_separate_draft_weights(self) -> bool:
         """Whether draft weights must be loaded from ``speculative_model``.
 
-        True for Eagle3 one-model / external drafters, Gemma4 shared-KV, and
-        one-model MTP when MTP heads live in a separate checkpoint.
+        This includes external draft models and MTP head replacement checkpoints.
         """
-        if (self.spec_dec_mode.need_load_draft_weights()
-                or self._use_shared_kv_cache):
-            return True
-        return self.loads_mtp_from_separate_checkpoint
+        return (self.spec_dec_mode.need_load_draft_weights()
+                or self.uses_external_draft_model
+                or self.uses_replacement_heads)
 
     @property
     def spec_dec_mode(self):
@@ -4053,8 +4093,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=None,
         min_length=1,
         status="prototype",
-        description="Initial pool ratios for KV cache manager v2. Values map to "
-        "KVCacheManagerV2 pool_group_id order and must sum to 1.0. Hybrid Mamba "
+        description="Initial hot-tier byte ratios by layer group for KV cache "
+        "manager v2. Values map to KVCacheManagerV2 layer-group ID order and "
+        "must sum to 1.0. Cold tiers preserve the implied slot-count ratios. Hybrid Mamba "
         "models and DeepSeek-V4 use this directly, so avg_seq_len does not take "
         "effect when this is set.")
 

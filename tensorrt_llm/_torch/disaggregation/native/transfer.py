@@ -852,6 +852,13 @@ class Sender(SenderBase):
 
             tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
+            if peer_ri.cp_size > 1 and self._registrar.self_rank_info.cp_size == 1:
+                # Helix: the receiver owns global blocks [cp_rank::cp_size]
+                # (same protocol as partition_context_for_helix). The strided
+                # subset has exactly the receiver's block count, so the
+                # suffix alignment below degenerates to identity; block
+                # reuse is rejected under helix.
+                src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
 
@@ -1779,8 +1786,13 @@ class Receiver(ReceiverBase):
         # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
+        # Helix writers contribute unequal shares (one KV owner, one state
+        # sender, the rest empty), so the fan-in equal split would overflow
+        # into neighboring reservations; use the per-fragment path.
+        cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
         allow_bounce = task.expected_transfers == 1 or (
             sender_dp_rank is not None
+            and not cp_involved
             and self._fanin_bounce_safe(
                 topo_overlap,
                 peer_infos,
@@ -1793,14 +1805,15 @@ class Receiver(ReceiverBase):
         extra_bytes = 0
         if receiver_req.mamba_state_index is not None:
             if peer_infos.page_table is None:
-                allow_bounce = False  # cannot size the sender's recurrent-state payload
+                allow_bounce = False  # cannot size the recurrent-state payload
             else:
-                extra_bytes = MambaPolicy.payload_bytes(
+                # Receiver-local sizing: RankInfoServer runs on ctx rank 0
+                # only, so a sender-side simulation under-reserves for every
+                # receiver whose paired sender is not rank 0.
+                extra_bytes = MambaPolicy.receiver_payload_bytes(
                     sender_page_table=peer_infos.page_table,
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=receiver_req.mamba_state_index,
-                    sender_ri=peer_infos,
-                    receiver_ri=self._registrar.self_rank_info,
                 )
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes

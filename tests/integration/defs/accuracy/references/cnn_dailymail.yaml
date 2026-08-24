@@ -36,28 +36,10 @@ gpt-next:
   - accuracy: 25.516
 microsoft/phi-2:
   - accuracy: 31.255
-microsoft/Phi-3-mini-4k-instruct:
-  - accuracy: 33.147
-microsoft/Phi-3-mini-128k-instruct:
-  - accuracy: 31.331
-microsoft/Phi-3-small-8k-instruct:
-  - accuracy: 26.994
-microsoft/Phi-3-small-128k-instruct:
-  - accuracy: 27.208
-microsoft/Phi-3.5-mini-instruct:
-  - accuracy: 31.354
-microsoft/Phi-4-mini-instruct:
-  - accuracy: 32.921
-  - quant_algo: FP8
-    accuracy: 32.823
 bigcode/starcoder2-7b:
   - accuracy: 26.611
   - quant_algo: FP8
     accuracy: 26.611
-mistralai/Codestral-22B-v0.1:
-  - accuracy: 30.316
-  - quant_algo: FP8
-    accuracy: 30.316
 state-spaces/mamba-130m-hf:
   - accuracy: 19.470
 lmsys/vicuna-7b-v1.3:
@@ -182,59 +164,11 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 34.383
   - quant_algo: FP8
     accuracy: 34.927
-mistralai/Mistral-7B-v0.1:
-  - accuracy: 25.741
-  - extra_acc_spec: beam_width=4
-    accuracy: 28.368
-  - extra_acc_spec: beam_width=2
-    accuracy: 27.663
-  - extra_acc_spec: beam_width=1
-    accuracy: 25.604
-  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
-    accuracy: 24.806
-  - quant_algo: FP8
-    accuracy: 25.180
-  - quant_algo: W4A16_AWQ
-    accuracy: 24.806
-mistralai/Mistral-7B-Instruct-v0.3:
-  - quant_algo: W4A16
-    accuracy: 31.372
-  - quant_algo: W4A16_AWQ
-    accuracy: 31.457
-  - quant_algo: W4A8_AWQ
-    accuracy: 31.201
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 29.20
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 27.0
-nvidia/Mistral-NeMo-Minitron-8B-Instruct:
-  - quant_algo: FP8
-    accuracy: 32.553
-mistralai/Mixtral-8x7B-v0.1:
-  - accuracy: 28.810
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 29.733
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 27.109
-  - quant_algo: W4A16
-    accuracy: 23.229
-  - quant_algo: W4A16_AWQ
-    accuracy: 23.229
-  - quant_algo: W8A16
-    accuracy: 27.624
-  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
-    accuracy: 27.979
-mistralai/Mixtral-8x7B-Instruct-v0.1:
-  - quant_algo: W4A16_AWQ
-    accuracy: 28.810
-mistralai/Mixtral-8x22B-v0.1:
-  - quant_algo: FP8
-    accuracy: 25.519
-  - quant_algo: W8A16
-    accuracy: 27.427
 google/gemma-2b:
   - accuracy: 23.194
   - quant_algo: W8A16

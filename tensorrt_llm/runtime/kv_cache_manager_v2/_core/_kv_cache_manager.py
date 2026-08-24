@@ -259,6 +259,7 @@ class KVCacheManager:
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
+        self._living_kv_caches = set[rawref.ref[_KVCache]]()
         self._life_cycles = LifeCycleRegistry(config)
         storage_config = create_storage_config(config)
         storage = StorageManager(
@@ -275,7 +276,6 @@ class KVCacheManager:
         radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         self._storage = storage
         self._radix_tree = radix_tree
-        self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
         self._avg_sqr_capacity = MovingAverage(decay)
@@ -909,20 +909,20 @@ class KVCacheManager:
         tokens_per_block = self.tokens_per_block
         storage = self._storage
 
-        def ratio_from_length(
-            history_length: int, capacity: int
-        ) -> TypedIndexList[PoolGroupIndex, float]:
-            return storage.ratio_from_length(tokens_per_block, history_length, capacity)
-
         avg_reused_length: int = round(self._avg_reused_length.value)
         avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)
         avg_history_length: int = round(self._avg_sqr_history_length.value**0.5)
         if avg_capacity > 0:
-            self._target_ratio_list_gpu = storage.constrain_ratio(
-                ratio_from_length(avg_history_length, avg_capacity)
+            life_cycle_ratio = storage.ratio_from_length(
+                tokens_per_block, avg_history_length, avg_capacity
             )
+            pool_group_ratio = storage.pool_group_ratio(life_cycle_ratio)
+            self._target_ratio_list_gpu = storage.constrain_pool_group_ratio(pool_group_ratio)
         if avg_reused_length > 0:
-            self._target_ratio_list_other = ratio_from_length(avg_reused_length, avg_reused_length)
+            life_cycle_ratio = storage.ratio_from_length(
+                tokens_per_block, avg_reused_length, avg_reused_length
+            )
+            self._target_ratio_list_other = storage.pool_group_ratio(life_cycle_ratio)
 
     # @TODO: need updating when dynamic resizing is supported.
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int:

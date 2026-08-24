@@ -4,13 +4,14 @@
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import types
 from typing import Optional, Tuple
 
 import torch
 
-from .common import _INIT_SCORE, _LOCAL_SCORE, write_kv_slots
+from .common import write_kv_slots
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
@@ -19,9 +20,34 @@ MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
 
 
+def _install_msa_cutlass_compatibility() -> None:
+    """Provide the CUTLASS 4.5 names still referenced by the packaged MSA sources."""
+    try:
+        import cutlass.cute as cute
+    except ImportError:
+        return
+
+    # MSA has not yet migrated these two aliases to their CUTLASS DSL 4.6
+    # names. Keep this shim local to the MSA import path and remove it once the
+    # packaged sources use cute.ThrMma and cute.make_rmem_tensor directly.
+    if not hasattr(cute.core, "ThrMma"):
+        setattr(cute.core, "ThrMma", cute.ThrMma)
+    if not hasattr(cute, "make_fragment"):
+        setattr(cute, "make_fragment", cute.make_rmem_tensor)
+
+
+@functools.lru_cache(maxsize=1)
 def msa_package_available() -> bool:
-    """Return whether the packaged fmha_sm100 module can be imported."""
-    return importlib.util.find_spec("fmha_sm100") is not None
+    """Prepare and report whether the packaged fmha_sm100 module can be imported.
+
+    Cached: each call scans sys.path until fmha_sm100 is first imported, and
+    create_fmha_libs asks once per attention layer. Whether the package is
+    installed cannot change within a process.
+    """
+    if importlib.util.find_spec("fmha_sm100") is None:
+        return False
+    _install_msa_cutlass_compatibility()
+    return True
 
 
 def require_msa_module() -> types.ModuleType:
@@ -31,6 +57,7 @@ def require_msa_module() -> types.ModuleType:
     advertised in the config schema on systems where the kernels cannot load.
     A missing package is a hard error, never a silent fallback to another backend.
     """
+    _install_msa_cutlass_compatibility()
     try:
         import fmha_sm100
     except ImportError as exc:
@@ -156,42 +183,26 @@ def select_blocks_from_maxscore(
     n_valid_blocks: torch.Tensor,
     init_blocks: int,
     local_blocks: int,
+    head_major_output: bool = False,
 ) -> torch.Tensor:
     """Select per-query top-k blocks from per-KV-head block scores.
 
     Applies init and local forced blocks and per-query valid-block masking
     on the amax-reduced scores [num_kv_heads, n_blocks, total_q]. Returns
     [total_q, num_kv_heads, topk] int32 ascending block ids with -1 tail
-    padding.
+    padding. When ``head_major_output`` is set, the logical result uses a
+    head-major backing so ``result.permute(1, 0, 2)`` is contiguous without a
+    copy.
     """
-    num_kv_heads, n_blocks, total_q = max_score_kv.shape
-    device = max_score_kv.device
-    scores = max_score_kv.permute(2, 0, 1).to(torch.float32).clone()
-    block_ids = torch.arange(n_blocks, device=device, dtype=torch.long)
-    nvb = n_valid_blocks.to(device=device, dtype=torch.long)
-
-    if init_blocks > 0:
-        init_mask = block_ids.view(1, 1, -1) < init_blocks
-        scores = torch.where(init_mask, torch.full_like(scores, _INIT_SCORE), scores)
-    if local_blocks > 0:
-        local_start = (nvb - local_blocks).clamp_min(0)
-        local_mask = (block_ids.view(1, -1) >= local_start.view(-1, 1)) & (
-            block_ids.view(1, -1) < nvb.view(-1, 1)
-        )
-        scores = torch.where(local_mask.unsqueeze(1), torch.full_like(scores, _LOCAL_SCORE), scores)
-    block_valid = block_ids.view(1, -1) < nvb.view(-1, 1)
-    scores = scores.masked_fill(~block_valid.unsqueeze(1), float("-inf"))
-
-    k = min(topk, n_blocks)
-    vals, idx = scores.topk(k=k, dim=-1)
-    idx = torch.where(vals != float("-inf"), idx, torch.full_like(idx, -1))
-    sort_key = torch.where(idx < 0, torch.full_like(idx, n_blocks), idx)
-    sort_key, _ = torch.sort(sort_key, dim=-1)
-    idx = torch.where(sort_key >= n_blocks, torch.full_like(sort_key, -1), sort_key)
-    if k < topk:
-        pad = torch.full((total_q, num_kv_heads, topk - k), -1, dtype=idx.dtype, device=device)
-        idx = torch.cat([idx, pad], dim=-1)
-    return idx.to(torch.int32)
+    nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
+    return torch.ops.trtllm.minimax_m3_select_blocks(
+        max_score_kv,
+        nvb,
+        topk,
+        init_blocks,
+        local_blocks,
+        head_major_output,
+    )
 
 
 __all__ = [

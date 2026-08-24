@@ -88,28 +88,6 @@ meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 78.58
-mistralai/Mistral-7B-v0.1:
-  - accuracy: 66
-mistralai/Mistral-7B-Instruct-v0.3:
-  - quant_algo: W4A16
-    accuracy: 59.23
-  - quant_algo: W4A16_AWQ
-    accuracy: 61.06
-  - quant_algo: W4A8_AWQ
-    accuracy: 60.04
-mistralai/Mixtral-8x7B-v0.1:
-  - accuracy: 71.35
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 71.27
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 69.64
-mistralai/Mixtral-8x7B-Instruct-v0.1:
-  - accuracy: 68.0
-mistralai/Mixtral-8x22B-v0.1:
-  - quant_algo: FP8
-    accuracy: 77.63
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 81.7
   - quant_algo: FP8
@@ -309,22 +287,11 @@ nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 57.12
-microsoft/Phi-4-mini-instruct:
-  - accuracy: 68.98
-  - quant_algo: FP8
-    accuracy: 68.30
 bigcode/starcoder2-7b:
   - accuracy: 41.35
   - quant_algo: FP8
     accuracy: 41.35
-mistralai/Codestral-22B-v0.1:
-  - accuracy: 61.72
-  - quant_algo: FP8
-    accuracy: 61.72
-# Created a dummy accuracy to track tp_size=2 for phi4-mini model.
 # TODO: update once https://nvbugs/5393849 is fixed.
-microsoft/Phi-4-mini-instruct-tp2:
-  - accuracy: 0.0
 nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
   - accuracy: 83.70
   - quant_algo: FP8
@@ -335,14 +302,6 @@ mistralai/Ministral-8B-Instruct-2410:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 65.96
-microsoft/Phi-4-multimodal-instruct:
-  - accuracy: 69.69
-  - quant_algo: FP8
-    accuracy: 68.86
-  - quant_algo: NVFP4
-    accuracy: 64.04
-microsoft/Phi-4-multimodal-instruct-long-rope:
-  - accuracy: 65.98
 GPT-OSS/BF16:
   - accuracy: 77.50
 GPT-OSS/MXFP4:

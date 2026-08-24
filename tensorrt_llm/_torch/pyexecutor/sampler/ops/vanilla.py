@@ -187,6 +187,54 @@ def sample_rejected(
 GREEDY_TEMPERATURE_THRESHOLD = 1e-4
 
 
+def occurrence_penalized_logits(
+    logits: torch.Tensor,
+    *,
+    count: torch.Tensor,
+    seen_for_repetition: torch.Tensor,
+    seen_for_presence: torch.Tensor,
+    repetition: torch.Tensor,
+    presence: torch.Tensor,
+    frequency: torch.Tensor,
+) -> torch.Tensor:
+    """The occurrence-penalty formula, shared by every backend that applies it.
+
+    Single source of truth for the arithmetic, so the eager and CUDA-graph paths
+    cannot drift apart. Callers differ only in how they gather the operands; this
+    function knows nothing about slots, beams or row layouts.
+
+    Args:
+        logits: ``[..., vocab_size]`` raw logits. Not modified; the penalized values
+            are returned, cast back to ``logits.dtype``.
+        count: how often each token has occurred, broadcast against ``logits``.
+        seen_for_repetition: mask of tokens the repetition penalty applies to. Kept
+            separate from ``seen_for_presence`` because a prompt prefix excluded by
+            ``prompt_ignore_length`` still counts as "seen" for repetition.
+        seen_for_presence: mask of tokens presence/frequency apply to.
+        repetition / presence / frequency: per-row penalty parameters, broadcast
+            against ``logits``.
+
+    Repetition is multiplicative and splits on the logit's sign -- dividing a
+    negative logit would raise it -- so a value > 1 always pushes a seen token down.
+    Presence and frequency are plain subtractions.
+    """
+    penalized = logits.float()
+    repeated = torch.where(penalized < 0, penalized * repetition, penalized / repetition)
+    penalized = torch.where(seen_for_repetition, repeated, penalized)
+    penalized = penalized - torch.where(
+        seen_for_presence,
+        presence + frequency * count.to(torch.float32),
+        penalized.new_zeros(()),
+    )
+    # Clamp only what the arithmetic above could have pushed out of range. A logit
+    # that arrived non-finite -- a -inf from an embedding bias, say, since bias runs
+    # before penalties -- must stay that way; clamping it to the finite minimum would
+    # make a token the user masked out eligible for sampling again.
+    limit = torch.finfo(logits.dtype).max
+    clamped = penalized.clamp(-limit, limit)
+    return torch.where(torch.isfinite(logits), clamped, logits.float()).to(logits.dtype)
+
+
 class Fusions:
     @staticmethod
     @torch.compile(dynamic=None, fullgraph=True)
@@ -604,16 +652,15 @@ class Fusions:
             # Prompt-ignore-prefix tokens count for repetition only, not presence/frequency.
             seen = seen | prefix_seen_cuda[row_slot]
 
-        penalized = logits.float()
-        repeated = torch.where(penalized < 0, penalized * rep, penalized / rep)
-        penalized = torch.where(seen, repeated, penalized)
-        penalized = penalized - torch.where(
-            count > 0,
-            pre + freq * count.to(torch.float32),
-            penalized.new_zeros(()),
+        penalized = occurrence_penalized_logits(
+            logits,
+            count=count,
+            seen_for_repetition=seen,
+            seen_for_presence=count > 0,
+            repetition=rep,
+            presence=pre,
+            frequency=freq,
         )
-        limit = torch.finfo(logits.dtype).max
-        penalized = penalized.clamp(-limit, limit).to(logits.dtype)
         # Cast before the select so inactive rows stay bit-identical, then write in place.
         logits.copy_(torch.where(row_active.unsqueeze(1), penalized, logits))
 

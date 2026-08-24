@@ -1759,6 +1759,7 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
@@ -1788,6 +1789,7 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
@@ -1986,6 +1988,7 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
         mgr.head_dim_per_layer = [64, 64]
         mgr.pp_layers = [0, 1]
