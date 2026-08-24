@@ -40,7 +40,7 @@ from tensorrt_llm._torch.peft.lora.config import (
 from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
                                                    supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
