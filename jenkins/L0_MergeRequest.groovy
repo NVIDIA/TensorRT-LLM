@@ -196,6 +196,8 @@ def TARGET_BRANCH = "target_branch"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def BUILD_BRANCH = "build_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -205,6 +207,7 @@ def globalVars = [
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
 ]
+globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 if (runMode == "nightly_release") {
     globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
 }
@@ -1609,6 +1612,14 @@ def collectTestResults(pipeline, testFilter, globalVars)
     })
 }
 
+def resolveBuildBranch(globalVars)
+{
+    if (globalVars[GITHUB_PR_API_URL]) {
+        return "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+    }
+    return env.gitlabBranch ? env.gitlabBranch : "main"
+}
+
 def getCommonParameters()
 {
     return [
@@ -2062,10 +2073,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
 
                         // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
                         // instead of the BuildDockerImages helper job's own counter.
@@ -2132,10 +2140,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 stage("[Build-Release-Docker-Images] Remote Run") {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
 
                         // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
                         // instead of the BuildDockerImages helper job's own counter.
@@ -2289,10 +2294,7 @@ pipeline {
             script {
                 stage("Upload Build Info") {
                     try {
-                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                        if (globalVars[GITHUB_PR_API_URL]) {
-                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
-                        }
+                        def branch = globalVars[BUILD_BRANCH]
                         def buildInfo = "commit=${env.gitlabCommit}\n" +
                             "branch=${branch}\n" +
                             "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
