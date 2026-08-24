@@ -479,7 +479,7 @@ class TestCompressionCompatibility:
         "config",
         (
             ColdPageQuantizationCompressionConfig(),
-            TriAttentionKvCacheCompressionConfig(),
+            TriAttentionKvCacheCompressionConfig(calibration_path="triattention-calibration.pt"),
         ),
     )
     def test_helix_is_rejected(self, config):
