@@ -174,6 +174,7 @@ def _gqa_sparse_decode_kernel(
     COMPUTE_DTYPE: tl.constexpr,  # dtype q is widened to; drives the QK/PV math
     USE_PDL: tl.constexpr,
     KV_NVFP4: tl.constexpr,  # cache holds packed E2M1 plus E4M3 block scales
+    USE_LINEAR_SOFTMAX: tl.constexpr,  # measured NVFP4 online-softmax recurrence
     SCALE_COLS: tl.constexpr,  # head_dim // NVFP4_SF_VEC_SIZE, NVFP4 only
     DIRECT_OUTPUT: tl.constexpr,  # one chunk needs neither FP32 scratch nor a merge
 ):
@@ -225,7 +226,13 @@ def _gqa_sparse_decode_kernel(
     bt_row = block_table_ptr + req_id * stride_bt_b
 
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-    lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    if USE_LINEAR_SOFTMAX:
+        # Keep the linear softmax denominator and reuse the producer's alpha.
+        # This removes one exp2 plus one log2 from every visited KV page; only
+        # the final LSE written for split-K merging still needs a logarithm.
+        l_i = tl.zeros((BLOCK_SIZE_H,), dtype=tl.float32)
+    else:
+        lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
     q = tl.load(
         q_ptr
@@ -296,7 +303,11 @@ def _gqa_sparse_decode_kernel(
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
         p = tl.exp2(qk - m_ij[:, None])
         l_ij = tl.sum(p, axis=1)
-        acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+        if USE_LINEAR_SOFTMAX:
+            alpha = tl.exp2(m_i - m_ij)
+            acc_o = acc_o * alpha[:, None]
+        else:
+            acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
         if KV_NVFP4:
             # V block scales use vLLM's 4x4 token-quad order rather than K's
             # linear one: [token // 4, scale_col, token % 4].
@@ -338,11 +349,19 @@ def _gqa_sparse_decode_kernel(
             if USE_SCALE:
                 v = (v * kv_scale).to(q.dtype)
         acc_o += tl.dot(p.to(v.dtype), v)
+        if USE_LINEAR_SOFTMAX:
+            l_i = l_i * alpha + l_ij
+        else:
+            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         m_i = m_ij
-        lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
 
     # An empty chunk of an active row must store zero, or the merge hits 0 * NaN.
-    scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), 0.0)
+    if USE_LINEAR_SOFTMAX:
+        scale = tl.where(l_i > 0.0, 1.0 / l_i, 0.0)
+        lse_out = tl.where(l_i > 0.0, m_i + tl.log2(l_i), float("-inf"))
+    else:
+        scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), 0.0)
+        lse_out = lse_i
     if KV_NVFP4:
         # Applying V's scale per partial is exact: the merge is a weighted
         # average whose weights sum to one, so a constant survives it.
@@ -356,7 +375,7 @@ def _gqa_sparse_decode_kernel(
     )
     if not DIRECT_OUTPUT:
         lse_base = lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h
-        tl.store(lse_base + off_h * stride_l_h, lse_i, mask=h_mask)
+        tl.store(lse_base + off_h * stride_l_h, lse_out, mask=h_mask)
 
     # After the stores, never before: this releases either the merge grid or,
     # for direct output, the next PDL-enabled consumer of the final tensor.
@@ -466,6 +485,34 @@ def _sm103_nvfp4_num_topk_chunks(
         13: 2,
         14: 2,
     }.get(local_batch)
+
+
+def _sm103_nvfp4_use_linear_softmax(
+    *,
+    total_q: int,
+    num_kv_heads: int,
+    gqa_group_size: int,
+    max_topk: int,
+    decode_query_len: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> bool:
+    """Use the measured lower-register recurrence on validated M3 shapes."""
+    if capability is None:
+        capability = torch.cuda.get_device_capability()
+    if (
+        capability != (10, 3)
+        or num_kv_heads not in (1, 2, 4)
+        or gqa_group_size != 16
+        or max_topk != 16
+        or decode_query_len != 4
+        or total_q % decode_query_len != 0
+    ):
+        return False
+    local_batch = total_q // decode_query_len
+    # The TP4/DEP32 single-request graph is 8.9% faster with the original
+    # log-domain recurrence; every other measured DEP8/16/32 bucket is neutral
+    # or faster with the linear denominator.
+    return not (num_kv_heads == 1 and local_batch == 1)
 
 
 def _sm103_nvfp4_launch_options(
@@ -712,6 +759,13 @@ def minimax_m3_sparse_attn_decode(
 
     use_pdl = _pdl_enabled()
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
+    use_linear_softmax = kv_nvfp4 and _sm103_nvfp4_use_linear_softmax(
+        total_q=total_q,
+        num_kv_heads=num_kv_heads,
+        gqa_group_size=gqa_group_size,
+        max_topk=max_topk,
+        decode_query_len=decode_query_len,
+    )
     launch_options = (
         _sm103_nvfp4_launch_options(
             total_q=total_q,
@@ -772,6 +826,7 @@ def minimax_m3_sparse_attn_decode(
         COMPUTE_DTYPE=compute_dtype,
         USE_PDL=use_pdl,
         KV_NVFP4=kv_nvfp4,
+        USE_LINEAR_SOFTMAX=use_linear_softmax,
         SCALE_COLS=scale_cols,
         DIRECT_OUTPUT=direct_output,
         **pdl_launch,
@@ -811,6 +866,7 @@ __all__ = [
     "SPARSE_BLOCK_SIZE",
     "_sm103_nvfp4_merge_launch_options",
     "_sm103_nvfp4_num_topk_chunks",
+    "_sm103_nvfp4_use_linear_softmax",
     "minimax_m3_sparse_attn_decode",
     "resolve_num_topk_chunks",
 ]
