@@ -630,8 +630,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _close_failed_sessions(self, sessions: dict, reqs: dict, failed: list):
         for rid in failed:
+            session = sessions[rid]
+            if getattr(session, "_enforce_physical_ownership", False):
+                resources_drained = getattr(session, "resources_drained", None)
+                if resources_drained is None or not resources_drained():
+                    continue
             reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
-            sessions[rid].close()
+            if session.close() is False:
+                continue
             del reqs[rid]
             del sessions[rid]
 
@@ -797,14 +803,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         for rid in cancelled:
-            self._send_sessions[rid].close()
+            if self._send_sessions[rid].close() is False:
+                continue
             del self._send_reqs[rid]
             del self._send_sessions[rid]
 
         for rid in completed:
             if mark_complete:
                 self._send_reqs[rid].state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-            self._send_sessions[rid].close()
+            if self._send_sessions[rid].close() is False:
+                continue
             del self._send_reqs[rid]
             del self._send_sessions[rid]
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
@@ -837,6 +845,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
+                if getattr(session, "_enforce_physical_ownership", False):
+                    resources_drained = getattr(session, "resources_drained", None)
+                    if resources_drained is None or not resources_drained():
+                        continue
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
                 # server timeout).  Return the req objects so the caller can
@@ -860,8 +872,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         cancelled_reqs = []
         for rid in cancelled:
+            session = self._recv_sessions[rid]
+            if session.close() is False:
+                continue
             cancelled_reqs.append(self._recv_reqs[rid])
-            self._recv_sessions[rid].close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
 
@@ -983,18 +997,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if self._send_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             else:
-                self._send_sessions[rid].close()
-                del self._send_reqs[rid]
-                del self._send_sessions[rid]
+                if self._send_sessions[rid].close() is False:
+                    has_transferring = True
+                else:
+                    del self._send_reqs[rid]
+                    del self._send_sessions[rid]
 
         if rid in self._recv_sessions:
             self._recv_sessions[rid].cancel()
             if self._recv_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             else:
-                self._recv_sessions[rid].close()
-                del self._recv_reqs[rid]
-                del self._recv_sessions[rid]
+                if self._recv_sessions[rid].close() is False:
+                    has_transferring = True
+                else:
+                    del self._recv_reqs[rid]
+                    del self._recv_sessions[rid]
 
         if has_transferring:
             return False
