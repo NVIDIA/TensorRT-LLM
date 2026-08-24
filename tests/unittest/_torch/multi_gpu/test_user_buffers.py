@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import gc
 import pickle
 import sys
 import traceback
@@ -31,6 +35,21 @@ MPI.pickle.__init__(
 
 # needed since we reuse the mpi executor pool, first test running will leak a thread
 pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+def _shutdown_userbuffers_manager(_):
+    gc.collect()
+    ub.shutdown_userbuffers_manager()
+    return True
+
+
+@pytest.fixture(autouse=True)
+def shutdown_userbuffers_manager_after_test(mpi_pool_executor):
+    yield
+    results = mpi_pool_executor.map(_shutdown_userbuffers_manager,
+                                    range(mpi_pool_executor.num_workers))
+    for result in results:
+        assert result is True
 
 
 def _assert_match_counts(backend, expected_match_count_by_pass):

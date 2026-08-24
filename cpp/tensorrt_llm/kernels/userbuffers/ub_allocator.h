@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,11 +66,12 @@ public:
     virtual UBBuffer registerUBBuffer(size_t bytes);
 
 private:
-    communicator* mUbComm;
+    communicator* mUbComm{nullptr};
 
 protected:
     std::vector<UBBuffer> mBuffers;
-    bool mIsInitialized;
+    std::vector<bool> mReleased;
+    bool mIsInitialized{false};
     ::tensorrt_llm::runtime::WorldConfig mWorldConfig;
 };
 

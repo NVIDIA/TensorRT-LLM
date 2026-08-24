@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,6 +69,9 @@ public:
     //! @param addr The address of the buffer to release.
     void release_buffer(void* addr);
 
+    //! @brief Deallocate all unused buffers owned by the current engine.
+    void shutdown();
+
 private:
     std::mutex mutex_;
     std::vector<UBBufferInfo> buffers_;
@@ -77,5 +80,6 @@ private:
 
 void initialize_userbuffers_manager(
     int64_t tp_size, int64_t pp_size, int64_t cp_size, int64_t rank, int64_t gpus_per_node, int64_t buffer_size);
+void shutdown_userbuffers_manager();
 
 } // namespace tensorrt_llm::runtime::ub

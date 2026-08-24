@@ -1224,7 +1224,9 @@ class KvCacheCreator:
                     kv_stats_draft.allocated_bytes
                     if kv_stats_draft is not None else 0)
                 py_executor.is_warmup = False
-                py_executor.shutdown()
+                # This executor is temporary; the same model engine (including
+                # its userbuffer manager) is reused by the final executor.
+                py_executor.shutdown(shutdown_userbuffers=False)
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
 

@@ -1468,9 +1468,14 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
-    def shutdown(self):
+    def shutdown(self, shutdown_userbuffers: bool = True):
         """
         Signals the server to shutdown.
+
+        Args:
+            shutdown_userbuffers: Whether this is the terminal shutdown for
+                the model engines. Capacity estimation passes ``False``
+                because it reuses the engines in a new executor.
         """
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
@@ -1504,13 +1509,28 @@ class PyExecutor:
         # empty_cache), the subsequent CUDA graph teardown can trigger a
         # device-wide cudaErrorIllegalAddress when the driver touches metadata
         # for the now-freed memory regions.
-        for engine in (self.model_engine, self.draft_model_engine):
+        engines = (self.model_engine, self.draft_model_engine)
+        for engine in engines:
             if engine is not None and hasattr(engine, '_release_cuda_graphs'):
                 engine._release_cuda_graphs()
         # Ensure graph destruction has fully completed on device before
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+
+        # Userbuffer unregister performs MPI collectives, so every rank must
+        # enter it here rather than relying on rank-asynchronous __del__ calls.
+        # Try every engine in the same order before propagating an error.
+        userbuffer_errors = []
+        if shutdown_userbuffers:
+            for engine in engines:
+                if engine is not None and hasattr(engine,
+                                                  'shutdown_userbuffers'):
+                    try:
+                        engine.shutdown_userbuffers()
+                    except RuntimeError as error:
+                        userbuffer_errors.append(error)
+
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -1521,9 +1541,9 @@ class PyExecutor:
         # to compute kv_cache_max_memory. cleanup() would set
         # model_engine.model = None, breaking that read with
         # `'NoneType' object has no attribute 'model_config'`.
-        # The engine's __del__ still calls cleanup() at terminal teardown
-        # (when the executor's reference is dropped), which is sufficient for
-        # the GMS daemon registry eviction the cleanup hook was added for.
+        # Capacity estimation passes shutdown_userbuffers=False because the
+        # engine and its manager are reused by the final executor. The engine's
+        # __del__ performs only non-collective cleanup.
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
@@ -1538,6 +1558,14 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+
+        if userbuffer_errors:
+            for index, error in enumerate(userbuffer_errors, start=1):
+                logger.error(f"Userbuffer shutdown failure {index}/"
+                             f"{len(userbuffer_errors)}: {error}")
+            raise RuntimeError(
+                "Failed to shut down userbuffers for one or more model engines"
+            ) from userbuffer_errors[0]
 
     def can_enqueue_requests(self) -> bool:
         """

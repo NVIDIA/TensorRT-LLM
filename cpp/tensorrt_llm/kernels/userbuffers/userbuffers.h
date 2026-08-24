@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -111,6 +111,8 @@ int register_user_buffer_collective(void** gpubuff, size_t bytes, communicator* 
    different operations returns -1 if can't register (too many preregistered regions already) if alloc==true will
    allocate memory and fill the pointers (required for NVL SHARP and NSO/MNNVL)
 */
+
+void unregister_user_buffer_collective(int handle, communicator* comm);
 
 void destroy_communicator(communicator* comm);
 } // namespace tensorrt_llm::runtime::ub

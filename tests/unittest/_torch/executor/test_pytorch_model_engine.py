@@ -1237,6 +1237,95 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
         torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
+    def test_shutdown_userbuffers_defers_legacy_error_until_manager_shutdown(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.ub_buffers = [Mock(addr=123)]
+        engine._userbuffers_manager_initialized = True
+        engine._userbuffers_shutdown_failed = False
+
+        legacy_error = RuntimeError("legacy userbuffer cleanup failed")
+        shutdown_order = []
+
+        def fail_deallocate(_addr) -> None:
+            shutdown_order.append("deallocate")
+            raise legacy_error
+
+        def record_manager_shutdown() -> None:
+            shutdown_order.append("manager")
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.ub.ub_deallocate",
+                side_effect=fail_deallocate), patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine."
+                    "ub.shutdown_userbuffers_manager",
+                    side_effect=record_manager_shutdown) as shutdown_manager, \
+                patch("tensorrt_llm._torch.pyexecutor.model_engine.release_gc"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Failed to deallocate one or more userbuffers"):
+                engine.shutdown_userbuffers()
+
+        shutdown_manager.assert_called_once_with()
+        self.assertEqual(shutdown_order, ["deallocate", "manager"])
+        self.assertFalse(engine._userbuffers_manager_initialized)
+        self.assertEqual(len(engine.ub_buffers), 1)
+        self.assertTrue(engine._userbuffers_shutdown_failed)
+        with self.assertRaisesRegex(RuntimeError, "cannot be retried safely"):
+            engine.shutdown_userbuffers()
+
+    def test_shutdown_userbuffers_reports_deallocation_and_manager_errors(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.ub_buffers = [Mock(addr=123)]
+        engine._userbuffers_manager_initialized = True
+        engine._userbuffers_shutdown_failed = False
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.ub.ub_deallocate",
+                side_effect=RuntimeError("deallocation details")), patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine."
+                    "ub.shutdown_userbuffers_manager",
+                    side_effect=RuntimeError("manager details")
+                ), patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine.release_gc"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "deallocation details.*manager details") as context:
+                engine.shutdown_userbuffers()
+
+        self.assertIsInstance(context.exception.__cause__, RuntimeError)
+        self.assertEqual(str(context.exception.__cause__),
+                         "deallocation details")
+        self.assertTrue(engine._userbuffers_shutdown_failed)
+
+    def test_cleanup_does_not_enter_collective_userbuffer_shutdown(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine._cleanup_done = False
+        engine.model_loader = None
+        engine.model = Mock()
+        engine._release_cuda_graphs = Mock()
+        engine.input_processor = Mock()
+        engine.input_processor_with_hash = Mock()
+        engine.ub_buffers = [Mock(addr=123)]
+        engine._userbuffers_manager_initialized = True
+        engine._userbuffers_shutdown_failed = False
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.ub.ub_deallocate"
+        ) as deallocate, patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine."
+                "ub.shutdown_userbuffers_manager") as shutdown_manager, \
+                patch("tensorrt_llm._torch.pyexecutor.model_engine.release_gc"):
+            engine.cleanup()
+
+        deallocate.assert_not_called()
+        shutdown_manager.assert_not_called()
+        self.assertTrue(engine._userbuffers_manager_initialized)
+        self.assertEqual(len(engine.ub_buffers), 1)
+        self.assertTrue(engine._cleanup_done)
+
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
         request = LlmRequest(

@@ -26,6 +26,7 @@ import torch.multiprocessing as torch_mp
 
 from tensorrt_llm._torch.disaggregation.executor.admission import DisaggTransferAdmissionController
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.pyexecutor.encoder_executor import EncoderExecutor
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -184,6 +185,152 @@ class MockPyExecutor:
     def _get_new_active_requests_queue_latency(self):
         """Get the queue latency for new active requests."""
         return self.new_active_requests_queue_latency_ms
+
+
+def test_shutdown_calls_userbuffer_collectives_for_all_engines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-engine failure must not skip another engine's collective."""
+    calls = []
+    target = MagicMock()
+    draft = MagicMock()
+    target._release_cuda_graphs.side_effect = lambda: calls.append("target_graphs")
+    draft._release_cuda_graphs.side_effect = lambda: calls.append("draft_graphs")
+
+    def fail_target_userbuffers() -> None:
+        calls.append("target_userbuffers")
+        raise RuntimeError("target teardown failed")
+
+    target.shutdown_userbuffers.side_effect = fail_target_userbuffers
+    draft.shutdown_userbuffers.side_effect = lambda: calls.append("draft_userbuffers")
+
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = MagicMock()
+    executor.shutdown_event = MagicMock()
+    executor.hang_detector = MagicMock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = MagicMock()
+    executor.dist = types.SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = MagicMock()
+    executor.model_engine = target
+    executor.draft_model_engine = draft
+    executor.resource_manager = types.SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.sampler = object()
+    executor.dwdp_manager = None
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="Failed to shut down userbuffers"):
+        executor.shutdown()
+
+    assert calls == [
+        "target_graphs",
+        "draft_graphs",
+        "target_userbuffers",
+        "draft_userbuffers",
+    ]
+
+
+def test_nonterminal_shutdown_preserves_userbuffer_managers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capacity estimation must not tear down managers reused by the final executor."""
+    target = MagicMock()
+    draft = MagicMock()
+
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = MagicMock()
+    executor.shutdown_event = MagicMock()
+    executor.hang_detector = MagicMock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = MagicMock()
+    executor.dist = types.SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = MagicMock()
+    executor.model_engine = target
+    executor.draft_model_engine = draft
+    executor.resource_manager = types.SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.sampler = object()
+    executor.dwdp_manager = None
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+    executor.shutdown(shutdown_userbuffers=False)
+
+    target.shutdown_userbuffers.assert_not_called()
+    draft.shutdown_userbuffers.assert_not_called()
+
+
+def test_shutdown_logs_all_userbuffer_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = MagicMock()
+    draft = MagicMock()
+    target.shutdown_userbuffers.side_effect = RuntimeError("target failure")
+    draft.shutdown_userbuffers.side_effect = RuntimeError("draft failure")
+
+    executor = object.__new__(PyExecutor)
+    executor.executor_request_queue = MagicMock()
+    executor.shutdown_event = MagicMock()
+    executor.hang_detector = MagicMock()
+    executor.hang_detector.detected.return_value = False
+    executor.worker_thread = MagicMock()
+    executor.dist = types.SimpleNamespace(pp_size=1)
+    executor._shutdown_sleep_wakeup_listeners = MagicMock()
+    executor.model_engine = target
+    executor.draft_model_engine = draft
+    executor.resource_manager = types.SimpleNamespace(resource_managers={})
+    executor.virtual_memory_pools = None
+    executor.sampler = object()
+    executor.dwdp_manager = None
+    log_error = MagicMock()
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.logger.error", log_error)
+
+    with pytest.raises(RuntimeError, match="Failed to shut down userbuffers"):
+        executor.shutdown()
+
+    assert [call.args for call in log_error.call_args_list] == [
+        ("Userbuffer shutdown failure 1/2: target failure",),
+        ("Userbuffer shutdown failure 2/2: draft failure",),
+    ]
+
+
+def test_encoder_shutdown_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = MagicMock()
+    executor = object.__new__(EncoderExecutor)
+    executor.model_engine = engine
+    executor._cleanup_done = False
+    executor._cleanup_error = None
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+    executor.shutdown()
+    executor.shutdown()
+
+    engine._release_cuda_graphs.assert_called_once_with()
+    engine.shutdown_userbuffers.assert_called_once_with()
+    assert executor._cleanup_done
+    assert not hasattr(executor, "model_engine")
+
+
+def test_encoder_shutdown_preserves_failure_on_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    shutdown_error = RuntimeError("userbuffer shutdown failed")
+    engine = MagicMock()
+    engine.shutdown_userbuffers.side_effect = shutdown_error
+    executor = object.__new__(EncoderExecutor)
+    executor.model_engine = engine
+    executor._cleanup_done = False
+    executor._cleanup_error = None
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="userbuffer shutdown failed"):
+        executor.shutdown()
+    with pytest.raises(
+        RuntimeError, match=("previous EncoderExecutor shutdown failed.*userbuffer shutdown failed")
+    ):
+        executor.shutdown()
+
+    engine._release_cuda_graphs.assert_called_once_with()
+    engine.shutdown_userbuffers.assert_called_once_with()
+    assert executor._cleanup_done
+    assert not hasattr(executor, "model_engine")
 
 
 @pytest.fixture

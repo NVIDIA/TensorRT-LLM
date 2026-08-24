@@ -18,6 +18,7 @@ Each test allocates an output tensor with DEFAULT / USERBUFFERS / NCCL_WINDOW,
 fills it with known values, runs an AllReduce, and verifies correctness.
 """
 
+import gc
 import os
 import pickle
 import sys
@@ -130,15 +131,10 @@ def _run_allreduce_userbuffers(tp_size, tp_rank, seq_len, hidden_size):
     def _allocate(ref, kind, tp_group):
         return torch.ops.trtllm.allocate_output(ref, kind, tp_group)
 
-    if not ub.ub_is_initialized():
-        # Initialize once with the maximum size needed across all parametrized
-        # cases.  UserBuffersManager reuses pool buffers by size; initializing
-        # with a larger buffer_size_ later can cause OOB reuse of smaller
-        # previously-allocated buffers.
-        max_bytes = 256 * 4096 * torch.tensor([], dtype=dtype).element_size()
-        ub.initialize_userbuffers_manager(
-            tp_size, 1, 1, tp_rank, torch.cuda.device_count(), max_bytes
-        )
+    buffer_bytes = seq_len * hidden_size * torch.tensor([], dtype=dtype).element_size()
+    ub.initialize_userbuffers_manager(
+        tp_size, 1, 1, tp_rank, torch.cuda.device_count(), buffer_bytes
+    )
 
     ref = torch.zeros(seq_len, hidden_size, dtype=dtype, device="cuda")
     out, actual_kind_int = _allocate(ref, int(BufferKind.USERBUFFERS), mapping.tp_group)
@@ -167,6 +163,9 @@ def _run_allreduce_userbuffers(tp_size, tp_rank, seq_len, hidden_size):
 
     torch.testing.assert_close(residual_out, expected_residual, atol=5e-1, rtol=1e-2)
     torch.testing.assert_close(norm_out, expected_norm, atol=5e-1, rtol=1e-2)
+    del out, norm_out, residual_out
+    gc.collect()
+    ub.shutdown_userbuffers_manager()
     return True
 
 
@@ -194,6 +193,48 @@ def _run_allreduce_nccl_window(tp_size, tp_rank, seq_len, hidden_size):
 
     expected = torch.full((seq_len, hidden_size), tp_size, dtype=dtype, device="cuda")
     torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+    return True
+
+
+def _run_userbuffers_manager_reinitialize(tp_size, tp_rank):
+    """Repeatedly shut down and reinitialize the engine-scoped UB pool."""
+
+    def _create_tensor(shape, dtype):
+        return torch.ops.trtllm.create_userbuffers_tensor(shape, dtype)
+
+    if not ub.ub_supported():
+        return True
+
+    dtype = torch.bfloat16
+    small_shape = (16, 512)
+    large_shape = (256, 4096)
+
+    ub.shutdown_userbuffers_manager()
+
+    # Exceed MAX_REGIONS to prove shutdown unregisters each region instead of
+    # merely hiding it from the manager's reuse pool.
+    for _ in range(20):
+        small_bytes = torch.Size(small_shape).numel() * torch.empty((), dtype=dtype).element_size()
+        ub.initialize_userbuffers_manager(
+            tp_size, 1, 1, tp_rank, torch.cuda.device_count(), small_bytes
+        )
+        tensor = _create_tensor(small_shape, dtype)
+        tensor.fill_(tp_rank + 1)
+        torch.cuda.synchronize()
+        del tensor
+        gc.collect()
+        ub.shutdown_userbuffers_manager()
+
+    large_bytes = torch.Size(large_shape).numel() * torch.empty((), dtype=dtype).element_size()
+    ub.initialize_userbuffers_manager(
+        tp_size, 1, 1, tp_rank, torch.cuda.device_count(), large_bytes
+    )
+    tensor = _create_tensor(large_shape, dtype)
+    tensor.fill_(tp_rank + 1)
+    torch.cuda.synchronize()
+    del tensor
+    gc.collect()
+    ub.shutdown_userbuffers_manager()
     return True
 
 
@@ -237,6 +278,20 @@ def test_allreduce_userbuffers_buffer(seq_len, hidden_size, mpi_pool_executor):
     )
     for r in results:
         assert r is True, r
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_userbuffers_manager_reinitialize(mpi_pool_executor):
+    tp_size = mpi_pool_executor.num_workers
+    results = list(
+        mpi_pool_executor.map(
+            run_single_rank,
+            *zip(*[(tp_size, _run_userbuffers_manager_reinitialize)] * tp_size),
+        )
+    )
+    for result in results:
+        assert result is True, result
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs")
