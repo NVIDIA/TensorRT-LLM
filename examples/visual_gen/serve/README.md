@@ -292,7 +292,7 @@ You can customize these by:
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
 
-> **`response_format="path"`** (image and video) returns absolute server-side file paths, only useful for clients co-located with the server (shared filesystem). The paths are always under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), so the disclosure is bounded and it is enabled by default; because `trtllm-serve` has no authentication, set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400.
+> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400.
 
 #### Tensor-format consumer contract
 
@@ -408,7 +408,7 @@ curl -X POST "http://localhost:8000/v1/videos" \
 curl -X GET "http://localhost:8000/v1/videos/{video_id}"
 ```
 
-The async job's `status` advances `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. Poll for the `postprocessing` transition to measure generation time before postprocessing starts, and for `completed` to download via `/content`.
+The async job's `status` advances `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; poll for `completed` to download via `/content`.
 
 ### Download Video
 ```bash
