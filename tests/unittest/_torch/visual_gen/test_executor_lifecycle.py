@@ -17,6 +17,7 @@ import asyncio
 import os
 import select
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -29,6 +30,8 @@ from tensorrt_llm._torch.visual_gen import executor as executor_module
 from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
 
 _THREADING_EVENT = threading.Event
+_LIFECYCLE_HELPER = Path(__file__).with_name("_executor_lifecycle_helper.py")
+_SUBPROCESS_TIMEOUT = 180.0
 
 
 def _pre_set_event() -> threading.Event:
@@ -52,175 +55,88 @@ def _wait_for_process_exit(pid: int, timeout: float = 10.0) -> None:
     assert not _process_is_running(pid)
 
 
-def _parent_bound_worker(parent_pid: int, ready_fd: int) -> None:
-    blocked_signals = signal.pthread_sigmask(signal.SIG_BLOCK, [])
-    if signal.SIGINT in blocked_signals or signal.SIGTERM in blocked_signals:
-        os.write(ready_fd, b"error:worker inherited blocked termination signal\n")
-        os._exit(2)
-    executor_module._set_worker_parent_death_signal(parent_pid)
-    executor_module._start_parent_process_watchdog(parent_pid)
-    os.write(ready_fd, f"worker:{os.getpid()}\n".encode())
-    while True:
-        signal.pause()
+def _start_lifecycle_helper(*args: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, str(_LIFECYCLE_HELPER), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
 
 
-def _run_owned_worker_coordinator(write_fd: int, fail_owner_wait_once: bool) -> None:
-    os.setsid()
-    parent_pid = os.getpid()
-    context = executor_module._get_mp_context("fork")
+def _wait_for_helper_messages(
+    process: subprocess.Popen,
+    required_prefixes: tuple[str, ...],
+) -> dict[str, str]:
+    assert process.stdout is not None
+    messages = {}
+    output = []
+    deadline = time.monotonic() + _SUBPROCESS_TIMEOUT
+    while set(messages) != set(required_prefixes) and time.monotonic() < deadline:
+        ready, _, _ = select.select([process.stdout], [], [], 0.1)
+        if not ready:
+            if process.poll() is not None:
+                break
+            continue
+        line = process.stdout.readline()
+        if not line:
+            break
+        decoded_line = line.decode(errors="replace").rstrip()
+        output.append(decoded_line)
+        if decoded_line.startswith("error:"):
+            pytest.fail(f"lifecycle helper failed: {decoded_line}\n" + "\n".join(output))
+        for prefix in required_prefixes:
+            if decoded_line.startswith(prefix):
+                messages[prefix] = decoded_line.removeprefix(prefix)
 
-    if not fail_owner_wait_once:
+    missing = set(required_prefixes) - set(messages)
+    if missing:
+        pytest.fail(
+            f"lifecycle helper did not report {sorted(missing)}; "
+            f"returncode={process.poll()}, output={output}"
+        )
+    return messages
 
-        def lightweight_worker(parent_pid, **_kwargs) -> None:
-            _parent_bound_worker(parent_pid, write_fd)
 
-        def lightweight_background(client) -> None:
-            client.event_loop_ready.set()
-            client.shutdown_event.wait()
-
-        args = MagicMock()
-        args.parallel_config.n_workers = 1
-        startup_error = []
-        clients = []
-
-        def construct_client_from_temporary_thread() -> None:
-            try:
-                with (
-                    patch.object(executor_module, "_detect_external_launch", return_value=None),
-                    patch.object(
-                        executor_module,
-                        "find_free_port",
-                        side_effect=[29500, 29501, 29502],
-                    ),
-                    patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
-                    patch.object(executor_module, "_get_mp_context", return_value=context),
-                    patch.object(executor_module, "run_diffusion_worker", lightweight_worker),
-                    patch.object(
-                        DiffusionRemoteClient,
-                        "_serve_forever_thread",
-                        lightweight_background,
-                    ),
-                    patch.object(DiffusionRemoteClient, "_wait_ready"),
-                    patch.object(executor_module, "_register_atexit"),
-                ):
-                    clients.append(DiffusionRemoteClient(args=args))
-            except BaseException as e:
-                startup_error.append(e)
-
-        constructor = threading.Thread(target=construct_client_from_temporary_thread)
-        constructor.start()
-        constructor.join(timeout=10.0)
-        if constructor.is_alive() or startup_error or not clients:
-            os.write(write_fd, b"error\n")
-            os._exit(1)
-        os.write(write_fd, b"constructor:done\n")
-        os.close(write_fd)
-        while True:
-            signal.pause()
-
-    worker = context.Process(target=_parent_bound_worker, args=(parent_pid, write_fd))
-    initial_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
-    owner = executor_module._WorkerProcessOwner([worker], initial_signal_mask)
-    owner_wait_failed = threading.Event()
-
-    wait_for_release = owner._wait_for_release
-
-    def fail_once() -> None:
-        if not owner_wait_failed.is_set():
-            owner_wait_failed.set()
-            raise RuntimeError("injected owner wait failure")
-        wait_for_release()
-
-    owner._wait_for_release = fail_once
-
-    startup_error = []
-
-    def construct_from_temporary_thread() -> None:
+def _kill_process_group(process: subprocess.Popen) -> None:
+    if process.poll() is None:
         try:
-            owner.start()
-            owner.wait_for_spawn(timeout=10.0)
-        except BaseException as e:
-            startup_error.append(e)
-
-    constructor = threading.Thread(target=construct_from_temporary_thread)
-    constructor.start()
-    constructor.join(timeout=10.0)
-    if constructor.is_alive() or startup_error:
-        os.write(write_fd, b"error\n")
-        os._exit(1)
-    if not owner_wait_failed.wait(timeout=10.0):
-        os.write(write_fd, b"error\n")
-        os._exit(1)
-    os.write(write_fd, b"constructor:done\n")
-    os.close(write_fd)
-    while True:
-        signal.pause()
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=10.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10.0)
+    if process.stdout is not None:
+        process.stdout.close()
 
 
 def _assert_owned_worker_lifecycle(fail_owner_wait_once: bool) -> None:
-    read_fd, write_fd = os.pipe()
-    coordinator_pid = os.fork()
-    if coordinator_pid == 0:
-        try:
-            os.close(read_fd)
-            _run_owned_worker_coordinator(write_fd, fail_owner_wait_once)
-        finally:
-            os._exit(1)
-
-    os.close(write_fd)
+    coordinator = _start_lifecycle_helper(
+        "owned-worker",
+        str(int(fail_owner_wait_once)),
+    )
     worker_pid = None
-    coordinator_reaped = False
     try:
-        payload = b""
-        deadline = time.monotonic() + 10.0
-        while (
-            b"error:" not in payload
-            and (b"constructor:done\n" not in payload or b"worker:" not in payload)
-            and time.monotonic() < deadline
-        ):
-            ready, _, _ = select.select([read_fd], [], [], 0.1)
-            if ready:
-                chunk = os.read(read_fd, 128)
-                assert chunk, "coordinator closed readiness pipe before startup completed"
-                payload += chunk
-
-        lines = payload.decode().splitlines()
-        assert not any(line.startswith("error:") for line in lines), lines
-        assert "constructor:done" in lines
-        worker_lines = [line for line in lines if line.startswith("worker:")]
-        assert len(worker_lines) == 1
-        worker_pid = int(worker_lines[0].split(":", maxsplit=1)[1])
+        messages = _wait_for_helper_messages(
+            coordinator,
+            ("constructor:done", "worker:"),
+        )
+        worker_pid = int(messages["worker:"])
 
         # The temporary constructor thread is gone. The dedicated process
         # owner must keep the thread-scoped PDEATHSIG from firing.
         time.sleep(1.0)
-        assert _process_is_running(coordinator_pid)
+        assert coordinator.poll() is None
         assert _process_is_running(worker_pid)
 
-        os.kill(coordinator_pid, signal.SIGKILL)
-        waited_pid, status = os.waitpid(coordinator_pid, 0)
-        coordinator_reaped = True
-        assert waited_pid == coordinator_pid
-        assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL
+        coordinator.kill()
+        assert coordinator.wait(timeout=_SUBPROCESS_TIMEOUT) == -signal.SIGKILL
         _wait_for_process_exit(worker_pid)
     finally:
-        os.close(read_fd)
-        needs_group_cleanup = not coordinator_reaped or (
-            worker_pid is not None and _process_is_running(worker_pid)
-        )
-        if needs_group_cleanup:
-            try:
-                os.killpg(coordinator_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                try:
-                    os.kill(coordinator_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        if not coordinator_reaped:
-            try:
-                os.waitpid(coordinator_pid, 0)
-            except ChildProcessError:
-                pass
+        _kill_process_group(coordinator)
         if worker_pid is not None and _process_is_running(worker_pid):
             os.kill(worker_pid, signal.SIGKILL)
 
@@ -267,71 +183,20 @@ def test_worker_kills_itself_if_coordinator_exits_before_registration() -> None:
     reason="pidfd process monitoring is Linux-specific",
 )
 def test_process_watchdog_kills_worker_when_watched_process_exits() -> None:
-    watched_pid = os.fork()
-    if watched_pid == 0:
-        try:
-            while True:
-                signal.pause()
-        finally:
-            os._exit(1)
-
-    read_fd, write_fd = os.pipe()
-    worker_pid = os.fork()
-    if worker_pid == 0:
-        try:
-            os.close(read_fd)
-            watchdog = executor_module._start_parent_process_watchdog(watched_pid)
-            if watchdog is None:
-                os._exit(2)
-            os.write(write_fd, b"ready")
-            while True:
-                signal.pause()
-        finally:
-            os._exit(1)
-
-    os.close(write_fd)
-    watched_reaped = False
-    worker_reaped = False
+    watched = subprocess.Popen(
+        [sys.executable, "-c", "import signal; signal.pause()"],
+        start_new_session=True,
+    )
+    worker = _start_lifecycle_helper("process-watchdog", str(watched.pid))
     try:
-        ready, _, _ = select.select([read_fd], [], [], 10.0)
-        assert ready, "process watchdog did not start"
-        assert os.read(read_fd, 16) == b"ready"
+        _wait_for_helper_messages(worker, ("ready",))
 
-        os.kill(watched_pid, signal.SIGKILL)
-        waited_pid, status = os.waitpid(watched_pid, 0)
-        watched_reaped = True
-        assert waited_pid == watched_pid
-        assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL
-
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            waited_pid, status = os.waitpid(worker_pid, os.WNOHANG)
-            if waited_pid == worker_pid:
-                worker_reaped = True
-                assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL
-                break
-            time.sleep(0.05)
-        assert worker_reaped, "watchdog did not kill worker after watched process exited"
+        watched.kill()
+        assert watched.wait(timeout=_SUBPROCESS_TIMEOUT) == -signal.SIGKILL
+        assert worker.wait(timeout=_SUBPROCESS_TIMEOUT) == -signal.SIGKILL
     finally:
-        os.close(read_fd)
-        if not watched_reaped:
-            try:
-                os.kill(watched_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(watched_pid, 0)
-            except ChildProcessError:
-                pass
-        if not worker_reaped:
-            try:
-                os.kill(worker_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(worker_pid, 0)
-            except ChildProcessError:
-                pass
+        _kill_process_group(watched)
+        _kill_process_group(worker)
 
 
 def test_worker_arms_both_parent_death_guards_before_initialization() -> None:
@@ -384,62 +249,18 @@ def test_worker_arms_both_parent_death_guards_before_initialization() -> None:
 
 @pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-specific")
 def test_worker_is_killed_when_coordinator_is_sigkilled() -> None:
-    read_fd, write_fd = os.pipe()
-    coordinator_pid = os.fork()
-    if coordinator_pid == 0:
-        try:
-            os.close(read_fd)
-            os.setsid()
-            expected_parent_pid = os.getpid()
-            worker_pid = os.fork()
-            if worker_pid == 0:
-                try:
-                    executor_module._set_worker_parent_death_signal(expected_parent_pid)
-                    os.write(write_fd, str(os.getpid()).encode())
-                    while True:
-                        signal.pause()
-                finally:
-                    os._exit(1)
-            os.close(write_fd)
-            os.waitpid(worker_pid, 0)
-        finally:
-            os._exit(0)
-
-    os.close(write_fd)
+    coordinator = _start_lifecycle_helper("parent-death")
     worker_pid = None
-    coordinator_reaped = False
     try:
-        ready, _, _ = select.select([read_fd], [], [], 10.0)
-        assert ready, "worker did not register parent-death signal"
-        worker_pid_bytes = os.read(read_fd, 32)
-        assert worker_pid_bytes, "worker exited before reporting its pid"
-        worker_pid = int(worker_pid_bytes)
+        messages = _wait_for_helper_messages(coordinator, ("worker:",))
+        worker_pid = int(messages["worker:"])
 
-        os.kill(coordinator_pid, signal.SIGKILL)
-        waited_pid, status = os.waitpid(coordinator_pid, 0)
-        coordinator_reaped = True
-        assert waited_pid == coordinator_pid
-        assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL
+        coordinator.kill()
+        assert coordinator.wait(timeout=_SUBPROCESS_TIMEOUT) == -signal.SIGKILL
 
         _wait_for_process_exit(worker_pid)
     finally:
-        os.close(read_fd)
-        needs_group_cleanup = not coordinator_reaped or (
-            worker_pid is not None and _process_is_running(worker_pid)
-        )
-        if needs_group_cleanup:
-            try:
-                os.killpg(coordinator_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                try:
-                    os.kill(coordinator_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        if not coordinator_reaped:
-            try:
-                os.waitpid(coordinator_pid, 0)
-            except ChildProcessError:
-                pass
+        _kill_process_group(coordinator)
         if worker_pid is not None and _process_is_running(worker_pid):
             os.kill(worker_pid, signal.SIGKILL)
 
