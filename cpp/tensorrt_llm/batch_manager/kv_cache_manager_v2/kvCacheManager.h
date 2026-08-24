@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
+#include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/eventSink.h"
@@ -36,24 +37,6 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
-
-// ---------------------------------------------------------------------------
-// PoolDesc / PoolGroupDesc — describe GPU memory pool layout.
-// ---------------------------------------------------------------------------
-struct PoolDesc
-{
-    PoolIndex poolIndex{0};
-    MemAddress baseAddress = 0;
-    size_t slotBytes = 0;
-};
-
-struct PoolGroupDesc
-{
-    PoolGroupIndex poolGroupIndex{0};
-    SlotCount numSlots = 0;
-    SlotDesc slotDesc;
-    TypedVec<PoolIndex, PoolDesc> pools;
-};
 
 // ---------------------------------------------------------------------------
 // ExpandedBuffer / AggregatedPageDesc — returned by getAggregatedPages().
@@ -117,7 +100,10 @@ struct PageIndexConverter
 class KvCacheManager : public std::enable_shared_from_this<KvCacheManager>
 {
 public:
-    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr);
+    // coldPageCodec is consumed when construction is invoked, including when construction throws; nullptr selects
+    // the default lossless codec.
+    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr,
+        std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec = nullptr);
     ~KvCacheManager();
 
     KvCacheManager(KvCacheManager const&) = delete;
@@ -321,15 +307,15 @@ private:
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherPersistentPages() const;
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
 
     PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);
     void _updateIterationPeakNumBlocks();
 
-    // Current per-pool-group GPU utilization ratios.
-    TypedVec<PoolGroupIndex, float> _currentGpuRatio() const;
-    TypedVec<PoolGroupIndex, float> _currentOtherRatios() const;
+    // Current per-pool-group utilization ratios for the hot and cold representations.
+    TypedVec<PoolGroupIndex, float> _currentHotRatio() const;
+    TypedVec<PoolGroupIndex, float> _currentColdRatios() const;
 
     KVCacheManagerConfig mConfig;
     LifeCycleRegistry mLifeCycles;
@@ -345,8 +331,8 @@ private:
     MovingAverage mAvgSqrCapacity;
     MovingAverage mAvgSqrHistoryLength;
 
-    TypedVec<PoolGroupIndex, float> mTargetRatioListGpu;
-    TypedVec<PoolGroupIndex, float> mTargetRatioListOther;
+    TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
+    TypedVec<PoolGroupIndex, float> mTargetRatioListCold;
 
     int mNumCreatedKvCaches{0};
     int mNumSampledKvCaches{0};

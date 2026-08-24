@@ -2383,6 +2383,141 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         del local_slot_id, expert_id
         return module.fc2_input_scale.data
 
+    def prepare_streaming_expert_load(self, module: torch.nn.Module) -> None:
+        """Pre-create every staging container ``load_streaming_nvfp4_expert``
+        mutates, before any loader thread starts.
+
+        The whole-checkpoint path creates these lazily with
+        ``if not hasattr(module, ...)`` / ``getattr(module, ..., {})``, which is
+        a read-modify-write and therefore loses entries when a model streams
+        experts from several threads. Creating them up front keeps the
+        per-expert mutations to ``dict.__setitem__`` / ``set.add``, which are
+        atomic.
+        """
+        module.tmp_raw_input_scales = {}
+        module.tmp_weight_scale_2 = {}
+        module._streamed_expert_slots = set()
+
+    def finalize_streamed_expert(self, module: torch.nn.Module,
+                                 local_slot_id: int) -> None:
+        """Resolve any per-expert staging left by ``load_streaming_nvfp4_expert``.
+
+        No-op by default: a backend that writes straight through to its
+        destination has nothing to drain. Backends that stage (the Cutlass
+        child, and MegaMoE CuteDSL) override this so a streaming loader does
+        not accumulate a second copy of the routed-expert weights.
+        """
+
+    def load_streaming_nvfp4_expert(
+        self,
+        module: torch.nn.Module,
+        *,
+        global_expert_id: int,
+        local_slot_id: int,
+        w1_weight: torch.Tensor,
+        w1_weight_scale: torch.Tensor,
+        w1_weight_scale_2: torch.Tensor,
+        w1_input_scale: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_weight_scale: torch.Tensor,
+        w2_weight_scale_2: torch.Tensor,
+        w2_input_scale: torch.Tensor,
+        w3_weight: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+        w3_weight_scale_2: torch.Tensor,
+        w3_input_scale: torch.Tensor,
+    ) -> None:
+        """Load one NVFP4 checkpoint expert into a local slot.
+
+        Per-expert counterpart of the ``load_weights`` /
+        ``load_quant_scales`` pair, for models whose checkpoint is too large to
+        keep mapped while the whole layer loads. It calls exactly the same
+        primitives on exactly the same destinations and leaves the same staging
+        state behind, so ``process_weights_after_loading`` finalizes a streamed
+        layer and a whole-checkpoint layer identically.
+
+        ``prepare_streaming_expert_load`` must have run first, and
+        ``module.process_weights_after_loading()`` must run once the layer's
+        last slot is in — nothing else calls it on this path.
+
+        One deliberate difference from ``load_quant_scales``: it reduces the
+        activation ``input_scale`` over every expert in the checkpoint, whereas
+        a streaming caller only ever holds its own rank's experts, so the
+        reduction is over the rank-local slice. The two agree only while
+        ``input_scale`` is uniform across experts — which is what a
+        static-activation-scale checkpoint (e.g. ``nvidia/Kimi-K3-NVFP4``, all
+        1.0) gives. A checkpoint with genuinely per-expert activation scales
+        would make expert-parallel ranks disagree, so such a checkpoint needs a
+        cross-rank reduction added here first.
+        """
+        if not 0 <= local_slot_id < module.expert_size_per_partition:
+            raise IndexError(f"local_slot_id={local_slot_id} is outside "
+                             f"[0, {module.expert_size_per_partition}).")
+        expected_expert_id = module.initial_local_expert_ids[local_slot_id]
+        if global_expert_id != expected_expert_id:
+            raise ValueError(
+                f"local slot {local_slot_id} expects global expert "
+                f"{expected_expert_id}, got {global_expert_id}.")
+        if not hasattr(module, "_streamed_expert_slots"):
+            raise RuntimeError(
+                "prepare_streaming_expert_load() must run before "
+                "load_streaming_nvfp4_expert().")
+        if local_slot_id in module._streamed_expert_slots:
+            raise ValueError(
+                f"NVFP4 local slot {local_slot_id} was loaded twice.")
+
+        for name, value in (("w1_weight", w1_weight), ("w2_weight", w2_weight),
+                            ("w3_weight", w3_weight)):
+            if value.dtype != torch.uint8:
+                raise TypeError(f"{name} must contain packed NVFP4 uint8 data, "
+                                f"got {value.dtype}.")
+
+        # Cutlass stages the two halves of w3_w1 per expert and needs the slot
+        # id as the staging key; other backends write straight through.
+        w3_w1_weight_kargs = {}
+        if "expert_idx" in inspect.getfullargspec(
+                self.load_expert_w3_w1_weight).args:
+            w3_w1_weight_kargs["expert_idx"] = local_slot_id
+        w3_w1_scale_kargs = {}
+        if "expert_idx" in inspect.getfullargspec(
+                self.load_expert_w3_w1_weight_scale_nvfp4).args:
+            w3_w1_scale_kargs["expert_idx"] = local_slot_id
+
+        self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                      module.w3_w1_weight.data[local_slot_id],
+                                      **w3_w1_weight_kargs)
+        self.load_expert_w2_weight(module, w2_weight,
+                                   module.w2_weight.data[local_slot_id])
+        self.load_expert_w3_w1_weight_scale_nvfp4(
+            module, w1_weight_scale, w3_weight_scale,
+            module.w3_w1_weight_scale.data[local_slot_id], **w3_w1_scale_kargs)
+        self.load_expert_w2_weight_scale_nvfp4(
+            module, w2_weight_scale, module.w2_weight_scale.data[local_slot_id])
+
+        # ``_reconcile_and_compute_alphas`` keys weight_scale_2 by local slot
+        # and ``process_weights_after_loading`` keys the input scales by global
+        # expert id; both are only reduced, never indexed positionally.
+        module.tmp_weight_scale_2[local_slot_id] = {
+            'w1': w1_weight_scale_2,
+            'w3': w3_weight_scale_2,
+            'w2': w2_weight_scale_2,
+        }
+        module.tmp_raw_input_scales[global_expert_id] = {
+            'w1': w1_input_scale[...].reshape([]),
+            'w3': w3_input_scale[...].reshape([]),
+            'w2': w2_input_scale[...].reshape([]),
+        }
+
+        # Backends that only stage their input here resolve this slot right
+        # away, so the staged footprint stays proportional to the experts in
+        # flight rather than growing with the load.
+        self.finalize_streamed_expert(module, local_slot_id)
+
+        # MegaMoE backends assert this in transform_weights; it is normally set
+        # by the load_weights this path replaces.
+        module._weights_loaded = True
+        module._streamed_expert_slots.add(local_slot_id)
+
     def load_fp4_weight_block_scales(
             self,
             module: torch.nn.Module,
@@ -2810,6 +2945,14 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
     NVFP4_ROW_ALIGNMENT = 128
     NVFP4_COL_ALIGNMENT = 4
 
+    def prepare_streaming_expert_load(self, module: torch.nn.Module) -> None:
+        # This backend defers the cat + pad + interleave of w3_w1 to
+        # process_weights_after_loading, so it stages both halves per expert in
+        # two more dicts that a streaming loader writes from several threads.
+        super().prepare_streaming_expert_load(module)
+        module.tmp_cutlass_w3_w1_weights = {}
+        module.tmp_cutlass_w3_w1_weight_scales = {}
+
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
         """Override the base method to get aligned weights shapes for Cutlass nvfp4 alignment."""
@@ -3034,30 +3177,83 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
                 "constant", 0).contiguous()
         return source_tensor
 
+    def _resolve_staged_w3_w1_weight(self, entry: Dict) -> None:
+        """Cat + pad one staged expert's w3_w1 halves into its destination."""
+        w3 = entry.get('w3')
+        w1 = entry.get('w1')
+        dst = entry['dst']
+        if w3 is not None and w1 is not None:
+            cat_weight = torch.cat([w3, w1], dim=0)
+            cat_weight = self._maybe_padding_shape(cat_weight, dst)
+            dst.copy_(cat_weight, non_blocking=True)
+        elif w1 is not None:
+            # Non-gated MoE (e.g. Relu2): dst holds only w1; w3 source is empty.
+            w1 = self._maybe_padding_shape(w1, dst)
+            dst.copy_(w1, non_blocking=True)
+
+    def _resolve_staged_w3_w1_weight_scale(self, entry: Dict) -> None:
+        """Cat + pad + interleave one staged expert's w3_w1 block scales."""
+        w3_scale = entry.get('w3')
+        w1_scale = entry.get('w1')
+        dst = entry['dst']
+        if w3_scale is not None and w1_scale is not None:
+            cat_scale = torch.cat([w3_scale, w1_scale], dim=0)
+            cat_scale = self._maybe_padding_shape(cat_scale, dst)
+            dst.copy_(cat_scale)
+            self._interleave_w3_w1_weight_scale(dst)
+        elif w1_scale is not None:
+            # Non-gated MoE (e.g. Relu2): dst holds only w1; w3 source is empty.
+            w1_scale = self._maybe_padding_shape(w1_scale, dst)
+            dst.copy_(w1_scale)
+            self._interleave_w3_w1_weight_scale(dst)
+
+    def finalize_streamed_expert(self, module: torch.nn.Module,
+                                 local_slot_id: int) -> None:
+        """Resolve just this slot's staged halves, as soon as it is loaded.
+
+        Staging is per-expert, so it can be drained per-expert. Doing so bounds
+        the staged footprint to the few experts in flight instead of letting it
+        grow with the load: the halves are a second copy of the routed-expert
+        weights, and a streaming loader that groups its work by shard FILE
+        (Kimi K3 does) finishes a given layer only when the last of its slots
+        happens to land, which can be arbitrarily late.
+
+        ``dict.pop`` is atomic, so concurrent loader threads draining different
+        slots need no lock.
+        """
+        # The key must be built exactly as the staging site builds it. The two
+        # sites do not agree on the accessor -- the weight one uses
+        # untyped_storage(), the scale one the deprecated storage() -- so
+        # mirror each rather than assume they return the same address.
+        for attr, dst_base, resolve in (
+            ('tmp_cutlass_w3_w1_weights', lambda: module.w3_w1_weight.data[
+                local_slot_id].untyped_storage().data_ptr(),
+             self._resolve_staged_w3_w1_weight),
+            ('tmp_cutlass_w3_w1_weight_scales',
+             lambda: module.w3_w1_weight_scale.data[local_slot_id].storage(
+             ).data_ptr(), self._resolve_staged_w3_w1_weight_scale),
+        ):
+            staged = getattr(module, attr, None)
+            if not staged:
+                continue
+            entry = staged.pop((dst_base(), local_slot_id), None)
+            if entry is not None:
+                resolve(entry)
+
     def process_weights_after_loading(self, module: torch.nn.Module):
-        # Finalize w3_w1 weights: cat + pad
+        # Finalize w3_w1 weights: cat + pad. Streamed loads drain these
+        # per-expert in finalize_streamed_expert, so this handles whatever is
+        # left -- everything, for a whole-checkpoint load; nothing, for a fully
+        # streamed one.
         if hasattr(module, 'tmp_cutlass_w3_w1_weights'):
             for entry in module.tmp_cutlass_w3_w1_weights.values():
-                w3 = entry.get('w3')
-                w1 = entry.get('w1')
-                dst = entry['dst']
-                if w3 is not None and w1 is not None:
-                    cat_weight = torch.cat([w3, w1], dim=0)
-                    cat_weight = self._maybe_padding_shape(cat_weight, dst)
-                    dst.copy_(cat_weight, non_blocking=True)
+                self._resolve_staged_w3_w1_weight(entry)
             delattr(module, 'tmp_cutlass_w3_w1_weights')
 
         # Finalize w3_w1 weight scales: cat + pad + interleave
         if hasattr(module, 'tmp_cutlass_w3_w1_weight_scales'):
             for entry in module.tmp_cutlass_w3_w1_weight_scales.values():
-                w3_scale = entry.get('w3')
-                w1_scale = entry.get('w1')
-                dst = entry['dst']
-                if w3_scale is not None and w1_scale is not None:
-                    cat_scale = torch.cat([w3_scale, w1_scale], dim=0)
-                    cat_scale = self._maybe_padding_shape(cat_scale, dst)
-                    dst.copy_(cat_scale)
-                    self._interleave_w3_w1_weight_scale(dst)
+                self._resolve_staged_w3_w1_weight_scale(entry)
             delattr(module, 'tmp_cutlass_w3_w1_weight_scales')
 
         # Finalize w2 weight scales: interleave (regular experts)
@@ -3622,6 +3818,34 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     weight_dtype = FUSED_MOE_NVFP4_WEIGHT_DTYPE
     block_scales_dtype = FUSED_MOE_NVFP4_WEIGHT_BLOCK_SCALE_DTYPE
 
+    def prepare_streaming_expert_load(self, module: torch.nn.Module) -> None:
+        # Like the Cutlass child this backend stages the w3_w1 halves, and it
+        # additionally tracks which w2 rows a partial load covered. Every one of
+        # those containers is created lazily on the load path, which a
+        # multi-threaded streaming loader cannot do safely.
+        super().prepare_streaming_expert_load(module)
+        # This backend keeps its raw NVFP4 source params as 0-element
+        # placeholders and only rematerializes them inside its own
+        # load_weights, which a streaming loader bypasses -- so without this
+        # the first per-expert write indexes an empty tensor
+        # ("index 0 is out of bounds for dimension 0 with size 0").
+        # process_weights_after_loading shrinks them again after packing.
+        self._materialize_source_params(module)
+        module.tmp_cutlass_w3_w1_weights = {}
+        module.tmp_cutlass_w3_w1_weight_scales = {}
+        module._streamed_w2_covered = set()
+        module._streamed_w2_scale_covered = set()
+
+    # NOTE: this backend deliberately does NOT override
+    # finalize_streamed_expert, unlike its Cutlass sibling. Its staged
+    # dicts are not only staging: _initial_slot_coverage() COUNTS their
+    # entries to decide which slots a partial load actually populated, so
+    # draining them per expert would report zero coverage and make a
+    # complete load look empty. Bounding the staged footprint here means
+    # moving that accounting off the dicts first (e.g. onto
+    # _streamed_expert_slots, which already tracks exactly this) rather
+    # than copying the Cutlass drain over.
+
     def _get_fc2_alpha_input_scale(
         self,
         module: torch.nn.Module,
@@ -4051,7 +4275,24 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                                           module: torch.nn.Module) -> None:
         """Reject partially populated NVFP4 auxiliary-scale families."""
         n_slots = module.expert_size_per_partition
-        n_experts = module.num_experts
+        # A whole-checkpoint load is handed every expert's input_scale, because
+        # the weights dict holds the entire checkpoint; a streaming EP load
+        # only ever reads its own rank's experts, so its complete answer is
+        # expert_size_per_partition, not num_experts. Expecting the latter
+        # turns a complete streamed load into a false "partial" report.
+        #
+        # This is the one place the documented divergence in
+        # load_streaming_nvfp4_expert becomes visible: with fewer entries the
+        # global input-scale reduction in process_weights_after_loading is over
+        # the rank-local slice rather than all experts. The two agree exactly
+        # while input_scale is uniform across experts -- which is what a
+        # static-activation-scale checkpoint gives. A checkpoint with genuinely
+        # per-expert activation scales needs a cross-rank reduction added
+        # there; this check is not the place to catch that, because a
+        # single-rank load of such a checkpoint would be equally wrong and
+        # equally "complete".
+        streamed = bool(getattr(module, '_streamed_expert_slots', None))
+        n_experts = n_slots if streamed else module.num_experts
         weight_scale_2 = getattr(module, 'tmp_weight_scale_2', None) or {}
         raw_input_scales = getattr(module, 'tmp_raw_input_scales', None) or {}
 

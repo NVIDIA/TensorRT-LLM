@@ -40,6 +40,7 @@ class MiniMaxM3SparseParams(SparseParams):
     score_type: str = "max"
     disable_index_value: bool = True
     implementation: Literal["triton", "msa"] = "triton"
+    indexer_kv_dtype: Literal["bf16", "fp8"] = "bf16"
 
     @property
     def indices_block_size(self) -> int:
@@ -170,6 +171,11 @@ def write_kv_slots(
     "HND" is [num_pages, num_heads, tokens_per_block, channel]. The paged view
     is non-contiguous, so the slot id is split into (page, within) and written
     by multi-dim assignment. `values` is always [num_tokens, num_heads, channel].
+
+    Callers must provide valid slots for every live token. The production M3
+    mapping satisfies this contract: ``get_block_ids_per_seq`` canonicalizes
+    padded ``BAD_PAGE_INDEX`` entries before ``build_paged_kv_slot_mapping``
+    selects only the allocated live-token positions.
     """
     with torch.no_grad():
         if cache.ndim >= 4:
@@ -216,7 +222,9 @@ def build_paged_kv_slot_mapping(
     """
     tokens_per_block = int(kv_cache_manager.tokens_per_block)
     # block_ids_per_seq is a [batch, max_blocks_per_seq] tensor; row b holds the
-    # block ids assigned to request_ids[b] in order.
+    # block ids assigned to request_ids[b] in order. KVCacheManagerV2 maps
+    # padded BAD_PAGE_INDEX entries to zero, and the live ranges selected below
+    # never address those padded positions.
     block_ids = kv_cache_manager.get_block_ids_per_seq(list(request_ids))
     batch = int(qo_lens_cpu.shape[0])
     max_blocks = int(block_ids.shape[1])
