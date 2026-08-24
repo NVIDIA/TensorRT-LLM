@@ -383,7 +383,6 @@ def create_moe(
     trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
-    communication_method: Optional[str] = None,
 ) -> MoE | VanillaMoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
@@ -413,7 +412,6 @@ def create_moe(
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
-        communication_method: Optional ConfigurableMoE communication method
 
     Returns:
         A complete MoE layer: a ``MoE`` (``ConfigurableMoE`` around an
@@ -508,13 +506,10 @@ def create_moe(
             trtllm_gen_activation_type=trtllm_gen_activation_type,
             trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
-            communication_method=communication_method,
         )
 
     # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
     # and own their communication and forward paths.
-    if communication_method is not None:
-        raise ValueError("communication_method requires ConfigurableMoE.")
     return create_moe_backend(
         moe_cls=moe_cls,
         routing_method=routing_method,

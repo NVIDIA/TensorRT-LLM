@@ -17,7 +17,9 @@ from transformers.configuration_utils import PretrainedConfig
 
 class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    # Tuple, not list: a class-level mutable default could be appended to
+    # in place, changing the default for every instance.
+    keys_to_ignore_at_inference = ("past_key_values",)
 
     def __init__(
         self,

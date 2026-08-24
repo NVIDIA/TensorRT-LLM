@@ -88,7 +88,6 @@ class CommunicationFactory:
         alltoall_result_do_sum: bool = True,
         use_flashinfer: bool = False,
         hidden_size: Optional[int] = None,
-        communication_method: Optional[str] = None,
     ) -> Optional[Communication]:
         """
         Create the best communication method for the given configuration
@@ -114,8 +113,6 @@ class CommunicationFactory:
             hidden_size: Actual MoE activation dimension (the A2A payload width).
                 For latent-MoE models this is moe_latent_size, not pretrained_config.hidden_size.
                 Falls back to pretrained_config.hidden_size when not provided.
-            communication_method: Optional model-selected communication method.
-                ``TRTLLM_FORCE_COMM_METHOD`` takes precedence when set.
             # TODO: Need a way to indicate whether EPLB is enabled.
 
         Returns:
@@ -151,15 +148,7 @@ class CommunicationFactory:
         if mapping.moe_tp_size != 1:
             return AllGatherReduceScatter(mapping)
 
-        # A forced method comes either from the environment, which wins, or from the
-        # model-selected argument. Keep the source with the value so the log below can
-        # name the one the reader can actually go and change.
-        env_method = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
-        if env_method is not None:
-            force_method, force_source = env_method, "TRTLLM_FORCE_COMM_METHOD"
-        else:
-            force_method, force_source = communication_method, "communication_method"
-
+        force_method = os.environ.get("TRTLLM_FORCE_COMM_METHOD")
         if force_method is not None:
             strategy = CommunicationFactory._create_forced_method(
                 force_method,
@@ -175,7 +164,7 @@ class CommunicationFactory:
             )
             logger.info(
                 f"Selected communication strategy: {strategy.__class__.__name__} "
-                f"({force_source}={force_method})"
+                f"(TRTLLM_FORCE_COMM_METHOD={force_method})"
             )
             return strategy
 
