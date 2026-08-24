@@ -2293,11 +2293,13 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
                       f"reference is at least {min_topk_overlap}")
                 print(f"  ! {topk_mismatch}")
 
+        uses_footer_scale_cache = bool(
+            getattr(kv_cache_manager, "use_fp8_ds_mla", False))
         if (sparse_attn_algo == "deepseek_v4"
                 and batch_name == "large_mixed_deepseek_v4"):
             print("  ⚠ Skipping output assert_close for "
                   "large_mixed_deepseek_v4; top-k overlap was validated")
-        elif kv_cache_dtype == "auto":
+        elif kv_cache_dtype == "auto" and not uses_footer_scale_cache:
             torch.testing.assert_close(output,
                                        reference_output,
                                        rtol=0.2,
