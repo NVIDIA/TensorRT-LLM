@@ -343,7 +343,13 @@ def test_mamba_payload_bytes_matched_tp():
 
     from types import SimpleNamespace
 
-    ri = SimpleNamespace(tp_size=2, tp_rank=0, attention=SimpleNamespace(enable_attention_dp=False))
+    ri = SimpleNamespace(
+        tp_size=2,
+        tp_rank=0,
+        cp_size=1,
+        cp_rank=0,
+        attention=SimpleNamespace(enable_attention_dp=False),
+    )
     got = mamba_payload_bytes(
         sender_page_table=pt, receiver_page_table=pt, dst_slot=3, sender_ri=ri, receiver_ri=ri
     )

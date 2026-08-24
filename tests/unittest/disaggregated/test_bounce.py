@@ -812,11 +812,11 @@ class TestHybridK3Bounce:
         assert t.reserve(_recv_req([2]), num_writers=1, extra_bytes=400) is False  # 600 > 500
 
     def test_reserve_extra_bytes_fanin_falls_back(self, monkeypatch):
-        # Fan-in splits the region equally by writer; per-writer recurrent-state fragments can
-        # differ (PP stages hold different mamba layers), so state + fan-in falls back.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
-        assert t.reserve(_recv_req([2, 0]), num_writers=2, extra_bytes=64) is False
-        assert t.reserve(_recv_req([2, 0]), num_writers=2) is True  # no state -> fan-in fine
+        # Fan-in with a STATE group present falls back: per-writer recurrent-state
+        # fragments can differ (PP stages hold different mamba layers).
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100, None])
+        assert t.reserve(_recv_req([2, 1]), num_writers=2, extra_bytes=64) is False
+        assert t.reserve(_recv_req([2, 0]), num_writers=2) is True  # no state blocks -> fan-in fine
 
     def test_mamba_payload_bytes_matches_k3_geometry(self):
         # Matched-TP replicated KDA state: payload_bytes must reproduce the per-request

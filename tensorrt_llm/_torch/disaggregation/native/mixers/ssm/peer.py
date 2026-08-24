@@ -669,3 +669,41 @@ def mamba_payload_bytes(
             total += int(rp.src.memory.bytes_per_region) * rp.src.memory.ptrs.size
 
     return total
+
+
+def mamba_receiver_payload_bytes(
+    sender_page_table: KVCachePageTable,
+    receiver_page_table: KVCachePageTable,
+    dst_slot: Optional[int],
+) -> int:
+    """Recurrent-state bytes that will land in the receiver's slot.
+
+    Receiver-local invariant: regardless of the sender-side shard pairing,
+    the slot receives exactly the receiver's own per-layer slot bytes over
+    the overlapping mamba layers.  This avoids the RankInfoServer rank-0
+    limitation that makes sender-side simulation return 0 for non-rank-0
+    receivers.
+    """
+    if dst_slot is None:
+        return 0
+    sender_mlg = MambaPolicy._find_mamba_layer_group(sender_page_table)
+    receiver_mlg = MambaPolicy._find_mamba_layer_group(receiver_page_table)
+    if sender_mlg is None or receiver_mlg is None:
+        return 0
+
+    sender_globals = {ll.global_layer_id for ll in sender_mlg.local_layers}
+    receiver_globals = {ll.global_layer_id for ll in receiver_mlg.local_layers}
+    overlap = sender_globals & receiver_globals
+    if not overlap:
+        return 0
+
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+
+    receiver_lg_idx = next(
+        i for i, lg in enumerate(receiver_page_table.layer_groups) if lg.kind == CacheKind.STATE
+    )
+    per_layer = sum(
+        get_physical_pool(receiver_page_table, receiver_lg_idx, pv.pool_idx).slot_bytes
+        for pv in receiver_mlg.pool_views
+    )
+    return len(overlap) * per_layer

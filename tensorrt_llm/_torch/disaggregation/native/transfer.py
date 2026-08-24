@@ -62,7 +62,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
-    mamba_payload_bytes,
+    mamba_receiver_payload_bytes,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
@@ -1802,12 +1802,10 @@ class Receiver(ReceiverBase):
             if peer_infos.page_table is None:
                 allow_bounce = False  # cannot size the recurrent-state payload
             else:
-                extra_bytes = mamba_payload_bytes(
+                extra_bytes = mamba_receiver_payload_bytes(
                     sender_page_table=peer_infos.page_table,
                     receiver_page_table=self._registrar.self_extractor.page_table,
                     dst_slot=mamba_dst_slot,
-                    sender_ri=peer_infos,
-                    receiver_ri=self._registrar.self_rank_info,
                 )
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes
