@@ -27,6 +27,14 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime.
+
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -38,19 +46,31 @@ from tensorrt_llm._torch.visual_gen.utils import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media.decoding import decode_video_reference_window
+from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
 from .defaults import (
+    COSMOS3_720P_PARAMS,
     COSMOS3_ENVELOPES,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,
+    COSMOS3_V2V_DEFAULT_FLOW_SHIFT,
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
-from .sampling import Cosmos3SamplingPolicy, load_scheduler
+from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
+from .transfer import (
+    TRANSFER_DEFAULTS,
+    Cosmos3TransferConfig,
+    decode_media_to_uint8_cthw,
+    find_closest_target_size,
+    load_or_compute_control_frames,
+    pad_temporal_frames,
+    resolve_transfer_config,
+    uint8_cthw_to_normalized_5d,
+)
 from .transformer_cosmos3 import NEMOTRON_DENSE_RECIPE, Cosmos3VFMTransformer, resolve_arch_recipe
 
 # Image modes declare no negative prompt in the reference
@@ -89,6 +109,11 @@ COSMOS3_T2I_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate images from a give prompt."
 )
 COSMOS3_V2V_FLOW_SHIFT = 10.0
+# Fraction of a transfer hint that may be mirror-padding before it is worth a
+# warning. A few frames of tail ping-pong is normal when clips differ slightly;
+# beyond this the control is mostly invented and the client likely sent clips of
+# different videos.
+CONTROL_LENGTH_MISMATCH_RATIO = 0.10
 COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
@@ -541,13 +566,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         Derived rather than fixed so a new family or mode table is picked up
         automatically: the per-mode generation tables, the checkpoint's own
-        shift, and V2V's stronger shift. Entries are still created lazily, so a
-        mode that is never served never builds one.
+        shift, V2V's stronger shift, and the per-hint transfer presets. Entries
+        are still created lazily, so a mode that is never served never builds
+        one.
+
+        Transfer's shifts are included even though every hint currently declares
+        the same value as V2V: tuning one off that value would otherwise drop it
+        out of the cache silently and rebuild a scheduler on every request for
+        that hint.
         """
         cached = getattr(self, "_cacheable_flow_shifts_cache", None)
         if cached is not None:
             return cached
-        shifts = {COSMOS3_V2V_FLOW_SHIFT}
+        shifts = {COSMOS3_V2V_FLOW_SHIFT, COSMOS3_V2V_DEFAULT_FLOW_SHIFT}
         checkpoint_shift = getattr(self.sampling, "checkpoint_flow_shift", None)
         if checkpoint_shift is not None:
             shifts.add(float(checkpoint_shift))
@@ -556,6 +587,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             mode_shift = table.get("flow_shift")
             if mode_shift is not None:
                 shifts.add(float(mode_shift))
+        for hint_defaults in TRANSFER_DEFAULTS.values():
+            hint_shift = hint_defaults.get("flow_shift")
+            if hint_shift is not None:
+                shifts.add(float(hint_shift))
         cached = self._cacheable_flow_shifts_cache = frozenset(shifts)
         return cached
 
@@ -590,6 +625,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
         is_t2i = str(output_type).lower() == "image"
+        transfer_config = resolve_transfer_config(extra_params, req.params, req.prompt)
 
         # Caller-assigned values win. Anything still carrying a pipeline
         # default — unset, or merged by the executor from the video table —
@@ -600,10 +636,49 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             value = getattr(req.params, field_name)
             return value if field_name in specified else None
 
+        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
+        # Source-derived sizes go in as non-None, so they win over the mode
+        # table: _resolve_generation_params only fills what is still None.
+        height, width = as_given("height"), as_given("width")
+        frame_rate = req.params.frame_rate
+        wants_source_size = "height" not in specified and "width" not in specified
+        # Timing resolves as a unit. A caller who pinned `num_frames` -- directly,
+        # or via `seconds`, which the serving layer already converted at the
+        # default rate -- has fixed the output duration; adopting a different
+        # frame rate underneath that would silently stretch or compress it.
+        wants_source_fps = "frame_rate" not in specified and "num_frames" not in specified
+        if wants_source_size or wants_source_fps:
+            source = video
+            if source is None and transfer_config is not None:
+                # Transfer can run on precomputed controls alone; then the
+                # control clip is what defines the structure to match.
+                source = next(
+                    (hint.control for hint in transfer_config.ordered_hints if hint.control),
+                    None,
+                )
+            # One header read serves both: no GPU, no frame decoded.
+            info = video_stream_info(source) if source is not None else None
+            if info is not None:
+                if wants_source_size:
+                    # Follow the reference's aspect, so a portrait or square
+                    # source is not center-cropped into the default landscape
+                    # bucket. Skipped when either dimension was named: that
+                    # states an intent, and overriding half of it would be
+                    # worse than leaving it alone.
+                    width, height = find_closest_target_size(info.height, info.width, 720)
+                if wants_source_fps and info.frame_rate is not None:
+                    # Emitting an 8 fps source at the 24 fps default would play
+                    # it back at 3x speed and misreport its duration to the
+                    # text conditioning.
+                    frame_rate = info.frame_rate
+                if self.rank == 0:
+                    logger.info(
+                        f"Cosmos3 following the source: {width}x{height} (WxH) @ {frame_rate} fps"
+                    )
         resolved = self._resolve_generation_params(
             "image" if is_t2i else "video",
-            height=as_given("height"),
-            width=as_given("width"),
+            height=height,
+            width=width,
             num_inference_steps=as_given("num_inference_steps"),
             guidance_scale=as_given("guidance_scale"),
         )
@@ -611,7 +686,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         width = resolved["width"]
         num_inference_steps = resolved["num_inference_steps"]
         guidance_scale = resolved["guidance_scale"]
-        video = extra_params.get("video")  # encoded MP4/AVI bytes (the extra-param contract)
 
         return self.forward(
             prompt=req.prompt,
@@ -624,7 +698,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             guidance_scale=guidance_scale,
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
-            frame_rate=req.params.frame_rate,
+            frame_rate=frame_rate,
             use_duration_template=extra_params.get(
                 "use_duration_template",
                 COSMOS3_EXTRA_SPECS["use_duration_template"].default,
@@ -642,6 +716,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             condition_video_latent_indexes=extra_params.get("condition_video_latent_indexes"),
             condition_video_keep=extra_params.get("condition_video_keep"),
             flow_shift=extra_params.get("flow_shift"),
+            transfer_config=transfer_config,
         )
 
     def _apply_metadata_templates(
@@ -781,7 +856,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         token_ids.append(self.tokenizer.convert_tokens_to_ids("<|vision_start|>"))  # 151652
         seq_len = len(token_ids)
 
-        # Pad to max_sequence_length
+        # Pad to max_sequence_length. TRT's shared denoiser concatenates CFG
+        # prompt tensors, so cond/uncond sequence lengths must match.
         pad_len = max_sequence_length - seq_len
         attention_mask = [1] * seq_len + [0] * pad_len
         token_ids = token_ids + [self.tokenizer.pad_token_id or 0] * pad_len
@@ -923,8 +999,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     # VAE decode
     # =========================================================================
 
-    @nvtx_range("_decode_latents", color="blue")
-    def _decode_latents(self, latents):
+    def _decode_latents_raw(self, latents):
         latents = latents.to(self.vae.dtype)
 
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
@@ -944,9 +1019,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             scaling_factor = self.vae.config.get("scaling_factor", 1.0)
             latents = latents / scaling_factor
 
-        video = self.vae.decode(latents, return_dict=False)[0]
-        video = postprocess_video_tensor(video)
-        return video
+        return self.vae.decode(latents, return_dict=False)[0]
+
+    @nvtx_range("_decode_latents", color="blue")
+    def _decode_latents(self, latents):
+        return postprocess_video_tensor(self._decode_latents_raw(latents))
 
     # =========================================================================
     # Audio generation
@@ -1081,6 +1158,39 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return latents, velocity_mask, condition_latents
 
     # =========================================================================
+    # Transfer
+    # =========================================================================
+
+    def _prepare_transfer_latents(
+        self,
+        target_video: torch.Tensor,
+        current_conditional_frames: int,
+        generator: torch.Generator,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        condition_latents = self._encode_video_tensor(target_video)
+        noise = randn_tensor(
+            condition_latents.shape,
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        condition_mask = torch.zeros(
+            1,
+            1,
+            condition_latents.shape[2],
+            1,
+            1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        if current_conditional_frames > 0:
+            latent_frames = (current_conditional_frames - 1) // self.vae_scale_factor_temporal + 1
+            condition_mask[:, :, :latent_frames] = 1.0
+        latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
+        velocity_mask = 1.0 - condition_mask
+        return latents, velocity_mask, condition_mask * condition_latents
+
+    # =========================================================================
     # Forward (main generation entry point)
     # =========================================================================
 
@@ -1109,6 +1219,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         condition_video_latent_indexes: Iterable[int] | None = None,
         condition_video_keep: str | None = None,
         flow_shift: Optional[float] = None,
+        transfer_config: Optional[Cosmos3TransferConfig] = None,
     ):
         """Run one generation. ``infer()`` is the resolved entry point.
 
@@ -1179,9 +1290,29 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         is_v2v = video is not None and not is_t2i
         if use_system_prompt is None:
             # V2V always wants it; otherwise the checkpoint declares the default.
-            use_system_prompt = is_v2v or self.default_use_system_prompt
+            # Transfer opts out for reference parity (vllm-omni
+            # `_forward_transfer` defaults it False).
+            if transfer_config is not None:
+                use_system_prompt = False
+            else:
+                use_system_prompt = is_v2v or self.default_use_system_prompt
         else:
             use_system_prompt = bool(use_system_prompt)
+        if transfer_config is not None:
+            if is_t2i:
+                raise ValueError("Cosmos3 transfer inference is supported only for video outputs.")
+            if enable_audio:
+                raise ValueError(
+                    "Cosmos3 transfer inference cannot be combined with sound generation."
+                )
+            if image is not None:
+                # _forward_transfer takes no image: structure comes from the
+                # control hints and the first chunk conditions on `video`. Say
+                # so rather than dropping the reference silently.
+                raise ValueError(
+                    "Cosmos3 transfer inference cannot be combined with an image reference; "
+                    "pass the conditioning clip as the 'video' extra param instead."
+                )
 
         guidance_interval = None
         if is_t2i:
@@ -1208,9 +1339,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         else:
             target_shift = mode_shift if flow_shift is None else flow_shift
             target_karras = None
-        self.scheduler = self._scheduler_for(target_shift, target_karras)
-        if getattr(self, "audio_scheduler", None) is not None:
-            self.audio_scheduler = self._scheduler_for(target_shift, target_karras, stream="audio")
+        if transfer_config is None:
+            # Transfer applies the hint's own shift inside _forward_transfer, so
+            # rebuilding the schedulers here would only be undone a few lines later.
+            self.scheduler = self._scheduler_for(target_shift, target_karras)
+            if getattr(self, "audio_scheduler", None) is not None:
+                self.audio_scheduler = self._scheduler_for(
+                    target_shift, target_karras, stream="audio"
+                )
 
         if self.rank == 0:
             logger.info(
@@ -1263,8 +1399,28 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             torch.distributed.broadcast(text_blocked, src=0)
 
         if text_blocked.item():
-            timer.mark_end()
-            return timer.fill(PipelineOutput())
+            return PipelineOutput()
+
+        if transfer_config is not None:
+            return self._forward_transfer(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height,
+                width=width,
+                max_frames=transfer_config.max_frames,
+                num_inference_steps=num_inference_steps,
+                max_sequence_length=max_sequence_length,
+                use_system_prompt=use_system_prompt,
+                use_duration_template=False,
+                use_resolution_template=False,
+                seed=seed,
+                frame_rate=frame_rate,
+                num_frames=num_frames,
+                use_guardrails=use_guardrails,
+                timer=timer,
+                transfer_config=transfer_config,
+                video=video,
+            )
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -1589,5 +1745,595 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 audio_sample_rate=self.audio_tokenizer.model_config["sampling_rate"]
                 if waveform is not None
                 else None,
+            )
+        )
+
+    @staticmethod
+    def _get_transfer_num_chunks(
+        total_frames: int,
+        frames_per_chunk: int,
+        conditional_frames: int,
+    ) -> tuple[int, int]:
+        if frames_per_chunk <= 0:
+            raise ValueError("Cosmos3 transfer frames_per_chunk must be positive.")
+        if total_frames <= frames_per_chunk:
+            return 1, frames_per_chunk
+        stride = frames_per_chunk - conditional_frames
+        if stride <= 0:
+            raise ValueError(
+                "Cosmos3 transfer num_conditional_frames must be smaller than num_video_frames_per_chunk."
+            )
+        remaining = total_frames - frames_per_chunk
+        extra_chunks = remaining // stride + (1 if remaining % stride else 0)
+        return 1 + extra_chunks, stride
+
+    def _warn_on_control_length_mismatch(
+        self, per_hint_frames: dict[str, torch.Tensor], total_frames: int
+    ) -> None:
+        """Flag hints short enough that mirror-padding invents most of their control.
+
+        Measured as padding actually applied rather than as disagreement between
+        hints, because that is what reaches the model: a request that pins
+        ``num_frames`` down to the shortest clip pads nothing and stays silent,
+        while a few frames of tail ping-pong is well under the threshold. A
+        large gap is almost always a client that sent clips of different videos.
+        """
+        if self.rank != 0 or total_frames <= 0:
+            return
+        short = {
+            key: frames.shape[1]
+            for key, frames in per_hint_frames.items()
+            if (total_frames - frames.shape[1]) / total_frames > CONTROL_LENGTH_MISMATCH_RATIO
+        }
+        if not short:
+            return
+        counts = ", ".join(f"{key}: {count}" for key, count in sorted(short.items()))
+        logger.warning(
+            f"Cosmos3 transfer control length mismatch: {counts} against {total_frames} frames "
+            f"generated. The short hints are mirror-padded up to that length, so the output is "
+            f"conditioned on control content that does not exist in them. Supply clips of "
+            f"matching length, or set num_frames to the shortest one."
+        )
+
+    @staticmethod
+    def _positive_float(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return value
+
+    @staticmethod
+    def _transfer_active_at(
+        timestep: torch.Tensor,
+        interval: tuple[float, float] | None,
+    ) -> bool:
+        """Is guidance active at ``timestep``?
+
+        ``interval`` is in the scheduler's own timestep units (raw, typically
+        0-1000 counting down), not a fraction of the schedule -- ``[0.0, 0.8]``
+        selects the last step rather than the first 80%.
+        """
+        if interval is None:
+            return True
+        t_scalar = float(timestep.item()) if torch.is_tensor(timestep) else float(timestep)
+        lo, hi = interval
+        return float(lo) <= t_scalar <= float(hi)
+
+    @staticmethod
+    def _combine_transfer_predictions(
+        *,
+        cond_full: torch.Tensor,
+        cond_no_control: torch.Tensor | None,
+        uncond_full: torch.Tensor | None,
+        guidance_scale: float,
+        control_guidance: float,
+    ) -> torch.Tensor:
+        needs_control_cfg = cond_no_control is not None and control_guidance != 1.0
+        needs_text_cfg = uncond_full is not None and guidance_scale > 1.0
+
+        if needs_control_cfg and needs_text_cfg:
+            control_cond = cond_no_control + control_guidance * (cond_full - cond_no_control)
+            return uncond_full + guidance_scale * (control_cond - uncond_full)
+        if needs_control_cfg:
+            return cond_no_control + control_guidance * (cond_full - cond_no_control)
+        if needs_text_cfg:
+            return uncond_full + guidance_scale * (cond_full - uncond_full)
+        return cond_full
+
+    def diffuse_transfer(
+        self,
+        *,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        cond_ids: torch.Tensor,
+        cond_mask: torch.Tensor,
+        uncond_ids: torch.Tensor,
+        uncond_mask: torch.Tensor,
+        guidance_scale: float,
+        control_guidance: float,
+        control_guidance_interval: tuple[float, float] | None,
+        control_latents: list[torch.Tensor],
+        shared_kwargs: dict[str, Any],
+        velocity_mask: torch.Tensor,
+        condition_latents: torch.Tensor,
+        generator: torch.Generator,
+        guidance_interval: tuple[float, float] | None = None,
+    ) -> torch.Tensor:
+        """Run Cosmos3 transfer denoising with sequential control/text CFG branches."""
+
+        branch_caches: dict[str, tuple[Any, Any]] = {}
+
+        def run_branch(
+            cache_key: str,
+            *,
+            text_ids: torch.Tensor,
+            text_mask: torch.Tensor,
+            branch_control_latents: list[torch.Tensor] | None,
+            timestep: torch.Tensor,
+        ) -> torch.Tensor:
+            self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
+                cache_key,
+                (None, None),
+            )
+            result = self.transformer(
+                hidden_states=latents,
+                timestep=timestep / self.scheduler.config.num_train_timesteps,
+                raw_timestep=timestep,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                control_latents=branch_control_latents,
+                **shared_kwargs,
+            )
+            branch_caches[cache_key] = (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+            )
+            if result.video is None:
+                raise ValueError("Cosmos3 transfer diffusion expects video predictions.")
+            return result.video
+
+        self.transformer.reset_cache()
+        try:
+            transfer_steps = tqdm(
+                timesteps,
+                total=len(timesteps),
+                desc="Transfer denoising",
+                disable=self.rank != 0,
+                dynamic_ncols=True,
+            )
+            for t in transfer_steps:
+                timestep = t.expand(latents.shape[0])
+                step_guidance = (
+                    float(guidance_scale) if self._transfer_active_at(t, guidance_interval) else 1.0
+                )
+                step_control = (
+                    float(control_guidance)
+                    if self._transfer_active_at(t, control_guidance_interval)
+                    else 1.0
+                )
+
+                cond_full = run_branch(
+                    "transfer_cond_full",
+                    text_ids=cond_ids,
+                    text_mask=cond_mask,
+                    branch_control_latents=control_latents,
+                    timestep=timestep,
+                )
+                cond_no_control = None
+                if step_control != 1.0:
+                    cond_no_control = run_branch(
+                        "transfer_cond_no_control",
+                        text_ids=cond_ids,
+                        text_mask=cond_mask,
+                        branch_control_latents=None,
+                        timestep=timestep,
+                    )
+
+                uncond_full = None
+                if step_guidance > 1.0:
+                    uncond_full = run_branch(
+                        "transfer_uncond_full",
+                        text_ids=uncond_ids,
+                        text_mask=uncond_mask,
+                        branch_control_latents=control_latents,
+                        timestep=timestep,
+                    )
+
+                noise_pred = self._combine_transfer_predictions(
+                    cond_full=cond_full,
+                    cond_no_control=cond_no_control,
+                    uncond_full=uncond_full,
+                    guidance_scale=step_guidance,
+                    control_guidance=step_control,
+                )
+                noise_pred = noise_pred * velocity_mask
+                latents = self.scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    return_dict=False,
+                    **self.sampling.scheduler_step_kwargs(generator),
+                )[0]
+                latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+        finally:
+            self.transformer.reset_cache()
+
+        return latents
+
+    def _forward_transfer(
+        self,
+        *,
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[str],
+        height: int,
+        width: int,
+        max_frames: int,
+        num_inference_steps: int,
+        max_sequence_length: int,
+        use_system_prompt: bool,
+        use_duration_template: bool,
+        use_resolution_template: bool,
+        seed: int,
+        frame_rate: float,
+        num_frames: int,
+        use_guardrails: bool,
+        timer: CudaPhaseTimer,
+        transfer_config: Cosmos3TransferConfig,
+        video: Optional[bytes],
+    ) -> PipelineOutput:
+        if self.rank == 0:
+            logger.info(f"Cosmos3 transfer target={width}x{height} (WxH)")
+
+        # Decode the input video and every precomputed control on this rank's
+        # NVDEC. A decode can fail non-uniformly across ranks (decoder init,
+        # corrupt stream, allocation), so converge all ranks on one outcome
+        # before any model collective rather than hanging the healthy ones.
+        # The decoder sizes its retention ring from the requested window, so
+        # asking for `max_frames` (5000 by default) would reserve ~14 GB at 720p
+        # before a single frame lands. Bound it by what is actually generated:
+        # the output is `num_frames` long, and `max_frames` stays the ceiling.
+        decode_frames = min(int(max_frames), int(transfer_config.num_frames or num_frames))
+        if self.rank == 0:
+            logger.info(f"Cosmos3 transfer decoding up to {decode_frames} frames per reference")
+
+        input_frames = None
+        per_hint_frames: dict[str, torch.Tensor] = {}
+        prepare_error: Optional[Exception] = None
+        try:
+            if video is not None:
+                input_frames = decode_media_to_uint8_cthw(
+                    video,
+                    height=height,
+                    width=width,
+                    max_frames=decode_frames,
+                    device=self.device,
+                )
+
+            for hint in transfer_config.ordered_hints:
+                frames = load_or_compute_control_frames(
+                    hint,
+                    height=height,
+                    width=width,
+                    max_frames=decode_frames,
+                    input_frames=input_frames,
+                    device=self.device,
+                )
+                if frames.shape[1] < 1:
+                    raise ValueError(f"Cosmos3 transfer hint '{hint.key}' produced no frames.")
+                per_hint_frames[hint.key] = frames
+            if not per_hint_frames:
+                raise ValueError("Cosmos3 transfer requires at least one control hint.")
+        except Exception as exc:
+            prepare_error = exc
+        synchronize_media_prepare_status(prepare_error)
+
+        # The longest hint sets the length. Taking the first hint's instead would
+        # make the result depend on TRANSFER_HINT_KEYS order rather than on the
+        # request: with the same two clips, the earlier modality would win, so a
+        # shorter first hint silently truncated the longer one (the chunk loop
+        # never reads past total_frames) while a longer one padded it. No
+        # further clamp is needed -- every hint was decoded under decode_frames,
+        # which already bounds them by num_frames.
+        total_frames = max(1, max(frames.shape[1] for frames in per_hint_frames.values()))
+        self._warn_on_control_length_mismatch(per_hint_frames, total_frames)
+        per_hint_frames = {
+            key: pad_temporal_frames(frames, total_frames)
+            for key, frames in per_hint_frames.items()
+        }
+        if input_frames is not None:
+            input_frames = pad_temporal_frames(input_frames, total_frames)
+
+        temporal_compression = self.vae_scale_factor_temporal
+        chunk_frames = 1 if total_frames == 1 else transfer_config.num_video_frames_per_chunk
+        chunk_frames = (
+            math.ceil((chunk_frames - 1) / temporal_compression) * temporal_compression + 1
+        )
+        num_chunks, stride = self._get_transfer_num_chunks(
+            total_frames,
+            chunk_frames,
+            transfer_config.num_conditional_frames,
+        )
+        padded_frames = max(total_frames, chunk_frames)
+        per_hint_frames = {
+            key: pad_temporal_frames(frames, padded_frames)
+            for key, frames in per_hint_frames.items()
+        }
+        if input_frames is not None:
+            input_frames = pad_temporal_frames(input_frames, padded_frames)
+
+        # The encoded reference carries no frame rate across the extra-param
+        # boundary, so the hint's configured fps (wsm's 10) wins over the
+        # request's, which falls back to the mode default.
+        frame_rate = (
+            self._positive_float(transfer_config.fps) or self._positive_float(frame_rate) or 24.0
+        )
+        num_inference_steps = num_inference_steps or COSMOS3_720P_PARAMS["num_inference_steps"]
+        guidance_scale = (
+            float(transfer_config.guidance_scale)
+            if transfer_config.guidance_scale is not None
+            else COSMOS3_720P_PARAMS["guidance_scale"]
+        )
+        if self.sampling.is_distilled:
+            # A distilled checkpoint runs one schedule and bakes guidance into
+            # the weights, so the per-hint guidance presets cannot apply. Say so
+            # rather than silently sampling off-distribution.
+            num_inference_steps = self.sampling.num_steps(num_inference_steps)
+            if guidance_scale != DISTILLED_GUIDANCE_SCALE:
+                logger.warning(
+                    f"Cosmos3 transfer on a distilled checkpoint: overriding "
+                    f"guidance_scale {guidance_scale} with the mandated "
+                    f"{DISTILLED_GUIDANCE_SCALE}; per-hint guidance presets do not apply."
+                )
+            guidance_scale = DISTILLED_GUIDANCE_SCALE
+        flow_shift_target = float(
+            transfer_config.flow_shift
+            if transfer_config.flow_shift is not None
+            else COSMOS3_V2V_DEFAULT_FLOW_SHIFT
+        )
+        max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
+        self._guidance_scale = guidance_scale
+        self._num_timesteps = num_inference_steps
+        # forward() skips its own scheduler rebuild for transfer, so this is the
+        # only setup on this path: assigning is what keeps a previous request's
+        # scheduler from carrying over on a reused worker.
+        self.scheduler = self._scheduler_for(flow_shift_target, use_karras_sigmas=False)
+
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        if negative_prompt is None:
+            negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
+
+        # Transfer prompts are already upsampled by the benchmark/config path.
+        # Keep them verbatim; duration/resolution templates would change parity.
+        prompt = [prompt] if isinstance(prompt, str) else list(prompt)
+        prompt = prompt[0]
+        prompt = transfer_config.emphasized_prompt(prompt)
+        if self.rank == 0:
+            logger.info(f"Transfer prompt: '{prompt}'")
+
+        # 1. Tokenize prompts (no separate text encoder — transformer embeds internally)
+        logger.info("Tokenizing prompts...")
+        system_prompt = COSMOS3_DEFAULT_SYSTEM_PROMPT
+        cond_ids, cond_mask = self._tokenize_prompt(
+            prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
+        )
+        uncond_ids, uncond_mask = self._tokenize_prompt(
+            negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
+        )
+
+        # Finished frames land in host memory as they are produced rather than
+        # stacking on the GPU for the whole run: at 720p a decoded chunk is
+        # ~0.5 GB, so a long generation would pile several GB of *completed*
+        # output on top of the denoise working set -- and `torch.cat` would then
+        # briefly double it. Only the next chunk's conditioning has to stay
+        # resident.
+        #
+        # Pinned, because the copy is then asynchronous and overlaps the next
+        # chunk's denoise; into pageable memory the same copy blocks and runs
+        # ~40x slower. Allocated per request rather than held, since torch's
+        # caching host allocator keeps the block and only the first request of a
+        # given size reaches cudaHostAlloc -- so deployments that never serve
+        # transfer page-lock nothing.
+        #
+        # Assembled on rank 0 alone: every rank decodes each chunk because the
+        # next one conditions on it, but the executor sends only rank 0's
+        # response, so assembling on the others allocates a pinned buffer per
+        # rank to build a video nobody reads.
+        assembles_output = self.rank == 0
+        show_controls = transfer_config.show_control_condition
+        show_input_panel = transfer_config.show_input and input_frames is not None
+        panels = (len(per_hint_frames) if show_controls else 0) + (1 if show_input_panel else 0)
+        host_output = (
+            torch.empty(
+                (1, total_frames, height, width * (panels + 1), 3),
+                dtype=torch.uint8,
+                # Page-locking needs a CUDA context; only the CPU-only unit
+                # tests run without one, and there is nothing to overlap there.
+                pin_memory=torch.cuda.is_available(),
+            )
+            if assembles_output
+            else None
+        )
+        frames_written = 0
+        previous_output: torch.Tensor | None = None
+
+        # Every chunk's decode is part of generation here (it feeds the next
+        # chunk), so the whole loop counts as denoise; post covers assembly.
+        timer.mark_denoise_start()
+        for chunk_id in range(num_chunks):
+            start_frame = chunk_id * stride
+            end_frame = min(start_frame + chunk_frames, total_frames)
+            control_norms = {
+                key: uint8_cthw_to_normalized_5d(
+                    pad_temporal_frames(frames[:, start_frame:end_frame], chunk_frames),
+                    dtype=self.dtype,
+                )
+                for key, frames in per_hint_frames.items()
+            }
+            target_norm = torch.zeros_like(next(iter(control_norms.values())))
+            current_conditional_frames = 0
+
+            if chunk_id == 0 and transfer_config.num_first_chunk_conditional_frames > 0:
+                if input_frames is None:
+                    raise ValueError(
+                        "Cosmos3 transfer num_first_chunk_conditional_frames > 0 requires a video input."
+                    )
+                current_conditional_frames = min(
+                    transfer_config.num_first_chunk_conditional_frames,
+                    input_frames.shape[1],
+                    chunk_frames,
+                )
+                if current_conditional_frames > 0:
+                    input_cond = uint8_cthw_to_normalized_5d(
+                        input_frames[:, :current_conditional_frames],
+                        dtype=self.dtype,
+                    )
+                    target_norm[:, :, :current_conditional_frames] = input_cond
+                    if current_conditional_frames < chunk_frames:
+                        fill = target_norm[
+                            :, :, current_conditional_frames - 1 : current_conditional_frames
+                        ]
+                        target_norm[:, :, current_conditional_frames:] = fill.expand(
+                            -1,
+                            -1,
+                            chunk_frames - current_conditional_frames,
+                            -1,
+                            -1,
+                        )
+            elif chunk_id > 0 and previous_output is not None:
+                current_conditional_frames = min(
+                    transfer_config.num_conditional_frames,
+                    previous_output.shape[2],
+                    chunk_frames,
+                )
+                if current_conditional_frames > 0:
+                    target_norm[:, :, :current_conditional_frames] = previous_output[
+                        :, :, -current_conditional_frames:
+                    ].to(target_norm)
+                    if current_conditional_frames < chunk_frames:
+                        fill = target_norm[
+                            :, :, current_conditional_frames - 1 : current_conditional_frames
+                        ]
+                        target_norm[:, :, current_conditional_frames:] = fill.expand(
+                            -1,
+                            -1,
+                            chunk_frames - current_conditional_frames,
+                            -1,
+                            -1,
+                        )
+
+            control_latents = [
+                self._encode_video_tensor(control) for control in control_norms.values()
+            ]
+            latents, velocity_mask, condition_latents = self._prepare_transfer_latents(
+                target_norm,
+                current_conditional_frames,
+                generator,
+            )
+            video_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+            shared_kwargs = dict(
+                video_shape=video_shape,
+                fps=frame_rate,
+                noisy_frame_mask=velocity_mask,
+                transfer_share_vision_temporal_positions=transfer_config.share_vision_temporal_positions,
+            )
+
+            self.sampling.set_timesteps(self.scheduler, num_inference_steps, device=self.device)
+            latents = self.diffuse_transfer(
+                latents=latents,
+                timesteps=self.scheduler.timesteps,
+                cond_ids=cond_ids,
+                cond_mask=cond_mask,
+                uncond_ids=uncond_ids,
+                uncond_mask=uncond_mask,
+                guidance_scale=guidance_scale,
+                control_guidance=transfer_config.control_guidance,
+                control_guidance_interval=transfer_config.control_guidance_interval,
+                control_latents=control_latents,
+                shared_kwargs=shared_kwargs,
+                velocity_mask=velocity_mask,
+                condition_latents=condition_latents,
+                generator=generator,
+            )
+            # Deliberately the raw decode rather than `decode_latents()`: the
+            # decoded chunk is this loop's *input* as well as its output — the
+            # next chunk conditions on its tail — so every rank needs it. Owning
+            # one rank's decode and broadcasting would ship ~0.5 GB per chunk
+            # and serialize the loop behind a collective, which costs more than
+            # recomputing the decode locally.
+            output_video = self._decode_latents_raw(latents).clamp(-1, 1)
+
+            # Chunk 0 keeps every frame; later chunks drop the overlap they were
+            # conditioned on. The tail trim that used to follow the final concat
+            # happens here instead, as a bound on what each chunk contributes.
+            skip = 0 if chunk_id == 0 else current_conditional_frames
+            take = min(output_video.shape[2] - skip, total_frames - frames_written)
+            if assembles_output and take > 0:
+                chunk = output_video[:, :, skip : skip + take]
+                panel_tensors = []
+                if show_controls:
+                    panel_tensors.extend(
+                        control_norms[key][:, :, skip : skip + take] for key in per_hint_frames
+                    )
+                if show_input_panel:
+                    panel_tensors.append(
+                        uint8_cthw_to_normalized_5d(
+                            input_frames[:, frames_written : frames_written + take],
+                            dtype=torch.float32,
+                        )
+                    )
+                if panel_tensors:
+                    chunk = torch.cat([p.to(chunk) for p in panel_tensors] + [chunk], dim=-1)
+                # Post-processing is elementwise, so doing it per chunk is
+                # bitwise identical to doing it on the assembled clip -- and it
+                # halves the transfer, since uint8 crosses instead of bf16.
+                host_output[:, frames_written : frames_written + take].copy_(
+                    postprocess_video_tensor(chunk), non_blocking=True
+                )
+                frames_written += take
+
+            # Only the tail is read as the next chunk's conditioning (one frame
+            # by default), so keep that slice rather than pinning the whole
+            # ~0.5 GB chunk across the next denoise.
+            keep = min(transfer_config.num_conditional_frames, output_video.shape[2])
+            previous_output = output_video[:, :, -keep:].clone() if keep > 0 else None
+
+        timer.mark_post_start()
+
+        # The chunk copies are asynchronous, so the host buffer is not readable
+        # until the stream drains. The upload below would be correctly ordered
+        # without this, but the guardrail reads the frames on the CPU.
+        #
+        # Only false under the CPU-only unit tests, where the copies above were
+        # host-to-host and there is no stream to wait on (``CudaPhaseTimer``
+        # disables itself on the same condition).
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+
+        # Same screening the other modes get: rank 0, post-processed frames,
+        # and a None result means the guardrail rejected the clip. With the
+        # debug panels enabled the caller's own control frames ride along in
+        # the same tensor and are screened too, which errs safe. Screening the
+        # host copy rather than a device one removes a full round trip:
+        # ``check_video_safety`` moves to CPU internally and returns on the
+        # input tensor's device.
+        video = host_output
+        if self.rank == 0 and use_guardrails and self.safety_checker is not None:
+            video = check_video_safety(video, self.safety_checker)
+        # Back to the device the other pipelines hand back, now that denoising
+        # has released its working set.
+        if video is not None:
+            video = video.to(self.device)
+
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                frame_rate=frame_rate,
             )
         )

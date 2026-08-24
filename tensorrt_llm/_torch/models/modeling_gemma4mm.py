@@ -984,6 +984,8 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     - mm_token_type_ids-based bidirectional masking
     """
 
+    build_mtp_draft_model_from_config = True
+
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
         if _is_mm_disagg():
             raise NotImplementedError(

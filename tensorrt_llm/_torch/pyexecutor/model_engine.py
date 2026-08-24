@@ -18,6 +18,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
@@ -42,8 +44,6 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend.interface import (AttentionMetadata,
@@ -530,6 +530,7 @@ class PyTorchModelEngine(ModelEngine):
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
+            # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
@@ -1134,6 +1135,7 @@ class PyTorchModelEngine(ModelEngine):
                 max_lora_rank=lora_config.max_lora_rank,
                 model=self.model,
                 lora_model_config=self.lora_model_config,
+                overlap_lora_and_base=lora_config.overlap_lora_and_base,
                 device='cuda',
                 max_tokens_per_seq=max_tokens_per_seq)
 
@@ -3754,6 +3756,16 @@ class PyTorchModelEngine(ModelEngine):
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
+    def _should_use_full_generation_page_table(
+            self, spec_config: Optional[DecodingBaseConfig],
+            attn_metadata: AttentionMetadata) -> bool:
+        """Return whether overlap decode needs every reserved generation page."""
+        # FlashInfer metadata owns the optional device-side KV-length correction used with this
+        # wider page table.
+        return (self.enable_spec_decode and not self._disable_overlap_scheduler
+                and getattr(spec_config, '_use_shared_kv_cache', False)
+                and hasattr(attn_metadata, 'apply_spec_decode_kv_lens_offsets'))
+
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
         Make some changes to the device inputs and avoid blocking the async data transfer
@@ -3805,6 +3817,17 @@ class PyTorchModelEngine(ModelEngine):
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
                     inputs['attn_metadata'].on_update_kv_lens()
+                # TRTLLM uses `kv_lens_cuda` above; FlashInfer exposes this backend-specific
+                # correction without coupling the engine to its metadata type.
+                elif hasattr(inputs['attn_metadata'],
+                             'apply_spec_decode_kv_lens_offsets'):
+                    inputs['attn_metadata'].apply_spec_decode_kv_lens_offsets(
+                        self.previous_kv_lens_offsets_cuda,
+                        num_gen_requests,
+                        self.get_runtime_tokens_per_gen_step(
+                            self.runtime_draft_len),
+                        num_chunked_contexts=num_chunked_ctx_requests,
+                    )
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -3852,6 +3875,18 @@ class PyTorchModelEngine(ModelEngine):
                                 self.
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
+                # Restore the FlashInfer-specific logical KV lengths through the same optional hook
+                # used by `_preprocess_inputs`.
+                elif hasattr(inputs['attn_metadata'],
+                             'apply_spec_decode_kv_lens_offsets'):
+                    inputs['attn_metadata'].apply_spec_decode_kv_lens_offsets(
+                        self.previous_kv_lens_offsets_cuda,
+                        num_gen_requests,
+                        self.get_runtime_tokens_per_gen_step(
+                            self.runtime_draft_len),
+                        num_chunked_contexts=num_chunked_ctx_requests,
+                        restore=True,
+                    )
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
@@ -4555,7 +4590,10 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            use_full_generation_page_table=(
+                self._should_use_full_generation_page_table(
+                    spec_config, attn_metadata)))
         attn_metadata.kv_cache_manager = kv_cache_manager
         attn_metadata.prepare()
 
@@ -5686,6 +5724,7 @@ class PyTorchModelEngine(ModelEngine):
                     input_ids.append(
                         request.get_tokens(0)[request.context_current_position])
                     past_seen_token_num = request.context_current_position
+                    request_has_previous_tensor = False
                 # The request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -5707,17 +5746,34 @@ class PyTorchModelEngine(ModelEngine):
                             else:
                                 input_ids.append(request.get_last_tokens(beam))
                     past_seen_token_num = request.max_beam_num_tokens - 1
+                    request_has_previous_tensor = False
                 else:
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
+                    request_has_previous_tensor = True
 
                 position_id = past_seen_token_num
                 if _has_cp_helix:
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    if request_has_previous_tensor:
+                        # With the overlap scheduler this batch is prepared
+                        # before the previous iteration's _update_requests has
+                        # advanced py_decoding_iter, so the counter is one
+                        # behind. Compensate exactly like the non-helix path
+                        # above, which uses max_beam_num_tokens *without* the
+                        # -1 in this case. Without this, the position repeats
+                        # once (L, L, L+1, ...) and the new token's K is roped
+                        # at the wrong position before being written to the KV
+                        # cache, corrupting every later step.
+                        # TODO: revisit for helix x speculative decoding -
+                        # the base formula and this +1 both assume exactly
+                        # one new token per step (draft-token modes are
+                        # currently rejected under helix).
+                        position_id += 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
                     else:
@@ -6198,7 +6254,10 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            use_full_generation_page_table=(
+                self._should_use_full_generation_page_table(
+                    spec_config, attn_metadata)))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
@@ -6585,234 +6644,6 @@ class PyTorchModelEngine(ModelEngine):
 
         return inputs, None
 
-    def _prepare_star_attention_inputs(
-            self,
-            scheduled_requests: ScheduledRequests,
-            kv_cache_manager,
-            attn_metadata: AttentionMetadata,
-            resource_manager: Optional[ResourceManager] = None):
-        """
-        Prepare inputs for Pytorch Model.
-        """
-        sequence_lengths = []
-        input_ids = []
-        prompt_lengths = []
-        request_ids = []
-        gather_ids = []
-        position_ids = []
-        # for star attention, we need customized block ids
-        block_ids_per_seq = []
-        num_cached_tokens_per_seq = []
-        for request in scheduled_requests.context_requests:
-            request_ids.append(request.py_request_id)
-            prompt_lengths.append(request.py_prompt_len)
-
-            ctx_iter = request.ctx_iters
-            ctx_blocks = request.ctx_blocks
-            ctx_position_blocks = request.ctx_position_blocks
-            all_cache_indices = kv_cache_manager.get_cache_indices(request)
-            ### for the first iteration, we need to construct input as C[0]  + C[1]
-            if ctx_iter == 0:
-                input_id = ctx_blocks[0] + ctx_blocks[1]
-                num_kv_blocks = kv_cache_manager.get_num_kv_blocks(
-                    len(input_id))
-                position_id = ctx_position_blocks[0] + ctx_position_blocks[1]
-                past_seen_token_num = 0
-                all_cache_indices = all_cache_indices[:num_kv_blocks]
-            else:
-                input_id = ctx_blocks[ctx_iter + 1]
-                position_id = ctx_position_blocks[ctx_iter + 1]
-                ## compute C[0] and ctx_blocks
-                if ctx_iter < len(ctx_blocks) - 2:
-                    if self.mapping.cp_rank == 0:
-                        anchor_block = ctx_blocks[
-                            0][:self.mapping.cp_config['cp_anchor_size']]
-                    else:
-                        anchor_block = ctx_blocks[0]
-
-                    num_anchor_cache_blocks = kv_cache_manager.get_num_kv_blocks(
-                        len(anchor_block))
-                    ### we need to construct input as C[0] + C[x+i]
-                    #C0 has been computed, can be shared across all blocks
-                    anchor_indices = all_cache_indices[:num_anchor_cache_blocks]
-
-                    # C1~C[ctx_iter] should be skipped in the computation
-                    token_start_idx = sum(
-                        len(block) for block in ctx_blocks[:(ctx_iter + 1)])
-                    token_end_idx = sum(
-                        len(block) for block in ctx_blocks[:(ctx_iter + 2)])
-                    block_start_idx = kv_cache_manager.get_num_kv_blocks(
-                        token_start_idx)
-                    block_end_idx = kv_cache_manager.get_num_kv_blocks(
-                        token_end_idx)
-                    block_indices = all_cache_indices[
-                        block_start_idx:block_end_idx]
-
-                    all_cache_indices = anchor_indices + block_indices
-                    past_seen_token_num = len(
-                        anchor_block)  ### C[0] can be reused
-                else:
-                    continue
-            input_ids.extend(input_id)
-            position_ids.extend(position_id)
-            gather_ids.append(len(input_ids) - 1)
-            sequence_lengths.append(len(input_id))
-            block_ids_per_seq.extend([all_cache_indices])
-            num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.cached_tokens = num_cached_tokens_per_seq[-1]
-        num_contexts = len(sequence_lengths)
-        for request in scheduled_requests.context_requests:
-            ctx_iter = request.ctx_iters
-            ctx_blocks = request.ctx_blocks
-            ctx_position_blocks = request.ctx_position_blocks
-            num_kvblocks_per_ctx_block = kv_cache_manager.get_num_kv_blocks(
-                len(ctx_blocks[0]))
-            all_cache_indices = kv_cache_manager.get_cache_indices(request)
-            ### for query phase
-            ## compute C[0~blocks] with query for the first rank
-            ## compute C[1~blocks] with query for the other rank
-            if ctx_iter == len(ctx_blocks) - 2:
-                input_id = ctx_blocks[ctx_iter + 1]
-                position_id = ctx_position_blocks[ctx_iter + 1]
-                if self.mapping.cp_rank == 0:
-                    past_seen_token_num = sum(
-                        len(block) for block in ctx_blocks[:ctx_iter + 1])
-                else:
-                    # drop C0, free KV cache
-                    all_cache_indices = all_cache_indices[
-                        num_kvblocks_per_ctx_block:]
-                    past_seen_token_num = sum(
-                        len(block) for block in ctx_blocks[1:ctx_iter + 1])
-                if self.mapping.cp_rank == self.mapping.cp_size - 1:
-                    num_kv_tokens = past_seen_token_num + len(input_id)
-                else:
-                    num_kv_tokens = past_seen_token_num  # don't need to append/compute query's kv cache
-                num_kv_blocks = kv_cache_manager.get_num_kv_blocks(
-                    num_kv_tokens)
-                all_cache_indices = all_cache_indices[:num_kv_blocks]
-            else:
-                continue
-
-            input_ids.extend(input_id)
-            position_ids.extend(position_id)
-            gather_ids.append(len(input_ids) - 1)
-            sequence_lengths.append(len(input_id))
-            block_ids_per_seq.extend([all_cache_indices])
-            num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.cached_tokens = num_cached_tokens_per_seq[-1]
-        num_queries = len(sequence_lengths) - num_contexts
-
-        # Requests with draft tokens are treated like extend requests.
-        extend_requests = [
-            request for request in scheduled_requests.generation_requests
-            if request.py_draft_tokens
-        ]
-        generation_requests = [
-            request for request in scheduled_requests.generation_requests
-            if not request.py_draft_tokens
-        ]
-        is_spec_decode = len(extend_requests) > 0
-        assert not is_spec_decode, 'star attention does not support draft tokens now.'
-
-        for request in generation_requests:
-            request_ids.append(request.py_request_id)
-            prompt_lengths.append(request.py_prompt_len)
-
-            input_token_id = request.get_token(0, request.get_num_tokens(0) - 1)
-            input_ids.append(input_token_id)
-            gather_ids.append(len(input_ids) - 1)
-            sequence_lengths.append(1)
-            past_seen_token_num = request.max_beam_num_tokens - 1
-
-            # for sp, we only increase the generated KV cache for the last rank
-            ctx_blocks = request.ctx_blocks
-            total_anchor_ctx_query_len = sum(
-                [len(block) for block in ctx_blocks])
-            query_len = len(ctx_blocks[-1])
-            anchor_len = len(ctx_blocks[0])
-
-            if self.mapping.cp_size == 1:
-                past_seen_token_num = total_anchor_ctx_query_len + request.gen_iters
-                num_kv_tokens = past_seen_token_num + 1
-            else:
-                if self.mapping.cp_rank == self.mapping.cp_size - 1:
-                    past_seen_token_num = total_anchor_ctx_query_len + request.gen_iters - anchor_len
-                    num_kv_tokens = past_seen_token_num + 1
-                else:
-                    if self.mapping.cp_rank != 0:
-                        past_seen_token_num = total_anchor_ctx_query_len - anchor_len - query_len
-                    else:
-                        past_seen_token_num = total_anchor_ctx_query_len - query_len
-                    num_kv_tokens = past_seen_token_num  # don't need to append kv cache
-
-            num_kv_blocks = kv_cache_manager.get_num_kv_blocks(num_kv_tokens)
-            all_cache_indices = kv_cache_manager.get_cache_indices(request)
-            if self.mapping.cp_rank != 0:
-                num_kvblocks_per_ctx_block = kv_cache_manager.get_num_kv_blocks(
-                    anchor_len)
-                all_cache_indices = all_cache_indices[
-                    num_kvblocks_per_ctx_block:]
-            cache_indices = all_cache_indices[:num_kv_blocks]
-            last_query_pos_id = request.ctx_position_blocks[-1][-1]
-            position_ids.append(last_query_pos_id + request.gen_iters + 1)
-            block_ids_per_seq.extend([all_cache_indices])
-            num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.cached_tokens = num_cached_tokens_per_seq[-1]
-
-        num_tokens = len(input_ids)
-        assert num_tokens <= self.max_num_tokens, (
-            "num_tokens should be less than or equal to max_num_tokens")
-        input_ids = torch.tensor(input_ids,
-                                 dtype=torch.int,
-                                 pin_memory=prefer_pinned())
-        self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
-
-        position_ids = torch.tensor(position_ids,
-                                    dtype=torch.int,
-                                    pin_memory=prefer_pinned())
-        self.position_ids_cuda[:num_tokens].copy_(position_ids,
-                                                  non_blocking=True)
-
-        if not attn_metadata.is_cuda_graph:
-            # No need to overwrite seq lens when using CUDA graphs -
-            # CUDA graphs are only used for pure decoding batches
-            # and have static batch size, so the seqlens never change.
-            # Note that it's important to not free the seq_lens_cuda
-            # buffer once the graph has been captured also - this will invalidate
-            # the graph and force an expensive recapture.
-            attn_metadata.seq_lens = torch.tensor(
-                sequence_lengths,
-                dtype=torch.int,
-                pin_memory=prefer_pinned(),
-            )
-
-        attn_metadata.request_ids = request_ids
-        attn_metadata.prompt_lens = prompt_lengths
-        attn_metadata.num_contexts = num_contexts
-        attn_metadata.num_queries = num_queries
-
-        attn_metadata.kv_cache_params = KVCacheParams(
-            use_cache=True,
-            block_ids_per_seq=block_ids_per_seq,
-            num_cached_tokens_per_seq=num_cached_tokens_per_seq)
-
-        attn_metadata.kv_cache_manager = kv_cache_manager
-
-        attn_metadata.prepare()
-
-        if self.enable_attention_dp:
-            all_rank_num_tokens = self.dist.tp_allgather(
-                attn_metadata.num_tokens)
-            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
-
-        return {
-            'attn_metadata': attn_metadata,
-            'input_ids': self.input_ids_cuda[:num_tokens],
-            'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
-            'inputs_embeds': None,
-            'resource_manager': resource_manager,
-        }, gather_ids if is_spec_decode else None
-
     def _get_lora_params_from_requests(
             self,
             scheduled_requests: ScheduledRequests,
@@ -6990,11 +6821,7 @@ class PyTorchModelEngine(ModelEngine):
         set_per_request_prefill_cuda_graph_flag(False)
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
-            if CpType.STAR == cp_type:
-                return self._prepare_star_attention_inputs(
-                    scheduled_requests, kv_cache_manager, attn_metadata,
-                    resource_manager)
-            elif cp_type in (CpType.HELIX, CpType.ULYSSES):
+            if cp_type in (CpType.HELIX, CpType.ULYSSES):
                 # Take the usual route of _prepare_tp_inputs.
                 pass
             else:

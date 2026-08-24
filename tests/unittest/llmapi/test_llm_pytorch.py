@@ -42,7 +42,7 @@ from utils.util import (force_ampere, similar, similarity_score,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
-from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
@@ -227,7 +227,9 @@ def test_llm_reward_model():
 @pytest.mark.part3
 def test_llm_perf_metrics():
     with LLM(model=llama_model_path,
-             kv_cache_config=global_kvcache_config) as llm:
+             kv_cache_config=global_kvcache_config.model_copy(
+                 update={"use_kv_cache_manager_v2": True}),
+             return_perf_metrics=False) as llm:
         sampling_params = SamplingParams(max_tokens=10,
                                          return_perf_metrics=True)
         outputs = llm.generate(prompts, sampling_params)
@@ -265,8 +267,10 @@ def test_llm_prefix_cache_reuse(attn_backend):
     with LLM(
             model=model_path,
             attn_backend=attn_backend,
-            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                          use_kv_cache_manager_v2=True),
             cuda_graph_config=None,
+            return_perf_metrics=False,
     ) as llm:
         cold_output = llm.generate(prompt, sampling_params).outputs[0]
         warm_output = llm.generate(prompt, sampling_params).outputs[0]
@@ -875,7 +879,7 @@ def test_lora_many_adapters_no_memory_leak() -> None:
 def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
                                        description):
     """Test load_torch_nemo_lora function with different LoRA rank configurations."""
-    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+    from tensorrt_llm._torch.peft.lora.manager import load_torch_nemo_lora
 
     nemo_path = create_mock_nemo_lora_checkpoint(
         tmp_path,
@@ -904,7 +908,7 @@ def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
 @pytest.mark.part0
 def test_nemo_lora_unsupported_modules_validation(tmp_path):
     """Test validation of unsupported modules in NeMo LoRA."""
-    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+    from tensorrt_llm._torch.peft.lora.manager import load_torch_nemo_lora
 
     nemo_path = create_mock_nemo_lora_checkpoint(
         tmp_path,

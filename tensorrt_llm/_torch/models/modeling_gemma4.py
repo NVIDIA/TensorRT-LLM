@@ -14,6 +14,7 @@
 # limitations under the License.
 """TensorRT-LLM PyTorch backend implementation for Gemma4 text model."""
 
+import copy
 import dataclasses
 import math
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple, Union
@@ -59,7 +60,11 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoad
 from ..modules.rms_norm import RMSNorm
 from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
-from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
+from .modeling_speculative import (
+    _SPECULATIVE_POSITION_HEADROOM,
+    SpecDecOneEngineForCausalLM,
+    _slice_spec_position_ids,
+)
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 if TYPE_CHECKING:
@@ -76,6 +81,17 @@ if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
     )
 
 from transformers import Gemma4TextConfig  # noqa: E402
+
+
+def _gemma4_rope_max_positions(model_config: ModelConfig) -> int:
+    """Size RoPE for transient speculative positions beyond max_seq_len."""
+    max_positions = model_config.pretrained_config.max_position_embeddings
+    spec_config = model_config.spec_config
+    if spec_config is not None:
+        # Overlap can have one pending verification width, while the current target and shared,
+        # Q-only assistant consume the next one.
+        max_positions += 2 * spec_config.tokens_per_gen_step
+    return max_positions
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +242,7 @@ class Gemma4Attention(QKNormRoPEAttention):
 
         # Build RoPE params per layer type
         rope_params = RopeParams()
-        rope_params.max_positions = config.max_position_embeddings
+        rope_params.max_positions = _gemma4_rope_max_positions(model_config)
         if is_sliding:
             # Sliding: default RoPE, theta=10K, full rotation
             rope_config = (
@@ -1227,6 +1243,8 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    build_mtp_draft_model_from_config = True
+
     def __init__(
         self,
         model_config: ModelConfig[Gemma4TextConfig],
@@ -1595,9 +1613,16 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
 
     def __init__(self, model_config: ModelConfig):
         assistant_config = model_config.pretrained_config
+        assistant_text_config = copy.deepcopy(assistant_config.text_config)
+        # The assistant is deliberately built without `spec_config` to avoid recursive speculative
+        # initialization. Carry only its fixed physical position headroom through the internal model
+        # attributes instead.
+        assistant_text_config.max_position_embeddings += model_config.extra_attrs.get(
+            _SPECULATIVE_POSITION_HEADROOM, 0
+        )
         text_model_config = dataclasses.replace(
             model_config,
-            pretrained_config=assistant_config.text_config,
+            pretrained_config=assistant_text_config,
             spec_config=None,
         )
         super().__init__(

@@ -19,6 +19,10 @@ google/gemma-4-26B-A4B-it:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 54.0
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 54.0
 google/gemma-3-12b-it:
   - accuracy: 50.44
   - quant_algo: FP8
@@ -82,22 +86,3 @@ moonshotai/Kimi-K2.5:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 81.56
-# Step-3.7-Flash multimodal (PerceptionEncoder vision tower + MoE text decoder).
-# Reasoning model: <think>...</think> traces are stripped before MMMU answer
-# extraction (see test_llm_api_pytorch_multimodal.py::TestStep3_7). FP8 measured
-# on the FP8 block-scale checkpoint over the full 900-sample MMMU val split (TP4
-# / EP4, TRTLLM attention + MoE backends); NVFP4 (modelopt export, FP8 KV cache)
-# reuses the FP8 baseline.
-stepfun-ai/Step-3.7-Flash:
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 60
-  - quant_algo: FP8_BLOCK_SCALES
-    spec_dec_algo: MTP
-    accuracy: 60
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 60
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    spec_dec_algo: MTP
-    accuracy: 60

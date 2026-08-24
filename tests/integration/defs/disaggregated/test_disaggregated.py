@@ -347,6 +347,10 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_conditional.yaml",
         "ngram":
         f"{test_configs_root}/disagg_config_ngram.yaml",
+        "sa":
+        f"{test_configs_root}/disagg_config_sa.yaml",
+        "sa_python":
+        f"{test_configs_root}/disagg_config_sa_python.yaml",
         "ctxpp2_genpp2":
         f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml",
         "ctxtp2_genpp2":
@@ -1821,6 +1825,37 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
+                           env=llm_venv._new_env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_sa(disaggregated_test_root, llm_venv,
+                          disaggregated_example_root, llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa",
+                           env=llm_venv._new_env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
+                                 disaggregated_example_root, llama_model_root):
+    """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
+
+    NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
+    covers this split only on the C++ DEFAULT backend.
+    """
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa_python",
                            env=llm_venv._new_env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
