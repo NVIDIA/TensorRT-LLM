@@ -53,7 +53,10 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
+    UtilsSamplingParams,
+    _get_max_beam_width,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
     GREEDY,
     BeamSearch,
@@ -3615,3 +3618,25 @@ class TestTopPDecay:
             )
         # Same request without decay is accepted.
         sampler.validate_request(self._mock_request(SamplingParams(top_p=0.9), draft_tokens=[1, 2]))
+
+    @pytest.mark.parametrize(
+        "beam_width_array, expected_max_width",
+        [([], 1), (None, 1), ([1], 1), ([1, 2], 2), ([3, 5, 7], 7)],
+    )
+    def test_beam_width_array_max_handles_empty(
+        self, beam_width_array: list[int] | None, expected_max_width: int
+    ) -> None:
+        # An empty beam_width_array reaches the sampler: the executor's
+        # checkBeamWidthArray bounds only the array's length, so [] passes
+        # admission. _get_max_beam_width must fall back to beam_width instead of
+        # reducing over the empty array, and must still take the array's maximum
+        # when it has entries.
+        params = SamplingParams(top_p=0.9)
+        if beam_width_array is not None:
+            params.beam_width_array = beam_width_array
+        request = self._mock_request(params)
+        assert _get_max_beam_width(request) == expected_max_width
+        # The same request must survive admission: top_p_decay is unset, but
+        # TopPDecayHandler.validate_request resolves the sampling params -- and
+        # with them the beam width -- before it checks whether decay is active.
+        self._make_sampler().validate_request(request)

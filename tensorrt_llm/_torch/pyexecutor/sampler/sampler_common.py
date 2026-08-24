@@ -140,13 +140,12 @@ def _get_beam_width_out(request: LlmRequest) -> int:
 def _get_max_beam_width(request: LlmRequest) -> int:
     sampling_config = request.sampling_config
     max_beam_width = cast(int, sampling_config.beam_width)
-    if sampling_config.beam_width_array is not None:
-        max_beam_width = max(
-            max_beam_width,
-            cast(
-                int, torch.tensor(sampling_config.beam_width_array, dtype=torch.int32).max().item()
-            ),
-        )
+    # The array holds at most kMaxBeamWidthArrayLength (8) entries, so reduce it
+    # on the host. Truthiness rather than `is not None`: an empty array carries
+    # no schedule (SamplingConfig::checkBeamWidthArray bounds only its length),
+    # and max() over an empty sequence would raise.
+    if sampling_config.beam_width_array:
+        max_beam_width = max(max_beam_width, *map(int, sampling_config.beam_width_array))
     return max_beam_width
 
 
