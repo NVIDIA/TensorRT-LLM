@@ -151,6 +151,37 @@ def _record_hash(path: Path) -> str:
     return f"sha256={b64}"
 
 
+def repack_wheel(
+    root: Path, dest: Path, original_infos: dict[str, zipfile.ZipInfo]
+) -> None:
+    """Zip <root> into <dest>, re-stamping each member's original ZipInfo.
+
+    zf.write() would record the on-disk mode, which extractall() already reduced
+    to the umask default -- silently dropping the exec bit off any executable the
+    wheel ships. So carry the source archive's external_attr (mode) and timestamp
+    across for every member, bolted or not; only the content differs. Members
+    absent from `original_infos` were created here and have no mode to preserve.
+    """
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(root.rglob("*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(root).as_posix()
+            src_info = original_infos.get(rel)
+            if src_info is None:
+                zf.write(f, rel)
+                continue
+            info = zipfile.ZipInfo(rel, date_time=src_info.date_time)
+            info.external_attr = src_info.external_attr
+            info.internal_attr = src_info.internal_attr
+            info.create_system = src_info.create_system
+            info.compress_type = zipfile.ZIP_DEFLATED
+            # Stream rather than read the member into memory: the bolted
+            # members include multi-hundred-MB shared objects.
+            with zf.open(info, "w", force_zip64=True) as dst, f.open("rb") as src:
+                shutil.copyfileobj(src, dst)
+
+
 def process_wheel(
     wheel: Path, profiles_dir: Path, flags: list[str], strip: bool, dry_run: bool
 ) -> int:
@@ -162,6 +193,10 @@ def process_wheel(
     with tempfile.TemporaryDirectory(prefix="bolt_whl_") as td:
         wd = Path(td)
         with zipfile.ZipFile(wheel) as zf:
+            # extractall() applies the process umask rather than the archived
+            # mode, so the source zip's central directory is the ONLY record of
+            # each member's real permission bits. Keep it to re-stamp on repack.
+            original_infos = {info.filename: info for info in zf.infolist()}
             zf.extractall(wd)
 
         bolted = 0
@@ -193,12 +228,8 @@ def process_wheel(
             raise SystemExit(2)
         _rewrite_record(record_path, wd, changed)
 
-        # Rezip the wheel (deterministic-ish: sorted, deflate).
         tmp_whl = wheel.with_suffix(".whl.new")
-        with zipfile.ZipFile(tmp_whl, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in sorted(wd.rglob("*")):
-                if f.is_file():
-                    zf.write(f, f.relative_to(wd).as_posix())
+        repack_wheel(wd, tmp_whl, original_infos)
         os.replace(tmp_whl, wheel)
         log(f"  repacked wheel ({bolted} libs bolted, RECORD updated)")
         return bolted

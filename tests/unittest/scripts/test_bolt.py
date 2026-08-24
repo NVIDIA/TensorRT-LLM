@@ -19,11 +19,15 @@ Covers the pure logic most likely to regress silently:
   profiled (explicit list) rather than the full suite declaration.
 - apply_bolt.profile_for: ELF-basename -> profile-file mapping (.yaml preferred,
   .fdata fallback, multi-dot names like the python bindings, empty/missing).
+- apply_bolt.repack_wheel: member permission bits survive the unzip/rezip round
+  trip, which zipfile does NOT give us for free.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import stat
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -101,3 +105,74 @@ def test_profile_for_missing_returns_none(apply_bolt, tmp_path):
 def test_profile_for_ignores_empty_profile(apply_bolt, tmp_path):
     (tmp_path / "lib.yaml").write_text("")  # zero-size is treated as absent
     assert apply_bolt.profile_for("lib.so", tmp_path) is None
+
+
+# ------------------------------ apply_bolt.repack_wheel --------------------------
+def _mode_of(zip_path: Path, member: str) -> int:
+    with zipfile.ZipFile(zip_path) as zf:
+        return zf.getinfo(member).external_attr >> 16
+
+
+def _build_wheel(path: Path, members: dict) -> dict:
+    """Write a zip whose members carry explicit unix modes; return their ZipInfos."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, (data, mode) in members.items():
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.external_attr = (mode & 0xFFFF) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, data)
+    with zipfile.ZipFile(path) as zf:
+        return {i.filename: i for i in zf.infolist()}
+
+
+def test_repack_wheel_preserves_member_modes(apply_bolt, tmp_path):
+    src = tmp_path / "src.whl"
+    infos = _build_wheel(
+        src,
+        {
+            "pkg/runner.sh": ("#!/bin/sh\n", 0o755),
+            "pkg/lib.so": ("\x7fELF-ish", 0o644),
+        },
+    )
+    # Mimic process_wheel: extract (which drops modes), mutate, then repack.
+    work = tmp_path / "work"
+    with zipfile.ZipFile(src) as zf:
+        zf.extractall(work)
+    (work / "pkg" / "lib.so").write_text("bolted payload")
+
+    out = tmp_path / "out.whl"
+    apply_bolt.repack_wheel(work, out, infos)
+
+    # The executable keeps its exec bit; the untouched member keeps its mode.
+    assert _mode_of(out, "pkg/runner.sh") & stat.S_IXUSR
+    assert stat.S_IMODE(_mode_of(out, "pkg/runner.sh")) == 0o755
+    assert stat.S_IMODE(_mode_of(out, "pkg/lib.so")) == 0o644
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read("pkg/lib.so") == b"bolted payload"
+
+
+def test_repack_wheel_regression_plain_write_loses_exec_bit(apply_bolt, tmp_path):
+    """Guards the reason repack_wheel exists: zf.write() would drop the mode."""
+    src = tmp_path / "src.whl"
+    _build_wheel(src, {"pkg/runner.sh": ("#!/bin/sh\n", 0o755)})
+    work = tmp_path / "work"
+    with zipfile.ZipFile(src) as zf:
+        zf.extractall(work)
+    naive = tmp_path / "naive.whl"
+    with zipfile.ZipFile(naive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(work / "pkg" / "runner.sh", "pkg/runner.sh")
+    assert not _mode_of(naive, "pkg/runner.sh") & stat.S_IXUSR
+
+
+def test_repack_wheel_falls_back_for_new_members(apply_bolt, tmp_path):
+    src = tmp_path / "src.whl"
+    infos = _build_wheel(src, {"pkg/lib.so": ("x", 0o644)})
+    work = tmp_path / "work"
+    with zipfile.ZipFile(src) as zf:
+        zf.extractall(work)
+    # A member created after extraction has no original ZipInfo to honor.
+    (work / "pkg" / "GENERATED").write_text("new")
+    out = tmp_path / "out.whl"
+    apply_bolt.repack_wheel(work, out, infos)
+    with zipfile.ZipFile(out) as zf:
+        assert sorted(zf.namelist()) == ["pkg/GENERATED", "pkg/lib.so"]
