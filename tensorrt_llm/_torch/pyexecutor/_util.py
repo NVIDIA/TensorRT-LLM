@@ -1046,6 +1046,14 @@ class KvCacheCreator:
             logger.info(
                 "KV cache size estimation is not supported for context parallelism, disable it."
             )
+            if (self._is_kv_cache_manager_v2
+                    and self._mapping.cp_config.get('cp_type') == CpType.HELIX):
+                # Promote like the encoder-decoder case so build_managers
+                # runs configure_kv_cache_capacity(), which sets the quota
+                # KVCacheManagerV2 requires at construction (V1 stays local).
+                # HELIX only: configure_kv_cache_capacity has no sizing path
+                # for other CP types and would hit its assertion.
+                self._skip_est = True
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
             estimating_kv_cache = False
@@ -1088,6 +1096,41 @@ class KvCacheCreator:
                 self._kv_cache_config.max_tokens = max_tokens
         return estimating_kv_cache
 
+    def _configure_helix_kv_cache_capacity(self) -> None:
+        """Set the helix KV quota without profiling (not CP-aware).
+
+        Explicit quotas pass through; otherwise fraction sizing sets
+        ``max_gpu_total_bytes`` (a rank-local byte cap the manager consumes
+        as-is). Setting ``max_tokens`` here would overshoot the fraction:
+        the manager inflates that knob by 1 / max_util_for_resume.
+        """
+        if (self._kv_cache_config.max_tokens is not None
+                and self._kv_cache_config.max_tokens <= 0):
+            raise ValueError(
+                "Helix CP: kv_cache_config.max_tokens must be positive when "
+                f"set, got {self._kv_cache_config.max_tokens}.")
+        if (self._kv_cache_config.max_gpu_total_bytes or 0) > 0 or \
+                (self._kv_cache_config.max_tokens or 0) > 0:
+            logger.info("Helix CP: skipping KV cache capacity profiling; using "
+                        "the explicitly configured quota.")
+            return
+        fraction = self._kv_cache_config.free_gpu_memory_fraction
+        free_mem, _total = torch.cuda.mem_get_info()
+        budget_bytes = int(free_mem * fraction)
+        if budget_bytes <= 0:
+            raise ValueError(
+                "Helix CP: fraction-based KV sizing found no usable free "
+                "memory; set kv_cache_config.max_tokens or "
+                "max_gpu_total_bytes.")
+        logger.warning(
+            "Helix CP: capacity profiling is unsupported; sizing the KV "
+            f"cache as fraction {fraction} of free memory -> "
+            f"max_gpu_total_bytes={budget_bytes} (rank-local byte cap; the "
+            "manager min-syncs across ranks and converts to global tokens). "
+            "Set kv_cache_config.max_tokens or max_gpu_total_bytes to "
+            "override.")
+        self._kv_cache_config.max_gpu_total_bytes = budget_bytes
+
     def configure_kv_cache_capacity(self,
                                     py_executor: PyExecutor = None) -> None:
         """Perform KV cache capacity estimation.
@@ -1098,6 +1141,16 @@ class KvCacheCreator:
         mapping = self._mapping
 
         # TODO: support CP by generating dummy requests for it.
+        if mapping.cp_config.get('cp_type') == CpType.HELIX:
+            if not self._is_kv_cache_manager_v2:
+                # The helix sizing below emits V2 ledger (global) quotas;
+                # V1 reads max_tokens as rank-local. Reject explicitly.
+                raise NotImplementedError(
+                    "TRTLLM_SKIP_KV_CACHE_ESTIMATION with helix CP requires "
+                    "the V2 KV cache manager "
+                    "(kv_cache_config.use_kv_cache_manager_v2=True).")
+            self._configure_helix_kv_cache_capacity()
+            return
         assert 'cp_type' not in mapping.cp_config
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction
