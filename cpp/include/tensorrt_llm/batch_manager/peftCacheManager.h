@@ -164,6 +164,15 @@ public:
     void prefetchLoraWeights(std::string const& modelDir, runtime::BufferManager const& bufferManager);
 
 private:
+    static std::pair<uint64_t, uint64_t> getMaxNumSlots(PeftCacheManagerConfig const& config,
+        tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
+        std::optional<uint64_t> deviceCacheAvailableMemory);
+
+    static std::pair<runtime::LoraCachePageManagerConfig, runtime::LoraCachePageManagerConfig> getPageManagerConfig(
+        PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
+        runtime::WorldConfig const& worldConfig, tensorrt_llm::DataType dataType,
+        std::optional<uint64_t> deviceCacheAvailableMemory);
+
     std::unique_ptr<runtime::LoraCache> mHostLoraCache;
     std::unique_ptr<runtime::LoraCache> mDeviceLoraCache;
 
@@ -181,6 +190,8 @@ private:
 
     runtime::ModelConfig mModelConfig;
     runtime::WorldConfig mWorldConfig;
+    PeftCacheManagerConfig mConfig;
+    std::optional<uint64_t> mDeviceCacheAvailableMemory;
 
     mutable std::mutex mDataTypeMutex;
     std::optional<tensorrt_llm::DataType> mDataType;
