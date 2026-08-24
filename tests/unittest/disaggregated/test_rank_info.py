@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -66,6 +67,29 @@ def test_rank_info_msgpack_roundtrip():
     assert restored.tp_size == ri.tp_size
     assert restored.transfer_engine_info == ri.transfer_engine_info
     assert restored.aux_meta is None
+    assert restored.physical_ownership_protocol == 0
+    assert "physical_ownership_protocol" not in msgpack.unpackb(data, raw=False)
+
+
+def test_rank_info_advertises_enabled_physical_ownership_protocol():
+    ri = RankInfo(
+        instance_name="gen_0",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[32],
+        sender_endpoints=["tcp://10.0.0.1:5000"],
+        self_endpoint="tcp://10.0.0.1:5001",
+        transfer_engine_info=b"",
+        physical_ownership_protocol=1,
+    )
+
+    data = ri.to_bytes()
+
+    assert msgpack.unpackb(data, raw=False)["physical_ownership_protocol"] == 1
+    assert RankInfo.from_bytes(data).physical_ownership_protocol == 1
 
 
 def test_rank_info_roundtrip_with_aux_meta():

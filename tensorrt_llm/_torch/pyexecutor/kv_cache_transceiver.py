@@ -232,6 +232,11 @@ def create_kv_cache_transceiver(
 
 class KvCacheTransceiver(ABC):
 
+    @property
+    def requires_physical_drain_before_request_release(self) -> bool:
+        """Whether executor teardown needs an explicit physical-drain proof."""
+        return False
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
         raise NotImplementedError
@@ -265,6 +270,10 @@ class KvCacheTransceiver(ABC):
 
     def has_poisoned_transfer_buffer(self) -> bool:
         return False
+
+    def get_physical_ownership_fault(self) -> Optional[BaseException]:
+        """Return a sticky Python-transfer fault requiring fail-stop."""
+        return None
 
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):

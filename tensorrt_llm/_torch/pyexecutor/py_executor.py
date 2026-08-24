@@ -1511,9 +1511,7 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        for manager in self.resource_manager.resource_managers.values():
-            if manager:
-                manager.shutdown()
+        self._shutdown_resource_managers()
         # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
         # also invoked mid-init by configure_kv_cache_capacity() in
         # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
@@ -1538,6 +1536,24 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+
+    def _shutdown_resource_managers(self) -> None:
+        """Prove native transfer drain before freeing request-owned memory."""
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        requires_drain = (getattr(
+            transceiver,
+            "requires_physical_drain_before_request_release",
+            False,
+        ) is True)
+        if requires_drain:
+            drained = transceiver.shutdown()
+            if drained is not True:
+                raise RuntimeError(
+                    "KV cache transceiver still owns physical accessors; "
+                    "refusing to shut down resource managers")
+        for manager in self.resource_manager.resource_managers.values():
+            if manager:
+                manager.shutdown()
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -4069,6 +4085,30 @@ class PyExecutor:
         """
         if not self.kv_cache_transceiver:
             return
+
+        ownership_enabled = (getattr(
+            self.kv_cache_transceiver,
+            "requires_physical_drain_before_request_release",
+            False,
+        ) is True)
+        ownership_fault = (
+            self.kv_cache_transceiver.get_physical_ownership_fault()
+            if ownership_enabled else None)
+        any_ownership_fault = ownership_fault is not None
+        if ownership_enabled and self.dist.world_size != 1:
+            any_ownership_fault = bool(
+                self.dist.allreduce(
+                    int(any_ownership_fault),
+                    op=ReduceOp.MAX,
+                ))
+        if any_ownership_fault:
+            # Do not route an ambiguous physical accessor through the normal
+            # error path, which releases request-owned memory. The world vote
+            # makes a rank-local transport fault fail-stop every peer before
+            # any rank enters later collectives.
+            raise RuntimeError(
+                "Python KV transfer completion is IN_DOUBT; process restart is required"
+            ) from ownership_fault
 
         if self._is_disagg_inflight_cancel_active():
             local_poisoned = self.kv_cache_transceiver.has_poisoned_transfer_buffer(
@@ -8043,6 +8083,16 @@ class PyExecutor:
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
+        transceiver = self.kv_cache_transceiver
+        if (transceiver is not None and getattr(
+                transceiver,
+                "requires_physical_drain_before_request_release",
+                False,
+        )):
+            if not transceiver.cancel_request(request):
+                raise RuntimeError(
+                    f"Refusing to release request {request.py_request_id}: "
+                    "KV transfer still owns physical accessors")
         self._free_request_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
