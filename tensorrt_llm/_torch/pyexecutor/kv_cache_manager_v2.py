@@ -846,6 +846,34 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.tokens_per_block = tokens_per_block
+        # Helix super-block ledger: bookkeeping runs in GLOBAL tokens, one
+        # ledger block = cp_size physical pages (one per rank), while
+        # self.tokens_per_block stays the PHYSICAL kernel page size.
+        self._has_cp_helix = mapping.has_cp_helix()
+        self._helix_cp_rank = mapping.cp_rank if self._has_cp_helix else 0
+        self._helix_cp_size = mapping.cp_size if self._has_cp_helix else 1
+        self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
+        if self._has_cp_helix:
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support block reuse with "
+                    "helix context parallelism: a ledger block's bytes span "
+                    "all CP ranks, so publishing it requires a group-wide "
+                    "protocol. Set kv_cache_config.enable_block_reuse=False."
+                )
+            if is_draft:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support a draft cache "
+                    "manager with helix context parallelism."
+                )
+            if mapping.enable_attention_dp:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support attention-DP with "
+                    "helix context parallelism: disagg transfer-completion "
+                    "consensus is skipped under attention-DP, so the "
+                    "scheduler's request view would not be rank-invariant "
+                    "across the CP group."
+                )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
@@ -1183,7 +1211,9 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_capacity = (
             self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         )
-        self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block - 1) // tokens_per_block
+        self.max_blocks_per_seq = (
+            max_seq_capacity + self._ledger_tokens_per_block - 1
+        ) // self._ledger_tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
@@ -1457,6 +1487,17 @@ class KVCacheManagerV2(BaseResourceManager):
         return layer_sizes, attention_windows
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
+        """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
+        tokens = self._get_max_tokens_from_quota_impl(quota)
+        if self._has_cp_helix and not math.isinf(tokens):
+            # Floor to whole physical pages before scaling: a ledger block
+            # allocates one full page on every CP rank, so a partial
+            # trailing page in the rank-local budget is never usable.
+            tokens = int(tokens) // self.tokens_per_block * self.tokens_per_block
+            tokens *= self._helix_cp_size
+        return tokens
+
+    def _get_max_tokens_from_quota_impl(self, quota: int) -> float:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
@@ -1490,6 +1531,16 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
+        """Token capacity (GLOBAL tokens under helix) -> rank-local byte quota."""
+        if self._has_cp_helix:
+            # Round up to whole ledger blocks first: allocation is page-
+            # granular on every rank, so a request of N global tokens costs
+            # ceil(N / ledger_tpb) full physical pages per rank.
+            blocks = -(-int(max_tokens) // self._ledger_tokens_per_block)
+            max_tokens = blocks * self.tokens_per_block
+        return self._get_quota_from_max_tokens_impl(max_tokens)
+
+    def _get_quota_from_max_tokens_impl(self, max_tokens: int) -> int:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
@@ -1912,7 +1963,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         return KVCacheManagerConfigPy(
-            tokens_per_block=tokens_per_block,
+            # Used by the backend only for token<->block arithmetic and
+            # radix hashing; BufferConfig.size above stays the physical page.
+            tokens_per_block=self._ledger_tokens_per_block,
             cache_tiers=cache_tiers,
             layers=layer_configs,
             typical_step=typical_step,
@@ -2161,6 +2214,17 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
     ) -> int:
+        """Clamp ``token_num_upper_bound`` to the allocatable token capacity.
+
+        Unit note: under helix the backend runs on the ledger
+        ``tokens_per_block``, so the returned capacity (like
+        ``token_num_upper_bound`` and ``max_seq_len``) is in GLOBAL ledger
+        tokens - the coordinate request lengths are expressed in. Callers
+        that additionally bound the result by per-forward budgets (e.g.
+        ``max_num_tokens``) stay consistent because a helix context forward
+        replicates all tokens on every rank, so both bounds constrain the
+        same request-length variable.
+        """
         extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
@@ -2235,6 +2299,33 @@ class KVCacheManagerV2(BaseResourceManager):
                 draft_len = self.max_total_draft_tokens
         return draft_len
 
+    def _helix_local_len(self, global_len: int) -> int:
+        """Tokens of the first ``global_len`` owned by this CP rank
+        (continuation round-robin: page b lives on rank b %% cp)."""
+        phys = self.tokens_per_block
+        full, rem = divmod(global_len, self._ledger_tokens_per_block)
+        return full * phys + min(max(rem - self._helix_cp_rank * phys, 0), phys)
+
+    def _set_helix_rank_fields(self, req: LlmRequest) -> None:
+        """Derive the per-rank helix fields from the global position.
+
+        The decode-step index is manager-owned (committed in
+        ``try_allocate_generation`` on successful resize) rather than derived
+        from ``py_decoding_iter``: the sampler advances that counter after
+        scheduling under the overlap loop, so a schedule-time read is one
+        step behind and would repeat the first decode position, overwriting
+        the first generated token's KV. Assumes one new token per step
+        (draft-token modes are rejected under helix).
+        """
+        step = req.py_helix_decode_group_index + 1
+        pos = req.total_input_len_cp + step - 1
+        owner = (pos // self.tokens_per_block) % self._helix_cp_size
+        active = owner == self._helix_cp_rank
+        req.py_helix_is_inactive_rank = not active
+        # Convention shared with model_engine: the active rank's seqlen
+        # includes the in-flight token (past_seen = seqlen - 1 there).
+        req.seqlen_this_rank_cp = self._helix_local_len(pos) + (1 if active else 0)
+
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
@@ -2259,7 +2350,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
         draft_len = self._effective_draft_len(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        is_helix_req = self._has_cp_helix and not req.is_dummy_request
+        if is_helix_req:
+            self._set_helix_rank_fields(req)
+        if not kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity)):
+            return False
+        if is_helix_req:
+            # Commit only on success so a same-pass retry recomputes the
+            # same step instead of skipping one.
+            req.py_helix_decode_group_index += 1
+        return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
@@ -2277,6 +2377,9 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
+        if self._has_cp_helix and not req.is_dummy_request and req.py_helix_decode_group_index > 0:
+            # The forward pass for this step is skipped; give the step back.
+            req.py_helix_decode_group_index -= 1
         draft_len = self._allocated_draft_lens.pop(
             req.py_request_id, self._effective_draft_len(req)
         )
@@ -2378,7 +2481,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     tokens,
                     cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
-                    expected_prompt_length=req.prompt_len - 1,
+                    expected_prompt_length=(
+                        req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+                    )
+                    - 1,
                 )
                 if kv_cache is None:
                     return False
@@ -2416,6 +2522,13 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
+        if self._has_cp_helix and not req.is_dummy_request:
+            raise ValueError(
+                "resize_context is not helix-aware: its rank-local chunk "
+                "target would under-size the global ledger. Helix requests "
+                "are disagg-generation-only and must never take the context "
+                "path."
+            )
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -2449,11 +2562,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # prompt_len is the full incoming prompt length, robust to block
         # reuse (which may leave a non-zero context_current_position).
-        target = req.prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        # Helix requests carry the rank-local strided slice in prompt_len;
+        # the global ledger sizes off the full prompt instead.
+        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        success = kv_cache.resize(capacity, req.prompt_len)
+        success = kv_cache.resize(capacity, prompt_len)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
@@ -3269,6 +3385,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
+            if self._has_cp_helix:
+                # Keep the frozen dummy fields self-consistent (the active
+                # rank's past_seen = seqlen - 1 must stay >= 1).
+                token_num = max(token_num, 2)
             # token_num - 1 is the past history length in generation.
             history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
@@ -3340,6 +3460,20 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
+                if self._has_cp_helix:
+                    # Frozen fields (V1 parity): dummies never pass the
+                    # per-step derivation — last CP rank active, shared
+                    # synthetic global length.
+                    if self._helix_cp_rank == self._helix_cp_size - 1:
+                        req.py_helix_is_inactive_rank = False
+                        req.prompt_len = token_num - 1
+                    else:
+                        req.py_helix_is_inactive_rank = True
+                        req.prompt_len = token_num
+                    req.py_prompt_len = req.prompt_len
+                    req.seqlen_this_rank_cp = req.prompt_len
+                    req.total_input_len_cp = token_num * self._helix_cp_size - 1
+                    req.py_decoding_iter = 1
                 if prepare_resource:
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
@@ -3774,7 +3908,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 else kv_cache.capacity - rewind_len
             )
             history_length = (
-                None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1
+                None
+                # Reuse (history's consumer) is disabled under helix, and
+                # max_beam_num_tokens mixes rank-local and global counts.
+                if self.kv_compression_manages_history or self._has_cp_helix
+                else req.max_beam_num_tokens - 1
             )
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
