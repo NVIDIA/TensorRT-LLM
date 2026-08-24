@@ -293,6 +293,7 @@ class TestNoBounce:
     def test_noop_behaviour(self):
         nb = btr.NoBounceTransport()
         assert nb.enabled is False
+        assert nb.has_unresolved_accessors is False
         assert nb.reserve(SimpleNamespace()) is False
         assert nb.build_request(SimpleNamespace()) is None
         assert nb.writer_base(("r", 0), 1) is None
@@ -668,18 +669,39 @@ class TestFanInReserve:
         t.release_idle_reservation(rid_slice)  # already gone -> no-op, must not raise
 
     def test_orphan_reservation_quarantines_and_is_idempotent(self, monkeypatch):
-        # Giving up on an in-flight reservation must quarantine the region (a write may still land),
-        # not release or leak it; a second give-up is a no-op.
+        # The default-off path preserves the existing quarantine contract.
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])
         assert t.reserve(req, num_writers=1) is True
         rid_slice = (req.unique_rid, req.slice_id)
         t.orphan_reservation(rid_slice)
-        assert t._recv_alloc.quarantined == [0]  # quarantined, not released
-        assert t._recv_alloc.released == []
-        assert t.is_bounced(rid_slice) is False  # settled and removed from the live map
-        t.orphan_reservation(rid_slice)  # already gone -> no-op, must not raise
         assert t._recv_alloc.quarantined == [0]
+        assert t._recv_alloc.released == []
+        assert t.is_bounced(rid_slice) is False
+        t.orphan_reservation(rid_slice)
+        assert t._recv_alloc.quarantined == [0]
+
+    def test_retained_orphan_waits_for_every_writer_before_release(self, monkeypatch):
+        # Cancellation is only a logical outcome. The slot remains live until every writer reports
+        # terminal evidence, then becomes reusable exactly once.
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=2) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+        t.record_failure(rid_slice, 7)
+        t.retain_orphaned_reservation(rid_slice)
+        assert t.is_bounced(rid_slice) is True
+        assert t.has_unresolved_accessors is True
+        assert t._recv_alloc.quarantined == []
+        assert t._recv_alloc.released == []
+        t.retain_orphaned_reservation(rid_slice)  # idempotent while proof is incomplete
+        assert t._recv_alloc.released == []
+
+        t.record_result(rid_slice, 3)
+        assert t.is_bounced(rid_slice) is False
+        assert t.has_unresolved_accessors is False
+        assert t._recv_alloc.released == [0]
+        assert t._recv_alloc.quarantined == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1009,6 +1031,18 @@ class TestLifecycle:
         ret = c.settle()
         assert ret.disposition is bcore.Disposition.QUARANTINE and ret.success is False
         assert c.state is bcore.TransferState.QUARANTINED
+
+    def test_orphan_waits_for_quiescence_then_releases(self):
+        c = self._ctx(2)
+        c.record_writer_result(7, succeeded=True, src_base=0, **self._dst())
+        c.retain_orphaned()  # the other writer is in-doubt
+        assert not c.ready_to_scatter()
+        assert not c.ready_to_settle()
+        c.record_writer_result(3, succeeded=False)
+        assert c.ready_to_settle()
+        ret = c.settle()
+        assert ret.disposition is bcore.Disposition.RELEASE and ret.success is False
+        assert c.state is bcore.TransferState.FAILED
 
     def test_empty_tail_success_releases_without_scatter(self):
         c = self._ctx(1)

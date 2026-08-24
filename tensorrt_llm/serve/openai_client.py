@@ -58,6 +58,7 @@ from tensorrt_llm.serve.router import Router
 # X-TRTLLM-Msgpack header (Content-Type stays application/json so FastAPI still
 # routes it through Request.json()). Fails loudly at import if msgspec is missing.
 _MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
+_CONTEXT_FIRST_RETIREMENT_ENV = "TRTLLM_ENABLE_CONTEXT_FIRST_NO_RETRY_KV_TRANSFER_RETIREMENT"
 if _MSGSPEC_ENABLED:
     try:
         import msgspec
@@ -232,7 +233,11 @@ class OpenAIHttpClient(OpenAIClient):
         # to keep retrying.  Non-transient errors still raise on the first
         # attempt that reaches self._max_retries.
         _TRANSIENT_TCP_BUDGET = 5
-        loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
+        retirement_no_retry = (
+            os.getenv(_CONTEXT_FIRST_RETIREMENT_ENV) == "1"
+            and getattr(request, "disaggregated_params", None) is not None
+        )
+        loop_max = 1 if retirement_no_retry else max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
         for attempt in range(loop_max):
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
@@ -335,7 +340,9 @@ class OpenAIHttpClient(OpenAIClient):
                     (aiohttp.ServerDisconnectedError, ConnectionResetError),
                 )
                 effective_max = self._max_retries
-                if is_transient_tcp:
+                if retirement_no_retry:
+                    effective_max = 0
+                elif is_transient_tcp:
                     effective_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET)
                 if attempt >= effective_max:
                     logger.error(

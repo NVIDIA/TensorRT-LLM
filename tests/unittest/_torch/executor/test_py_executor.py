@@ -2535,6 +2535,8 @@ def _make_disagg_err_stub(
     if kv_cache_transceiver is _DEFAULT_KV_CACHE_TRANSCEIVER:
         kv_cache_transceiver = Mock()
         kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
+        kv_cache_transceiver.supports_transfer_retirement_monitoring.return_value = False
+        kv_cache_transceiver.get_transfer_retirement_error.return_value = None
         kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = False
     stub.kv_cache_transceiver = kv_cache_transceiver
     stub._disagg_inflight_cancel_unsupported_logged = False
@@ -2567,6 +2569,26 @@ def _make_disagg_err_stub(
 
 
 class TestDisaggCacheErrorsSynced:
+    def test_retirement_error_fails_closed_without_request_cleanup(self):
+        stub = _make_disagg_err_stub(active_requests=[_err_req()])
+        stub.kv_cache_transceiver.supports_transfer_retirement_monitoring.return_value = True
+        stub.kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = True
+        stub.kv_cache_transceiver.get_transfer_retirement_error.return_value = (
+            "backend quiescence deadline expired"
+        )
+        stub._fatal_error = None
+        stub.is_shutdown = False
+        stub.executor_request_queue = Mock()
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.propagate_hard_kill") as hard_kill:
+            with pytest.raises(RuntimeError, match="backend quiescence deadline expired"):
+                stub._handle_disagg_cache_errors_synced()
+
+        stub.executor_request_queue.enqueue_shutdown_request.assert_called_once_with()
+        hard_kill.assert_called_once_with()
+        assert stub.is_shutdown
+        assert stub.handle_errors_calls == []
+
     def test_guard_short_circuits_without_transceiver(self):
         stub = _make_disagg_err_stub(kv_cache_transceiver=None, active_requests=[_err_req()])
         stub._handle_disagg_cache_errors_synced()
@@ -2664,6 +2686,72 @@ class TestDisaggCacheErrorsSynced:
         stub._handle_disagg_cache_errors_synced()
 
         assert stub.handle_errors_calls == []
+
+
+def test_retirement_deadline_is_checked_before_transfer_completion():
+    executor = object.__new__(PyExecutor)
+    calls = []
+    executor._check_disagg_ctx_schedulable_status = lambda requests: calls.append(
+        ("context", requests)
+    )
+    executor._is_transfer_retirement_monitoring_active = lambda: True
+    executor._check_kv_transfer_timeout = lambda: calls.append(("timeout", None))
+    executor._check_disagg_gen_transfer_status = lambda: calls.append(("generation", None))
+    requests = [object()]
+
+    PyExecutor._check_disagg_transfer_status_and_timeouts(executor, requests)
+
+    assert calls == [
+        ("timeout", None),
+        ("context", requests),
+        ("generation", None),
+    ]
+
+
+def test_overdue_context_completion_is_classified_as_timeout_first():
+    executor = object.__new__(PyExecutor)
+    request = types.SimpleNamespace(py_kv_transfer_timed_out=False)
+    executor._is_transfer_retirement_monitoring_active = lambda: True
+
+    def mark_timeout():
+        request.py_kv_transfer_timed_out = True
+
+    def observe_context(_requests):
+        assert request.py_kv_transfer_timed_out is True
+
+    executor._check_kv_transfer_timeout = mark_timeout
+    executor._check_disagg_ctx_schedulable_status = observe_context
+    executor._check_disagg_gen_transfer_status = lambda: None
+
+    PyExecutor._check_disagg_transfer_status_and_timeouts(executor, [request])
+
+
+def test_direct_context_status_poll_cannot_overtake_deadline(monkeypatch):
+    request = types.SimpleNamespace(
+        py_request_id=7,
+        py_kv_transfer_start_time=0.0,
+        py_kv_transfer_timed_out=False,
+        state=LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS,
+    )
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = types.SimpleNamespace(
+        kv_transfer_timeout_ms=1_000,
+        check_context_transfer_status=Mock(return_value=([7], [])),
+    )
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {7: request}
+    executor.active_requests = []
+    executor._disagg_timed_out_ctx_cancelled_ids = set()
+    executor._is_transfer_retirement_monitoring_active = lambda: True
+    executor._is_disagg_inflight_cancel_active = lambda: False
+    executor._end_transfer_and_maybe_terminate = Mock()
+    monkeypatch.setattr(time, "monotonic", lambda: 2.0)
+
+    PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
+
+    assert request.py_kv_transfer_timed_out is True
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    executor._end_transfer_and_maybe_terminate.assert_called_once_with(request)
 
 
 class TestCheckCacheTransferErrorsAdpNoop:

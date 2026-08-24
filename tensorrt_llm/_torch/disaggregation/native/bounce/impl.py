@@ -365,6 +365,11 @@ class VmmBounceTransport(BounceTransport):
         with self._reserved_map_lock:
             return rid_slice in self._reserved_map
 
+    @property
+    def has_unresolved_accessors(self) -> bool:
+        with self._reserved_map_lock:
+            return bool(self._reserved_map)
+
     def release_idle_reservation(self, rid_slice: RidSlice) -> None:
         """Immediately release a reservation cancelled before any address went out; no write can be
         in flight. Idempotent. Drained transfers finalize through the result path instead."""
@@ -374,9 +379,7 @@ class VmmBounceTransport(BounceTransport):
             self._recv_alloc.release(ctx.slot_id)
 
     def orphan_reservation(self, rid_slice: RidSlice) -> None:
-        """Give up on a reservation whose write may still be in flight (cancel/timeout/lost result).
-        The write can't be aborted, so quarantine the region (reclaimed later) rather than releasing
-        or leaking it. Idempotent; a no-op once the transfer has settled."""
+        """Preserve the legacy quarantine behavior for unowned transfers."""
         self._apply(rid_slice, lambda ctx: ctx.mark_orphaned())
 
     def abort_publication(self, rid_slice: RidSlice, published_writers: set[int]) -> None:
@@ -385,6 +388,10 @@ class VmmBounceTransport(BounceTransport):
             rid_slice,
             lambda ctx: ctx.abort_publication(published_writers),
         )
+
+    def retain_orphaned_reservation(self, rid_slice: RidSlice) -> None:
+        """Retain the live slot until all writers report or the process exits."""
+        self._apply(rid_slice, lambda ctx: ctx.retain_orphaned())
 
     def _apply(self, rid_slice: RidSlice, mutate: Callable[[TransferContext], None]) -> None:
         """Mutate the state under the lock, then do what it asks (scatter or settle) with the lock
@@ -535,6 +542,9 @@ class NoBounceTransport(BounceTransport):
         pass
 
     def abort_publication(self, rid_slice, published_writers: set[int]) -> None:
+        pass
+
+    def retain_orphaned_reservation(self, rid_slice) -> None:
         pass
 
     def record_result(

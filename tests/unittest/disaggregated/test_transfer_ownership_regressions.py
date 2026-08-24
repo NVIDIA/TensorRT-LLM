@@ -66,6 +66,9 @@ class _BounceProbe:
     ) -> None:
         return
 
+    def retain_orphaned_reservation(self, rid_slice: tuple[int, int]) -> None:
+        self.orphaned.append(rid_slice)
+
     def is_bounced(self, _rid_slice: tuple[int, int]) -> bool:
         return False
 

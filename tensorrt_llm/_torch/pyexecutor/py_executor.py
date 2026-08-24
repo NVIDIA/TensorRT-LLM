@@ -3711,9 +3711,7 @@ class PyExecutor:
         self._handle_control_request()
 
         if self.kv_cache_transceiver:
-            self._check_disagg_ctx_schedulable_status(new_requests)
-            self._check_disagg_gen_transfer_status()
-            self._check_kv_transfer_timeout()
+            self._check_disagg_transfer_status_and_timeouts(new_requests)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -4048,15 +4046,36 @@ class PyExecutor:
     def _handle_disagg_cache_errors_synced(self):
         """Rank-safe disagg cache error and poison handler.
 
-        Called from the top of every executor iteration. Buffer poison is
-        reduced over the full executor world because one poisoned PP/DP rank
-        requires the whole distributed executor to stop. ADP TP ranks then
-        vote on failed request IDs and fail matching local replicas together;
-        otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
-        deadlocks or leaves peer replicas running.
+        Called from the top of every executor iteration. Deadline-bounded
+        retirement bypasses normal request cleanup and propagates a hard kill
+        through MPI/the launcher so no peer can continue into later
+        collectives. The existing in-flight-cancel poison path remains
+        collectively aligned. ADP TP ranks then vote on failed request IDs and
+        fail matching local replicas together.
         """
         if not self.kv_cache_transceiver:
             return
+
+        supports_retirement = getattr(
+            self.kv_cache_transceiver,
+            "supports_transfer_retirement_monitoring", None)
+        retirement_monitoring = bool(supports_retirement is not None
+                                     and supports_retirement() is True)
+        if retirement_monitoring:
+            retirement_error = getattr(
+                self.kv_cache_transceiver,
+                "get_transfer_retirement_error",
+                lambda: None,
+            )()
+            if retirement_error is not None:
+                self._fatal_error = RuntimeError(
+                    f"Fatal error: {retirement_error}")
+                self.is_shutdown = True
+                # Do not enter normal request termination: its resource cleanup
+                # would release memory without backend quiescence proof.
+                self.executor_request_queue.enqueue_shutdown_request()
+                propagate_hard_kill()
+                raise self._fatal_error
 
         if self._is_disagg_inflight_cancel_active():
             local_poisoned = self.kv_cache_transceiver.has_poisoned_transfer_buffer(
@@ -6625,6 +6644,20 @@ class PyExecutor:
 
         return
 
+    def _check_disagg_transfer_status_and_timeouts(
+            self, new_requests: List[LlmRequest]) -> None:
+        if self._is_transfer_retirement_monitoring_active():
+            # A request crossing its logical deadline must not be promoted by
+            # either context or generation completion observed later in the
+            # same executor iteration.
+            self._check_kv_transfer_timeout()
+            self._check_disagg_ctx_schedulable_status(new_requests)
+            self._check_disagg_gen_transfer_status()
+            return
+        self._check_disagg_ctx_schedulable_status(new_requests)
+        self._check_disagg_gen_transfer_status()
+        self._check_kv_transfer_timeout()
+
     def _is_disagg_inflight_cancel_active(self) -> bool:
         if not is_disagg_inflight_cancel_enabled():
             return False
@@ -6649,6 +6682,14 @@ class PyExecutor:
                 "cancellation behavior for this transceiver.")
             self._disagg_inflight_cancel_unsupported_logged = True
         return False
+
+    def _is_transfer_retirement_monitoring_active(self) -> bool:
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        if transceiver is None:
+            return False
+        supports = getattr(transceiver,
+                           "supports_transfer_retirement_monitoring", None)
+        return callable(supports) and supports() is True
 
     def _request_kv_transfer_cancellation(self, request: LlmRequest) -> bool:
         """Best-effort cancellation that leaves ownership intact on errors."""
@@ -7545,8 +7586,16 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
+        retirement_monitoring = self._is_transfer_retirement_monitoring_active()
+        if retirement_monitoring:
+            # This status helper has several direct callers outside the main
+            # loop wrapper. Check both sides of the potentially-blocking poll
+            # so a completion cannot overtake a logical deadline.
+            self._check_kv_transfer_timeout()
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
+        if retirement_monitoring:
+            self._check_kv_transfer_timeout()
 
         completed_req_ids = set(finished_requests + error_requests)
 
@@ -7561,6 +7610,12 @@ class PyExecutor:
                 continue
 
             request = requests_in_transfer[request_id]
+
+            if retirement_monitoring and request.py_kv_transfer_timed_out:
+                # Backend DONE proves safe retirement, but it does not undo a
+                # logical request timeout that won while the status poll was
+                # in progress.
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
 
             self._end_transfer_and_maybe_terminate(request)
 
@@ -7584,6 +7639,15 @@ class PyExecutor:
                 logger.warning(f"Cancelled timed-out context KV transfer for "
                                f"request {request.py_request_id}; waiting for "
                                "C++ transfer status to report final cleanup")
+            elif self._is_transfer_retirement_monitoring_active():
+                # The ownership profile reaches this branch only after the
+                # rank-aligned transceiver status path has removed the sealed
+                # session, proving that no backend accessor remains. The
+                # request deadline is still a logical failure; quiescence only
+                # makes its resources safe to retire.
+                request.py_kv_transfer_start_time = None
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                self._end_transfer_and_maybe_terminate(request)
             else:
                 # Preserve the legacy timeout behavior when in-flight
                 # cancellation is disabled: a queued transfer that can be

@@ -161,6 +161,7 @@ def make_rankinfo(
     enable_attention_dp=False,
     layer_num_per_pp=None,
     page_table=None,
+    transfer_retirement_protocol=0,
 ):
     if layer_num_per_pp is None:
         layer_num_per_pp = [2] * pp_size
@@ -176,6 +177,7 @@ def make_rankinfo(
         cp_size=cp_size,
         cp_rank=cp_rank,
         device_id=0,
+        transfer_retirement_protocol=transfer_retirement_protocol,
         layer_num_per_pp=layer_num_per_pp,
         self_endpoint="",
         transfer_engine_info=b"",
@@ -217,6 +219,7 @@ def _make_peer_registrar_and_peer_ri(self_ri, peer_ri):
             enable_attention_dp=peer_ri.attention.enable_attention_dp,
             layer_num_per_pp=peer_ri.layer_num_per_pp,
             page_table=make_page_table(),
+            transfer_retirement_protocol=peer_ri.transfer_retirement_protocol,
         )
     return reg, peer_ri
 
@@ -412,6 +415,24 @@ def test_peer_registrar_register_and_get():
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
+def test_peer_registrar_rejects_mixed_retirement_protocols():
+    self_rankinfo = make_rankinfo(
+        instance_name="local",
+        page_table=make_page_table(),
+        transfer_retirement_protocol=1,
+    )
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        page_table=make_page_table(),
+        transfer_retirement_protocol=0,
+    )
+
+    with pytest.raises(ValueError, match="peer peer .* is incompatible"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
 def test_peer_registrar_unregister():
