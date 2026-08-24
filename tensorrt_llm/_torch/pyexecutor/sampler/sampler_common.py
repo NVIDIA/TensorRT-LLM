@@ -28,10 +28,10 @@ log-probs) build on:
   :class:`RequestSeeds` (seed manager -> strategy impls) and
   :class:`_BatchedSamplingResult` (sampler -> log-probs).
 
-That last group is also how a type-level import cycle gets broken: when a
-lower-layer module needs a type defined in a higher one, the type is sunk here
-rather than imported backwards. A type that a single feature owns belongs with
-that feature instead -- the ``*Store`` classes all live in their own modules.
+That last group follows the package's dependency rule: a type shared across
+features belongs here, so that a lower-layer module never has to import a
+higher-layer one to name it. A type owned by a single feature belongs with that
+feature instead -- the ``*Store`` classes all live in their own modules.
 
 Resolving a request's ``Strategy`` lives in ``sampler_strategy``.
 """

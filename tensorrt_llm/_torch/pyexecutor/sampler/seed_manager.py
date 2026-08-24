@@ -42,9 +42,9 @@ class _SeedManager:
     request's own running draw count, both indexed by sequence slot.
 
     Requests without a seed fall back to ``global_seed`` and share the same
-    per-slot offset counter, which keeps them deterministic per slot but
-    intentionally does not reproduce the pre-existing batch-wide generator
-    stream token-for-token.
+    per-slot offset counter. They are therefore deterministic for a given
+    sequence slot, but their token stream is not stable across runs that batch
+    them differently or assign them a different slot.
 
     .. warning::
        This plumbing is complete but **not yet effective for batched requests**.

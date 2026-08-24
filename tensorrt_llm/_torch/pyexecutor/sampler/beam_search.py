@@ -14,10 +14,10 @@
 
 """Beam search for ``TorchSampler``.
 
-The candidate-selection, beam-expansion and candidate-beams-array (CBA) logic,
-originally split out of ``ops.vanilla``: pure tensor functions plus the
-metadata dataclasses they consume (:class:`BeamSearchStore`,
-:class:`BeamSearchMetadata`, :class:`CBAState`, :class:`BeamHistory`).
+The candidate-selection, beam-expansion and candidate-beams-array (CBA) logic:
+pure tensor functions plus the metadata dataclasses they consume
+(:class:`BeamSearchStore`, :class:`BeamSearchMetadata`, :class:`CBAState`,
+:class:`BeamHistory`).
 
 :class:`BeamSearchHandler` sits on top of those: it owns the store and the
 host-side state the CBA path needs, builds the per-step

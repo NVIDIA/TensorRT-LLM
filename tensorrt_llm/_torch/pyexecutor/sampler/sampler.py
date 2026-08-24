@@ -27,10 +27,10 @@ the two real implementations:
 * :class:`TRTLLMSampler` -- the C++ decoder path.
 
 NOTE: ``TRTLLMSampler`` is deprecated and slated for removal (``_util.py``
-warns that it goes away in release 1.4). When it is dropped -- together with
-:class:`Algorithms` and its ``SampleState*`` types -- this module should be
-revisited and reorganized: what remains is the ABC, the state types and
-``TorchSampler``, which no longer need to share a file.
+warns that it goes away in release 1.4). Dropping it -- together with
+:class:`Algorithms` and its ``SampleState*`` types -- leaves only the ABC, the
+state types and ``TorchSampler``, which do not need to share a file; this
+module is worth reorganizing at that point.
 """
 
 import sys
