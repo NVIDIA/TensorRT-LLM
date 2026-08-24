@@ -220,7 +220,7 @@ private:
         return memory == mHostMemories.end() ? nullptr : *memory;
     }
 
-    template <bool Encode>
+    template <bool isEncode>
     bool dispatch(GroupConfig const* group, void* dstBasePtr, void const* srcBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) const
     {
@@ -228,7 +228,7 @@ private:
         {
             return group != nullptr;
         }
-        if (group == nullptr || pageIndices == nullptr || (Encode ? dstBasePtr == nullptr : srcBasePtr == nullptr)
+        if (group == nullptr || pageIndices == nullptr || (isEncode ? dstBasePtr == nullptr : srcBasePtr == nullptr)
             || stream == nullptr || numBasePages > std::numeric_limits<size_t>::max() / group->copyPlans.stdSize())
         {
             return false;
@@ -261,7 +261,7 @@ private:
         // cuMemcpyBatchAsync cannot handle one copy entry that spans two such registrations. The cold pointer can be a
         // subrange of a larger staging allocation, so calculate boundaries relative to its owning HostMem span.
         auto const* const coldBase
-            = Encode ? static_cast<std::byte const*>(dstBasePtr) : static_cast<std::byte const*>(srcBasePtr);
+            = isEncode ? static_cast<std::byte const*>(dstBasePtr) : static_cast<std::byte const*>(srcBasePtr);
         MemAddress const coldBaseAddress = reinterpret_cast<MemAddress>(coldBase);
         HostMem const* const hostMem = findHostMem(coldBaseAddress);
         bool const splitRegistrationChunks = hostMem != nullptr && hostMem->size() > HostMem::kChunkSize;
@@ -302,12 +302,12 @@ private:
             for (PoolCopyPlan const& plan : group->copyPlans)
             {
                 auto* const hotBase
-                    = plan.hotBase + static_cast<size_t>(Encode ? pageIndex.src : pageIndex.dst) * plan.hotPageBytes;
+                    = plan.hotBase + static_cast<size_t>(isEncode ? pageIndex.src : pageIndex.dst) * plan.hotPageBytes;
                 size_t const coldOffset
-                    = static_cast<size_t>(Encode ? pageIndex.dst : pageIndex.src) * group->coldPageBytes
+                    = static_cast<size_t>(isEncode ? pageIndex.dst : pageIndex.src) * group->coldPageBytes
                     + plan.coldPageOffset;
                 size_t const pinnedOffset = coldBaseOffset + coldOffset;
-                if constexpr (Encode)
+                if constexpr (isEncode)
                 {
                     appendCopy(coldDstBase + coldOffset, hotBase, pinnedOffset, plan.hotPageBytes);
                 }
