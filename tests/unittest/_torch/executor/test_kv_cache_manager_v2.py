@@ -157,6 +157,7 @@ def _make_manager_for_cache_tier_test(
     module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
     with (
         patch(f"{module}.CuError", _CacheTierInitError),
+        patch(f"{module}.IndexMapper"),
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
         patch.object(KVCacheManagerV2, "_build_cache_config", build_cache_config),
@@ -181,8 +182,8 @@ def _make_manager_for_cache_tier_test(
     return manager, impl_constructor
 
 
-def _host_fallback_consensus_worker() -> tuple[int, int, int, bool]:
-    """Exercise the real world collective from an attention-DP worker."""
+def _multi_rank_host_fallback_consensus_worker() -> tuple[int, int, int, bool]:
+    """Exercise the real world collective from an MPI worker."""
     from tensorrt_llm._utils import mpi_rank, mpi_world_size
 
     rank = mpi_rank()
@@ -205,7 +206,6 @@ def _host_fallback_consensus_worker() -> tuple[int, int, int, bool]:
             world_size=world_size,
             rank=rank,
             tp_size=world_size,
-            enable_attention_dp=True,
         ),
     )
 
@@ -379,12 +379,12 @@ def test_kv_cache_manager_init_status_sync_uses_world_max() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device (MPI) build required")
-def test_attention_dp_ranks_converge_on_hostless_fallback() -> None:
+def test_world_ranks_converge_on_hostless_fallback() -> None:
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
     session = MpiPoolSession(n_workers=2)
     try:
-        results = session.submit_sync(_host_fallback_consensus_worker)
+        results = session.submit_sync(_multi_rank_host_fallback_consensus_worker)
     finally:
         session.shutdown()
 
