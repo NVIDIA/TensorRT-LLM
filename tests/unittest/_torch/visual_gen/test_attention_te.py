@@ -1,12 +1,34 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Tests for the TransformerEngine FP8 attention backend (TEAttention).
 
-GPU tests (requires transformer_engine) cover forward correctness vs VANILLA.
+Three tests, each covering one failure mode of the backend:
+  1. numerics of ``forward``            -- output matches a full-precision reference
+  2. mask handling                      -- FULL / None / CAUSAL / unsupported
+  3. object contract                    -- layout, no-LSE, op cache, config rejection
+
+FP8 tolerances: TEAttention quantizes Q/K/V, so it sits at roughly 0.08 relative
+error against an fp32 reference (measured on GB300 across S=128..1024 for
+B=1 H=10 D=128). Comparisons against a full-precision reference therefore use
+cosine similarity plus a loose relative error rather than elementwise
+assert_close.
 """
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
@@ -24,6 +46,9 @@ pytestmark = pytest.mark.skipif(
     reason="transformer_engine and GPU required",
 )
 
+FP8_COS_SIM = 0.99
+FP8_REL_ERR = 0.12
+
 
 @pytest.fixture
 def make_te_attn():
@@ -38,202 +63,107 @@ def make_te_attn():
     return _make
 
 
-def _vanilla_ref(q, k, v):
-    q_ = q.transpose(1, 2).float()
-    k_ = k.transpose(1, 2).float()
-    v_ = v.transpose(1, 2).float()
-    out = torch.nn.functional.scaled_dot_product_attention(q_, k_, v_, is_causal=False)
+def _qkv(B, S, H, D, Hkv=None, seed=0):
+    torch.manual_seed(seed)
+    kw = dict(device="cuda", dtype=torch.bfloat16)
+    return (
+        torch.randn(B, S, H, D, **kw),
+        torch.randn(B, S, Hkv or H, D, **kw),
+        torch.randn(B, S, Hkv or H, D, **kw),
+    )
+
+
+def _reference(q, k, v, D, is_causal=False, enable_gqa=False):
+    """Full-precision SDPA reference in [B, S, H, D] layout."""
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2).float(),
+        k.transpose(1, 2).float(),
+        v.transpose(1, 2).float(),
+        scale=1.0 / (D**0.5),
+        is_causal=is_causal,
+        enable_gqa=enable_gqa,
+    )
     return out.transpose(1, 2).to(q.dtype)
 
 
-def test_output_shape(make_te_attn):
-    B, S, H, D = 2, 64, 4, 64
-    attn = make_te_attn(num_heads=H, head_dim=D)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+def _assert_close_fp8(out, ref, what):
+    o, r = out.reshape(-1).float(), ref.reshape(-1).float()
+    cos = F.cosine_similarity(o, r, dim=0).item()
+    rel = (torch.linalg.vector_norm(o - r) / torch.linalg.vector_norm(r)).item()
+    assert cos > FP8_COS_SIM, f"{what}: cosine similarity {cos:.4f} <= {FP8_COS_SIM}"
+    assert rel < FP8_REL_ERR, f"{what}: relative error {rel:.4f} >= {FP8_REL_ERR}"
+
+
+@pytest.mark.parametrize("S,Hkv", [(64, None), (256, None), (1024, None), (256, 2)])
+def test_forward_matches_reference(make_te_attn, S, Hkv):
+    """forward() returns a well-formed [B, S, H, D] tensor matching full-precision SDPA.
+
+    Parametrized over sequence length and over GQA (Hkv=2 against H=8), because
+    the GQA path takes a different branch in _parse_inputs and previously did not
+    agree with the non-GQA one.
+    """
+    B, H, D = 1, 8, 64
+    attn = make_te_attn(num_heads=H, head_dim=D, num_kv_heads=Hkv)
+    q, k, v = _qkv(B, S, H, D, Hkv, seed=42)
+
     with torch.no_grad():
         out = attn(q, k, v)
+
     assert out.shape == (B, S, H, D)
+    assert torch.isfinite(out).all(), "output contains NaN or Inf"
+    _assert_close_fp8(out, _reference(q, k, v, D, enable_gqa=Hkv is not None), f"S={S} Hkv={Hkv}")
 
 
-def test_output_finite(make_te_attn):
-    B, S, H, D = 1, 128, 4, 64
-    attn = make_te_attn(num_heads=H, head_dim=D)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad():
-        out = attn(q, k, v)
-    assert torch.isfinite(out).all()
+def test_attention_mask_handling(make_te_attn):
+    """FULL and None mean no mask, CAUSAL masks, anything else is rejected.
 
-
-def test_preferred_layout_nhd(make_te_attn):
-    attn = make_te_attn()
-    assert attn.preferred_layout == AttentionTensorLayout.NHD
-
-
-@pytest.mark.parametrize("S", [64, 256, 1024])
-def test_output_close_to_vanilla_ref(make_te_attn, S):
-    B, H, D = 1, 4, 64
-    attn = make_te_attn(num_heads=H, head_dim=D)
-    torch.manual_seed(42)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad():
-        out_te = attn(q, k, v)
-        out_ref = _vanilla_ref(q, k, v)
-    cos_sim = torch.nn.functional.cosine_similarity(
-        out_te.reshape(-1).float(), out_ref.reshape(-1).float(), dim=0
-    ).item()
-    assert cos_sim > 0.99, f"Cosine similarity {cos_sim:.4f} < 0.99 at S={S}"
-
-
-def test_causal_mask(make_te_attn):
+    None is the no-mask convention across the backends -- VanillaAttention derives
+    causality as `attention_mask == CAUSAL`, and Attention2DAttention explicitly
+    permits None and forwards it to the inner backend unchanged.
+    """
     B, S, H, D = 1, 64, 4, 64
     attn = make_te_attn(num_heads=H, head_dim=D)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    q, k, v = _qkv(B, S, H, D, seed=3)
+
     with torch.no_grad():
         out_full = attn(q, k, v, attention_mask=PredefinedAttentionMask.FULL)
+        out_none = attn(q, k, v, attention_mask=None)
         out_causal = attn(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL)
-    assert out_full.shape == out_causal.shape
-    assert not torch.allclose(out_full, out_causal, atol=1e-3)
 
+    # FP8 tolerance, not exact: DelayedScaling updates amax history on every call.
+    _assert_close_fp8(out_none, out_full, "attention_mask=None must mean FULL")
+    _assert_close_fp8(out_causal, _reference(q, k, v, D, is_causal=True), "causal")
+    assert not torch.allclose(out_full, out_causal, atol=1e-3), "causal must differ from full"
 
-def test_key_padding_mask_raises(make_te_attn):
-    B, S, H, D = 1, 64, 4, 64
-    attn = make_te_attn(num_heads=H, head_dim=D)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(B, S, device="cuda", dtype=torch.bool)
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
-        attn(q, k, v, key_padding_mask=mask)
+        attn(q, k, v, key_padding_mask=torch.ones(B, S, device="cuda", dtype=torch.bool))
+    with pytest.raises(NotImplementedError, match="attention_mask"):
+        attn(q, k, v, attention_mask="bidirectional")
 
 
-def test_support_lse_true():
-    assert TEAttention.support_lse() is True
-
-
-def test_forward_with_lse_shapes(make_te_attn):
-    B, S, H, D = 1, 64, 4, 64
-    attn = make_te_attn(num_heads=H, head_dim=D)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad():
-        out, lse = attn.forward_with_lse(q, k, v)
-    assert out.shape == (B, S, H, D)
-    assert lse.shape == (B, H, S)
-    assert lse.dtype == torch.float32
-
-
-def test_forward_with_lse_consistent_with_forward(make_te_attn):
-    B, S, H, D = 1, 64, 4, 64
-    attn = make_te_attn(num_heads=H, head_dim=D)
-    torch.manual_seed(0)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad():
-        out_fwd = attn.forward(q, k, v)
-        out_lse, lse = attn.forward_with_lse(q, k, v)
-    assert torch.allclose(out_fwd, out_lse, atol=1e-3), (
-        "forward and forward_with_lse outputs differ"
-    )
-    assert torch.isfinite(lse).all(), "LSE contains NaN or Inf"
-
-
-def test_forward_with_lse_values(make_te_attn):
-    """LSE from TE must satisfy the softmax partition property: exp(scores - LSE) sums to 1.
-
-    This is the contract Attention2DAttention relies on when combining partial
-    attention results across context-parallel ranks.
-    """
-    B, S, H, D = 1, 64, 4, 64
-    attn = make_te_attn(num_heads=H, head_dim=D)
-    torch.manual_seed(42)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    scale = 1.0 / (D ** 0.5)
-
-    with torch.no_grad():
-        _, lse = attn.forward_with_lse(q, k, v)  # lse: [B, H, S] float32
-
-        # Reference LSE from BF16 scores.
-        scores = torch.matmul(
-            q.transpose(1, 2).float(),
-            k.transpose(1, 2).float().transpose(-1, -2),
-        ) * scale  # [B, H, S, S]
-        lse_ref = torch.logsumexp(scores, dim=-1)  # [B, H, S]
-
-    # 1. LSE values align with BF16 reference (FP8 introduces small error).
-    cos_sim = torch.nn.functional.cosine_similarity(
-        lse.reshape(-1), lse_ref.reshape(-1), dim=0
-    ).item()
-    assert cos_sim > 0.99, f"LSE cosine similarity {cos_sim:.4f} < 0.99"
-
-    # 2. Partition property: softmax rows reconstructed from TE's LSE sum to ~1.
-    #    This is exactly the property Attention2D uses when merging shards.
-    row_sums = torch.exp(scores - lse.unsqueeze(-1)).sum(-1)  # [B, H, S]
-    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=0.05), (
-        f"Softmax row sums deviate: max={row_sums.max():.3f} min={row_sums.min():.3f}"
-    )
-
-
-def test_forward_with_lse_gqa(make_te_attn):
-    B, S, H, Hkv, D = 1, 64, 8, 2, 64
-    attn = make_te_attn(num_heads=H, head_dim=D, num_kv_heads=Hkv)
-    torch.manual_seed(7)
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, Hkv, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, Hkv, D, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad():
-        out, lse = attn.forward_with_lse(q, k, v)
-    assert out.shape == (B, S, H, D)
-    assert lse.shape == (B, H, S)
-    assert lse.dtype == torch.float32
-    assert torch.isfinite(lse).all()
-
-
-def test_attn_op_cached_per_trait(make_te_attn):
-    """Each distinct trait tuple keeps its own DotProductAttention instance.
-
-    DotProductAttention carries the DelayedScaling amax history, so alternating
-    mask types must not rebuild -- a rebuild would reset FP8 scaling every switch.
-    """
+def test_backend_contract(make_te_attn):
+    """Layout/LSE declarations, per-trait op caching, and config rejection."""
     attn = make_te_attn(num_heads=4, head_dim=64)
-    B, S = 1, 64
-    q = torch.randn(B, S, 4, 64, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, 4, 64, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, 4, 64, device="cuda", dtype=torch.bfloat16)
+    assert attn.preferred_layout == AttentionTensorLayout.NHD
+    assert TEAttention.support_fused_qkv() is False
 
+    # No LSE: this is the flag Attention2D/Ring read to reject TE as an inner backend.
+    assert TEAttention.support_lse() is False
+
+    # Each trait keeps its own instance; rebuilding on a mask switch would reset FP8 calibration.
+    q, k, v = _qkv(1, 64, 4, 64, seed=5)
     with torch.no_grad():
         attn(q, k, v, attention_mask=PredefinedAttentionMask.FULL)
-    assert len(attn._attn_ops) == 1
-    op_full = next(iter(attn._attn_ops.values()))
-
-    with torch.no_grad():
         attn(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL)
-    assert len(attn._attn_ops) == 2, "causal mask must get its own attention op"
+    op_full = attn._get_attn_op(None, "no_mask")
     op_causal = attn._get_attn_op(None, "causal")
-    assert op_causal is not op_full
-
-    # Repeats reuse, and switching back returns the original instance rather
-    # than rebuilding it (which is what the single-slot cache used to do).
-    with torch.no_grad():
-        attn(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL)
-        attn(q, k, v, attention_mask=PredefinedAttentionMask.FULL)
+    assert op_full is not op_causal
     assert len(attn._attn_ops) == 2
-    assert attn._get_attn_op(None, "causal") is op_causal
+    with torch.no_grad():  # switching back reuses, never rebuilds
+        attn(q, k, v, attention_mask=PredefinedAttentionMask.FULL)
     assert attn._get_attn_op(None, "no_mask") is op_full
+    assert len(attn._attn_ops) == 2
 
-
-def test_quant_attention_config_rejected():
-    """TE drives its own FP8 recipe; a forwarded quant config must not be swallowed."""
+    # TE runs its own FP8 recipe and must not silently absorb quant_attention_config.
     with pytest.raises(NotImplementedError, match="quant_attention_config"):
         TEAttention(num_heads=4, head_dim=64, quant_attention_config=object())

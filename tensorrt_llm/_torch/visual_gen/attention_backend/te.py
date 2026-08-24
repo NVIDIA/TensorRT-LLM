@@ -19,9 +19,8 @@ Uses TransformerEngine's ``DotProductAttention`` under ``fp8_autocast`` with
 ([B, S, H, D]) which maps directly to TE's ``qkv_format="bshd"`` -- no
 transpose overhead.
 
-``forward`` and ``forward_with_lse`` are decorated with
-``@torch.compiler.disable`` because TE FP8 modules graph-break under
-torch.compile.
+``forward`` is decorated with ``@torch.compiler.disable`` because TE FP8
+modules graph-break under torch.compile.
 """
 
 import math
@@ -48,8 +47,12 @@ class TEAttention(AttentionBackend):
     No KV cache: diffusion models recompute attention each denoising step.
     For BF16 attention use ``VANILLA``.
 
-    Supports ``forward_with_lse`` (LSE computed from BF16 Q/K scores), enabling
-    use with Attention2DAttention for x72 context parallelism.
+    Does not support ``forward_with_lse``: TE's ``DotProductAttention`` does not
+    expose softmax stats, so the LSE would have to be recomputed from a separate
+    O(S^2) fp32 score matrix -- strictly more work than the attention itself.
+    That rules TE out as an inner backend for ``Attention2DAttention`` and
+    ``RingAttention``, which raise at construction on ``support_lse() is False``.
+    ``UlyssesAttention`` does not need LSE and still works.
     """
 
     def __init__(
@@ -69,8 +72,7 @@ class TEAttention(AttentionBackend):
                 "Install transformer_engine before using backend='TE'."
             )
         if quant_attention_config is not None:
-            # create_attention forwards this for every backend; TE drives its own
-            # FP8 recipe, so silently swallowing it would hide a config mistake.
+            # TE drives its own FP8 recipe; swallowing this would hide a config mistake.
             raise NotImplementedError(
                 "TE attention backend does not honor quant_attention_config -- it always "
                 "runs FP8 via its own DelayedScaling recipe. Drop quant_attention_config "
@@ -83,14 +85,9 @@ class TEAttention(AttentionBackend):
         self.dtype = dtype
         self.scale = 1.0 / math.sqrt(head_dim)
         self.recipe = DelayedScaling(fp8_dpa=True, fp8_mha=True)
-        # Amax reduction group for fp8_autocast. Left as None, TE reduces amax over
-        # the default process group on every autocast exit -- a world-wide collective
-        # per attention call, and a hang if ranks ever take different paths. Diffusion
-        # inference wants per-rank scales, so default to no reduction.
+        # None = no amax reduction: per-rank scales, no world-wide collective per call.
         self.fp8_group = fp8_group
-        # DotProductAttention is stateful (amax history), and rebuilding one throws
-        # that history away. Key a cache on the traits that force a new module so
-        # alternating mask types or GQA shapes reuse their own instance.
+        # Cache per trait: DotProductAttention holds amax history; rebuilding loses calibration.
         self._attn_ops: dict[tuple, Any] = {}
 
     def _get_attn_op(self, num_gqa_groups: Optional[int], attn_mask_type: str) -> Any:
@@ -117,7 +114,8 @@ class TEAttention(AttentionBackend):
             raise NotImplementedError("TE attention backend does not yet support key_padding_mask.")
         if attention_mask == PredefinedAttentionMask.CAUSAL:
             attn_mask_type = "causal"
-        elif attention_mask == PredefinedAttentionMask.FULL:
+        elif attention_mask is None or attention_mask == PredefinedAttentionMask.FULL:
+            # None means "no mask" across the backends, and Attention2D forwards it as-is.
             attn_mask_type = "no_mask"
         else:
             raise NotImplementedError(
@@ -147,52 +145,6 @@ class TEAttention(AttentionBackend):
             out = attn_op(q, k, v, attention_mask=None)
         return out.unflatten(-1, (self.num_heads, self.head_dim))
 
-    @torch.compiler.disable
-    def forward_with_lse(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """FP8 attention returning output and log-sum-exp. Required for Attention2D.
-
-        TE's DotProductAttention does not expose softmax stats, so LSE is
-        computed separately from BF16 Q/K scores. This is numerically accurate
-        and satisfies the partition property Attention2D relies on.
-
-        Note: allocates an O(S^2) float32 score matrix [B, H, S, S] for the
-        LSE pass. For CP use cases S is the local shard length per rank.
-
-        Returns:
-            output: [B, S, H, D]
-            lse:    [B, H, S] float32 -- log-sum-exp per query position
-        """
-        num_gqa_groups, attn_mask_type = self._parse_inputs(q, k, attention_mask, key_padding_mask)
-        attn_op = self._get_attn_op(num_gqa_groups, attn_mask_type)
-        B, S = q.shape[0], q.shape[1]
-        with fp8_autocast(enabled=True, fp8_recipe=self.recipe, fp8_group=self.fp8_group):
-            out = attn_op(q, k, v, attention_mask=None)
-        # out: [B, S, H*D] -> [B, S, H, D]
-        out = out.unflatten(-1, (self.num_heads, self.head_dim))
-
-        # Compute LSE from BF16 scores: [B, H, S, S] -> [B, H, S]
-        # q: [B, S, H, D] -> [B, H, S, D]
-        # k: [B, S, Hkv, D] -> [B, H, S, D] (expand KV heads for GQA)
-        q_f = q.transpose(1, 2).float()
-        k_f = k.transpose(1, 2).float()
-        if self.num_heads != self.num_kv_heads:
-            k_f = k_f.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-        scores = torch.matmul(q_f, k_f.transpose(-1, -2)) * self.scale
-        if attn_mask_type == "causal":
-            causal_mask = torch.ones(S, S, device=q.device, dtype=torch.bool).triu(diagonal=1)
-            scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-        lse = torch.logsumexp(scores, dim=-1)  # [B, H, S] float32
-        return out, lse
-
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
         return AttentionTensorLayout.NHD
@@ -203,4 +155,4 @@ class TEAttention(AttentionBackend):
 
     @classmethod
     def support_lse(cls) -> bool:
-        return True
+        return False
