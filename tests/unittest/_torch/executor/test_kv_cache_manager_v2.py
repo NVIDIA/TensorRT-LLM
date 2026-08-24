@@ -53,6 +53,7 @@ def test_generation_oom_is_reported_as_allocation_failure() -> None:
     kv_cache.resize.side_effect = ConcreteOOMError("CUDA out of memory")
     manager.kv_cache_map = {11: kv_cache}
     manager._allocated_draft_lens = {}
+    manager._has_cp_helix = False
     manager._effective_draft_len = lambda _req: 0
     request = SimpleNamespace(py_request_id=11)
 
@@ -121,6 +122,9 @@ def _make_cache_config_for_test(
     cache_manager.max_num_tokens = max_num_tokens
     cache_manager.max_draft_len = max_draft_len
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
+    # Mirrors __init__: without helix the ledger block equals the physical
+    # page (the helper re-enacts construction for partial instances).
+    cache_manager._ledger_tokens_per_block = 128
 
     return cache_manager._build_base_config(
         kv_cache_config,

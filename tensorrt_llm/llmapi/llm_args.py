@@ -714,12 +714,13 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
-    sparse_num_index_heads: int = Field(
+    sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description="Number of index-attention heads (per TP rank's view).",
     )
     sparse_index_dim: int = Field(
         default=128,
+        gt=0,
         description="Per-head index Q/K dimension.",
     )
     sparse_block_size: int = Field(
@@ -747,6 +748,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    indexer_kv_dtype: Literal["bf16", "fp8"] = Field(
+        default="bf16",
+        description=
+        "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses "
+        "unscaled E4M3 values with FP32 score accumulation and is supported only "
+        "by the MSA implementation.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -769,11 +778,18 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     )
 
     @model_validator(mode="after")
-    def _validate_msa_block_size(self):
+    def _validate_msa_configuration(self):
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "
                 f"128, got {self.sparse_block_size}.")
+        if self.indexer_kv_dtype == "fp8" and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 indexer_kv_dtype='fp8' currently requires the "
+                "'msa' implementation.")
+        if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
+            raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
+                             "sparse_disable_index_value=True.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -796,6 +812,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
+            indexer_kv_dtype=self.indexer_kv_dtype,
         )
 
     def to_sparse_metadata_params(self, **kwargs):

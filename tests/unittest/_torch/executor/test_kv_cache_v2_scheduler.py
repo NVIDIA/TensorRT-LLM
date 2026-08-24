@@ -168,6 +168,7 @@ def make_kv_cache_manager(
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
+    mgr._has_cp_helix = False
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)

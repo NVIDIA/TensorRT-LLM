@@ -372,7 +372,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
         """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
-        kv_cache_size and unblock the perf-metric timestamps that gate on it."""
+        kv_cache_size and unblock the perf-metric timestamps that gate on it.
+
+        Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
+        computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
+        every pool view of a group. The pool-0-only sizing gap for multi-pool attention groups is
+        tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
+        """
         pt = self._page_table
         if pt is None:
             return 0

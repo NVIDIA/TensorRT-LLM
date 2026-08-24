@@ -2,12 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity tests for the optimized Kimi K3 KDA prefill op."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda import (
+    KimiKDALinearAttention,  # noqa: E402
+    _kda_kernels,  # noqa: E402
+)
+from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
+    KimiKDAReference,
+    get_production_prefill_kernel_path,
+)
 
 NUM_HEADS = 96
 HEAD_DIM = 128
@@ -25,7 +34,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_attention_pair() -> tuple[KimiKDALinearAttention, KimiKDALinearAttention]:
+def _make_attention_pair(
+    expected_prefill_kernel_path: str = "optimized",
+) -> tuple[KimiKDALinearAttention, KimiKDAReference]:
     common = {
         "hidden_size": HIDDEN_SIZE,
         "num_heads": NUM_HEADS,
@@ -36,14 +47,81 @@ def _make_attention_pair() -> tuple[KimiKDALinearAttention, KimiKDALinearAttenti
         "rms_norm_eps": 1e-5,
         "dtype": torch.bfloat16,
     }
-    optimized = KimiKDALinearAttention(**common).to("cuda")
-    reference = KimiKDALinearAttention(**common, use_optimized_prefill=False).to("cuda")
+    cfg = SimpleNamespace(
+        hidden_size=HIDDEN_SIZE,
+        rms_norm_eps=common["rms_norm_eps"],
+        linear_attn_config={
+            "num_heads": NUM_HEADS,
+            "head_dim": HEAD_DIM,
+            "short_conv_kernel_size": CONV_KERNEL_SIZE,
+            "use_full_rank_gate": common["use_full_rank_gate"],
+            "gate_lower_bound": common["gate_lower_bound"],
+        },
+    )
+    optimized = KimiKDALinearAttention(cfg, layer_idx=0).to("cuda")
+    with torch.no_grad():
+        optimized.dt_bias.zero_()
+    reference = KimiKDAReference(**common).to("cuda")
     reference.load_state_dict(optimized.state_dict())
+    optimized.finalize_decode_weights()
 
-    assert optimized.prefill_kernel_path == "optimized"
-    assert reference.prefill_kernel_path == "fla"
-    assert reference.decode_kernel_path == optimized.decode_kernel_path
+    assert get_production_prefill_kernel_path(optimized) == expected_prefill_kernel_path
     return optimized, reference
+
+
+def _run_production_prefill(
+    attention: KimiKDALinearAttention,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    *,
+    conv_pool: torch.Tensor | None = None,
+    state_pool: torch.Tensor | None = None,
+    slot_indices: torch.Tensor | None = None,
+    has_initial_states: torch.Tensor | None = None,
+) -> torch.Tensor:
+    batch_size, sequence_length, _ = hidden_states.shape
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(batch_size + 1, device="cuda", dtype=torch.long) * sequence_length
+    else:
+        batch_size = cu_seqlens.numel() - 1
+
+    projection_size = NUM_HEADS * HEAD_DIM
+    if conv_pool is None:
+        conv_pool = torch.zeros(
+            batch_size,
+            3 * projection_size,
+            CONV_KERNEL_SIZE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+    if state_pool is None:
+        state_pool = torch.zeros(
+            batch_size,
+            NUM_HEADS,
+            HEAD_DIM,
+            HEAD_DIM,
+            dtype=torch.float32,
+            device="cuda",
+        )
+    if slot_indices is None:
+        slot_indices = torch.arange(batch_size, device="cuda", dtype=torch.long)
+    use_initial_states = has_initial_states is not None
+    if has_initial_states is None:
+        has_initial_states = torch.zeros(batch_size, device="cuda", dtype=torch.bool)
+    metadata = SimpleNamespace(
+        use_initial_states=use_initial_states,
+        has_initial_states=has_initial_states,
+    )
+    output = attention.forward_prefill(
+        hidden_states.reshape(-1, HIDDEN_SIZE),
+        cu_seqlens,
+        metadata,
+        batch_size,
+        conv_pool,
+        state_pool,
+        slot_indices,
+    )
+    return output.reshape_as(hidden_states)
 
 
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -75,12 +153,12 @@ def test_optimized_prefill_matches_fla_reference() -> None:
             )
             * 0.05
         )
-        actual = optimized.forward_prefill(hidden_states)
+        actual = _run_production_prefill(optimized, hidden_states)
         expected = reference.forward_prefill(hidden_states)
         _assert_close(actual, expected)
 
     hidden_states = torch.randn(1, 300, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
-    actual = optimized.forward_prefill(hidden_states)
+    actual = _run_production_prefill(optimized, hidden_states)
     expected = reference.forward_prefill(hidden_states)
     _assert_close(actual, expected)
 
@@ -100,10 +178,9 @@ def test_optimized_prefill_matches_fla_reference() -> None:
         )
         * 0.05
     )
-    actual = optimized.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
+    actual = _run_production_prefill(optimized, hidden_states, cumulative_lengths)
     expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
     _assert_close(actual, expected)
-    assert optimized.prefill_kernel_source()
 
 
 @torch.no_grad()
@@ -193,12 +270,10 @@ def test_kda_prefill_op_empty_token_batch_variants():
 
 @torch.no_grad()
 def test_kda_mixer_empty_prefill():
-    """Runtime-shaped regression: the mixer dispatch with an empty token
-    payload (a crashing call shape observed at runtime) must run
-    end-to-end on the optimized path."""
+    """The production mixer handles an empty token payload without raising."""
     optimized, _ = _make_attention_pair()
     hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-    out = optimized.forward_prefill(hidden_states)
+    out = _run_production_prefill(optimized, hidden_states)
     assert out.shape == (1, 0, HIDDEN_SIZE)
 
 
@@ -237,42 +312,127 @@ def test_kda_prefill_op_partial_final_chunk_large_batch():
             )
             * 0.05
         )
-        actual = optimized.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
+        actual = _run_production_prefill(optimized, hidden_states, cumulative_lengths)
         expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
         _assert_close(actual, expected)
 
 
 @torch.no_grad()
-def test_kda_prefill_op_small_varlen_batch():
-    """Small varlen batches (short-prompt contexts) through the dispatch.
+@pytest.mark.parametrize(
+    "sequence_lengths",
+    ([30], [65], [6, 12], [1, 2, 3], [64, 64, 63], [6, 12, 20, 25]),
+    ids=(
+        "one-chunk",
+        "two-chunk-single-seq",
+        "two-chunk-varlen",
+        "three-short-seqs",
+        "three-chunk-boundary",
+        "four-chunk-optimized-boundary",
+    ),
+)
+def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_lengths):
+    """Cover every small-varlen fallback chunk count and the optimized boundary.
 
-    The persistent K123 scheduler needs >= 4 total chunks, so the dispatch
-    routes NT < 4 batches to the FLA path ([6,12], [1,2,3], [30] here);
-    the [6,12,20,25] case carries exactly NT=4 with total T < 64, running
-    the optimized masked path where building the eqlen chunk-offset
-    scratch used to raise ``step must be nonzero`` (arange step
-    ``T // 64 == 0``) — its output is parity-checked against FLA.
+    The persistent K123 scheduler needs at least four total chunks. The
+    one-, two-, and three-chunk configurations must use FLA; the final case
+    has exactly four chunks and verifies the optimized boundary.
     """
     optimized, reference = _make_attention_pair()
-    for sequence_lengths in ([6, 12], [1, 2, 3], [30], [6, 12, 20, 25]):
-        cumulative_lengths = torch.tensor(
-            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
-            dtype=torch.long,
+    cumulative_lengths = torch.tensor(
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+        dtype=torch.long,
+        device="cuda",
+    )
+    hidden_states = (
+        torch.randn(
+            1,
+            sum(sequence_lengths),
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
             device="cuda",
         )
-        hidden_states = (
-            torch.randn(
-                1,
-                sum(sequence_lengths),
-                HIDDEN_SIZE,
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
-            * 0.05
+        * 0.05
+    )
+    actual = _run_production_prefill(optimized, hidden_states, cumulative_lengths)
+    expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
+    _assert_close(actual, expected)
+
+
+@torch.no_grad()
+def test_kda_prefill_unavailable_kernel_fallback_preserves_mixed_initial_states(monkeypatch):
+    """The FLA core preserves prefix and continuation pool states."""
+    torch.manual_seed(3)
+    optimized, _ = _make_attention_pair()
+    monkeypatch.setattr(_kda_kernels, "is_intree_prefill_available", lambda: False)
+    fallback, _ = _make_attention_pair(expected_prefill_kernel_path="fla")
+    fallback.load_state_dict(optimized.state_dict())
+
+    sequence_lengths = [64, 64, 64, 64]
+    cumulative_lengths = torch.tensor(
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+        dtype=torch.long,
+        device="cuda",
+    )
+    hidden_states = (
+        torch.randn(1, sum(sequence_lengths), HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        * 0.05
+    )
+    slots = 5
+    slot_indices = torch.tensor([3, 0, 4, 1], dtype=torch.long, device="cuda")
+    has_initial_states = torch.tensor([True, False, True, False], device="cuda")
+    projection_size = NUM_HEADS * HEAD_DIM
+    conv_seed = (
+        torch.randn(
+            slots,
+            3 * projection_size,
+            CONV_KERNEL_SIZE,
+            dtype=torch.bfloat16,
+            device="cuda",
         )
-        actual = optimized.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
-        expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
-        _assert_close(actual, expected)
+        * 0.05
+    )
+    state_seed = (
+        torch.randn(
+            slots,
+            NUM_HEADS,
+            HEAD_DIM,
+            HEAD_DIM,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        * 0.05
+    )
+
+    optimized_conv, optimized_state = conv_seed.clone(), state_seed.clone()
+    optimized_output = _run_production_prefill(
+        optimized,
+        hidden_states,
+        cumulative_lengths,
+        conv_pool=optimized_conv,
+        state_pool=optimized_state,
+        slot_indices=slot_indices,
+        has_initial_states=has_initial_states,
+    )
+    fallback_conv, fallback_state = conv_seed.clone(), state_seed.clone()
+    fallback_output = _run_production_prefill(
+        fallback,
+        hidden_states,
+        cumulative_lengths,
+        conv_pool=fallback_conv,
+        state_pool=fallback_state,
+        slot_indices=slot_indices,
+        has_initial_states=has_initial_states,
+    )
+
+    _assert_close(fallback_output, optimized_output)
+    _assert_close(
+        fallback_conv.index_select(0, slot_indices),
+        optimized_conv.index_select(0, slot_indices),
+    )
+    _assert_close(
+        fallback_state.index_select(0, slot_indices),
+        optimized_state.index_select(0, slot_indices),
+    )
 
 
 @torch.no_grad()
@@ -318,6 +478,6 @@ def test_kda_prefill_op_shape_growth_and_cu_dtype_transitions():
             )
             * 0.05
         )
-        actual = optimized.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
+        actual = _run_production_prefill(optimized, hidden_states, cumulative_lengths)
         expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
         _assert_close(actual, expected)

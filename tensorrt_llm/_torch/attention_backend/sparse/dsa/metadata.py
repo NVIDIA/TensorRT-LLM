@@ -336,7 +336,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             num_sms=self.num_sms,
         )
 
-    def on_update_kv_lens(self):
+    def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         #
@@ -345,6 +345,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
+
+        super().on_update_kv_lens()
 
         # _preprocess_inputs() also uses this as a general hook to "invalidate per-forward-pass
         # caches so they are recomputed (and captured) on every _forward_step". Invalidate the
