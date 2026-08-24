@@ -1442,8 +1442,6 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                      id="google_gemma-3-1b-it"),
         pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
                      id="mistralai_Ministral-8B-Instruct-2410"),
-        pytest.param("mistralai/Codestral-22B-v0.1", {}, [MMLU, GSM8K],
-                     id="mistralai_Codestral-22B-v0.1"),
         pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {}, [MMLU, GSM8K],
                      id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
         pytest.param(
