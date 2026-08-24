@@ -1839,6 +1839,7 @@ def test_megamoe_overrides_finalize_streamed_expert() -> None:
         "changes, re-check which staging behaviour it inherits"
     )
     assert issubclass(MegaMoE, NVFP4FusedMoEMethod)
+    assert "_finalize_staged_w3_w1_expert" in NVFP4FusedMoEMethod.__dict__
 
     for name in (
         "finalize_streamed_expert",
@@ -1846,6 +1847,12 @@ def test_megamoe_overrides_finalize_streamed_expert() -> None:
         "_resolve_staged_w3_w1_weight_scale",
     ):
         assert name in MegaMoE.__dict__, f"MegaMoE must define its own {name}"
+
+    for method in (NVFP4CutlassFusedMoEMethod, MegaMoE):
+        finalize_src = inspect.getsource(method.finalize_streamed_expert)
+        assert "self._finalize_staged_w3_w1_expert" in finalize_src, (
+            f"{method.__name__} must delegate staged draining to the shared helper"
+        )
 
     scale_src = inspect.getsource(MegaMoE._resolve_staged_w3_w1_weight_scale)
     assert "_interleave_w3_w1_weight_scale" not in scale_src, (

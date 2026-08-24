@@ -19,7 +19,7 @@ import os
 import threading
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -2398,6 +2398,32 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         module.tmp_weight_scale_2 = {}
         module._streamed_expert_slots = set()
 
+    def _finalize_staged_w3_w1_expert(
+        self,
+        module: torch.nn.Module,
+        local_slot_id: int,
+        weight_resolver: Callable[[Dict[str, torch.Tensor]], None],
+        weight_scale_resolver: Callable[[Dict[str, torch.Tensor]], None],
+    ) -> None:
+        """Drain one expert's staged w3/w1 weights and block scales."""
+        # The key must be built exactly as the staging site builds it. The two
+        # sites do not agree on the accessor -- the weight one uses
+        # untyped_storage(), the scale one the deprecated storage() -- so
+        # mirror each rather than assume they return the same address.
+        for attr, dst_base, resolve in (
+            ('tmp_cutlass_w3_w1_weights', lambda: module.w3_w1_weight.data[
+                local_slot_id].untyped_storage().data_ptr(), weight_resolver),
+            ('tmp_cutlass_w3_w1_weight_scales',
+             lambda: module.w3_w1_weight_scale.data[local_slot_id].storage(
+             ).data_ptr(), weight_scale_resolver),
+        ):
+            staged = getattr(module, attr, None)
+            if not staged:
+                continue
+            entry = staged.pop((dst_base(), local_slot_id), None)
+            if entry is not None:
+                resolve(entry)
+
     def finalize_streamed_expert(self, module: torch.nn.Module,
                                  local_slot_id: int) -> None:
         """Resolve any per-expert staging left by ``load_streaming_nvfp4_expert``.
@@ -3221,24 +3247,12 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
         ``dict.pop`` is atomic, so concurrent loader threads draining different
         slots need no lock.
         """
-        # The key must be built exactly as the staging site builds it. The two
-        # sites do not agree on the accessor -- the weight one uses
-        # untyped_storage(), the scale one the deprecated storage() -- so
-        # mirror each rather than assume they return the same address.
-        for attr, dst_base, resolve in (
-            ('tmp_cutlass_w3_w1_weights', lambda: module.w3_w1_weight.data[
-                local_slot_id].untyped_storage().data_ptr(),
-             self._resolve_staged_w3_w1_weight),
-            ('tmp_cutlass_w3_w1_weight_scales',
-             lambda: module.w3_w1_weight_scale.data[local_slot_id].storage(
-             ).data_ptr(), self._resolve_staged_w3_w1_weight_scale),
-        ):
-            staged = getattr(module, attr, None)
-            if not staged:
-                continue
-            entry = staged.pop((dst_base(), local_slot_id), None)
-            if entry is not None:
-                resolve(entry)
+        self._finalize_staged_w3_w1_expert(
+            module,
+            local_slot_id,
+            self._resolve_staged_w3_w1_weight,
+            self._resolve_staged_w3_w1_weight_scale,
+        )
 
     def process_weights_after_loading(self, module: torch.nn.Module):
         # Finalize w3_w1 weights: cat + pad. Streamed loads drain these
@@ -3906,24 +3920,12 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         ``dict.pop`` is atomic, so concurrent loader threads draining different
         slots need no lock.
         """
-        # The key must be built exactly as the staging site builds it. The two
-        # sites do not agree on the accessor -- the weight one uses
-        # untyped_storage(), the scale one the deprecated storage() -- so
-        # mirror each rather than assume they return the same address.
-        for attr, dst_base, resolve in (
-            ('tmp_cutlass_w3_w1_weights', lambda: module.w3_w1_weight.data[
-                local_slot_id].untyped_storage().data_ptr(),
-             self._resolve_staged_w3_w1_weight),
-            ('tmp_cutlass_w3_w1_weight_scales',
-             lambda: module.w3_w1_weight_scale.data[local_slot_id].storage(
-             ).data_ptr(), self._resolve_staged_w3_w1_weight_scale),
-        ):
-            staged = getattr(module, attr, None)
-            if not staged:
-                continue
-            entry = staged.pop((dst_base(), local_slot_id), None)
-            if entry is not None:
-                resolve(entry)
+        self._finalize_staged_w3_w1_expert(
+            module,
+            local_slot_id,
+            self._resolve_staged_w3_w1_weight,
+            self._resolve_staged_w3_w1_weight_scale,
+        )
 
     def _get_fc2_alpha_input_scale(
         self,
