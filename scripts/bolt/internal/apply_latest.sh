@@ -33,7 +33,7 @@
 # Usage: apply_latest.sh <branch> <triple> <in_tarball> <out_bolted_tarball>
 # Requires: llvm-bolt on PATH; urm-artifactory-creds for artifactory.sh pull-latest.
 
-set -uo pipefail
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../scripts/bolt/internal
 TOOLKIT="$(dirname "$HERE")"                            # .../scripts/bolt
