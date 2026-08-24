@@ -22,6 +22,8 @@ __all__ = [
     "GenerationRequest",
     "TruncateKVCacheRequest",
     "CancellingRequest",
+    "StartProfileRequest",
+    "StopProfileRequest",
 ]
 
 # Mirrors C++ executor.h Request::kDefaultPriority
@@ -251,7 +253,40 @@ class TruncateKVCacheRequest:
 
 
 class CancellingRequest:
-    ''' The request to cancel a generation. '''
+    """The request to cancel a generation."""
 
     def __init__(self, id: int):
         self.id = id
+
+
+class StartProfileRequest:
+    """Request the IPC worker to start runtime profiling.
+
+    Carries the same arguments as ``LLM.start_profile`` / the HTTP
+    ``/start_profile`` endpoint so the worker can forward them to
+    ``PyExecutor.start_profile``.
+    """
+
+    def __init__(self,
+                 output_dir=None,
+                 num_steps=None,
+                 start_step: int = 0,
+                 activities=None,
+                 ack_addr=None):
+        self.output_dir = output_dir
+        self.num_steps = num_steps
+        self.start_step = start_step
+        self.activities = activities
+        # (endpoint, hmac_key) of the proxy's ack channel. The proxy only
+        # binds that socket when profiling is first requested, so the
+        # address travels with the request rather than being handed to the
+        # worker at startup.
+        self.ack_addr = ack_addr
+
+
+class StopProfileRequest:
+    """Request the IPC worker to stop runtime profiling."""
+
+    def __init__(self, ack_addr=None):
+        # See StartProfileRequest.ack_addr.
+        self.ack_addr = ack_addr
