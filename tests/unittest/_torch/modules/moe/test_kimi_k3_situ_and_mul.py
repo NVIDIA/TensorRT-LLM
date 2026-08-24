@@ -8,8 +8,6 @@ Checks the fused SiTU activation op against the eager fp32
 * elementwise parity across shapes (masked tails, multi-block rows),
   ``beta`` / ``linear_beta`` settings (incl. ``linear_beta=None``), bf16
   in/out, tight tolerance;
-* the ``KimiK3MLP(use_fused_activation=True)`` wiring matches the eager
-  module bit-for-bit at the down_proj output tolerance;
 * the fake/meta registration produces the right shape/dtype (graph
   tracing contract);
 * the op is CUDA-graph-capturable (no host sync, no data-dependent
@@ -18,8 +16,9 @@ Checks the fused SiTU activation op against the eager fp32
 
 import pytest
 import torch
+from _torch.modules.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP
 
-from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import KimiK3MLP, SituAndMul
+from tensorrt_llm._torch.modules.situ import SituAndMul
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
@@ -67,35 +66,13 @@ def test_situ_and_mul_strided_rows():
 
 
 @requires_cuda
-@pytest.mark.parametrize("situ_beta,situ_linear_beta", _BETAS, ids=_BETA_IDS)
-def test_kimi_k3_mlp_fused_activation_matches_eager(situ_beta, situ_linear_beta):
-    device = torch.device("cuda")
-    hidden_size, intermediate_size = 512, 384
-    torch.manual_seed(3)
-    eager = KimiK3MLP(
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    with torch.no_grad():
-        for proj in (eager.gate_up_proj, eager.down_proj):
-            proj.weight.copy_(torch.randn_like(proj.weight, dtype=torch.float32) * 0.05)
-    fused = KimiK3MLP(
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        use_fused_activation=True,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    fused.load_state_dict(eager.state_dict())
+def test_situ_and_mul_rejects_strided_columns():
+    """The kernel does not accept a non-contiguous packed dimension."""
+    full = torch.randn(8, 1024, dtype=torch.bfloat16, device="cuda")
+    x = full[:, ::2]
 
-    x = torch.randn(64, hidden_size, dtype=torch.bfloat16, device=device) * 0.5
-    torch.testing.assert_close(fused(x), eager(x), rtol=1.6e-2, atol=1e-3)
+    with pytest.raises(ValueError, match="contiguous last dimension"):
+        torch.ops.trtllm.situ_and_mul(x, 4.0, 25.0)
 
 
 def test_kimi_k3_mlp_rejects_fused_flag_with_custom_activation():

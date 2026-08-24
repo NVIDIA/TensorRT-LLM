@@ -47,7 +47,7 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (BaseModel, ConfigDict, Field, PositiveInt,
+from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
                       field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
@@ -1686,6 +1686,71 @@ class ImageGenerationRequest(OpenAIBaseModel):
         Either both are sent (structured resolution wins over ``size``)
         or neither is sent (``size`` or pipeline default applies).
         """
+        if (self.width is None) != (self.height is None):
+            raise ValueError(
+                "width and height must be sent together; got width="
+                f"{self.width!r}, height={self.height!r}")
+        return self
+
+
+class ImageEditRequest(OpenAIBaseModel):
+    """OpenAI-compatible image editing request.
+
+    The server accepts the OpenAI multipart shape and a JSON/base64
+    shape for tests and non-SDK clients. Model-specific knobs travel
+    through ``extra_params`` and are validated by the loaded visual
+    generation pipeline.
+    """
+
+    prompt: str
+    image: Union[str, UploadFile, List[Union[str, UploadFile]]] = Field(
+        description="Input image or images to edit.")
+    mask: Optional[Union[str, UploadFile]] = Field(
+        default=None,
+        description=
+        "Optional edit mask. Currently accepted for compatibility but unsupported.",
+    )
+    response_format: Literal["url", "b64_json"] = "url"
+    output_format: Literal["png", "webp", "jpeg"] = Field(
+        default="png",
+        validation_alias=AliasChoices("output_format", "format"),
+        description="Edited image content encoding format.",
+    )
+    seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                description="Random seed for reproducibility.")
+
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+    num_inference_steps: Optional[int] = Field(default=None, gt=0)
+    guidance_scale: Optional[float] = Field(default=None, gt=0)
+    max_sequence_length: Optional[int] = Field(default=None, gt=0)
+    negative_prompt: Optional[str] = None
+    n: Optional[int] = Field(
+        default=None,
+        gt=0,
+        le=10,
+        description=("Number of edited images to generate. Capped at 10 to "
+                     "match the OpenAI images API."),
+    )
+
+    extra_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model-specific parameters forwarded to the underlying pipeline. "
+            "See per-model docs for accepted keys."),
+    )
+
+    model: Optional[str] = None
+    quality: Optional[Literal["standard", "hd"]] = None
+    user: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_paired_dimensions(self):
+        if isinstance(self.image, list) and not self.image:
+            raise ValueError("image must contain at least one input image")
         if (self.width is None) != (self.height is None):
             raise ValueError(
                 "width and height must be sent together; got width="

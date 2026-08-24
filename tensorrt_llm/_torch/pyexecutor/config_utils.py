@@ -637,8 +637,8 @@ def load_pretrained_config(model_name_or_path: str,
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
     elif is_qwen_image_bench_config(config_dict):
-        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
-            Qwen35ConfigCompat
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+            Qwen35ConfigCompat, _normalize_qwen35_quantization_config)
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
         # Keep the composite VLM config so the vision encoder and multimodal
@@ -647,6 +647,7 @@ def load_pretrained_config(model_name_or_path: str,
         model_config.architectures = ["QwenImageBenchForConditionalGeneration"]
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
             Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
+        _normalize_qwen35_quantization_config(model_config)
     elif model_type == "glm_moe_dsa":
         # GLM-MoE-DSA configs tag every layer with
         # layer_types=['deepseek_sparse_attention', ...] for HF bookkeeping.

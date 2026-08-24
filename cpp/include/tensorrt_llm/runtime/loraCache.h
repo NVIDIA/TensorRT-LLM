@@ -194,6 +194,17 @@ public:
      */
     void setDataType(tensorrt_llm::DataType dataType);
 
+    /**
+     * \brief Reinitialize this cache and another cache (e.g. a host/device pair) to store the
+     * given data type as a single atomic operation.
+     *
+     * Holds both caches' mutexes for the full duration so a concurrent copyTask (which locks
+     * the same mutexes to verify the two caches agree on dtype before copying) can never
+     * observe one cache already reconfigured to the new dtype while the other still holds the
+     * old one.
+     */
+    void setDataTypeCoordinated(LoraCache& other, tensorrt_llm::DataType dataType);
+
     [[nodiscard]] tensorrt_llm::DataType getDataType() const;
 
     /**
@@ -443,6 +454,12 @@ private:
     void loadWeights(TaskValue& cacheValue, TensorPtr weights, TensorPtr config);
     void bumpTaskInProgress(TaskIdType taskId);
     [[nodiscard]] ValueStatus getStatus(TaskIdType taskId) const;
+
+    /**
+     * \brief Core of setDataType, assumes mPagesMutex and mCacheMutex are already held by the
+     * caller. Used by setDataTypeCoordinated to reconfigure two caches under one combined lock.
+     */
+    void setDataTypeLocked(tensorrt_llm::DataType dataType);
 
     /**
      * \brief claim numPages, evicting tasks if needed

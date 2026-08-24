@@ -22,6 +22,7 @@
 #include <ATen/cuda/EmptyTensor.h>
 #include <torch/library.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -212,6 +213,13 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     int32_t max_num_padded_tokens_gemm1
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, 2 * args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+    // maybeGetMinTokenCount pads a buffer up to the 128 KiB floor using the row width it is
+    // handed, so its result is only valid for that width. A gated activation is half as wide as
+    // gemm1_output, so reusing max_num_padded_tokens_gemm1 delivers half the intended floor on
+    // small decode batches. Derive the capacity from the activation's own row width instead.
+    int32_t max_num_padded_tokens_activation
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
     int32_t max_num_padded_tokens_gemm2
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
@@ -254,10 +262,11 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
     at::Tensor gemm1_output_scale = at::detail::empty_cuda({2 * intermediate_size / 128, max_num_padded_tokens_gemm1},
         at::ScalarType::Float, routing_device, std::nullopt);
-    at::Tensor activation_output = at::detail::empty_cuda(
-        {max_num_padded_tokens_gemm1, intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
-    at::Tensor activation_output_scale = at::detail::empty_cuda(
-        {intermediate_size / 128, max_num_padded_tokens_gemm1}, at::ScalarType::Float, routing_device, std::nullopt);
+    at::Tensor activation_output = at::detail::empty_cuda({max_num_padded_tokens_activation, intermediate_size},
+        at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+    at::Tensor activation_output_scale
+        = at::detail::empty_cuda({intermediate_size / 128, max_num_padded_tokens_activation}, at::ScalarType::Float,
+            routing_device, std::nullopt);
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
@@ -340,7 +349,11 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
-    workspace.total_max_padded_tokens = std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
+    // The activation is the narrowest of the three buffers, so its 128 KiB floor needs the most
+    // rows and it is now the largest capacity of the three on small batches. Include it here or
+    // this descriptor under-counts the workspace it claims to describe.
+    workspace.total_max_padded_tokens
+        = std::max({max_num_padded_tokens_gemm1, max_num_padded_tokens_activation, max_num_padded_tokens_gemm2});
     workspace.routing_expert_indexes = expert_indexes.data_ptr<int>();
     workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();
     workspace.expanded_idx_to_permuted_idx

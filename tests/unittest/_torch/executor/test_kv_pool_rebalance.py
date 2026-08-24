@@ -906,6 +906,8 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     exe.device_id = 0
     exe.enable_iter_perf_stats = False
     exe.iter_counter = 0
+    exe._mm_encoder_item_scheduling_enabled = False
+    exe._pending_recompute_pause_ids = set()
 
     # Rebalance state.  _uses_kv_manager_v2() reads the explicit flag first.
     exe._is_kv_manager_v2 = True
@@ -987,6 +989,11 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # fact and ends the loop.
     exe._forward_step_inter_pp = MagicMock(side_effect=_ReachedForward)
 
+    # These control-flow tests run in CPU CI; CUDA synchronization is out of scope.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.current_stream",
+        MagicMock(),
+    )
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device", MagicMock()
     )

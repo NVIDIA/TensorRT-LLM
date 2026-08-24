@@ -21,8 +21,10 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
-    create_kv_cache_transceiver
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    create_kv_cache_transceiver,
+    maybe_enable_fabric_memory_for_python_transceiver)
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
@@ -40,6 +42,34 @@ DEFAULT_KV_TRANSFER_TIMEOUT_S = (
     CacheTransceiverConfig.model_fields["kv_transfer_timeout_ms"].default /
     1000.0)
 KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "runtime,manager_cls,initial_value,expected_value",
+    [
+        ("PYTHON", KVCacheManager, None, "1"),
+        ("PYTHON", KVCacheManager, "0", "0"),
+        ("PYTHON", KVCacheManagerV2, None, None),
+        ("CPP", KVCacheManager, None, None),
+        # "auto" is resolved to PYTHON/CPP by serving before this helper runs;
+        # callers that construct CacheTransceiverConfig directly must resolve
+        # it first — the helper deliberately leaves "auto" untouched.
+        ("auto", KVCacheManager, None, None),
+    ],
+)
+def test_maybe_enable_fabric_memory_for_python_transceiver(
+        monkeypatch, runtime, manager_cls, initial_value, expected_value):
+    env_name = "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"
+    if initial_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, initial_value)
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime)
+
+    maybe_enable_fabric_memory_for_python_transceiver(config, manager_cls)
+
+    assert os.environ.get(env_name) == expected_value
 
 
 @pytest.mark.parametrize("transceiver_runtime", ["CPP", "auto"])
