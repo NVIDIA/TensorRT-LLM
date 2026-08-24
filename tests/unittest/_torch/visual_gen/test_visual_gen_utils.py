@@ -1135,38 +1135,75 @@ class TestReferenceBroadcastSplit:
         )
         return DiffusionRequest(request_id=1, prompt=["x"], params=params)
 
-    def test_detach_empties_the_object_and_records_sizes(self):
+    @staticmethod
+    def _drive_broadcast(req, rank=0, peer_sizes=None):
+        """Run ``_broadcast_request`` with the collectives stubbed out.
+
+        Returns ``(result, pickled_object)`` so a test can inspect exactly what
+        ``broadcast_object_list`` was handed.
+        """
+        from unittest import mock
+
+        from tensorrt_llm._torch.visual_gen import executor as ex
+
+        captured = {}
+
+        def fake_obj_list(obj_list, src=0):
+            captured["obj"] = pickle.dumps(obj_list[0])
+            if rank != 0:
+                peer = pickle.loads(captured["obj"])
+                peer.ref_sizes = peer_sizes if peer_sizes is not None else peer.ref_sizes
+                obj_list[0] = peer
+
+        self_ = mock.Mock(rank=rank)
+        with (
+            mock.patch.object(ex.dist, "broadcast_object_list", side_effect=fake_obj_list),
+            mock.patch.object(ex.dist, "broadcast", lambda *a, **k: None),
+        ):
+            out = ex.DiffusionExecutor._broadcast_request(self_, req)
+        return out, captured.get("obj")
+
+    def test_payload_never_reaches_the_object_pickle(self):
+        """The whole point of the split: the bytes must not be in what
+        ``broadcast_object_list`` serializes."""
         payloads = (os.urandom(4096), os.urandom(64))
         req = self._request(*payloads)
 
-        detached = req.refs_detach()
+        out, pickled = self._drive_broadcast(req)
 
-        assert detached[:2] == list(payloads)
-        assert req.ref_sizes == [len(p) for p in detached]
-        assert all(r.content == b"" for r in req.params.image_reference)
-        assert payloads[0] not in pickle.dumps(req)
+        assert payloads[0] not in pickled
+        assert payloads[1] not in pickled
+        assert out is req
 
-    def test_attach_restores_every_slot_in_order(self):
+    def test_payloads_come_back_to_their_own_slots(self):
         payloads = (os.urandom(2048), os.urandom(128))
         req = self._request(*payloads)
 
-        detached = req.refs_detach()
-        req.refs_attach(detached)
+        out, _ = self._drive_broadcast(req)
 
-        assert tuple(r.content for r in req.params.image_reference) == payloads
-        assert req.params.video_reference[0].content == b"\x00\x00\x00\x18ftypmp42"
-        assert req.ref_sizes is None
+        assert tuple(r.content for r in out.params.image_reference) == payloads
+        assert out.params.video_reference[0].content == b"\x00\x00\x00\x18ftypmp42"
+        assert out.ref_sizes is None
 
     def test_sizes_let_a_peer_size_its_buffers(self):
         """Non-source ranks allocate from ``ref_sizes`` alone, so it has to
         survive the object hop and match the payloads exactly."""
         payloads = (os.urandom(1024), os.urandom(7))
         req = self._request(*payloads)
-        req.refs_detach()
 
-        peer = pickle.loads(pickle.dumps(req))
-        assert peer.ref_sizes == req.ref_sizes
+        _, pickled = self._drive_broadcast(req)
+
+        peer = pickle.loads(pickled)
         assert peer.ref_sizes[:2] == [1024, 7]
+        assert all(r.content == b"" for r in peer.params.image_reference)
+
+    def test_a_size_count_mismatch_is_refused(self):
+        """A peer whose ref_sizes disagrees with its slots would pair payloads
+        to the wrong references; zip() would do it silently."""
+        req = self._request(os.urandom(64), os.urandom(32))
+
+        with pytest.raises(ValueError, match="reference payloads"):
+            self._drive_broadcast(req, rank=1, peer_sizes=[64])
 
     @staticmethod
     def _blocks_of(req):
@@ -1196,16 +1233,6 @@ class TestReferenceBroadcastSplit:
         del req
         gc.collect()
         assert not any(b.exists() for b in blocks)
-
-    def test_attach_rejects_a_count_mismatch(self):
-        """Peers size their collectives from ``ref_sizes``, so a payload list
-        that does not match the reference count is a bug worth raising on
-        rather than silently leaving references empty."""
-        req = self._request(os.urandom(64), os.urandom(64))
-        detached = req.refs_detach()
-
-        with pytest.raises(ValueError, match="expected 3 reference payloads, got 2"):
-            req.refs_attach(detached[:2])
 
     def test_partial_handle_failure_stays_reclaimable(self):
         """If a later reference cannot reach shared memory, the blocks already

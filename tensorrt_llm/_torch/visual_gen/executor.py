@@ -299,7 +299,7 @@ class DiffusionRequest:
     # ``refs_to_shm``.
     ref_handles: Optional[List[Dict[str, Any]]] = field(default=None, repr=False)
     # Set only while the request is in flight on the rank0 -> N-rank hop; see
-    # ``refs_detach``.
+    # ``DiffusionExecutor._broadcast_request``.
     ref_sizes: Optional[List[int]] = field(default=None, repr=False)
 
     def refs_to_shm(self) -> None:
@@ -351,36 +351,6 @@ class DiffusionRequest:
             raise RuntimeError(
                 "failed to restore reference payloads from shared memory: " + "; ".join(failures)
             )
-
-    def _refs(self):
-        for slot in ("image_reference", "video_reference", "audio_reference"):
-            yield from getattr(self.params, slot, None) or []
-
-    def refs_detach(self) -> List[bytes]:
-        """Take the reference payloads out of the request and record their sizes.
-
-        Broadcasting them inside the request object would make
-        ``broadcast_object_list`` serialize every reference byte into a tensor
-        first, which costs more than the collective that follows.
-        """
-        if self.params is None:
-            return []
-        payloads = [ref.content for ref in self._refs()]
-        for ref in self._refs():
-            ref.content = b""
-        self.ref_sizes = [len(p) for p in payloads]
-        return payloads
-
-    def refs_attach(self, payloads: List[bytes]) -> None:
-        """Put the separately broadcast payloads back, in place."""
-        refs = list(self._refs())
-        if len(refs) != len(payloads):
-            # zip() would silently leave the tail of either side behind, and
-            # clearing ref_sizes below would erase the evidence.
-            raise ValueError(f"expected {len(refs)} reference payloads, got {len(payloads)}.")
-        for ref, payload in zip(refs, payloads):
-            ref.content = payload
-        self.ref_sizes = None
 
 
 @dataclass
@@ -522,14 +492,16 @@ class DiffusionExecutor:
         rather than inside it, because ``broadcast_object_list`` pickles the
         object into a tensor first and that copy dominates the collective.
         """
-        payloads = req.refs_detach() if self.rank == 0 and req is not None else []
-        if self.rank == 0 and len(payloads) != len(getattr(req, "ref_sizes", None) or []):
-            # Peers derive their collective count from ref_sizes, so a mismatch
-            # here would hang every rank. Fail on rank0, before the first one.
-            raise RuntimeError(
-                f"reference payload/size mismatch: {len(payloads)} payloads, "
-                f"{len(getattr(req, 'ref_sizes', None) or [])} sizes."
-            )
+        payloads = []
+        if self.rank == 0 and req is not None:
+            # Take the payloads out before the object is pickled, and leave their
+            # sizes behind so the peers can size their receive buffers.
+            for slot in ("image_reference", "video_reference", "audio_reference"):
+                for ref in getattr(req.params, slot, None) or []:
+                    payloads.append(ref.content)
+                    ref.content = b""
+            req.ref_sizes = [len(p) for p in payloads]
+
         obj_list = [req]
         dist.broadcast_object_list(obj_list, src=0)
         req = obj_list[0]
@@ -546,7 +518,19 @@ class DiffusionExecutor:
 
         if self.rank != 0:
             payloads = [b.numpy().tobytes() for b in buffers]
-        req.refs_attach(payloads)
+
+        refs = [
+            ref
+            for slot in ("image_reference", "video_reference", "audio_reference")
+            for ref in getattr(req.params, slot, None) or []
+        ]
+        if len(refs) != len(payloads):
+            # zip() would silently leave the tail of either side behind, and
+            # clearing ref_sizes below would erase the evidence.
+            raise ValueError(f"expected {len(refs)} reference payloads, got {len(payloads)}.")
+        for ref, payload in zip(refs, payloads):
+            ref.content = payload
+        req.ref_sizes = None
         return req
 
     def serve_forever(self):
