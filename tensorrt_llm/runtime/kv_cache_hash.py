@@ -46,11 +46,28 @@ def truncate_sha256_hash_to_int64(block_hash: bytes) -> int:
 
 
 def get_cache_salt_id(cache_salt: str) -> int:
-    """Return the cache salt id used by request handling and cache-aware routing."""
-    from blake3 import blake3
+    """Derive the salt id that keys the KV cache reuse namespace.
 
-    h = blake3(cache_salt.encode("utf-8")).digest(length=8)
-    return int.from_bytes(h, "little", signed=False)
+    Single source of truth shared by the engine and the KV-cache-aware router:
+    ``KVCacheManagerV2._derive_reuse_salt`` uses it to build the
+    ``ReuseScope.salt`` that seeds the radix-tree root (and therefore every
+    block hash the worker publishes in KV cache events), and the serve-layer
+    router uses it to recompute those hashes for prefix matching. The two
+    derivations MUST stay byte-identical or salted requests silently score
+    zero cache hits on every worker (the block-match walk breaks on the first
+    mismatching block).
+
+    Note: the V1 C++ ``BlockKeyHasher`` (cpp/tensorrt_llm/batch_manager/
+    blockKey.cpp) does not use this id; it mixes
+    ``std::hash<std::string>(cacheSalt)`` directly into the root block hash,
+    which is standard-library-implementation-defined and not reproducible
+    here. Router-computed v1 hashes for salted requests therefore only match
+    workers running KV cache manager V2.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
 
 
 def hash_v1_block_key(
