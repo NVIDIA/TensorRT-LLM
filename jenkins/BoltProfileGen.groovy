@@ -513,7 +513,8 @@ def pollSlurm(pipeline, remote, String jobId, String label)
 // Auth: the urm-artifactory-creds Jenkins credential (username/password),
 // injected by withCredentials (masked in the console) and written to a mode-600
 // netrc via `printf` (a shell builtin, so no `ps` exposure) with curl reading
-// --netrc-file (creds never on curl's argv); the netrc is removed after.
+// --netrc-file (creds never on curl's argv); the netrc is removed on exit,
+// including when the upload fails.
 //
 // Values are Groovy-interpolated into the script before bashWrappedRemoteCmd
 // wraps it (so the credential never appears as a shell variable). Assumes the
@@ -530,11 +531,16 @@ def promoteBundle(pipeline, remote, String bundle)
             usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
         def promote = """
             set -e
+            # Clean up via trap, not a trailing rm: under `set -e` a failed curl
+            # exits before the rm and would leave the plaintext netrc on shared
+            # scratch until the 7-day retention purge. umask covers the window
+            # between creation and chmod, when it would otherwise be readable.
+            umask 077
+            trap 'rm -f "${netrc}"' EXIT
             printf 'machine ${host} login ${env.ART_USER} password ${env.ART_PASS}\\n' > ${netrc}
             chmod 600 ${netrc}
             curl -fsS --netrc-file ${netrc} --retry 5 --retry-all-errors -T ${bundle} ${base}/${bundleName}
             curl -fsS --netrc-file ${netrc} --retry 5 --retry-all-errors -T ${bundle} ${base}/latest.tar.gz
-            rm -f ${netrc}
         """.stripIndent()
         Utils.exec(pipeline, timeout: false, numRetries: 2,
             script: Utils.sshUserCmd(remote, b64BashRemoteCmd(promote)))
