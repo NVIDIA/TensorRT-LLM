@@ -37,12 +37,7 @@ from utils.util import check_accuracy
 
 import tensorrt_llm._torch.models.modeling_kimi_linear as modeling_kimi_linear
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_kimi_linear import (
-    _K3_MOE_EP_ENV,
-    _K3_MOE_TP_ENV,
-    KimiK3MoEGate,
-    KimiK3MoERuntime,
-)
+from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate, KimiK3MoERuntime
 from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
     _MEGA_MOE_SYMM_BUFFER_CACHE,
@@ -475,27 +470,18 @@ def test_mapping_records_moe_tp_ep_user_specified():
     assert ep.moe_tp_size == 1 and ep.moe_ep_size == 8
 
 
-def test_kimi_k3_moe_split_selection(monkeypatch):
-    monkeypatch.delenv(_K3_MOE_TP_ENV, raising=False)
-    monkeypatch.delenv(_K3_MOE_EP_ENV, raising=False)
-
+def test_kimi_k3_moe_split_selection() -> None:
     # Auto mapping default stays EP-only (the historical K3 layout), even
     # though the resolved mapping says moe_tp=8.
     auto = Mapping(world_size=8, tp_size=8)
     assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (1, 8)
 
-    # Explicit pure-TP and hybrid requests are honored.
+    # Explicit pure-TP and hybrid requests are honored. The MoE split is only
+    # ever set through the config; there is no env override.
     tp = Mapping(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1)
     assert KimiK3MoERuntime._select_moe_tp_ep(tp) == (8, 1)
     tep = Mapping(world_size=8, tp_size=8, moe_tp_size=4, moe_ep_size=2)
     assert KimiK3MoERuntime._select_moe_tp_ep(tep) == (4, 2)
-
-    # Env override wins; a single side derives the other from tp_size.
-    monkeypatch.setenv(_K3_MOE_TP_ENV, "4")
-    assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (4, 2)
-    monkeypatch.delenv(_K3_MOE_TP_ENV)
-    monkeypatch.setenv(_K3_MOE_EP_ENV, "2")
-    assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (4, 2)
 
 
 @pytest.mark.parametrize("backend", ["CUTLASS", "TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"])
@@ -1746,3 +1732,203 @@ def test_fp8_placeholder_fill_contract():
     single.load_checkpoint_pair([pairs[0]])
     ref = FP8Linear.from_checkpoint_fp8(pairs[0][0], pairs[0][1], outs[0])
     assert _bitwise_equal(single.weight, ref.weight)
+
+
+def test_megamoe_streamed_coverage_survives_per_expert_drain() -> None:
+    """MegaMoE's coverage check must not be defeated by draining the stashes.
+
+    ``finalize_streamed_expert`` drains each slot's staged w3_w1 halves as soon
+    as it lands, so the second copy of the routed-expert weights stays bounded
+    by the experts in flight. That is what makes EP8 fit: at EP16 the unbounded
+    staging survived on 56 rank-local experts, at EP8 it is 112 and the DEP8
+    disagg gen worker OOM'd inside setup_engine with the whole card free
+    beforehand.
+
+    The drain was previously blocked because ``_streamed_coverage`` decided
+    which slots a load had populated by COUNTING staged dict entries -- so
+    draining would report 0/N and turn a complete load into a spurious
+    "partially covered" error. This asserts the two are now disentangled:
+    coverage comes from ``_streamed_expert_slots`` for a streamed load, which
+    records the same fact and survives draining.
+
+    Pure bookkeeping, so it needs no GPU and no EP rendezvous.
+    """
+    from tensorrt_llm._torch.modules.fused_moe.quantization import NVFP4MegaMoECuteDslMethod
+
+    n_slots = 4
+    method = NVFP4MegaMoECuteDslMethod.__new__(NVFP4MegaMoECuteDslMethod)
+
+    def _fake_module() -> SimpleNamespace:
+        m = SimpleNamespace()
+        m.w3_w1_weight = SimpleNamespace(data=torch.zeros(n_slots, 8, 4, dtype=torch.uint8))
+        m.w3_w1_weight_scale = SimpleNamespace(data=torch.zeros(n_slots, 8, 4, dtype=torch.uint8))
+        m.w2_weight = SimpleNamespace(data=torch.zeros(n_slots, 4, 4, dtype=torch.uint8))
+        m.w2_weight_scale = SimpleNamespace(data=torch.zeros(n_slots, 4, 4, dtype=torch.uint8))
+        # w2 is written through directly; its coverage is row-pointer based and
+        # is unaffected by this change. Mark every row covered.
+        m._streamed_w2_covered = {m.w2_weight.data[i].data_ptr() for i in range(n_slots)}
+        m._streamed_w2_scale_covered = {
+            m.w2_weight_scale.data[i].data_ptr() for i in range(n_slots)
+        }
+        return m
+
+    # ---- streamed load, stashes fully drained: must report FULL coverage.
+    drained = _fake_module()
+    drained.tmp_cutlass_w3_w1_weights = {}
+    drained.tmp_cutlass_w3_w1_weight_scales = {}
+    drained._streamed_expert_slots = set(range(n_slots))
+    cov = method._streamed_coverage(drained)
+    assert cov == {
+        "w3_w1_weight": n_slots,
+        "w3_w1_weight_scale": n_slots,
+        "w2_weight": n_slots,
+        "w2_weight_scale": n_slots,
+    }, f"drained streamed load must read as fully covered, got {cov}"
+
+    # ---- a genuinely partial streamed load must still read as partial, so the
+    # drain does not turn the check into a rubber stamp.
+    partial = _fake_module()
+    partial.tmp_cutlass_w3_w1_weights = {}
+    partial.tmp_cutlass_w3_w1_weight_scales = {}
+    partial._streamed_expert_slots = {0, 1}
+    cov = method._streamed_coverage(partial)
+    assert cov["w3_w1_weight"] == 2 and cov["w3_w1_weight_scale"] == 2, cov
+
+    # ---- whole-checkpoint load (never streams, never drains): the stash count
+    # is still the source of truth, and a half-staged entry still does not count.
+    whole = _fake_module()
+    whole._streamed_expert_slots = set()
+    wbase = whole.w3_w1_weight.data.storage().data_ptr()
+    sbase = whole.w3_w1_weight_scale.data.storage().data_ptr()
+    whole.tmp_cutlass_w3_w1_weights = {
+        (wbase, i): {"w1": 1, "w3": 1, "dst": None} for i in range(n_slots)
+    }
+    whole.tmp_cutlass_w3_w1_weight_scales = {
+        (sbase, i): {"w1": 1, "w3": 1, "dst": None} for i in range(n_slots - 1)
+    }
+    whole.tmp_cutlass_w3_w1_weight_scales[(sbase, n_slots - 1)] = {"w1": 1, "dst": None}
+    cov = method._streamed_coverage(whole)
+    assert cov["w3_w1_weight"] == n_slots, cov
+    assert cov["w3_w1_weight_scale"] == n_slots - 1, (
+        "a stash entry missing its w3 half must not count as covered",
+        cov,
+    )
+
+
+def test_megamoe_overrides_finalize_streamed_expert() -> None:
+    """MegaMoE must actually drain, and must not interleave when it does.
+
+    Two things a reader could get wrong by copying the Cutlass sibling: it is a
+    SIBLING, not a parent, so nothing is inherited; and its scale resolver must
+    NOT call block_scale_interleave -- MegaMoE's kernel does its own 16-atom
+    gate/up interleave and to_blocked swizzle in _build_mega_format_weights, so
+    interleaving here would apply it twice.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+        NVFP4CutlassFusedMoEMethod,
+        NVFP4FusedMoEMethod,
+    )
+    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+        NVFP4MegaMoECuteDslMethod as MegaMoE,
+    )
+
+    assert not issubclass(MegaMoE, NVFP4CutlassFusedMoEMethod), (
+        "MegaMoE is a sibling of the Cutlass method, not a child; if this ever "
+        "changes, re-check which staging behaviour it inherits"
+    )
+    assert issubclass(MegaMoE, NVFP4FusedMoEMethod)
+    assert "_finalize_staged_w3_w1_expert" in NVFP4FusedMoEMethod.__dict__
+
+    for name in (
+        "finalize_streamed_expert",
+        "_resolve_staged_w3_w1_weight",
+        "_resolve_staged_w3_w1_weight_scale",
+    ):
+        assert name in MegaMoE.__dict__, f"MegaMoE must define its own {name}"
+
+    for method in (NVFP4CutlassFusedMoEMethod, MegaMoE):
+        finalize_src = inspect.getsource(method.finalize_streamed_expert)
+        assert "self._finalize_staged_w3_w1_expert" in finalize_src, (
+            f"{method.__name__} must delegate staged draining to the shared helper"
+        )
+
+    scale_src = inspect.getsource(MegaMoE._resolve_staged_w3_w1_weight_scale)
+    assert "_interleave_w3_w1_weight_scale" not in scale_src, (
+        "MegaMoE's scale resolver must not interleave; the kernel does that itself"
+    )
+    # The Cutlass sibling's does, which is what makes the distinction load-bearing.
+    assert "_interleave_w3_w1_weight_scale" in inspect.getsource(
+        NVFP4CutlassFusedMoEMethod._resolve_staged_w3_w1_weight_scale
+    )
+
+
+@nvfp4_moe_supported
+def test_mega_format_transform_is_slot_blockwise() -> None:
+    """Chunking the MegaMoE-format transform must be exactly equivalent.
+
+    ``_build_mega_format_weights`` runs the transform in slot chunks so its
+    transient stays bounded: the transform materializes several contiguous
+    copies of whatever it is handed, and at EP8 a whole layer's routed weights
+    made that peak overflow the card (job 489557 asked for 1.15 GiB with ~50
+    MiB free). Chunking only helps if slot i's output depends on slot i's input
+    and nothing else.
+
+    That property is asserted here BITWISE rather than argued from the code,
+    because the transform's 16-atom gate/up interleave is exactly the kind of
+    layout operation whose errors are silent -- shapes stay right, values go
+    wrong, and only an accuracy run notices.
+
+    Includes an uneven final chunk (a prime slot count against the chunk size),
+    which is the case a divisible-only test would miss.
+    """
+    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+        NVFP4MegaMoECuteDslMethod as MegaMoE,
+    )
+
+    method = MegaMoE.__new__(MegaMoE)
+
+    hidden, intermediate = 256, 64
+    expand_intermediate = 2 * intermediate
+    num_slots = 7  # deliberately not a multiple of the chunk size below
+    h_bytes = hidden // 2
+
+    torch.manual_seed(31)
+    raw_w3_w1 = torch.randint(
+        0, 255, (num_slots, expand_intermediate, h_bytes), dtype=torch.uint8, device="cuda"
+    )
+    raw_w2 = torch.randint(
+        0, 255, (num_slots, hidden, intermediate // 2), dtype=torch.uint8, device="cuda"
+    )
+    raw_w3_w1_sf = torch.randint(
+        0, 255, (num_slots, expand_intermediate, hidden // 16), dtype=torch.uint8, device="cuda"
+    )
+    raw_w2_sf = torch.randint(
+        0, 255, (num_slots, hidden, intermediate // 16), dtype=torch.uint8, device="cuda"
+    )
+
+    def _run(lo: int, hi: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return method._build_mega_format_buffers(
+            raw_w3_w1=raw_w3_w1[lo:hi],
+            raw_w3_w1_sf=raw_w3_w1_sf[lo:hi],
+            raw_w2=raw_w2[lo:hi],
+            raw_w2_sf=raw_w2_sf[lo:hi],
+            num_slots=hi - lo,
+            intermediate=intermediate,
+            hidden=hidden,
+            expand_intermediate=expand_intermediate,
+        )
+
+    whole = _run(0, num_slots)
+
+    for chunk in (1, 3, 16):  # 16 > num_slots: the single-call degenerate case
+        pieces = [_run(lo, min(lo + chunk, num_slots)) for lo in range(0, num_slots, chunk)]
+        for i, name in enumerate(("mega_fc1", "mega_fc1_sf", "mega_fc2", "mega_fc2_sf")):
+            stitched = torch.cat([p[i] for p in pieces], dim=0)
+            assert stitched.shape == whole[i].shape, (
+                f"chunk={chunk} {name}: {stitched.shape} vs {whole[i].shape}"
+            )
+            assert _bitwise_equal(stitched, whole[i]), (
+                f"chunk={chunk} {name} differs from the whole-layer transform"
+            )
