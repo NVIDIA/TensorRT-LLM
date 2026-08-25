@@ -26,20 +26,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.modules.linear import (
-    FP8BlockScalesLinearMethod,
-    Linear,
-    NVFP4LinearMethod,
-    TensorParallelMode,
-)
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.utils import (
-    Fp4QuantizedTensor,
-    Fp8BlockScalesQuantizedTensor,
-    gelu_tanh,
-    maybe_compile,
-)
+from tensorrt_llm._torch.utils import gelu_tanh, maybe_compile
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     Attention2DAttention,
     RingAttention,
@@ -50,7 +40,6 @@ from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
-from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
@@ -73,19 +62,6 @@ _NON_SERIALIZED_QUANT_PARAM_NAMES = (
     "inv_kv_scales",
 )
 
-_ULYSSES_DYNAMIC_QUANT_BF16_PATTERNS = (
-    "txt_in",
-    "transformer_blocks.*.txt_mod.*",
-    "transformer_blocks.*.txt_mlp.*",
-    "transformer_blocks.*.attn.add_q_proj",
-    "transformer_blocks.*.attn.add_k_proj",
-    "transformer_blocks.*.attn.add_v_proj",
-    "transformer_blocks.*.attn.to_add_out",
-    "transformer_blocks.*.attn.to_q",
-    "transformer_blocks.*.attn.to_k",
-    "transformer_blocks.*.attn.to_v",
-    "transformer_blocks.*.img_mlp.*",
-)
 
 def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     remapped = {}
@@ -536,12 +512,6 @@ class QwenJointAttention(Attention):
             self.attn_backend, self.attn
         )
         self._uses_sequence_parallel_attention = _is_qwen_sequence_parallel_attention(self.attn)
-        self._packed_image_fp8_qkv: Optional[
-            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
-        ] = None
-        self._packed_text_fp8_qkv: Optional[
-            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
-        ] = None
 
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
 
@@ -609,174 +579,6 @@ class QwenJointAttention(Attention):
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
         return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
 
-    @staticmethod
-    def _can_share_dynamic_nvfp4_qkv(input: torch.Tensor, *projections: Linear) -> bool:
-        if isinstance(input, Fp4QuantizedTensor):
-            return True
-        if not isinstance(input, torch.Tensor):
-            return False
-        if input.dtype != torch.bfloat16:
-            return False
-        for projection in projections:
-            if not projection.has_nvfp4:
-                return False
-            if not projection.force_dynamic_quantization:
-                return False
-            if projection.pre_quant_scale is not None:
-                return False
-            if getattr(projection, "scaling_vector_size", None) is None:
-                return False
-            if getattr(projection, "weight_scale_2", None) is None:
-                return False
-        return True
-
-    @staticmethod
-    def _shared_dynamic_nvfp4_input(input: torch.Tensor, reference_projection: Linear):
-        if isinstance(input, Fp4QuantizedTensor):
-            return input
-        return NVFP4LinearMethod.quantize_dynamic_input(
-            input, reference_projection.scaling_vector_size
-        )
-
-    @staticmethod
-    def _can_share_fp8_block_scales_qkv(input: torch.Tensor, *projections: Linear) -> bool:
-        if isinstance(input, Fp8BlockScalesQuantizedTensor):
-            return True
-        if not isinstance(input, torch.Tensor):
-            return False
-        if input.dtype != torch.bfloat16 or not is_sm_100f():
-            return False
-        for projection in projections:
-            if not projection.has_fp8_block_scales:
-                return False
-            if projection.use_cute_dsl_blockscaling_mm:
-                return False
-            if projection.disable_deep_gemm:
-                return False
-        return True
-
-    @staticmethod
-    def _shared_fp8_block_scales_input(input: torch.Tensor):
-        if isinstance(input, Fp8BlockScalesQuantizedTensor):
-            return input
-        return FP8BlockScalesLinearMethod.quantize_deep_gemm_input(input)
-
-    @staticmethod
-    def _build_packed_fp8_qkv(
-        *projections: Linear,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
-        if len(projections) != 3:
-            return None
-        for projection in projections:
-            if not projection.has_fp8_block_scales:
-                return None
-            if projection.use_cute_dsl_blockscaling_mm:
-                return None
-            if projection.disable_deep_gemm:
-                return None
-            if projection.weight_scale.dim() != 2:
-                return None
-            if projection.weight.shape[0] != projection.out_features:
-                return None
-
-        first = projections[0]
-        for projection in projections[1:]:
-            if projection.weight.shape[1] != first.weight.shape[1]:
-                return None
-            if projection.weight_scale.shape[1] != first.weight_scale.shape[1]:
-                return None
-            if (projection.bias is None) != (first.bias is None):
-                return None
-
-        weight = torch.cat([projection.weight for projection in projections], dim=0)
-        scale_m = sum(projection.weight_scale.shape[0] for projection in projections)
-        scale_k = first.weight_scale.shape[1]
-        weight_scale_physical = torch.cat(
-            [projection.weight_scale.transpose(0, 1) for projection in projections],
-            dim=1,
-        ).contiguous()
-        weight_scale = torch.as_strided(
-            weight_scale_physical,
-            (scale_m, scale_k),
-            (1, scale_m),
-        )
-        bias = (
-            None
-            if first.bias is None
-            else torch.cat([projection.bias for projection in projections], dim=0)
-        )
-        return weight, weight_scale, bias
-
-    def cache_packed_projection_weights(self) -> None:
-        self._packed_image_fp8_qkv = self._build_packed_fp8_qkv(self.to_q, self.to_k, self.to_v)
-        self._packed_text_fp8_qkv = self._build_packed_fp8_qkv(
-            self.add_q_proj, self.add_k_proj, self.add_v_proj
-        )
-
-    def _packed_fp8_block_scales_qkv(
-        self,
-        input: torch.Tensor,
-        packed_qkv: Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        if packed_qkv is None:
-            return None
-        if isinstance(input, Fp8BlockScalesQuantizedTensor):
-            pass
-        elif not isinstance(input, torch.Tensor):
-            return None
-        elif input.dtype != torch.bfloat16 or not is_sm_100f():
-            return None
-        if not isinstance(input, Fp8BlockScalesQuantizedTensor):
-            input = self._shared_fp8_block_scales_input(input)
-
-        weight, weight_scale, bias = packed_qkv
-        original_shape = input.original_shape
-        qkv = torch.ops.trtllm.fp8_prequantized_gemm(
-            input.fp8_tensor,
-            input.scaling_factor,
-            weight,
-            weight_scale,
-            output_dtype=torch.bfloat16,
-            disable_ue8m0_cast=True,
-        )
-        if bias is not None:
-            qkv = qkv + bias
-        if len(original_shape) > 2:
-            qkv = qkv.reshape(*original_shape[:-1], qkv.shape[-1])
-        return qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-
-    def _get_image_qkv(self, hidden_states: torch.Tensor):
-        packed_qkv = self._packed_fp8_block_scales_qkv(hidden_states, self._packed_image_fp8_qkv)
-        if packed_qkv is not None:
-            return packed_qkv
-        if self._can_share_dynamic_nvfp4_qkv(hidden_states, self.to_q, self.to_k, self.to_v):
-            hidden_states = self._shared_dynamic_nvfp4_input(hidden_states, self.to_q)
-        elif self._can_share_fp8_block_scales_qkv(hidden_states, self.to_q, self.to_k, self.to_v):
-            hidden_states = self._shared_fp8_block_scales_input(hidden_states)
-        return self.get_qkv(hidden_states)
-
-    def _get_text_qkv(self, encoder_hidden_states: torch.Tensor):
-        packed_qkv = self._packed_fp8_block_scales_qkv(
-            encoder_hidden_states, self._packed_text_fp8_qkv
-        )
-        if packed_qkv is not None:
-            return packed_qkv
-        if self._can_share_dynamic_nvfp4_qkv(
-            encoder_hidden_states, self.add_q_proj, self.add_k_proj, self.add_v_proj
-        ):
-            encoder_hidden_states = self._shared_dynamic_nvfp4_input(
-                encoder_hidden_states, self.add_q_proj
-            )
-        elif self._can_share_fp8_block_scales_qkv(
-            encoder_hidden_states, self.add_q_proj, self.add_k_proj, self.add_v_proj
-        ):
-            encoder_hidden_states = self._shared_fp8_block_scales_input(encoder_hidden_states)
-        return (
-            self.add_q_proj(encoder_hidden_states),
-            self.add_k_proj(encoder_hidden_states),
-            self.add_v_proj(encoder_hidden_states),
-        )
-
     def _use_fused_qk_norm_rope(
         self,
         hidden_states: torch.Tensor,
@@ -798,8 +600,10 @@ class QwenJointAttention(Attention):
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        img_q, img_k, img_v = self._get_image_qkv(hidden_states)
-        txt_q, txt_k, txt_v = self._get_text_qkv(encoder_hidden_states)
+        img_q, img_k, img_v = self.get_qkv(hidden_states)
+        txt_q = self.add_q_proj(encoder_hidden_states)
+        txt_k = self.add_k_proj(encoder_hidden_states)
+        txt_v = self.add_v_proj(encoder_hidden_states)
 
         txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
         img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
@@ -826,9 +630,11 @@ class QwenJointAttention(Attention):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Image QKV.
-        img_q, img_k, img_v = self._get_image_qkv(hidden_states)
+        img_q, img_k, img_v = self.get_qkv(hidden_states)
         # Text QKV.
-        txt_q, txt_k, txt_v = self._get_text_qkv(encoder_hidden_states)
+        txt_q = self.add_q_proj(encoder_hidden_states)
+        txt_k = self.add_k_proj(encoder_hidden_states)
+        txt_v = self.add_v_proj(encoder_hidden_states)
 
         # Reshape to (B, S, H, D).
         img_q = img_q.unflatten(-1, (self.local_num_attention_heads, -1))
@@ -1345,26 +1151,15 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
     def apply_quant_config_exclude_modules(self) -> None:
         quant_config = self.model_config.quant_config
-        if quant_config is None:
-            return
-
-        exclude_modules = list(quant_config.exclude_modules or [])
-        if self._keep_ulysses_dynamic_quant_modules_bf16(quant_config):
-            exclude_modules.extend(_ULYSSES_DYNAMIC_QUANT_BF16_PATTERNS)
-
-        if not exclude_modules:
+        if quant_config is None or quant_config.exclude_modules is None:
             return
 
         kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
         no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
-        exclusion_config = QuantConfig(
-            kv_cache_quant_algo=kv_cache_quant_algo,
-            exclude_modules=exclude_modules,
-        )
 
         for name, module in self.named_modules():
             if isinstance(module, Linear):
-                is_excluded = exclusion_config.is_module_excluded_from_quantization(name)
+                is_excluded = quant_config.is_module_excluded_from_quantization(name)
                 if is_excluded and getattr(module, "quant_config", None) is not None:
                     module.quant_config = no_quant_config
                     if getattr(module, "_weights_created", False):
@@ -1373,15 +1168,6 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                         module._parameters.clear()
                         module._buffers.clear()
                         module.create_weights()
-
-    def _keep_ulysses_dynamic_quant_modules_bf16(self, quant_config: QuantConfig) -> bool:
-        if not self.model_config.dynamic_weight_quant:
-            return False
-        vgm = self.model_config.visual_gen_mapping
-        if getattr(vgm, "ulysses_size", 1) <= 1:
-            return False
-        quant_mode = quant_config.layer_quant_mode
-        return quant_mode.has_nvfp4() or quant_mode.has_fp8_block_scales()
 
     def _non_serialized_quant_parameter_names(self) -> set[str]:
         """Return shared Linear parameters absent from ModelOpt checkpoints."""
@@ -1480,9 +1266,6 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                         f"weight_scale_shape={scale_shape}, "
                         f"weight_scale_dtype={scale_dtype}"
                     ) from exc
-        for module in self.modules():
-            if isinstance(module, QwenJointAttention):
-                module.cache_packed_projection_weights()
 
     def forward(
         self,

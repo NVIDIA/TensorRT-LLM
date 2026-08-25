@@ -3,7 +3,6 @@
 
 import contextlib
 import functools
-import math
 import os
 import threading
 from collections.abc import Callable
@@ -213,35 +212,10 @@ class Fp4QuantizedTensor:
     # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
     # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
     unquantized_hidden_states: Optional[torch.Tensor] = None
-    # Optional runtime activation scale for dynamic NVFP4. This is
-    # amax(input)/(FP8_MAX*E2M1_MAX), shared by projections that consume the
-    # same pre-quantized activation and combined with each layer's weight scale
-    # to produce that layer's GEMM alpha.
-    dynamic_alpha_scale: Optional[torch.Tensor] = None
 
     @property
     def shape(self):
         return self.fp4_tensor.shape
-
-
-@dataclass
-class Fp8BlockScalesQuantizedTensor:
-    """FP8_BLOCK_SCALES activation and its per-1x128 scaling factors."""
-
-    fp8_tensor: torch.Tensor
-    scaling_factor: torch.Tensor
-    original_shape: torch.Size
-
-    @property
-    def shape(self) -> torch.Size:
-        return self.original_shape
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.fp8_tensor.dtype
-
-    def numel(self) -> int:
-        return math.prod(self.original_shape)
 
 
 @dataclass
