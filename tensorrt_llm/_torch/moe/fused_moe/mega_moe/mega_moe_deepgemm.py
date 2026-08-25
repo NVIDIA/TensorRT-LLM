@@ -63,7 +63,110 @@ __all__ = ["MegaMoEDeepGemm"]
 # on the current TRT-LLM execution contract that MegaMoE layers run
 # serially within a forward pass; concurrent MegaMoE forwards sharing
 # a key would race on the same scratch buffers.
-_MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, object] = {}
+#
+# Keyed on buffer geometry only, never on the EP group's identity: a
+# worker process outlives the LLM built in it, so keying on the group
+# would mint a fresh key per LLM and stack a second allocation on top
+# of the first (and ``id()`` is recycled, so it can also alias a dead
+# group). Since the key no longer distinguishes groups, each entry
+# records the ProcessGroup it was allocated over and a hit is
+# re-validated against the caller's live group in
+# ``_take_cached_symm_buffer``. The group is recorded on this side of
+# the DeepGEMM boundary on purpose: relying on ``SymmBuffer.group``
+# would make correctness depend on DeepGEMM storing the passed group
+# verbatim, and a version bump that normalizes it would turn every hit
+# into a false stale -- freeing a buffer another layer already holds.
+# ``release_symm_buffer_cache`` bounds the lifetime.
+_MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, Tuple[object, object]] = {}
+
+
+def _free_symm_buffer(buffered: object) -> int:
+    """Release one DG SymmBuffer's symmetric memory. Returns its size in bytes.
+
+    ``SymmBuffer.destroy`` nulls only ``handle``/``buffer``/``group``/``x``/
+    ``x_sf``, leaving the other tensor views sliced out of the allocation
+    in place -- and any surviving view pins the whole thing. So sweep every
+    remaining tensor attribute too, otherwise this frees nothing whenever the
+    object is held by a reference cycle rather than dropped outright.
+
+    Tolerates an already-destroyed buffer (``buffer`` is ``None``) so a
+    double free degrades to a no-op instead of taking down the teardown path.
+    """
+    buffer = getattr(buffered, "buffer", None)
+    nbytes = buffer.nbytes if buffer is not None else 0
+    buffered.destroy()
+    for name, value in list(vars(buffered).items()):
+        if isinstance(value, torch.Tensor):
+            setattr(buffered, name, None)
+    return nbytes
+
+
+def _take_cached_symm_buffer(key: tuple, ep_pg: object) -> Optional[object]:
+    """Return the cached SymmBuffer for ``key`` if it was allocated over
+    ``ep_pg``; free and drop a geometry-equal entry from another group.
+
+    A geometry-equal entry recorded against a different (already destroyed)
+    EP group means an LLM was torn down without ``release_symm_buffer_cache``,
+    and its buffer's peer mappings are dead. Free it here so the driver can
+    reuse those pages for the caller's allocation -- symmetric memory is
+    outside the caching allocator, so this is the only way to get it back
+    within the process. Evict before freeing so a raising free cannot leave
+    a half-destroyed buffer behind for the next lookup.
+    """
+    entry = _MEGA_MOE_SYMM_BUFFER_CACHE.get(key)
+    if entry is None:
+        return None
+    cached, cached_pg = entry
+    if cached_pg is ep_pg:
+        return cached
+    del _MEGA_MOE_SYMM_BUFFER_CACHE[key]
+    freed = _free_symm_buffer(cached)
+    logger.info(
+        f"[MegaMoE] released stale DG SymmBuffer from a previous EP group: {freed / 2**30:.2f} GiB"
+    )
+    return None
+
+
+def release_symm_buffer_cache() -> None:
+    """Free every cached DG SymmBuffer. Call once per executor teardown.
+
+    The EP group these buffers were rendezvoused over is destroyed on
+    executor shutdown, so nothing may reuse them afterwards. They must be
+    dropped explicitly: the backing symmetric memory sits outside PyTorch's
+    caching allocator, so neither a GC nor ``torch.cuda.empty_cache()``
+    reclaims it, and a reused worker process would otherwise carry a full
+    activation workspace into the next LLM's memory budget.
+
+    Only the MPI worker path (``GenerationExecutorWorker.shutdown``) calls
+    this today. The Ray and RPC worker paths do not: their worker process
+    exits with the LLM, so the driver reclaims the memory at process exit.
+    Any path that starts reusing a worker process across LLMs must call this
+    on its teardown too.
+    """
+    if not _MEGA_MOE_SYMM_BUFFER_CACHE:
+        return
+    # Detach before freeing so a raising free cannot leave a half-destroyed
+    # buffer in the cache for a later lookup to trip over.
+    entries = list(_MEGA_MOE_SYMM_BUFFER_CACHE.values())
+    _MEGA_MOE_SYMM_BUFFER_CACHE.clear()
+    # Free one at a time and keep going on failure: the entries are already
+    # out of the cache, so any buffer skipped by a raising predecessor would
+    # be unreclaimable for the rest of the process lifetime.
+    released = 0
+    total_bytes = 0
+    for buffered, _ in entries:
+        try:
+            total_bytes += _free_symm_buffer(buffered)
+            released += 1
+        except Exception as e:
+            logger.error(
+                f"[MegaMoE] failed to release a DG SymmBuffer during executor "
+                f"teardown, continuing with the remaining buffers: {e}"
+            )
+    logger.info(
+        f"[MegaMoE] released {released}/{len(entries)} DG SymmBuffer(s): "
+        f"{total_bytes / 2**30:.2f} GiB"
+    )
 
 
 # ---- Fused MXFP8 per-token quant backends --------------------------------
@@ -564,7 +667,8 @@ class MegaMoEDeepGemm(MoEImplBase):
         capture would fail on the host-side IPC handle exchange.
 
         Buffers are shared across layers via ``_MEGA_MOE_SYMM_BUFFER_CACHE``
-        keyed on the (EP-PG, slot/expert/topk/shape/activation) tuple.
+        keyed on the (EP-size, slot/expert/topk/shape/activation) tuple; see
+        that cache's definition for why the key carries no group identity.
         Sharing is safe only while MegaMoE layer forwards are issued
         serially within a forward pass; concurrent MegaMoE forwards
         sharing a key would race on the same scratch buffers.
@@ -584,7 +688,7 @@ class MegaMoEDeepGemm(MoEImplBase):
         if self._symm_buffer is not None:
             return
         key = (
-            id(self._ep_pg),
+            self.ep_size,
             self.num_experts,
             self.num_slots,
             self.max_num_tokens,
@@ -593,7 +697,7 @@ class MegaMoEDeepGemm(MoEImplBase):
             self.intermediate_size,
             self.dg_activation,
         )
-        cached = _MEGA_MOE_SYMM_BUFFER_CACHE.get(key)
+        cached = _take_cached_symm_buffer(key, self._ep_pg)
         if cached is None:
             cached = self._dg.get_symm_buffer_for_mega_moe(
                 self._ep_pg,
@@ -606,7 +710,7 @@ class MegaMoEDeepGemm(MoEImplBase):
                 mma_type="fp8xfp4",
                 activation=self.dg_activation,
             )
-            _MEGA_MOE_SYMM_BUFFER_CACHE[key] = cached
+            _MEGA_MOE_SYMM_BUFFER_CACHE[key] = (cached, self._ep_pg)
             # Log only on the first layer; deeper layers reuse the cache
             # and would otherwise spam N copies of an identical line.
             log_fn = logger.info if self.layer_idx == 0 else logger.debug
