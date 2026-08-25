@@ -1,18 +1,21 @@
 # Disaggregated Serving
 
-- [Motivation](#Motivation)
-- [KV Cache Exchange](#KV-Cache-Exchange)
-  - [Multi-backend Support](#Multi-backend-Support)
-  - [NIXL Backend Configuration](#nixl-backend-configuration)
-  - [Overlap Optimization](#Overlap-Optimization)
-  - [Cache Layout Transformation](#Cache-Layout-Transformation)
-  - [Unique Global Request ID](#Unique-Global-Request-ID)
-- [Usage](#Usage)
-  - [Dynamo](#Dynamo)
+- [Motivation](#motivation)
+- [KV Cache Exchange](#kv-cache-exchange)
+  - [Multi-backend Support](#multi-backend-support)
+  - [Overlap Optimization](#overlap-optimization)
+  - [Cache Layout Transformation](#cache-layout-transformation)
+  - [Unique Global Request ID](#unique-global-request-id)
+- [Usage](#usage)
+  - [Dynamo](#dynamo)
   - [trtllm-serve](#trtllm-serve)
   - [Multiple Instances](#multiple-instances)
-- [Environment Variables](#Environment-Variables)
-- [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
+  - [Coordinator and Worker Fleet](#coordinator-and-worker-fleet)
+- [Environment Variables](#environment-variables)
+- [Troubleshooting and FAQ](#troubleshooting-and-faq)
+
+For the internals of the component that actually moves the KV blocks, see
+[Introduction to KV Cache Transmission](../developer-guide/kv-transfer.md).
 
 ## Motivation
 
@@ -47,7 +50,7 @@ You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more de
 
 ### Multi-backend Support
 
-In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache manager and the underlying communication libraries, as shown in Figure 3. The KV cache exchange module is responsible for efficient transmission and reception of the cache, promptly releasing cache space, and performing cache layout conversions during the exchange process. Currently, mainstream communication protocols—MPI, UCX, and NIXL—are all supported by TensorRT-LLM, and the underlying communication protocols utilize RDMA / NVLink. Currently, we recommend using UCX and NIXL backends, as we are adding a dynamic scaling mechanism on top of them—specifically, dynamic node joining and leaving. This allows customers to adjust the load based on traffic demands or switch roles between context and generation dynamically.
+In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache manager and the underlying communication libraries, as shown in Figure 3. The KV cache exchange module is responsible for efficient transmission and reception of the cache, promptly releasing cache space, and performing cache layout conversions during the exchange process. Use `backend: NIXL`. It transfers over RDMA / NVLink, and a dynamic scaling mechanism—specifically, dynamic node joining and leaving—is being built on top of it. This allows customers to adjust the load based on traffic demands or switch roles between context and generation dynamically.
 
 <div align="center">
 <figure>
@@ -55,18 +58,6 @@ In TensorRT-LLM, the KV cache exchange is modularly decoupled from the KV cache 
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. KV cache exchange architecture</em></sub></p>
-
-### NIXL Backend Configuration
-
-NIXL supports multiple underlying communication backends for KV cache exchange in disaggregated serving. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
-
-**Supported NIXL backends:**
-- **UCX** (default)
-- **LIBFABRIC** (available from v0.16.0)
-
-If an unsupported backend is specified, NIXL will automatically fall back to UCX.
-
-For detailed setup instructions and configuration examples, please refer to the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md).
 
 ### Overlap Optimization
 
@@ -90,7 +81,7 @@ To minimize KV cache transmission latency, TensorRT LLM currently uses direct tr
 </div>
 <p align="center"><sub><em>Figure 5. KV cache layout conversion</em></sub></p>
 
-The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
+The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#environment-variables).
 
 ### Unique Global Request ID
 
@@ -151,36 +142,40 @@ We use the `cache_transceiver_config` configuration to set up disaggregated serv
 
 ```yaml
 cache_transceiver_config:
-  backend: <str>
+  backend: NIXL
   max_tokens_in_buffer: <int>
+  kv_transfer_timeout_ms: <int>
+  kv_cache_bounce_size_mb: <int>
 ```
 
-`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`, `UCX`, `NIXL`, and `MPI`. The default backend is NIXL.
+`backend` selects the communication library used to transfer the KV cache. Set it to `NIXL`, which transfers over RDMA / NVLink. The field has no default — if it is left unset, the worker still starts, but it brings up no cache transceiver and rejects the disaggregated requests it is then routed. Set the same value on the context and the generation worker.
 
-Note: NIXL supports multiple underlying backends configured via the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable:
-- `UCX` (default)
-- `LIBFABRIC` (available from v0.16.0)
+`max_tokens_in_buffer` is best left unset. It bounds how many KV transfers a generation worker admits concurrently, and the built-in default is derived from the model's maximum sequence length, so a small hand-written value only throttles the transfer path.
 
-`max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
+`kv_transfer_timeout_ms` bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is `60000`.
+
+`kv_cache_bounce_size_mb` is `0` by default, which sends each KV block separately. Setting it to a positive size coalesces a request's blocks into one contiguous buffer of that many MiB per direction and issues a single NIXL write, which helps when a request's blocks are scattered. It requires fabric (MNNVL) memory.
 
 For example, you could launch two context servers and one generation server as follows:
 
-```
+```bash
 
 # Generate context_config.yml
-# Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: NIXL" > context_config.yml
 
 # Start Context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --config ./context_config.yml &> log_ctx_0 &
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --config ./context_config.yml &> log_ctx_1 &
 
 # Generate gen_config.yml
-echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_config.yml
+echo -e "cache_transceiver_config:\n  backend: NIXL" > gen_config.yml
 
 # Start Generation servers
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --config ./gen_config.yml &> log_gen_0 &
 ```
+
+Both workers must carry the same `cache_transceiver_config`; confirm each one brought the transceiver up with `grep "Using KvCacheTransceiverV2" log_ctx_0 log_gen_0`.
+
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
 and generation servers. The disaggregated server can be launched with:
@@ -222,7 +217,7 @@ curl http://localhost:8000/v1/completions \
 
 #### Launching disaggregated servers on SLURM clusters
 
-Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
+Please refer to [Disaggregated Inference Benchmark Scripts](source:examples/disaggregated/slurm).
 
 ### Multiple Instances
 
@@ -334,24 +329,9 @@ A fleet worker fails fast if its coordinator is unreachable: on startup it probe
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
-* `TRTLLM_NIXL_KVCACHE_BACKEND`: When using NIXL as the cache transceiver backend, this variable specifies the underlying communication backend for NIXL. Valid options are:
-  - `UCX` (default)
-  - `LIBFABRIC` (available from v0.16.0)
-  - If an unsupported value is specified, NIXL will automatically fall back to UCX
+* `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
-* `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, generationExecutor will not overlap KV cache transfer with model inference. The default value is `0`.
-
-* `TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL`:  When the generation rank receives KV cache from multiple context ranks within a single context instance, it will receive KV cache from each rank sequentially. If set to `1`, the generation rank will receive KV cache from each rank within one context instance in parallel. The default value is `0`.
-
-* `TRTLLM_REQUEST_KV_CACHE_CONCURRENT`: If set to `1`, generationExecutor prepares independent resources for each context executor to receive KV cache, requests whose KV cache are received from different context executors will be processed concurrently. If set to `0`, the generation executor will reuse the same resource to process KV cache transfer for each request sequentially, reducing the resources used by KV cache transmission and thereby lowering the risk of running out of memory. The default value is `0`.
-
-* `TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER`: TRT-LLM typically copies non-contiguous data into a temporary buffer before sending KV cache. If set to `1`, TRT-LLM will attempt to directly transmit each KV cache block, eliminating extra copies. The default value is `0`.
-
-* `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE`: By default, TRT-LLM uses a `stream-ordered memory allocator` to allocate temporary buffers. If this environment variable is set to #Size, TRT-LLM will use `cudaMalloc` to allocate buffer of size #Size for KV cache transmission. The default value is `512MB`. Users can set `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=1GB` to allocate a 1 GB buffer with `cudaMalloc` for KV cache transmission.
-
-* `TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER`: If set to `1`, TRT-LLM will use `cudaMallocAsync` to allocate buffers for KV cache transmission. The default value is `0`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
-
-* `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `1`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
+* `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
 
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
@@ -370,15 +350,7 @@ There are some other useful environment variables that may help when encounterin
 
 *Q. What are the limitations of disaggregated serving in TRT-LLM?*
 
-A. Currently, only decoder-only models and beam width of 1 are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
-
-*Q. When using the TRT backend, is the engine used for disaggregated serving different from other engines?*
-
-A. No. There are no special requirements for the arguments to build engine.
-
-*Q. When using the TRT backend, do the engines used by the context and generation instances need to be the same?*
-
-A. No. The engines used by context and generation instances can be different, and their parallelism can be heterogeneous, i.e., TP,PP can be different, and TRT-LLM will handle the heterogeneity of KV cache.
+A. Currently, only decoder-only models are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads. The context and generation instances may use different parallelism, that is, TP and PP can differ, and TRT-LLM will handle the heterogeneity of KV cache.
 
 *Q. Can a TRT-LLM server instance handle both context-only requests and generation-only requests?*
 
@@ -390,23 +362,25 @@ A. Yes, it's recommended that different server instances use different GPUs. We 
 
 ### Debugging FAQs
 
-*Q. Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?*
-
-A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
-
-1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
-2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
-
-Please see the [disaggregated serving examples documentation](../../../examples/disaggregated/README.md) for detailed installation and configuration instructions.
-
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 
-A. please set `backendType` of `CacheTransceiverConfig`.
-```cpp
-ExecutorConfig executorConfig{...};
+A. `cache_transceiver_config.backend` has no default, so leaving it unset disables the transceiver on that worker. Set it in the worker's `--config` file, on both the context and the generation worker:
 
-executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::DEFAULT));
+```yaml
+cache_transceiver_config:
+  backend: NIXL
 ```
+
+*Q. How do I confirm that a worker actually brought up the cache transceiver?*
+
+A. Each worker logs the outcome at INFO level, which `trtllm-serve` enables by default:
+
+```bash
+grep -E "Using KvCacheTransceiverV2|cache_transceiver is disabled" log_ctx_0 log_gen_0
+```
+
+Check the context and the generation worker separately, and configure the two together — nothing negotiates the transfer settings across workers, so a mismatch is not reported as a configuration error.
+
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
