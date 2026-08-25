@@ -716,9 +716,9 @@ class DecoderModelForCausalLM(nn.Module,
 
         This preference is intentionally kept out of the generic
         :meth:`get_model_defaults` deep-merge: it must not materialize a
-        ``cache_transceiver_config`` when disaggregated serving is disabled,
-        and it is only honored when the effective backend supports it (the
-        Python transceiver requires NIXL).
+        ``cache_transceiver_config`` when disaggregated serving is disabled.
+        Preferences are adopted only for the 'auto' setting; a 'PYTHON'
+        preference still requires NIXL when the transceiver is created.
         """
         return None
 
