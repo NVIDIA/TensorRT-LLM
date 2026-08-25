@@ -956,11 +956,77 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
     creator = object.__new__(KvCacheCreator)
     creator._kv_connector_manager = object() if has_connector else None
     creator._max_beam_width = max_beam_width
+    creator._cache_transceiver_config = None
 
     with pytest.raises(NotImplementedError, match=expected):
         creator._validate_or_fallback_kv_cache_manager_v2(
             MambaHybridCacheManagerV2, model_config, KvCacheConfig()
         )
+
+
+def _v2_gate_creator(cache_transceiver_config=None):
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 1
+    creator._cache_transceiver_config = cache_transceiver_config
+    return creator
+
+
+@pytest.mark.parametrize(
+    "transceiver_runtime",
+    [None, "CPP", "auto"],
+)
+def test_v2_rejects_cpp_cache_transceiver(transceiver_runtime):
+    """The C++ transceiver takes ``kv_cache_manager.impl`` and expects the
+    nanobind KVCacheManagerCpp, so a V2-pinned model must be rejected here
+    rather than in a nanobind constructor. "auto" counts as C++: paths that
+    skip _resolve_transceiver_runtime_auto leave the sentinel in place and
+    create_kv_cache_transceiver maps it to the C++ runtime."""
+    creator = _v2_gate_creator(
+        SimpleNamespace(backend="UCX", transceiver_runtime=transceiver_runtime)
+    )
+
+    with pytest.raises(NotImplementedError, match="disaggregated serving"):
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            MambaHybridCacheManagerV2, _hybrid_model_config(), KvCacheConfig()
+        )
+
+
+def test_v2_cpp_transceiver_message_points_at_the_python_runtime():
+    creator = _v2_gate_creator(SimpleNamespace(backend="UCX", transceiver_runtime="CPP"))
+
+    with pytest.raises(NotImplementedError) as excinfo:
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            MambaHybridCacheManagerV2, _hybrid_model_config(), KvCacheConfig()
+        )
+
+    assert "transceiver_runtime='PYTHON'" in str(excinfo.value)
+
+
+def test_v2_allows_the_python_cache_transceiver():
+    """KvCacheTransceiverV2 takes the manager object, not ``.impl``, so the
+    Python runtime is not gated."""
+    creator = _v2_gate_creator(SimpleNamespace(backend="NIXL", transceiver_runtime="PYTHON"))
+
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            MambaHybridCacheManagerV2, _hybrid_model_config(), KvCacheConfig()
+        )
+        is MambaHybridCacheManagerV2
+    )
+
+
+def test_v2_allows_a_disabled_cache_transceiver():
+    """``backend is None`` means disagg was never enabled; the model preference
+    must not materialize a transceiver config the user did not ask for."""
+    creator = _v2_gate_creator(SimpleNamespace(backend=None, transceiver_runtime=None))
+
+    assert (
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            MambaHybridCacheManagerV2, _hybrid_model_config(), KvCacheConfig()
+        )
+        is MambaHybridCacheManagerV2
+    )
 
 
 def _make_mgr(

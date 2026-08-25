@@ -515,3 +515,34 @@ zai-org/GLM-5.2:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 90
+# Step-3.7-Flash text decoder (MoE) GSM8K, full 1319-sample split, TP4/EP4 with
+# TRTLLM attention + MoE backends. FP8 measured on the FP8 block-scale
+# checkpoint; NVFP4 measured on the modelopt NVFP4 export (FP8 KV cache). MTP
+# (mtp_nextn=3) is lossless for both FP8 and NVFP4 and reuses the non-spec
+# baseline accuracy.
+stepfun-ai/Step-3.7-Flash:
+  - accuracy: 88
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 88
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 88
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 88
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 88
+# Inkling NVFP4 (thinkingmachines/Inkling-NVFP4): RoPE-free hybrid-attention
+# reasoning model, text-only path. Measured on the full 1319-item set at TP=4,
+# greedy, with CUDA graph and the overlap scheduler on. KV cache is unquantized
+# (the checkpoint sets kv_cache_quant_algo=none).
+thinkingmachines/Inkling-NVFP4:
+  - quant_algo: NVFP4
+    accuracy: 96.13
+# Inkling-Small NVFP4: smaller sibling of the above (42 layers / hidden 4096
+# against 66 / 6144). Full 1319-item set at TP=4, greedy.
+thinkingmachines/Inkling-Small-NVFP4:
+  - quant_algo: NVFP4
+    accuracy: 95.75

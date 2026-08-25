@@ -15,7 +15,10 @@
 import pytest
 
 from tensorrt_llm import LLM
-from tensorrt_llm.evaluate.post_processing import strip_thinking_and_extract_mmmu_answer
+from tensorrt_llm.evaluate.post_processing import (
+    strip_inkling_and_extract_mmmu_answer,
+    strip_thinking_and_extract_mmmu_answer,
+)
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
     KvCacheConfig,
@@ -583,6 +586,63 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
+
+
+class TestInkling_NVFP4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "thinkingmachines/Inkling-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/Inkling-NVFP4"
+    MAX_NUM_TOKENS = 16384
+
+    # Inkling is a long-CoT reasoning model: keep a large max_tokens so the
+    # chain-of-thought is not truncated, and truncate long MMMU prompts to the
+    # task's input budget.
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    # Reasoning output: keep Inkling's typed-content markers, route out
+    # <|content_thinking|>, and extract the final MMMU choice before scoring.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        post_process_fn=strip_inkling_and_extract_mmmu_answer,
+        keep_special_tokens=True,
+        preserve_caller_max_tokens=True,
+    )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(183000)
+    def test_nvfp4(self):
+        """NVFP4 accuracy on the MMMU vision benchmark (Blackwell, TP=4).
+
+        Exercises image attach + placeholder expansion + fusion. The reference
+        (references/mmmu.yaml) was taken with this TP size and KV fraction, so
+        the runtime configuration here has to match. TP=4 is also required to
+        fit the checkpoint on Blackwell at this KV fraction. Validation is on
+        aggregate accuracy, not per-item identity.
+        """
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=4,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
+class TestInkling_Small_NVFP4(TestInkling_NVFP4):
+    """MMMU accuracy for Inkling-Small; vision path inherited from TestInkling_NVFP4."""
+
+    MODEL_NAME = "thinkingmachines/Inkling-Small-NVFP4"
+    MODEL_PATH = f"{llm_models_root()}/Inkling-Small-NVFP4"
 
 
 class TestMistralSmall24B(LlmapiAccuracyTestHarness):

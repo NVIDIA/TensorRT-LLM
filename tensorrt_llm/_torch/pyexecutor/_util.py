@@ -51,8 +51,9 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
+                           is_hybrid_linear, is_inkling, is_kimi_linear, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid,
+                           reject_unsupported_inkling_kv_cache_features,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -101,10 +102,12 @@ def _get_initial_lora_data_type(
 
 
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
-    # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
-    # require KVCacheManagerV2 for per-layer buffer sizes.
+    # Per-layer head_dim / num_kv_heads needs V2's per-layer buffer sizes. The
+    # identity tests are a backstop against an explicit
+    # use_kv_cache_manager_v2=False: this runs before the model exists, so
+    # get_model_defaults cannot be the mechanism here.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
-                or is_gemma4_hybrid(config))
+                or is_gemma4_hybrid(config) or is_inkling(config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
@@ -619,6 +622,16 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
+        # Checked here because this is the one place that sees the resolved
+        # kv_cache_config -- model defaults already deep-merged with the user's.
+        reject_unsupported_inkling_kv_cache_features(
+            model_config.pretrained_config,
+            enable_block_reuse=kv_cache_config.enable_block_reuse,
+            enable_cache_transceiver=(self._cache_transceiver_config is not None
+                                      and self._cache_transceiver_config.backend
+                                      is not None),
+            periodic_snapshot_interval=(
+                kv_cache_config.mamba_state_config.periodic_snapshot_interval))
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,
@@ -658,6 +671,27 @@ class KvCacheCreator:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
+            # The C++ CacheTransceiver expects the nanobind KVCacheManagerCpp,
+            # but V2's ``.impl`` is the Python manager, so disagg would die in a
+            # nanobind constructor with an unrelated TypeError. Catch it here,
+            # where the message can name the unsupported combination.
+            #
+            # Scoped to the C++ runtime (KvCacheTransceiverV2 takes the manager
+            # object instead). ``transceiver_runtime`` may still be the
+            # unresolved "auto" sentinel, which maps to C++, so treat anything
+            # that is not an explicit "PYTHON" as C++.
+            if (self._cache_transceiver_config is not None
+                    and self._cache_transceiver_config.backend is not None
+                    and self._cache_transceiver_config.transceiver_runtime
+                    != "PYTHON"):
+                incompat.append(
+                    "disaggregated serving with the C++ cache transceiver "
+                    "(try cache_transceiver_config.transceiver_runtime="
+                    "'PYTHON' with backend='NIXL')")
+            if (sparse_attn_config is not None
+                    and sparse_attn_config.algorithm == "dsa"
+                    and self._mapping.cp_config.get("cp_type") == CpType.STAR):
+                incompat.append("STAR context parallelism")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Never silently replace a sparse V2 manager with V1. Some
@@ -678,6 +712,13 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
+                if is_inkling(config):
+                    # V1's unified pool would coerce the per-layer KV-head split
+                    # to one value and mis-size the pool.
+                    raise NotImplementedError(
+                        f"Inkling hybrid attention requires KVCacheManagerV2, "
+                        f"which is not yet supported with {incompat_str}. "
+                        f"Disable these features to run Inkling.")
                 if is_hybrid_linear(config):
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
@@ -807,6 +848,13 @@ class KvCacheCreator:
         # The MM encoder is profiled independently at its own token budget.
         requests = []
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
+        # When the input-embedding vocab is padded above the output head vocab
+        # (as in Inkling), ids in the gap fail the same token-range check real
+        # requests take, so bound the dummy range to the head.
+        lm_head = getattr(self._model_engine.model, "lm_head", None)
+        head_vocab = getattr(lm_head, "num_embeddings", None)
+        if head_vocab:
+            vocab_size = min(vocab_size, head_vocab)
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
 
@@ -2257,6 +2305,10 @@ def _create_kv_cache_manager(
     num_attention_heads = config.num_attention_heads
     num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
         config, 'num_key_value_heads', num_attention_heads)
+    if is_inkling(config):
+        # Local (sliding-window) layers carry more KV heads than global ones;
+        # head_dim is uniform, so only this list varies per layer.
+        num_key_value_heads = config.num_kv_heads_per_layer()
     if not isinstance(head_dim, int):
         head_dim = getattr(config, "head_dim", None)
     if not isinstance(head_dim, int):

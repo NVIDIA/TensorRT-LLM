@@ -26,9 +26,17 @@ def get_sparse_attn_kv_cache_manager(
 
     from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager, DSACacheManagerV2
+    from .inkling import InklingHybridCacheManager
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
     from .rocket import RocketKVCacheManager
 
+    if sparse_attention_config.algorithm == "inkling":
+        # Reached because Inkling populates `sparse_attention_config` (see
+        # `.inkling.params`), which makes `get_kv_cache_manager_cls` take its
+        # sparse branch before the `is_inkling` route in
+        # `_non_hybrid_kv_cache_manager_cls`. Without this entry that branch
+        # raises "Unsupported sparse attention algorithm" at engine startup.
+        return InklingHybridCacheManager
     if sparse_attention_config.algorithm == "rocket":
         return RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
@@ -85,8 +93,17 @@ def get_trtllm_sparse_attn_attention_backend(
 
     from .deepseek_v4 import DeepseekV4TrtllmAttention
     from .dsa import DSATrtllmAttention
+    from .inkling import InklingTritonAttention
     from .rocket import RocketTrtllmAttention
 
+    if sparse_params.algorithm == "inkling":
+        # Inkling is NOT a sparse-attention algorithm -- its attention is dense
+        # (full causal on global layers, a sliding window on local ones) with a
+        # learned relative-bias score_mod. It is dispatched here because this is
+        # where every model-specific backend is selected, and routing it through
+        # a branch in `get_attention_backend` instead left consumers that hold no
+        # ModelConfig resolving the family default. See `.inkling.params`.
+        return InklingTritonAttention
     if sparse_params.algorithm == "rocket":
         return RocketTrtllmAttention
     elif sparse_params.algorithm == "dsa":
