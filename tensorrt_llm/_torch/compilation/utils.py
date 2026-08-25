@@ -109,24 +109,11 @@ def inplace_info():
             3: "topk_idx_out",
             4: "topk_weights_out"
         },
-        torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell.default:
-        {
-            1: "output"
-        },
         torch.ops.trtllm.pp_recv_tensors.default: {
             1: "tensors"
         },
         torch.ops.trtllm.pp_send_tensors.default: {
             1: "tensors"
-        },
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell.default: {
-            1: "output"
-        },
-        torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell.default: {
-            1: "output"
-        },
-        torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell.default: {
-            1: "output"
         },
         torch.ops.trtllm.compressor_paged_kv_compress.default: {
             1: "paged_kv",
@@ -178,6 +165,23 @@ def inplace_info():
         }
     }
     optional_inplace_infos = {
+        # The cute_dsl_* ops are registered only under cute_dsl_custom_ops'
+        # ``if IS_CUTLASS_DSL_AVAILABLE:`` block, so they belong here: this runs
+        # for every torch.compile backend build with no cute-DSL opt-in, and
+        # naming them in the literal above raises AttributeError when the
+        # optional cutlass DSL is absent.
+        "cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell": {
+            1: "output"
+        },
+        "cute_dsl_fp8_bmm_blackwell": {
+            1: "output"
+        },
+        "cute_dsl_bf16_bmm_blackwell": {
+            1: "output"
+        },
+        "cute_dsl_bf16_gemm_blackwell": {
+            1: "output"
+        },
         "attn_custom_op_inplace": {
             1: "output",
             2: "output_sf"
