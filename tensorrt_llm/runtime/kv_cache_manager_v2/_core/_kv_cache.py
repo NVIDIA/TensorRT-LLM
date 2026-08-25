@@ -249,6 +249,7 @@ class _KVCache:
         "_enable_swa_scratch_reuse",
         "_text_only",
         "_scratch_slots",
+        "_enable_request_stats",
         "_pending_stats",
         "__rawref__",
     )
@@ -293,6 +294,7 @@ class _KVCache:
     _ssm_blocks: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]]
     _never_resumed: bool
     _enable_swa_scratch_reuse: bool
+    _enable_request_stats: bool
     # Scratch slots for SWA prefill memory reuse, per life cycle. These hold coalesced slots
     # whose sub-pages are reinterpreted as per-block storage for the currently executing layer.
     # Number of scratch blocks depends on diff between history_length and capacity.
@@ -310,6 +312,7 @@ class _KVCache:
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> None:
         # Keep a partially constructed cache inert if validation fails.
         self.__rawref__ = rawref.NULL
@@ -353,6 +356,7 @@ class _KVCache:
         self._scratch_slots = make_typed(
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
+        self._enable_request_stats = enable_request_stats
         self._pending_stats = _PendingStats()
         self._status = self.Status.SUSPENDED
         if reuse_match is not None:
@@ -414,20 +418,39 @@ class _KVCache:
     def num_blocks(self) -> int:
         return len(self._blocks)
 
-    def _should_record_stats(self) -> bool:
-        return self.manager._stats_enabled and not self.manager.is_stats_excluded(self.id)
+    def _stats_excluded(self) -> bool:
+        return self.manager.is_stats_excluded(self.id)
+
+    def _should_record_manager_stats(self) -> bool:
+        return self.manager._stats_enabled and not self._stats_excluded()
+
+    def _should_record_request_stats(self) -> bool:
+        # Manager stats historically also produced the request delta returned by
+        # commit_pending_stats(). Preserve that contract while allowing callers
+        # to opt in to request-only accounting through _enable_request_stats.
+        return (
+            self.manager._stats_enabled or self._enable_request_stats
+        ) and not self._stats_excluded()
 
     def commit_pending_stats(self) -> KVCacheStatsDelta:
-        if not self._should_record_stats():
+        record_manager_stats = self._should_record_manager_stats()
+        record_request_stats = self._should_record_request_stats()
+        if not (record_manager_stats or record_request_stats):
             self.discard_pending_stats()
             return KVCacheStatsDelta()
-        self.manager.commit_stats(
-            self._pending_stats.global_stats, self._pending_stats.iteration_stats_by_life_cycle
+        if record_manager_stats:
+            self.manager.commit_stats(
+                self._pending_stats.global_stats,
+                self._pending_stats.iteration_stats_by_life_cycle,
+            )
+            self.manager._commit_ssm_snapshot_iteration_stats(
+                self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
+            )
+        request_stats = (
+            self._pending_stats.request_stats.copy()
+            if record_request_stats
+            else KVCacheStatsDelta()
         )
-        self.manager._commit_ssm_snapshot_iteration_stats(
-            self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
-        )
-        request_stats = self._pending_stats.request_stats.copy()
         self._pending_stats.clear()
         self.manager.clear_stats_dirty(self.id)
         return request_stats
@@ -478,7 +501,9 @@ class _KVCache:
         excluded_ranges: TypedIndexList[LifeCycleId, HalfOpenRange[BlockOrdinal]],
         count_as_generation: bool,
     ) -> None:
-        if not self._should_record_stats() or block_begin >= block_end:
+        record_manager_stats = self._should_record_manager_stats()
+        record_request_stats = self._should_record_request_stats()
+        if not (record_manager_stats or record_request_stats) or block_begin >= block_end:
             return
         # V2 includes generation allocations in per-request alloc_total/new
         # metrics. This intentionally differs from the legacy V1 C++ manager,
@@ -495,6 +520,8 @@ class _KVCache:
                     beam_width=int(beam_width),
                     count_as_missed=not count_as_generation,
                     count_as_generation=count_as_generation,
+                    record_manager_stats=record_manager_stats,
+                    record_request_stats=record_request_stats,
                 )
         if changed:
             self.manager.mark_stats_dirty(self.id)
@@ -517,7 +544,7 @@ class _KVCache:
         # Every life cycle is reported, including SSM / recurrent ones: iteration
         # statistics are keyed by life cycle, so recurrent page movement stays
         # distinguishable from attention movement downstream.
-        if iteration_stats.empty or not self._should_record_stats():
+        if iteration_stats.empty or not self._should_record_manager_stats():
             return
         self.manager.commit_stats(KVCacheStatsDelta(), {life_cycle: iteration_stats})
 
@@ -528,7 +555,7 @@ class _KVCache:
         src_level: CacheLevel,
         dst_level: CacheLevel,
     ) -> None:
-        if not self._should_record_stats():
+        if not self._should_record_manager_stats():
             return
         assert len(pages) == len(slots)
         for page in pages:
@@ -565,12 +592,12 @@ class _KVCache:
         """Record host-tier LRU drops (pages released without onboarding back to GPU).
 
         Mirrors _record_migrated_slots in structure: per-life-cycle attribution,
-        gated on _should_record_stats(), per-page bytes computed from slot_size.
+        gated on manager statistics, per-page bytes computed from slot_size.
         cache_level is unused for now (we only have a 2-tier setup in practice;
         all last-level drops are host drops) but kept in the signature for future
         per-tier disambiguation.
         """
-        if not self._should_record_stats() or not pages:
+        if not self._should_record_manager_stats() or not pages:
             return
         for page in pages:
             pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
@@ -1389,13 +1416,19 @@ class _KVCache:
                     )
                 if lc_idx != ssm_lc_id:
                     life_cycle_key = self._stats_life_cycle_key(lc_idx)
-                    if life_cycle_key is not None and self._should_record_stats():
+                    record_manager_stats = self._should_record_manager_stats()
+                    record_request_stats = self._should_record_request_stats()
+                    if life_cycle_key is not None and (
+                        record_manager_stats or record_request_stats
+                    ):
                         changed = self._pending_stats.record_allocation_range(
                             life_cycle_key,
                             last_ordinal,
                             BlockOrdinal(last_ordinal + 1),
                             beam_width=1,
                             count_as_missed=not has_partial_reuse_source,
+                            record_manager_stats=record_manager_stats,
+                            record_request_stats=record_request_stats,
                         )
                         if changed:
                             self.manager.mark_stats_dirty(self.id)
@@ -2144,7 +2177,9 @@ class _KVCache:
 
         beam_idx = DEFAULT_BEAM_INDEX
 
-        should_record_stats = self._should_record_stats()
+        record_manager_stats = self._should_record_manager_stats()
+        record_request_stats = self._should_record_request_stats()
+        record_shared_stats = record_manager_stats or record_request_stats
         for lc_idx, lc in life_cycles.items():
             if lc_idx == ssm_lc_id:
                 continue  # SSM is handled separately below
@@ -2159,7 +2194,7 @@ class _KVCache:
                 # For partial blocks (last block, not full), we defer the copy to first resume().
                 # Just store the holder of the original committed page for now.
                 block[lc_idx] = holder
-                if should_record_stats and isinstance(lc, AttnLifeCycle):
+                if record_shared_stats and isinstance(lc, AttnLifeCycle):
                     if ordinal < full_reused_end:
                         full_reused_blocks += 1
                     elif (
@@ -2168,11 +2203,13 @@ class _KVCache:
                         and self._has_reuse_source(holder)
                     ):
                         partial_reused_blocks = 1
-            if should_record_stats and isinstance(lc, AttnLifeCycle):
+            if record_shared_stats and isinstance(lc, AttnLifeCycle):
                 changed = self._pending_stats.record_reuse(
                     lc_idx,
                     full_reused_blocks=full_reused_blocks,
                     partial_reused_blocks=partial_reused_blocks,
+                    record_manager_stats=record_manager_stats,
+                    record_request_stats=record_request_stats,
                 )
                 if changed:
                     self.manager.mark_stats_dirty(self.id)
@@ -2185,7 +2222,7 @@ class _KVCache:
             )
             snapshot_holder = snapshot_page.hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
-        if should_record_stats and ssm_lc_id is not None:
+        if record_manager_stats and ssm_lc_id is not None:
             changed = self._pending_stats.record_ssm_snapshot_lookup(
                 ssm_lc_id,
                 lookup_tokens=match.num_lookup_tokens,

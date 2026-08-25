@@ -1879,7 +1879,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             {
                 parent = nb::cast<EventManagerTestBlock&>(parentObject).block.get();
             }
-            auto block = kv::addOrGetExistingBlock(parent, std::move(tokens), knownNoDigest);
+            // addOrGetExistingBlock() may hand back a pre-existing block -- an exact-key
+            // match, or a longer sibling covering these tokens. This helper then installs
+            // pages into `storage` directly (bypassing replacePage()), which would clobber
+            // that block's existing back-pointers, so reject the case outright: a test
+            // asking for a block that already exists is a test bug.
+            bool blockIsNew = false;
+            auto block = kv::addOrGetExistingBlock(parent, std::move(tokens), knownNoDigest, &blockIsNew);
+            if (!blockIsNew)
+            {
+                throw std::invalid_argument("make_test_block: an equivalent block is already in the tree");
+            }
 
             kv::TypedVec<kv::LifeCycleId, kv::SlotCount> counts(manager.lifeCycles().size(), 0);
             for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
@@ -2208,7 +2218,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
-                std::optional<int> expectedPromptLength, std::optional<bool> textOnly)
+                std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
@@ -2216,7 +2226,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     nb::gil_scoped_release release;
                     return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
-                        expectedPromptLength, textOnly);
+                        expectedPromptLength, textOnly, enableRequestStats);
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
@@ -2232,13 +2242,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                             promptLen = static_cast<int>(view.size());
                         }
                         nb::gil_scoped_release release;
-                        return self->createKvCache(
-                            std::move(reuseScope), view, id, std::move(priorityCb), promptLen, textOnly);
+                        return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
+                            textOnly, enableRequestStats);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
-            nb::arg("text_only") = std::nullopt)
+            nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)

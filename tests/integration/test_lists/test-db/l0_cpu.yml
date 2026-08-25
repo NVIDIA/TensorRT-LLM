@@ -39,6 +39,7 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_utils.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
@@ -96,6 +97,7 @@ l0_cpu:
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_report_addr.py
+  - unittest/llmapi/test_session_prefetcher.py
   - unittest/llmapi/test_utils.py
   - unittest/metrics/test_collector.py
   - unittest/models/test_quant_config_utils.py

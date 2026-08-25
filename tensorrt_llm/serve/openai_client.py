@@ -374,6 +374,7 @@ class OpenAIHttpClient(OpenAIClient):
             last_token_time = start_time
             chunk_count = 0
             marker = f"event: {SSE_METRICS_EVENT}\n".encode()
+            event_delimiter = b"\n\n"
             pending = b""
             metrics_event = b""
             async for chunk in http_response.content.iter_any():
@@ -407,8 +408,9 @@ class OpenAIHttpClient(OpenAIClient):
                     metrics_event = pending[marker_index:]
                     pending = b""
                     continue
-                emit_size = len(pending) - len(marker) + 1
-                if emit_size > 0:
+                event_end = pending.rfind(event_delimiter)
+                if event_end >= 0:
+                    emit_size = event_end + len(event_delimiter)
                     yield pending[:emit_size]
                     pending = pending[emit_size:]
                 await asyncio.sleep(0)

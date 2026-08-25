@@ -1628,8 +1628,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     }
     auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
 
-    if (!isLastLevel(level))
-        TLLM_CHECK_DEBUG(persistentPages == nullptr);
+    TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
     // Shrink first.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
