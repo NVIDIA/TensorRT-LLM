@@ -1472,6 +1472,13 @@ class KVCacheManager(BaseResourceManager):
             # 1 bytes for 2 elements, and SFs (fp8) per 16 elements.
             mem_per_token = math.ceil(mem_per_token / 2) + math.ceil(
                 mem_per_token / 16)
+        elif (quant_config is not None
+              and quant_config.quant_mode.has_fp8_k_nvfp4_v_kv_cache()):
+            key_elements = head_dim
+            value_elements = head_dim
+            bytes_per_layer = (key_elements + math.ceil(value_elements / 2)
+                               + math.ceil(value_elements / 16))
+            mem_per_token = num_attention_layers * bytes_per_layer
         else:
             # All other cases (fp16/bf16 kv cache), we need 2 bytes per token for K and V.
             assert quant_config is None or (

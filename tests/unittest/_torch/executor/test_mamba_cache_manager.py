@@ -71,6 +71,7 @@ from tensorrt_llm.llmapi.llm_utils import (
     _resolve_transceiver_runtime_auto,
 )
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
@@ -1596,6 +1597,25 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
             is_draft=True,
         )
         assert draft_cost == (64 * rank, 0)
+
+
+def test_v2_hybrid_mixed_kv_estimator_accounts_for_fp8_k_nvfp4_v():
+    model_config = _hybrid_cache_sizing_model_config(
+        ["linear_attention", "full_attention"]
+    )
+    model_config.quant_config = QuantConfig(
+        kv_cache_quant_algo=QuantAlgo.FP8_K_NVFP4_V
+    )
+
+    cache_cost = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        model_config,
+        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        max_batch_size=1,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+    )
+
+    # Per attention layer: 16 FP8 K bytes + 8 packed V bytes + 1 V scale byte.
+    assert cache_cost == (25, 2400)
 
 
 @pytest.mark.parametrize(
