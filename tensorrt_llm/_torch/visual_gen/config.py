@@ -73,7 +73,7 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 
 
 def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
+    """Create model-scoped state shared by visual-gen attention layers."""
     return {"metadata_cache": {}}
 
 
@@ -623,7 +623,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             NVFP4LinearMethod.use_tunable_quantize = True
 
         attention_metadata_state = (
-            create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
+            create_attention_metadata_state()
+            if attention_cfg.backend in ("TRTLLM", "FLASHINFER")
+            else None
         )
 
         pipeline_config = cls(
