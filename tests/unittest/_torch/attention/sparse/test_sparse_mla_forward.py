@@ -1726,7 +1726,7 @@ def test_forward_sparse_mla_unified(batch_name, kv_cache_dtype: str,
         num_layers = 3  # Test multi-layer pool
         vocab_size = 129280
         compress_ratios = [1, 4, 128]
-        tokens_per_block = 256 if kv_cache_dtype == "fp8_ds_mla" else 128
+        tokens_per_block = 128
     else:
         raise ValueError(
             f"Invalid sparse attention algorithm: {sparse_attn_algo}")

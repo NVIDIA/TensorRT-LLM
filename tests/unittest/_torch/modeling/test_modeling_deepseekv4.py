@@ -179,7 +179,7 @@ def test_deepseek_v4_hopper_uses_fp8_ds_mla_defaults(monkeypatch) -> None:
     assert defaults == {
         "kv_cache_config": {
             "dtype": "fp8_ds_mla",
-            "tokens_per_block": 256,
+            "tokens_per_block": 128,
             "enable_swa_scratch_reuse": True,
         }
     }

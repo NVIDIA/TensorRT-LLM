@@ -2555,7 +2555,6 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         }
         if get_sm_version() == 90:
             kv_cache_defaults["dtype"] = "fp8_ds_mla"
-            kv_cache_defaults["tokens_per_block"] = 256
         elif llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
             kv_cache_defaults["tokens_per_block"] = 256
         return {"kv_cache_config": kv_cache_defaults}

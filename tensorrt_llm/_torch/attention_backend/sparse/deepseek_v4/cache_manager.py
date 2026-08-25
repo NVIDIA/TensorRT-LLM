@@ -312,15 +312,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
         self.use_fp8_ds_mla = kv_cache_config.dtype == "fp8_ds_mla"
-        if get_sm_version() == 90 and not self.use_fp8_ds_mla:
+        sm_version = get_sm_version()
+        if sm_version == 90 and not self.use_fp8_ds_mla:
             raise ValueError(
                 "DeepSeek-V4 on Hopper requires kv_cache_config.dtype='fp8_ds_mla'; "
                 f"got {kv_cache_config.dtype!r}."
             )
-        if self.use_fp8_ds_mla and tokens_per_block != 256:
+        if self.use_fp8_ds_mla and sm_version != 90 and tokens_per_block != 256:
             raise ValueError(
-                "DeepSeek-V4 fp8_ds_mla KV cache requires tokens_per_block=256, "
-                f"got {tokens_per_block}."
+                "DeepSeek-V4 fp8_ds_mla KV cache requires tokens_per_block=256 "
+                f"on SM{sm_version}, got {tokens_per_block}."
             )
 
         self.index_head_dim = sparse_attn_config.index_head_dim
