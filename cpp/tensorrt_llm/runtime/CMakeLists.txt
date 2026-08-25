@@ -77,8 +77,6 @@ set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
 
-target_link_libraries(runtime_src PUBLIC ${CUDA_NVML_LIB})
-
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 
 if(ENABLE_MULTI_DEVICE)
