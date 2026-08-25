@@ -1087,6 +1087,51 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return None, None
 
+    def forward_prepopulated_kv(
+        self,
+        q: torch.Tensor,
+        metadata: MiniMaxM3MsaSparseAttentionMetadata,
+        forward_args: "AttentionForwardArgs",
+    ) -> None:
+        """Run MSA after the horizontal producer inserted main K/V.
+
+        ``TrtllmAttention.forward`` interprets ``k=None`` as a packed fused-QKV
+        buffer, so it cannot represent compact Q with prewritten paged K/V.
+        Dispatch the same MSA paged-GQA helper directly; it already skips its
+        cache write when live K/V tensors are absent.
+        """
+        output = forward_args.output
+        if output is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.forward_prepopulated_kv requires an output buffer."
+            )
+
+        sparse_backend_args = forward_args.sparse_backend_args
+        kv_block_indexes = (
+            sparse_backend_args.topk_indices if sparse_backend_args is not None else None
+        )
+        if kv_block_indexes is not None:
+            plan = metadata.msa_decode_gqa_plan
+            if plan is None:
+                plan = metadata.msa_eager_gqa_plan
+        else:
+            plan = metadata.msa_decode_dense_plan
+            if plan is None:
+                plan = metadata.msa_eager_dense_plan
+
+        from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+
+        run_msa_paged_gqa(
+            self,
+            q,
+            None,
+            None,
+            metadata,
+            output,
+            kv_block_indexes=kv_block_indexes,
+            plan=plan,
+        )
+
 
 __all__ = [
     "MiniMaxM3MsaSparseAttention",

@@ -14,12 +14,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
 )
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
@@ -582,6 +584,53 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
     assert result.shape == (num_tokens, 1, 16)
     assert captured["head_major_output"] is expected_head_major
     assert captured["index_k_cache"] is metadata.idx_k_cache
+
+
+@pytest.mark.parametrize("is_sparse", [False, True], ids=["dense", "sparse"])
+@pytest.mark.parametrize("use_decode_plan", [False, True], ids=["eager", "decode"])
+def test_forward_prepopulated_kv_dispatches_compact_q_without_cache_rewrite(
+    monkeypatch,
+    is_sparse: bool,
+    use_decode_plan: bool,
+) -> None:
+    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
+
+    captured = {}
+
+    def fake_run_msa_paged_gqa(*args, **kwargs) -> None:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(msa_sparse_gqa, "run_msa_paged_gqa", fake_run_msa_paged_gqa)
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    q = torch.randn(3, 8)
+    output = torch.empty_like(q)
+    topk_indices = torch.zeros(3, 1, 16, dtype=torch.int32) if is_sparse else None
+    metadata = SimpleNamespace(
+        msa_decode_gqa_plan=("decode_sparse",) if use_decode_plan else None,
+        msa_eager_gqa_plan=("eager_sparse",),
+        msa_decode_dense_plan=("decode_dense",) if use_decode_plan else None,
+        msa_eager_dense_plan=("eager_dense",),
+    )
+    sparse_args = SparseBackendForwardArgs(topk_indices=topk_indices) if is_sparse else None
+
+    attention.forward_prepopulated_kv(
+        q,
+        metadata,
+        AttentionForwardArgs(output=output, sparse_backend_args=sparse_args),
+    )
+
+    args = captured["args"]
+    assert args[0] is attention
+    assert args[1] is q
+    assert args[2] is None
+    assert args[3] is None
+    assert args[4] is metadata
+    assert args[5] is output
+    assert captured["kwargs"]["kv_block_indexes"] is topk_indices
+    plan_kind = "sparse" if is_sparse else "dense"
+    plan_phase = "decode" if use_decode_plan else "eager"
+    assert captured["kwargs"]["plan"] == (f"{plan_phase}_{plan_kind}",)
 
 
 @pytest.mark.parametrize(

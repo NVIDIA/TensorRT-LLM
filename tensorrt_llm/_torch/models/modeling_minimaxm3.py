@@ -817,19 +817,78 @@ def _extract_minimax_m3_attention_extra_attrs(layer_idx: str):
     return metadata, attn_layer
 
 
+@torch.library.custom_op("trtllm::minimax_m3_qkv_index_proj", mutates_args=())
+def minimax_m3_qkv_index_proj(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+) -> torch.Tensor:
+    """Run the five-way projection as one CUDA-graph-capturable custom op."""
+    del position_ids  # Symbolic token-shape carrier; projection itself is position agnostic.
+    _, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    return attn_layer.qkv_proj(hidden_states)
+
+
+@minimax_m3_qkv_index_proj.register_fake
+def _minimax_m3_qkv_index_proj_fake(
+    hidden_states: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    layer_idx: str,
+) -> torch.Tensor:
+    """Preserve the symbolic token dimension across the opaque projection."""
+    _, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    qkv_proj = attn_layer.qkv_proj
+    if not isinstance(qkv_proj, MiniMaxM3QKVIndexerLinear):
+        raise RuntimeError(
+            "MiniMax-M3 fused QKV/index projection custom op requires "
+            f"MiniMaxM3QKVIndexerLinear, got {type(qkv_proj).__name__}."
+        )
+    # The real projection is token-major over ``hidden_states``. Keep that
+    # exact output contract here so generation CUDA-graph batch sizes can
+    # share Dynamo's dynamic-shape specialization. ``position_ids`` remains
+    # an explicit custom-op input to carry the unpadded token symbol into
+    # piecewise context segments; the attention output below uses that symbol.
+    return hidden_states.new_empty((hidden_states.shape[0], sum(qkv_proj.local_output_sizes)))
+
+
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
 def minimax_m3_attn_custom_op_inplace(
-    q: torch.Tensor,
+    q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
     idx_q: Optional[torch.Tensor],
     idx_k: Optional[torch.Tensor],
+    packed_qkv_index: Optional[torch.Tensor],
+    position_ids: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
 ) -> None:
-    """Run MiniMax-M3 cache and attention work behind a compile boundary."""
+    """Run MiniMax-M3 cache and attention work behind a compile boundary.
+
+    The horizontal producer needs live paged-cache tensors and cache-slot
+    metadata, which are intentionally resolved inside this opaque attention
+    boundary rather than traced through Dynamo.  Projection remains in the
+    captured segment; only the cache-writing producer and MSA attention stay
+    on the eager side of the existing piecewise boundary.
+    """
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     num_tokens = attn_metadata.num_tokens
+    if packed_qkv_index is not None:
+        horizontal = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+            packed_qkv_index[:num_tokens],
+            position_ids[..., :num_tokens] if position_ids is not None else None,
+            attn_metadata,
+        )
+        if horizontal is None:
+            raise RuntimeError(
+                "MiniMax-M3 fused horizontal producer is required inside the "
+                f"piecewise attention boundary for layer {layer_idx}, but its "
+                "runtime geometry or cache layout was unsupported."
+            )
+        q, idx_q = horizontal
+        k = v = idx_k = None
+    if q is None:
+        raise RuntimeError(f"MiniMax-M3 attention layer {layer_idx} received no query tensor.")
     attn_layer._dispatch_attention_backend(
         q[:num_tokens],
         k[:num_tokens] if k is not None else None,
@@ -1247,8 +1306,6 @@ class MiniMaxM3Attention(Attention):
             or not self._emit_fp8_main_qkv()
             or self.attn.indexer_kv_dtype != "fp8"
         ):
-            return None
-        if is_torch_compiling() or int(packed.shape[0]) != int(attn_metadata.num_tokens):
             return None
         if (
             packed.dtype != torch.bfloat16
@@ -1723,6 +1780,8 @@ class MiniMaxM3Attention(Attention):
                 v,
                 idx_q,
                 idx_k,
+                None,
+                None,
                 self.layer_idx_str,
                 output,
             )
@@ -1788,7 +1847,10 @@ class MiniMaxM3Attention(Attention):
             assert idx_q is None and idx_k is None
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
-        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        if k is None:
+            self.attn.forward_prepopulated_kv(q, attn_metadata, forward_args)
+        else:
+            self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
         return output
 
     def _sparse_forward(
@@ -1846,6 +1908,33 @@ class MiniMaxM3Attention(Attention):
         packed_qkv = None
         packed_idx_qk = None
         if self.enable_fused_qkv_index_projection:
+            if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
+                # Keep the projection in the captured segment while hiding
+                # its shape-specializing MXFP8 internals behind a symbolic
+                # fake implementation. Cache insertion and MSA remain in the
+                # existing eager attention boundary below.
+                packed = torch.ops.trtllm.minimax_m3_qkv_index_proj(
+                    hidden_states, position_ids, self.layer_idx_str
+                )
+                num_tokens = (
+                    position_ids.shape[-1] if position_ids is not None else hidden_states.shape[0]
+                )
+                output = packed.new_empty(
+                    (num_tokens, self.num_heads * self.head_dim),
+                    dtype=self.attn_activation_dtype,
+                )
+                maybe_bcg_minimax_m3_attn_custom_op_inplace(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    packed,
+                    position_ids,
+                    self.layer_idx_str,
+                    output,
+                )
+                return self.o_proj(output, all_reduce_params=all_reduce_params)
             packed = self.qkv_proj(hidden_states)
             horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
                 packed, position_ids, attn_metadata

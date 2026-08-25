@@ -31,6 +31,7 @@ from torch import nn
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
+import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -140,6 +141,160 @@ def test_eagle_capture_precedes_next_layer_norm() -> None:
     torch.testing.assert_close(captured_residual, torch.tensor([4.0]))
     torch.testing.assert_close(output, torch.tensor([15.0]))
     torch.testing.assert_close(output_residual, torch.tensor([24.0]))
+
+
+def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> None:
+    class FakeAttentionLayer:
+        def __init__(self) -> None:
+            self.producer_shapes = None
+
+        def _fused_fp8_qkv_indexer_norm_rope_kv_insert(self, packed, position_ids, attn_metadata):
+            self.producer_shapes = (
+                tuple(packed.shape),
+                tuple(position_ids.shape),
+                attn_metadata.num_tokens,
+            )
+            return packed[:, :3].clone(), packed[:, :1].clone()
+
+        def _dispatch_attention_backend(self, q, k, v, idx_q, idx_k, attn_metadata, output) -> None:
+            assert k is None and v is None and idx_k is None
+            assert idx_q.shape == (attn_metadata.num_tokens, 1)
+            output.copy_(q)
+
+    metadata = SimpleNamespace(num_tokens=2)
+    layer = FakeAttentionLayer()
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (metadata, layer),
+    )
+    packed = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+    position_ids = torch.arange(4, dtype=torch.int32).reshape(1, 4)
+    output = torch.full((4, 3), -1.0)
+
+    modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
+        None,
+        None,
+        None,
+        None,
+        None,
+        packed,
+        position_ids,
+        "3",
+        output,
+    )
+
+    assert layer.producer_shapes == ((2, 5), (1, 2), 2)
+    torch.testing.assert_close(output[:2], packed[:2, :3])
+    torch.testing.assert_close(output[2:], torch.full((2, 3), -1.0))
+
+
+def test_piecewise_projection_fake_preserves_padded_hidden_rows(monkeypatch) -> None:
+    projection = object.__new__(MiniMaxM3QKVIndexerLinear)
+    nn.Module.__init__(projection)
+    projection.local_output_sizes = (3, 4)
+    layer = SimpleNamespace(qkv_proj=projection)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (SimpleNamespace(), layer),
+    )
+    hidden_states = torch.randn(256, 5)
+    position_ids = torch.arange(6).reshape(1, 6)
+
+    packed = modeling_minimaxm3._minimax_m3_qkv_index_proj_fake(hidden_states, position_ids, "3")
+
+    # The real GEMM projects every padded hidden row. Position IDs remain an
+    # input solely to carry the unpadded token symbol to the piecewise segment.
+    assert packed.shape == (hidden_states.shape[0], 7)
+
+
+def test_piecewise_fused_projection_preserves_input_token_dimension(monkeypatch) -> None:
+    """Do not inherit a bucket-specialized token dimension from the GEMM output."""
+    packed = torch.randn(2, 7)
+    captured = {}
+
+    def fake_boundary(q, k, v, idx_q, idx_k, packed_arg, position_ids, layer_idx, output):
+        assert q is None and k is None and v is None
+        assert idx_q is None and idx_k is None
+        captured["packed"] = packed_arg
+        captured["position_ids"] = position_ids
+        captured["output_shape"] = tuple(output.shape)
+        output.zero_()
+
+    layer = SimpleNamespace(
+        enable_fused_qkv_index_projection=True,
+        qkv_proj=lambda hidden_states: packed,
+        register_to_config=True,
+        num_heads=1,
+        head_dim=3,
+        attn_activation_dtype=torch.float32,
+        layer_idx_str="3",
+        o_proj=lambda output, all_reduce_params: output,
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda layer_idx: (SimpleNamespace(), layer),
+    )
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "maybe_bcg_minimax_m3_attn_custom_op_inplace",
+        fake_boundary,
+    )
+    hidden_states = torch.randn(4, 5)
+    position_ids = torch.arange(6).reshape(1, 6)
+
+    result = MiniMaxM3Attention._sparse_forward(
+        layer,
+        position_ids=position_ids,
+        hidden_states=hidden_states,
+        attn_metadata=SimpleNamespace(),
+    )
+
+    assert captured["packed"] is packed
+    assert captured["position_ids"] is position_ids
+    assert captured["output_shape"] == (position_ids.shape[-1], 3)
+    assert result.shape == (position_ids.shape[-1], 3)
+
+
+def test_msa_attention_core_routes_compact_q_to_prewritten_kv_entrypoint() -> None:
+    selected_blocks = torch.zeros(2, 1, 16, dtype=torch.int32)
+
+    class FakeMsaBackend:
+        def __init__(self) -> None:
+            self.prepopulated_call = None
+
+        def run_indexer(self, idx_q, idx_k, metadata):
+            assert idx_k is None
+            assert metadata is attn_metadata
+            return selected_blocks
+
+        def forward_prepopulated_kv(self, q, metadata, forward_args) -> None:
+            self.prepopulated_call = (q, metadata, forward_args)
+
+        def forward(self, *unused_args, **unused_kwargs) -> None:
+            raise AssertionError("compact Q must not enter TrtllmAttention.forward")
+
+    layer = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    backend = FakeMsaBackend()
+    layer.attn = backend
+    layer.is_sparse_attention_layer = True
+    q = torch.randn(2, 8)
+    idx_q = torch.randn(2, 4)
+    attn_metadata = SimpleNamespace()
+    output = torch.empty_like(q)
+
+    result = layer._msa_attention_core(q, None, None, idx_q, None, attn_metadata, output)
+
+    assert result is output
+    assert backend.prepopulated_call is not None
+    called_q, called_metadata, forward_args = backend.prepopulated_call
+    assert called_q is q
+    assert called_metadata is attn_metadata
+    assert forward_args.output is output
+    assert forward_args.sparse_backend_args.topk_indices is selected_blocks
 
 
 def test_model_init_validates_sparse_attention_runtime_config() -> None:
