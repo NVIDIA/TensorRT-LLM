@@ -2176,6 +2176,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'wait_success_seconds': "",
                             ]
                         }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
+                        }
 
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
@@ -2246,6 +2249,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
                         } else {
                             additionalParameters['nspect_id'] = ""
+                        }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
                         }
                         launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {

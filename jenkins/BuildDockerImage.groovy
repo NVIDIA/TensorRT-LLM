@@ -867,6 +867,9 @@ pipeline {
                                 """
                             if (params.register_images) {
                                 cmd += "--add_version "
+                                if (params.release_type_id) {
+                                    cmd += "--release_type_id ${params.release_type_id} "
+                                }
                             }
                             if (params.osrb_ticket) {
                                 cmd += "--osrb_ticket ${params.osrb_ticket} "
