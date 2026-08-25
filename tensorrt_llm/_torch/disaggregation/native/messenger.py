@@ -88,6 +88,9 @@ class ZMQMessenger(MessengerInterface):
         self._socket = self._context.socket(self.SOCKET_MODES[mode])
         self._endpoint: Optional[str] = None
         self._lock = Lock()
+        # Serializes _socket sends. Deliberately NOT self._lock: stop() holds
+        # that across the listener join, and listener callbacks may send.
+        self._send_lock = Lock()
         self._closed = False
         self._stop_event = Event()
         self._listener_thread: Optional[Thread] = None
@@ -118,10 +121,20 @@ class ZMQMessenger(MessengerInterface):
         pass
 
     def send(self, messages: list[bytes], recipient: Optional[bytes] = None) -> None:
-        if recipient:
-            self._socket.send_multipart([recipient] + messages)
-        else:
-            self._socket.send_multipart(messages)
+        """Send one multipart message. Safe to call from any thread.
+
+        pyzmq sockets are not thread-safe: concurrent send_multipart() interleaves
+        frames, so peers decode misaligned payloads. Owning the serialization here
+        means no caller can get it wrong, from any thread.
+        """
+        frames = [recipient] + messages if recipient else messages
+        with self._send_lock:
+            # stop() closes the socket under this same lock, so a send racing
+            # shutdown becomes a defined no-op instead of a use-after-close.
+            if self._socket.closed:
+                logger.debug(f"ZMQMessenger({self._endpoint}) send after stop; dropping message")
+                return
+            self._socket.send_multipart(frames)
 
     def receive(self) -> list[bytes]:
         return self._socket.recv_multipart()
@@ -197,7 +210,11 @@ class ZMQMessenger(MessengerInterface):
                 if self._listener_thread.is_alive():
                     logger.warning("Listener thread did not terminate within timeout")
 
-            _close_socket(self._socket)
+            # Take _send_lock only after the join: a listener callback may be
+            # mid-send holding it (RankInfoServer replies from its callback),
+            # so acquiring it before the join would deadlock against join().
+            with self._send_lock:
+                _close_socket(self._socket)
             _close_socket(self._internal_socket)
             _close_socket(self._control_socket)
 

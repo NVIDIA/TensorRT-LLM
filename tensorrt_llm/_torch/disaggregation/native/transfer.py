@@ -314,8 +314,10 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}  # used by listener thread only (single-threaded path)
-        self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
+        # One DEALER pool shared by every thread. _dealers_lock guards only the
+        # lookup/create; ZMQMessenger.send() serializes the socket itself.
+        self._dealers: dict[str, ZMQMessenger] = {}
+        self._dealers_lock = threading.Lock()
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         self._pre_cancelled_rids: set[int] = set()
@@ -439,60 +441,30 @@ class Sender(SenderBase):
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         self._send_task_queues[thread_idx].put(write_meta)
 
-    def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
-        """Get or create a per-thread DEALER socket via threading.local().
-        Each worker thread gets its own cache so there is no cross-thread
-        access to the same ZMQ socket."""
-        if endpoint is None:
-            raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
-        dealers = getattr(self._thread_local, "dealers", None)
-        if dealers is None:
-            dealers = {}
-            self._thread_local.dealers = dealers
-        if endpoint not in dealers:
-            dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
-        return dealers[endpoint]
-
     def _process_task_queue(self, thread_idx: int):
         device_id = self._device_id
         torch.cuda.set_device(device_id)
         CUASSERT(cudart.cudaSetDevice(device_id))
 
         task_queue = self._send_task_queues[thread_idx]
-        try:
-            while True:
-                write_meta = task_queue.get()
-                if write_meta is None:
-                    break
-                try:
-                    if write_meta.meta_type == WriteMetaType.AUX:
-                        logger.debug(
-                            f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
-                        )
-                        self._deliver_aux_to_agent(write_meta)
-                    else:
-                        self._deliver_kv_to_agent(write_meta)
-                except Exception as e:
-                    logger.error(
-                        f"_process_task_queue[{thread_idx}]: unhandled exception for "
-                        f"unique_rid={write_meta.unique_rid}: {e}"
+        while True:
+            write_meta = task_queue.get()
+            if write_meta is None:
+                break
+            try:
+                if write_meta.meta_type == WriteMetaType.AUX:
+                    logger.debug(
+                        f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
                     )
-                    write_meta.task.fail(e)
-        finally:
-            # Clean up this thread's DEALER sockets. threading.local storage
-            # is only accessible from the owning thread, so shutdown must
-            # happen here rather than in Sender.shutdown().
-            dealers = getattr(self._thread_local, "dealers", None)
-            if dealers:
-                for endpoint, dealer in dealers.items():
-                    try:
-                        dealer.stop()
-                    except Exception as e:
-                        logger.warning(
-                            f"_process_task_queue[{thread_idx}]: failed to stop dealer "
-                            f"for endpoint {endpoint}: {e}"
-                        )
-                dealers.clear()
+                    self._deliver_aux_to_agent(write_meta)
+                else:
+                    self._deliver_kv_to_agent(write_meta)
+            except Exception as e:
+                logger.error(
+                    f"_process_task_queue[{thread_idx}]: unhandled exception for "
+                    f"unique_rid={write_meta.unique_rid}: {e}"
+                )
+                write_meta.task.fail(e)
 
     @staticmethod
     @nvtx_range("_make_agent_request")
@@ -574,14 +546,15 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+            self._send_to_peer(
+                write_meta.peer_endpoint,
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
                     write_meta.slice_id,
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
-                )
+                ),
             )
             return
 
@@ -604,14 +577,15 @@ class Sender(SenderBase):
                     f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+                self._send_to_peer(
+                    write_meta.peer_endpoint,
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
                         write_meta.slice_id,
                         True,  # is_last_slice — ensures receiver resolves its task future
                         AgentResult.FAILED,
-                    )
+                    ),
                 )
                 return
             if timer:
@@ -658,7 +632,7 @@ class Sender(SenderBase):
             transfer_size=transfer_size,
             tail=tail,
         )
-        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
+        self._send_to_peer(write_meta.peer_endpoint, result_msg)
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -714,13 +688,14 @@ class Sender(SenderBase):
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
 
-        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+        self._send_to_peer(
+            write_meta.peer_endpoint,
             [
                 MessageType.AUX_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
                 str(write_meta.unique_rid).encode("ascii"),
                 agent_result.value.encode("ascii"),
-            ]
+            ],
         )
 
         if timer:
@@ -1119,26 +1094,49 @@ class Sender(SenderBase):
         try:
             peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
             slice_id = info.slice_id if info.slice_id is not None else 0
-            self._get_or_connect_dealer(peer_ri.self_endpoint).send(
+            self._send_to_peer(
+                peer_ri.self_endpoint,
                 _make_kv_result_msg(
                     self._instance_rank,
                     info.unique_rid,
                     slice_id,
                     True,  # is_last_slice
                     AgentResult.FAILED,
-                )
+                ),
             )
         except Exception as e:
             logger.warning(
                 f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
             )
 
-    def _get_or_connect_dealer(self, endpoint: Optional[str]):
+    def _send_to_peer(self, endpoint: Optional[str], message: list[bytes]) -> None:
+        """The ONLY way to send a control message to a peer. Callable from any thread.
+
+        The pool lock covers lookup/connect alone and is released before the send,
+        so a peer stalled at its high-water mark cannot block sends to other peers.
+        """
+        dealer = self._get_or_connect_dealer(endpoint)
+        if dealer is not None:
+            dealer.send(message)
+
+    def _get_or_connect_dealer(self, endpoint: Optional[str]) -> Optional[ZMQMessenger]:
+        """Pool lookup/create; returns None once shutdown has started.
+
+        Call ONLY from _send_to_peer(). test_dealer_thread_safety.py enforces that
+        so no second, thread-unsafe send idiom can reappear (see #13075 / #16116).
+        """
         if endpoint is None:
             raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
-        if endpoint not in self._dealers:
-            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
-        return self._dealers[endpoint]
+        with self._dealers_lock:
+            # Checked under the lock that shutdown() clears the pool under, so a
+            # late send cannot resurrect a DEALER (and leak its ZMQ context).
+            if self._shutdown:
+                return None
+            dealer = self._dealers.get(endpoint)
+            if dealer is None:
+                dealer = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+                self._dealers[endpoint] = dealer
+        return dealer
 
     def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
         req_info = peer_transfer_req_info
@@ -1168,7 +1166,11 @@ class Sender(SenderBase):
         self._remove_req_info(unique_rid)
 
     def send_cancel_to_receivers(self, unique_rid: int) -> None:
-        """Notify all receivers involved in this session to cancel."""
+        """Notify all receivers involved in this session to cancel.
+
+        Reachable from both the listener thread (_handle_cancel_session) and the
+        executor thread (cancel_request -> TxSession.cancel).
+        """
         # Snapshot under the lock to avoid RuntimeError if the listener thread
         # mutates the dict via _add_req_info() concurrently.
         with self._peer_requests_lock:
@@ -1179,8 +1181,9 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                self._send_to_peer(
+                    peer_ri.self_endpoint,
+                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")],
                 )
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
@@ -1210,12 +1213,16 @@ class Sender(SenderBase):
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        for dealer in self._dealers.values():
+        # Drain the pool under its lock so no thread can add a dealer after this,
+        # then stop outside it: ZMQMessenger.stop() calls context.term().
+        with self._dealers_lock:
+            dealers = list(self._dealers.values())
+            self._dealers.clear()
+        for dealer in dealers:
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
-        self._dealers.clear()
 
     def __del__(self):
         try:
@@ -1585,7 +1592,9 @@ class Receiver(ReceiverBase):
         self._registrar = peer_registrar
         self._agent = agent
         self._bounce = bounce
-        self._dealers = {}
+        # One DEALER pool shared by every thread; see Sender._send_to_peer.
+        self._dealers: dict[str, ZMQMessenger] = {}
+        self._dealers_lock = threading.Lock()
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
         # compatibility check. Requests targeting such a peer fail fast
@@ -1610,12 +1619,16 @@ class Receiver(ReceiverBase):
         if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
-        for dealer in self._dealers.values():
+        # Drain the pool under its lock so no thread can add a dealer after this,
+        # then stop outside it: ZMQMessenger.stop() calls context.term().
+        with self._dealers_lock:
+            dealers = list(self._dealers.values())
+            self._dealers.clear()
+        for dealer in dealers:
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Receiver shutdown: {e}")
-        self._dealers.clear()
         self._messenger.stop()
 
     def clear_session(self, unique_rid: int):
@@ -1847,12 +1860,34 @@ class Receiver(ReceiverBase):
         endpoint = self._extract_info_endpoint(params)
         return endpoint not in self._sender_ep_instance_map
 
-    def _get_or_connect_dealer(self, endpoint: Optional[str]):
+    def _send_to_peer(self, endpoint: Optional[str], message: list[bytes]) -> None:
+        """The ONLY way to send a control message to a peer. Callable from any thread.
+
+        The pool lock covers lookup/connect alone and is released before the send,
+        so a peer stalled at its high-water mark cannot block sends to other peers.
+        """
+        dealer = self._get_or_connect_dealer(endpoint)
+        if dealer is not None:
+            dealer.send(message)
+
+    def _get_or_connect_dealer(self, endpoint: Optional[str]) -> Optional[ZMQMessenger]:
+        """Pool lookup/create; returns None once shutdown has started.
+
+        Call ONLY from _send_to_peer(). test_dealer_thread_safety.py enforces that
+        so no second, thread-unsafe send idiom can reappear (see #13075 / #16116).
+        """
         if endpoint is None:
             raise ValueError("Receiver: peer endpoint is None; peer may not have registered yet")
-        if endpoint not in self._dealers:
-            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
-        return self._dealers[endpoint]
+        with self._dealers_lock:
+            # Checked under the lock that shutdown() clears the pool under, so a
+            # late send cannot resurrect a DEALER (and leak its ZMQ context).
+            if self._shutdown:
+                return None
+            dealer = self._dealers.get(endpoint)
+            if dealer is None:
+                dealer = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+                self._dealers[endpoint] = dealer
+        return dealer
 
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)
@@ -1896,10 +1931,10 @@ class Receiver(ReceiverBase):
                 self._incompatible_peers[info_endpoint] = msg
                 raise PeerIncompatibleError(msg) from e
 
+            # Serialize our RankInfo once: to_bytes() msgpacks the whole page table.
+            rank_info_bytes = self._registrar.self_rank_info.to_bytes()
             for endpoint in sender_info.sender_endpoints:
-                dealer = self._get_or_connect_dealer(endpoint)
-                rank_info = self._registrar.self_rank_info
-                dealer.send([MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()])
+                self._send_to_peer(endpoint, [MessageType.REGISTER_RANK_INFO, rank_info_bytes])
 
             self._sender_ep_instance_map[info_endpoint] = sender_info
             return sender_info
@@ -1908,11 +1943,15 @@ class Receiver(ReceiverBase):
             return self._sender_ep_instance_map[info_endpoint]
 
     def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> None:
-        """Notify all senders involved in this session to cancel."""
+        """Notify all senders involved in this session to cancel.
+
+        Reachable from both the listener thread (_handle_cancel_session) and the
+        executor thread (cancel_request -> RxSession.cancel).
+        """
         for endpoint in sender_endpoints:
             try:
-                self._get_or_connect_dealer(endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                self._send_to_peer(
+                    endpoint, [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
                 )
             except Exception as e:
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
@@ -2003,8 +2042,7 @@ class Receiver(ReceiverBase):
     def _request_sender_data(self, endpoint: str, receiver_info_bytes: bytes):
         # receiver_info serialized once and reused for every peer rank (block-table msgpack isn't free at fan-out).
         logger.debug("Sending data request to endpoint '%s'", endpoint)
-        messenger = self._get_or_connect_dealer(endpoint)
-        messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes])
+        self._send_to_peer(endpoint, [MessageType.REQUEST_DATA, receiver_info_bytes])
 
     def __del__(self):
         try:
