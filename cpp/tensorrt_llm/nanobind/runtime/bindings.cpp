@@ -158,7 +158,8 @@ void initBindings(nb::module_& m)
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer,
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_mc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getMCBuffer,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_buffer_size", &tensorrt_llm::runtime::McastGPUBuffer::getBufferSize);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)

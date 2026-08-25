@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import os
 import platform
@@ -31,6 +34,12 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
+_MNNVL_NUM_LAMPORT_BUFFERS = 3
+_MNNVL_BUFFER_ALIGNMENT_BYTES = 2 * 16
+_MNNVL_UINT32_MAX = 2**32 - 1
+_MNNVL_MAX_BUFFER_SIZE_BYTES = (
+    _MNNVL_UINT32_MAX //
+    _MNNVL_BUFFER_ALIGNMENT_BYTES) * _MNNVL_BUFFER_ALIGNMENT_BYTES
 
 _thread_local = threading.local()
 
@@ -90,17 +99,73 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
+def _create_allreduce_mnnvl_workspace(mapping: Mapping, buffer_size_bytes: int,
+                                      use_fabric_handle: bool, comm) -> Dict:
+    requested_buffer_size_bytes = buffer_size_bytes
+    requested_workspace_size_bytes = (_MNNVL_NUM_LAMPORT_BUFFERS *
+                                      requested_buffer_size_bytes)
+    mcast_buf_handle = McastGPUBuffer(
+        requested_workspace_size_bytes,
+        mapping.tp_size,
+        mapping.tp_rank,
+        mapping.local_rank,
+        use_fabric_handle,
+        comm.py2f(),
+    )
+
+    # C++ places the signal pad after the usable region and reports the fabric allocation's
+    # multicast-granularity-rounded capacity (512 MiB granularity on GB200). Partition that capacity here instead
+    # of independently rounding or geometrically growing the request in Python. Two-shot kernels split each
+    # Lamport buffer into two stages accessed with 16-byte vectors, so keep every buffer 32-byte aligned.
+    usable_workspace_size_bytes = mcast_buf_handle.get_buffer_size()
+    buffer_size_bytes = min(
+        usable_workspace_size_bytes // _MNNVL_NUM_LAMPORT_BUFFERS,
+        _MNNVL_MAX_BUFFER_SIZE_BYTES,
+    )
+    buffer_size_bytes -= buffer_size_bytes % _MNNVL_BUFFER_ALIGNMENT_BYTES
+    if buffer_size_bytes < requested_buffer_size_bytes:
+        raise RuntimeError(
+            f"[MNNVL] Allocated workspace reports only {buffer_size_bytes} bytes per Lamport buffer, "
+            f"below the requested {requested_buffer_size_bytes} bytes.")
+    workspace_size_bytes = _MNNVL_NUM_LAMPORT_BUFFERS * buffer_size_bytes
+
+    # We use one FP32 element per entry for Lamport synchronization.
+    buffer = mcast_buf_handle.get_uc_buffer(
+        mapping.tp_rank,
+        (workspace_size_bytes // torch.float32.itemsize, ),
+        torch.float32,
+        0,
+    )
+    buffer.fill_(-0.0)
+    torch.cuda.synchronize()
+    comm.Barrier()
+
+    # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages,
+    # numBytesToClear[4], access count ptr].
+    num_bytes_to_clear = [0] * 4
+    buffer_flags = torch.tensor(
+        [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+        dtype=torch.uint32,
+        device=torch.device("cuda", mapping.local_rank),
+    )
+    return {
+        "handle": mcast_buf_handle,
+        "uc_buffer": buffer,
+        "buffer_flags": buffer_flags,
+        "buffer_size_bytes": buffer_size_bytes,
+        "mpi_comm": comm,
+    }
+
+
 def get_or_scale_allreduce_mnnvl_workspace(
     mapping: Mapping,
     dtype: torch.dtype,
-    buffer_size_bytes: Optional[int] = None
-) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
+    buffer_size_bytes: Optional[int] = None,
+) -> Dict:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
     """
-
-    NUM_LAMPORT_BUFFERS = 3
 
     # Use MNNVLAllReduce class to share across threads
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
@@ -110,75 +175,61 @@ def get_or_scale_allreduce_mnnvl_workspace(
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
     use_fabric_handle = force_mn or mapping.is_multi_node()
 
-    if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
-            mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
-        # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
-        init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
-                                     or 0)
-        # Creating the workspace if it doesn't exist
-        if mapping not in allreduce_mnnvl_workspaces:
-            # Do the communicator split if there is no communicator in the workspace
+    required_size_bytes = buffer_size_bytes or 0
+    if required_size_bytes < 0:
+        raise ValueError("[MNNVL] Required workspace size must be nonnegative")
+
+    with MNNVLAllReduce.workspace_lock:
+        current_workspace = allreduce_mnnvl_workspaces.get(mapping)
+        if (current_workspace is not None and
+                current_workspace["buffer_size_bytes"] >= required_size_bytes):
+            return current_workspace
+
+        initial_size_bytes = max(1024 * 8192 * elem_size, required_size_bytes)
+        current_size_bytes = (None if current_workspace is None else
+                              current_workspace["buffer_size_bytes"])
+
+        if torch.cuda.is_current_stream_capturing():
+            current_description = ("unallocated" if current_size_bytes is None
+                                   else f"{current_size_bytes} bytes")
+            raise RuntimeError(
+                f"[MNNVL] Cannot grow workspace during CUDA Graph capture: requested "
+                f"{required_size_bytes} bytes, current capacity is {current_description}. "
+                "Reserve or warm up the maximum shape before capture.")
+
+        requested_size_bytes = (initial_size_bytes if current_workspace is None
+                                else required_size_bytes)
+        if current_workspace is None:
             comm = mpi_comm().Split(
                 int(mapping.pp_rank * mapping.cp_size + mapping.cp_rank),
                 mapping.tp_rank)
-            # Use the predefined buffer size if no buffer size is provided
-            buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
-            if mapping.tp_rank == 0:
-                logger.debug(
-                    f"[MNNVL] Creating workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} with {buffer_size_bytes} bytes"
-                )
-
         else:
-            comm = allreduce_mnnvl_workspaces[mapping]["mpi_comm"]
-            # Safeguard against when buffer_size_bytes is None
-            req_buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
-            # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
-            buffer_size_bytes = math.ceil(req_buffer_size_bytes /
-                                          (8 * 1024 * 1024)) * (8 * 1024 * 1024)
-            logger.debug(
-                f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
-            )
-        # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
-        workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
-        # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
-        mcast_buf_handle = McastGPUBuffer(
-            workspace_size_bytes,
-            mapping.tp_size,
-            mapping.tp_rank,
-            mapping.local_rank,
-            use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
-            comm.py2f(),  # Fortran handle for the MPI communicator
+            comm = current_workspace["mpi_comm"]
+
+        new_workspace = _create_allreduce_mnnvl_workspace(
+            mapping,
+            requested_size_bytes,
+            use_fabric_handle,
+            comm,
         )
 
-        # We use per FP32 element in the buffer for lamport sync
-        buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
-                                                (workspace_size_bytes //
-                                                 (torch.float32.itemsize), ),
-                                                torch.float32, 0)
-        buffer.fill_(-0.0)
-        # Wait until the initialization is done
-        torch.cuda.synchronize()
-        comm.Barrier()
+        if mapping.tp_rank == 0:
+            if current_workspace is None:
+                logger.debug(
+                    f"[MNNVL] Created workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size}; "
+                    f"requested {requested_size_bytes} bytes and received "
+                    f"{new_workspace['buffer_size_bytes']} bytes per Lamport buffer"
+                )
+            else:
+                logger.debug(
+                    f"[MNNVL] Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from "
+                    f"{current_size_bytes} to {new_workspace['buffer_size_bytes']} bytes per Lamport buffer "
+                    f"for a {requested_size_bytes}-byte request")
 
-        # This is a buffer to maintain the state of this allreduce Op
-        # Should have the same lifetime with self._buffer
-        # The flag should be binded to each buffer allocation
-        # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
-        num_bytes_to_clear = [0] * 4
-        buffer_flags = torch.tensor(
-            [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
-            dtype=torch.uint32,
-            device=torch.device("cuda", mapping.local_rank),
-        )
-
-        allreduce_mnnvl_workspaces[mapping] = {
-            "handle": mcast_buf_handle,
-            "uc_buffer": buffer,
-            "buffer_flags": buffer_flags,
-            "buffer_size_bytes": buffer_size_bytes,
-            "mpi_comm": comm,
-        }
-    return allreduce_mnnvl_workspaces[mapping]
+        # Keep exactly one cached workspace per mapping. Warmup must establish the maximum capacity before CUDA
+        # Graph capture; replacing this entry after a graph is instantiated would invalidate its captured pointers.
+        allreduce_mnnvl_workspaces[mapping] = new_workspace
+        return new_workspace
 
 
 def userbuffers_allreduce_finalize(
@@ -555,6 +606,7 @@ class MNNVLAllReduce(nn.Module):
     from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
     """
     allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
+    workspace_lock = threading.Lock()
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -637,13 +689,13 @@ class MNNVLAllReduce(nn.Module):
         workspace_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
 
-        # We use uint32_t to store workspace size related info. Safeguard against overflow.
-        if workspace_size_bytes >= 2**32 - 1:
+        # The final aligned capacity is stored in a uint32 flag.
+        if workspace_size_bytes > _MNNVL_MAX_BUFFER_SIZE_BYTES:
             # Raise an error so we can fallback to other allreduce strategies
             raise ValueError(
-                f"[MNNVL AllReduce] Required workspace {workspace_size_bytes} bytes exceeds uint32 limits "
-                f"for shard ({num_tokens}, {hidden_dim}), TP {self.mapping.tp_size}."
-            )
+                f"[MNNVL AllReduce] Required workspace {workspace_size_bytes} bytes exceeds the largest "
+                f"aligned uint32 capacity {_MNNVL_MAX_BUFFER_SIZE_BYTES} for shard "
+                f"({num_tokens}, {hidden_dim}), TP {self.mapping.tp_size}.")
 
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping,

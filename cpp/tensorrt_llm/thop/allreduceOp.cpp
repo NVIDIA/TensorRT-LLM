@@ -2063,9 +2063,9 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
     torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_)
 {
-    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    auto mcastMem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
-        mcast_mem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a mcastBuffer instance.");
+        mcastMem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a McastGPUBuffer instance");
     TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
     TORCH_CHECK(input.dim() >= 2, "[mnnvlFusionAllReduce] input must have at least 2 dimensions");
 
@@ -2147,14 +2147,14 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     }
 
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
-    allreduce_params.nRanks = mcast_mem->getWorldSize();
-    allreduce_params.rank = mcast_mem->getRank();
+    allreduce_params.nRanks = mcastMem->getWorldSize();
+    allreduce_params.rank = mcastMem->getRank();
     allreduce_params.dType = dtype;
     allreduce_params.numTokens = numTokens;
     allreduce_params.tokenDim = hiddenDim;
-    allreduce_params.bufferPtrsDev = reinterpret_cast<void**>(mcast_mem->getBufferPtrsDev());
+    allreduce_params.bufferPtrsDev = reinterpret_cast<void**>(mcastMem->getBufferPtrsDev());
     allreduce_params.bufferPtrLocal = comm_buffer.mutable_data_ptr();
-    allreduce_params.multicastPtr = mcast_mem->getMulticastPtr();
+    allreduce_params.multicastPtr = mcastMem->getMulticastPtr();
     allreduce_params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.mutable_data_ptr());
     allreduce_params.input = input.const_data_ptr();
     allreduce_params.pattern = pattern;
