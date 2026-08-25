@@ -351,6 +351,22 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
     }
+    if (params.program_version_name) {
+        env.NSPECT_RELEASE_VERSION = params.program_version_name
+    } else {
+        def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
+        def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
+        if (!versionMatcher.find()) {
+            error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
+        }
+        def nspectReleaseVersionSuffix = "dev"
+        if (runMode == "nightly_release") {
+            nspectReleaseVersionSuffix = "nightly"
+        } else if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+            nspectReleaseVersionSuffix = "postmerge"
+        }
+        env.NSPECT_RELEASE_VERSION = "${versionMatcher.group(1)}_${nspectReleaseVersionSuffix}"
+    }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
     if (!GEN_POST_MERGE_BUILDS_ONLY) {
@@ -2083,13 +2099,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 runMode == "nightly_release" ||
                                 env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
+                            'program_version_name': env.NSPECT_RELEASE_VERSION,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildInternalRelease': false,
                                 'buildCiImage': false,
                                 'buildNgcRelease': true,
-                                'register_images': true,
                                 'wait_success_seconds': "",
                             ]
                         }
@@ -2158,9 +2174,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildNgcRelease': true,
-                                'register_images': true,
                                 'wait_success_seconds': "",
                             ]
+                            additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
                         } else {
                             additionalParameters['nspect_id'] = ""
                         }

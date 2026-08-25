@@ -1431,6 +1431,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
+        kv_cache_dtype: str = "auto",
         flashinfer_mla_backend: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -1447,6 +1448,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            kv_cache_dtype (str): KV-cache dtype selected by ``KvCacheConfig``. Accepted
+                values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
+                torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
+                used by DeepSeek-V4 and DSA on SM120/SM121.
             flashinfer_mla_backend (Optional[str]): FlashInfer MLA generation backend
                                                     selected for this attention instance.
                                                     None preserves the ordered FMHA-library
@@ -1455,6 +1460,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        self.kv_cache_dtype = kv_cache_dtype
+        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
         self.flashinfer_mla_backend = flashinfer_mla_backend
         # Per-batch MLA decode backend override hook. Maps (statically
         # configured backend, batch metadata, generation-token count) to the
@@ -1774,6 +1781,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.original_max_positions
 
     def create_fmha_libs(self) -> None:
+        sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
+        if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
+                and get_sm_version() in (120, 121)
+                and getattr(self, "kv_cache_dtype", None) != "fp8_ds_mla"):
+            raise ValueError(
+                "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
+                "kv_cache_config.dtype='fp8_ds_mla'.")
         self.fmha_libs = []
         for fmha_cls in get_enabled_fmha_lib_classes():
             if fmha_cls.is_available(self):
@@ -1857,6 +1871,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # generation FMHA only reads the cache, and the fallback path needs the
         # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
         if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                and not getattr(self, "use_fp8_ds_mla", False)
                 and forward_args.attention_input_type
                 == AttentionInputType.generation_only):
             num_ctx = metadata.num_contexts

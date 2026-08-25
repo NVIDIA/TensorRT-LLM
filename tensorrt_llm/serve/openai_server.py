@@ -2078,10 +2078,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         functools.partial(self.generator.input_processor,
                                           prompt, sampling_params))
                     tokens_prompt = TokensPrompt(
-                        prompt_token_ids=prompt_token_ids,
-                        query_token_ids=extra_processed_inputs.get(
-                            "query_token_ids")
-                        if extra_processed_inputs is not None else None)
+                        prompt_token_ids=prompt_token_ids)
                 else:
                     tokens_prompt = prompt
 

@@ -424,6 +424,7 @@ class _ContextRequest:
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
     is_dummy_request: bool = False
+    return_perf_metrics: bool = False
     context_current_position: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None

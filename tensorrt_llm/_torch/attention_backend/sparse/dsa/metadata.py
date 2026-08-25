@@ -52,6 +52,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
     sparse_metadata_params: Optional[DSAMetadataParams] = None
+    use_fp8_ds_mla: bool = field(default=False, init=False)
+    # Store reference to indexer for preparation stage
+    indexer: Optional["Indexer"] = None
     # Chunked prefill metadata for indexer (prefill-only, no CUDA graph needed)
     indexer_prefill_chunks: Optional[List[IndexerPrefillChunkMetadata]] = None
     # Max chunk size for two-level chunking:
@@ -140,6 +143,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "DSAtrtllmAttentionMetadata requires DSACacheManager-compatible "
                 f"cache manager, got {type(self.kv_cache_manager)}"
             )
+        self.use_fp8_ds_mla = getattr(self.kv_cache_manager, "use_fp8_ds_mla", False)
 
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -373,6 +377,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
 
             global_positions = start_positions[req_indices] + token_offsets
+            if self.use_fp8_ds_mla:
+                self.token_positions_cuda[: self.num_tokens] = global_positions.to(torch.int32)
             # Honor MXFP4 indexer K cache layout (½ byte per value vs FP8's
             # 1 byte) when the cache manager exposes a use_fp4 flag.
             index_head_dim = self.kv_cache_manager.index_head_dim
@@ -598,6 +604,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        self.token_positions_cuda = None
+        if self.use_fp8_ds_mla:
+            self.token_positions_cuda = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_tokens,),
+                cache_name="token_positions_cuda",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         # Allocate separate indexer block-offset and slot-mapping buffers for
         # the draft KV cache manager, mirroring draft_kv_cache_block_offsets:
         # the draft-replay context swaps these in by rebinding, so CUDA graph
