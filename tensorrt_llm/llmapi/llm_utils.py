@@ -681,14 +681,22 @@ def _transceiver_python_fallback_reason(
 
     Checks the configuration-level constraints of the Python (V2)
     transceiver so that resolving 'auto' never selects a runtime that would
-    fail at transceiver creation time.
+    fail at transceiver creation time. Only consulted when the model
+    expressed no runtime preference: a model preferring 'PYTHON' may
+    genuinely require it (e.g. recurrent-state transfer), so it is never
+    silently rerouted — transceiver creation raises with an actionable
+    message instead.
     """
     cfg = llm_args.cache_transceiver_config
     effective_backend, _ = cfg._resolve_default_backend()
     if effective_backend != "NIXL":
         return (f"backend {effective_backend!r} (the Python transceiver "
                 "requires NIXL)")
-    if llm_args.parallel_config and llm_args.parallel_config.cp_size > 1:
+    # getattr: external callers (e.g. the perf-sanity cache-transceiver
+    # precheck) invoke the resolver with a lightweight stand-in object that
+    # only carries cache_transceiver_config.
+    parallel_config = getattr(llm_args, 'parallel_config', None)
+    if parallel_config is not None and parallel_config.cp_size > 1:
         return "context parallelism > 1"
     if cfg.kv_transfer_timeout_ms is None:
         return ("kv_transfer_timeout_ms=None (the Python transceiver "
@@ -706,11 +714,13 @@ def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',
       must never materialize or alter a transceiver config that the user did
       not enable.
     - Explicit user value ('CPP'/'PYTHON'/None): left untouched.
-    - 'auto': default to the Python (V2) transceiver. A model can opt out
-      via ``model_cls.get_preferred_transceiver_runtime()`` returning 'CPP'.
-      Configurations the Python transceiver does not support (non-NIXL
-      backend, context parallelism, or an infinite kv_transfer_timeout_ms)
-      fall back to None (C++ transceiver).
+    - 'auto': a model preference from
+      ``model_cls.get_preferred_transceiver_runtime()`` ('CPP' or 'PYTHON')
+      is adopted verbatim — never rerouted, so unsupported configurations
+      surface as transceiver-creation errors. Without a preference, default
+      to the Python (V2) transceiver, falling back to None (C++ transceiver)
+      for configurations it does not support (non-NIXL backend, context
+      parallelism, or an infinite kv_transfer_timeout_ms).
 
     ``pretrained_config`` is forwarded to the hook so implementation classes
     shared by several architectures can differentiate per checkpoint.
@@ -734,7 +744,9 @@ def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',
 
     resolved = preferred if preferred is not None else "PYTHON"
 
-    if resolved == "PYTHON":
+    # Fallbacks apply only to the no-preference default: an explicit model
+    # preference is adopted verbatim (see _transceiver_python_fallback_reason).
+    if preferred is None:
         fallback_reason = _transceiver_python_fallback_reason(llm_args)
         if fallback_reason is not None:
             logger.info(

@@ -696,11 +696,16 @@ class DecoderModelForCausalLM(nn.Module,
     ) -> Optional[Literal["CPP", "PYTHON"]]:
         """Return the model's preferred KV-cache transceiver runtime.
 
-        Subclasses can override this to opt into a specific transceiver
-        implementation ('CPP' or 'PYTHON') that is adopted when the user
-        leaves ``cache_transceiver_config.transceiver_runtime`` at its
-        default 'auto'. Return None to defer to the global default (the
-        Python transceiver, with capability-based fallbacks to C++).
+        Subclasses can override this to pin a specific transceiver
+        implementation ('CPP' or 'PYTHON') that is adopted verbatim when the
+        user leaves ``cache_transceiver_config.transceiver_runtime`` at its
+        default 'auto'; unsupported configurations then fail loudly at
+        transceiver creation rather than being rerouted. Return None to
+        defer to the global default: the Python transceiver, falling back to
+        C++ when the deployment does not support it (non-NIXL backend,
+        context parallelism, or an infinite ``kv_transfer_timeout_ms``), so
+        the effective runtime for a no-preference model is
+        deployment-dependent.
 
         Args:
             pretrained_config: the loaded HF pretrained config (may be None
