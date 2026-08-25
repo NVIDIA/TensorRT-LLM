@@ -29,8 +29,7 @@ import types
 import pytest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-_MODULE_PATH = (_REPO_ROOT / "tests" / "integration" / "defs" / "perf" /
-                "perf_regression_utils.py")
+_MODULE_PATH = _REPO_ROOT / "tests" / "integration" / "defs" / "perf" / "perf_regression_utils.py"
 
 
 def _load_perf_regression_utils():
@@ -61,7 +60,8 @@ def _load_perf_regression_utils():
     sys.modules.update(stubs)
     try:
         spec = importlib.util.spec_from_file_location(
-            "defs.perf.perf_regression_utils", _MODULE_PATH)
+            "defs.perf.perf_regression_utils", _MODULE_PATH
+        )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     finally:
@@ -78,13 +78,11 @@ get_job_info = _load_perf_regression_utils().get_job_info
 # A real post-merge build of release/1.3.0rc22.post1, whose job URL still says
 # ".../job/LLM/job/main/job/L0_PostMerge/...".
 _JENKINS = "https://prod.blsm.nvidia.com"
-_RELEASE_BUILD_JOB_URL = (
-    f"{_JENKINS}/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge/2911/")
+_RELEASE_BUILD_JOB_URL = f"{_JENKINS}/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge/2911/"
 _GITHUB_PR_JOB_URL = f"{_JENKINS}/job/LLM/job/main/job/L0_MergeRequest_PR/1234/"
 _GITLAB_MR_JOB_URL = f"{_JENKINS}/job/LLM/job/main/job/L0_MergeRequest/77/"
 
-_INHERITED_CI_VARS = ("globalVars", "gitlabCommit", "BUILD_ID", "BUILD_URL",
-                      "JOB_NAME")
+_INHERITED_CI_VARS = ("globalVars", "gitlabCommit", "BUILD_ID", "BUILD_URL", "JOB_NAME")
 
 
 @pytest.fixture(autouse=True)
