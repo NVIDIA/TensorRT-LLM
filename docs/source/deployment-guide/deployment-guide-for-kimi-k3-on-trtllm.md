@@ -10,7 +10,7 @@ This guide uses Slurm and the `trtllm-llmapi-launch` multi-node launcher. The co
 
 ## Prerequisites
 
-* GPU: NVIDIA Blackwell GPUs. DEP16 and TEP16 use 16 GPUs; the TEP8 recipe uses 8 GPUs. These deployment recipes were validated on GB300 NVL GPUs. The repository's Slurm examples assume 4 GPUs per node. Other GPU architectures are not currently supported.
+* GPU: NVIDIA Blackwell GPUs. DEP16 and TEP16 use 16 GPUs; the TEP8 recipe uses 8 GPUs. These deployment recipes were validated on GB300 NVL GPUs. The repository's Slurm examples assume 4 GPUs per node. These recipes require GB300-class per-GPU memory: on B200 (`SM100`), Kimi K3 is functionally supported at the kernel and module level, but the deployments in this guide exceed the 180 GB per-GPU memory (the BF16 non-expert weights take ~109 GB per rank, plus ~87 GB per rank of MXFP4 routed experts at 16-way expert parallelism); full-model serving on B200 would require a wider expert-parallel group (>=32 GPUs, not validated). Other GPU architectures are not supported.
 * Multi-node launcher: Slurm with the pyxis/enroot container plugin (or an equivalent MPI launcher) to start one rank per GPU across the nodes.
 * High-speed inter-node interconnect (e.g., NVLink/InfiniBand) for the expert-parallel traffic.
 * Shared filesystem visible to all nodes for the repository, the model weights, and the configuration file.
@@ -26,7 +26,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 
 ## Feature Support Notes
 
-* **Blackwell only.** NVIDIA Blackwell GPUs are supported. The configurations and results in this guide were validated on NVIDIA GB300 NVL GPUs. Support for other GPU architectures may be added in a future release.
+* **Blackwell only.** NVIDIA Blackwell GPUs are supported. The configurations and results in this guide were validated on NVIDIA GB300 NVL GPUs. Kimi K3 kernels and modules are also functional on B200 (`SM100`) and covered by unit tests in CI; the full-model deployments in this guide exceed B200 per-GPU memory (see Prerequisites). Support for other GPU architectures may be added in a future release.
 * **High-throughput and low-latency deployments are provided.** DEP16 (`enable_attention_dp: true`, `moe_expert_parallel_size: 16`) is the high-throughput deployment. TEP16 (`enable_attention_dp: false`, `moe_expert_parallel_size: 16`) is the low-latency deployment. An 8-GPU deployment, TEP8 (`enable_attention_dp: false`, `moe_expert_parallel_size: 8`), is also provided. Select the deployment and concurrency appropriate for your workload.
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
@@ -44,7 +44,7 @@ python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_whe
 .venv-3.12/bin/python -m pip install -e .
 ```
 
-`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103-real` for GB300). The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
+`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103-real` for GB300, `100-real` for B200). A `103-real` build also runs on B200 (the Kimi K3 kernels compile for the `100f` family) but omits the `sm100a`-specific batched-GEMM kernels, so build with `100-real` when targeting B200. The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
 
 Kimi K3 additionally depends on `fla` and `einops`, installed into the same in-place environment (these dependencies might be removed in future releases, replaced by other kernels):
 

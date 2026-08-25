@@ -5,8 +5,12 @@ start and configuration for GSM8K evaluation.
 
 ## Hardware support
 
-Only NVIDIA Blackwell GPUs are currently supported and tested. Support for
-other GPU architectures may be added in a future release.
+Only NVIDIA Blackwell GPUs (`SM100` family) are supported. The full-model
+16-GPU deployments in this example were validated on GB300 NVL (`SM103`).
+B200 (`SM100`) is functionally supported at the kernel and module level and
+covered by unit tests in CI; full-model serving on B200 is not supported at
+16-way expert parallelism (see Current limitations). Support for other GPU
+architectures may be added in a future release.
 
 ## Prerequisites
 
@@ -27,12 +31,14 @@ other GPU architectures may be added in a future release.
   for `.venv-3.12` in every command below and export
   `TRTLLM_VENV=/path/to/repo/.venv-<major>.<minor>` when submitting the
   Slurm jobs (they default to the repository-root `.venv-3.12`). Adjust
-  `--cuda_architectures` to the target GPUs (`103-real` for GB300).
+  `--cuda_architectures` to the target GPUs (`103-real` for GB300,
+  `100-real` for B200).
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g.
   [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
   from the Hugging Face Hub (the example scripts take a local filesystem
   path).
-- A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
+- A Slurm cluster with 16 NVIDIA Blackwell GPUs (GB300-class per-GPU memory;
+  see Hardware support) and a TensorRT-LLM container
   image. The image passed as `--image` below must already provide
   TensorRT-LLM's runtime dependencies, that is, a release-style TensorRT-LLM
   container; a build or devel image without them does not work. The Slurm
@@ -214,6 +220,13 @@ decoding requires the default cache manager, which cannot reuse blocks.
 ## Current limitations
 
 - Pipeline parallelism is not supported.
+- **B200 full-model serving is not supported.** Kimi K3 kernels and modules
+  are functional on B200 (`SM100`) and covered by unit tests in CI, but at
+  16-way expert parallelism the BF16 non-expert weights (~109 GB per rank)
+  plus the MXFP4 routed experts (~87 GB per rank) exceed the 180 GB per-GPU
+  memory. Serving would require a wider expert-parallel group (>=32 GPUs,
+  not validated) or the default-off FP8 weight-read path, tracked as
+  TRTLLM-14765.
 - **Known performance limitation at DEP16 saturation** (attention-DP +
   EP16 throughput recipe): the 8K/1K serving sweep loses several percent
   of output throughput at concurrency ≥ 128 (up to ~15% at concurrency
