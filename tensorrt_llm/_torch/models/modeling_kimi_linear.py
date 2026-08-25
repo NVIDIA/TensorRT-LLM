@@ -132,6 +132,8 @@ _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from ...llmapi.llm_args import DecodingBaseConfig
+
 # Identity-RoPE table positions for the MLA backends. K3 is NoPE (the table
 # holds cos=1/sin=0), but the chunked-context path indexes the table by
 # absolute position, so it must cover max_position_embeddings (~512MB per
@@ -1424,10 +1426,11 @@ class KimiMLARuntime(nn.Module):
 
     def __init__(
         self,
-        cfg,
+        cfg: "PretrainedConfig",
         layer_idx: int,
         model_config: ModelConfig,
-    ):
+        mapping_with_cp: Optional[Mapping] = None,
+    ) -> None:
         super().__init__()
 
         from ..modules.kimi_k3_mla import KimiK3MLAAttention
@@ -1442,6 +1445,9 @@ class KimiMLARuntime(nn.Module):
         # KimiK3MLAAttention owns MLA projection/head sharding. Keep only the
         # final output reduction in this wrapper so the output gate remains
         # between attention and the row-parallel o_proj.
+        # Helix: mapping_with_cp (the CP original) activates the base MLA's
+        # helix machinery; this wrapper's allreduce over the repurposed
+        # mapping sums the base o_proj's tp*cp partials.
         mapping = model_config.mapping
         reduce_output = not mapping.enable_attention_dp and mapping.tp_size > 1
         self._o_allreduce = (
@@ -1467,6 +1473,7 @@ class KimiMLARuntime(nn.Module):
             use_output_gate=cfg.mla_use_output_gate,
             max_position_embeddings=max_positions,
             model_config=model_config,
+            mapping_with_cp=mapping_with_cp,
         )
 
     def forward(
@@ -1530,6 +1537,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 cfg,
                 layer_idx,
                 model_config=mla_model_config,
+                # CP original stashed by _setup_helix_mappings; None outside helix.
+                mapping_with_cp=getattr(model_config, "_helix_mapping_with_cp", None),
             )
 
         self.is_moe = (
@@ -1869,6 +1878,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         cfg = _get_text_config(model_config.pretrained_config)
         assert model_config.mapping.pp_size == 1, "Kimi K3 does not support pipeline parallelism"
         spec_config = getattr(model_config, "spec_config", None)
+
+        # Helix: swap in the repurposed mapping; restored after super().__init__.
+        self._setup_helix_mappings(model_config, cfg, spec_config)
         # Supported spec-dec modes:
         # - SA (suffix automaton): one-engine in-forward drafting, no draft
         #   weights; the KDA/MLA verify paths below implement multi-token
@@ -1893,6 +1905,91 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
         )
+
+        # Restore the CP original: executor-side helix bookkeeping keys off
+        # has_cp_helix() at runtime.
+        if self.mapping_with_cp is not None:
+            model_config._frozen = False
+            model_config.mapping = self.mapping_with_cp
+            model_config._frozen = True
+
+    def _setup_helix_mappings(
+        self,
+        model_config: ModelConfig,
+        cfg: "PretrainedConfig",
+        spec_config: Optional["DecodingBaseConfig"],
+    ) -> None:
+        """Validate helix preconditions and stage the dual-mapping swap.
+
+        DeepseekV3 pattern: the MLA layers keep the CP original; everything
+        else is built against the repurposed mapping (CP ranks become TP
+        ranks). Sets ``mapping_with_cp`` (restored after construction) and
+        ``_repurposed_tp_mapping`` (load_weights shard selection); both stay
+        None outside helix.
+        """
+        self.mapping_with_cp = None
+        self._repurposed_tp_mapping = None
+        if not model_config.mapping.has_cp_helix():
+            return
+        if model_config.mapping.enable_attention_dp:
+            raise ValueError(
+                "Kimi K3 helix phase 1 requires enable_attention_dp="
+                "False: the helix ADP token-scatter conflicts with the "
+                "per-request locality of KDA recurrent state."
+            )
+        if spec_config is not None:
+            raise ValueError(
+                "Kimi K3 helix phase 1 does not support speculative "
+                "decoding (round-robin KV bookkeeping assumes one token "
+                "per decode step)."
+            )
+        cp = model_config.mapping.cp_size
+        repurposed_tp = model_config.mapping.tp_size * cp
+        if cfg.num_attention_heads % repurposed_tp != 0:
+            raise ValueError(
+                f"Kimi K3 helix requires tp_size*cp_size ({repurposed_tp}) "
+                f"to divide the MLA head count ({cfg.num_attention_heads})."
+            )
+        kda_heads = cfg.linear_attn_config["num_heads"]
+        if kda_heads % repurposed_tp != 0:
+            raise ValueError(
+                f"Kimi K3 helix requires tp_size*cp_size ({repurposed_tp}) to "
+                f"divide the KDA head count ({kda_heads})."
+            )
+        # MoE splits apply to the repurposed tp*cp group (helix
+        # moe_world_size = tp*cp); default EP-only. The Mapping constructor
+        # skips its product check when both sizes are 1, so validate here.
+        moe_ep = repurposed_tp
+        if model_config.mapping.moe_tp_ep_user_specified:
+            moe_tp = model_config.mapping.moe_tp_size
+            moe_ep = model_config.mapping.moe_ep_size
+            if moe_tp * moe_ep != repurposed_tp:
+                raise ValueError(
+                    f"Kimi K3 helix: moe_tensor_parallel_size ({moe_tp}) x "
+                    f"moe_expert_parallel_size ({moe_ep}) must equal "
+                    f"tp_size*cp_size ({repurposed_tp}): MoE runs on the "
+                    "repurposed tp*cp group."
+                )
+        if cfg.num_experts and cfg.num_experts % moe_ep != 0:
+            raise ValueError(
+                f"Kimi K3 helix requires the MoE EP size ({moe_ep}) to "
+                f"divide the routed expert count ({cfg.num_experts}): each "
+                "EP rank of the repurposed tp*cp group holds whole experts."
+            )
+        self.mapping_with_cp = copy.deepcopy(model_config.mapping)
+        repurposed = model_config.mapping.repurpose_helix_cp_to_tp()
+        # repurpose passes resolved moe sizes, which the Mapping constructor
+        # mistakes for user-specified values; restore the flag.
+        repurposed.moe_tp_ep_user_specified = self.mapping_with_cp.moe_tp_ep_user_specified
+        # load_weights shard selection must use this tp_rank; the restored
+        # CP original's tp_rank is 0 on every rank.
+        self._repurposed_tp_mapping = repurposed
+        model_config._frozen = False
+        model_config.mapping = repurposed
+        # Side-channel for the MLA layers (avoids threading a kwarg through
+        # every intermediate signature).
+        model_config._helix_mapping_with_cp = self.mapping_with_cp
+        model_config._frozen = True
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
@@ -2085,7 +2182,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # MLP TP shard index. A dense MLP whose intermediate size does not
         # divide model TP uses a smaller repeated TP subgroup, so its local
         # shard rank is model tp_rank modulo the parameter's shard count.
-        model_tp_rank = self.model_config.mapping.tp_rank
+        # Under helix the modules were sharded against the repurposed
+        # mapping; the restored CP original's tp_rank is 0 on every rank.
+        model_tp_rank = (
+            self._repurposed_tp_mapping.tp_rank
+            if self._repurposed_tp_mapping is not None
+            else self.model_config.mapping.tp_rank
+        )
         # Keep each FP8_PB_WO checkpoint pair alongside the BF16
         # parameter only when the later weight-read conversion consumes it.
         stash_ckpt_fp8 = _resolve_fp8_weight_read_gates()[0]
@@ -2158,6 +2261,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     ).to(param.dtype)
                 )
                 mla_mixer.k_b_proj_trans.data.copy_(k_weight.transpose(1, 2))
+                # Helix: v_b_proj holds this rank's 1/cp post-all-to-all
+                # head chunk; kv_b/k_b_proj_trans keep every tp-local head.
+                h_cp = mla_mixer.num_heads_tp_cp
+                if h_cp != h:
+                    lo = mla_mixer.mapping.cp_rank * h_cp
+                    v_weight = v_weight[lo : lo + h_cp]
                 mla_mixer.v_b_proj.data.copy_(v_weight)
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
