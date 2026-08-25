@@ -4020,20 +4020,22 @@ class TestTransceiverRuntimeAutoResolution:
         with pytest.raises(ValueError, match="JAVA"):
             _resolve_transceiver_runtime_auto(args, _BadModel)
 
-    def test_model_cpp_opt_out_respected(self):
+    def test_model_cpp_opt_out_respected(self) -> None:
         """A model returning 'CPP' opts out of the Python default."""
 
         class _CppOptOutModel:
 
             @classmethod
-            def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+            def get_preferred_transceiver_runtime(cls,
+                                                  pretrained_config: Any = None
+                                                  ) -> Literal["CPP"]:
                 return "CPP"
 
         args = self._disagg_args()
         _resolve_transceiver_runtime_auto(args, _CppOptOutModel)
         assert args.cache_transceiver_config.transceiver_runtime == "CPP"
 
-    def test_context_parallelism_falls_back_to_cpp(self):
+    def test_context_parallelism_falls_back_to_cpp(self) -> None:
         """The Python transceiver does not support cp_size > 1."""
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
@@ -4043,7 +4045,7 @@ class TestTransceiverRuntimeAutoResolution:
         _resolve_transceiver_runtime_auto(args)
         assert args.cache_transceiver_config.transceiver_runtime is None
 
-    def test_infinite_kv_transfer_timeout_falls_back_to_cpp(self):
+    def test_infinite_kv_transfer_timeout_falls_back_to_cpp(self) -> None:
         """The Python transceiver requires a finite kv_transfer_timeout_ms."""
         args = self._disagg_args(kv_transfer_timeout_ms=None)
         _resolve_transceiver_runtime_auto(args)
