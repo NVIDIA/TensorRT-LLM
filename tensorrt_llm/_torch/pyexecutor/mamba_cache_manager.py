@@ -126,6 +126,19 @@ class MambaRole:
     CONV_STATE = DataRole("conv_state")
 
 
+def _mamba_effective_tp_size(mapping: Mapping) -> int:
+    """TP degree for sizing per-rank mamba/KDA state pools.
+
+    Attention-DP replicates the state and takes precedence; helix
+    repurposes CP ranks as plain TP for recurrent-state layers.
+    """
+    if mapping.enable_attention_dp:
+        return 1
+    if mapping.has_cp_helix():
+        return mapping.tp_size * mapping.cp_size
+    return mapping.tp_size
+
+
 def get_tensor_size_bytes(tensor):
     """Calculate tensor size in bytes."""
     if isinstance(tensor, torch.Tensor):
@@ -449,7 +462,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self._seed_request_counter = 0
 
         # get tp size
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        tp_size = _mamba_effective_tp_size(mapping)
 
         # derive mamba parameters for conv and ssm states
         d_inner = head_dim * num_heads
@@ -2203,7 +2216,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        tp_size = _mamba_effective_tp_size(mapping)
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -2936,7 +2949,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self.local_num_mamba_layers > 0)
 
         if self.local_num_mamba_layers > 0:
-            tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+            tp_size = _mamba_effective_tp_size(mapping)
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim
