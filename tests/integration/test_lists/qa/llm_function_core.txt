@@ -58,6 +58,7 @@ accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False]
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True]
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2]
+accuracy/test_disaggregated_serving.py::TestQwen3_5_397B_A17B_NVFP4_V2::test_auto_dtype[use_py_transceiver=True]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-False]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-True]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True-True]

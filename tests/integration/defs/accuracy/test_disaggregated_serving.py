@@ -26,18 +26,20 @@ import tempfile
 import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Optional, Union
 
 import openai
 import pytest
 import requests
 import yaml
 from defs.common import wait_for_reported_addr
+from pytest_mock import MockerFixture
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
+from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_sm_version, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
@@ -2322,6 +2324,107 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@pytest.mark.timeout(14400)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(183000)
+class TestQwen3_5_397B_A17B_NVFP4_V2(LlmapiAccuracyTestHarness):
+    """Disaggregated accuracy coverage for the Qwen3.5 NVFP4 V2 checkpoint."""
+
+    MODEL_NAME = "nvidia/Qwen3.5-397B-A17B-NVFP4-V2"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4-V2"
+    EXTRA_EVALUATOR_KWARGS: ClassVar[Dict[type, Dict[str, Any]]] = {
+        GSM8K: {
+            "apply_chat_template": True,
+            "fewshot_as_multiturn": True,
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+            },
+        },
+    }
+
+    def _make_configs(
+        self, use_py_transceiver: bool
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "max_tokens_in_buffer": 8192,
+        }
+        if use_py_transceiver:
+            cache_transceiver_config["transceiver_runtime"] = "PYTHON"
+
+        kv_cache_config = {
+            "dtype": "fp8",
+            "enable_block_reuse": False,
+            "mamba_ssm_cache_dtype": "bfloat16",
+            "free_gpu_memory_fraction": 0.7,
+        }
+        common_server_config = {
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": False,
+            "enable_chunked_prefill": True,
+            "max_batch_size": 32,
+            # GSM8K does not need the checkpoint's 262K-token context window.
+            "max_seq_len": 8192,
+            "max_num_tokens": 8192,
+            "trust_remote_code": True,
+            "cache_transceiver_config": cache_transceiver_config,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": {
+                "backend": "CUTEDSL",
+            },
+        }
+        ctx_server_config = {
+            **common_server_config,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_server_config,
+            "disable_overlap_scheduler": False,
+            "cuda_graph_config": None,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+            },
+            "generation_servers": {
+                "num_instances": 1,
+            },
+        }
+        return ctx_server_config, gen_server_config, disaggregated_server_config
+
+    @pytest.mark.skip_less_device(8)
+    @parametrize_with_ids("use_py_transceiver", [True])
+    def test_auto_dtype(self, use_py_transceiver: bool,
+                        mocker: MockerFixture) -> None:
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 512)
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
+        with launch_disaggregated_llm(
+                disagg_cfg,
+                ctx_cfg,
+                gen_cfg,
+                self.MODEL_PATH,
+                server_waiting_timeout=7200,
+                max_workers=32,
+        ) as llm:
+            # DuckLLM uses a metadata-only LlmArgs for accuracy reference
+            # lookup. The workers read the actual mixed-precision configuration
+            # directly from the checkpoint.
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME,
+                [GSM8K],
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+                timeout=3600,
+            )
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
