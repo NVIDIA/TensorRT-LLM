@@ -36,8 +36,8 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
-from ..utils import (Fp4QuantizedTensor, Fp8BlockScalesQuantizedTensor,
-                     get_model_extra_attrs, is_nvfp4_marlin_supported_sm,
+from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+                     is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
 
@@ -1232,21 +1232,6 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         else:
             module.register_parameter("bias", None)
 
-    @staticmethod
-    def quantize_deep_gemm_input(
-            input: torch.Tensor) -> Fp8BlockScalesQuantizedTensor:
-        original_shape = input.shape
-        if input.dim() > 2:
-            input = input.reshape(-1, input.shape[-1])
-        assert input.dtype == torch.bfloat16
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
-            input)
-        return Fp8BlockScalesQuantizedTensor(
-            act_input_fp8,
-            act_input_sf,
-            original_shape,
-        )
-
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
@@ -1254,73 +1239,63 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
-        if isinstance(input, Fp8BlockScalesQuantizedTensor):
-            output = torch.ops.trtllm.fp8_prequantized_gemm(
-                input.fp8_tensor,
-                input.scaling_factor,
-                module.weight,
-                module.weight_scale,
-                output_dtype=torch.bfloat16,
-                disable_ue8m0_cast=True,
-            )
-            original_shape = input.original_shape
-        else:
-            if input.dim() > 2:
-                input = input.reshape(-1, input.shape[-1])
-            if input.dtype == torch.float8_e4m3fn:
-                input = input.to(torch.bfloat16) * module.input_scale
-            assert input.dtype == torch.bfloat16
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
 
-            sm_version = get_sm_version()
-            if is_sm_100f():
-                if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                    if _fp8_block_scales_uses_cute_dsl_sm107(module):
-                        # transform_weights() re-laid weight_scale out as UE8M0
-                        # K32 R128c4; quantize the activation to match.
-                        act_input_fp8, act_input_sf = (
-                            torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
-                                input))
-                        output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+        if input.dtype == torch.float8_e4m3fn:
+            input = input.to(torch.bfloat16) * module.input_scale
+        assert input.dtype == torch.bfloat16
+
+        sm_version = get_sm_version()
+        if is_sm_100f():
+            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
+                if _fp8_block_scales_uses_cute_dsl_sm107(module):
+                    # transform_weights() re-laid weight_scale out as UE8M0
+                    # K32 R128c4; quantize the activation to match.
+                    act_input_fp8, act_input_sf = (
+                        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+                            input))
+                    output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                        act_input_fp8, module.weight, act_input_sf,
+                        module.weight_scale)
+                else:
+                    act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                        input)
+                    if sm_version in (100, 103):
+                        output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
                             act_input_fp8, module.weight, act_input_sf,
                             module.weight_scale)
                     else:
-                        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                            input)
-                        if sm_version in (100, 103):
-                            output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                                act_input_fp8, module.weight, act_input_sf,
-                                module.weight_scale)
-                        else:
-                            # cute_dsl_fp8_gemm_blackwell runs only on sm100/103. On
-                            # other sm_100f GPUs (e.g. sm107 without the CuTe DSL
-                            # MXFP8 path) keep honoring the DeepGEMM opt-out with
-                            # the trtllm-gen kernel, which consumes the same raw
-                            # fp32 scales.
-                            if module.use_cute_dsl_blockscaling_mm:
-                                logger.warning_once(
-                                    "use_cute_dsl_blockscaling_mm: no CuTe DSL FP8 "
-                                    f"block-scale GEMM on SM{sm_version}; using the "
-                                    "trtllm-gen kernel instead.",
-                                    key="cute_dsl_fp8_blockscale_unsupported_sm")
-                            output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                                act_input_fp8, module.weight, act_input_sf,
-                                module.weight_scale)
-                else:
-                    output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                        input,
-                        module.weight,
-                        module.weight_scale,
-                        disable_ue8m0_cast=True,
-                    )
-            elif sm_version == 120:
-                act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                    act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+                        # cute_dsl_fp8_gemm_blackwell runs only on sm100/103. On
+                        # other sm_100f GPUs (e.g. sm107 without the CuTe DSL
+                        # MXFP8 path) keep honoring the DeepGEMM opt-out with
+                        # the trtllm-gen kernel, which consumes the same raw
+                        # fp32 scales.
+                        if module.use_cute_dsl_blockscaling_mm:
+                            logger.warning_once(
+                                "use_cute_dsl_blockscaling_mm: no CuTe DSL FP8 "
+                                f"block-scale GEMM on SM{sm_version}; using the "
+                                "trtllm-gen kernel instead.",
+                                key="cute_dsl_fp8_blockscale_unsupported_sm")
+                        output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                            act_input_fp8, module.weight, act_input_sf,
+                            module.weight_scale)
             else:
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                    act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+                output = torch.ops.trtllm.fp8_swap_ab_gemm(
+                    input,
+                    module.weight,
+                    module.weight_scale,
+                    disable_ue8m0_cast=True,
+                )
+        elif sm_version == 120:
+            act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        else:
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                input)
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
 
         # Reshape output back to original shape (with out_features as last dim)
         if len(original_shape) > 2:
@@ -1506,8 +1481,6 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
     quantizes_nvfp4_activations: ClassVar[bool] = True
-    _FP8_MAX: ClassVar[float] = 448.0
-    _E2M1_MAX: ClassVar[float] = 6.0
 
     # Temporary workaround which will be resolved by TRTLLM-11958
     # When True, use tunable_fp4_quantize (AutoTuner selects TRTLLM vs
@@ -1573,32 +1546,6 @@ class NVFP4LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    @staticmethod
-    def quantize_dynamic_input(input: torch.Tensor,
-                               scaling_vector_size: int) -> Fp4QuantizedTensor:
-        amax_input = torch.amax(torch.abs(input)).float()
-        dynamic_alpha_scale = amax_input / (NVFP4LinearMethod._FP8_MAX *
-                                            NVFP4LinearMethod._E2M1_MAX)
-        input_scale = 1.0 / dynamic_alpha_scale
-        original_shape = input.shape
-        input_2d = input.reshape(-1, input.shape[-1])
-
-        if NVFP4LinearMethod.use_tunable_quantize:
-            act_fp4, act_sf = torch.ops.trtllm.tunable_fp4_quantize(
-                input_2d, input_scale, scaling_vector_size, False)
-        else:
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
-                input_2d, input_scale, scaling_vector_size, False)
-
-        if len(original_shape) > 2:
-            act_fp4 = act_fp4.reshape(*original_shape[:-1], act_fp4.shape[-1])
-        return Fp4QuantizedTensor(
-            act_fp4,
-            act_sf,
-            is_sf_swizzled=False,
-            dynamic_alpha_scale=dynamic_alpha_scale,
-        )
-
     def _input_prepare(self, module: Linear, input: torch.Tensor):
         """Quantize input tensor to FP4 format.
 
@@ -1611,19 +1558,12 @@ class NVFP4LinearMethod(LinearMethodBase):
         """
         if isinstance(input, Fp4QuantizedTensor):
             # Input is already quantized - this should not happen if pre_quant_scale exists
-            if module.pre_quant_scale is not None:
+            if module.pre_quant_scale is not None or module.force_dynamic_quantization:
                 raise RuntimeError(
                     "Received pre-quantized FP4 input for a layer that must quantize activations locally "
-                    "(pre_quant_scale is set). This indicates FP4 output was "
-                    "not disabled in the previous layer."
+                    "(pre_quant_scale is set or dynamic quantization is forced). "
+                    "This indicates FP4 output was not disabled in the previous layer."
                 )
-            if module.input_scale is None or module.force_dynamic_quantization:
-                if input.dynamic_alpha_scale is None:
-                    raise RuntimeError(
-                        "Received pre-quantized FP4 input for dynamic NVFP4 "
-                        "without dynamic_alpha_scale metadata.")
-                return (input.fp4_tensor, input.scaling_factor,
-                        input.dynamic_alpha_scale * module.weight_scale_2)
             return input.fp4_tensor, input.scaling_factor, module.alpha
         elif isinstance(input, tuple):
             # Input is a tuple of (fp4_tensor, scaling_factor)
@@ -1643,11 +1583,11 @@ class NVFP4LinearMethod(LinearMethodBase):
             # Dynamic vs static quantization
             if module.input_scale is None or module.force_dynamic_quantization:
                 # Dynamic mode: compute input_scale and alpha from current input
+                FP8_MAX, E2M1_MAX = 448.0, 6.0
                 amax_input = torch.amax(torch.abs(input)).float()
-                dynamic_alpha_scale = amax_input / (
-                    NVFP4LinearMethod._FP8_MAX * NVFP4LinearMethod._E2M1_MAX)
-                input_scale = 1.0 / dynamic_alpha_scale
-                alpha = dynamic_alpha_scale * module.weight_scale_2
+                input_scale = FP8_MAX * E2M1_MAX / amax_input
+                alpha = (amax_input /
+                         (FP8_MAX * E2M1_MAX)) * module.weight_scale_2
             else:
                 # Static mode: use pre-computed values
                 input_scale = module.input_scale
@@ -1673,8 +1613,6 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input.fp4_tensor.reshape(-1, input.fp4_tensor.shape[-1]),
                 input.scaling_factor,
                 input.is_sf_swizzled,
-                unquantized_hidden_states=input.unquantized_hidden_states,
-                dynamic_alpha_scale=input.dynamic_alpha_scale,
             )
         elif not isinstance(input,
                             (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
@@ -1688,8 +1626,6 @@ class NVFP4LinearMethod(LinearMethodBase):
                                                     input.fp4_tensor.shape[-1]),
                 scaling_factor=input.scaling_factor,
                 is_sf_swizzled=input.is_sf_swizzled,
-                unquantized_hidden_states=input.unquantized_hidden_states,
-                dynamic_alpha_scale=input.dynamic_alpha_scale,
             )
 
         act_fp4, act_sf, alpha = self._input_prepare(module, input)
