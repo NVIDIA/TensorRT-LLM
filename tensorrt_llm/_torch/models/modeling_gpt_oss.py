@@ -24,7 +24,8 @@ from ..modules.embedding import Embedding
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from ..moe.fused_moe import MoEWeightLoadingMode, RenormalizeMoeRoutingMethod, TritonFusedMoE, create_moe, is_moe_weight_owner
+from ..moe.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
+                             TritonFusedMoE, create_moe, is_moe_weight_owner)
 # isort: on
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
