@@ -208,18 +208,25 @@ def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
         assert generated[: len(expected)] == expected
 
 
-# Beam always rides kv-v1: KVCacheManagerV2 requires beam width 1 (a v2
-# preference with beam > 1 silently falls back to v1). The bf16 graphs-on case
-# captures decode graphs over batch_size * beam_width sequences.
+# The bf16 graphs-on cases capture decode graphs over
+# batch_size * beam_width sequences.
 _BEAM_SEARCH_CASES = [
-    pytest.param(None, None, False, id="fp32-kv-v1-graphs-off-beam2"),
-    pytest.param("bfloat16", [1, 2], True, id="bf16-kv-v1-decoder-graphs-on-beam2"),
+    pytest.param(None, False, None, False, id="fp32-kv-v1-graphs-off-beam2"),
+    pytest.param("bfloat16", False, [1, 2], True, id="bf16-kv-v1-decoder-graphs-on-beam2"),
+    pytest.param("bfloat16", True, [1, 2], True, id="bf16-kv-v2-decoder-graphs-on-beam2"),
 ]
 
 
-@pytest.mark.parametrize("torch_dtype,cuda_graph_batch_sizes,graphs_captured", _BEAM_SEARCH_CASES)
+@pytest.mark.parametrize(
+    "torch_dtype,use_kv_cache_manager_v2,cuda_graph_batch_sizes,graphs_captured",
+    _BEAM_SEARCH_CASES,
+)
 def test_whisper_pytorch_beam_search(
-    monkeypatch, torch_dtype, cuda_graph_batch_sizes, graphs_captured
+    monkeypatch,
+    torch_dtype,
+    use_kv_cache_manager_v2,
+    cuda_graph_batch_sizes,
+    graphs_captured,
 ):
     """Beam-2 transcription (cross-KV shared across beams)."""
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
@@ -230,6 +237,7 @@ def test_whisper_pytorch_beam_search(
     llm = _make_llm(
         model_path,
         max_beam_width=2,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         torch_dtype=torch_dtype,
         cuda_graph_batch_sizes=cuda_graph_batch_sizes,
     )
@@ -256,9 +264,8 @@ def _assert_decoder_cuda_graph_state(llm: LLM, captured: bool) -> None:
 
 # Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:
 # (torch_dtype override or None for checkpoint fp32, kv manager v2, decoder
-# cuda-graph batch sizes, graphs must capture, TP size). KVCacheManagerV2
-# requires beam width 1, so v2 rides greedy; the fp32+graphs-requested case
-# covers fp32 enc-dec capturing decoder graphs.
+# cuda-graph batch sizes, graphs must capture, TP size). These cases exercise
+# greedy feature combinations; beam coverage lives in _BEAM_SEARCH_CASES.
 _FEATURE_COMBINATION_CASES = [
     pytest.param(None, True, None, False, 1, id="fp32-kv-v2-graphs-off-greedy"),
     pytest.param(None, False, [1, 2], True, 1, id="fp32-kv-v1-graphs-requested-greedy"),

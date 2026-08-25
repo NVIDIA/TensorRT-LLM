@@ -814,6 +814,7 @@ class KVCacheManagerV2(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfigCpp] = None,
         max_beam_width: int = 1,
+        max_copy_beam_width: Optional[int] = None,
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
@@ -855,6 +856,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width
+        self.max_copy_beam_width = (
+            max_beam_width if max_copy_beam_width is None else max_copy_beam_width
+        )
+        assert self.max_copy_beam_width >= self.max_beam_width
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -1316,9 +1321,12 @@ class KVCacheManagerV2(BaseResourceManager):
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
             f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
             f"num_reserved_index_slots={num_reserved_index_slots}, "
-            f"max_beam_width={max_beam_width})"
+            f"max_beam_width={max_beam_width}, "
+            f"max_copy_beam_width={self.max_copy_beam_width})"
         )
-        self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
+        self.index_mapper = IndexMapper(
+            index_mapper_capacity, max_beam_width, self.max_copy_beam_width
+        )
         self._early_freed_index_requests: set[int] = set()
         self._prepare_page_table_tensor(index_mapper_capacity)
 
@@ -1732,7 +1740,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 layer_offsets[local_layer_idx, role_idx] = int(converter.layer_offset)
                 scratch_pages[local_layer_idx, role_idx] = int(converter.scratch_pages_per_block)
 
-        staging_capacity = index_mapper_capacity * self.max_beam_width
+        staging_capacity = index_mapper_capacity * self.max_copy_beam_width
         device = torch.device("cuda", torch.cuda.current_device())
         self._device_kv_cache_block_offsets_input = torch.empty_like(
             self.host_kv_cache_block_offsets,
@@ -2535,6 +2543,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _ensure_generation_beam_width(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
         target_beam_width = BeamIndex(req.py_beam_width)
+
+        # Cross KV is produced once per encoder request and shared by every
+        # decoder beam.  Its physical cache therefore stays at beam width 1;
+        # only the page-table copy path expands beam 0 to max_copy_beam_width.
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            assert 1 <= target_beam_width <= self.max_copy_beam_width
+            assert kv_cache.beam_width == 1
+            return True
+
         assert 1 <= target_beam_width <= self.max_beam_width
         if kv_cache.beam_width == target_beam_width:
             return True
@@ -4080,9 +4097,16 @@ class KVCacheManagerV2(BaseResourceManager):
     ):
         # max_blocks is accepted for signature parity with KVCacheManager; the
         # device-side copy op here already scales with allocated blocks only.
-        assert beam_width <= self.max_beam_width
+        assert beam_width <= self.max_copy_beam_width
 
-        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        # Cross KV is request-scoped: generation beams share the encoder K/V
+        # written to beam 0. Self KV keeps one distinct source row per beam.
+        copy_idx = self.index_mapper.get_copy_index(
+            request_ids,
+            num_contexts,
+            beam_width,
+            self.kv_cache_type == CacheTypeCpp.CROSS,
+        )
         assert copy_idx.shape[0] == num_seqs
 
         if self.enable_swa_scratch_reuse:

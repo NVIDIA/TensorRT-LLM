@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import IndexMapper
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -48,6 +49,37 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+def test_index_mapper_replicates_request_scoped_generation_rows() -> None:
+    index_mapper = IndexMapper(
+        max_batch_size=2,
+        max_beam_width=1,
+        max_copy_beam_width=3,
+    )
+    index_mapper.add_new_sequence(10)
+    index_mapper.add_new_sequence(20)
+
+    copy_index = index_mapper.get_copy_index(
+        request_ids=[10, 20],
+        num_context=1,
+        beam_width=3,
+        replicate_beam_zero=True,
+    )
+
+    assert copy_index.tolist() == [0, 1, 1, 1]
+
+
+def test_cross_kv_cache_keeps_one_physical_beam() -> None:
+    cache_manager = object.__new__(KVCacheManagerV2)
+    cache_manager.kv_cache_type = CacheType.CROSS
+    cache_manager.max_beam_width = 1
+    cache_manager.max_copy_beam_width = 3
+    kv_cache = SimpleNamespace(beam_width=1)
+    request = SimpleNamespace(py_beam_width=3)
+
+    assert cache_manager._ensure_generation_beam_width(request, kv_cache)
+    assert kv_cache.beam_width == 1
 
 
 class _CacheTierInitError(Exception):

@@ -268,8 +268,7 @@ _TEST_CASES = [
         cuda_graph_batch_sizes=[2],
         feature_id="bf16-kv-v1-cuda-graph-on-beam2",
     ),
-    # Precision coverage for beam search. KVCacheManagerV2 currently requires
-    # max_beam_width == 1, so beam-search precision coverage uses v1.
+    # V1 precision coverage for beam search.
     _test_case(
         model_name="t5-small",
         torch_dtype="float16",
@@ -514,6 +513,15 @@ _MIXED_BATCH_TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="fp32-kv-v1-decoder-cuda-graph-on-greedy-batch2",
+    ),
+    _mixed_batch_test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        feature_id="bf16-kv-v2-decoder-cuda-graph-on-beam2-batch2",
     ),
     _mixed_batch_test_case(
         model_name="t5-small",

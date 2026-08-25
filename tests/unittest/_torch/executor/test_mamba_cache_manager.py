@@ -970,7 +970,7 @@ def test_v2_hybrid_incompatibility_fails_without_cpp_fallback(
         )
 
 
-def test_v2_encoder_decoder_beam_falls_back_for_cross_kv_compatibility():
+def test_v2_encoder_decoder_beam_uses_v2_cross_kv_mapping():
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["T5ForConditionalGeneration"]),
         sparse_attention_config=None,
@@ -985,7 +985,7 @@ def test_v2_encoder_decoder_beam_falls_back_for_cross_kv_compatibility():
         creator._validate_or_fallback_kv_cache_manager_v2(
             KVCacheManagerV2, model_config, KvCacheConfig()
         )
-        is KVCacheManager
+        is KVCacheManagerV2
     )
 
 
