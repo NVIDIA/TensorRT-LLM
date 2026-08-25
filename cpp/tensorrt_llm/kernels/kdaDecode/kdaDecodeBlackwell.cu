@@ -35,9 +35,7 @@ namespace
 
 namespace cg = cooperative_groups;
 
-constexpr int kHeads = 12;
 constexpr int kDim = 128;
-constexpr int kFlat = kHeads * kDim;
 constexpr int kKernelWidth = 4;
 constexpr int kConvCacheWidth = kKernelWidth - 1;
 constexpr int kThreads = 256;
@@ -207,6 +205,7 @@ __device__ __forceinline__ void cp_async_wait_group_one()
     asm volatile("cp.async.wait_group 1;\n" ::);
 }
 
+template <int kHeads>
 __device__ __forceinline__ void cp_async_state_chunk(
     float* shared_state, float const* state, int batch_index, int head, int chunk, int stage)
 {
@@ -224,7 +223,7 @@ __device__ __forceinline__ void cp_async_state_chunk(
     cp_async_commit();
 }
 
-template <KernelSchedule kSchedule>
+template <KernelSchedule kSchedule, int kHeads>
 __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfloat16 const* __restrict__ x_q,
     __nv_bfloat16 const* __restrict__ x_k, __nv_bfloat16 const* __restrict__ x_v,
     __nv_bfloat16 const* __restrict__ w_q_t, __nv_bfloat16 const* __restrict__ w_k_t,
@@ -236,6 +235,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     __nv_bfloat16 const* __restrict__ onorm_g, float const* __restrict__ onorm_weight, float* __restrict__ state,
     __nv_bfloat16* __restrict__ out, float lower_bound, float scale, float onorm_epsilon)
 {
+    constexpr int kFlat = kHeads * kDim;
     constexpr bool kUseCpAsyncBulk = kSchedule == KernelSchedule::kSingleCtaTwoStageCpAsyncBulk
         || kSchedule == KernelSchedule::kSingleCtaFourStageCpAsyncBulk;
     constexpr int kCpAsyncBulkStageCount = kSchedule == KernelSchedule::kSingleCtaFourStageCpAsyncBulk ? kChunks : 2;
@@ -304,7 +304,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     else
     {
         int const first_chunk = cluster_rank * kClusterChunksPerBlock;
-        cp_async_state_chunk(&shared_state[0][0][0], state, batch_index, head, first_chunk, 0);
+        cp_async_state_chunk<kHeads>(&shared_state[0][0][0], state, batch_index, head, first_chunk, 0);
     }
 
     if (tid < kDim)
@@ -366,7 +366,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     if constexpr (!kUseCpAsyncBulk && (!kUseCluster || kClusterChunksPerBlock > 1))
     {
         int const second_chunk = cluster_rank * kClusterChunksPerBlock + 1;
-        cp_async_state_chunk(&shared_state[0][0][0], state, batch_index, head, second_chunk, 1);
+        cp_async_state_chunk<kHeads>(&shared_state[0][0][0], state, batch_index, head, second_chunk, 1);
     }
 
     float const q_square = tid < kDim ? shared_q[tid] * shared_q[tid] : 0.0f;
@@ -510,7 +510,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         {
             if (chunk + 2 < kChunks)
             {
-                cp_async_state_chunk(&shared_state[0][0][0], state, batch_index, head, chunk + 2, (chunk + 2) & 1);
+                cp_async_state_chunk<kHeads>(
+                    &shared_state[0][0][0], state, batch_index, head, chunk + 2, (chunk + 2) & 1);
             }
         }
     }
@@ -576,7 +577,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     }
 }
 
-template <KernelSchedule kSchedule>
+template <KernelSchedule kSchedule, int kHeads>
 cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t stream)
 {
     constexpr bool kUseCpAsyncBulk = kSchedule == KernelSchedule::kSingleCtaTwoStageCpAsyncBulk
@@ -589,8 +590,8 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
 
     if constexpr (kUseCpAsyncBulk)
     {
-        const cudaError_t attribute_status = cudaFuncSetAttribute(
-            kda_decode_native_kernel<kSchedule>, cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSharedBytes);
+        const cudaError_t attribute_status = cudaFuncSetAttribute(kda_decode_native_kernel<kSchedule, kHeads>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSharedBytes);
         if (attribute_status != cudaSuccess)
         {
             return attribute_status;
@@ -613,7 +614,7 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
         config.numAttrs = 1;
     }
 
-    cudaError_t const launchStatus = cudaLaunchKernelEx(&config, kda_decode_native_kernel<kSchedule>,
+    cudaError_t const launchStatus = cudaLaunchKernelEx(&config, kda_decode_native_kernel<kSchedule, kHeads>,
         static_cast<__nv_bfloat16 const*>(params.xQ), static_cast<__nv_bfloat16 const*>(params.xK),
         static_cast<__nv_bfloat16 const*>(params.xV), static_cast<__nv_bfloat16 const*>(params.wQT),
         static_cast<__nv_bfloat16 const*>(params.wKT), static_cast<__nv_bfloat16 const*>(params.wVT),
@@ -634,14 +635,13 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
 void validateBlackwellParams(KdaDecodeParams const& params)
 {
     TLLM_CHECK_WITH_INFO(params.batchSize > 0, "Blackwell KDA decode requires a non-empty batch");
-    TLLM_CHECK_WITH_INFO(params.numHeads == kHeads && params.numValueHeads == kHeads,
-        "Blackwell KDA decode currently requires numHeads == "
-        "numValueHeads == 12");
+    TLLM_CHECK_WITH_INFO(
+        params.numHeads == params.numValueHeads, "Blackwell KDA decode requires numHeads == numValueHeads");
     TLLM_CHECK_WITH_INFO(
         params.ssmStateIndices == nullptr, "Blackwell KDA decode does not yet support indexed recurrent state");
     TLLM_CHECK_WITH_INFO(params.cuSeqlens != nullptr, "Blackwell KDA decode requires cuSeqlens");
-    TLLM_CHECK_WITH_INFO(
-        params.stateSlotStride == kFlat * kDim, "Blackwell KDA decode requires a contiguous recurrent-state pool");
+    TLLM_CHECK_WITH_INFO(params.stateSlotStride == static_cast<int64_t>(params.numHeads) * kDim * kDim,
+        "Blackwell KDA decode requires a contiguous recurrent-state pool");
     TLLM_CHECK_WITH_INFO(params.applyOutputNorm, "Blackwell KDA decode requires output normalization");
     TLLM_CHECK_WITH_INFO(!params.updateConvCache, "Blackwell KDA decode does not yet support updateConvCache=true");
     TLLM_CHECK_WITH_INFO(params.useLowerBound, "Blackwell KDA decode requires the lower-bound gate");
@@ -649,32 +649,47 @@ void validateBlackwellParams(KdaDecodeParams const& params)
 }
 
 template <KernelSchedule kSchedule>
-void launchBlackwellKernel(KdaDecodeParams const& params, cudaStream_t stream)
+void dispatchKdaDecodeBlackwellHeads(KdaDecodeParams const& params, cudaStream_t stream)
 {
     validateBlackwellParams(params);
-    TLLM_CUDA_CHECK(launchKernelSchedule<kSchedule>(params, stream));
+    switch (params.numHeads)
+    {
+    case 1: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 1>(params, stream))); break;
+    case 2: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 2>(params, stream))); break;
+    case 3: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 3>(params, stream))); break;
+    case 4: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 4>(params, stream))); break;
+    case 6: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 6>(params, stream))); break;
+    case 8: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 8>(params, stream))); break;
+    case 12: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 12>(params, stream))); break;
+    case 16: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 16>(params, stream))); break;
+    case 24: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 24>(params, stream))); break;
+    case 32: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 32>(params, stream))); break;
+    case 48: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 48>(params, stream))); break;
+    case 96: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 96>(params, stream))); break;
+    default: TLLM_CHECK_WITH_INFO(false, "Blackwell KDA decode does not support numHeads=%d", params.numHeads);
+    }
 }
 
 } // namespace
 
 void launchKdaDecodeBlackwellSingleCta(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    launchBlackwellKernel<KernelSchedule::kSingleCtaCpAsync>(params, stream);
+    dispatchKdaDecodeBlackwellHeads<KernelSchedule::kSingleCtaCpAsync>(params, stream);
 }
 
 void launchKdaDecodeBlackwellTwoStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    launchBlackwellKernel<KernelSchedule::kSingleCtaTwoStageCpAsyncBulk>(params, stream);
+    dispatchKdaDecodeBlackwellHeads<KernelSchedule::kSingleCtaTwoStageCpAsyncBulk>(params, stream);
 }
 
 void launchKdaDecodeBlackwellFourStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    launchBlackwellKernel<KernelSchedule::kSingleCtaFourStageCpAsyncBulk>(params, stream);
+    dispatchKdaDecodeBlackwellHeads<KernelSchedule::kSingleCtaFourStageCpAsyncBulk>(params, stream);
 }
 
 void launchKdaDecodeBlackwellFourCtaCluster(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    launchBlackwellKernel<KernelSchedule::kFourCtaThreadBlockClusterCpAsync>(params, stream);
+    dispatchKdaDecodeBlackwellHeads<KernelSchedule::kFourCtaThreadBlockClusterCpAsync>(params, stream);
 }
 
 } // namespace kernels::kdaDecode
