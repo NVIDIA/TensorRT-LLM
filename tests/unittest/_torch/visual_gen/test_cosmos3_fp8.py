@@ -85,14 +85,19 @@ MODELOPT_FP8_QUANT_CONFIG = {
 
 
 def _llm_models_root() -> str:
+    """Resolve the checkpoint root, without asserting it exists.
+
+    The path constants below call this at module scope, so raising here would
+    error the whole module during collection -- including the config tests this
+    module documents as needing neither a checkpoint nor a GPU. Returning a
+    non-existent path instead lets the per-test ``_skip_if_missing`` guards skip
+    only the tests that actually load weights.
+    """
     root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ["LLM_MODELS_ROOT"])
     if not root.exists():
         root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
     return str(root)
 
 
