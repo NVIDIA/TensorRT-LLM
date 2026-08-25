@@ -88,6 +88,21 @@ __device__ __forceinline__ void storeHeadElements(
     }
 }
 
+template <int numElemsPerThread>
+__device__ __forceinline__ void storeFp8HeadElements64(
+    __nv_fp8_e4m3* out, int64_t offsetThread, float const (&elements)[numElemsPerThread])
+{
+    static_assert(numElemsPerThread == 4, "MiniMax-M3 FP8 store expects four elements per thread");
+    // Form the final pointer with 64-bit arithmetic before one aligned 32-bit
+    // store. Production coalesced paged-cache offsets can exceed INT32_MAX
+    // FP8 elements even though each individual head row is small.
+    auto* threadOut = out + offsetThread;
+    __nv_fp8x2_e4m3 const low(make_float2(elements[0], elements[1]));
+    __nv_fp8x2_e4m3 const high(make_float2(elements[2], elements[3]));
+    uint32_t const packed = static_cast<uint32_t>(low.__x) | (static_cast<uint32_t>(high.__x) << 16);
+    *reinterpret_cast<uint32_t*>(threadOut) = packed;
+}
+
 // Perform per-head QK Norm and RoPE in a single kernel, reading a BF16 input and
 // writing to a (possibly different-dtype) output buffer.
 // head_dim: the dimension of each head
@@ -351,6 +366,295 @@ __global__ void fusedQKNormRopeKernel(
     storeHeadElements<OutT, numElemsPerThread, vecSize>(qkv_out, offsetThread, elements);
 }
 
+namespace
+{
+
+constexpr int kMinimaxM3HeadDim = 128;
+constexpr int kMinimaxM3RotaryDim = 64;
+constexpr int kMinimaxM3PageSize = 128;
+constexpr int kMinimaxM3ElemsPerThread = kMinimaxM3HeadDim / 32;
+
+// MiniMax-M3-only direct-cache specialization for eager pure prefill. The
+// general fused QK-norm/RoPE producer plus the #16755 Triton scatter remains
+// the fallback for decode, mixed batches, BF16 caches, and unsupported layouts.
+__global__ void minimaxM3Fp8QKNormRopeKVInsertKernel(__nv_bfloat16 const* qkvInput, __nv_fp8_e4m3* qOutput,
+    __nv_fp8_e4m3* kvCache, int const* outCacheLoc, int64_t pageStride, int64_t planeStride, int64_t headStride,
+    int64_t tokenStride, int64_t numPages, int numTokens, int numHeadsQ, int numHeadsK, int numHeadsV, float eps,
+    __nv_bfloat16 const* qWeight, __nv_bfloat16 const* kWeight, float base, int const* positionIds)
+{
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+    int const globalWarp = blockIdx.x * warpsPerBlock + warpId;
+    int const totalHeads = numHeadsQ + numHeadsK + numHeadsV;
+    int const tokenIdx = globalWarp / totalHeads;
+    int const localHead = globalWarp % totalHeads;
+    if (tokenIdx >= numTokens)
+    {
+        return;
+    }
+
+    int const totalQKHeads = numHeadsQ + numHeadsK;
+    bool const isQ = localHead < numHeadsQ;
+    bool const isV = localHead >= totalQKHeads;
+    int const headIdx = isQ ? localHead : (isV ? localHead - totalQKHeads : localHead - numHeadsQ);
+    int64_t const inputOffset = (static_cast<int64_t>(tokenIdx) * totalHeads + localHead) * kMinimaxM3HeadDim
+        + laneId * kMinimaxM3ElemsPerThread;
+
+    float elements[kMinimaxM3ElemsPerThread];
+    float sumSquares = 0.0F;
+    constexpr int kVecSize = kMinimaxM3ElemsPerThread * sizeof(__nv_bfloat16) / 4;
+    using VecT = typename tensorrt_llm::common::packed_as<uint, kVecSize>::type;
+    VecT const packedInput = *reinterpret_cast<VecT const*>(qkvInput + inputOffset);
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+    {
+        float2 const values = __bfloat1622float2(
+            *reinterpret_cast<__nv_bfloat162 const*>(reinterpret_cast<uint const*>(&packedInput) + i));
+        if (!isV)
+        {
+            sumSquares += values.x * values.x;
+            sumSquares += values.y * values.y;
+        }
+        elements[2 * i] = values.x;
+        elements[2 * i + 1] = values.y;
+    }
+
+    __nv_fp8_e4m3* output = qOutput;
+    int64_t outputOffset;
+    if (isQ)
+    {
+        outputOffset = (static_cast<int64_t>(tokenIdx) * numHeadsQ + headIdx) * kMinimaxM3HeadDim
+            + laneId * kMinimaxM3ElemsPerThread;
+    }
+    else
+    {
+        int slot = laneId == 0 ? outCacheLoc[tokenIdx] : 0;
+        slot = __shfl_sync(0xffffffff, slot, 0);
+        // CUDA-graph padding uses -1 for non-live cache destinations. Q is
+        // still produced for the padded row, but K/V must not address it.
+        if (slot < 0)
+        {
+            return;
+        }
+        int const page = slot >> 7;
+        if (page >= numPages)
+        {
+            return;
+        }
+        int const withinPage = slot & (kMinimaxM3PageSize - 1);
+        int const plane = isV ? 1 : 0;
+        output = kvCache;
+        outputOffset = static_cast<int64_t>(page) * pageStride + static_cast<int64_t>(plane) * planeStride
+            + static_cast<int64_t>(headIdx) * headStride + static_cast<int64_t>(withinPage) * tokenStride
+            + laneId * kMinimaxM3ElemsPerThread;
+    }
+
+    // V is copy-cast only.
+    if (isV)
+    {
+        storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(output, outputOffset, elements);
+        return;
+    }
+
+    sumSquares = tensorrt_llm::common::warpReduceSum(sumSquares);
+    float const rmsReciprocal = rsqrtf(sumSquares / static_cast<float>(kMinimaxM3HeadDim) + eps);
+#pragma unroll
+    for (int i = 0; i < kMinimaxM3ElemsPerThread; ++i)
+    {
+        int const dim = laneId * kMinimaxM3ElemsPerThread + i;
+        float const weight = isQ ? __bfloat162float(qWeight[dim]) : __bfloat162float(kWeight[dim]);
+        elements[i] *= rmsReciprocal * (1.0F + weight);
+    }
+
+    // MiniMax-M3 uses NeoX partial RoPE over the first 64 of 128 channels.
+    // Only lanes 0..7 calculate the 32 distinct angles; lanes 8..15 reuse
+    // them for the paired half, while lanes 16..31 bypass RoPE.
+    float pairedElements[kMinimaxM3ElemsPerThread];
+    float cosineValues[kMinimaxM3ElemsPerThread] = {};
+    float sineValues[kMinimaxM3ElemsPerThread] = {};
+    __syncwarp();
+    constexpr int kPairOffset = (kMinimaxM3RotaryDim / 2) / kMinimaxM3ElemsPerThread;
+    int positionId = laneId == 0 ? positionIds[tokenIdx] : 0;
+    positionId = __shfl_sync(0xffffffff, positionId, 0);
+#pragma unroll
+    for (int i = 0; i < kMinimaxM3ElemsPerThread; ++i)
+    {
+        int const dim = laneId * kMinimaxM3ElemsPerThread + i;
+        pairedElements[i] = __shfl_xor_sync(0xffffffff, elements[i], kPairOffset);
+        if (laneId < kPairOffset)
+        {
+            pairedElements[i] = -pairedElements[i];
+        }
+
+        if (laneId < kPairOffset)
+        {
+            int const halfDim = dim;
+            float const frequency = powf(base, -2.0F * halfDim / static_cast<float>(kMinimaxM3RotaryDim));
+            __sincosf(static_cast<float>(positionId) * frequency, &sineValues[i], &cosineValues[i]);
+        }
+        if (laneId < 2 * kPairOffset)
+        {
+            int const sourceLane = laneId % kPairOffset;
+            cosineValues[i] = __shfl_sync(0x0000ffff, cosineValues[i], sourceLane);
+            sineValues[i] = __shfl_sync(0x0000ffff, sineValues[i], sourceLane);
+        }
+    }
+    __syncwarp();
+
+#pragma unroll
+    for (int i = 0; i < kMinimaxM3ElemsPerThread; ++i)
+    {
+        int const dim = laneId * kMinimaxM3ElemsPerThread + i;
+        if (dim < kMinimaxM3RotaryDim)
+        {
+            elements[i] = elements[i] * cosineValues[i] + pairedElements[i] * sineValues[i];
+        }
+    }
+
+    storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(output, outputOffset, elements);
+}
+
+// Horizontal sparse producer for a packed [Q|K|V|index-Q|index-K] row.
+// One warp owns one (token, head slot). All four norm/RoPE branches share the
+// model's precomputed FP32 RoPE table, eliminating per-head powf/sincos work.
+__global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const* packedInput, __nv_fp8_e4m3* qOutput,
+    __nv_fp8_e4m3* indexQOutput, __nv_fp8_e4m3* kvCache, __nv_fp8_e4m3* indexKCache, int const* outCacheLoc,
+    int64_t kvPageStride, int64_t kvPlaneStride, int64_t kvHeadStride, int64_t kvTokenStride, int64_t indexPageStride,
+    int64_t indexTokenStride, int64_t numPages, int numTokens, int numHeadsQ, int numHeadsKV, int numHeadsIndex,
+    float eps, __nv_bfloat16 const* qWeight, __nv_bfloat16 const* kWeight, __nv_bfloat16 const* indexQWeight,
+    __nv_bfloat16 const* indexKWeight, float const* rotaryCosSin, int const* positionIds)
+{
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+    int const globalWarp = blockIdx.x * warpsPerBlock + warpId;
+    int const totalHeads = numHeadsQ + 2 * numHeadsKV + numHeadsIndex + 1;
+    int const tokenIdx = globalWarp / totalHeads;
+    int const localHead = globalWarp % totalHeads;
+    if (tokenIdx >= numTokens)
+    {
+        return;
+    }
+
+    int const kBegin = numHeadsQ;
+    int const vBegin = kBegin + numHeadsKV;
+    int const indexQBegin = vBegin + numHeadsKV;
+    int const indexKHead = indexQBegin + numHeadsIndex;
+    bool const isQ = localHead < kBegin;
+    bool const isK = localHead >= kBegin && localHead < vBegin;
+    bool const isV = localHead >= vBegin && localHead < indexQBegin;
+    bool const isIndexQ = localHead >= indexQBegin && localHead < indexKHead;
+    bool const isIndexK = localHead == indexKHead;
+
+    int64_t const inputOffset = (static_cast<int64_t>(tokenIdx) * totalHeads + localHead) * kMinimaxM3HeadDim
+        + laneId * kMinimaxM3ElemsPerThread;
+    constexpr int kVecSize = kMinimaxM3ElemsPerThread * sizeof(__nv_bfloat16) / 4;
+    using VecT = typename tensorrt_llm::common::packed_as<uint, kVecSize>::type;
+    VecT const packed = *reinterpret_cast<VecT const*>(packedInput + inputOffset);
+
+    float elements[kMinimaxM3ElemsPerThread];
+    float sumSquares = 0.0F;
+#pragma unroll
+    for (int pair = 0; pair < kVecSize; ++pair)
+    {
+        float2 const values = __bfloat1622float2(
+            *reinterpret_cast<__nv_bfloat162 const*>(reinterpret_cast<uint const*>(&packed) + pair));
+        elements[2 * pair] = values.x;
+        elements[2 * pair + 1] = values.y;
+        if (!isV)
+        {
+            sumSquares += values.x * values.x + values.y * values.y;
+        }
+    }
+
+    if (!isV)
+    {
+        auto const* normWeight = isQ ? qWeight : (isK ? kWeight : (isIndexQ ? indexQWeight : indexKWeight));
+        sumSquares = tensorrt_llm::common::warpReduceSum(sumSquares);
+        float const rmsReciprocal = rsqrtf(sumSquares / static_cast<float>(kMinimaxM3HeadDim) + eps);
+#pragma unroll
+        for (int i = 0; i < kMinimaxM3ElemsPerThread; ++i)
+        {
+            int const dim = laneId * kMinimaxM3ElemsPerThread + i;
+            elements[i] *= rmsReciprocal * (1.0F + __bfloat162float(normWeight[dim]));
+        }
+
+        __syncwarp();
+        constexpr int kPairOffset = (kMinimaxM3RotaryDim / 2) / kMinimaxM3ElemsPerThread;
+        int positionId = laneId == 0 ? positionIds[tokenIdx] : 0;
+        positionId = __shfl_sync(0xffffffff, positionId, 0);
+        int64_t const ropeRow = static_cast<int64_t>(positionId) * kMinimaxM3RotaryDim;
+#pragma unroll
+        for (int i = 0; i < kMinimaxM3ElemsPerThread; ++i)
+        {
+            int const dim = laneId * kMinimaxM3ElemsPerThread + i;
+            float paired = __shfl_xor_sync(0xffffffff, elements[i], kPairOffset);
+            if (dim < kMinimaxM3RotaryDim)
+            {
+                bool const firstHalf = dim < kMinimaxM3RotaryDim / 2;
+                if (firstHalf)
+                {
+                    paired = -paired;
+                }
+                int const coefficient = firstHalf ? dim : dim - kMinimaxM3RotaryDim / 2;
+                float const cosine = rotaryCosSin[ropeRow + coefficient];
+                float const sine = rotaryCosSin[ropeRow + kMinimaxM3RotaryDim / 2 + coefficient];
+                elements[i] = elements[i] * cosine + paired * sine;
+            }
+        }
+        __syncwarp();
+    }
+
+    if (isQ)
+    {
+        int const head = localHead;
+        int64_t const outputOffset = (static_cast<int64_t>(tokenIdx) * numHeadsQ + head) * kMinimaxM3HeadDim
+            + laneId * kMinimaxM3ElemsPerThread;
+        storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(qOutput, outputOffset, elements);
+        return;
+    }
+    if (isIndexQ)
+    {
+        int const head = localHead - indexQBegin;
+        int64_t const outputOffset = (static_cast<int64_t>(tokenIdx) * numHeadsIndex + head) * kMinimaxM3HeadDim
+            + laneId * kMinimaxM3ElemsPerThread;
+        // Match vLLM's CUDA path: normalized/RoPE FP32 registers convert
+        // directly to saturating E4M3, without an intermediate BF16 round.
+        storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexQOutput, outputOffset, elements);
+        return;
+    }
+
+    int slot = laneId == 0 ? outCacheLoc[tokenIdx] : 0;
+    slot = __shfl_sync(0xffffffff, slot, 0);
+    if (slot < 0)
+    {
+        return;
+    }
+    int const page = slot >> 7;
+    if (page >= numPages)
+    {
+        return;
+    }
+    int const withinPage = slot & (kMinimaxM3PageSize - 1);
+    if (isIndexK)
+    {
+        int64_t const outputOffset = static_cast<int64_t>(page) * indexPageStride
+            + static_cast<int64_t>(withinPage) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
+        storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexKCache, outputOffset, elements);
+        return;
+    }
+
+    int const head = isK ? localHead - kBegin : localHead - vBegin;
+    int const plane = isV ? 1 : 0;
+    int64_t const outputOffset = static_cast<int64_t>(page) * kvPageStride + static_cast<int64_t>(plane) * kvPlaneStride
+        + static_cast<int64_t>(head) * kvHeadStride + static_cast<int64_t>(withinPage) * kvTokenStride
+        + laneId * kMinimaxM3ElemsPerThread;
+    storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(kvCache, outputOffset, elements);
+}
+
+} // namespace
+
 // Borrowed from
 // https://github.com/flashinfer-ai/flashinfer/blob/8125d079a43e9a0ba463a4ed1b639cefd084cec9/include/flashinfer/pos_enc.cuh#L568
 #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...)                                                               \
@@ -458,6 +762,63 @@ void launchFusedQKNormRopeToFp8(void const* qkv_in, void* qkv_out, int const num
         head_dim, rotary_dim, eps, static_cast<__nv_bfloat16 const*>(q_weight),
         static_cast<__nv_bfloat16 const*>(k_weight), base, interleave, position_ids, factor, low, high,
         attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
+}
+
+void launchMinimaxM3Fp8QKNormRopeKVInsert(void const* qkv_input, void* q_output, void* kv_cache,
+    int const* out_cache_loc, int64_t page_stride, int64_t plane_stride, int64_t head_stride, int64_t token_stride,
+    int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim,
+    int rotary_dim, float eps, void const* q_weight, void const* k_weight, float base, int const* position_ids,
+    cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(head_dim == kMinimaxM3HeadDim, "MiniMax-M3 FP8 main Q/K/V producer requires head_dim=128");
+    TLLM_CHECK_WITH_INFO(
+        rotary_dim == kMinimaxM3RotaryDim, "MiniMax-M3 FP8 main Q/K/V producer requires rotary_dim=64");
+    TLLM_CHECK_WITH_INFO(num_heads_q > 0, "MiniMax-M3 FP8 main Q/K/V producer requires query heads");
+    TLLM_CHECK_WITH_INFO(
+        num_heads_k > 0 && num_heads_v > 0, "MiniMax-M3 FP8 main Q/K/V producer requires K and V heads");
+    TLLM_CHECK_WITH_INFO(page_size == kMinimaxM3PageSize, "MiniMax-M3 FP8 main Q/K/V producer requires page_size=128");
+
+    constexpr int kBlockSize = 256;
+    constexpr int kWarpsPerBlock = kBlockSize / 32;
+    int const totalWarps = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
+    int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
+    minimaxM3Fp8QKNormRopeKVInsertKernel<<<gridSize, kBlockSize, 0, stream>>>(
+        static_cast<__nv_bfloat16 const*>(qkv_input), static_cast<__nv_fp8_e4m3*>(q_output),
+        static_cast<__nv_fp8_e4m3*>(kv_cache), out_cache_loc, page_stride, plane_stride, head_stride, token_stride,
+        num_pages, num_tokens, num_heads_q, num_heads_k, num_heads_v, eps, static_cast<__nv_bfloat16 const*>(q_weight),
+        static_cast<__nv_bfloat16 const*>(k_weight), base, position_ids);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
+    void* kv_cache, void* index_k_cache, int const* out_cache_loc, int64_t kv_page_stride, int64_t kv_plane_stride,
+    int64_t kv_head_stride, int64_t kv_token_stride, int64_t index_page_stride, int64_t index_token_stride,
+    int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
+    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
+    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(head_dim == kMinimaxM3HeadDim, "MiniMax-M3 horizontal producer requires head_dim=128");
+    TLLM_CHECK_WITH_INFO(rotary_dim == kMinimaxM3RotaryDim, "MiniMax-M3 horizontal producer requires rotary_dim=64");
+    TLLM_CHECK_WITH_INFO(page_size == kMinimaxM3PageSize, "MiniMax-M3 horizontal producer requires page_size=128");
+    TLLM_CHECK_WITH_INFO(num_heads_q > 0 && num_heads_kv > 0 && num_heads_index > 0,
+        "MiniMax-M3 horizontal producer requires Q, KV, and index heads");
+    TLLM_CHECK_WITH_INFO(
+        num_heads_index == num_heads_kv, "MiniMax-M3 horizontal producer requires index heads to equal KV heads");
+
+    constexpr int kBlockSize = 256;
+    constexpr int kWarpsPerBlock = kBlockSize / 32;
+    int const slotsPerToken = num_heads_q + 2 * num_heads_kv + num_heads_index + 1;
+    int const totalWarps = num_tokens * slotsPerToken;
+    int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
+    minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<<<gridSize, kBlockSize, 0, stream>>>(
+        static_cast<__nv_bfloat16 const*>(packed_input), static_cast<__nv_fp8_e4m3*>(q_output),
+        static_cast<__nv_fp8_e4m3*>(index_q_output), static_cast<__nv_fp8_e4m3*>(kv_cache),
+        static_cast<__nv_fp8_e4m3*>(index_k_cache), out_cache_loc, kv_page_stride, kv_plane_stride, kv_head_stride,
+        kv_token_stride, index_page_stride, index_token_stride, num_pages, num_tokens, num_heads_q, num_heads_kv,
+        num_heads_index, eps, static_cast<__nv_bfloat16 const*>(q_weight), static_cast<__nv_bfloat16 const*>(k_weight),
+        static_cast<__nv_bfloat16 const*>(index_q_weight), static_cast<__nv_bfloat16 const*>(index_k_weight),
+        rotary_cos_sin, position_ids);
+    TLLM_CUDA_CHECK(cudaGetLastError());
 }
 } // namespace kernels
 
