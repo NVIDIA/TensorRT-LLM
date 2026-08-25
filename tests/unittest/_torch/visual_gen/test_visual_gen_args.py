@@ -171,6 +171,43 @@ class TestAttentionConfigQuantValidation:
         assert attention.quant_attention_config is not None
         assert attention.quant_attention_config.v_block_size == v_block_size
 
+    @pytest.mark.parametrize(
+        ("qk_dtype", "v_dtype"),
+        [("nvfp4", "fp8"), ("nvfp4", "nvfp4")],
+    )
+    def test_supported_quant_config_flashinfer(self, qk_dtype: str, v_dtype: str) -> None:
+        attention = AttentionConfig(
+            backend="FLASHINFER",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype=qk_dtype,
+                v_dtype=v_dtype,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    @pytest.mark.parametrize("block_field", ("q_block_size", "k_block_size", "v_block_size"))
+    def test_nvfp4_block_size_rejected_on_flashinfer(self, block_field: str) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="nvfp4",
+                    v_dtype="fp8",
+                    **{block_field: 1},
+                ),
+            )
+
+    def test_fp8_qk_dtype_rejected_on_flashinfer(self) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="fp8",
+                    v_dtype="fp8",
+                ),
+            )
+
     def test_blockscaled_qk_dtype_rejected_on_trtllm(self):
         with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
             AttentionConfig(

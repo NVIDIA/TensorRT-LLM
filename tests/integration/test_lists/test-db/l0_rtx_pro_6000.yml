@@ -17,6 +17,7 @@ l0_rtx_pro_6000:
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling/test_modeling_deepseekv4.py::test_deepseek_v4_sanity[fp8-ds-mla]
   - unittest/_torch/attention/sparse/test_flashinfer_utils.py
+  - unittest/_torch/visual_gen/test_attention_flashinfer.py
   # - unittest/_torch/modeling -k "modeling_qwen3" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
   # SM120 W4A16 / W4A8 mixed-dtype GEMM coverage (paired with FinegrainedMixedDtypeGemm
