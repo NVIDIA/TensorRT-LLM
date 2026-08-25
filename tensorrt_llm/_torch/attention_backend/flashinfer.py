@@ -1444,24 +1444,29 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if plan_params.attention_mask_data is None and plan_params.multi_item_params is None:
                 wrappers = self._plan_params_to_wrappers[plan_params]
                 if wrappers.fa2_plan_num_blocks is not None:
-                    num_blocks = tuple(self.num_blocks[self.num_contexts:])
-                    if not num_blocks:
-                        wrappers.fa2_plan_num_blocks = None
-                    elif wrappers.fa2_plan_num_blocks == num_blocks:
-                        continue
-                    else:
-                        # Graph replay does not re-enter forward_impl. Refresh
-                        # captured FA2 schedules here; each wrapper owns its
-                        # persistent integer plan workspace, while the shared
-                        # float workspace is run scratch.
-                        wrappers.is_planned = False
-                        self._plan_with_params(plan_params)
-                        continue
+                    continue
                 wrappers.is_planned = False
                 if not defer_plan:
                     self._plan_with_params(plan_params)
             else:
                 del self._plan_params_to_wrappers[plan_params]
+
+    def _refresh_fa2_cuda_graph_plans(self) -> None:
+        """Refresh captured FA2 schedules after page metadata is finalized."""
+        num_blocks = tuple(self.num_blocks[self.num_contexts:])
+        for plan_params, wrappers in self._plan_params_to_wrappers.items():
+            if (plan_params.attention_mask_data is not None
+                    or plan_params.multi_item_params is not None
+                    or wrappers.fa2_plan_num_blocks is None):
+                continue
+            if not num_blocks:
+                wrappers.fa2_plan_num_blocks = None
+            elif wrappers.fa2_plan_num_blocks != num_blocks:
+                # Graph replay does not re-enter forward_impl. Each wrapper
+                # owns its persistent integer plan workspace, while the shared
+                # float workspace is run scratch.
+                wrappers.is_planned = False
+                self._plan_with_params(plan_params)
 
     def prepare(self) -> None:
 
@@ -1699,18 +1704,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        # Defer ordinary multi-wrapper plans to forward_impl. Captured FA2
-        # schedule refreshes are handled eagerly by _clean_cached_plans because
-        # graph replay does not re-enter Python. Single-wrapper models still
-        # plan eagerly because forward_impl cannot plan during graph capture.
-        active_wrappers = [
-            pp for pp in self._plan_params_to_wrappers
-            if pp.attention_mask_data is None
-        ]
-        defer_plan = len(active_wrappers) > 1
-        if not (self._is_separate_kv_draft_view and self.is_cuda_graph):
-            self._clean_cached_plans(defer_plan=defer_plan)
-
         # Re-plan MLA wrappers outside of forward/capture using the params
         # cached by prior warmup forwards. Forward still handles first-use or
         # dtype/shape changes by syncing only on a plan cache miss.
@@ -1840,6 +1833,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                              non_blocking=True)
                     if self.num_generations < batch_size:
                         kv_lens_buf[self.num_generations:batch_size].zero_()
+
+        # Refresh captured FA2 schedules only after all page metadata updates.
+        # Defer ordinary multi-wrapper plans to forward_impl; single-wrapper
+        # models still plan eagerly because forward_impl cannot plan during
+        # graph capture.
+        active_wrappers = [
+            pp for pp in self._plan_params_to_wrappers
+            if pp.attention_mask_data is None
+        ]
+        defer_plan = len(active_wrappers) > 1
+        if not (self._is_separate_kv_draft_view and self.is_cuda_graph):
+            self._refresh_fa2_cuda_graph_plans()
+            self._clean_cached_plans(defer_plan=defer_plan)
+
         if (not self._is_shared_kv_draft_view
                 and not self._is_separate_kv_draft_view
                 and self._draft_metadata is not None):
@@ -2072,9 +2079,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if decode_wrapper._backend == 'trtllm-gen':
                 block_tables = self._build_decode_block_tables(
                     plan_params, wrappers)
-            planned_max_kv_len = (decode_wrapper._max_kv_len
-                                  if wrappers.fa2_plan_num_blocks is not None
-                                  else None)
             decode_wrapper.plan(
                 paged_kv_indptr[:self.num_generations + 1],
                 self.paged_kv_indices[self.num_context_blocks:],
@@ -2093,9 +2097,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 q_len_per_req=plan_params.q_len_per_req,
                 disable_split_kv=False,
             )
-            if planned_max_kv_len is not None:
-                decode_wrapper._max_kv_len = max(planned_max_kv_len,
-                                                 decode_wrapper._max_kv_len)
             if use_graph_tensor_cores and decode_wrapper._backend == 'fa2':
                 wrappers.fa2_plan_num_blocks = tuple(
                     self.num_blocks[self.num_contexts:])
