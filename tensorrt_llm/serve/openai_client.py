@@ -155,6 +155,11 @@ class OpenAIHttpClient(OpenAIClient):
         )
         self._no_retry = os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
         self._max_retries = 0 if self._no_retry else max_retries
+        if self._no_retry:
+            logger.info(
+                "Disaggregated HTTP retry is DISABLED by "
+                f"TRTLLM_DISAGG_NO_RETRY=1 for role={role.name}"
+            )
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics

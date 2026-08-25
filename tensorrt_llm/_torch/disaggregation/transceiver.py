@@ -90,6 +90,10 @@ def _validate_fp4_mla_bridge_profile(
         return False
     supported = (
         os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
+        and cache_transceiver_config.backend == "NIXL"
+        and cache_transceiver_config.transceiver_runtime == "PYTHON"
+        and cache_transceiver_config.kv_transfer_timeout_ms is not None
+        and cache_transceiver_config.kv_transfer_timeout_ms > 0
         and mapping.enable_attention_dp
         and mapping.pp_size == 1
         and mapping.cp_size == 1
@@ -99,8 +103,8 @@ def _validate_fp4_mla_bridge_profile(
     )
     if not supported:
         raise ValueError(
-            "FP4 MLA lifecycle bridge requires no-retry ADP, PP1/CP1, "
-            "async non-layerwise Python/NIXL transfer, and bounce disabled"
+            "FP4 MLA lifecycle bridge requires a finite timeout, no-retry ADP, "
+            "PP1/CP1, async non-layerwise Python/NIXL transfer, and bounce disabled"
         )
     return True
 
@@ -170,6 +174,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 enforce_physical_ownership=enforce_physical_ownership,
             )
         )
+        if enforce_physical_ownership:
+            logger.info(
+                "FP4 MLA KV ownership bridge ENABLED: "
+                f"rank={rank}/{mapping.world_size}, backend=NIXL, runtime=PYTHON, "
+                "schedule=GENERATION_FIRST, attention_dp=True, pp=1, cp=1, "
+                "retry=False, async=True, layerwise=False, bounce_mb=0, "
+                f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}"
+            )
         logger.info(
             f"KvCacheTransceiverV2 setup: rank={rank} TransferWorker ready; "
             "broadcast context endpoint (collective)"
