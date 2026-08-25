@@ -216,8 +216,10 @@ TEST_F(PeftCacheManagerTest, adapterDataTypeRecalculatesHostByteBudgetPageCapaci
     bf16ModelConfig.setLoraModules(mModelConfig->getLoraModules());
     bf16ModelConfig.setMaxLoraRank(mModelConfig->getMaxLoraRank());
 
-    PeftCacheManagerConfig config(0, 2 * 8 * 92, 8, 64, 1, 1);
-    config.hostCacheSize = 100000000; // 100 MB
+    SizeType32 constexpr kDeviceModuleLayerCount = 2 * 8 * 92;
+    size_t constexpr kHostCacheByteBudget = 100'000'000; // 100 MB
+    PeftCacheManagerConfig config(0, kDeviceModuleLayerCount, 8, 64, 1, 1);
+    config.hostCacheSize = kHostCacheByteBudget;
     auto const [initialHostConfig, initialDeviceConfig]
         = PeftCacheManager::getPageManagerConfig(config, bf16ModelConfig, *mWorldConfig, *mManager);
     auto peftManager = std::make_unique<PeftCacheManager>(config, bf16ModelConfig, *mWorldConfig, *mManager);
@@ -226,7 +228,7 @@ TEST_F(PeftCacheManagerTest, adapterDataTypeRecalculatesHostByteBudgetPageCapaci
     auto const slotsPerPage = static_cast<uint64_t>(initialHostConfig.getSlotsPerPage());
     auto const fp8PageSlotBytes
         = pageWidth * static_cast<uint64_t>(runtime::BufferDataType(tensorrt_llm::DataType::kFP8).getSize());
-    auto const fp8HostSlots = static_cast<uint64_t>(config.hostCacheSize.value()) / fp8PageSlotBytes;
+    auto const fp8HostSlots = static_cast<uint64_t>(kHostCacheByteBudget) / fp8PageSlotBytes;
     auto const expectedFp8HostPages = (fp8HostSlots + slotsPerPage - 1) / slotsPerPage;
 
     EXPECT_EQ(tensorrt_llm::DataType::kBF16, initialHostConfig.getDataType());
@@ -247,8 +249,10 @@ TEST_F(PeftCacheManagerTest, adapterDataTypeRecalculatesDeviceByteBudgetPageCapa
     bf16ModelConfig.setLoraModules(mModelConfig->getLoraModules());
     bf16ModelConfig.setMaxLoraRank(mModelConfig->getMaxLoraRank());
 
-    PeftCacheManagerConfig config(2 * 8 * 128, 0, 8, 64, 1, 1);
+    SizeType32 constexpr kHostModuleLayerCount = 2 * 8 * 128;
+    SizeType32 constexpr kFp8ToBf16CapacityRatio = 2;
     float constexpr kDeviceCachePercent = 0.0001F;
+    PeftCacheManagerConfig config(kHostModuleLayerCount, 0, 8, 64, 1, 1);
     config.deviceCachePercent = kDeviceCachePercent;
     auto peftManager = std::make_unique<PeftCacheManager>(config, bf16ModelConfig, *mWorldConfig, *mManager);
     auto const initialDevicePages = peftManager->getMaxDevicePages();
@@ -259,8 +263,8 @@ TEST_F(PeftCacheManagerTest, adapterDataTypeRecalculatesDeviceByteBudgetPageCapa
     // Reusing one byte budget gives FP8 twice the BF16 slots; page rounding can
     // shift the doubled page count by one.
     EXPECT_GT(fp8DevicePages, initialDevicePages);
-    EXPECT_GE(fp8DevicePages, 2 * initialDevicePages - 1);
-    EXPECT_LE(fp8DevicePages, 2 * initialDevicePages + 1);
+    EXPECT_GE(fp8DevicePages, kFp8ToBf16CapacityRatio * initialDevicePages - 1);
+    EXPECT_LE(fp8DevicePages, kFp8ToBf16CapacityRatio * initialDevicePages + 1);
 }
 #endif
 
