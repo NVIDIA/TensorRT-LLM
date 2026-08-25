@@ -21,7 +21,7 @@ from unittest import mock
 import pytest
 import torch
 from datasets import load_dataset
-from defs.conftest import get_sm_version, is_sm_100f
+from defs.conftest import get_sm_version, is_sm_100f, skip_pre_rubin
 from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM
@@ -2777,9 +2777,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("moe_backend", ["TRTLLM"])
     @parametrize_with_ids("enable_autotuner", [False, True])
     def test_nvfp4_fine_grained_sync(self, fp8kv, attention_dp, cuda_graph,
-                                overlap_scheduler, torch_compile, mtp_nextn,
-                                moe_backend, nvfp4_gemm_backend,
-                                enable_autotuner):
+                                     overlap_scheduler, torch_compile,
+                                     mtp_nextn, moe_backend, enable_autotuner):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -2787,12 +2786,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend=moe_backend))
-        if nvfp4_gemm_backend is not None:
-            pytorch_config['nvfp4_gemm_config'] = Nvfp4GemmConfig(
-                allowed_backends=[nvfp4_gemm_backend])
         mtp_config = None
         if mtp_nextn > 0:
-            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
 
         if fp8kv:
             kv_cache_config.dtype = "fp8"
@@ -5427,8 +5423,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         (False, False),
         (True, True),
     ])
-    def test_w4a8_mxfp4_fine_grained_sync(self, enable_autotuner, activation_dtype,
-                                     cuda_graph, overlap_scheduler):
+    def test_w4a8_mxfp4_fine_grained_sync(self, enable_autotuner,
+                                          activation_dtype, cuda_graph,
+                                          overlap_scheduler):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -5453,7 +5450,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     def test_w4a16_mxfp4_fine_grained_sync(self, enable_autotuner, cuda_graph,
-                                      overlap_scheduler):
+                                           overlap_scheduler):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -6077,7 +6074,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     def test_w4_1gpu_fine_grained_sync(self, enable_autotuner, cuda_graph,
-                                  overlap_scheduler, mocker):
+                                       overlap_scheduler, mocker):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})

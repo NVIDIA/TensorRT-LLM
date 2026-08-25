@@ -333,7 +333,8 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         }
         catch (std::exception const& e)
         {
-            TLLM_LOG_DEBUG("No valid FineGrained fp8 per-tensor config for tileN=%d: %s", (int) tile_tokens_dim, e.what());
+            TLLM_LOG_DEBUG(
+                "No valid FineGrained fp8 per-tensor config for tileN=%d: %s", (int) tile_tokens_dim, e.what());
             moe_runner = nullptr;
         }
     }
@@ -352,7 +353,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
-    moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
+    moe_runner->run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
     return output;
 }
 } // namespace torch_ext

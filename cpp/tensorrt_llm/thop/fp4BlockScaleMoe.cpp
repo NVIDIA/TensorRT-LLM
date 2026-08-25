@@ -456,7 +456,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
         = expanded_idx_to_permuted_idx.data_ptr<int>(); // Needed by permute/finalize kernels
     workspace.permuted_idx_to_token_idx = permuted_idx_to_token_idx.data_ptr<int>(); // Needed by permuteGemm1 kernel
 
-    workspace.expert_weights = expert_weights_ptr;                                   // Consumed by finalize kernel
+    workspace.expert_weights = expert_weights_ptr; // Consumed by finalize kernel
 
     workspace.cta_idx_xy_to_batch_idx = cta_idx_xy_to_batch_idx.data_ptr<int>();
     workspace.cta_idx_xy_to_mn_limit = cta_idx_xy_to_mn_limit.data_ptr<int>();
@@ -534,8 +534,8 @@ public:
             }
             catch (std::exception const& e)
             {
-                TLLM_LOG_DEBUG("No %s FP4BlockScaleMoe runner for tileN=%d: %s", useFineGrained ? "FineGrained" : "non-FineGrained",
-                    tileN, e.what());
+                TLLM_LOG_DEBUG("No %s FP4BlockScaleMoe runner for tileN=%d: %s",
+                    useFineGrained ? "FineGrained" : "non-FineGrained", tileN, e.what());
             }
             it = mRunners.emplace(std::move(key), std::move(runner)).first;
         }

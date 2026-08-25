@@ -413,8 +413,8 @@ public:
     // FIXME: tileTokensDim is hardcoded for now
     Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
         int tileTokensDim = 8, ActType actType = ActType::SwiGlu, bool useFineGrained = false);
-    Runner(
-        batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8, bool useFineGrained = false);
+    Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
+        bool useFineGrained = false);
 
     void run(
         MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex);

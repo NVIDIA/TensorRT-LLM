@@ -284,7 +284,8 @@ void setFineGrainedSyncDisabledOverride(bool disabled)
 bool getEnvUseFineGrainedSync()
 {
     // Deliberately uncached: tests flip the env var between cases within one process.
-    return !gFineGrainedSyncDisabledOverride.load(std::memory_order_relaxed) && getBoolEnv("TLLM_USE_FINE_GRAINED_SYNC");
+    return !gFineGrainedSyncDisabledOverride.load(std::memory_order_relaxed)
+        && getBoolEnv("TLLM_USE_FINE_GRAINED_SYNC");
 }
 
 bool getEnvUseUCXKvCache()

@@ -1522,16 +1522,17 @@ class ModelLoader:
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
-from tensorrt_llm._torch.speculative.utils import (
+        from tensorrt_llm._torch.speculative.utils import (
             resolve_mtp_checkpoint_source, update_spec_config_from_model_config,
             uses_mtp_head_checkpoint)
 
         resolve_mtp_checkpoint_source(self.spec_config, checkpoint_dir)
 
         # Mirror use_fine_grained_sync into env var so C++ getEnvUseFineGrainedSync()
-        # sees it at kernel-option construction time.
-        os.environ["TLLM_USE_FINE_GRAINED_SYNC"] = (
-            "1" if self.llm_args.use_fine_grained_sync else "0")
+        # sees it at kernel-option construction time. Never write "0": that would
+        # clobber an externally exported TLLM_USE_FINE_GRAINED_SYNC=1.
+        if self.llm_args.use_fine_grained_sync:
+            os.environ["TLLM_USE_FINE_GRAINED_SYNC"] = "1"
         load_config_kwargs = dict(
             checkpoint_dir=checkpoint_dir,
             trust_remote_code=self.llm_args.trust_remote_code,

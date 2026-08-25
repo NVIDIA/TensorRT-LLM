@@ -5551,8 +5551,9 @@ class TorchLlmArgs(BaseLlmArgs):
     use_fine_grained_sync: bool = Field(
         default=False,
         description=
-        "Enable fine-grained synchronization for MoE kernels. When enabled, uses fine-grained-sync kernel variants "
-        "that overlap communication with computation for improved performance on multi-GPU setups.",
+        "Enable fine-grained synchronization for MoE kernels on SM107. The FC1 producer kernel signals "
+        "per-tile completion flags in device memory and the FC2 consumer kernel waits on them, so the "
+        "two GEMMs overlap instead of serializing at kernel launch boundaries.",
         status="prototype")
 
     enable_layerwise_nvtx_marker: bool = Field(

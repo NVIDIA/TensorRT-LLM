@@ -15,6 +15,7 @@
 
 import os
 import sys
+from contextlib import contextmanager
 from typing import Tuple
 
 import pytest
@@ -2106,7 +2107,8 @@ class TestMoeFp4:
     ],
 )
 def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
-                                  use_topk_as_input, use_fine_grained, routing_info):
+                                  use_topk_as_input, use_fine_grained,
+                                  routing_info):
     if use_fine_grained and getSMVersion() != 107:
         pytest.skip("fine-grained sync requires SM107")
     torch.random.manual_seed(0)
@@ -2387,7 +2389,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         if getSMVersion() != 107:
             pytest.skip("fine-grained sync requires SM107")
         if dtype_activation == "fp8":
-            pytest.skip("FineGrained not supported for fp8 (e4m3_mxe2m1) precision")
+            pytest.skip(
+                "FineGrained not supported for fp8 (e4m3_mxe2m1) precision")
 
     assert top_k <= num_experts
     assert top_k <= 10
