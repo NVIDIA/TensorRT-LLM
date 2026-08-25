@@ -143,6 +143,20 @@ class MoEWeightOwnerMixin:
         self._weights_created = True
         self._check_configs()
 
+    def _get_quant_method(self) -> object:
+        """Resolve the quantization method that owns this module's weights.
+
+        No default is possible -- a Cutlass-layout NVFP4 method is not
+        interchangeable with a TRTLLMGen one. ``MoEImplBase`` restates this as
+        ``@abc.abstractmethod`` so a missing override fails at construction;
+        ``MoE`` has no ``ABCMeta``, so this body is what stands in for that,
+        naming the method that is actually missing instead of surfacing as an
+        ``AttributeError`` from inside ``create_weights`` below.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} owns expert weights but does not implement _get_quant_method()."
+        )
+
     def _check_configs(self) -> None:
         """Invariants to assert once the weights exist.
 
