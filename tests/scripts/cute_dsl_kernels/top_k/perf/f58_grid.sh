@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Full-grid re-run on the current tree (post P4 fold work), fresh f58 prefix.
 BR=${GVR_BENCH_OUT:-./bench_results}
 cd "$(dirname "$0")"

@@ -8,15 +8,15 @@ equality. This file exposes every knob
 ``use_constant_hint``, ``compress_ratio``, ``max_seq_len`` hint) so bench
 scripts can override the heuristic.
 
-**Not in CI** — this file imports the DSL kernel module directly
+**Not in CI** - this file imports the DSL kernel module directly
 (no ``trtllm`` runtime dep), to enable knob-A/B development outside the
 production op.
 
 Two usage modes:
 
-* `python -m pytest run_gvr_topk.py`` — exhaustive parameterized correctness sweep
-  (dtype × K × N × seed × next_n × T × V × warp-parallel-reduce).
-* ``python run_gvr_topk.py --dtype bf16 --top_k 1024 --N 8192`` —
+* `python -m pytest run_gvr_topk.py`` - exhaustive parameterized correctness sweep
+  (dtype x K x N x seed x next_n x T x V x warp-parallel-reduce).
+* ``python run_gvr_topk.py --dtype bf16 --top_k 1024 --N 8192`` -
   single-case correctness verification on user-specified shape; knob
   overrides via ``--num_threads`` / ``--use_256bit_load`` / etc.
 """
@@ -231,7 +231,7 @@ def _compile(
         self_scan=self_scan,
         cap_c=cap_c,
         # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed;
-        # the qfrac values are unused here — only the slot count matters.
+        # the qfrac values are unused here - only the slot count matters.
         r0_qfracs=(0.85, 0.35) if (use_ext_counts or ext_rungs) else None,
     )
     return cute.compile(
@@ -284,16 +284,16 @@ def emu_block_max(
     """``[num_rows, nb_pad*4] fp32`` warp-partial upper-bound records.
 
     tail_mode:
-      "exact":   tight bound — max over valid positions only.
+      "exact":   tight bound - max over valid positions only.
       "pad_inf": a partially-valid tail unit is forced to +FLT_MAX, the
                  worst legal inflation (the indexer masks by request-level
                  ctx >= N_eff, so tail positions can inflate the bound).
     records:
-      "rotate":     fold-correctness fixture — the 128-block max lands in
+      "rotate":     fold-correctness fixture - the 128-block max lands in
                     ONE slot rotated by blk % 4, the other 3 hold
                     -FLT_MAX. Valid ONLY for grain-128 consumers (slots
                     are NOT positional).
-      "positional": production semantics — record r is the exact max of
+      "positional": production semantics - record r is the exact max of
                     positions [r*32, r*32+32) (the indexer's TMEM T2R
                     partition gives warp w of a tile the contiguous
                     positions [tile*128 + w*32, +32)). Required for
@@ -582,7 +582,7 @@ def emu_cand(
 
     Unordered (value fp32-bits, index) pairs of all valid positions
     >= t_0 = seed_thr[:, 0]; ctl = {claimed, void}. claimed may
-    over-approximate the true count (window sentinels, idx word = -1) —
+    over-approximate the true count (window sentinels, idx word = -1) -
     ``sentinel_pad`` injects that legally. void=1 when claimed > cap; on
     overflow only the first ``cap`` entries are materialized (contract v2:
     consumers scan [0, min(claimed, cap)) skipping sentinels).
@@ -624,7 +624,7 @@ def emu_cand(
 def enc_ordered_f32(t: torch.Tensor) -> torch.Tensor:
     """Order-preserving int encoding of fp32 (an involution).
 
-    Stored back in fp32 slots — matches the indexer's encoded-int atomic
+    Stored back in fp32 slots - matches the indexer's encoded-int atomic
     min/max.
     """
     bits = t.float().contiguous().view(torch.int32)
@@ -635,7 +635,7 @@ def enc_ordered_f32(t: torch.Tensor) -> torch.Tensor:
 def hit_agg_identities(num_rows: int, device) -> torch.Tensor:
     """Identity-initialized per-row hit aggregate.
 
-    {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} — the required initial state of
+    {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} - the required initial state of
     the buffer the indexer atomically merges into.
     """
     ident = torch.tensor([_FLT_MAX, -_FLT_MAX], dtype=torch.float32, device=device)
@@ -699,9 +699,9 @@ def gvr_topk_decode(
     Args:
         logits:    ``[num_rows, max_S]`` float32 / bfloat16 / float16.
         pre_idx:   ``[num_rows // next_n, pre_idx_count]`` int32.
-                   ``pre_idx[..., 0]`` must be the argmax index — indexer invariant.
+                   ``pre_idx[..., 0]`` must be the argmax index - indexer invariant.
         seq_lens:  ``[num_rows // next_n]`` int32 (uncompressed-token space).
-        top_k:     K ∈ {512, 1024, 2048} — compile-time specialized.
+        top_k:     K in {512, 1024, 2048} - compile-time specialized.
         next_n:    Temporal stride for V3.2 ``preIdxOffset = (row % next_n) + 1``.
         compress_ratio: KV-indexer compression factor (1 = DSv3.2, 4 = DSv4).
                    When != 1, logits/preIdx live in compressed-token-index space:
@@ -725,7 +725,7 @@ def gvr_topk_decode(
                    round; every warp reduces the staged warp counts and
                    replays the classify + secant update in registers.
                    False restores the leader cadence.
-        order_row: Required iff ``seqlen_sorted=True``. Request-level —
+        order_row: Required iff ``seqlen_sorted=True``. Request-level -
                    ``int32[batch_size = num_rows // next_n]`` on the same
                    device as ``logits``; ``order_row[i]`` is the original
                    request_id of the i-th-priority request. The kernel
@@ -998,7 +998,7 @@ def gvr_topk_sort_prepare(seq_lens: torch.Tensor) -> torch.Tensor:
 
     Returns ``int32[batch_size]`` (= ``seq_lens.shape[0]`` =
     ``num_rows // next_n``) whose i-th entry is the original-batch index
-    of the i-th longest request — request-level, NOT row-level. The
+    of the i-th longest request - request-level, NOT row-level. The
     kernel expands to row level via ``order_row[req] * next_n + nn``
     inside the const_expr ``seqlen_sorted`` branch. Run once per decode
     step; the same
@@ -1075,7 +1075,7 @@ def gvr_topk_lb_prepare(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the LB prepare kernel.
 
-    ``seq_lens`` keeps its actual shape ``(batch_size,)`` — the kernel
+    ``seq_lens`` keeps its actual shape ``(batch_size,)`` - the kernel
     is compiled to match that exact shape; ``max_batch_size`` only
     determines the prepare kernel's block size and the ``order_row``
     buffer length. ``long_threshold`` is in SCAN-LENGTH space
@@ -1090,8 +1090,8 @@ def gvr_topk_lb_prepare(
     """
     assert seq_lens.is_cuda and seq_lens.dtype == torch.int32
     # block_prefix_sum_kernel (used inside LB prepare) constraints:
-    # num_warps = max_batch_size / 32 must be > 1 and a power of 2 →
-    # max_batch_size ∈ {64, 128, 256, 512, 1024}.
+    # num_warps = max_batch_size / 32 must be > 1 and a power of 2 ->
+    # max_batch_size in {64, 128, 256, 512, 1024}.
     if not (64 <= max_batch_size <= 1024) or (max_batch_size & (max_batch_size - 1)) != 0:
         raise ValueError(
             f"max_batch_size must be a power of 2 in [64, 1024] "
@@ -1263,9 +1263,9 @@ def _make_inputs(
     """Build (logits, pre_idx, seq_lens) for a multi-row test.
 
     Shapes:
-      logits  : [num_rows, N]                 — compressed-token-index space
-      pre_idx : [num_rows // next_n, top_k]   — argmax in slot 0 (indexer invariant)
-      seq_lens: [num_rows // next_n]          — UNCOMPRESSED-token space
+      logits  : [num_rows, N]                 - compressed-token-index space
+      pre_idx : [num_rows // next_n, top_k]   - argmax in slot 0 (indexer invariant)
+      seq_lens: [num_rows // next_n]          - UNCOMPRESSED-token space
 
     Kernel divides ``seq_lens`` by ``compress_ratio`` internally. Setting
     ``seq_lens = N * cr`` makes the kernel's
@@ -1282,7 +1282,7 @@ def _make_inputs(
     logits_f32 = torch.randn(num_rows, N, dtype=torch.float32, device="cuda") * 2.0
     logits = logits_f32.to(dtype)
     num_groups = num_rows // next_n
-    # argmax must come from the effective scan range, not full N — for
+    # argmax must come from the effective scan range, not full N - for
     # next_n>1 the kernel's row-0 N_eff is only (N - next_n + 1) cols.
     effective_len = N - next_n + 1
     argmax_idx = logits[::next_n, :effective_len].argmax(dim=-1).int()
@@ -1330,7 +1330,7 @@ def _tie_aware_correct(
         actual_kv_len = int(seq_lens_host[row // next_n]) - next_n + ofs + 1
         N_eff = actual_kv_len // compress_ratio
         if N_eff < top_k:
-            # Degenerate path — skip; caller's main() guards against this.
+            # Degenerate path - skip; caller's main() guards against this.
             continue
         row_logits = logits_f32[row, :N_eff]
         topk_vals, _ = torch.topk(row_logits, k=top_k, largest=True, sorted=True)
@@ -1388,7 +1388,7 @@ def test_gvr_topk_decode(
 ) -> None:
     # Kernel scans `N_eff = seq_lens[0] - next_n + (row_idx % next_n) + 1`
     # columns. Smallest row's N_eff = N - next_n + 1. Degenerate path
-    # (N_eff <= top_k) is a separate code branch — skip here.
+    # (N_eff <= top_k) is a separate code branch - skip here.
     if N - next_n + 1 < top_k:
         pytest.skip("N_eff < top_k is degenerate; the kernel requires N_eff >= top_k")
     seed = 42

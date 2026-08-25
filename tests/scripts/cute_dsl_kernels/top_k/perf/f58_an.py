@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# ruff: noqa
-# Measurement harness committed verbatim for provenance; bench idioms
-# (loop-scoped buffers, del/rebind) trip static analysis.
-# f58: B×N 四张表(flash/pro × 算数均值/最小值),逐步配对 vs PR16457,
-# 我们的臂按线上路由(plan_emission)选取。
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# f58: B x N tables (flash/pro, arithmetic mean and minimum), step-by-step
+# paired against PR16457; our arm follows the shipped routing
+# (plan_emission).
 import glob
 import os
 import pickle
@@ -31,7 +31,10 @@ else:
             for k, v in per_step(f).items():
                 agg.setdefault(k, []).extend(v)
         data[a] = agg
-        print(f"  {a}: {len(agg)} 个(格,层)  {sum(len(v) for v in agg.values())} 步", flush=True)
+        print(
+            f"  {a}: {len(agg)} (cell, layer) pairs  {sum(len(v) for v in agg.values())} steps",
+            flush=True,
+        )
     pickle.dump(data, open(PKL, "wb"))
 
 sys.path.insert(
@@ -50,15 +53,15 @@ NS = ["8k", "16k", "32k", "64k", "128k", "256k"]
 BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
 cell = {}
-for m, isl, b in sorted({(m, i, b) for (m, i, b, l) in data["pr"]}):
+for m, isl, b in sorted({(m, i, b) for (m, i, b, lay) in data["pr"]}):
     n = int(isl[:-1]) * 1024 // CR[m]
     tier = plan_emission(b, n, KC[m], True)
     arm = TIER2ARM[tier]
     ratios = []
-    for (mm, ii, bb, l), pr in data["pr"].items():
+    for (mm, ii, bb, lay), pr in data["pr"].items():
         if (mm, ii, bb) != (m, isl, b):
             continue
-        ou = data[arm].get((mm, ii, bb, l), [])
+        ou = data[arm].get((mm, ii, bb, lay), [])
         for j in range(min(len(pr), len(ou))):
             ratios.append(pr[j] / ou[j])
     if ratios:
@@ -68,14 +71,15 @@ for m, isl, b in sorted({(m, i, b) for (m, i, b, l) in data["pr"]}):
 
 
 def table(m, key):
-    print(f"\n### {m} — {'算数均值' if key == 'mean' else '最小值'}(对 PR16457,全层×全步)")
+    label = "arithmetic mean" if key == "mean" else "minimum"
+    print(f"\n### {m} - {label} (vs PR16457, all layers x all steps)")
     print("| B \\ N | " + " | ".join(NS) + " |")
     print("|---" * (len(NS) + 1) + "|")
     for b in BS:
         row = [f"**{b}**"]
         for isl in NS:
             c = cell.get((m, isl, b))
-            row.append(f"{c[key]:.3f}" if c else "—")
+            row.append(f"{c[key]:.3f}" if c else "-")
         print("| " + " | ".join(row) + " |")
 
 
@@ -85,7 +89,7 @@ for m in ("flash", "pro", "v32"):
 
 tot = sum(c["n"] for c in cell.values())
 print(
-    f"\n共 {len(cell)} 格 / {tot} 逐步配对;各格档位:",
+    f"\n{len(cell)} cells / {tot} per-step pairs; tier per cell:",
     {
         t: sum(1 for c in cell.values() if c["tier"] == t)
         for t in ("list", "counts", "rungs", "none")

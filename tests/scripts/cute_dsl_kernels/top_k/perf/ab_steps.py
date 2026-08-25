@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-# ruff: noqa
-# Measurement harness committed verbatim for provenance; bench idioms
-# (loop-scoped buffers, del/rebind) trip static analysis.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: F821
+# The per-grid buffers are released with an explicit `del` at the end of
+# each loop body, which makes the analyzer treat every closure reference
+# to them as possibly-unbound. All F821 reports here are that one idiom.
 # Layer x step complete grid. One NVTX range per (arm, model, isl, B,
 # layer); the COLD reps cycle through ALL usable decode steps (batch
 # refilled from the step's row BEFORE the eviction, so the row itself

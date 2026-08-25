@@ -1,6 +1,6 @@
-# ruff: noqa
-# Measurement harness committed verbatim for provenance; bench idioms
-# (loop-scoped buffers, del/rebind) trip static analysis.
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Per-(layer, step) pairing straight out of the nsys sqlite.
 #
 # One NVTX range = one (arm, model, isl, N, B, layer); inside it the
@@ -10,10 +10,7 @@
 # summary only carries Avg/Min/Max per range, which cannot be paired.
 import glob
 import os
-import re
 import sqlite3
-import sys
-from collections import defaultdict
 
 D = os.environ.get("GVR_BENCH_OUT", "./bench_results")
 
@@ -40,8 +37,8 @@ def per_step(path):
             while i < len(ker) and ker[i][0] < re_:
                 i += 1
             continue
-        _, arm, m, isl, _n, b, l = p
-        acc = out.setdefault((m, isl, int(b[1:]), l), [])
+        _, arm, m, isl, _n, b, lay = p
+        acc = out.setdefault((m, isl, int(b[1:]), lay), [])
         while i < len(ker) and ker[i][0] < re_:
             acc.append(ker[i][1] / 1000.0)
             i += 1
@@ -67,7 +64,7 @@ if __name__ == "__main__":
     data = {a: collect(p) for a, p in arms.items()}
     for a, d in data.items():
         n = sum(len(v) for v in d.values())
-        print(f"  {a}: {len(d)} 个(格,层)  {n} 个步", flush=True)
+        print(f"  {a}: {len(d)} (cell, layer) pairs  {n} steps", flush=True)
     import pickle
 
     with open("/home/scratch.siyid_coreai/workspace/perstep.pkl", "wb") as f:
