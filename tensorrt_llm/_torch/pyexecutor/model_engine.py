@@ -379,12 +379,6 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
 
 class PyTorchModelEngine(ModelEngine):
 
-    # Class-level default: the `moe_load_balancer_iter_info` property is also
-    # read on objects that never run __init__ (engine shells built with
-    # `object.__new__`), and `__init__` itself reads it via the `is_warmup`
-    # setter before the model is loaded.
-    moe_load_balancer: Optional[MoeLoadBalancer] = None
-
     def __init__(
         self,
         *,
@@ -514,6 +508,8 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_format=llm_args.checkpoint_format,
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
+
+        self.moe_load_balancer: Optional[MoeLoadBalancer] = None
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
