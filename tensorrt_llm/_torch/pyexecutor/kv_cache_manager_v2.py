@@ -1293,22 +1293,37 @@ class KVCacheManagerV2(BaseResourceManager):
             # Mixed cache tensors are exposed directly through
             # get_fp8_k_nvfp4_v_buffers(). Keep the legacy pointer metadata
             # valid for scheduler plumbing, but do not pretend K and V share
-            # one scalar pool layout.
+            # one scalar pool layout. Hybrid managers can also own recurrent-
+            # state pools, which retain their native role and mapping offset.
             pool_pointers = []
             for pool_id in range(self.num_pools):
-                layer_id = self._pool_layer_ids_by_role[(pool_id, Role.KEY)]
+                role_a, _ = self._get_pool_roles(pool_id)
+                layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
                 pool_pointers.append(
                     [
                         self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
+                            layer_id, role_a, PageIndexMode.SHARED
                         ),
                         0,
                     ]
                 )
-            pool_mapping = [
-                [self.impl.get_layer_group_id(LayerId(layer_id)), 0]
-                for layer_id in range(self.num_local_layers)
-            ]
+            pool_mapping = []
+            for layer_id in typed_range(LayerId(self.num_local_layers)):
+                pool_id = self.impl.get_layer_group_id(layer_id)
+                role_a, role_b = self._get_pool_roles(pool_id)
+                offset = 0
+                if role_a != Role.KEY:
+                    addr_offset = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, role_a, PageIndexMode.SHARED
+                        )
+                        - pool_pointers[pool_id][0]
+                    )
+                    offset_divisor = self.impl.get_page_stride(layer_id, role_a)
+                    if role_b is not None:
+                        offset_divisor *= self.kv_factor
+                    offset = exact_div(addr_offset, offset_divisor)
+                pool_mapping.append([pool_id, offset])
             return (
                 torch.tensor(
                     pool_pointers,
@@ -1470,7 +1485,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for pool_id in range(self.num_pools):
             role_a, role_b = self._get_pool_roles(pool_id)
             layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
-            if self.is_fp8_k_nvfp4_v:
+            if self.is_fp8_k_nvfp4_v and role_a == Role.KEY:
                 assert role_b is not None
                 key_converter = self.impl.get_page_index_converter(layer_id, role_a)
                 value_layer_id = self._pool_layer_ids_by_role[(pool_id, role_b)]
@@ -3911,7 +3926,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
         if self.is_fp8_k_nvfp4_v:
-            for layer_id in self.layer_offsets:
+            for layer_id, layer_offset in self.layer_offsets.items():
+                pool_id = self.layer_to_pool_mapping_dict[layer_offset]
+                if (pool_id, Role.KEY) not in self._pool_layer_ids_by_role:
+                    continue
                 buffers = self.get_fp8_k_nvfp4_v_buffers(layer_id)
                 yield buffers.key
                 yield buffers.value
