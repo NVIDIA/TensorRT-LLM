@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import os
 import queue
 import socket
@@ -16,10 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
 
-from tensorrt_llm._torch.shared_tensor import (
-    SharedTensorContainer,
-    _SharedTensorRebuildMethodRegistry,
-)
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -29,38 +25,6 @@ from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen.params import VisualGenParams
-
-
-def _release_cpu_ref_blocks(handles: Optional[List[Dict]]) -> int:
-    """Unlink the shared-memory blocks behind reference handles nobody will take.
-
-    Only call this once the consumer is known never to open them: unlinking a
-    block the consumer has not yet opened turns its rebuild into a failure. A
-    dead worker is that signal; a request merely abandoned by its caller is not,
-    because rank0 keeps going and still consumes the handle.
-
-    Unlinking rather than rebuilding keeps it idempotent -- a block the consumer
-    already released is simply absent. CUDA handles carry no unlinkable name and
-    are left alone; the caching allocator reclaims them only once the consumer
-    process is gone.
-    """
-    released = 0
-    for entry in handles or []:
-        handle = entry.get("handle") or {}
-        if handle.get("method_key") != _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
-            continue
-        raw = handle.get("storage_handle")
-        if not raw:
-            continue
-        try:
-            name = base64.b64decode(raw).decode().lstrip("/")
-            os.unlink(os.path.join("/dev/shm", name))
-            released += 1
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            logger.warning(f"DiffusionClient: could not release shared block {raw!r}: {exc}")
-    return released
 
 
 # Timeouts (seconds) for the client-side coordinator.
@@ -311,9 +275,6 @@ class DiffusionRequest:
         """
         if self.params is None:
             return
-        # Publish the list before filling it: if a later reference fails to
-        # reach shared memory, the blocks already taken are still reachable
-        # for the reclaim path instead of leaking.
         self.ref_handles = handles = []
         for slot in ("image_reference", "video_reference", "audio_reference"):
             for index, ref in enumerate(getattr(self.params, slot, None) or []):
@@ -334,9 +295,8 @@ class DiffusionRequest:
     def refs_from_shm(self) -> None:
         """Restore reference payloads from shared memory, in place (consumer side).
 
-        Each handle is taken independently: one that cannot be rebuilt must not
-        strand the blocks behind it, since this is also the reclaim path and a
-        handle nobody consumes keeps its block mapped until the process exits.
+        Each handle is taken independently so one that cannot be rebuilt does
+        not strand the blocks behind it.
         """
         failures = []
         for entry in self.ref_handles or []:
@@ -842,11 +802,6 @@ class DiffusionRemoteClient:
         # full PipelineOutput tensor does not pin in completed_responses for
         # the process lifetime.
         self._abandoned_request_ids: Set[int] = set()
-        # Handles of requests already handed to the workers. rank0 frees a
-        # block by consuming it, so an entry here means "sent, not yet known
-        # consumed" -- what has to be released if the workers die first.
-        self._sent_ref_handles: Dict[int, List[Dict]] = {}
-
         # Iteration-stats tracker — populated on lifecycle events (enqueue,
         # request started, response received) and drained by
         # ``get_iteration_stats`` for the /metrics HTTP endpoint.  Mirrors
@@ -1042,8 +997,6 @@ class DiffusionRemoteClient:
 
             logger.info(f"DiffusionClient: Sending request {req.request_id}")
             self.requests_ipc.put(req)
-            if req.ref_handles:
-                self._sent_ref_handles[req.request_id] = req.ref_handles
             # Once the request has been handed to the workers it becomes the
             # in-flight ("active") request from the client's perspective.
             self._iter_stats.record_request_started(req.request_id, self.pending_requests.qsize())
@@ -1052,11 +1005,6 @@ class DiffusionRemoteClient:
         except Exception as e:
             logger.error(f"DiffusionClient: Error sending request: {e}")
             logger.error(traceback.format_exc())
-            if req is not None and req.ref_handles:
-                # The request never reached rank0, so nothing downstream will
-                # consume its handles, and an unconsumed handle keeps its
-                # shared-memory block mapped until this process exits.
-                req.refs_from_shm()
 
     def _process_responses(self):
         """Poll and process responses."""
@@ -1077,22 +1025,6 @@ class DiffusionRemoteClient:
         except Exception as e:
             logger.error(f"DiffusionClient: Error processing response: {e}")
 
-    def _forget_sent_handles(self, request_id: int) -> None:
-        """A response means rank0 got that far, so its blocks are its own now."""
-        self._sent_ref_handles.pop(request_id, None)
-
-    def _release_sent_handles(self, reason: str) -> None:
-        """Release the blocks of every request the workers can no longer take."""
-        if not self._sent_ref_handles:
-            return
-        outstanding, self._sent_ref_handles = self._sent_ref_handles, {}
-        released = sum(_release_cpu_ref_blocks(h) for h in outstanding.values())
-        if released:
-            logger.warning(
-                f"DiffusionClient: released {released} shared block(s) from "
-                f"{len(outstanding)} unfinished request(s) after {reason}"
-            )
-
     async def _store_response(self, response: DiffusionResponse):
         """Store response in the completed_responses dict (async helper).
 
@@ -1100,7 +1032,6 @@ class DiffusionRemoteClient:
         late-arriving responses for timed-out requests do not leak into
         ``completed_responses`` for the process lifetime.
         """
-        self._forget_sent_handles(response.request_id)
         async with self.lock:
             if response.request_id in self._abandoned_request_ids:
                 self._abandoned_request_ids.discard(response.request_id)
@@ -1189,37 +1120,9 @@ class DiffusionRemoteClient:
         while not self.shutdown_event.is_set():
             self._process_requests()
             self._process_responses()
-            if self._sent_ref_handles and self._workers_gone():
-                # A dead worker cannot open a block, so the ones it never got
-                # to are safe to release -- and nothing else will.
-                self._release_sent_handles("worker exit")
             await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
 
         self._cleanup_ipc()
-
-    def _workers_gone(self) -> bool:
-        """Whether the processes (or the external-launch thread) that consume
-        requests have exited."""
-        if self.worker_processes:
-            return any(not p.is_alive() for p in self.worker_processes)
-        if self._ext_worker_thread is not None:
-            return not self._ext_worker_thread.is_alive()
-        return False
-
-    def _reclaim_pending_handles(self) -> None:
-        """Consume the handles of requests that will never be sent.
-
-        A request abandoned in the queue still holds shared-memory blocks that
-        nothing downstream will consume, and they stay mapped until this
-        process exits.
-        """
-        while True:
-            try:
-                req = self.pending_requests.get_nowait()
-            except queue.Empty:
-                return
-            if req is not None and req.ref_handles:
-                req.refs_from_shm()
 
     def shutdown(self):
         """Shutdown client and workers."""
@@ -1231,9 +1134,6 @@ class DiffusionRemoteClient:
             logger.warning("DiffusionClient: Force stopping background thread")
             self.shutdown_event.set()
             self.background_thread.join(timeout=1.0)
-            self._reclaim_pending_handles()
-
-        self._reclaim_pending_handles()
 
         # Shutdown workers
         logger.info("DiffusionClient: Stopping workers")

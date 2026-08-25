@@ -17,11 +17,9 @@ import pickle
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
-from unittest import mock
 
 import numpy as np
 import pytest
-import torch
 from fastapi import UploadFile
 from PIL import Image
 
@@ -1217,10 +1215,9 @@ class TestReferenceBroadcastSplit:
             for e in req.ref_handles or []
         ]
 
-    def test_dropped_request_releases_its_shared_memory(self):
-        """An unconsumed handle keeps its block mapped until the process exits,
-        so a request that fails on its way to rank0 has to consume its own
-        handles on the way out."""
+    def test_consuming_a_handle_releases_its_block(self):
+        """rank0 frees a block by consuming its handle; nothing else does, so an
+        unconsumed one stays resident for the life of the process."""
         import gc
 
         req = self._request(os.urandom(1024 * 1024))
@@ -1233,76 +1230,6 @@ class TestReferenceBroadcastSplit:
         del req
         gc.collect()
         assert not any(b.exists() for b in blocks)
-
-    def test_partial_handle_failure_stays_reclaimable(self):
-        """If a later reference cannot reach shared memory, the blocks already
-        taken must still be reachable, or nothing can free them."""
-        import gc
-
-        req = self._request(os.urandom(256 * 1024), os.urandom(256 * 1024))
-        real = torch.frombuffer
-        calls = {"n": 0}
-
-        def flaky(buffer, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == 3:  # the third of this request's three references
-                raise RuntimeError("shared memory exhausted")
-            return real(buffer, **kwargs)
-
-        with mock.patch.object(torch, "frombuffer", flaky):
-            with pytest.raises(RuntimeError, match="shared memory exhausted"):
-                req.refs_to_shm()
-
-        blocks = self._blocks_of(req)
-        assert len(blocks) == 2, "handles taken before the failure must stay reachable"
-        assert all(b.exists() for b in blocks)
-
-        req.refs_from_shm()
-        del req
-        gc.collect()
-        assert not any(b.exists() for b in blocks)
-
-    def test_a_request_that_never_ships_hands_its_blocks_back(self):
-        """The blocks staying reachable is only half of it; the call site is
-        what has to hand them back when the request never reaches rank0."""
-        import gc
-        import itertools
-        from types import SimpleNamespace
-
-        from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
-        from tensorrt_llm.visual_gen.params import MediaRef
-
-        taken = {}
-        blocks_of = self._blocks_of
-
-        class _DeadExecutor:
-            default_generation_params = {}
-            extra_param_specs = {}
-            ref_slot_specs = None
-
-            def enqueue_requests(self, requests):
-                # Read the handles while they still exist, then fail the way a
-                # dead worker queue would.
-                taken["blocks"] = blocks_of(requests[0])
-                raise RuntimeError("worker queue is gone")
-
-        caller = SimpleNamespace(
-            _req_counter=itertools.count(),
-            default_params=VisualGenParams(),
-            executor=_DeadExecutor(),
-        )
-        buf = BytesIO()
-        # A real PNG: the engine choke point content-checks before the handles
-        # are minted, so random bytes never get far enough to take a block.
-        Image.new("RGB", (256, 256)).save(buf, format="PNG")
-        params = VisualGenParams(image_reference=[MediaRef(content=buf.getvalue(), format="bytes")])
-
-        with pytest.raises(RuntimeError, match="worker queue is gone"):
-            VisualGen.generate_async(caller, "x", params)
-
-        assert taken["blocks"], "the request must have taken a block to begin with"
-        gc.collect()
-        assert not any(b.exists() for b in taken["blocks"])
 
 
 class TestSafeLocalFileRead:

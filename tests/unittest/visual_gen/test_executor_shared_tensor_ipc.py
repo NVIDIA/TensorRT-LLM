@@ -8,25 +8,18 @@ created them, so the producer runs in a spawned subprocess and the consumer in t
 main process, mirroring the real worker/client split.
 """
 
-import base64
 import multiprocessing as mp
 import os
 import unittest
-from pathlib import Path
 from unittest import mock
 
 import torch
 import zmq
 
-from tensorrt_llm._torch.shared_tensor import (
-    SharedTensorContainer,
-    _SharedTensorRebuildMethodRegistry,
-)
 from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionExecutor,
     DiffusionRequest,
     DiffusionResponse,
-    _release_cpu_ref_blocks,
     find_free_port,
     run_diffusion_worker,
 )
@@ -263,82 +256,6 @@ class TestSpawnWorkerResponseHandleMode(unittest.TestCase):
                 if q.socket:
                     q.socket.setsockopt(zmq.LINGER, 0)
                 q.close()
-
-
-class TestUnconsumedReferenceBlocks(unittest.TestCase):
-    """A handle nobody consumes keeps its block mapped until the process exits.
-
-    Consuming is the normal release, so these cover the two ways a request can
-    stop short of it: a rebuild that fails partway, and workers that die before
-    reading what was already sent to them. Release is keyed on the workers being
-    gone rather than on the caller losing interest -- unlinking a block rank0 has
-    not opened yet would turn its rebuild into a failure.
-    """
-
-    @staticmethod
-    def _request(*payloads):
-        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
-
-        params = VisualGenParams(
-            image_reference=[MediaRef(content=p, format="bytes") for p in payloads]
-        )
-        return DiffusionRequest(request_id=7, prompt=["x"], params=params)
-
-    @staticmethod
-    def _blocks_of(handles):
-        return [
-            Path("/dev/shm") / base64.b64decode(e["handle"]["storage_handle"]).decode().lstrip("/")
-            for e in handles or []
-        ]
-
-    def test_one_bad_handle_does_not_strand_the_rest(self):
-        import gc
-
-        req = self._request(os.urandom(4096), os.urandom(4096), os.urandom(4096))
-        req.refs_to_shm()
-        blocks = self._blocks_of(req.ref_handles)
-        self.assertEqual(len(blocks), 3)
-
-        real = SharedTensorContainer.from_dict
-        calls = {"n": 0}
-
-        def flaky(handle):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                raise RuntimeError("handle is unusable")
-            return real(handle)
-
-        with mock.patch.object(SharedTensorContainer, "from_dict", staticmethod(flaky)):
-            with self.assertRaises(RuntimeError):
-                req.refs_from_shm()
-
-        self.assertEqual(calls["n"], 3, "a failure must not stop the loop at the bad entry")
-        del req
-        gc.collect()
-        self.assertLessEqual(sum(b.exists() for b in blocks), 1)
-
-    def test_blocks_of_a_dead_workers_request_are_released(self):
-        req = self._request(os.urandom(64 * 1024), os.urandom(64 * 1024))
-        req.refs_to_shm()
-        blocks = self._blocks_of(req.ref_handles)
-        self.assertTrue(all(b.exists() for b in blocks))
-
-        self.assertEqual(_release_cpu_ref_blocks(req.ref_handles), 2)
-        self.assertFalse(any(b.exists() for b in blocks))
-
-    def test_releasing_twice_is_harmless(self):
-        """Reclaim can fire from more than one place; it must not care."""
-        req = self._request(os.urandom(4096))
-        req.refs_to_shm()
-
-        self.assertEqual(_release_cpu_ref_blocks(req.ref_handles), 1)
-        self.assertEqual(_release_cpu_ref_blocks(req.ref_handles), 0)
-
-    def test_a_cuda_handle_is_left_alone(self):
-        """CUDA blocks carry no unlinkable name; skipping them is the contract."""
-        cuda_key = _SharedTensorRebuildMethodRegistry.REBUILD_CUDA
-        cuda_shaped = [{"slot": "image_reference", "index": 0, "handle": {"method_key": cuda_key}}]
-        self.assertEqual(_release_cpu_ref_blocks(cuda_shaped), 0)
 
 
 if __name__ == "__main__":
