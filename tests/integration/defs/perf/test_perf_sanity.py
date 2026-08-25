@@ -263,6 +263,20 @@ _NUM_GEN_TOKENS_RE = re.compile(r"'num_generation_tokens':\s*(\d+)")
 # py_executor.py's iteration log actually emits (do not copy the ': ' form in
 # examples/wide_ep/slurm_scripts/process_gen_iterlog.py, which is stale).
 _ITER_NSR_RE = re.compile(r"iter\s*=\s*(\d+),.*?num_scheduled_requests\s*=\s*(\d+)")
+# The emitting rank, used to key _scan_gen_worker_device_step_time's predecessor
+# bookkeeping so that interleaved ranks in one file cannot be read as each
+# other's predecessor.
+# py_executor.py only logs rank 0 by default (TLLM_PROFILE_LOG_RANKS, default
+# "0"), and no lane sets that variable today -- both artifact sets for nvbug
+# 6627789 are 518/518 global_rank = 0. But the variable accepts "all" or a rank
+# list and lane YAML can inject arbitrary server env vars, and in a mixed-rank
+# file the failure would be silent in the WRONG direction: the contaminated
+# row's immediate predecessor line would usually belong to a different rank,
+# whose num_scheduled_requests is nonzero, so the exclusion would quietly stop
+# excluding while still looking armed. Matching global_rank (not the trailing
+# 'rank = ') keeps this unambiguous; a line with neither shares one bucket,
+# which is exactly the pre-existing single-rank behaviour.
+_ITER_RANK_RE = re.compile(r"global_rank\s*=\s*(\d+)")
 
 # Hard cap on retained per-iteration samples per gen worker. The percentile and
 # stdev statistics need the whole sample, so the scan cannot be O(1) memory the
@@ -349,10 +363,12 @@ def _scan_gen_worker_device_step_time(
     kernel spent, which is how nvbug 6627789 read a +19% regression out of two
     runs whose steady-state iterations were both ~7.3 ms.
 
-    The row is dropped only when the immediately preceding parsed line is
-    provably the predecessor iteration: pred_iter == cur_iter - 1. If the
-    predecessor is missing, unparseable, or non-adjacent (interleaved ranks
-    writing to a shared log, a restarted iteration counter), the row is KEPT.
+    The row is dropped only when that rank's immediately preceding parsed line
+    is provably the predecessor iteration: pred_iter == cur_iter - 1.
+    Predecessor state is kept per emitting rank (_ITER_RANK_RE), so ranks
+    interleaved in one file are never read as each other's predecessor. If the
+    predecessor is missing, unparseable, or non-adjacent (a restarted iteration
+    counter, the first line after a seek), the row is KEPT.
     That is the safe direction to fail: the exclusion is an accuracy
     improvement on a metric that must keep reporting, so a scan that cannot
     prove a row is idle-contaminated should behave exactly as it did before.
@@ -380,8 +396,8 @@ def _scan_gen_worker_device_step_time(
         )
 
         rows: List[_IterRow] = []
-        prev_iter: Optional[int] = None
-        prev_nsr: Optional[int] = None
+        # rank -> (iter, num_scheduled_requests) of that rank's previous line.
+        prev_by_rank: Dict[Optional[int], Tuple[Optional[int], Optional[int]]] = {}
         with open(log_path, errors="replace") as f:
             if seek_to:
                 f.seek(seek_to)
@@ -391,13 +407,15 @@ def _scan_gen_worker_device_step_time(
                 # the num_scheduled_requests tracking below needs to see.
                 if "prev_device_step_time" not in line:
                     continue
-                # Snapshot the predecessor before this line overwrites it.
-                pred_iter, pred_nsr = prev_iter, prev_nsr
+                # Snapshot this rank's predecessor before this line overwrites it.
+                rank_m = _ITER_RANK_RE.search(line)
+                rank = int(rank_m.group(1)) if rank_m is not None else None
+                pred_iter, pred_nsr = prev_by_rank.get(rank, (None, None))
                 nsr_m = _ITER_NSR_RE.search(line)
                 if nsr_m is None:
-                    prev_iter, prev_nsr = None, None
+                    prev_by_rank[rank] = (None, None)
                 else:
-                    prev_iter, prev_nsr = int(nsr_m.group(1)), int(nsr_m.group(2))
+                    prev_by_rank[rank] = (int(nsr_m.group(1)), int(nsr_m.group(2)))
 
                 m = _DEVICE_STEP_TIME_RE.search(line)
                 if m is None:
@@ -491,9 +509,10 @@ def parse_gen_worker_device_step_time(
     falls back to its whole sample rather than being dropped to None. Returns
     None only if no usable line is found in any file.
 
-    The mean is the regression-gated statistic; the other four are uploaded
-    for diagnosis, because a mean on its own cannot distinguish a slower
-    workload from one anomalous iteration. See
+    The mean and the median are the regression-gated statistics
+    (GEN_ONLY_REGRESSION_METRICS); the other three are uploaded for diagnosis,
+    because a mean on its own cannot distinguish a slower workload from one
+    anomalous iteration. See
     _scan_gen_worker_device_step_time for the empty-iteration exclusion and
     _stats_at_mode_ngen for the bucket selection.
 
@@ -526,8 +545,9 @@ def add_perf_metric_value(
     - Adds `d_al` only when spec_decoding=True; non-spec rows omit it so
       OpenSearch baselines don't blend the two populations.
     - Adds the `d_*_gen_worker_per_iter_device_step_time` family only for the
-      disagg gen_only mode (the only mode that emits them). Of these only the
-      mean is regression-gated; the rest are uploaded for diagnosis.
+      disagg gen_only mode (the only mode that emits them). Of these the mean
+      and the median are regression-gated (GEN_ONLY_REGRESSION_METRICS); the
+      rest are uploaded for diagnosis.
 
     A missing or non-numeric gen_only statistic is omitted rather than
     forwarded: typeCheckForOpenSearchDB rejects both None and int for a `d_`

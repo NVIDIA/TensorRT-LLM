@@ -204,14 +204,18 @@ def _iter_line(
     device_step_time: str,
     ngen: int = 256,
     host_step_time: float = 7.4,
+    rank: int = 0,
 ) -> str:
     """One gen-worker iteration log line, in py_executor.py's real format.
 
     Keep the ' = ' spelling and the field order: the parsers depend on both.
+    rank defaults to 0 because that is the only rank py_executor.py logs unless
+    TLLM_PROFILE_LOG_RANKS is set; pass it to build a mixed-rank file.
     """
     return (
-        f"[TRT-LLM] [I] [_torch][RANK 0] iter = {iter_no}, global_rank = 0, "
-        f"rank = 0, num_scheduled_requests = {nsr}, kv_cache_util = 0.1, "
+        f"[TRT-LLM] [I] [_torch][RANK {rank}] iter = {iter_no}, "
+        f"global_rank = {rank}, "
+        f"rank = {rank}, num_scheduled_requests = {nsr}, kv_cache_util = 0.1, "
         f"currank_total_requests = 0/1, host_step_time = {host_step_time}ms, "
         f"prev_device_step_time = {device_step_time}, "
         "timestamp = 08-23-2026 01:02:03, "
@@ -311,6 +315,49 @@ def test_unparseable_predecessor_does_not_trigger_the_exclusion(
     rows = _scan(tmp_path)
 
     assert [row.device_step_time for row in rows[0]] == [999.0]
+
+
+def test_interleaved_ranks_do_not_defeat_the_exclusion(tmp_path: Path) -> None:
+    """Predecessor state is per rank, so a foreign line cannot mask the idle one.
+
+    py_executor.py logs rank 0 only unless TLLM_PROFILE_LOG_RANKS says otherwise,
+    but lane YAML can inject that variable. With one shared predecessor slot,
+    rank 1's line between rank 0's iters 259 and 260 would supply a nonzero
+    num_scheduled_requests and the 1450 ms row would survive -- the exclusion
+    silently off while still looking armed.
+    """
+    _write_gen_log(
+        tmp_path,
+        0,
+        [
+            _iter_line(258, 1, "7.32ms", rank=0),
+            _iter_line(259, 0, "7.39ms", rank=0),
+            _iter_line(259, 4, "7.40ms", rank=1),
+            _iter_line(260, 1, "1450.61ms", rank=0),
+        ],
+    )
+
+    rows = _scan(tmp_path)
+
+    assert 1450.61 not in [row.device_step_time for row in rows[0]]
+
+
+def test_another_ranks_idle_iteration_does_not_drop_a_valid_row(
+    tmp_path: Path,
+) -> None:
+    """The mirror image: rank 1 going idle must not cost rank 0 a good sample."""
+    _write_gen_log(
+        tmp_path,
+        0,
+        [
+            _iter_line(259, 0, "7.39ms", rank=1),
+            _iter_line(260, 1, "7.31ms", rank=0),
+        ],
+    )
+
+    rows = _scan(tmp_path)
+
+    assert [row.device_step_time for row in rows[0]] == [7.39, 7.31]
 
 
 def test_warmup_iterations_are_excluded(tmp_path: Path) -> None:
