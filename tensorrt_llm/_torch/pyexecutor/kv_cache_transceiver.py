@@ -31,6 +31,7 @@ _DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERL
 _DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
 _TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
 _KVCACHE_POOL_USE_FABRIC_MEMORY_ENV = "TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"
+_PHYSICAL_OWNERSHIP_ENV = "TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
 
@@ -149,6 +150,10 @@ def create_kv_cache_transceiver(
         cache_transceiver_config: CacheTransceiverConfig,
         mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
+        if getenv(_PHYSICAL_OWNERSHIP_ENV, "0") == "1":
+            raise ValueError(
+                f"{_PHYSICAL_OWNERSHIP_ENV}=1 requires an enabled Python/NIXL "
+                "cache transceiver")
         logger.info("cache_transceiver is disabled")
         return None
 
@@ -188,6 +193,15 @@ def create_kv_cache_transceiver(
             "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             "hangs or lower-than-expected performance.")
 
+    if (getenv(_PHYSICAL_OWNERSHIP_ENV, "0") == "1"
+            and (cache_transceiver_config.transceiver_runtime != "PYTHON"
+                 or cache_transceiver_config.backend != "NIXL")):
+        raise ValueError(
+            f"{_PHYSICAL_OWNERSHIP_ENV}=1 is supported only with "
+            "transceiver_runtime='PYTHON' and backend='NIXL'; got "
+            f"transceiver_runtime={cache_transceiver_config.transceiver_runtime!r}, "
+            f"backend={cache_transceiver_config.backend!r}")
+
     # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver.
@@ -222,7 +236,8 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+                                    cache_transceiver_config,
+                                    mamba_cache_manager)
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
@@ -231,6 +246,11 @@ def create_kv_cache_transceiver(
 
 
 class KvCacheTransceiver(ABC):
+
+    @property
+    def requires_physical_drain_before_request_release(self) -> bool:
+        """Whether executor teardown needs an explicit physical-drain proof."""
+        return False
 
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
@@ -265,6 +285,10 @@ class KvCacheTransceiver(ABC):
 
     def has_poisoned_transfer_buffer(self) -> bool:
         return False
+
+    def get_physical_ownership_fault(self) -> Optional[BaseException]:
+        """Return a sticky Python-transfer fault requiring fail-stop."""
+        return None
 
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):

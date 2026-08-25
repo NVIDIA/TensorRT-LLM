@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import json
 import os
 import platform
@@ -331,6 +332,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_overlap_gen_first_pp4.yaml",
         "overlap_transceiver_runtime_python":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
+        "physical_ownership_phase1":
+        f"{test_configs_root}/disagg_config_physical_ownership_phase1.yaml",
         "overlap_transceiver_runtime_python_bounce":
         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python_bounce.yaml",
         "python_transceiver_host_offload":
@@ -1012,6 +1015,102 @@ def setup_disagg_cluster(
     return config, ctx_workers, gen_workers, disagg_server, server_port, work_dir
 
 
+def setup_static_disagg_topology(
+    config_file: str,
+    model_name: str | None = None,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+    server_start_timeout: int = 300,
+    schedule_style: str | None = None,
+    save_log: bool = False,
+    ctx_env: dict[str, str] | None = None,
+    gen_env: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
+           ProcessWrapper, int, str]:
+    """Launch one statically configured CTX and GEN worker.
+
+    Phase 1 physical ownership deliberately rejects service discovery because
+    its worker count is a lower bound rather than an exact topology contract.
+    This launcher keeps the complete fixed worker configuration visible to the
+    disaggregated-server preflight.
+    """
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    ctx_config = config["context_servers"]
+    gen_config = config["generation_servers"]
+    if ctx_config.get("num_instances", 1) != 1 or gen_config.get(
+            "num_instances", 1) != 1:
+        raise ValueError("static Phase 1 topology requires one CTX and one GEN")
+
+    work_dir = tempfile.mkdtemp()
+    ports: set[int] = set()
+
+    def _next_port() -> int:
+        while (port := get_free_port()) in ports:
+            pass
+        ports.add(port)
+        return port
+
+    ctx_port = _next_port()
+    gen_port = _next_port()
+    server_port = _next_port()
+    model = resolve_llm_model_path(model_name or config.get("model"))
+    internal_request_auth_key = config.get(
+        "internal_request_auth_key") or secrets.token_hex(32)
+
+    def _worker_config(role_config: dict[str, Any]) -> dict[str, Any]:
+        worker_config = build_worker_config(config, role_config, {})
+        worker_config.pop("disagg_cluster", None)
+        worker_config["internal_request_auth_key"] = internal_request_auth_key
+        return worker_config
+
+    ctx_workers: list[ProcessWrapper] = []
+    gen_workers: list[ProcessWrapper] = []
+    disagg_server = None
+    try:
+        ctx_workers.append(
+            run_ctx_worker(model,
+                           _worker_config(ctx_config),
+                           work_dir,
+                           port=ctx_port,
+                           device=0,
+                           env=ctx_env or env,
+                           save_log=save_log))
+        gen_workers.append(
+            run_gen_worker(model,
+                           _worker_config(gen_config),
+                           work_dir,
+                           port=gen_port,
+                           device=1,
+                           env=gen_env or env,
+                           save_log=save_log))
+
+        server_config = copy.deepcopy(config)
+        server_config["port"] = server_port
+        server_config["internal_request_auth_key"] = internal_request_auth_key
+        server_config["context_servers"]["urls"] = [f"localhost:{ctx_port}"]
+        server_config["generation_servers"]["urls"] = [f"localhost:{gen_port}"]
+        if schedule_style is not None:
+            server_config["schedule_style"] = schedule_style
+        disagg_server = run_disagg_server(server_config,
+                                          work_dir,
+                                          server_port,
+                                          save_log=save_log,
+                                          env=env,
+                                          cwd=cwd)
+        asyncio.run(
+            wait_for_disagg_server_ready(server_port,
+                                         timeout=server_start_timeout))
+    except Exception:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+        if not save_log:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+
+    return config, ctx_workers, gen_workers, disagg_server, server_port, work_dir
+
+
 def run_disaggregated_test(example_dir,
                            test_desc,
                            num_iters=5,
@@ -1027,8 +1126,10 @@ def run_disaggregated_test(example_dir,
                            ctx_env=None,
                            gen_env=None,
                            share_gpu=False,
-                           server_start_timeout=300):
-    """Run disaggregated test using service discovery instead of MPI.
+                           server_start_timeout=300,
+                           static_topology=False,
+                           assert_worker_log_contains=None):
+    """Run a disaggregated test using service discovery or a fixed topology.
 
     If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
     client tests, at least one of them must contain that substring (used to prove the KV-cache
@@ -1050,14 +1151,23 @@ def run_disaggregated_test(example_dir,
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
+    save_log = (assert_gen_log_contains is not None
+                or assert_worker_log_contains is not None)
+    setup = (setup_static_disagg_topology
+             if static_topology else setup_disagg_cluster)
+    setup_kwargs = dict(model_name=model_path,
+                        env=run_env,
+                        cwd=cwd,
+                        server_start_timeout=server_start_timeout,
+                        schedule_style=disagg_schedule_style,
+                        save_log=save_log,
+                        ctx_env=ctx_run_env,
+                        gen_env=gen_run_env)
+    if not static_topology:
+        setup_kwargs.update(perf_metrics_output_dir=perf_metrics_output_dir,
+                            share_gpu=share_gpu)
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             server_start_timeout=server_start_timeout,
-                             schedule_style=disagg_schedule_style,
-                             save_log=assert_gen_log_contains is not None,
-                             perf_metrics_output_dir=perf_metrics_output_dir,
-                             ctx_env=ctx_run_env, gen_env=gen_run_env,
-                             share_gpu=share_gpu)
+        setup(config_file, **setup_kwargs)
 
     server_host = config.get("hostname", "localhost")
 
@@ -1105,6 +1215,14 @@ def run_disaggregated_test(example_dir,
                 f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
                 f"but none of {len(logs)} log(s) contained it (bounce did not engage)"
             )
+        if assert_worker_log_contains is not None:
+            for worker in ctx_workers + gen_workers:
+                assert worker.log_path is not None
+                with open(worker.log_path, "r", errors="replace") as f:
+                    log = f.read()
+                assert assert_worker_log_contains in log, (
+                    f"expected marker {assert_worker_log_contains!r} in "
+                    f"{worker.log_path}")
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1443,6 +1561,33 @@ def test_disaggregated_overlap_transceiver_runtime_python(
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_python_transceiver_physical_ownership_phase1(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    """Exercise the complete Phase 1 qualified deployment cell."""
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
+    env["TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP"] = "1"
+    env["TRTLLM_DISAGG_NO_RETRY"] = "1"
+    env["TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"] = "0"
+    env["TRTLLM_DISAGG_LAYERWISE"] = "0"
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "physical_ownership_phase1",
+        env=env,
+        model_path=llama_model_root,
+        disagg_schedule_style="context_first",
+        static_topology=True,
+        assert_worker_log_contains=(
+            "Phase 1 KV transfer physical ownership enabled"),
+        cwd=llm_venv.get_working_directory())
 
 
 # Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
