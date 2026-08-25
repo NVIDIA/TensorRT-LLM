@@ -30,6 +30,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
@@ -1162,6 +1163,20 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
     # fp8_block_scaling_gemm does not support writing into an NCCL window buffer.
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = False
 
+    @staticmethod
+    def _use_cute_dsl_gemm(module: Linear) -> bool:
+        """Whether the SM100f CuteDSL blockscaling GEMM can actually be used.
+
+        ``cute_dsl_fp8_gemm_blackwell`` is registered only under
+        ``cute_dsl_custom_ops``' ``if IS_CUTLASS_DSL_AVAILABLE:`` block, so
+        requesting it without the optional cutlass DSL raises ``AttributeError``
+        at the call site; the always-registered ``fp8_swap_ab_gemm`` path runs
+        instead. Pairing the request flags with the availability flag is the
+        idiom the DSA indexer already uses. See nvbug 6644645.
+        """
+        return (module.use_cute_dsl_blockscaling_mm
+                or module.disable_deep_gemm) and IS_CUTLASS_DSL_AVAILABLE
+
     def get_tp_alignment(self, tp_mode, quant_config=None):
         return 128
 
@@ -1205,7 +1220,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         assert input.dtype == torch.bfloat16
 
         if is_sm_100f():
-            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
+            if self._use_cute_dsl_gemm(module):
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
                 output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
@@ -1346,10 +1361,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def transform_weights(self, module: Linear) -> None:
         super().transform_weights(module)
+        # Must agree with apply()'s dispatch: whichever GEMM will actually run
+        # decides the layout, so the DSL-availability check has to be the same.
         use_deep_gemm_layout = (
             is_sm_100f()
-            and not (module.use_cute_dsl_blockscaling_mm
-                     or module.disable_deep_gemm)) or get_sm_version() == 120
+            and not self._use_cute_dsl_gemm(module)) or get_sm_version() == 120
         use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
             module, "use_indexer_q_cutedsl_fusion", False))
         if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:

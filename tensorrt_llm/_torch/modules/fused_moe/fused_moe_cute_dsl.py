@@ -25,12 +25,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor,
@@ -325,6 +320,18 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 tile_size = tactic
         if tile_size is None:
             return True
+
+        # Imported here rather than at module scope: these runners only exist
+        # under cute_dsl_custom_ops' ``if IS_CUTLASS_DSL_AVAILABLE:`` block, and
+        # create_moe imports this file eagerly, so a module-scope import breaks
+        # all model startup when the optional cutlass DSL is absent. Reaching
+        # this line means a CuteDSL runner is being tuned, so it is installed.
+        # See nvbug 6644645.
+        from ...custom_ops.cute_dsl_custom_ops import (
+            Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+            Sm100BlockScaledContiguousGroupedGemmRunner,
+            Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 
         for runner, tactic in comb:
             if isinstance(
