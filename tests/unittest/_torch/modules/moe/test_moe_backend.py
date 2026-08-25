@@ -664,6 +664,55 @@ def test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins(quant_algo) ->
         _make_trtllm_gen_moe(quant_config=QuantConfig(quant_algo=quant_algo), situ=True)
 
 
+@_situ_supported
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,expected",
+    [
+        pytest.param(512, 256, (32, 32), id="no_padding"),
+        pytest.param(2880, 2880, (256, 256), id="hidden_not_256_aligned"),
+        pytest.param(1536, 192, (128, 32), id="intermediate_needs_128"),
+    ],
+)
+def test_nvfp4_trtllm_gen_resolve_alignments_matches_create_weights(
+    hidden_size, intermediate_size, expected
+) -> None:
+    """``resolve_alignments`` must predict what ``create_weights`` selects.
+
+    ``TRTLLMGenFusedMoE`` validates its MoE-TP shard from ``__init__``, i.e.
+    before ``create_weights`` has shadowed the class attributes with
+    shape-resolved instance ones, so the check has to predict them. If the two
+    ever drift apart the shard contract is validated against the wrong number.
+    """
+    predicted = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(hidden_size, intermediate_size)
+    assert predicted == expected
+
+    backend = _make_trtllm_gen_moe(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        situ=True,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    assert (
+        backend.quant_method.weight_alignment,
+        backend.quant_method.input_hidden_alignment,
+    ) == predicted
+
+
+@_situ_supported
+def test_nvfp4_trtllm_gen_class_alignment_would_admit_bad_shards() -> None:
+    """Why the MoE-TP check cannot read the class attribute.
+
+    ``hidden=1536``/``intermediate=192`` resolves to a 128 weight alignment.
+    192 is divisible by the class default (32) but not by 128, so validating
+    against ``NVFP4TRTLLMGenFusedMoEMethod.weight_alignment`` admits a shard
+    the loader cannot lay out. Pins the gap, so reverting the check to the
+    class attribute fails here rather than in a multi-GPU accuracy run.
+    """
+    resolved, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(1536, 192)
+    assert 192 % NVFP4TRTLLMGenFusedMoEMethod.weight_alignment == 0
+    assert 192 % resolved != 0
+
+
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)

@@ -5347,8 +5347,42 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
 
 class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
+    # Starting point only: create_weights resolves both from the layer shape
+    # via resolve_alignments() below. Read the class attributes directly only
+    # when you mean "the unresolved default".
     weight_alignment = 32
     input_hidden_alignment = 32
+
+    @classmethod
+    def resolve_alignments(cls, hidden_size: int,
+                           intermediate_size_per_partition: int):
+        """The alignments create_weights will select for this shape.
+
+        Exposed as a classmethod because TRTLLMGenFusedMoE validates its
+        MoE-TP shard from __init__, i.e. before create_weights has run and
+        shadowed the class attributes with instance ones. Reading the class
+        attributes from there would validate against the unresolved default
+        (32) and admit shards this method cannot lay out.
+
+        Returns ``(weight_alignment, input_hidden_alignment)``.
+        """
+        # Padding is only enabled for hidden_size > 1024, since there are
+        # small unit tests that expect no padding.
+        if hidden_size > 1024 and hidden_size % 256 != 0:
+            # For now let's keep input alignment same as weight alignment.
+            # There are practical reasons that this might be a different
+            # value. See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod
+            # for more details.
+            return 256, 256
+        # Weight scales require M % 128 in
+        # get_shuffle_matrix_sf_a_row_indices. If the intermediate size after
+        # padding does not satisfy that, drop to a 128 weight alignment.
+        padded = (
+            (intermediate_size_per_partition + cls.weight_alignment - 1) //
+            cls.weight_alignment * cls.weight_alignment)
+        if padded % 128 != 0:
+            return 128, cls.input_hidden_alignment
+        return cls.weight_alignment, cls.input_hidden_alignment
 
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
@@ -5403,22 +5437,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         return (x + alignment - 1) // alignment * alignment
 
     def create_weights(self, module: torch.nn.Module):
-        # Here we only enable padding for hidden_size > 1024 since there are small unit tests that expect no padding.
-        if module.hidden_size > 1024 and module.hidden_size % 256 != 0:
-            self.weight_alignment = 256
-            # For now let's keep input alignment same as weight alignment. There are practical reasons that this might be a different value.
-            # See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod for more details.
-            self.input_hidden_alignment = 256
-
-        else:
-            # Weight scales require M % 128 in get_shuffle_matrix_sf_a_row_indices.
-            # Check if intermediate_size after padding satisfies this requirement.
-            # If not, set weight_alignment to 128.
-            intermediate_size_padded = self._round_up(
-                module.intermediate_size_per_partition, self.weight_alignment)
-            if intermediate_size_padded % 128 != 0:
-                self.weight_alignment = 128
-
+        self.weight_alignment, self.input_hidden_alignment = (
+            self.resolve_alignments(module.hidden_size,
+                                    module.intermediate_size_per_partition))
         super().create_weights(module, bias_dtype=torch.float32)
 
     def setup_quant_scales(self, module: torch.nn.Module):

@@ -401,9 +401,18 @@ class TRTLLMGenFusedMoE(MoE):
             # per-rank shard to stay a whole multiple of the quant method's
             # weight alignment so per-shard scale groups and the padded
             # weight buffers line up without fractional groups.
-            alignment = (NVFP4TRTLLMGenFusedMoEMethod.weight_alignment
-                         if quant_algo == QuantAlgo.NVFP4 else
-                         W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment)
+            if quant_algo == QuantAlgo.NVFP4:
+                # NVFP4 picks its alignment from the layer shape in
+                # create_weights (32 -> 128 or 256), which runs after this
+                # check. Ask for the resolved value: the class attribute is
+                # only the starting point, and validating against it would
+                # admit shards the loader cannot lay out.
+                alignment, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(
+                    self.hidden_size, self.intermediate_size_per_partition)
+            else:
+                # MXFP4's alignment is a fixed class attribute.
+                alignment = (
+                    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.weight_alignment)
             if (self.intermediate_size % self.tp_size != 0
                     or self.intermediate_size_per_partition % alignment != 0):
                 raise ValueError(
