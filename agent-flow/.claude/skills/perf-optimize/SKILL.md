@@ -137,6 +137,8 @@ than inventing values:
   target is met, or an analyzer turn finds no actionable item), so
   `max_rounds × max_items_per_round`
   is what bounds the items a campaign can attempt — 15 with the defaults.
+  `optimize.item_execution` defaults to `parallel`; set it to `serial`
+  to apply approved items directly in order from the latest campaign state.
   Two things worth telling the user when sizing a run:
   - **Rounds are not equally expensive.** A round pays for a profile
     after an accept, after a reverted code attempt may have changed
