@@ -1370,14 +1370,6 @@ def qcache_dir_without_install_package(llm_venv, llm_root):
     )
 
 
-@pytest.fixture(scope="module")
-def star_attention_input_root(llm_root):
-    "Get star attention input file dir"
-    star_attention_input_root = unittest_path() / "_torch" / "multi_gpu"
-
-    return star_attention_input_root
-
-
 def parametrize_with_ids(
     argnames: str | Sequence[str],
     argvalues: Iterable[ParameterSet | Sequence[object] | object],

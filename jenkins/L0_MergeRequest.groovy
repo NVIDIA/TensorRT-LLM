@@ -155,6 +155,19 @@ def DISABLE_CBTS = "disable_cbts"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
+// Version-controlled Tier 2 rollout policy. Keep this in the infra-owned Groovy
+// boundary so changing who receives coverage-based narrowing requires infra review.
+@Field
+def CBTS_COVERAGE_PILOT_USERS = [
+    "crazydemo",
+    "QiJune",
+    "sunnyqgg",
+    "Barry-Delaney",
+    "xxi-nv",
+    "leslie-fang25",
+    "rosong11",
+    "tongyuantongyu",
+] as Set
 @Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
 
@@ -350,6 +363,22 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
         checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
+    }
+    if (params.program_version_name) {
+        env.NSPECT_RELEASE_VERSION = params.program_version_name
+    } else {
+        def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
+        def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
+        if (!versionMatcher.find()) {
+            error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
+        }
+        def nspectReleaseVersionSuffix = "dev"
+        if (runMode == "nightly_release") {
+            nspectReleaseVersionSuffix = "nightly"
+        } else if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+            nspectReleaseVersionSuffix = "postmerge"
+        }
+        env.NSPECT_RELEASE_VERSION = "${versionMatcher.group(1)}_${nspectReleaseVersionSuffix}"
     }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
@@ -931,12 +960,15 @@ def _cbtsCoverageAudit(pipeline)
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
         def readyJson = ""
+        def prAuthor = ""
         def pilotEligible = false
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
-            pilotEligible = sh(
+            prAuthor = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
-            ).trim() == "true"
+            ).trim()
+            pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
+            pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
             if (pilotEligible) {
                 readyJson = sh(
                     script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
@@ -2084,13 +2116,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 runMode == "nightly_release" ||
                                 env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
+                            'program_version_name': env.NSPECT_RELEASE_VERSION,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildInternalRelease': false,
                                 'buildCiImage': false,
                                 'buildNgcRelease': true,
-                                'register_images': true,
                                 'wait_success_seconds': "",
                             ]
                         }
@@ -2159,9 +2191,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildNgcRelease': true,
-                                'register_images': true,
                                 'wait_success_seconds': "",
                             ]
+                            additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
                         } else {
                             additionalParameters['nspect_id'] = ""
                         }

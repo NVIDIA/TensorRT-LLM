@@ -17,6 +17,11 @@ class BaseToolParser(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
     needs_raw_special_tokens: bool = False
+    # Parsers whose forced/named ``tool_choice`` output still carries the
+    # model's native tool-call markup (rather than grammar-constrained bare
+    # JSON arguments) set this to True so the serving layer runs extraction
+    # on the named-choice path instead of passing raw text through.
+    extracts_forced_tool_calls: bool = False
 
     def __init__(self):
         # Streaming state management
@@ -109,6 +114,17 @@ class BaseToolParser(ABC):
             if bot_token.startswith(buffer[-i:]):
                 return i
         return 0
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Finalize a stream that ended before the format's closing markers.
+
+        Called once by the serving layer when generation finishes, after the
+        last ``parse_streaming_increment`` call, so parsers that buffer whole
+        sections can emit whatever the truncated stream still holds. The
+        default is a no-op to preserve the existing behavior of parsers that
+        manage ``self._buffer`` incrementally.
+        """
+        return StreamingParseResult()
 
     def parse_streaming_increment(self, new_text: str,
                                   tools: List[Tool]) -> StreamingParseResult:
