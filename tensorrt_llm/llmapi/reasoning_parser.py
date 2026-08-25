@@ -361,9 +361,6 @@ class DeepSeekR1Parser(BaseReasoningParser):
         Partial tag prefixes become ordinary model output at end-of-stream.
         A complete end tag while inside reasoning is a delimiter (discarded).
         A complete start tag while outside opens an empty reasoning block.
-        A complete start tag while already inside reasoning is kept as literal
-        text (``parse()`` parity for deepseek-r1 on ``"a<think>"``). A complete
-        end tag while outside is literal content.
         """
         remaining = self._buffer
         self._buffer = ""
@@ -373,10 +370,6 @@ class DeepSeekR1Parser(BaseReasoningParser):
             return ReasoningParserResult()
         if remaining == self.reasoning_start and not self.in_reasoning:
             return ReasoningParserResult()
-        if remaining == self.reasoning_start and self.in_reasoning:
-            return ReasoningParserResult(reasoning_content=remaining)
-        if remaining == self.reasoning_end and not self.in_reasoning:
-            return ReasoningParserResult(content=remaining)
         if self.in_reasoning:
             return ReasoningParserResult(reasoning_content=remaining)
         return ReasoningParserResult(content=remaining)
