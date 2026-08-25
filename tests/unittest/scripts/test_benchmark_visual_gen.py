@@ -104,10 +104,11 @@ def test_v2v_multipart_payload(tmp_path: Path) -> None:
     assert json.loads(fields["extra_params"]) == extra_params
 
 
-def test_transfer_multipart_payload(tmp_path: Path) -> None:
-    fields = _multipart_fields(tmp_path, {"extra_params": {"edge": True}})
+def test_transfer_multi_control_multipart_payload(tmp_path: Path) -> None:
+    controls = {"edge": True, "seg": {"control": "encoded-segmentation"}}
+    fields = _multipart_fields(tmp_path, {"extra_params": controls})
 
-    assert json.loads(fields["extra_params"]) == {"edge": True}
+    assert json.loads(fields["extra_params"]) == controls
 
 
 def test_ti2av_multipart_payload(tmp_path: Path) -> None:
@@ -177,6 +178,49 @@ def test_prepare_transfer_embeds_precomputed_control(tmp_path: Path) -> None:
 
     encoded_control = extra_body["extra_params"]["depth"]["control"]
     assert base64.b64decode(encoded_control, validate=True) == b"precomputed depth control"
+
+
+def test_prepare_transfer_supports_multiple_controls(tmp_path: Path) -> None:
+    input_reference = tmp_path / "source.mp4"
+    input_reference.write_bytes(b"source video")
+    segmentation = tmp_path / "segmentation control.mp4"
+    segmentation.write_bytes(b"segmentation control")
+
+    transfer_controls = benchmark._parse_transfer_controls(
+        json.dumps({"edge": True, "seg": str(segmentation)})
+    )
+    extra_body = benchmark._prepare_transfer_extra_body(
+        extra_body={"extra_params": {"control_guidance": 1.5}},
+        input_reference=str(input_reference),
+        transfer_hint=None,
+        control_reference=None,
+        transfer_controls=transfer_controls,
+    )
+
+    assert extra_body["extra_params"]["edge"] is True
+    encoded_control = extra_body["extra_params"]["seg"]["control"]
+    assert base64.b64decode(encoded_control, validate=True) == b"segmentation control"
+    assert extra_body["extra_params"]["control_guidance"] == 1.5
+
+
+def test_parse_transfer_controls_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="non-empty JSON object"):
+        benchmark._parse_transfer_controls("{}")
+    with pytest.raises(ValueError, match="only edge and blur"):
+        benchmark._parse_transfer_controls('{"seg": true}')
+    with pytest.raises(ValueError, match="true or a non-empty"):
+        benchmark._parse_transfer_controls('{"edge": false}')
+
+
+def test_prepare_transfer_rejects_singular_and_plural_controls() -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        benchmark._prepare_transfer_extra_body(
+            extra_body=None,
+            input_reference="source.mp4",
+            transfer_hint="edge",
+            control_reference=None,
+            transfer_controls={"blur": None},
+        )
 
 
 @pytest.mark.parametrize("transfer_hint", ["depth", "seg", "wsm"])
@@ -641,6 +685,53 @@ def test_shell_transfer_accepts_precomputed_control(tmp_path: Path) -> None:
     assert metadata["control_reference"] == "depth control.mp4"
 
 
+def test_shell_transfer_accepts_multiple_controls(tmp_path: Path) -> None:
+    input_reference = tmp_path / "source video.mp4"
+    input_reference.write_bytes(b"source video")
+    segmentation = tmp_path / "segmentation control.mp4"
+    segmentation.write_bytes(b"segmentation control")
+    transfer_controls = json.dumps({"edge": True, "seg": str(segmentation)})
+
+    result = _run_shell(
+        tmp_path,
+        script_name="benchmark_visual_gen_client.sh",
+        MODE="transfer",
+        INPUT_REFERENCE=str(input_reference),
+        TRANSFER_CONTROLS=transfer_controls,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--transfer-controls" in result.stdout
+    assert "segmentation\\ control.mp4" in result.stdout
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["transfer_hint"] is None
+    assert metadata["control_reference"] is None
+    assert metadata["transfer_controls"] == {
+        "edge": "input_reference",
+        "seg": "segmentation control.mp4",
+    }
+
+
+def test_composed_shell_forwards_multiple_controls(tmp_path: Path) -> None:
+    input_reference = tmp_path / "source.mp4"
+    input_reference.write_bytes(b"source video")
+
+    result = _run_shell(
+        tmp_path,
+        MODE="transfer",
+        INPUT_REFERENCE=str(input_reference),
+        TRANSFER_CONTROLS='{"edge":true,"blur":true}',
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--transfer-controls" in result.stdout
+    metadata = json.loads((tmp_path / "results/metadata.json").read_text(encoding="utf-8"))
+    assert metadata["transfer_controls"] == {
+        "edge": "input_reference",
+        "blur": "input_reference",
+    }
+
+
 def test_shell_enables_client_media_retention(tmp_path: Path) -> None:
     result = _run_shell(
         tmp_path,
@@ -842,6 +933,23 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         (
             {"MODE": "t2v", "TRANSFER_HINT": "edge"},
             "TRANSFER_HINT requires MODE=transfer",
+        ),
+        (
+            {
+                "MODE": "transfer",
+                "TRANSFER_HINT": "edge",
+                "INPUT_REFERENCE": __file__,
+                "TRANSFER_CONTROLS": '{"blur": true}',
+            },
+            "TRANSFER_CONTROLS cannot be combined",
+        ),
+        (
+            {"MODE": "transfer", "TRANSFER_CONTROLS": '{"seg": true}'},
+            "only edge and blur",
+        ),
+        (
+            {"MODE": "t2v", "TRANSFER_CONTROLS": '{"edge": true}'},
+            "TRANSFER_CONTROLS requires MODE=transfer",
         ),
         (
             {"MODE": "t2i", "BACKEND": "openai-videos"},

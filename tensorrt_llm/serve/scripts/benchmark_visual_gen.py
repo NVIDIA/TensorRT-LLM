@@ -732,47 +732,91 @@ def _validate_input_reference(path_value: Optional[str]) -> Optional[str]:
     return str(path.resolve())
 
 
+def _parse_transfer_controls(raw_value: Optional[str]) -> Optional[dict[str, Optional[str]]]:
+    """Parse a hint-to-control mapping without loading control media into the CLI argv."""
+    if raw_value is None or raw_value == "":
+        return None
+    try:
+        raw_controls = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in --transfer-controls: {exc}") from exc
+    if not isinstance(raw_controls, dict) or not raw_controls:
+        raise ValueError("--transfer-controls must be a non-empty JSON object")
+
+    controls: dict[str, Optional[str]] = {}
+    for hint, control_reference in raw_controls.items():
+        if hint not in TRANSFER_HINTS:
+            raise ValueError(
+                f"--transfer-controls keys must be among {sorted(TRANSFER_HINTS)}, got {hint!r}"
+            )
+        if control_reference is True:
+            if hint not in AUTO_TRANSFER_HINTS:
+                raise ValueError(
+                    f"--transfer-controls.{hint}=true is unsupported; only edge and blur "
+                    "can derive a control from --input-reference"
+                )
+            controls[hint] = None
+            continue
+        if not isinstance(control_reference, str) or not control_reference:
+            raise ValueError(
+                f"--transfer-controls.{hint} must be true or a non-empty control-media path"
+            )
+        controls[hint] = _validate_input_reference(control_reference)
+    return controls
+
+
 def _prepare_transfer_extra_body(
     *,
     extra_body: Optional[dict[str, Any]],
     input_reference: Optional[str],
     transfer_hint: Optional[str],
     control_reference: Optional[str],
+    transfer_controls: Optional[dict[str, Optional[str]]] = None,
 ) -> Optional[dict[str, Any]]:
-    """Add one Transfer hint without carrying control media in the CLI argv."""
+    """Add one or more Transfer hints without carrying control media in the CLI argv."""
+    if transfer_controls is not None and (
+        transfer_hint is not None or control_reference is not None
+    ):
+        raise ValueError(
+            "--transfer-controls cannot be combined with --transfer-hint or --control-reference"
+        )
     if transfer_hint is None:
         if control_reference is not None:
             raise ValueError("--control-reference requires --transfer-hint")
-        return extra_body
-
-    if transfer_hint not in TRANSFER_HINTS:
-        raise ValueError(
-            f"--transfer-hint must be one of {sorted(TRANSFER_HINTS)}, got {transfer_hint!r}"
-        )
-    if control_reference is None:
-        if transfer_hint not in AUTO_TRANSFER_HINTS:
+        if transfer_controls is None:
+            return extra_body
+        controls = transfer_controls
+    else:
+        if transfer_hint not in TRANSFER_HINTS:
+            raise ValueError(
+                f"--transfer-hint must be one of {sorted(TRANSFER_HINTS)}, got {transfer_hint!r}"
+            )
+        if control_reference is None and transfer_hint not in AUTO_TRANSFER_HINTS:
             raise ValueError(
                 f"--transfer-hint={transfer_hint} requires --control-reference; only "
                 "edge and blur can derive a control from --input-reference"
             )
-        if input_reference is None:
-            raise ValueError(
-                f"--transfer-hint={transfer_hint} requires --input-reference or --control-reference"
-            )
+        controls = {transfer_hint: control_reference}
+
+    derived_hints = [hint for hint, path in controls.items() if path is None]
+    if derived_hints and input_reference is None:
+        formatted_hints = ", ".join(sorted(derived_hints))
+        raise ValueError(
+            f"Transfer hint(s) {formatted_hints} require --input-reference or a control-media path"
+        )
 
     body = dict(extra_body or {})
     extra_params = dict(body.get("extra_params") or {})
-    if transfer_hint in extra_params:
-        raise ValueError(
-            f"--transfer-hint={transfer_hint} conflicts with "
-            f"--extra-body.extra_params.{transfer_hint}"
-        )
-
-    if control_reference is None:
-        extra_params[transfer_hint] = True
-    else:
-        control_bytes = Path(control_reference).read_bytes()
-        extra_params[transfer_hint] = {"control": base64.b64encode(control_bytes).decode("ascii")}
+    for hint, path in controls.items():
+        if hint in extra_params:
+            raise ValueError(
+                f"Transfer hint {hint!r} conflicts with --extra-body.extra_params.{hint}"
+            )
+        if path is None:
+            extra_params[hint] = True
+        else:
+            control_bytes = Path(path).read_bytes()
+            extra_params[hint] = {"control": base64.b64encode(control_bytes).decode("ascii")}
     body["extra_params"] = extra_params
     return body
 
@@ -785,6 +829,7 @@ def _validate_request_configuration(
     extra_body: Optional[dict[str, Any]],
     require_audio: bool,
     transfer_hint: Optional[str] = None,
+    transfer_controls: Optional[dict[str, Optional[str]]] = None,
 ) -> None:
     """Reject incompatible client request combinations before benchmarking."""
     if input_reference is not None and backend != "openai-videos":
@@ -794,9 +839,9 @@ def _validate_request_configuration(
             "Specify conditioning media with --input-reference, not both "
             "--input-reference and --extra-body.input_reference"
         )
-    if transfer_hint is not None:
+    if transfer_hint is not None or transfer_controls is not None:
         if backend != "openai-videos":
-            raise ValueError("--transfer-hint is supported only by the openai-videos backend")
+            raise ValueError("Transfer controls are supported only by the openai-videos backend")
         if "cosmos3-edge" in model_id.lower():
             raise ValueError("Cosmos3-Edge does not support Transfer benchmarks")
         if require_audio:
@@ -883,11 +928,13 @@ def main(args: argparse.Namespace):
     extra_body = _parse_extra_body(args.extra_body)
     input_reference = _validate_input_reference(args.input_reference)
     control_reference = _validate_input_reference(args.control_reference)
+    transfer_controls = _parse_transfer_controls(args.transfer_controls)
     extra_body = _prepare_transfer_extra_body(
         extra_body=extra_body,
         input_reference=input_reference,
         transfer_hint=args.transfer_hint,
         control_reference=control_reference,
+        transfer_controls=transfer_controls,
     )
     _validate_request_configuration(
         backend=backend,
@@ -896,6 +943,7 @@ def main(args: argparse.Namespace):
         extra_body=extra_body,
         require_audio=args.require_audio,
         transfer_hint=args.transfer_hint,
+        transfer_controls=transfer_controls,
     )
 
     num_gpus = _resolve_num_gpus(args)
@@ -942,6 +990,11 @@ def main(args: argparse.Namespace):
             result_json["transfer_hint"] = args.transfer_hint
         if control_reference is not None:
             result_json["control_reference"] = Path(control_reference).name
+        if transfer_controls is not None:
+            result_json["transfer_controls"] = {
+                hint: "input_reference" if path is None else Path(path).name
+                for hint, path in transfer_controls.items()
+            }
 
         if args.metadata:
             for item in args.metadata:
@@ -1112,6 +1165,16 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Precomputed MP4/AVI Transfer control clip, encoded into extra_params client-side.",
+    )
+    gen_group.add_argument(
+        "--transfer-controls",
+        type=str,
+        default=None,
+        help=(
+            "JSON hint-to-control mapping for multi-control Transfer. Values are true for "
+            "edge/blur derived from --input-reference, or client-local MP4/AVI paths. Cannot "
+            "be combined with --transfer-hint or --control-reference."
+        ),
     )
     gen_group.add_argument(
         "--require-audio",
