@@ -148,6 +148,7 @@ def _make_manager_for_cache_tier_test(
     module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
     with (
         patch(f"{module}.CuError", _CacheTierInitError),
+        patch(f"{module}.IndexMapper"),
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
         patch.object(KVCacheManagerV2, "_build_cache_config", build_cache_config),
