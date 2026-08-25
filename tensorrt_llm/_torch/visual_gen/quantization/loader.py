@@ -30,6 +30,11 @@ _STATIC_SCALE_KEYS = {
     QuantAlgo.NVFP4: ("weight_scale", "weight_scale_2"),
 }
 
+# Weight dtypes a module holds when it was *not* built for a quantized recipe.
+# Quantized recipes allocate a narrow buffer instead (float8_e4m3fn for FP8,
+# packed uint8 for NVFP4/AWQ).
+_HIGH_PRECISION_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
 
 class DynamicLinearWeightLoader:
     """
@@ -148,7 +153,11 @@ class DynamicLinearWeightLoader:
         return None
 
     def _check_static_quant_scales(
-        self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
+        self,
+        weight_dict: Dict[str, torch.Tensor],
+        quant_algo: Optional[QuantAlgo],
+        name: str,
+        module: Optional[Linear] = None,
     ) -> None:
         """Refuse static quant recipes against checkpoints without scales.
 
@@ -170,6 +179,21 @@ class DynamicLinearWeightLoader:
 
         if self.quant_config is not None:
             if self.quant_config.is_module_excluded_from_quantization(name):
+                return
+
+        # Ask the destination buffer, not the module's name. ``quant_algo``
+        # above falls back to the *global* recipe for any module that carries
+        # no ``quant_config`` of its own, which includes modules that cannot be
+        # quantized at all: ``Embedding`` reaches this loader because it
+        # subclasses ``LMHead`` -> ``Linear``, yet its ``__init__`` never
+        # exposes ``quant_config``, so it always keeps a high-precision buffer.
+        # A high-precision weight landing in a high-precision buffer is a
+        # correct load with nothing to corrupt, which is the condition this
+        # guard is about. Where the destination is unknown the check proceeds,
+        # keeping the fail-closed behaviour.
+        if module is not None:
+            destination = getattr(module, "weight", None)
+            if destination is not None and destination.dtype in _HIGH_PRECISION_DTYPES:
                 return
 
         weight = weight_dict.get("weight")
@@ -337,7 +361,7 @@ class DynamicLinearWeightLoader:
         # Static (pre-quantized) recipes must not be loaded from checkpoints
         # that do not carry the expected scale tensors.
         for weight_dict in weight_dicts:
-            self._check_static_quant_scales(weight_dict, quant_algo, name)
+            self._check_static_quant_scales(weight_dict, quant_algo, name, module)
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
