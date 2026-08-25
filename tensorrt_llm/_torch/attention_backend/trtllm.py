@@ -30,7 +30,9 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend.fmha import (
-    Fmha, get_enabled_fmha_lib_classes)
+    CombinedFmha, Fmha, FmhaPhase, PhasedFmha, get_enabled_fmha_lib_classes)
+from tensorrt_llm._torch.attention_backend.fmha.interface import (
+    MlaBackendPolicy, _CuteDslMlaStagingKey)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -176,6 +178,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _flash_mla_metadata_valid: bool = field(default=False,
                                             init=False,
                                             repr=False)
+
+    # Per-forward-pass staging key for the CuTeDSL MLA generation workspace
+    # (page table + sequence lengths). All MLA layers of one step stage
+    # byte-identical data into the shared workspace, so the first layer
+    # copies and later layers skip. Reset whenever kv lens can change so
+    # eager forwards always re-stage (under CUDA graphs the first layer's
+    # captured copies replay once per step).
+    _cute_dsl_mla_staging_key: Optional[_CuteDslMlaStagingKey] = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
@@ -551,6 +565,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # buffers below must be rebuilt before the next MLA layer reads them.
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
+        # The staged CuTe DSL page table and sequence lengths are derived from
+        # the same per-iteration scheduler state.
+        self._cute_dsl_mla_staging_key = None
 
     def update_helix_param(
         self,
@@ -1170,7 +1187,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         is_spec_dec_dynamic_tree,
         max_draft_len,
         max_total_draft_tokens,
-        model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
         num_contexts: int = 0,
@@ -1184,7 +1200,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             is_spec_dec_dynamic_tree: bool, whether using dynamic tree.
             max_draft_len: int, the number of the draft layers.
             max_total_draft_tokens: int, the number of all nodes in the tree (except the root).
-            model_is_wrapped: Optional[bool] = False, whether the drafter model is wrapped (i.e, CDL).
             spec_metadata: Optional['SpecMetadata'] = None, the metadata of the spec-dec.
             spec_tree_manager: Optional['SpecTreeManager'] = None, the spec_tree_manager for draft token tree.
             num_contexts: int = 0, the number of context (prefill) requests in the
@@ -1312,61 +1327,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
                 cpp_query_len = n_dt
 
-            # Case 2/3: static tree
+            # Case 2: static tree (target model only)
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
                 assert (spec_metadata.spec_dec_mode.is_eagle3()
                         or spec_metadata.spec_dec_mode.is_eagle3_one_model()
                         ), "Tree decoding is only supported for Eagle3 now"
+                assert not getattr(spec_metadata, 'is_draft_model', False), (
+                    "Static tree spec-dec params are only prepared for the target model"
+                )
 
-                is_target_model = not getattr(spec_metadata, 'is_draft_model',
-                                              False)
+                # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
+                self.spec_decoding_position_offsets[:batch_size, :].copy_(
+                    spec_tree_manager.spec_dec_position_offsets[0, :],
+                    non_blocking=True)
+                self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
+                    spec_tree_manager.spec_dec_packed_mask[0, :, :],
+                    non_blocking=True)
+                self.spec_decoding_generation_lengths[:batch_size].fill_(
+                    spec_tree_manager.max_total_draft_tokens + 1)
 
-                # Case 2: static tree and target model
-                if is_target_model:
-                    # For the target model, we update the spec-dec parameters with the spec_tree_manager, which is prepared in advance.
-                    self.spec_decoding_position_offsets[:batch_size, :].copy_(
-                        spec_tree_manager.spec_dec_position_offsets[0, :],
-                        non_blocking=True)
-                    self.spec_decoding_packed_mask[:batch_size, :, :].copy_(
-                        spec_tree_manager.spec_dec_packed_mask[0, :, :],
-                        non_blocking=True)
-                    self.spec_decoding_generation_lengths[:batch_size].fill_(
-                        spec_tree_manager.max_total_draft_tokens + 1)
-
-                # Case 3: static tree and the first drafter layer
-                else:
-                    assert model_is_wrapped == True, "The drafter model should be wrapped"
-                    # The first drafter layer will take the padded tokens as input (padding to the max_draft_len + 1)
-                    # But the spec-dec parameters are still in the shape of max_total_draft_tokens + 1.
-                    # Considering that these spec-dec params are accessed consecutively (without padding) in the attention Op,
-                    # we need to write them consecutively when setting them.
-                    # For the next drafter layers, we will prepare these spec-dec params in the drafting loops.
-
-                    # position_offsets
-                    position_offset = torch.arange(
-                        max_draft_len + 1,
-                        dtype=torch.int,
-                        device='cpu',
-                        pin_memory=prefer_pinned()).repeat(batch_size)
-                    self.spec_decoding_position_offsets.reshape(
-                        -1)[:(max_draft_len + 1) * batch_size].copy_(
-                            position_offset, non_blocking=True)
-                    # packed_mask
-                    dummy_idx = torch.arange(max_draft_len + 1)
-                    spec_decoding_packed_mask = torch.pow(
-                        2, dummy_idx + 1) - 1  # [max_draft_len + 1]
-                    spec_decoding_packed_mask = spec_decoding_packed_mask.repeat(
-                        batch_size)  # [batch_size * (max_draft_len + 1)]
-                    self.spec_decoding_packed_mask.reshape(
-                        -1)[:(max_draft_len + 1) * batch_size].copy_(
-                            spec_decoding_packed_mask, non_blocking=True)
-                    self.generate_spec_decoding_generation_length(
-                        runtime_draft_len=max_draft_len)
-                    if (self.spec_decoding_position_offsets is not None
-                            and self.spec_decoding_position_offsets.dim() == 1):
-                        cpp_query_len = max_draft_len + 1
-
-            # Case 4: linear tree
+            # Case 3: linear tree
             else:
                 # Currently dynamic draft length is only supported for linear tree
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
@@ -1414,8 +1394,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
+        kv_cache_dtype: str = "auto",
+        flashinfer_mla_backend: Optional[str] = None,
         **kwargs,
-    ):
+    ) -> None:
         """
         Initialize the backend.
         Args:
@@ -1429,10 +1411,30 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            kv_cache_dtype (str): KV-cache dtype selected by ``KvCacheConfig``. Accepted
+                values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
+                torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
+                used by DeepSeek-V4 and DSA on SM120/SM121.
+            flashinfer_mla_backend (Optional[str]): FlashInfer MLA generation backend
+                                                    selected for this attention instance.
+                                                    None preserves the ordered FMHA-library
+                                                    dispatch.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        self.kv_cache_dtype = kv_cache_dtype
+        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
+        self.flashinfer_mla_backend = flashinfer_mla_backend
+        # Per-batch MLA decode backend override hook. Maps (statically
+        # configured backend, batch metadata, generation-token count) to the
+        # backend name for the current batch. None (the default) keeps the
+        # static ``flashinfer_mla_backend`` selection unchanged. Model code
+        # that needs batch-dependent selection (e.g. Kimi K3's MLA module)
+        # installs a policy on the attention instances it owns; it lives on
+        # the backend object rather than the FMHA lib instances because
+        # ``create_fmha_libs`` may recreate those after model construction.
+        self.mla_backend_policy: Optional[MlaBackendPolicy] = None
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
@@ -1487,6 +1489,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self.fmha_libs: List[Fmha] = []
+        self.phased_fmha_libs: List[PhasedFmha] = []
+        self.non_phased_fmha_libs: List[Fmha] = []
+        self.combined_fmha: Optional[CombinedFmha] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1742,10 +1747,111 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.original_max_positions
 
     def create_fmha_libs(self) -> None:
+        sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
+        if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
+                and get_sm_version() in (120, 121)
+                and getattr(self, "kv_cache_dtype", None) != "fp8_ds_mla"):
+            raise ValueError(
+                "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
+                "kv_cache_config.dtype='fp8_ds_mla'.")
         self.fmha_libs = []
         for fmha_cls in get_enabled_fmha_lib_classes():
             if fmha_cls.is_available(self):
                 self.fmha_libs.append(fmha_cls(self))
+
+        self.phased_fmha_libs = [
+            fmha for fmha in self.fmha_libs if isinstance(fmha, PhasedFmha)
+        ]
+        self.non_phased_fmha_libs = [
+            fmha for fmha in self.fmha_libs if not isinstance(fmha, PhasedFmha)
+        ]
+        self.combined_fmha = (CombinedFmha(self) if self.phased_fmha_libs
+                              and not self.is_mla_enable else None)
+
+    def _select_non_mla_fmha(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        has_context = metadata.num_contexts > 0
+        has_generation = metadata.num_generations > 0
+        if not has_context and not has_generation:
+            return None
+
+        context_fmha = None
+        generation_fmha = None
+        for fmha in self.fmha_libs:
+            if isinstance(fmha, PhasedFmha):
+                if (has_context and context_fmha is None and fmha.is_supported(
+                        q,
+                        k,
+                        v,
+                        metadata,
+                        forward_args,
+                        phase=FmhaPhase.CONTEXT,
+                )):
+                    context_fmha = fmha
+                if (has_generation and generation_fmha is None
+                        and fmha.is_supported(
+                            q,
+                            k,
+                            v,
+                            metadata,
+                            forward_args,
+                            phase=FmhaPhase.GENERATION,
+                        )):
+                    generation_fmha = fmha
+
+                if (has_context and context_fmha is None) or (
+                        has_generation and generation_fmha is None):
+                    continue
+                if context_fmha is None:
+                    return generation_fmha
+                if generation_fmha is None or context_fmha is generation_fmha:
+                    return context_fmha
+
+                self.combined_fmha.set_fmha_impls(
+                    context_fmha,
+                    generation_fmha,
+                )
+                return self.combined_fmha
+            if fmha.is_supported(q, k, v, metadata, forward_args):
+                return fmha
+        return None
+
+    def _select_mla_fmha(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        if forward_args.attention_input_type == AttentionInputType.context_only:
+            phase = FmhaPhase.CONTEXT
+        elif forward_args.attention_input_type == AttentionInputType.generation_only:
+            phase = FmhaPhase.GENERATION
+        else:
+            return None
+
+        for fmha in self.fmha_libs:
+            if isinstance(fmha, PhasedFmha):
+                supported = fmha.is_supported(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    phase=phase,
+                )
+            else:
+                supported = fmha.is_supported(q, k, v, metadata, forward_args)
+            if supported:
+                return fmha
+        return None
 
     def forward(
         self,
@@ -1825,6 +1931,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # generation FMHA only reads the cache, and the fallback path needs the
         # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
         if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                and not getattr(self, "use_fp8_ds_mla", False)
                 and forward_args.attention_input_type
                 == AttentionInputType.generation_only):
             num_ctx = metadata.num_contexts
@@ -2045,13 +2152,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self.fmha_libs:
             self.create_fmha_libs()
 
-        for fmha in self.fmha_libs:
-            if fmha.is_supported(q, k, v, metadata, forward_args):
-                fmha.forward(q, k, v, metadata, forward_args)
-                break
+        fmha: Optional[Fmha] = None
+        if self.is_mla_enable:
+            fmha = self._select_mla_fmha(q, k, v, metadata, forward_args)
         else:
+            fmha = self._select_non_mla_fmha(
+                q,
+                k,
+                v,
+                metadata,
+                forward_args,
+            )
+
+        if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
+        fmha.forward(q, k, v, metadata, forward_args)
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat

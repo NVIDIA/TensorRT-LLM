@@ -94,6 +94,9 @@ def _make_cache_config_for_test(
     cache_manager.max_num_tokens = max_num_tokens
     cache_manager.max_draft_len = max_draft_len
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
+    # Mirrors __init__: without helix the ledger block equals the physical
+    # page (the helper re-enacts construction for partial instances).
+    cache_manager._ledger_tokens_per_block = 128
 
     return cache_manager._build_base_config(
         kv_cache_config,
@@ -421,6 +424,7 @@ class _ContextRequest:
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
     is_dummy_request: bool = False
+    return_perf_metrics: bool = False
     context_current_position: int = 0
     prepopulated_prompt: tuple[int, int] | None = None
     multimodal_hashes: None = None
@@ -776,6 +780,42 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     assert ssm_stats.pool_group_id == 1
     assert ssm_stats.snapshot_stats.iter_snapshot_hit_rate == 0.5
     assert ssm_stats.snapshot_stats.iter_reused_tokens == 32
+
+
+def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._cold_pool_group_membership = lambda: ((0, frozenset({0, 1})),)
+    life_cycle_metadata = {
+        0: (0, 32, "attention"),
+        1: (1, 64, "attention"),
+    }
+    secondary_stats_by_level = [
+        [SimpleNamespace(total=7, available=2, evictable=1, slot_sizes=(4096,))],
+        [SimpleNamespace(total=11, available=5, evictable=3, slot_sizes=(4096,))],
+    ]
+    secondary_peak_stats_by_level = [
+        [SimpleNamespace(available=1, unavailable=6, evictable=2)],
+        [SimpleNamespace(available=4, unavailable=7, evictable=3)],
+    ]
+
+    report = manager._build_cold_pool_group_iteration_stats(
+        life_cycle_metadata,
+        primary_stats=(),
+        secondary_stats_by_level=secondary_stats_by_level,
+        primary_peak_stats=(),
+        secondary_peak_stats_by_level=secondary_peak_stats_by_level,
+    )
+
+    cold_group = report[0]
+    assert cold_group.slot_size == (4096,)
+    assert cold_group.window_sizes == (32, 64)
+    assert cold_group.stats.secondary_max_num_blocks == 18
+    assert cold_group.stats.secondary_free_num_blocks == 7
+    assert cold_group.stats.secondary_used_num_blocks == 11
+    assert cold_group.stats.secondary_evictable_num_blocks == 4
+    assert cold_group.stats.secondary_peak_free_num_blocks == 5
+    assert cold_group.stats.secondary_peak_used_num_blocks == 13
+    assert cold_group.stats.secondary_peak_evictable_num_blocks == 5
 
 
 def test_disagg_role_mapper_kinds_default_to_indexed():
