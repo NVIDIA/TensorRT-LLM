@@ -1470,14 +1470,9 @@ class KVCacheManagerV2(BaseResourceManager):
         for pool_id in range(self.num_pools):
             role_a, role_b = self._get_pool_roles(pool_id)
             layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
-            key_converter = self.impl.get_page_index_converter(layer_id, role_a)
-            if key_converter.expansion != 1:
-                raise NotImplementedError(
-                    "Attention block tables do not support expanded K page indices."
-                )
-            self.index_scales[pool_id] = key_converter.scale
             if self.is_fp8_k_nvfp4_v:
                 assert role_b is not None
+                key_converter = self.impl.get_page_index_converter(layer_id, role_a)
                 value_layer_id = self._pool_layer_ids_by_role[(pool_id, role_b)]
                 value_converter = self.impl.get_page_index_converter(value_layer_id, role_b)
                 scale_layer_id = self._pool_layer_ids_by_role[(pool_id, Role.VALUE_BLOCK_SCALE)]
@@ -1498,15 +1493,22 @@ class KVCacheManagerV2(BaseResourceManager):
                         "FP8-K/NVFP4-V requires K, V, and V-scale buffers to "
                         "share one page-index conversion."
                     )
+                self.index_scales[pool_id] = key_converter.scale
                 self.kv_offset[pool_id] = 0
-            elif role_b is not None:
-                self.kv_offset[pool_id] = exact_div(
-                    self.impl.get_mem_pool_base_address(layer_id, role_b, PageIndexMode.SHARED)
-                    - self.impl.get_mem_pool_base_address(layer_id, role_a, PageIndexMode.SHARED),
-                    self.impl.get_page_stride(layer_id, role_a),
-                )
             else:
-                self.kv_offset[pool_id] = 0
+                self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, role_a)
+                if role_b is not None:
+                    self.kv_offset[pool_id] = exact_div(
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, role_b, PageIndexMode.SHARED
+                        )
+                        - self.impl.get_mem_pool_base_address(
+                            layer_id, role_a, PageIndexMode.SHARED
+                        ),
+                        self.impl.get_page_stride(layer_id, role_a),
+                    )
+                else:
+                    self.kv_offset[pool_id] = 0
         # Plain-int mirror of index_scales so the per-step block-table build
         # does not index a tensor per request (see get_batch_cache_indices*).
         self._index_scale_ints: List[int] = self.index_scales.tolist()
