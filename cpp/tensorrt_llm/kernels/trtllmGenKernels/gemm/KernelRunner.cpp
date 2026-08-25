@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,12 @@ static GemmInterface::ModuleCache globalTrtllmGenGemmModuleCache;
 
 constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
 {
-    if (gpuSM == 103)
+    if (gpuSM == 107)
+    {
+        // SM107 can run SM100f family kernels or SM107a-specific kernels
+        return kernelSM == SmVersion::Sm107a || kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 103)
     {
         return kernelSM == SmVersion::Sm103a || kernelSM == SmVersion::Sm100f;
     }
@@ -51,6 +56,11 @@ constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
     else if (gpuSM == 90)
     {
         return kernelSM == SmVersion::Sm90a;
+    }
+    // Redirect SM100 family (major version 10) to family kernels
+    else if (tensorrt_llm::common::isSM100Family(gpuSM))
+    {
+        return kernelSM == SmVersion::Sm100f;
     }
     return true;
 }
@@ -88,6 +98,9 @@ size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mValidK = k;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -118,6 +131,9 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mValidK = k;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
@@ -161,6 +177,9 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? n : m;
+    gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? m : n;
+    gemmData.mProblemDimensions.mValidK = k;
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
