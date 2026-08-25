@@ -36,13 +36,27 @@ FP4_E2M1_MAX = 6.0
 FP8_E4M3_MAX = 448.0
 SF_VEC = 16
 
+# The bf16 up_proj GELU epilogue fusion is opt-in via this env var
+# (nvbugs/6655986).
+FUSE_GELU_ENV = "TRTLLM_MLP_FUSE_GELU_EPILOGUE"
 
-@pytest.mark.skipif(
+needs_addmm_activation = pytest.mark.skipif(
     not torch.cuda.is_available() or not hasattr(torch, "_addmm_activation"),
     reason="requires CUDA torch._addmm_activation",
 )
-def test_mlp_gelu_tanh_backward_uses_unfused_path() -> None:
-    """Autograd keeps eager linear + GELU so bf16 backward remains valid."""
+
+
+@pytest.fixture
+def fused_gelu_opt_in(monkeypatch) -> None:
+    """Opt into the bf16 GELU epilogue fusion, so that whatever else the test
+    varies is what decides between the fused and unfused path."""
+    monkeypatch.setenv(FUSE_GELU_ENV, "1")
+
+
+def _bf16_gelu_mlp():
+    """A bf16 GELU(tanh) MLP with bias -- the shape eligible for the fused
+    cuBLASLt up_proj epilogue -- with small random weights. Left on CPU; the
+    caller moves it if it runs a real forward."""
     from tensorrt_llm._torch.modules.mlp import MLP
     from tensorrt_llm._torch.utils import gelu_tanh
 
@@ -53,10 +67,17 @@ def test_mlp_gelu_tanh_backward_uses_unfused_path() -> None:
         activation=gelu_tanh,
         dtype=torch.bfloat16,
         reduce_output=False,
-    ).cuda()
+    )
     with torch.no_grad():
         for parameter in mlp.parameters():
             parameter.normal_(std=0.02)
+    return mlp
+
+
+@needs_addmm_activation
+def test_mlp_gelu_tanh_backward_uses_unfused_path(fused_gelu_opt_in) -> None:
+    """Autograd keeps eager linear + GELU so bf16 backward remains valid."""
+    mlp = _bf16_gelu_mlp().cuda()
 
     x = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     with mock.patch.object(
@@ -70,29 +91,17 @@ def test_mlp_gelu_tanh_backward_uses_unfused_path() -> None:
     assert torch.isfinite(x.grad).all()
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not hasattr(torch, "_addmm_activation"),
-    reason="requires CUDA torch._addmm_activation",
-)
+@needs_addmm_activation
 @pytest.mark.parametrize(
     "excluded_linear_path",
     ["gather_output", "use_custom_cublas_mm", "use_cute_dsl_bf16_gemm"],
 )
 def test_mlp_gelu_tanh_excluded_linear_path_uses_unfused_path(
     excluded_linear_path: str,
+    fused_gelu_opt_in,
 ) -> None:
     """Linear post-processing and alternate GEMM backends keep their dispatch."""
-    from tensorrt_llm._torch.modules.mlp import MLP
-    from tensorrt_llm._torch.utils import gelu_tanh
-
-    mlp = MLP(
-        hidden_size=64,
-        intermediate_size=128,
-        bias=True,
-        activation=gelu_tanh,
-        dtype=torch.bfloat16,
-        reduce_output=False,
-    )
+    mlp = _bf16_gelu_mlp()
     setattr(mlp.up_proj, excluded_linear_path, True)
 
     x = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="cuda")
@@ -114,27 +123,11 @@ def test_mlp_gelu_tanh_excluded_linear_path_uses_unfused_path(
     assert output is x_down
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not hasattr(torch, "_addmm_activation"),
-    reason="requires CUDA torch._addmm_activation",
-)
-def test_mlp_gelu_tanh_eligible_path_uses_fused_epilogue() -> None:
+@needs_addmm_activation
+def test_mlp_gelu_tanh_eligible_path_uses_fused_epilogue(fused_gelu_opt_in) -> None:
     """An eligible bf16 inference MLP engages the fused epilogue and stays
     close to the unfused reference."""
-    from tensorrt_llm._torch.modules.mlp import MLP
-    from tensorrt_llm._torch.utils import gelu_tanh
-
-    mlp = MLP(
-        hidden_size=64,
-        intermediate_size=128,
-        bias=True,
-        activation=gelu_tanh,
-        dtype=torch.bfloat16,
-        reduce_output=False,
-    ).cuda()
-    with torch.no_grad():
-        for parameter in mlp.parameters():
-            parameter.normal_(std=0.02)
+    mlp = _bf16_gelu_mlp().cuda()
 
     x = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="cuda")
     with (
@@ -154,19 +147,30 @@ def test_mlp_gelu_tanh_eligible_path_uses_fused_epilogue() -> None:
     torch.testing.assert_close(fused_out.float(), unfused_out.float(), atol=2e-2, rtol=2e-2)
 
 
+@needs_addmm_activation
+def test_mlp_gelu_tanh_fusion_is_opt_in(monkeypatch) -> None:
+    """Without the opt-in env var the bf16 epilogue fusion stays disabled.
+
+    The fused epilogue shifts bf16 rounding in a way that compounds across
+    diffusion denoising steps (nvbugs/6655986), so it must not self-activate on
+    an otherwise fully eligible MLP.
+    """
+    monkeypatch.delenv(FUSE_GELU_ENV, raising=False)
+    mlp = _bf16_gelu_mlp()
+
+    x = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="cuda")
+    # Both rows under no_grad(), where every other eligibility guard is
+    # satisfied: the env var alone flips the verdict, so the negative row cannot
+    # pass just because something else held the fusion back.
+    with torch.no_grad():
+        assert not mlp._unquantized_gelu_fusion_eligible(x)
+        monkeypatch.setenv(FUSE_GELU_ENV, "1")
+        assert mlp._unquantized_gelu_fusion_eligible(x)
+
+
 def test_mlp_nvfp4_gelu_gather_output_is_ineligible() -> None:
     """The direct NVFP4 GELU kernels must not bypass column all-gather."""
-    from tensorrt_llm._torch.modules.mlp import MLP
-    from tensorrt_llm._torch.utils import gelu_tanh
-
-    mlp = MLP(
-        hidden_size=64,
-        intermediate_size=128,
-        bias=True,
-        activation=gelu_tanh,
-        dtype=torch.bfloat16,
-        reduce_output=False,
-    )
+    mlp = _bf16_gelu_mlp()
     up = torch.nn.Identity()
     up.gather_output = True
     up.has_nvfp4_activation_quantization = True

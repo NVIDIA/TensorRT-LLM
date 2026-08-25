@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from collections.abc import Callable
 from typing import Optional, Tuple, Union
 
@@ -172,7 +173,19 @@ class MLP(nn.Module):
         """Whether the unquantized up projection can use the cuBLASLt GELU
         epilogue without bypassing Linear post-processing or another GEMM
         backend.
+
+        The epilogue applies GELU to the fp32 accumulator, whereas the unfused
+        path rounds the GEMM result to bf16 first. The fused result is in fact
+        the *more* accurate of the two against an fp32 reference, but the ~0.2%
+        per-layer delta is a different rounding trajectory than the one
+        iterative diffusion samplers were calibrated against, and it compounds
+        across blocks and denoising steps (LTX-2 e2e LPIPS 0.0045 -> 0.094).
+        Hence opt-in via ``TRTLLM_MLP_FUSE_GELU_EPILOGUE=1`` rather than on by
+        default; the same drift is documented for Inductor's fused GELU in
+        ``visual_gen/models/flux/transformer_flux.py::_gelu_tanh_eager``.
         """
+        if os.environ.get("TRTLLM_MLP_FUSE_GELU_EPILOGUE", "0") != "1":
+            return False
         up_proj = self.up_proj
         return (self.activation is gelu_tanh
                 and hasattr(torch, "_addmm_activation")
