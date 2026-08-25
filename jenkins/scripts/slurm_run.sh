@@ -98,9 +98,9 @@ slurm_wait_all_ranks() {
     touch "$readyDir/rank_${SLURM_PROCID}.ready"
 
     # Bounded so a dead rank fails the stage loudly instead of hanging until the
-    # partition walltime kills it. This bounds arrival skew between ranks (each 
-    # rank's deadline starts after its own install finished) -- comfortably above 
-    # the  ~10min skew seen in the bug -  not any single install-phase timeout; 
+    # partition walltime kills it. This bounds arrival skew between ranks (each
+    # rank's deadline starts after its own install finished) -- comfortably above
+    # the  ~10min skew seen in the bug -  not any single install-phase timeout;
     # in slurm_install.sh so a merely slow rank still releases the barrier.
     local timeoutSecs=3600
     local deadline=$((SECONDS + timeoutSecs))
