@@ -2028,6 +2028,28 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
+                // BOLT profile generation (producer): refreshes the branch-keyed
+                // `latest` bundle the BOLT consumers pull, on this pipeline's
+                // cadence. Post-merge only -- it profiles the SBSA build just
+                // built under three multi-hour GPU workloads, so it must never
+                // land on a pre-merge /bot run. Best-effort: the producer depends
+                // on external SLURM health and bundles are drift-tolerant, so a
+                // failure just leaves `latest` where it was; it must not fail
+                // post-merge nor block the tests behind it.
+                if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    stage("[BOLT-Profile-Gen] Remote Run") {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            def additionalParameters = [
+                                "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                                'targetArch': "aarch64-linux-gnu",
+                                'branch': globalVars[BUILD_BRANCH],
+                                'promote': "true",
+                            ]
+                            launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
+                        }
+                    }
+                }
+
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
                 def singleGpuInfraIncomplete = false
