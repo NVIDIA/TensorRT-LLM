@@ -57,6 +57,9 @@ l0_b300:
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_cutlass_situ_bf16_matches_reference
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_match_situ_reference[static_1.0]
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_megamoe_streamed_coverage_survives_per_expert_drain
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_megamoe_overrides_finalize_streamed_expert
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py::test_mega_format_transform_is_slot_blockwise
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
