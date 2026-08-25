@@ -214,7 +214,8 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
                 return optionsA.mNumSlicesForSplitK > optionsB.mNumSlicesForSplitK;
             }
 
-            return true;
+            // Elements are equivalent - must return false for strict weak ordering
+            return false;
         });
 
     for (auto const& configIndex : sortedIndices)
