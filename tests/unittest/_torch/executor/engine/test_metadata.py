@@ -118,7 +118,6 @@ def test_update_spec_metadata_handles_parallel_draft_and_dynamic_tree() -> None:
     )
     attn_metadata = SimpleNamespace(update_spec_dec_param=Mock())
     spec_tree_manager = SimpleNamespace(
-        use_dynamic_tree=True,
         slot_storage=SimpleNamespace(fill_all_slot_ids=Mock()),
     )
 
@@ -173,7 +172,6 @@ def test_update_spec_metadata_uses_non_parallel_limits_for_draft_model() -> None
     )
     attn_metadata = SimpleNamespace(update_spec_dec_param=Mock())
     spec_tree_manager = SimpleNamespace(
-        use_dynamic_tree=True,
         slot_storage=SimpleNamespace(fill_all_slot_ids=Mock()),
     )
 
