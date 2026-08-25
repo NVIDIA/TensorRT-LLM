@@ -131,6 +131,7 @@ class MsaIndexer:
         proxy_plan: Optional[tuple] = None,
         max_score: Optional[torch.Tensor] = None,
         n_valid_blocks: Optional[torch.Tensor] = None,
+        head_major_output: bool = False,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -183,6 +184,7 @@ class MsaIndexer:
             n_valid_blocks=n_valid_blocks,
             init_blocks=config.init_blocks,
             local_blocks=config.local_blocks,
+            head_major_output=head_major_output,
         )
 
 

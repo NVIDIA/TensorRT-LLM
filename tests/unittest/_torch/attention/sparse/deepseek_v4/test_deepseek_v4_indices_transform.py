@@ -28,8 +28,10 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4AttentionType,
     DeepseekV4CacheManager,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import get_token_bytes
-from tensorrt_llm._torch.attention_backend.sparse.kernel import deepseek_v4_local_to_global_indices
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.kernels import (
+    deepseek_v4_local_to_global_indices,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig

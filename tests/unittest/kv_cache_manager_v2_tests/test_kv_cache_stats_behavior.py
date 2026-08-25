@@ -16,6 +16,7 @@
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -56,6 +57,7 @@ class _StatsRequest:
     is_disagg_generation_transmission_complete: bool = False
     is_finished_due_to_cancellation: bool = False
     context_phase_params: None = None
+    return_perf_metrics: bool = False
     py_draft_tokens: list[int] = field(default_factory=list)
     draft_tokens: list[int] = field(default_factory=list)
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
@@ -83,6 +85,15 @@ class _StatsRequest:
     def get_tokens(self, beam_id: int = DEFAULT_BEAM_INDEX) -> list[int]:
         assert beam_id == DEFAULT_BEAM_INDEX
         return self.tokens
+
+    def get_tokens_view(self, beam_id: int = DEFAULT_BEAM_INDEX) -> np.ndarray:
+        """Mirror LlmRequest.get_tokens_view, which the C++ backend takes on the reuse path.
+
+        The real binding returns a zero-copy contiguous 1-D int32 view of the token buffer;
+        the dtype matters because it selects the C++ int32 ingest fast path.
+        """
+        assert beam_id == DEFAULT_BEAM_INDEX
+        return np.asarray(self.tokens, dtype=np.int32)
 
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)

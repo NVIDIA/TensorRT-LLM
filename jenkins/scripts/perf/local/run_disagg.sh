@@ -145,7 +145,8 @@ else
     fi
     image_source="resolved from \$image_var=${image_var} via current_image_tags.properties"
 fi
-# urm.nvidia.com/ → urm.nvidia.com# (enroot URI form). No-op if user already passed enroot form.
+# host/ → host# (enroot URI form). No-op if user already passed enroot form.
+image=${image//artifactory.nvidia.com\//artifactory.nvidia.com#}
 image=${image//urm.nvidia.com\//urm.nvidia.com#}
 
 echo "=== Configuration ==="

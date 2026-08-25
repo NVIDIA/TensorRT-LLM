@@ -20,8 +20,10 @@ import java.lang.Exception
 import groovy.transform.Field
 
 // Docker image registry
-IMAGE_NAME = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging"
+IMAGE_NAME = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm-staging"
 NGC_IMAGE_NAME = "${IMAGE_NAME}/ngc"
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -172,7 +174,9 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
-                    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202608172149_docker_dind_mtu_helper
+                    command: ['/usr/local/bin/dind-mtu']
+                    args: ['start']
                     tty: true
                     resources:
                       requests:
@@ -218,6 +222,8 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
             spec:
                 qosClass: Guaranteed
                 ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                   - name: jnlp
@@ -327,6 +333,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
 
     // Step 2: Build the images
     stage ("Install Package") {
+        sh(label: "Validate Docker bridge MTU", script: "/usr/local/bin/dind-mtu validate")
         sh "pwd && ls -alh"
         sh "env | sort"
         sh "apk add make git"
@@ -350,9 +357,9 @@ def buildImage(config, imageKeyToTag, versionOverride)
                     // earlier one fails, so a failure on one registry can't leave
                     // another still authenticated.
                     try {
-                        sh "docker logout urm.nvidia.com"
+                        sh "docker logout artifactory.nvidia.com"
                     } catch (Exception logoutEx) {
-                        echo "docker logout urm.nvidia.com failed: ${logoutEx}"
+                        echo "docker logout artifactory.nvidia.com failed: ${logoutEx}"
                     }
                     try {
                         sh "docker logout ${DEFAULT_GIT_URL}:5005"
@@ -363,8 +370,9 @@ def buildImage(config, imageKeyToTag, versionOverride)
             }
         }) {
         stage ("Docker Login") {
-            withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-                trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
+            // Read-write artifactory credentials (image push)
+            withCredentials([usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker login artifactory.nvidia.com -u ${USERNAME} -p ${PASSWORD}")
             }
 
             withCredentials([
@@ -564,14 +572,37 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             dockerfileStage: "release",
         ],
     ]
+    def triggerTypeBuildDefaults = [
+        "nightly-release": [
+            buildInternalRelease: false,
+            buildCiImage: false,
+            buildNgcRelease: true,
+        ],
+    ]
+    def buildDefaults = triggerTypeBuildDefaults[TRIGGER_TYPE] ?: [:]
+    // params may contain a Declarative default even when the remote parameter was dropped.
+    // env presence indicates that the parameter was attached to the current build.
+    def resolveBuildStageParam = { parameterName ->
+        if (env."${parameterName}" != null) {
+            return params[parameterName]
+        }
+        if (buildDefaults.containsKey(parameterName)) {
+            return buildDefaults[parameterName]
+        }
+        return params[parameterName]
+    }
+    def buildInternalRelease = resolveBuildStageParam("buildInternalRelease")
+    def buildCiImage = resolveBuildStageParam("buildCiImage")
+    def buildNgcRelease = resolveBuildStageParam("buildNgcRelease")
+
     def enabledStages = []
-    if (params.buildInternalRelease) {
+    if (buildInternalRelease) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
-    if (params.buildCiImage) {
+    if (buildCiImage) {
         enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
     }
-    if (params.buildNgcRelease) {
+    if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
     }
     buildConfigs = buildConfigs.findAll { key, config -> key in enabledStages }
@@ -818,7 +849,7 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                            def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
+                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {
                                 echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
@@ -828,17 +859,20 @@ pipeline {
                                 trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                             }
                             def nspect_env = params.nspect_env ? params.nspect_env : "prod"
-                            def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                            def nspectReleaseVersion = params.program_version_name ?: "PostMerge"
                             def cmd = """./nspect/nspect.py \
                                 --env ${nspect_env} \
                                 --nspect_id ${params.nspect_id} \
-                                --program_version_name '${program_version_name}' \
+                                --program_version_name '${nspectReleaseVersion}' \
                                 """
                             if (params.register_images) {
-                                cmd += "--register "
+                                cmd += "--add_version "
                             }
                             if (params.osrb_ticket) {
                                 cmd += "--osrb_ticket ${params.osrb_ticket} "
+                            }
+                            if (params.export_compliance_bug) {
+                                cmd += "--export_compliance_bug '${params.export_compliance_bug}' "
                             }
                             if (params.wait_success_seconds) {
                                 cmd += "--check_launch_api "
@@ -846,7 +880,10 @@ pipeline {
                             }
                             cmd += "--image "
                             cmd += imageKeyToTag.values().join(" ")
-                            withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                            withCredentials([
+                                usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET'),
+                                usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')
+                            ]) {
                                 trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
                             }
                         }

@@ -1,0 +1,30 @@
+# Identical to eval_extra_llm_options.yaml except for the reuse-specific
+# keys: kv_cache_config.enable_block_reuse is flipped to true and
+# mamba_state_config.periodic_snapshot_interval is set. Keep every other
+# key in sync with the base file when editing either.
+tensor_parallel_size: 16
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+max_batch_size: 32
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
+moe_config:
+  max_num_tokens: 33024
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64
+  # Restore the pre-rework snapshot cadence: upstream deprecated
+  # mamba_state_cache_interval (default 256) into
+  # mamba_state_config.periodic_snapshot_interval (default 0 = snapshots
+  # off), and hybrid models only expose reusable prefixes at snapshot
+  # boundaries — without this, block reuse silently never engages.
+  mamba_state_config:
+    periodic_snapshot_interval: 256

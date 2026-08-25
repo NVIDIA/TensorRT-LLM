@@ -12,6 +12,7 @@
 
 import gc
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -20,7 +21,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -153,6 +154,33 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
                 )
                 self.assertNotIn(Role.INDEX_KEY, roles)
         finally:
+            mgr.shutdown()
+            del mgr
+
+    def test_page_table_uses_physical_pool_representative(self):
+        mgr = KVCacheManagerV2(**_make_kwargs(head_dim=[64, 192, 64, 192]))
+        real_impl = mgr.impl
+        try:
+            pool_id = 0
+            physical_layer = mgr._pool_layer_ids_by_role[(pool_id, Role.KEY)]
+            other_layer = next(
+                layer_id
+                for layer_id in real_impl.layer_grouping[pool_id]
+                if int(layer_id) != int(physical_layer)
+            )
+            impl_proxy = Mock(wraps=real_impl)
+            impl_proxy.layer_grouping = ((other_layer, physical_layer),)
+            mgr.impl = impl_proxy
+
+            mgr._prepare_page_table_tensor(index_mapper_capacity=1)
+
+            self.assertEqual(
+                impl_proxy.get_mem_pool_base_address.call_args_list[0].args,
+                (physical_layer, Role.KEY, PageIndexMode.SHARED),
+            )
+            impl_proxy.get_page_index_scale.assert_called_once_with(physical_layer, Role.KEY)
+        finally:
+            mgr.impl = real_impl
             mgr.shutdown()
             del mgr
 

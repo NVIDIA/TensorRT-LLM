@@ -30,9 +30,9 @@ skip_no_cuda = pytest.mark.skipif(
 
 @pytest.mark.parametrize(
     "value,expected",
-    [(None, False), ("", False), ("0", False), ("false", False), ("typo", False), ("1", True)],
+    [(None, True), ("", False), ("0", False), ("false", False), ("typo", False), ("1", True)],
 )
-def test_gdn_replay_env_requires_one(monkeypatch, value, expected):
+def test_gdn_replay_env_defaults_on_and_requires_one_when_set(monkeypatch, value, expected):
     from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 
     if value is None:

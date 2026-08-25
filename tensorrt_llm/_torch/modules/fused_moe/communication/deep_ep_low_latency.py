@@ -48,6 +48,15 @@ class DeepEPLowLatency(Communication):
     Sourced from SWITCH_HIDDEN_FOR_EXTENSION_KERNELS in extension_kernels.cu.
     """
 
+    MAX_TOP_K: int = 9
+    """int: Compile-time top-k cap of the low-latency kernels.
+
+    ``kNumMaxTopK``/``kNumMaxTopk`` in internode_ll.cu (dispatch and combine)
+    size per-thread register arrays with it and guard it with
+    ``EP_HOST_ASSERT(num_topk <= kNumMaxTopK)`` — a larger top_k aborts on the
+    first dispatch/combine, so selection must reject it up front.
+    """
+
     def __init__(
         self,
         mapping: Mapping,

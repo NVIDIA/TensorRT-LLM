@@ -21,6 +21,7 @@ client stub for the pinned ModelExpress 0.4.1 API shape.
 
 from types import SimpleNamespace
 
+import pytest
 from _source_identity_fakes import FakeMapping
 from _source_identity_fakes import make_identity as _identity
 
@@ -28,6 +29,8 @@ from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
     MXCheckpointLoader,
     _build_mx_source_metadata,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _new_loader(local_identity):

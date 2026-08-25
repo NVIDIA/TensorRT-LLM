@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import sys
 
 import pytest
@@ -8,8 +23,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.utils import (is_nvfp4_marlin_supported_sm,
-                                       model_extra_attrs)
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -752,9 +766,10 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 
 @pytest.mark.skipif(
-    not is_nvfp4_marlin_supported_sm(),
-    reason="Marlin NVFP4 backend runs on Ada (SM89) and Hopper (SM90-99)",
+    not (89 <= get_sm_version() < 100 or get_sm_version() in (120, 121)),
+    reason="Dense Marlin NVFP4 runs on SM89-99 and SM120/121",
 )
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "mnk",
@@ -776,7 +791,10 @@ def test_fp4_linear_cuda_core(dtype, mnk):
         (3, 176, 144),
         (128, 928, 1360),
     ])
-def test_fp4_linear_marlin(dtype, mnk):
+def test_fp4_linear_marlin(quant_algo, dtype, mnk):
+    if quant_algo == QuantAlgo.NVFP4 and get_sm_version() in (120, 121):
+        pytest.skip(
+            "Marlin backend shouldn't be used for NVFP4 quant on SM120/121")
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
 
@@ -798,7 +816,7 @@ def test_fp4_linear_marlin(dtype, mnk):
             out_features=OUTPUT_SIZE,
             bias=False,
             dtype=dtype,
-            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            quant_config=QuantConfig(quant_algo=quant_algo),
             nvfp4_allowed_backends=['marlin'],  # key
         )
 

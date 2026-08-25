@@ -293,16 +293,16 @@ class VisualGen:
 
     @property
     def default_params(self) -> "VisualGenParams":
-        """Returns a ``VisualGenParams`` with the loaded pipeline's defaults.
+        """Returns a ``VisualGenParams`` with all defaults resolved for the loaded pipeline.
 
         Universal fields (height, width, etc.) are filled from the
-        pipeline's defaults.  Pipelines with mode-dependent defaults
-        (e.g. Cosmos3, where text-to-image and video requests use
-        different resolutions) leave such fields as ``None``; they are
-        resolved per request from the output mode, so ``None`` here
-        means "the mode's default", not "unset".  All declared
-        ``extra_params`` keys are included with their defaults
-        (``None`` for params without one).
+        pipeline's defaults.  All declared ``extra_params`` keys are
+        included with their defaults (``None`` for params without one).
+
+        Fields carrying a pipeline default are reported as unset, so a
+        round trip through this object does not read as caller intent
+        and request-dependent defaults stay resolvable; assigning any of
+        them marks it as yours.
 
         Use this to inspect what the model will use, then modify and
         pass to ``generate()``::
@@ -321,7 +321,13 @@ class VisualGen:
         if extra:
             kwargs["extra_params"] = extra
 
-        return VisualGenParams(**kwargs)
+        params = VisualGenParams(**kwargs)
+        # These came from the pipeline, not the caller. Un-marking them keeps
+        # request-dependent defaults resolvable after a round trip through
+        # this object; assigning any of them re-marks it automatically.
+        for field_name in self.executor.default_generation_params:
+            params.model_fields_set.discard(field_name)
+        return params
 
     @set_api_status("prototype")
     def generate(

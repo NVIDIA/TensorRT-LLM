@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import time
 
@@ -67,6 +82,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         use_prog_thread: bool = True,
         num_threads: int = 1,
         enable_telemetry: bool = False,
+        rank: int | None = None,
+        world_size: int | None = None,
         **kwargs,
     ):
         backend_params = kwargs
@@ -97,6 +114,8 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             use_listen_thread=False,
             enable_telemetry=enable_telemetry,
             backend_params=backend_params,
+            rank=rank,
+            world_size=world_size,
         )
         self._cpp_agent = CppNixlTransferAgent(config)
         self.name = name

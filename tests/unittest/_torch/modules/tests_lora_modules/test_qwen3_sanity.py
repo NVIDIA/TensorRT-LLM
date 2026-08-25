@@ -17,6 +17,7 @@
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,8 +26,11 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_gpu_memory_less_than_80gb
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.peft.lora import layer as lora_layer_module
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_helper import LoraConfig
 
 # HF module name -> block path relative to layers.{idx}.
 # Attention targets work on all architectures. MLP targets only apply to
@@ -149,17 +153,22 @@ def _assert_lora_changes_output(out_lora, out_base):
     assert any_differ, "LoRA outputs identical to base model (same tokens AND same logprobs)"
 
 
-def _run_lora_test(model_path, target_modules, trtllm_modules, dtype=torch.bfloat16):
+def _run_lora_test(model_path, target_modules, trtllm_modules, dtype=torch.bfloat16, overlap=False):
     """End-to-end helper: create adapter, run inference, assert output differs."""
     with tempfile.TemporaryDirectory() as tmpdir:
         lora_dir = _create_lora_adapter(
-            os.path.join(tmpdir, "lora"), model_path, target_modules, dtype=dtype
+            os.path.join(tmpdir, "lora"),
+            model_path,
+            target_modules,
+            lora_rank=16 if dtype == torch.float8_e4m3fn else 8,
+            dtype=dtype,
         )
         lora_config = LoraConfig(
             lora_dir=[lora_dir],
             lora_target_modules=trtllm_modules,
             max_lora_rank=16,
             max_loras=2,
+            overlap_lora_and_base=overlap,
         )
         out_lora, out_base = _run_with_and_without_lora(
             model_path,
@@ -168,6 +177,38 @@ def _run_lora_test(model_path, target_modules, trtllm_modules, dtype=torch.bfloa
             ["The capital of France is", "Hello, how are you"],
         )
         _assert_lora_changes_output(out_lora, out_base)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="LoRA overlap requires CUDA streams.")
+def test_lora_forward_with_base_executes_overlap(monkeypatch):
+    """Verify that the LoRA overlap path uses its auxiliary CUDA stream."""
+    lora_layer = LoraLayer([LoraModuleType.ATTENTION_Q], [2])
+    layer_key = lora_layer_module.CudaGraphLoraParams.LoraLayerKey(
+        layer_idx=0, module_ids=tuple(lora_layer.lora_module_types)
+    )
+    aux_stream = torch.cuda.Stream()
+    parallel_streams = []
+    original_parallel_executor = lora_layer_module.maybe_execute_in_parallel
+
+    def record_parallel_executor(*args, **kwargs):
+        parallel_streams.append(args[4])
+        return original_parallel_executor(*args, **kwargs)
+
+    monkeypatch.setattr(lora_layer_module, "maybe_execute_in_parallel", record_parallel_executor)
+    monkeypatch.setattr(LoraLayer, "forward", lambda self, x, *_: torch.ones_like(x))
+
+    x = torch.ones((2, 2), device="cuda")
+    lora_params = {
+        "cuda_graph_params": SimpleNamespace(layer_info={layer_key: object()}),
+        "lora_aux_stream": aux_stream,
+    }
+    with with_multi_stream(True):
+        output = LoraLayer.forward_with_base(lambda: x.clone(), (lora_layer,), x, lora_params, 0)
+
+    assert lora_layer._par_events is not None
+    assert len(parallel_streams) == 1
+    assert parallel_streams[0] is aux_stream
+    torch.testing.assert_close(output, 2 * x)
 
 
 class TestQwen3LoRA:
@@ -190,6 +231,23 @@ class TestQwen3LoRA:
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             dtype=torch.float8_e4m3fn,
+        )
+
+    def test_qwen3_bf16_lora_overlap(self):
+        _run_lora_test(
+            self.model_path,
+            {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
+            _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+            overlap=True,
+        )
+
+    def test_qwen3_fp8_lora_overlap(self):
+        _run_lora_test(
+            self.model_path,
+            {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
+            _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+            dtype=torch.float8_e4m3fn,
+            overlap=True,
         )
 
 

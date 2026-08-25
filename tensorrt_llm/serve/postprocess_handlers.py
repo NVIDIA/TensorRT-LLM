@@ -2,6 +2,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor
 from tensorrt_llm.serve.responses_utils import \
     create_response_non_store as responses_api_create_response_non_store
@@ -40,7 +41,7 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               ResponsesResponse, StreamOptions, ToolCall,
                               UsageInfo, to_disaggregated_params)
 from .tool_parser.base_tool_parser import BaseToolParser
-from .tool_parser.core_types import ToolCallItem
+from .tool_parser.core_types import StreamingParseResult, ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
 
 # yapf: enable
@@ -187,8 +188,11 @@ def apply_reasoning_parser(args: ChatPostprocArgs,
     return content, reasoning_content
 
 
-def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
-                      streaming: bool) -> Tuple[str, List[ToolCallItem]]:
+def apply_tool_parser(args: ChatPostprocArgs,
+                      output_index: int,
+                      text: str,
+                      streaming: bool,
+                      finished: bool = False) -> Tuple[str, List[ToolCallItem]]:
     tool_parser = None
     tools = args.tools
     if args.tool_parser is not None and tools is not None:
@@ -203,6 +207,11 @@ def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = tool_parser.detect_and_parse(text, tools)
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
+            if finished:
+                finish_result = tool_parser.finish(tools)
+                result = StreamingParseResult(
+                    normal_text=result.normal_text + finish_result.normal_text,
+                    calls=result.calls + finish_result.calls)
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
@@ -210,6 +219,47 @@ def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
         normal_text, calls = text, []
 
     return normal_text, calls
+
+
+def _forced_tool_choice(
+        args: ChatPostprocArgs) -> Optional[ChatCompletionNamedToolChoiceParam]:
+    """Return the named tool_choice param if the request forces a tool."""
+    if isinstance(args.tool_choice, ChatCompletionNamedToolChoiceParam):
+        return args.tool_choice
+    return None
+
+
+def _forced_choice_uses_tool_parser(args: ChatPostprocArgs) -> bool:
+    """Whether the configured tool parser extracts forced/named tool calls.
+
+    Parsers whose forced output is grammar-constrained bare JSON keep the
+    raw-passthrough behavior; parsers that opt in (see
+    ``BaseToolParser.extracts_forced_tool_calls``) still emit their native
+    markup on forced calls and need the extraction path.
+    """
+    if args.tool_parser is None or args.tools is None:
+        return False
+    parser_cls = ToolParserFactory.parsers.get(args.tool_parser.lower())
+    return bool(parser_cls
+                and getattr(parser_cls, "extracts_forced_tool_calls", False))
+
+
+def _forced_call_name(calls: List[ToolCallItem], forced_name: str) -> str:
+    """Validate parser-extracted calls against the request's forced tool.
+
+    The name always comes from the request (the caller chose it); the parser
+    output is only checked so a disagreeing model is visible in the logs.
+    """
+    if len(calls) > 1:
+        logger.warning(
+            f"Forced tool_choice '{forced_name}' produced {len(calls)} tool "
+            "calls; keeping the first.")
+    parsed_name = calls[0].name
+    if parsed_name and parsed_name != forced_name:
+        logger.warning(
+            f"Forced tool_choice '{forced_name}' but the model emitted a call "
+            f"to '{parsed_name}'; using the forced name.")
+    return forced_name
 
 
 @nvtx_range_debug("chat_stream_post_processor")
@@ -279,18 +329,32 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             True,
             finished=(output.finish_reason is not None))
 
-        if args.tool_choice and type(
-                args.tool_choice) is ChatCompletionNamedToolChoiceParam:
+        forced_tool = _forced_tool_choice(args)
+        if forced_tool and not _forced_choice_uses_tool_parser(args):
+            # Forced calls constrained to bare JSON arguments: raw deltas are
+            # the arguments stream. The response carries a tool call, so the
+            # final chunk must report finish_reason="tool_calls".
+            args.has_tool_call[i] = True
             delta_message = DeltaMessage(tool_calls=[
                 DeltaToolCall(
-                    function=DeltaFunctionCall(
-                        name=args.tool_choice.function.name,
-                        arguments=delta_text),
+                    function=DeltaFunctionCall(name=forced_tool.function.name,
+                                               arguments=delta_text),
                     index=i,
                 ),
             ], )
         else:
-            delta_text, calls = apply_tool_parser(args, i, delta_text, True)
+            delta_text, calls = apply_tool_parser(args,
+                                                  i,
+                                                  delta_text,
+                                                  True,
+                                                  finished=(output.finish_reason
+                                                            is not None))
+            if forced_tool and calls:
+                forced_name = _forced_call_name(calls,
+                                                forced_tool.function.name)
+                calls = calls[:1]
+                if calls[0].name:
+                    calls[0].name = forced_name
             tool_calls = []
             for call_item in calls:
                 # Tool call ID should be generated only once per tool call
@@ -392,15 +456,48 @@ def chat_response_post_processor(
         text, reasoning_text = apply_reasoning_parser(args, output.index,
                                                       output.text, False)
 
-        if args.tool_choice and isinstance(args.tool_choice,
-                                           ChatCompletionNamedToolChoiceParam):
+        forced_tool = _forced_tool_choice(args)
+        if forced_tool and not _forced_choice_uses_tool_parser(args):
+            # Forced calls constrained to bare JSON arguments: the whole text
+            # is the arguments payload. The response carries a tool call, so
+            # finish_reason must be "tool_calls".
+            args.has_tool_call[output.index] = True
             message = ChatMessage(
                 role=role,
                 content="",
                 tool_calls=[
                     ToolCall(function=FunctionCall(
-                        name=args.tool_choice.function.name, arguments=text))
+                        name=forced_tool.function.name, arguments=text))
                 ])
+        elif forced_tool:
+            # The parser extracts the forced call from the model's native
+            # markup; any free-text preamble becomes content per OpenAI
+            # semantics.
+            text, calls = apply_tool_parser(args, output.index, text or "",
+                                            False)
+            if calls:
+                forced_name = _forced_call_name(calls,
+                                                forced_tool.function.name)
+                message = ChatMessage(
+                    role=role,
+                    content=text,
+                    reasoning_content=reasoning_text,
+                    tool_calls=[
+                        ToolCall(function=FunctionCall(
+                            name=forced_name, arguments=calls[0].parameters))
+                    ])
+            else:
+                # No tool markup despite the forced choice (nothing
+                # constrains the model for these parsers). Returning the text
+                # as arguments would hand the caller garbage JSON, so return
+                # it as content and keep finish_reason honest.
+                logger.warning(
+                    f"Forced tool_choice '{forced_tool.function.name}' but the "
+                    "model emitted no tool-call markup; returning the text as "
+                    "content.")
+                message = ChatMessage(role=role,
+                                      content=text,
+                                      reasoning_content=reasoning_text)
         else:
             if text is None:
                 text = ""
@@ -416,6 +513,17 @@ def chat_response_post_processor(
                                   tool_calls=tool_calls)
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
+        if (disaggregated_params is not None and args.chat_template_kwargs
+                and args.reasoning_parser
+                and ReasoningParserFactory.resolves_thinking_from_prompt(
+                    args.reasoning_parser)):
+            # Relay the mode we resolved from the rendered prompt; the
+            # generation worker never renders and so cannot resolve it. Gated
+            # on the parser opting in, so we never overwrite a mode another
+            # parser derives from the caller's own kwargs.
+            resolved = args.chat_template_kwargs.get("enable_thinking")
+            if resolved is not None:
+                disaggregated_params.resolved_thinking = resolved
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,

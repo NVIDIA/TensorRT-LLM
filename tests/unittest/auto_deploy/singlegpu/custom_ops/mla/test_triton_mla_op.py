@@ -454,6 +454,7 @@ class TestTritonMLAPrefill:
         )
 
 
+@pytest.mark.cpu_only
 class TestTritonMLADescriptor:
     """Test TritonMLAAttention descriptor configuration."""
 

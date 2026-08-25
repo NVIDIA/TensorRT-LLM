@@ -1,0 +1,83 @@
+{
+  "_comment": "Auto-derived from a layer-wise nsys trace by tools/gen_module_cases.py. Regenerate rather than hand-edit. share_of_iteration is that shape's fraction of one decode iteration's GPU time on the traced run.",
+  "_case_inputs": "what the pytest case is built from -- these are consumed",
+  "case_inputs": {
+    "moe_backend": "DEEPGEMM",
+    "num_tokens": 128,
+    "use_cuda_graph": true
+  },
+  "_provenance": "where the numbers came from. NOT inputs: module perf builds one MoE module on one GPU, it does not run layers. Recorded so a share_of_iteration can be traced back to the run that measured it.",
+  "provenance": {
+    "model": "DeepSeek-V4-Flash-Base",
+    "run_type": "GEN",
+    "batch_size": 128,
+    "seq_len_q": 1,
+    "ep_size": 4,
+    "layer_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "enable_attention_dp": true,
+    "artifact": "artifacts\\b40\\lwb",
+    "rank": 0
+  },
+  "experts_per_rank": 64,
+  "gemm_shapes": [
+    {
+      "N": 4096,
+      "K": 4096,
+      "num_groups": 64,
+      "gemm_type": "MGroupedMasked",
+      "dtype_in": "fp8_e4m3",
+      "dtype_out": "bf16",
+      "share_of_iteration": 0.3225,
+      "modules": [
+        "DeepseekV4MoE/MoE"
+      ]
+    },
+    {
+      "N": 4096,
+      "K": 2048,
+      "num_groups": 64,
+      "gemm_type": "MGroupedMasked",
+      "dtype_in": "fp8_e4m3",
+      "dtype_out": "bf16",
+      "share_of_iteration": 0.1741,
+      "modules": [
+        "DeepseekV4MoE/MoE"
+      ]
+    },
+    {
+      "N": 4096,
+      "K": 2048,
+      "num_groups": 1,
+      "gemm_type": "Normal",
+      "dtype_in": "fp8_e4m3",
+      "dtype_out": "bf16",
+      "share_of_iteration": 0.0183,
+      "modules": [
+        "DeepseekV4MoE/GatedMLP"
+      ]
+    },
+    {
+      "N": 4096,
+      "K": 4096,
+      "num_groups": 1,
+      "gemm_type": "Normal",
+      "dtype_in": "fp8_e4m3",
+      "dtype_out": "bf16",
+      "share_of_iteration": 0.0162,
+      "modules": [
+        "DeepseekV4MoE/GatedMLP"
+      ]
+    }
+  ],
+  "derived_dims": {
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "consistent": true,
+    "check": "up.N(4096) == 2*intermediate(4096) and down.N(4096) == hidden(4096)"
+  }
+}

@@ -35,6 +35,9 @@ LLM_DOCKER_IMAGE = env.dockerImage
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
 
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
 // Literals for easier access.
@@ -227,6 +230,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 - "qa_only"
 ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                     env:
@@ -370,10 +375,13 @@ def prepareLLMBuild(pipeline, config, versionOverride)
     def tarName = buildFlags[TARNAME]
 
     def is_linux_x86_64 = config.contains("linux_x86_64")
+    // Type checking is a platform-independent static analysis, so run it once,
+    // on the x86_64 vanilla build only, rather than in every build config.
+    def typeCheck = (config == CONFIG_LINUX_X86_64_VANILLA)
     def artifacts = ["${tarName}": tarName]
     def runner = {
         runLLMBuild(
-            pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride)
+            pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck)
     }
 
     return [artifacts, runner]
@@ -381,7 +389,7 @@ def prepareLLMBuild(pipeline, config, versionOverride)
 }
 
 def runLLMBuild(
-    pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride)
+    pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck=false)
 {
     // Step 1: cloning tekit source code
     sh "pwd && ls -alh"
@@ -433,6 +441,22 @@ def runLLMBuild(
             sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
         }
     }
+
+    // Type-check with the compiled bindings that build_wheel.py just produced in
+    // place. Runs mypy directly (not via pre-commit) so this step does zero
+    // network: the pre-commit orchestrator clones every remote hook repo from
+    // github up front, which flakes on nodes without github access. mypy and its
+    // config come from requirements-dev.txt (installed above) via the internal
+    // PyPI mirror. MYPY_REQUIRE_BINDINGS=1 makes run_mypy.sh hard-fail if the
+    // bindings can't be imported, rather than silently degrading to the
+    // lightweight (no-bindings) check.
+    if (typeCheck) {
+        echo "-- Running mypy type check with compiled bindings..."
+        withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
+            sh "cd ${LLM_ROOT} && bash scripts/run_mypy.sh"
+        }
+    }
+
     sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"

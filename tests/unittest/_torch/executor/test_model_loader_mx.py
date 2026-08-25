@@ -13,17 +13,20 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from torch import nn
-from transformers import LlamaConfig
+from transformers import LlamaConfig, Qwen2Config
 from utils.post_transform_qualification import (
     PostTransformQualificationCase,
     assert_post_transform_lifecycle_equivalent,
 )
 
+import tensorrt_llm.mapping as mapping_mod
+from tensorrt_llm._torch import distributed as distributed_mod
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_llama as modeling_llama_mod
+from tensorrt_llm._torch.models import modeling_qwen as modeling_qwen_mod
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.modules import mla as mla_mod
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
@@ -36,6 +39,8 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformProfile,
     PostTransformProfileRegistry,
     PostTransformQualificationReason,
+    PostTransformRuntimeConfig,
+    PostTransformRuntimeConstraints,
     PostTransformTransferScope,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
@@ -63,6 +68,17 @@ class _LinearStub(nn.Module):
 
     def post_load_weights(self):
         pass
+
+
+class _AllReduceStub(nn.Module):
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        super().__init__()
+
+    def uses_nccl_symmetric_memory_window(self) -> bool:
+        return False
+
+    def forward(self, tensor: torch.Tensor, **_kwargs: object) -> torch.Tensor:
+        return tensor
 
 
 def _make_draft_model_config():
@@ -124,14 +140,20 @@ def _moe_context(config, mapping):
     yield None
 
 
-class _UnqualifiedLlamaForCausalLM(model_loader_mod.LlamaForCausalLM):
+class _UnqualifiedLlamaForCausalLM(modeling_llama_mod.LlamaForCausalLM):
+    pass
+
+
+class _UnqualifiedQwen2ForCausalLM(modeling_qwen_mod.Qwen2ForCausalLM):
     pass
 
 
 def _tiny_llama_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    model_class: type[nn.Module] = model_loader_mod.LlamaForCausalLM,
+    model_class: type[nn.Module] = modeling_llama_mod.LlamaForCausalLM,
+    tp_size: int = 1,
+    rank: int = 0,
 ) -> nn.Module:
     monkeypatch.setattr(modeling_llama_mod, "get_sm_version", lambda: 90)
     llama_config = LlamaConfig(
@@ -147,12 +169,17 @@ def _tiny_llama_model(
         num_key_value_heads=2,
         rms_norm_eps=1e-5,
         tie_word_embeddings=False,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.bfloat16,
         vocab_size=32,
     )
     model = model_class(
         ModelConfig(
             pretrained_config=llama_config,
+            mapping=mapping_mod.Mapping(
+                world_size=tp_size,
+                rank=rank,
+                tp_size=tp_size,
+            ),
             max_num_tokens=16,
             max_seq_len=16,
         )
@@ -180,13 +207,138 @@ def _llama_alias_state(model):
     }
 
 
-def _llama_embedding_logits(model: nn.Module) -> torch.Tensor:
+def _llama_input_embeddings(model: nn.Module) -> torch.Tensor:
     input_ids = torch.tensor(
         [0, 1, 2],
         dtype=torch.long,
         device=model.model.embed_tokens.weight.device,
     )
-    return model.lm_head(model.model.embed_tokens(input_ids))
+    return model.model.embed_tokens(input_ids)
+
+
+def _llama_embedding_logits(model: nn.Module) -> torch.Tensor:
+    return model.lm_head(_llama_input_embeddings(model))
+
+
+def _tiny_qwen2_model(
+    *,
+    model_class: type[nn.Module] = modeling_qwen_mod.Qwen2ForCausalLM,
+    tp_size: int = 1,
+    rank: int = 0,
+    kv_cache_compression_config: object | None = None,
+) -> nn.Module:
+    qwen2_config = Qwen2Config(
+        architectures=["Qwen2ForCausalLM"],
+        attention_bias=True,
+        hidden_act="silu",
+        hidden_size=16,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        mlp_bias=False,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+        torch_dtype=torch.bfloat16,
+        vocab_size=32,
+    )
+    model = model_class(
+        ModelConfig(
+            pretrained_config=qwen2_config,
+            mapping=mapping_mod.Mapping(
+                world_size=tp_size,
+                rank=rank,
+                tp_size=tp_size,
+            ),
+            max_num_tokens=16,
+            max_seq_len=16,
+            kv_cache_compression_config=kv_cache_compression_config,
+        )
+    )
+    with torch.no_grad():
+        for index, parameter in enumerate(model.parameters()):
+            values = torch.arange(
+                parameter.numel(),
+                dtype=torch.float32,
+                device=parameter.device,
+            ).reshape(parameter.shape)
+            parameter.copy_(((values + index) % 17).to(parameter.dtype) / 17)
+    return model
+
+
+def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
+    values = {
+        "dtype": "bfloat16",
+        "quant_algorithm": "none",
+        "kv_cache_quant_algorithm": "none",
+        "layerwise_quantization": False,
+        "force_dynamic_quantization": False,
+        "lora_enabled": False,
+        "sparse_attention_enabled": False,
+        "attention_backend": "TRTLLM",
+        "moe_backend": "CUTLASS",
+        "tp_size": 1,
+        "pp_size": 1,
+        "cp_size": 1,
+        "moe_tp_size": 1,
+        "moe_ep_size": 1,
+        "attention_tp_size": 1,
+        "attention_cp_size": 1,
+        "attention_dp": False,
+        "multi_node": False,
+        "tied_word_embeddings": False,
+        "rope_type": "default",
+        "rope_fusion": True,
+    }
+    values.update(overrides)
+    return PostTransformRuntimeConfig(**values)
+
+
+def _qwen2_layout_state(model: nn.Module) -> dict[str, object]:
+    layer = model.model.layers[0]
+    return {
+        "attention_type": type(layer.self_attn).__name__,
+        "qkv_weight_mode": layer.self_attn.qkv_proj.weights_loading_config.weight_mode,
+        "qkv_weight_shape": tuple(layer.self_attn.qkv_proj.weight.shape),
+        "gate_up_weight_mode": layer.mlp.gate_up_proj.weights_loading_config.weight_mode,
+        "gate_up_weight_shape": tuple(layer.mlp.gate_up_proj.weight.shape),
+        "qkv_bias": layer.self_attn.qkv_proj.bias is not None,
+        "rope_fusion": layer.self_attn.rope_fusion,
+        "rotary_embedding": layer.self_attn.rotary_emb,
+        "tied_lm_head": model.lm_head.weight is model.model.embed_tokens.weight,
+    }
+
+
+def _qwen2_input_embeddings(model: nn.Module) -> torch.Tensor:
+    input_ids = torch.tensor(
+        [0, 1, 2],
+        dtype=torch.long,
+        device=model.model.embed_tokens.weight.device,
+    )
+    return model.model.embed_tokens(input_ids)
+
+
+def _qwen2_embedding_logits(model: nn.Module) -> torch.Tensor:
+    return model.lm_head(_qwen2_input_embeddings(model))
+
+
+def _qwen2_hidden_states(model: nn.Module) -> torch.Tensor:
+    qkv_weight = model.model.layers[0].self_attn.qkv_proj.weight
+    values = torch.arange(
+        3 * model.config.hidden_size,
+        dtype=torch.float32,
+        device=qkv_weight.device,
+    ).reshape(3, model.config.hidden_size)
+    return (values % 17).to(qkv_weight.dtype) / 17
+
+
+def _qwen2_fused_qkv_output(model: nn.Module) -> torch.Tensor:
+    return model.model.layers[0].self_attn.qkv_proj(_qwen2_hidden_states(model))
+
+
+def _qwen2_fused_gate_up_output(model: nn.Module) -> torch.Tensor:
+    return model.model.layers[0].mlp.gate_up_proj(_qwen2_hidden_states(model))
 
 
 def _tiny_profile_registry(*, speculative_mode: str | None = None) -> PostTransformProfileRegistry:
@@ -201,6 +353,7 @@ def _tiny_profile_registry(*, speculative_mode: str | None = None) -> PostTransf
                 protocol_version=(ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
                 transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                 transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+                runtime_constraints=PostTransformRuntimeConstraints(),
             ),
         )
     )
@@ -230,9 +383,10 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         )
     )
 
-    monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(model_loader_mod, "timing_metric", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(model_loader_mod, "maybe_create_moe_load_balancer", _moe_context)
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
+
     # These tests stub ModelConfig, while SourceIdentity has dedicated
     # coverage. Keep this file focused on ModelLoader MX branch behavior.
 
@@ -264,11 +418,6 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         MagicMock(return_value=_TinyModel(events)),
     )
     monkeypatch.setattr(model_loader_mod, "get_rank_model_storage", lambda _model: 0)
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda: SimpleNamespace(synchronize=lambda: None),
-    )
     return loader
 
 
@@ -293,9 +442,57 @@ def test_construct_checkpoint_loader_passes_mx_config():
     assert checkpoint_loader.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
 
+def _format_documented_values(
+    values: frozenset[object] | None,
+    *,
+    labels: dict[object, str] | None = None,
+) -> str:
+    assert values is not None
+    assert None not in values
+    labels = labels or {}
+    return " or ".join(labels.get(value, str(value)) for value in sorted(values, key=str))
+
+
+def _documented_dense_constraints(profile: PostTransformProfile) -> str:
+    constraints = profile.runtime_constraints
+    assert constraints.quant_algorithms == frozenset({"none"})
+    assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
+    assert constraints.layerwise_quantization == frozenset({False})
+    assert constraints.force_dynamic_quantization == frozenset({False})
+    assert constraints.lora_enabled == frozenset({False})
+    assert constraints.sparse_attention_enabled == frozenset({False})
+    assert constraints.attention_dp == frozenset({False})
+    assert constraints.multi_node == frozenset({False})
+    assert constraints.tied_word_embeddings == frozenset({False})
+    assert constraints.rope_types == frozenset({"default"})
+    assert constraints.rope_fusion == frozenset({True})
+    assert constraints.moe_backends is None
+    assert constraints.moe_tp_sizes is None
+    assert constraints.moe_ep_sizes is None
+    assert constraints.attention_tp_sizes == constraints.tp_sizes
+    assert constraints.attention_cp_sizes == constraints.cp_sizes
+    assert constraints.pp_sizes == constraints.cp_sizes
+    assert profile.speculative_mode is None
+    assert profile.supported_features == frozenset()
+
+    dtypes = _format_documented_values(
+        constraints.dtypes,
+        labels={"bfloat16": "BF16"},
+    )
+    attention_backends = _format_documented_values(constraints.attention_backends)
+    tp_sizes = _format_documented_values(constraints.tp_sizes)
+    pp_cp_sizes = _format_documented_values(constraints.pp_sizes)
+    return (
+        f"Single-node dense {dtypes}, unquantized weights and KV cache, "
+        f"{attention_backends} attention, default fused RoPE, untied embeddings, "
+        f"TP={tp_sizes}, PP/CP={pp_cp_sizes}, no LoRA, sparse attention, "
+        "attention DP, speculative mode, or separately loaded draft model"
+    )
+
+
 @pytest.mark.cpu_only
 def test_public_support_table_matches_qualified_profile_registry() -> None:
-    profiles = ModelLoader._POST_TRANSFORM_PROFILE_REGISTRY.profiles
+    profiles = ModelLoader._post_transform_profile_registry().profiles
     documentation = (Path(__file__).parents[4] / "docs/source/features/model-express.md").read_text(
         encoding="utf-8"
     )
@@ -314,12 +511,13 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
     assert len(table_rows) == len(profiles)
     for profile in profiles:
         scope = profile.transfer_scope.value.replace("_", " ").capitalize()
-        expected_row_prefix = (
+        expected_row = (
             f"| `{profile.profile_id}` | `{profile.root_model_class.__name__}` | "
             f"`{profile.architecture}` / `{profile.model_type}` | {scope} | "
-            f"{profile.protocol_version} | `{profile.transform_abi_id}` |"
+            f"{profile.protocol_version} | `{profile.transform_abi_id}` | "
+            f"{_documented_dense_constraints(profile)} |"
         )
-        assert any(row.startswith(expected_row_prefix) for row in table_rows)
+        assert expected_row in table_rows
 
 
 @pytest.mark.cpu_only
@@ -505,7 +703,304 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(
         output_probes=(("embedding-logits", _llama_embedding_logits),),
     )
 
-    assert_post_transform_lifecycle_equivalent(case)
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert (
+        PostTransformRuntimeConfig.from_model_config(producer.model_config, model=producer)
+        == _bf16_dense_runtime_config()
+    )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+) -> None:
+    monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
+    monkeypatch.setattr(modeling_llama_mod, "AllReduce", _AllReduceStub)
+    case = PostTransformQualificationCase(
+        profile_id="llama-for-causal-lm-target-v1",
+        model_factory=lambda: _tiny_llama_model(
+            monkeypatch,
+            tp_size=2,
+            rank=rank,
+        ),
+        unqualified_model_factory=lambda: _tiny_llama_model(
+            monkeypatch,
+            model_class=_UnqualifiedLlamaForCausalLM,
+            tp_size=2,
+            rank=rank,
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(("aliases", _llama_alias_state),),
+        output_probes=(("input-embeddings", _llama_input_embeddings),),
+    )
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer
+    ) == _bf16_dense_runtime_config(
+        tp_size=2,
+        moe_tp_size=2,
+        attention_tp_size=2,
+    )
+
+
+def test_qwen2_dense_profile_qualifies_full_staged_lifecycle() -> None:
+    case = PostTransformQualificationCase(
+        profile_id="qwen2-for-causal-lm-bf16-target-v1",
+        model_factory=_tiny_qwen2_model,
+        unqualified_model_factory=lambda: _tiny_qwen2_model(
+            model_class=_UnqualifiedQwen2ForCausalLM
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(("layout", _qwen2_layout_state),),
+        output_probes=(
+            ("embedding-logits", _qwen2_embedding_logits),
+            ("fused-qkv", _qwen2_fused_qkv_output),
+            ("fused-gate-up", _qwen2_fused_gate_up_output),
+        ),
+    )
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert (
+        PostTransformRuntimeConfig.from_model_config(producer.model_config, model=producer)
+        == _bf16_dense_runtime_config()
+    )
+    assert _qwen2_layout_state(producer) == {
+        "attention_type": modeling_qwen_mod.QwenAttention.__name__,
+        "qkv_weight_mode": WeightMode.FUSED_QKV_LINEAR,
+        "qkv_weight_shape": (32, 16),
+        "gate_up_weight_mode": WeightMode.FUSED_GATE_UP_LINEAR,
+        "gate_up_weight_shape": (64, 16),
+        "qkv_bias": True,
+        "rope_fusion": True,
+        "rotary_embedding": None,
+        "tied_lm_head": False,
+    }
+
+
+def test_qwen2_dense_profile_rejects_effective_unfused_rope() -> None:
+    model = _tiny_qwen2_model(
+        kv_cache_compression_config=SimpleNamespace(changes_physical_kv_length=True)
+    )
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert model.model.layers[0].self_attn.rope_fusion is False
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset({"rope_fusion"})
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_qwen2_dense_profile_qualifies_tp2_rank_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+) -> None:
+    monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
+    case = PostTransformQualificationCase(
+        profile_id="qwen2-for-causal-lm-bf16-target-v1",
+        model_factory=lambda: _tiny_qwen2_model(tp_size=2, rank=rank),
+        unqualified_model_factory=lambda: _tiny_qwen2_model(
+            model_class=_UnqualifiedQwen2ForCausalLM,
+            tp_size=2,
+            rank=rank,
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(("layout", _qwen2_layout_state),),
+        output_probes=(
+            ("fused-qkv", _qwen2_fused_qkv_output),
+            ("fused-gate-up", _qwen2_fused_gate_up_output),
+        ),
+    )
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer
+    ) == _bf16_dense_runtime_config(
+        tp_size=2,
+        moe_tp_size=2,
+        attention_tp_size=2,
+    )
+    assert _qwen2_layout_state(producer)["qkv_weight_shape"] == (16, 16)
+    assert _qwen2_layout_state(producer)["gate_up_weight_shape"] == (32, 16)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides, expected_dimensions",
+    [
+        pytest.param({"dtype": "float16"}, {"dtype"}, id="fp16"),
+        pytest.param(
+            {"quant_algorithm": "FP8"},
+            {"quant_algorithm"},
+            id="weight-quantization",
+        ),
+        pytest.param(
+            {"kv_cache_quant_algorithm": "FP8"},
+            {"kv_cache_quant_algorithm"},
+            id="kv-cache-quantization",
+        ),
+        pytest.param(
+            {"layerwise_quantization": True},
+            {"layerwise_quantization"},
+            id="layerwise-quantization",
+        ),
+        pytest.param(
+            {"force_dynamic_quantization": True},
+            {"force_dynamic_quantization"},
+            id="dynamic-quantization",
+        ),
+        pytest.param({"lora_enabled": True}, {"lora_enabled"}, id="lora"),
+        pytest.param(
+            {"sparse_attention_enabled": True},
+            {"sparse_attention_enabled"},
+            id="sparse-attention",
+        ),
+        pytest.param(
+            {"attention_backend": "FLASHINFER"},
+            {"attention_backend"},
+            id="attention-backend",
+        ),
+        pytest.param({"tp_size": 4}, {"tp_size"}, id="tp4"),
+        pytest.param({"pp_size": 2}, {"pp_size"}, id="pipeline-parallel"),
+        pytest.param({"cp_size": 2}, {"cp_size"}, id="context-parallel"),
+        pytest.param(
+            {"attention_tp_size": 4},
+            {"attention_tp_size"},
+            id="attention-tensor-parallel",
+        ),
+        pytest.param(
+            {"attention_cp_size": 2},
+            {"attention_cp_size"},
+            id="attention-context-parallel",
+        ),
+        pytest.param(
+            {"attention_dp": True},
+            {"attention_dp"},
+            id="attention-dp",
+        ),
+        pytest.param({"multi_node": True}, {"multi_node"}, id="multi-node"),
+        pytest.param(
+            {"tied_word_embeddings": True},
+            {"tied_word_embeddings"},
+            id="tied-embeddings",
+        ),
+        pytest.param({"rope_type": "yarn"}, {"rope_type"}, id="yarn"),
+        pytest.param({"rope_fusion": False}, {"rope_fusion"}, id="unfused-rope"),
+    ],
+)
+@pytest.mark.parametrize(
+    "root_model_class, architecture, model_type",
+    [
+        pytest.param(
+            modeling_llama_mod.LlamaForCausalLM,
+            "LlamaForCausalLM",
+            "llama",
+            id="llama",
+        ),
+        pytest.param(
+            modeling_qwen_mod.Qwen2ForCausalLM,
+            "Qwen2ForCausalLM",
+            "qwen2",
+            id="qwen2",
+        ),
+    ],
+)
+def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
+    overrides: dict[str, object],
+    expected_dimensions: set[str],
+    root_model_class: type[nn.Module],
+    architecture: str,
+    model_type: str,
+) -> None:
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=root_model_class,
+        architecture=architecture,
+        model_type=model_type,
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(**overrides),
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset(expected_dimensions)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"moe_backend": "TRTLLM"}, id="alternate-moe-backend"),
+        pytest.param(
+            {
+                "tp_size": 2,
+                "moe_tp_size": 1,
+                "moe_ep_size": 2,
+                "attention_tp_size": 2,
+            },
+            id="alternate-moe-partition",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "root_model_class, architecture, model_type",
+    [
+        pytest.param(
+            modeling_llama_mod.LlamaForCausalLM,
+            "LlamaForCausalLM",
+            "llama",
+            id="llama",
+        ),
+        pytest.param(
+            modeling_qwen_mod.Qwen2ForCausalLM,
+            "Qwen2ForCausalLM",
+            "qwen2",
+            id="qwen2",
+        ),
+    ],
+)
+def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
+    overrides: dict[str, object],
+    root_model_class: type[nn.Module],
+    architecture: str,
+    model_type: str,
+) -> None:
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=root_model_class,
+        architecture=architecture,
+        model_type=model_type,
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(**overrides),
+    )
+
+    assert decision.qualified
 
 
 @pytest.mark.cpu_only

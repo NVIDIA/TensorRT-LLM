@@ -187,10 +187,13 @@ class KVCacheManagerConfig:
     enable_partial_reuse: bool = True
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
+    # One positive, normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
+    # layer-group slot-count proportions.
     initial_pool_ratio: list[float] | None = None
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     commit_min_snapshot: bool = False
     enable_stats: bool = True
+    text_only: bool = False
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -287,7 +290,7 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# From _cache_key.py
+# Backend-neutral key builders (native C++ under the C++ backend, pure-Python otherwise).
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
@@ -318,6 +321,9 @@ class _KVCache:
         reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
+        expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -381,6 +387,10 @@ class _KVCache:
     def enable_swa_scratch_reuse(self) -> bool: ...
     @enable_swa_scratch_reuse.setter
     def enable_swa_scratch_reuse(self, enable: bool) -> None: ...
+    @property
+    def text_only(self) -> bool: ...
+    @text_only.setter
+    def text_only(self, text_only: bool) -> None: ...
     def supports_index_mode(self, mode: PageIndexMode) -> bool: ...
     @property
     def status(self) -> _Status: ...
@@ -467,11 +477,23 @@ class PageIndexConverter:
         scratch: ScratchDesc | None = None,
     ) -> list[int]: ...
 
+class IKvCacheColdPageCodec: ...
+
+def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
+    """Create the default lossless cold-page codec.
+
+    Passing ``cold_page_codec=None`` to ``KVCacheManager`` already selects this codec, so normal users do not need to
+    call this factory. It is primarily provided to demonstrate how a native codec factory exposes an owning
+    ``IKvCacheColdPageCodec`` object for transfer into ``KVCacheManager``. Any ``KVCacheManager`` construction attempt
+    consumes an explicitly supplied codec, including an attempt that fails.
+    """
+
 class KVCacheManager:
     def __init__(
         self,
         config: KVCacheManagerConfig,
         event_manager: KVCacheEventManager | None = None,
+        cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
@@ -492,6 +514,8 @@ class KVCacheManager:
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
         expected_prompt_length: int | None = None,
+        text_only: bool | None = None,
+        enable_request_stats: bool = False,
     ) -> _KVCache: ...
     def probe_reuse(
         self,

@@ -62,7 +62,6 @@ common-files: &common_files |
         examples/llm-api/quickstart_advanced.py |
         examples/llm-api/quickstart_example.py |
         examples/llm-api/quickstart_multimodal.py |
-        examples/llm-api/star_attention.py |
         examples/longbench/eval_longbench_v1.py |
         examples/models/core/gpt_oss/openai_chat_client_function_calling.py |
         examples/models/core/kimi_k2/kimi_k2_tool_calling_example.py |
@@ -103,7 +102,6 @@ common-files: &common_files |
         scripts/test_to_stage_mapping.py |
         setup.py |
         tensorrt_llm/__init__.py |
-        tensorrt_llm/_ray_utils.py |
         tensorrt_llm/_torch/__init__.py |
         tensorrt_llm/_torch/attention_backend/__init__.py |
         tensorrt_llm/_torch/attention_backend/flashinfer.py |
@@ -113,7 +111,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/attention_backend/sparse/kernel.py |
         tensorrt_llm/_torch/attention_backend/sparse/rocket.py |
         tensorrt_llm/_torch/attention_backend/sparse/utils.py |
-        tensorrt_llm/_torch/attention_backend/star_flashinfer.py |
         tensorrt_llm/_torch/attention_backend/trtllm.py |
         tensorrt_llm/_torch/attention_backend/utils.py |
         tensorrt_llm/_torch/attention_backend/vanilla.py |
@@ -265,13 +262,8 @@ common-files: &common_files |
         tensorrt_llm/_torch/modules/fused_moe/fused_moe_triton.py |
         tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py |
         tensorrt_llm/_torch/modules/fused_moe/fused_moe_vanilla.py |
-        tensorrt_llm/_torch/modules/fused_moe/fused_moe_wide_ep.py |
         tensorrt_llm/_torch/modules/fused_moe/interface.py |
         tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py |
-        tensorrt_llm/_torch/modules/fused_moe/ops/__init__.py |
-        tensorrt_llm/_torch/modules/fused_moe/ops/moe_op.py |
-        tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_cutlass.py |
-        tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_deepgemm.py |
         tensorrt_llm/_torch/modules/fused_moe/quantization.py |
         tensorrt_llm/_torch/modules/fused_moe/routing.py |
         tensorrt_llm/_torch/modules/gated_mlp.py |
@@ -299,6 +291,7 @@ common-files: &common_files |
         tensorrt_llm/_torch/modules/triton_linear.py |
         tensorrt_llm/_torch/peft/__init__.py |
         tensorrt_llm/_torch/peft/lora/__init__.py |
+        tensorrt_llm/_torch/peft/lora/config.py |
         tensorrt_llm/_torch/peft/lora/layer.py |
         tensorrt_llm/_torch/pyexecutor/__init__.py |
         tensorrt_llm/_torch/pyexecutor/_util.py |
@@ -375,8 +368,10 @@ common-files: &common_files |
         tensorrt_llm/executor/ipc.py |
         tensorrt_llm/executor/postproc_worker.py |
         tensorrt_llm/executor/proxy.py |
-        tensorrt_llm/executor/ray_executor.py |
-        tensorrt_llm/executor/ray_gpu_worker.py |
+        tensorrt_llm/executor/ray/executor.py |
+        tensorrt_llm/executor/ray/gpu_worker.py |
+        tensorrt_llm/executor/ray/stub.py |
+        tensorrt_llm/executor/ray/utils.py |
         tensorrt_llm/executor/request.py |
         tensorrt_llm/executor/result.py |
         tensorrt_llm/executor/rpc/__init__.py |
@@ -405,11 +400,11 @@ common-files: &common_files |
         tensorrt_llm/llmapi/mm_encoder.py |
         tensorrt_llm/llmapi/mpi_session.py |
         tensorrt_llm/llmapi/reasoning_parser.py |
+        tensorrt_llm/llmapi/serialization.py |
         tensorrt_llm/llmapi/tokenizer.py |
         tensorrt_llm/llmapi/tracer.py |
         tensorrt_llm/llmapi/tracing.py |
         tensorrt_llm/llmapi/utils.py |
-        tensorrt_llm/lora_helper.py |
         tensorrt_llm/mapping.py |
         tensorrt_llm/math_utils.py |
         tensorrt_llm/metrics/__init__.py |
@@ -425,7 +420,6 @@ common-files: &common_files |
         tensorrt_llm/quantization/utils/__init__.py |
         tensorrt_llm/quantization/utils/fp4_utils.py |
         tensorrt_llm/quantization/utils/fp8_utils.py |
-        tensorrt_llm/ray_stub.py |
         tensorrt_llm/runtime/__init__.py |
         tensorrt_llm/runtime/memory_pools/__init__.py |
         tensorrt_llm/scaffolding/__init__.py |
@@ -455,7 +449,6 @@ common-files: &common_files |
         tensorrt_llm/scaffolding/task_collection.py |
         tensorrt_llm/scaffolding/worker.py |
         tensorrt_llm/scheduling_params.py |
-        tensorrt_llm/serialization.py |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
@@ -836,7 +829,6 @@ legacy-files: &legacy_files |
         examples/llm-api/quickstart_advanced.py |
         examples/llm-api/quickstart_example.py |
         examples/llm-api/quickstart_multimodal.py |
-        examples/llm-api/star_attention.py |
         examples/longbench/eval_longbench_v1.py |
         examples/models/core/gpt_oss/openai_chat_client_function_calling.py |
         examples/models/core/kimi_k2/kimi_k2_tool_calling_example.py |
@@ -877,7 +869,6 @@ legacy-files: &legacy_files |
         scripts/test_to_stage_mapping.py |
         setup.py |
         tensorrt_llm/__init__.py |
-        tensorrt_llm/_ray_utils.py |
         tensorrt_llm/_torch/__init__.py |
         tensorrt_llm/_torch/attention_backend/__init__.py |
         tensorrt_llm/_torch/attention_backend/flashinfer.py |
@@ -887,7 +878,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/attention_backend/sparse/kernel.py |
         tensorrt_llm/_torch/attention_backend/sparse/rocket.py |
         tensorrt_llm/_torch/attention_backend/sparse/utils.py |
-        tensorrt_llm/_torch/attention_backend/star_flashinfer.py |
         tensorrt_llm/_torch/attention_backend/trtllm.py |
         tensorrt_llm/_torch/attention_backend/utils.py |
         tensorrt_llm/_torch/attention_backend/vanilla.py |
@@ -1039,13 +1029,8 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/modules/fused_moe/fused_moe_triton.py |
         tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py |
         tensorrt_llm/_torch/modules/fused_moe/fused_moe_vanilla.py |
-        tensorrt_llm/_torch/modules/fused_moe/fused_moe_wide_ep.py |
         tensorrt_llm/_torch/modules/fused_moe/interface.py |
         tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py |
-        tensorrt_llm/_torch/modules/fused_moe/ops/__init__.py |
-        tensorrt_llm/_torch/modules/fused_moe/ops/moe_op.py |
-        tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_cutlass.py |
-        tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_deepgemm.py |
         tensorrt_llm/_torch/modules/fused_moe/quantization.py |
         tensorrt_llm/_torch/modules/fused_moe/routing.py |
         tensorrt_llm/_torch/modules/gated_mlp.py |
@@ -1073,6 +1058,7 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/modules/triton_linear.py |
         tensorrt_llm/_torch/peft/__init__.py |
         tensorrt_llm/_torch/peft/lora/__init__.py |
+        tensorrt_llm/_torch/peft/lora/config.py |
         tensorrt_llm/_torch/peft/lora/layer.py |
         tensorrt_llm/_torch/pyexecutor/__init__.py |
         tensorrt_llm/_torch/pyexecutor/_util.py |
@@ -1149,8 +1135,10 @@ legacy-files: &legacy_files |
         tensorrt_llm/executor/ipc.py |
         tensorrt_llm/executor/postproc_worker.py |
         tensorrt_llm/executor/proxy.py |
-        tensorrt_llm/executor/ray_executor.py |
-        tensorrt_llm/executor/ray_gpu_worker.py |
+        tensorrt_llm/executor/ray/executor.py |
+        tensorrt_llm/executor/ray/gpu_worker.py |
+        tensorrt_llm/executor/ray/stub.py |
+        tensorrt_llm/executor/ray/utils.py |
         tensorrt_llm/executor/request.py |
         tensorrt_llm/executor/result.py |
         tensorrt_llm/executor/rpc/__init__.py |
@@ -1179,11 +1167,11 @@ legacy-files: &legacy_files |
         tensorrt_llm/llmapi/mm_encoder.py |
         tensorrt_llm/llmapi/mpi_session.py |
         tensorrt_llm/llmapi/reasoning_parser.py |
+        tensorrt_llm/llmapi/serialization.py |
         tensorrt_llm/llmapi/tokenizer.py |
         tensorrt_llm/llmapi/tracer.py |
         tensorrt_llm/llmapi/tracing.py |
         tensorrt_llm/llmapi/utils.py |
-        tensorrt_llm/lora_helper.py |
         tensorrt_llm/mapping.py |
         tensorrt_llm/math_utils.py |
         tensorrt_llm/metrics/__init__.py |
@@ -1199,7 +1187,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/quantization/utils/__init__.py |
         tensorrt_llm/quantization/utils/fp4_utils.py |
         tensorrt_llm/quantization/utils/fp8_utils.py |
-        tensorrt_llm/ray_stub.py |
         tensorrt_llm/runtime/__init__.py |
         tensorrt_llm/runtime/memory_pools/__init__.py |
         tensorrt_llm/scaffolding/__init__.py |
@@ -1229,7 +1216,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/scaffolding/task_collection.py |
         tensorrt_llm/scaffolding/worker.py |
         tensorrt_llm/scheduling_params.py |
-        tensorrt_llm/serialization.py |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
@@ -1551,20 +1537,10 @@ legacy-files: &legacy_files |
     )$
 # <<<< END AUTO-GENERATED >>>>
 
-# Files to be subjected to static analysis
-static-analysis-files: &static_analysis_files |
-    (?x)^(
-        tensorrt_llm/_torch/pyexecutor/sampler/sampler.py |
-        tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py |
-        tensorrt_llm/_torch/pyexecutor/sampler/sampling_utils.py |
-        tensorrt_llm/_torch/pyexecutor/sampler/ops/interface.py |
-        tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py |
-        tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py |
-        tests/unittest/_torch/sampler/test_torch_sampler.py |
-        tests/unittest/_torch/sampler/test_token_ban.py |
-        tests/unittest/_torch/sampler/test_beam_search.py |
-        tests/unittest/_torch/sampler/test_beam_search_util.py |
-    )$
+# The set of files subjected to mypy static analysis is single-sourced in
+# pyproject.toml under [tool.mypy] `files`. The type-check hook below runs mypy
+# with no explicit file arguments (pass_filenames: false) so mypy reads that
+# list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
 exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$)'
@@ -1723,4 +1699,9 @@ repos:
         language: script
         verbose: true
         require_serial: true  # because of install_types=true
-        files: *static_analysis_files
+        # Run mypy with no explicit paths so it type-checks the set declared in
+        # pyproject.toml [tool.mypy] `files` (single source of truth). This
+        # `files:` pattern only decides when the hook triggers — any change under
+        # the sampler source/test dirs.
+        pass_filenames: false
+        files: ^(tensorrt_llm/_torch/pyexecutor/sampler/|tests/unittest/_torch/sampler/)

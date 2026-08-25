@@ -98,6 +98,7 @@ def _check_collective_rpc_guard(
 
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
+    WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
 
     def __init__(
         self,
@@ -603,6 +604,72 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self._handle_background_error()
 
+    def _abort_owned_session(self, reason: BaseException) -> None:
+        """Force the worker world down, but only if this proxy created it.
+
+        An externally owned (shared) session must stay alive for its owner to
+        tear down.
+        """
+        if self._owns_mpi_session:
+            self.mpi_session.shutdown_abort(reason=reason)
+
+    def _fail_initialization(self,
+                             error: BaseException,
+                             cause: Optional[BaseException] = None):
+        """Ordered teardown for every initialization-failure path.
+
+        Abort strictly before marking: shutdown_abort() escalates to
+        MPI_Abort only if its own blocking shutdown() overruns the grace
+        period, and _mark_engine_dead() -> release_exit_joins() marks the
+        pool dead, which forces that shutdown() non-blocking. Marking first
+        would defang the abort and leave wedged ranks holding their weights.
+        Every initialization failure must come through here so the ordering
+        cannot be violated from a side entrance. Marking runs even if the
+        abort itself raises, so the engine-dead bookkeeping (and the original
+        initialization error) cannot be lost to a teardown failure.
+        """
+        root_cause = cause if cause is not None else error
+        try:
+            self._abort_owned_session(root_cause)
+        except Exception as abort_error:  # noqa: BLE001 - teardown must not mask the init failure
+            logger.error(f"Session abort failed during initialization "
+                         f"teardown (continuing): {abort_error!r}")
+        finally:
+            self._set_fatal_error(root_cause)
+            if not self.doing_shutdown:
+                self.pre_shutdown()
+        raise error from cause
+
+    def _detect_worker_death_during_init(self) -> Optional[BaseException]:
+        """Detect a worker death without recording or tearing anything down.
+
+        The runtime checks (_check_mpi_workers, _check_remote_worker_death)
+        mark the engine dead as a side effect of detection, and marking
+        before the abort would defang it (see _fail_initialization), so the
+        init wait loop needs detection kept separate from handling.
+        """
+        dead_worker = self._worker_process_monitor.find_dead_worker()
+        if dead_worker is not None:
+            return RuntimeError("MPI worker rank "
+                                f"{dead_worker.rank} (pid {dead_worker.pid}) "
+                                "exited unexpectedly")
+        for fut in self.mpi_futures:
+            if fut.done():
+                # exception() raises CancelledError on a cancelled future,
+                # which would escape the init wait loop without the ordered
+                # teardown; a cancelled worker future still means this rank
+                # can never come up, so report it as a death instead.
+                exc = fut.exception() if not fut.cancelled() else None
+                return exc or RuntimeError("MPI worker exited unexpectedly")
+        check = getattr(self.mpi_session, "check_worker_error", None)
+        if check is None:
+            return None
+        try:
+            return check()
+        except Exception as exc:  # noqa: BLE001 - detection must not die
+            logger.debug(f"check_worker_error failed (ignored): {exc!r}")
+            return None
+
     def _start_executor_workers(self, worker_kwargs):
 
         self_ref = weakref.ref(self)
@@ -616,7 +683,12 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
-        from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
+        # With the lazily loaded model zoo this snapshot is intentionally
+        # partial: it carries only externally-registered (and already
+        # resolved) classes; workers resolve built-ins on demand. Do not
+        # "fix" it by importing the zoo eagerly before submit.
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
         torch.cuda.Stream()
 
         # Strip the tokenizer from worker_kwargs to avoid MPI pickle failures.
@@ -628,6 +700,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             k: v
             for k, v in worker_kwargs.items() if k != 'tokenizer'
         }
+        worker_process_identities_signal = (
+            self.WORKER_PROCESS_IDENTITIES_SIGNAL
+            if self._can_monitor_worker_processes() else None)
 
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
@@ -636,11 +711,32 @@ class GenerationExecutorProxy(GenerationExecutor):
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,
             ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+            worker_process_identities_signal=worker_process_identities_signal,
         )
+
+        self.workers_started = True
+
+        status = self._wait_for_executor_workers_ready()
+
+        ready_signal, error_trace = status[:2]
+        if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
+            logger.error(f"Executor worker initialization error: {error_trace}")
+            self._fail_initialization(
+                RuntimeError("Executor worker returned error"), ready_signal)
+
+        # Register the fast-death callback only after the world reported
+        # ready: on an already-completed future, add_done_callback() runs the
+        # callback synchronously right here, and _handle_worker_death ->
+        # _mark_engine_dead() would mark the pool dead BEFORE
+        # _fail_initialization's abort, defanging the MPI_Abort escalation.
+        # Until this point _detect_worker_death_during_init() covers worker
+        # deaths.
         for fut in self.mpi_futures:
             fut.add_done_callback(mpi_done_callback)
 
-        self.workers_started = True
+    def _wait_for_executor_workers_ready(self) -> tuple:
+        """Wait for worker readiness while monitoring published processes."""
+        worker_processes_registered = False
 
         while True:
             if self.worker_init_status_queue.poll(1):
@@ -648,23 +744,35 @@ class GenerationExecutorProxy(GenerationExecutor):
                 # Send ACK to the worker
                 self.worker_init_status_queue.put("ACK")
                 logger.info("get signal from executor worker")
-                break
-            if any(fut.done() for fut in self.mpi_futures):
-                logger.error("Executor worker died during initialization.")
-                raise RuntimeError("Executor worker died during initialization")
+
+                signal = status[0]
+                if signal == self.WORKER_PROCESS_IDENTITIES_SIGNAL:
+                    if len(status) != 3:
+                        raise RuntimeError(
+                            "Executor worker returned invalid process identities"
+                        )
+                    self._register_worker_processes(status)
+                    worker_processes_registered = True
+                    continue
+
+                # Backward compatibility for workers that only publish their
+                # identities together with READY.
+                if (signal == self.READY_SIGNAL
+                        and not worker_processes_registered):
+                    self._register_worker_processes(status)
+                return status
+
+            death = self._detect_worker_death_during_init()
+            if death is not None:
+                message = f"Executor worker died during initialization: {death}"
+                logger.error(message)
+                # A non-leader rank that fails here returns without notifying
+                # anyone, so its peers stay blocked in the init collective
+                # still holding their share of the weights. Raising alone
+                # leaks them until job end and makes the next blocking
+                # shutdown() hang instead of reporting this failure.
+                self._fail_initialization(RuntimeError(message), death)
             self._handle_background_error()
-
-        ready_signal, error_trace = status[:2]
-        if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
-            logger.error(f"Executor worker initialization error: {error_trace}")
-            # Only abort a session this proxy created; an externally owned
-            # (shared) session must stay alive for its owner to tear down.
-            if self._owns_mpi_session:
-                self.mpi_session.shutdown_abort(reason=ready_signal)
-            raise RuntimeError(
-                "Executor worker returned error") from ready_signal
-
-        self._register_worker_processes(status)
 
     def _register_worker_processes(self, status: tuple) -> None:
         """Register identities returned by locally spawned MPI workers.
@@ -673,11 +781,16 @@ class GenerationExecutorProxy(GenerationExecutor):
         reference with a factory, so identify pool-backed sessions by excluding
         the external communication session types.
         """
-        if not isinstance(
-                self.mpi_session,
-            (MpiCommSession, RemoteMpiCommSessionClient)) and len(status) == 3:
+        if self._can_monitor_worker_processes() and len(status) == 3:
             worker_process_identities: List[WorkerProcessIdentity] = status[2]
             self._worker_process_monitor.register(worker_process_identities)
+
+    def _can_monitor_worker_processes(self) -> bool:
+        """Return whether the session uses locally spawned MPI workers."""
+        return not isinstance(
+            self.mpi_session,
+            (MpiCommSession, RemoteMpiCommSessionClient),
+        )
 
     def _abort_all_requests(self):
         # The results can be finished during this loop, so self._results may be changed.
@@ -958,6 +1071,19 @@ class GenerationExecutorProxy(GenerationExecutor):
         except RPCError as e:
             logger.error(f"Error fetching data transceiver state via RPC: {e}")
             raise
+
+    def get_startup_metrics(self) -> dict | None:
+        """Get rank-0 startup metrics, or ``None`` if the RPC is unavailable."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get startup metrics")
+            return None
+        try:
+            metrics = self.rpc_client.get_startup_metrics().remote()
+            return metrics if isinstance(metrics, dict) else None
+        except RPCError as e:
+            logger.warning(f"Error fetching startup metrics via RPC: {e}")
+            return None
 
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).

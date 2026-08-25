@@ -1,5 +1,5 @@
-/*loraCac
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+/*
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -185,6 +185,27 @@ public:
      */
     LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
+
+    /**
+     * \brief Reinitialize an empty cache to store the given data type.
+     *
+     * The page geometry remains unchanged. This is intended for selecting a
+     * homogeneous LoRA cache dtype before the first task is inserted.
+     */
+    void setDataType(tensorrt_llm::DataType dataType);
+
+    /**
+     * \brief Reinitialize this cache and another cache (e.g. a host/device pair) to store the
+     * given data type as a single atomic operation.
+     *
+     * Holds both caches' mutexes for the full duration so a concurrent copyTask (which locks
+     * the same mutexes to verify the two caches agree on dtype before copying) can never
+     * observe one cache already reconfigured to the new dtype while the other still holds the
+     * old one.
+     */
+    void setDataTypeCoordinated(LoraCache& other, tensorrt_llm::DataType dataType);
+
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const;
 
     /**
      * \brief put a task in the cache, and claim pages for it, and optionally load task weights.
@@ -433,6 +454,12 @@ private:
     void loadWeights(TaskValue& cacheValue, TensorPtr weights, TensorPtr config);
     void bumpTaskInProgress(TaskIdType taskId);
     [[nodiscard]] ValueStatus getStatus(TaskIdType taskId) const;
+
+    /**
+     * \brief Core of setDataType, assumes mPagesMutex and mCacheMutex are already held by the
+     * caller. Used by setDataTypeCoordinated to reconfigure two caches under one combined lock.
+     */
+    void setDataTypeLocked(tensorrt_llm::DataType dataType);
 
     /**
      * \brief claim numPages, evicting tasks if needed

@@ -71,6 +71,7 @@ worker_config:
       max_tokens_in_buffer: 120000
       backend: NIXL
       transceiver_runtime: PYTHON
+    disable_overlap_scheduler: false
     num_postprocess_workers: 8
     stream_interval: 10
   ctx:
@@ -84,7 +85,7 @@ worker_config:
     max_num_tokens: 8192
     max_seq_len: 121000
     enable_chunked_prefill: true
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 32

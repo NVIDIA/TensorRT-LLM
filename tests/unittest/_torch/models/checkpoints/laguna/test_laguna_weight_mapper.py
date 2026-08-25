@@ -20,6 +20,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_laguna import LagunaHfWeightMapper
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoEEligibility
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 
 pytestmark = pytest.mark.cpu_only
@@ -39,8 +40,8 @@ class _FakeQuantMode:
 
 class _FakeMoE(MoE):
     @classmethod
-    def can_implement(cls, *args, **kwargs):
-        return True, None
+    def can_implement(cls, p, d):
+        return MoEEligibility.ok()
 
     def __init__(self):
         nn.Module.__init__(self)

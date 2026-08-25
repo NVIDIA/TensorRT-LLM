@@ -111,7 +111,6 @@ exclude = [
     "examples/llm-api/quickstart_advanced.py",
     "examples/llm-api/quickstart_example.py",
     "examples/llm-api/quickstart_multimodal.py",
-    "examples/llm-api/star_attention.py",
     "examples/longbench/eval_longbench_v1.py",
     "examples/models/core/gpt_oss/openai_chat_client_function_calling.py",
     "examples/models/core/kimi_k2/kimi_k2_tool_calling_example.py",
@@ -152,7 +151,6 @@ exclude = [
     "scripts/test_to_stage_mapping.py",
     "setup.py",
     "tensorrt_llm/__init__.py",
-    "tensorrt_llm/_ray_utils.py",
     "tensorrt_llm/_torch/__init__.py",
     "tensorrt_llm/_torch/attention_backend/__init__.py",
     "tensorrt_llm/_torch/attention_backend/flashinfer.py",
@@ -162,7 +160,6 @@ exclude = [
     "tensorrt_llm/_torch/attention_backend/sparse/kernel.py",
     "tensorrt_llm/_torch/attention_backend/sparse/rocket.py",
     "tensorrt_llm/_torch/attention_backend/sparse/utils.py",
-    "tensorrt_llm/_torch/attention_backend/star_flashinfer.py",
     "tensorrt_llm/_torch/attention_backend/trtllm.py",
     "tensorrt_llm/_torch/attention_backend/utils.py",
     "tensorrt_llm/_torch/attention_backend/vanilla.py",
@@ -314,13 +311,8 @@ exclude = [
     "tensorrt_llm/_torch/modules/fused_moe/fused_moe_triton.py",
     "tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py",
     "tensorrt_llm/_torch/modules/fused_moe/fused_moe_vanilla.py",
-    "tensorrt_llm/_torch/modules/fused_moe/fused_moe_wide_ep.py",
     "tensorrt_llm/_torch/modules/fused_moe/interface.py",
     "tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py",
-    "tensorrt_llm/_torch/modules/fused_moe/ops/__init__.py",
-    "tensorrt_llm/_torch/modules/fused_moe/ops/moe_op.py",
-    "tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_cutlass.py",
-    "tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_deepgemm.py",
     "tensorrt_llm/_torch/modules/fused_moe/quantization.py",
     "tensorrt_llm/_torch/modules/fused_moe/routing.py",
     "tensorrt_llm/_torch/modules/gated_mlp.py",
@@ -348,6 +340,7 @@ exclude = [
     "tensorrt_llm/_torch/modules/triton_linear.py",
     "tensorrt_llm/_torch/peft/__init__.py",
     "tensorrt_llm/_torch/peft/lora/__init__.py",
+    "tensorrt_llm/_torch/peft/lora/config.py",
     "tensorrt_llm/_torch/peft/lora/layer.py",
     "tensorrt_llm/_torch/pyexecutor/__init__.py",
     "tensorrt_llm/_torch/pyexecutor/_util.py",
@@ -424,8 +417,10 @@ exclude = [
     "tensorrt_llm/executor/ipc.py",
     "tensorrt_llm/executor/postproc_worker.py",
     "tensorrt_llm/executor/proxy.py",
-    "tensorrt_llm/executor/ray_executor.py",
-    "tensorrt_llm/executor/ray_gpu_worker.py",
+    "tensorrt_llm/executor/ray/executor.py",
+    "tensorrt_llm/executor/ray/gpu_worker.py",
+    "tensorrt_llm/executor/ray/stub.py",
+    "tensorrt_llm/executor/ray/utils.py",
     "tensorrt_llm/executor/request.py",
     "tensorrt_llm/executor/result.py",
     "tensorrt_llm/executor/rpc/__init__.py",
@@ -454,11 +449,11 @@ exclude = [
     "tensorrt_llm/llmapi/mm_encoder.py",
     "tensorrt_llm/llmapi/mpi_session.py",
     "tensorrt_llm/llmapi/reasoning_parser.py",
+    "tensorrt_llm/llmapi/serialization.py",
     "tensorrt_llm/llmapi/tokenizer.py",
     "tensorrt_llm/llmapi/tracer.py",
     "tensorrt_llm/llmapi/tracing.py",
     "tensorrt_llm/llmapi/utils.py",
-    "tensorrt_llm/lora_helper.py",
     "tensorrt_llm/mapping.py",
     "tensorrt_llm/math_utils.py",
     "tensorrt_llm/metrics/__init__.py",
@@ -474,7 +469,6 @@ exclude = [
     "tensorrt_llm/quantization/utils/__init__.py",
     "tensorrt_llm/quantization/utils/fp4_utils.py",
     "tensorrt_llm/quantization/utils/fp8_utils.py",
-    "tensorrt_llm/ray_stub.py",
     "tensorrt_llm/runtime/__init__.py",
     "tensorrt_llm/runtime/memory_pools/__init__.py",
     "tensorrt_llm/scaffolding/__init__.py",
@@ -504,7 +498,6 @@ exclude = [
     "tensorrt_llm/scaffolding/task_collection.py",
     "tensorrt_llm/scaffolding/worker.py",
     "tensorrt_llm/scheduling_params.py",
-    "tensorrt_llm/serialization.py",
     "tensorrt_llm/serve/__init__.py",
     "tensorrt_llm/serve/chat_utils.py",
     "tensorrt_llm/serve/cluster_storage.py",
@@ -885,6 +878,29 @@ explicit_package_bases = true
 namespace_packages = true
 strict = true
 show_error_codes = true
+# Files checked when mypy runs with no explicit paths. This is the single source
+# of truth for the type-check file set. Both the CI build stage (which invokes
+# scripts/run_mypy.sh directly) and the local pre-commit hook run mypy without
+# explicit paths (the hook sets `pass_filenames: false`), so both read this list.
+files = [
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_common.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_strategy.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/logprobs.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_features.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/seed_manager.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/two_model_spec_dec.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/finish_reasons.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/top_p_decay.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/penalties.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py",
+    "tests/unittest/_torch/sampler/test_torch_sampler.py",
+    "tests/unittest/_torch/sampler/test_token_ban.py",
+    "tests/unittest/_torch/sampler/test_beam_search.py",
+    "tests/unittest/_torch/sampler/test_beam_search_util.py",
+]
 # NB:
 #   .   -> 'tensorrt_llm'
 #   tests/unittest   -> 'utils'
@@ -927,7 +943,14 @@ module = [
     "tensorrt_llm._torch.pyexecutor.sampler.*",
 ]
 disable_error_code = [
-    "no-untyped-call"
+    "no-untyped-call",
+    # TODO(TRTLLM-15310): strict mode's warn_redundant_casts flags several cast(...) calls
+    # in sampler_strategy.py (introduced by #16620). Whether a cast is "redundant" is
+    # binding-dependent -- the full build check (compiled bindings + stubs) flags 2,
+    # the bindings-less local/pre-commit check flags ~20 -- so removing casts is a
+    # fragile WAR. Suppress redundant-cast for the sampler module until the casts are
+    # audited and the annotations tightened, rather than churn the source.
+    "redundant-cast",
 ]
 
 [[tool.mypy.overrides]]

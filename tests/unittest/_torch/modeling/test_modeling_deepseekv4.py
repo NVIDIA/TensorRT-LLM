@@ -1,29 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import ast
 import inspect
 import json
 import struct
-import textwrap
 import weakref
 from copy import deepcopy
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+from torch import nn
 from transformers import PretrainedConfig
+from utils.util import getSMVersion, skip_blackwell_geforce, skip_pre_blackwell
 
 # from utils.util import default_dtype
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
-    DeepseekV4CacheManager,
+from tensorrt_llm._torch.attention_backend.fmha import FallbackFmha, FlashInferSparseMlaFmha
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    PositionalEmbeddingParams,
+    RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+    DeepseekV4CacheManager,
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
+)
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+    _fused_q_rope_specs,
+    _is_fused_kv_norm_enabled,
+    _is_fused_prologue_active,
+    _is_fused_q_fp8_quant_enabled,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
@@ -41,6 +52,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     _resolve_enable_fused_hc,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -103,14 +115,6 @@ DEEPSEEK_V4_TINY_CONFIG = {
 }
 
 
-def _source_calls(source):
-    return {
-        ast.unparse(node)
-        for node in ast.walk(ast.parse(textwrap.dedent(source)))
-        if isinstance(node, ast.Call)
-    }
-
-
 def _write_safetensors_header(path, tensor_name, dtype, shape):
     header = {
         tensor_name: {
@@ -152,16 +156,27 @@ def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
     assert _resolve_enable_fused_hc(config) is False
 
 
-def test_deepseek_v4_model_defaults():
+def test_deepseek_v4_kv_cache_defaults_and_v2_preference():
+    defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
+
+    assert defaults == {
+        "kv_cache_config": {
+            "tokens_per_block": 128,
+            "enable_swa_scratch_reuse": True,
+        }
+    }
+    assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
+
+
+def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks() -> None:
     class LlmArgs:
-        pass
+        kv_cache_config = KvCacheConfig(dtype="fp8_ds_mla")
 
     defaults = DeepseekV4ForCausalLM.get_model_defaults(LlmArgs())
 
     assert defaults == {
         "kv_cache_config": {
-            "tokens_per_block": 128,
-            "use_kv_cache_manager_v2": True,
+            "tokens_per_block": 256,
             "enable_swa_scratch_reuse": True,
         }
     }
@@ -370,28 +385,67 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
     assert not torch.allclose(per_head, joint, atol=0.1)
 
 
-def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
-    from tensorrt_llm._torch.modules.mla import MLA
+def test_deepseek_v4_mla_builds_both_norms_at_the_v4_widths():
+    """The two tests above pin the norm maths; this pins how MLA wires them up.
 
-    init_src = inspect.getsource(MLA.__init__)
-    helper_src = inspect.getsource(MLA._deepseek_v4_q_b_layernorm)
-    forward_src = inspect.getsource(MLA.forward_impl_with_deepseek_v4)
-    init_src_no_ws = "".join(init_src.split())
+    `kv_a_layernorm` spans the WHOLE 512-wide latent, RoPE tail included -- unlike
+    V3/V3.2, where it is `kv_lora_rank` wide and the tail bypasses it. The fused KV
+    kernel applies the norm itself over that full row and
+    `_is_fused_kv_norm_enabled` gates on the weight width, so narrowing it would
+    silently disable the fusion rather than fail.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("MLA construction requires CUDA")
 
-    assert "self.q_b_layernorm=RMSNorm(hidden_size=self.qk_head_dim" in init_src_no_ws
-    assert "has_weights=False" in init_src
-    assert "kv_a_layernorm_hidden_size = (" in init_src
-    assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
-    assert "self.kv_a_layernorm=RMSNorm(hidden_size=kv_a_layernorm_hidden_size" in init_src_no_ws
-    assert "q.dim() == 2" in helper_src
-    assert "self.num_heads_tp * self.qk_head_dim" in helper_src
-    assert "torch.ops.trtllm.deepseek_v4_q_norm" in helper_src
-    assert ".is_cuda" not in helper_src
-    assert ".is_contiguous" not in helper_src
-    assert "q.dtype" not in helper_src
-    assert "total_rows" not in helper_src
-    assert "self.q_b_layernorm(" not in helper_src
-    assert "self._deepseek_v4_q_b_layernorm(q_proj)" in _source_calls(forward_src)
+    cfg = DeepseekV4Config(**deepcopy(DEEPSEEK_V4_TINY_CONFIG))
+    model_config = ModelConfig(
+        pretrained_config=cfg,
+        sparse_attention_config=DeepSeekV4SparseAttentionConfig(
+            index_n_heads=32, index_head_dim=128, index_topk=512
+        ),
+    )
+    if getSMVersion() in (120, 121):
+        # SM120/SM121 only support DeepSeek-V4 sparse MLA through the FlashInfer
+        # fp8_ds_mla path; construction raises ValueError with any other dtype.
+        model_config.extra_attrs["kv_cache_dtype"] = "fp8_ds_mla"
+    mla = MLA(
+        hidden_size=cfg.hidden_size,
+        num_attention_heads=cfg.num_attention_heads,
+        num_key_value_heads=1,
+        qk_nope_head_dim=cfg.qk_nope_head_dim,
+        qk_rope_head_dim=cfg.qk_rope_head_dim,
+        v_head_dim=cfg.v_head_dim,
+        q_lora_rank=cfg.q_lora_rank,
+        kv_lora_rank=cfg.kv_lora_rank,
+        predicted_tokens_per_seq=1,
+        max_position_embeddings=cfg.max_position_embeddings,
+        bias=False,
+        pos_embd_params=_deepseek_v4_pos_embd_params(cfg, model_config, 0),
+        layer_idx=0,
+        dtype=torch.bfloat16,
+        config=model_config,
+        num_groups=cfg.o_groups,
+        o_lora_rank=cfg.o_lora_rank,
+    ).to("cuda")
+
+    latent_width = cfg.kv_lora_rank + cfg.qk_rope_head_dim
+    assert mla.kv_a_layernorm.weight.shape == (latent_width,)
+    assert mla.q_b_layernorm.weight.shape == (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim,)
+    assert list(mla.q_b_layernorm.named_parameters()) == []
+    # `kv_b_proj` is absent because DeepSeekV4Hooks.need_absorption is False, which
+    # is what proves the 512 above came from the V4 hook rather than from MLA's own
+    # `kv_lora_rank`-wide construction.
+    assert not hasattr(mla, "kv_b_proj")
+
+    # The RoPE tail is inside the norm: perturbing it moves the normalized nope
+    # segment, which a 448-wide V3-style norm would leave untouched.
+    latent = torch.randn(4, latent_width, dtype=torch.bfloat16, device="cuda")
+    perturbed = latent.clone()
+    perturbed[:, cfg.kv_lora_rank :] *= 4.0
+    assert not torch.allclose(
+        mla.kv_a_layernorm(latent)[:, : cfg.kv_lora_rank],
+        mla.kv_a_layernorm(perturbed)[:, : cfg.kv_lora_rank],
+    )
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
@@ -801,8 +855,40 @@ def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(tmp_path, 
     assert model_config.sparse_attention_config.compress_ratios == [128, 128, 1]
 
 
-def test_deepseek_v4_sanity():
+@pytest.mark.parametrize(
+    "kv_cache_dtype,tokens_per_block,binding_dtype",
+    [
+        pytest.param(
+            "auto",
+            128,
+            tensorrt_llm.bindings.DataType.BF16,
+            marks=skip_blackwell_geforce,
+            id="bf16-kv",
+        ),
+        pytest.param(
+            "fp8_ds_mla",
+            256,
+            tensorrt_llm.bindings.DataType.FP8,
+            marks=pytest.mark.skipif(
+                getSMVersion() not in (120, 121),
+                reason="FlashInfer sparse MLA requires SM 120 or SM 121",
+            ),
+            id="fp8-ds-mla",
+        ),
+    ],
+)
+def test_deepseek_v4_sanity(
+    kv_cache_dtype: str,
+    tokens_per_block: int,
+    binding_dtype: tensorrt_llm.bindings.DataType,
+) -> None:
     config_dict = deepcopy(DEEPSEEK_V4_TINY_CONFIG)
+    if kv_cache_dtype == "fp8_ds_mla":
+        # Sparse MLA coverage does not depend on the MoE intermediate width.
+        # Preserve 256 experts because the real routing kernel requires that
+        # topology, but keep its weights small enough for an RTX Pro 6000D.
+        config_dict["moe_intermediate_size"] = 128
+        config_dict["vocab_size"] = 1024
     config = DeepseekV4Config(**config_dict)
     config.dtype = torch.bfloat16
     config.mapping = Mapping(world_size=1, tp_size=1, rank=0)
@@ -822,11 +908,24 @@ def test_deepseek_v4_sanity():
 
     device = torch.device("cuda")
     # with default_dtype(config.dtype):
-    model_config = ModelConfig(
-        pretrained_config=config, sparse_attention_config=sparse_attn_config, attn_backend="TRTLLM"
+    quant_config = QuantConfig(
+        kv_cache_quant_algo=QuantAlgo.FP8 if kv_cache_dtype == "fp8_ds_mla" else None
     )
+    model_config = ModelConfig(
+        pretrained_config=config,
+        sparse_attention_config=sparse_attn_config,
+        attn_backend="TRTLLM",
+        quant_config=quant_config,
+    )
+    model_config.extra_attrs["kv_cache_dtype"] = kv_cache_dtype
     model = DeepseekV4ForCausalLM(model_config).to(device)
     assert not model.model.layers[0].fusion_config.POST_MOE_FUSION
+    fmha_libs = model.model.layers[0].self_attn.mqa.fmha_libs
+    if kv_cache_dtype == "fp8_ds_mla":
+        assert any(isinstance(fmha, FlashInferSparseMlaFmha) for fmha in fmha_libs)
+        assert not any(isinstance(fmha, FallbackFmha) for fmha in fmha_libs)
+    else:
+        assert any(isinstance(fmha, FallbackFmha) for fmha in fmha_libs)
 
     context_sequence_length = [3, 2, 5]
     num_contexts = len(context_sequence_length)
@@ -840,7 +939,6 @@ def test_deepseek_v4_sanity():
     request_ids = list(range(len(sequence_length)))
     token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_length)).tolist()
     prompt_lens = token_nums[:num_contexts] + past_seen_tokens[num_contexts:]
-    tokens_per_block = 128  # DeepSeek-V4 requirement
     max_new_tokens = 1024
     required_blocks = sum(
         (token_num + max_new_tokens + tokens_per_block - 1) // tokens_per_block
@@ -852,22 +950,16 @@ def test_deepseek_v4_sanity():
     max_seq_len = num_blocks * tokens_per_block
     batch_size = len(sequence_length)
 
-    if config.dtype == torch.half:
-        kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
-    elif config.dtype == torch.bfloat16:
-        kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-    else:
-        raise ValueError("Invalid dtype")
     mapping = config.mapping
-    kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
-    kv_cache_config.max_util_for_resume = 0.1
+    kv_cache_config = KvCacheConfig(
+        dtype=kv_cache_dtype,
+        enable_block_reuse=False,
+        max_tokens=num_blocks * tokens_per_block,
+        event_buffer_max_size=0,
+    )
 
     kv_cache_manager = DeepseekV4CacheManager(
-        kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
-            max_tokens=num_blocks * tokens_per_block,
-            event_buffer_max_size=0,
-        ),
+        kv_cache_config=kv_cache_config,
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=num_layers,
         num_kv_heads=1,
@@ -876,7 +968,7 @@ def test_deepseek_v4_sanity():
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
         mapping=mapping,
-        dtype=kv_cache_dtype,
+        dtype=binding_dtype,
         compressor_dtype=tensorrt_llm.bindings.DataType.FLOAT,
         vocab_size=vocab_size,
         max_num_tokens=max_seq_len * max_batch_size,
@@ -983,3 +1075,398 @@ def test_deepseek_v4_sanity():
     for req in reqs:
         kv_cache_manager.free_resources(req)
     kv_cache_manager.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Dispatch coverage for the MLA prologue fusions: which path is taken, not
+# the numerics. Merged from test_mla_dsv4_fusion_dispatch.py.
+# ---------------------------------------------------------------------------
+
+
+# DSv4-Pro latent geometry: 448 nope + 64 rope = a 512-wide head.
+KV_LORA_RANK = 448
+QK_ROPE_HEAD_DIM = 64
+
+
+class _FakeAttention(nn.Module):
+    """Stands in for the attention backend; only the fusion inputs matter."""
+
+    def __init__(self, has_fp8_kv_cache: bool):
+        super().__init__()
+        self.has_fp8_kv_cache = has_fp8_kv_cache
+        self.rotary_cos_sin = torch.zeros(8, dtype=torch.float32)
+
+    def support_fused_rope(self) -> bool:
+        return True
+
+    def update_quant_config(self, _quant_config: object) -> None:
+        pass
+
+    def _ensure_rope_table_size(self, _max_seq_len: int) -> None:
+        pass
+
+
+def _make_mla(
+    *,
+    has_fp8_kv_cache: bool,
+    dsv4_geometry: bool = True,
+    kv_lora_rank: int = KV_LORA_RANK,
+    qk_rope_head_dim: int = QK_ROPE_HEAD_DIM,
+) -> MLA:
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+    config = ModelConfig(skip_create_weights_in_init=True)
+    position_embedding = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.rope_gpt_neox,
+        rope=RopeParams(dim=QK_ROPE_HEAD_DIM, max_positions=8192),
+    )
+    with patch(
+        "tensorrt_llm._torch.modules.mla.create_attention",
+        side_effect=lambda *a, **kw: _FakeAttention(has_fp8_kv_cache),
+    ):
+        mla = MLA(
+            hidden_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            qk_nope_head_dim=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=kv_lora_rank,
+            q_lora_rank=32,
+            kv_lora_rank=kv_lora_rank,
+            predicted_tokens_per_seq=1,
+            max_position_embeddings=8192,
+            bias=False,
+            pos_embd_params=position_embedding,
+            layer_idx=0,
+            dtype=torch.bfloat16,
+            config=config,
+        )
+    # DSv4 widens kv_a_layernorm to the whole 512 latent, and
+    # `_is_fused_kv_norm_enabled` checks that width. Do NOT fabricate attributes the
+    # real module lacks: the predicates live in the DSv4 sparse module, so reaching
+    # them already implies DSv4 and only the geometry is actually checked.
+    if dsv4_geometry:
+        mla.kv_a_layernorm = RMSNorm(
+            hidden_size=kv_lora_rank + qk_rope_head_dim, dtype=torch.bfloat16, eps=1e-6
+        )
+    return mla
+
+
+def _make_metadata(
+    *, num_ctx_tokens: int, num_tokens: int, num_seqs: int, num_contexts: int = 0
+) -> SimpleNamespace:
+    """Only the five attributes `_fused_q_rope_specs` reads."""
+    # Production returns `mla_ctx_cu_q_seqlens[:num_contexts + 1]`, so match that length.
+    cu_ctx = torch.zeros(num_contexts + 1, dtype=torch.int32)
+    return SimpleNamespace(
+        kv_lens_cuda_runtime=torch.arange(num_seqs, dtype=torch.int32),
+        num_ctx_tokens=num_ctx_tokens,
+        num_tokens=num_tokens,
+        max_seq_len=8192,
+        mla_prepare_ctx_cu_seqlens=lambda: cu_ctx,
+    )
+
+
+@pytest.mark.parametrize("has_fp8_kv_cache", [True, False])
+def test_fusions_require_fp8_kv_cache(has_fp8_kv_cache: bool) -> None:
+    """Both predicates hang off the KV-cache dtype.
+
+    A bf16 configuration must report the fusions off. Without this the
+    backend-level suites, which build a bf16 cache, look like coverage while
+    never entering a fused path.
+    """
+    mla = _make_mla(has_fp8_kv_cache=has_fp8_kv_cache)
+    assert _is_fused_kv_norm_enabled(mla, num_generations=1) is has_fp8_kv_cache
+    assert _is_fused_q_fp8_quant_enabled(mla, num_generations=1, num_contexts=0) is has_fp8_kv_cache
+
+
+def test_kv_norm_fusion_needs_the_full_width_weight() -> None:
+    """The KV kernels norm the whole 512 latent, so a 448-wide weight must bail.
+
+    This is the guard against an out-of-bounds read, not a style check: the kernel
+    indexes `kv_norm_weight` across `K_DIM + ROPE_DIM` regardless of its length.
+    """
+    mla = _make_mla(has_fp8_kv_cache=True, dsv4_geometry=False)
+    assert mla.kv_a_layernorm.weight.shape[0] == KV_LORA_RANK
+    assert _is_fused_kv_norm_enabled(mla, num_generations=1) is False
+
+
+def test_rope_specs_mixed_batch_splits_by_phase() -> None:
+    """The regression this file exists for, and the only per-phase spec test.
+
+    Pure-context and pure-generation cases were dropped: mutation attribution
+    showed the generation-only test killed no mutant, and every mutant the
+    context-only test killed is also killed here. A mixed batch exercises both
+    position rules at once, so it strictly dominates them.
+
+    A mixed batch needs both position rules, so it gets one spec per phase. When
+    this returned nothing the fused path silently fell back to
+    `applyMLARopeAndAssignQKVKernel*` and no test noticed.
+    """
+    # 2 context sequences (96 tokens) + 3 generation sequences (3 tokens).
+    metadata = _make_metadata(num_ctx_tokens=96, num_tokens=99, num_seqs=5, num_contexts=2)
+    mla = _make_mla(has_fp8_kv_cache=True)
+
+    cos_sin, specs = _fused_q_rope_specs(mla, metadata, num_contexts=2, num_generations=3)
+
+    assert cos_sin is not None
+    assert len(specs) == 2, "mixed batch must not fall back to a single launch"
+
+    (
+        (ctx_rows, ctx_cache_lens, ctx_seq_len, ctx_cu),
+        (
+            gen_rows,
+            gen_cache_lens,
+            gen_seq_len,
+            gen_cu,
+        ),
+    ) = specs
+
+    # Context first, generation second, disjoint and covering every row exactly once.
+    assert ctx_rows == slice(0, 96)
+    assert gen_rows == slice(96, 99)
+    assert ctx_rows.stop == gen_rows.start
+
+    assert ctx_seq_len == 0 and ctx_cu is not None
+    assert gen_seq_len == 1 and gen_cu is None
+
+    # Each half sees only its own sequences' cache lengths.
+    assert ctx_cache_lens.shape[0] == 2
+    assert gen_cache_lens.shape[0] == 3
+
+
+def test_kv_norm_fusion_is_coupled_to_the_q_rope_fold() -> None:
+    """The two fusions must move together.
+
+    The KV fusion hands the un-fused RoPE kernels the RAW latent, so their Q
+    region would read it un-normalized. That is only safe because the fused Q
+    path takes the Q side over entirely -- enabling one without the other is a
+    silent correctness bug, not a slower path.
+    """
+    mla = _make_mla(has_fp8_kv_cache=True)
+    metadata = _make_metadata(num_ctx_tokens=96, num_tokens=96, num_seqs=3, num_contexts=3)
+    metadata.mla_prepare_ctx_cu_seqlens = None  # forces the Q fold off
+
+    _cos_sin, specs = _fused_q_rope_specs(mla, metadata, num_contexts=3, num_generations=0)
+    assert not specs
+
+    # The KV predicate on its own still says yes -- so the coupling, not a shared
+    # precondition, is what has to turn the fusion off.
+    assert _is_fused_kv_norm_enabled(mla, num_generations=0) is True
+
+    # `forward_impl_with_deepseek_v4` assigns `_fused_kv_norm_active` from exactly
+    # this call, so asserting on it here is asserting on the shipped decision.
+    assert (
+        _is_fused_prologue_active(mla, num_contexts=3, num_generations=0, rope_specs=specs) is False
+    ), "kv-norm fusion must not engage when the Q RoPE fold is unavailable"
+
+    # ...and it does engage once the specs exist, so the False above is the coupling
+    # talking and not a predicate that is off for some unrelated reason.
+    assert (
+        _is_fused_prologue_active(
+            mla, num_contexts=3, num_generations=0, rope_specs=[("dummy", None, 0, None)]
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "kv_lora_rank,qk_rope_head_dim",
+    [(512, 64), (448, 128)],
+    ids=["lora512", "rope128"],
+)
+def test_fusions_require_the_448_64_latent(kv_lora_rank: int, qk_rope_head_dim: int) -> None:
+    """The kernels hard-code the latent row in template constants.
+
+    `mlaKvNormRopeQuant*Kernel` is instantiated at K_DIM=448 / ROPE_DIM=64, so a
+    model whose latent is shaped differently must not reach it -- the kernel would
+    stride the wrong row width. Every other fixture here builds DSv4 geometry, so
+    without this case the guard is unreachable and deleting it breaks no test.
+    """
+    mla = _make_mla(
+        has_fp8_kv_cache=True,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+    assert _is_fused_kv_norm_enabled(mla, num_generations=1) is False
+
+
+# ---------------------------------------------------------------------------
+# Numerics for the Q RoPE fold in `deepseek_v4_q_norm_fused_fp8`.
+# Merged from test_deepseek_v4_q_norm_fused_rope.py.
+# ---------------------------------------------------------------------------
+
+
+# DSv4-Pro Q geometry: 448 nope + 64 rope per head.
+HEAD_DIM = 512
+NOPE_DIM = 448
+ROPE_DIM = HEAD_DIM - NOPE_DIM
+EPS = 1e-6
+QUANT_SCALE = 0.5
+MAX_POSITIONS = 512
+
+
+def _make_cos_sin(device: torch.device) -> torch.Tensor:
+    """Rope table in the layout every MLA kernel here indexes.
+
+    The pointer is `float2 const*` strided by ROPE_DIM per position, so a row is
+    ROPE_DIM float2 entries even though only the first ROPE_DIM/2 -- one per
+    rotated pair -- are ever read. Filling the unused tail with NaN keeps a
+    stride mistake from silently reading plausible numbers.
+    """
+    table = torch.full((MAX_POSITIONS, ROPE_DIM, 2), float("nan"), dtype=torch.float32)
+    # Angles are decorrelated across positions on purpose. A smooth table (e.g.
+    # linspace) makes neighbouring positions nearly identical, and an off-by-one
+    # in the position arithmetic then lands inside any sane tolerance.
+    generator = torch.Generator().manual_seed(1234)
+    angles = torch.rand((MAX_POSITIONS, ROPE_DIM // 2), generator=generator) * (2 * torch.pi)
+    table[:, : ROPE_DIM // 2, 0] = torch.cos(angles)
+    table[:, : ROPE_DIM // 2, 1] = torch.sin(angles)
+    return table.to(device)
+
+
+def _reference(
+    q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, num_heads: int
+) -> torch.Tensor:
+    """RMS-norm over the whole 512-wide head, rotate the tail, scale for FP8."""
+    num_tokens = q.shape[0]
+    x = q.view(num_tokens, num_heads, HEAD_DIM).float()
+    inv_rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS)
+    normed = x * inv_rms
+
+    nope = normed[..., :NOPE_DIM] * QUANT_SCALE
+
+    # GPT-J interleave: pair j is elements (2j, 2j+1) of the rope tail.
+    rope = normed[..., NOPE_DIM:]
+    even, odd = rope[..., 0::2], rope[..., 1::2]
+    coef = cos_sin[positions][:, : ROPE_DIM // 2, :]  # [tokens, 32, 2]
+    cos = coef[..., 0].unsqueeze(1)  # broadcast over heads
+    sin = coef[..., 1].unsqueeze(1)
+    rotated = torch.empty_like(rope)
+    rotated[..., 0::2] = cos * even - sin * odd
+    rotated[..., 1::2] = cos * odd + sin * even
+
+    return torch.cat([nope, rotated * QUANT_SCALE], dim=-1)
+
+
+def _run_op(q, num_heads, cos_sin, cache_seq_lens, seq_len, cu_q_seqlens):
+    num_tokens = q.shape[0]
+    quant_q = torch.zeros(
+        (num_tokens, num_heads * HEAD_DIM), dtype=torch.float8_e4m3fn, device=q.device
+    )
+    # Sentinel: the fold must leave q_pe untouched, because the rope tail is
+    # supposed to land in quant_q instead.
+    q_pe = torch.full((num_tokens, num_heads * ROPE_DIM), 7.0, dtype=q.dtype, device=q.device)
+    quant_scale = torch.tensor([QUANT_SCALE], dtype=torch.float32, device=q.device)
+
+    torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q,
+        quant_q,
+        q_pe,
+        num_heads,
+        HEAD_DIM,
+        NOPE_DIM,
+        EPS,
+        quant_scale,
+        cos_sin,
+        cache_seq_lens,
+        seq_len,
+        cu_q_seqlens,
+    )
+    return quant_q, q_pe
+
+
+def _assert_matches(quant_q, q_pe, reference, num_heads):
+    """Compare in FP8, not in float.
+
+    A relative tolerance on the dequantized values has to be at least one e4m3
+    step (~13%) to absorb rounding, and that is wide enough to swallow real bugs
+    -- normalizing over 448 dims instead of 512 is only a 6.9% shift. So quantize
+    the reference the same way and require the codes to agree. The kernel folds
+    inv_rms and the quant scale into a single multiply where the reference uses
+    two, so a few values sit on the other side of a rounding boundary; those get
+    a small budget, capped at one FP8 step each.
+    """
+    num_tokens = quant_q.shape[0]
+    got = quant_q.view(num_tokens, num_heads, HEAD_DIM).float()
+    expected = reference.to(torch.float8_e4m3fn).float()
+
+    differing = got != expected
+    frac = differing.float().mean().item()
+    assert frac < 0.01, f"{frac:.4%} of FP8 codes differ from the reference"
+
+    if differing.any():
+        scale = torch.maximum(got.abs(), expected.abs()).clamp_min(1e-6)
+        worst = ((got - expected).abs() / scale)[differing].max().item()
+        assert worst < 0.13, f"a differing code is off by more than one FP8 step ({worst:.3f})"
+
+    assert torch.all(q_pe == 7.0), (
+        "q_pe was written; the rope tail must go to quant_q on the fused path"
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "num_heads,seq_len",
+    [(4, 2), (6, 3)],
+    ids=["heads4_seqlen2_pow2", "heads6_seqlen3_divide"],
+)
+def test_fused_rope_generation_positions(num_heads: int, seq_len: int) -> None:
+    """Uniform query length: position = cache_len[batch] - seq_len + local_token.
+
+    The parameters flip both power-of-two shortcuts the kernel takes (`row /
+    num_heads` and `token / seq_len` become shift/mask only when the host says
+    the divisor is a power of two), so the ids name which arithmetic runs.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    num_seqs = 3
+    num_tokens = num_seqs * seq_len
+
+    q = torch.randn((num_tokens, num_heads * HEAD_DIM), dtype=torch.bfloat16, device=device)
+    cos_sin = _make_cos_sin(device)
+    cache_seq_lens = torch.tensor([16, 40, 71], dtype=torch.int32, device=device)
+
+    quant_q, q_pe = _run_op(q, num_heads, cos_sin, cache_seq_lens, seq_len, None)
+
+    token = torch.arange(num_tokens, device=device)
+    positions = cache_seq_lens[token // seq_len] - seq_len + (token % seq_len)
+    reference = _reference(q, cos_sin, positions.long(), num_heads)
+    _assert_matches(quant_q, q_pe, reference, num_heads)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "num_heads,cached_offset",
+    [(4, 0), (6, 5)],
+    ids=["heads4_fresh_prefill", "heads6_chunked_prefill"],
+)
+def test_fused_rope_context_positions(num_heads: int, cached_offset: int) -> None:
+    """Ragged: position = local_token + (cache_len[seq] - current_seq_len).
+
+    `cached_offset > 0` is the chunked-prefill / block-reuse case, where part of
+    the sequence is already in the KV cache and this chunk's first token is not
+    at position 0. Every other test in the suite pins it to zero by disabling
+    block reuse, so the second parameter is the only thing that walks that term.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    seq_lens = [5, 3, 7]
+    num_tokens = sum(seq_lens)
+
+    cu_q_seqlens = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32, device=device
+    )
+    cache_seq_lens = torch.tensor(
+        [s + cached_offset for s in seq_lens], dtype=torch.int32, device=device
+    )
+    q = torch.randn((num_tokens, num_heads * HEAD_DIM), dtype=torch.bfloat16, device=device)
+    cos_sin = _make_cos_sin(device)
+
+    quant_q, q_pe = _run_op(q, num_heads, cos_sin, cache_seq_lens, 0, cu_q_seqlens)
+
+    positions = torch.cat(
+        [torch.arange(length, device=device) + cached_offset for length in seq_lens]
+    )
+    reference = _reference(q, cos_sin, positions.long(), num_heads)
+    _assert_matches(quant_q, q_pe, reference, num_heads)

@@ -18,6 +18,9 @@ from tensorrt_llm._torch.visual_gen.output import (
 )
 from tensorrt_llm.visual_gen import VisualGenMetrics, VisualGenOutput
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # VisualGenOutput shape and re-exports
 # ---------------------------------------------------------------------------

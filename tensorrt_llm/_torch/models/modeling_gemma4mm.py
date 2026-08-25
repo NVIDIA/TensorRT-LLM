@@ -25,7 +25,7 @@ import dataclasses
 import math
 from collections.abc import Sequence
 from itertools import groupby
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import transformers
@@ -61,6 +61,9 @@ from .modeling_multimodal_mixin import (
 )
 from .modeling_multimodal_utils import _MULTIMODAL_ENV_NAME, _is_mm_disagg
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
 if Version(transformers.__version__) < Version(_MIN_TRANSFORMERS_FOR_GEMMA4):
@@ -557,11 +560,29 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     supports_encoder_cache = True
 
     @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
         return {
             "attn_backend": "FLASHINFER",
         }
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 — see Gemma4ForCausalLM."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2.
+
+        Multimodal disaggregated serving is currently rejected in __init__,
+        but if it lands, the NIXL route must resolve to the Python
+        transceiver for _resolve_kv_cache_manager_v2_auto to keep V2.
+        """
+        return "PYTHON"
 
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         # transformers 5.x ``PreTrainedModel.__init__`` calls this with an
@@ -610,6 +631,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                 hits={},
                 miss_indices=list(range(len(partition.keys))),
                 keys=partition.keys,
+                looked_up=partition.looked_up,
             )
         if (
             modality in ("image", "audio")
@@ -634,6 +656,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                     hits={},
                     miss_indices=list(range(len(partition.keys))),
                     keys=partition.keys,
+                    looked_up=partition.looked_up,
                 )
         return partition
 
@@ -960,6 +983,8 @@ class Gemma4ForConditionalGeneration(Gemma4MultimodalModelBase):
     - Support for image_position_ids (2D patch coordinates)
     - mm_token_type_ids-based bidirectional masking
     """
+
+    build_mtp_draft_model_from_config = True
 
     def __init__(self, model_config: ModelConfig[Gemma4Config]):
         if _is_mm_disagg():
