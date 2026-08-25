@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <cuda_runtime_api.h>
 #include <exception>
+#include <limits>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -38,6 +40,9 @@ namespace
 // An efficient implementation assuming gran is a power of 2
 inline size_t roundUp(size_t val, size_t gran)
 {
+    TLLM_CHECK_WITH_INFO(
+        gran != 0 && (gran & (gran - 1)) == 0, "Allocation granularity must be a nonzero power of two");
+    TLLM_CHECK_WITH_INFO(val <= std::numeric_limits<size_t>::max() - (gran - 1), "Allocation size overflow");
     return (val + gran - 1) & ~(gran - 1);
 }
 
@@ -147,7 +152,7 @@ void runCollectivePhase(McastGroupComm& comm, char const* phase, Action action, 
 McastDeviceMemory::McastDeviceMemory(
     size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink, int64_t mpiCommFortranHandle)
     : McastDeviceMemory(
-        bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::make_shared<MpiMcastGroupComm>(mpiCommFortranHandle))
+          bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::make_shared<MpiMcastGroupComm>(mpiCommFortranHandle))
 {
 }
 
@@ -190,6 +195,7 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
         {
             TLLM_CHECK_WITH_INFO(
                 mGroupRank < mGroupSize, "[McastDeviceMemory] group rank is out of range for the group size.");
+            TLLM_CHECK_WITH_INFO(mBufSize > 0, "[McastDeviceMemory] Buffer size must be positive.");
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
             int multicastSupported{0};
             TLLM_CU_CHECK(
@@ -204,6 +210,13 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
                     fabricHandleSupported != 0, "[McastDeviceMemory] Device does not support fabric handle.");
             }
         });
+
+    uint64_t const localRequest = mBufSize;
+    std::vector<uint64_t> requests(mGroupSize);
+    mGroupComm->allgather(&localRequest, requests.data(), sizeof(localRequest));
+    TLLM_CHECK_WITH_INFO(std::all_of(requests.begin(), requests.end(),
+                             [localRequest](uint64_t request) { return request == localRequest; }),
+        "[McastDeviceMemory] All ranks must allocate the same logical size.");
 
     // From pytorch implementation for alignment
     constexpr size_t kSignalPadAlignment = 16UL;
@@ -239,8 +252,7 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
                 mUcPtrsDev = nullptr;
             }
             if (mUcBasePtr != 0
-                && cleanupNoThrow("unicast virtual address reservation",
-                    [this]()
+                && cleanupNoThrow("unicast virtual address reservation", [this]()
                     { TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(mUcBasePtr, mAllocationSize * mGroupSize)); }))
             {
                 mUcBasePtr = 0;
@@ -257,13 +269,36 @@ McastDeviceMemory::McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_
     }
     else
     {
-        allocNvlsMcastMem(mSignalPadOffset + kSIGNAL_PAD_SIZE);
-        initializePointerTables();
+        try
+        {
+            allocNvlsMcastMem(mSignalPadOffset + kSIGNAL_PAD_SIZE);
+            runCollectivePhase(*mGroupComm, "pointer-table initialization", [this]() { initializePointerTables(); });
+        }
+        catch (...)
+        {
+            cleanupNoThrow("NVLS multicast memory", [this]() { tensorrt_llm::runtime::ipcNvlsFree(mNvlsHandle); });
+            cleanupNoThrow(
+                "signal-pad pointer table", [this]() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaFree(mSignalPadsDev)); });
+            cleanupNoThrow("unicast pointer table", [this]() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaFree(mUcPtrsDev)); });
+            throw;
+        }
     }
+}
+
+void* McastDeviceMemory::getUnicastPtr(uint32_t rank) const
+{
+    TLLM_CHECK_WITH_INFO(rank < mGroupSize, "[McastDeviceMemory] Unicast rank is out of range.");
+    return reinterpret_cast<void*>(mUcPtrs[rank]);
+}
+
+void* McastDeviceMemory::getMulticastPtr() const
+{
+    return reinterpret_cast<void*>(mMcPtr);
 }
 
 void McastDeviceMemory::initializePointerTables()
 {
+    TLLM_CHECK_WITH_INFO(mUcPtrs.size() == mGroupSize, "[McastDeviceMemory] Incorrect number of unicast pointers.");
     // Initialize signal pads and rebuild graph-independent peer pointer tables.
     mSignalPads.resize(mGroupSize);
     for (size_t i = 0; i < mGroupSize; i++)
@@ -289,6 +324,10 @@ void McastDeviceMemory::initializePointerTables()
 
 McastDeviceMemory::~McastDeviceMemory() noexcept
 {
+    int previousDevice{-1};
+    bool const restoreDevice = cudaGetDevice(&previousDevice) == cudaSuccess;
+    cleanupNoThrow("device selection", [this]() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaSetDevice(mDeviceIdx)); });
+    cleanupNoThrow("device synchronization", []() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaDeviceSynchronize()); });
     cleanupNoThrow(
         "multicast buffer registration", [this]() { tensorrt_llm::common::unregisterMcastDevMemBuffer(this); });
     if (mIsMNNvlink)
@@ -322,6 +361,11 @@ McastDeviceMemory::~McastDeviceMemory() noexcept
     {
         cleanupNoThrow("unicast pointer table", [this]() { TLLM_CUDA_CHECK(cudaFree(mUcPtrsDev)); });
     }
+    if (restoreDevice)
+    {
+        cleanupNoThrow(
+            "previous device", [previousDevice]() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaSetDevice(previousDevice)); });
+    }
 }
 
 void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
@@ -332,7 +376,10 @@ void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = mDeviceIdx;
-    prop.allocFlags.gpuDirectRDMACapable = 1;
+    int gpuDirectRdmaSupported{0};
+    TLLM_CU_CHECK(cuDeviceGetAttribute(
+        &gpuDirectRdmaSupported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, mDeviceIdx));
+    prop.allocFlags.gpuDirectRDMACapable = gpuDirectRdmaSupported != 0;
 
     size_t allocGranularity{0}, mcGranularity{0};
     size_t allocationSize{0};
@@ -341,7 +388,7 @@ void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
         [&]()
         {
             TLLM_CU_CHECK(cuMemGetAllocationGranularity(&allocGranularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-            allocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, allocGranularity);
+            allocationSize = roundUp(roundUp(bufSize, 16UL) + kSIGNAL_PAD_SIZE, allocGranularity);
             mcProp = {.numDevices = mGroupSize, .size = allocationSize, .handleTypes = handleType};
             TLLM_CU_CHECK(cuMulticastGetGranularity(&mcGranularity, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
             allocationSize = roundUp(allocationSize, mcGranularity);
@@ -353,7 +400,19 @@ void McastDeviceMemory::createAndMapMnMcastMem(size_t bufSize)
                     "layout.");
             }
         });
+    uint64_t const localLayout[3] = {allocationSize, allocGranularity, mcGranularity};
+    std::vector<uint64_t> layouts(mGroupSize * 3);
+    mGroupComm->allgather(localLayout, layouts.data(), sizeof(localLayout));
+    TLLM_CHECK_WITH_INFO(
+        std::all_of(layouts.begin(), layouts.end(),
+            [&localLayout, index = size_t{0}](uint64_t value) mutable { return value == localLayout[index++ % 3]; }),
+        "[McastDeviceMemory] Ranks computed inconsistent aligned allocation properties.");
+    TLLM_CHECK_WITH_INFO(allocationSize <= std::numeric_limits<size_t>::max() / mGroupSize,
+        "[McastDeviceMemory] Unicast reservation size overflow.");
     mAllocationSize = allocationSize;
+    // Reuse multicast alignment slack while retaining exactly the same layout across restore.
+    mBufSize = mAllocationSize - kSIGNAL_PAD_SIZE;
+    mSignalPadOffset = mBufSize;
     runCollectivePhase(*mGroupComm, "restore precondition validation",
         [this]()
         {
@@ -700,6 +759,7 @@ void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
     // Reuse existing implementation, handing it this group's collective so the allocation works
     // under MPI and non-MPI (Ray) orchestrators alike.
     mNvlsHandle = tensorrt_llm::runtime::ipcNvlsAllocate(bufSize, ranks, mGroupComm);
+    TLLM_CHECK_WITH_INFO(mNvlsHandle != nullptr, "[McastDeviceMemory] ipcNvlsAllocate returned a null handle.");
     mMcHandle = mNvlsHandle->mc_handle;
     mMcPtr = mNvlsHandle->mc_va;
     mUcPtrs = mNvlsHandle->ipc_uc_vas;
