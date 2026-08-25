@@ -1202,8 +1202,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             # DEFAULT drops the per-test UCX pinning but still runs UCX, since
             # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
             # backend but NIXL. Transport coverage is unchanged by this move.
-            # CPP is explicit: helix (CP) requires the C++ transceiver, and
-            # DeepSeek's Python preference is otherwise adopted verbatim.
+            # CPP is explicit: this test runs on UCX (see the DEFAULT note
+            # above), and DeepSeek's Python preference would otherwise be
+            # adopted verbatim and fail at creation on a non-NIXL backend.
             "cache_transceiver_config": {
                 "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,

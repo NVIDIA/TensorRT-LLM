@@ -677,30 +677,32 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
 
 def _transceiver_python_fallback_reason(
         llm_args: 'TorchLlmArgs') -> Optional[str]:
-    """Why the Python transceiver cannot be used, or None if it can.
+    """Why 'auto' should not default to the Python transceiver, or None.
 
-    Checks the configuration-level constraints of the Python (V2)
-    transceiver so that resolving 'auto' never selects a runtime that would
-    fail at transceiver creation time. Only consulted when the model
-    expressed no runtime preference: a model preferring 'PYTHON' may
-    genuinely require it (e.g. recurrent-state transfer), so it is never
-    silently rerouted — transceiver creation raises with an actionable
-    message instead.
+    Checks only the constraints that are decidable from
+    ``cache_transceiver_config`` itself (backend and timeout). Any other
+    incompatibility (e.g. non-helix context parallelism) is NOT resolved
+    here and fails loudly at transceiver creation instead. Only consulted
+    when the model expressed no runtime preference: a model preferring
+    'PYTHON' may genuinely require it (e.g. recurrent-state transfer), so it
+    is never silently rerouted — transceiver creation raises with an
+    actionable message instead.
     """
     cfg = llm_args.cache_transceiver_config
     effective_backend, _ = cfg._resolve_default_backend()
     if effective_backend != "NIXL":
         return (f"backend {effective_backend!r} (the Python transceiver "
                 "requires NIXL)")
-    # getattr: external callers (e.g. the perf-sanity cache-transceiver
-    # precheck) invoke the resolver with a lightweight stand-in object that
-    # only carries cache_transceiver_config.
-    parallel_config = getattr(llm_args, 'parallel_config', None)
-    if parallel_config is not None and parallel_config.cp_size > 1:
-        return "context parallelism > 1"
     if cfg.kv_transfer_timeout_ms is None:
         return ("kv_transfer_timeout_ms=None (the Python transceiver "
                 "requires a finite timeout)")
+    # Deliberately reads only cache_transceiver_config: external callers
+    # (e.g. the perf-sanity cache-transceiver precheck) invoke the resolver
+    # with a lightweight stand-in object, and per-server fields beyond this
+    # config could resolve differently on ctx and gen servers (e.g. context
+    # parallelism, where only the gen side runs helix). Conditions the
+    # Python transceiver cannot serve (such as non-helix CP) fail loudly at
+    # transceiver creation instead.
     return None
 
 
@@ -719,8 +721,8 @@ def _resolve_transceiver_runtime_auto(llm_args: 'TorchLlmArgs',
       is adopted verbatim — never rerouted, so unsupported configurations
       surface as transceiver-creation errors. Without a preference, default
       to the Python (V2) transceiver, falling back to None (C++ transceiver)
-      for configurations it does not support (non-NIXL backend, context
-      parallelism, or an infinite kv_transfer_timeout_ms).
+      for configurations it does not support (non-NIXL backend or an
+      infinite kv_transfer_timeout_ms).
 
     ``pretrained_config`` is forwarded to the hook so implementation classes
     shared by several architectures can differentiate per checkpoint.

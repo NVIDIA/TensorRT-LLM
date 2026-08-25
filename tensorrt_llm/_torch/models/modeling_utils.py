@@ -702,9 +702,10 @@ class DecoderModelForCausalLM(nn.Module,
         default 'auto'; unsupported configurations then fail loudly at
         transceiver creation rather than being rerouted. Return None to
         defer to the global default: the Python transceiver, falling back to
-        C++ when the deployment does not support it (non-NIXL backend,
-        context parallelism, or an infinite ``kv_transfer_timeout_ms``), so
-        the effective runtime for a no-preference model is
+        C++ only for conditions decidable from the transceiver config itself
+        (non-NIXL backend or an infinite ``kv_transfer_timeout_ms``) — other
+        incompatibilities fail at transceiver creation. The effective
+        runtime for a no-preference model is therefore
         deployment-dependent.
 
         Args:
