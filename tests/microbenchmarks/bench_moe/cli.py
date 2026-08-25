@@ -29,7 +29,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType
-from .mapping import _resolve_mapping_layout
+from .mapping import PARALLEL_MODE_SYNTAX_HINT, _resolve_mapping_layout, is_named_parallel_mode
 from .routing import _per_rank_tokens
 from .search import (
     _coerce_str_tuple,
@@ -104,6 +104,21 @@ def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int)
         ],
         "base_config": ctx.base_config.to_dict(),
     }
+
+
+def _parallel_mode_arg(value: str) -> str:
+    """Argparse ``type`` for ``--parallel_mode``.
+
+    A fixed ``choices=`` tuple cannot express the hybrid ``(D|T)TP<k>EP<m>``
+    grammar, so validation happens here instead. The four legacy names and
+    ``CUSTOM`` are accepted exactly as before.
+    """
+    mode = str(value).upper()
+    if mode == "CUSTOM" or is_named_parallel_mode(mode):
+        return mode
+    raise argparse.ArgumentTypeError(
+        f"invalid parallel mode {value!r}; {PARALLEL_MODE_SYNTAX_HINT}"
+    )
 
 
 def _add_search_arguments(parser: argparse.ArgumentParser) -> None:
@@ -338,15 +353,17 @@ def parse_args() -> argparse.Namespace:
     parallel_group = parser.add_argument_group("Parallel layout")
     parallel_group.add_argument(
         "--parallel_mode",
-        type=str,
+        type=_parallel_mode_arg,
         nargs="+",
         default=("DEP",),
-        choices=("DEP", "TEP", "DTP", "TTP", "CUSTOM"),
+        metavar="MODE",
         help=(
             "Parallel layout(s) to benchmark. Pass multiple values to sweep, e.g. "
             "--parallel_mode DEP TEP. DEP=attention DP + MoE EP; TEP=attention TP + "
-            "MoE EP; DTP/TTP use MoE TP; CUSTOM requires --moe_ep_size and "
-            "--moe_tp_size and must be passed alone."
+            "MoE EP; DTP/TTP use MoE TP. Hybrid MoE TP x EP layouts have their own "
+            "sweepable names, (D|T)TP<k>EP<m> with moe_tp_size=k and moe_ep_size=m "
+            "(e.g. DTP2EP2, TTP2EP4); k*m must equal world_size. CUSTOM requires "
+            "--moe_ep_size and --moe_tp_size and must be passed alone."
         ),
     )
     parallel_group.add_argument(
@@ -645,8 +662,18 @@ def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
 
     parallel_mode = parallel_list[0] if parallel_list else "DEP"
 
+    explicit_sizes = args.moe_ep_size is not None or args.moe_tp_size is not None
+
+    # A hybrid (D|T)TP<k>EP<m> name already spells the grid out; combining it with
+    # explicit size flags would silently discard one of the two intents.
+    if explicit_sizes and parallel_mode not in ("DEP", "TEP", "DTP", "TTP", "CUSTOM"):
+        raise ValueError(
+            f"--parallel_mode={parallel_mode} already specifies moe_tp_size/moe_ep_size; "
+            "drop --moe_ep_size/--moe_tp_size, or use --parallel_mode CUSTOM with them."
+        )
+
     # parallel_mode CUSTOM if explicit EP/TP overrides are present.
-    if (args.moe_ep_size is not None or args.moe_tp_size is not None) and parallel_mode in (
+    if explicit_sizes and parallel_mode in (
         "DEP",
         "TEP",
         "DTP",
