@@ -15,10 +15,10 @@
 
 import pytest
 
-from tensorrt_llm._torch.moe.communication.moe_alltoall import (
+from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import (
     get_force_cft as get_force_cft_standalone,
 )
-from tensorrt_llm._torch.moe.communication.moe_alltoall import (
+from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import (
     should_use_cft as should_use_cft_standalone,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (

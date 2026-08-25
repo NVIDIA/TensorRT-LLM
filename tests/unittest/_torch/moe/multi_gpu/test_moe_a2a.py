@@ -24,7 +24,8 @@ from mpi4py import MPI
 
 import tensorrt_llm as tllm
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.distributed import MoeAlltoAll
+from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import \
+    MoeAlltoAll
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])

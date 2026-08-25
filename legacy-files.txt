@@ -160,7 +160,7 @@ tensorrt_llm/_torch/debug/debug_hook.py
 tensorrt_llm/_torch/device_mesh.py
 tensorrt_llm/_torch/distributed/__init__.py
 tensorrt_llm/_torch/distributed/communicator.py
-tensorrt_llm/_torch/moe/communication/moe_alltoall.py
+tensorrt_llm/_torch/moe/fused_moe/communication/moe_alltoall.py
 tensorrt_llm/_torch/distributed/ops.py
 tensorrt_llm/_torch/distributed/pg_utils.py
 tensorrt_llm/_torch/moe/expert_statistic.py

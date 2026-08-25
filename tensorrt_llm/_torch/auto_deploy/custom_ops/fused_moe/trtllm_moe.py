@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.moe.communication.moe_alltoall import MoeAlltoAll
+from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
