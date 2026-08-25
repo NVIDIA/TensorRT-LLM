@@ -1585,11 +1585,8 @@ class KvCacheCreator:
         )
         if draft_tokens_per_block != self._tokens_per_block:
             logger.info(
-                "Draft KV cache manager uses tokens_per_block=%d "
-                "(target uses %d).",
-                draft_tokens_per_block,
-                self._tokens_per_block,
-            )
+                f"Draft KV cache manager uses tokens_per_block={draft_tokens_per_block} "
+                f"(target uses {self._tokens_per_block}).")
             draft_kv_config.tokens_per_block = draft_tokens_per_block
         return _create_kv_cache_manager(
             model_engine=None,

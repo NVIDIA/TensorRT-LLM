@@ -766,7 +766,8 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "is sharded with the KV heads and index-K is replicated. MSA batches "
         "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
         "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
-        "requires the MSA implementation.",
+        "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
+        "main KV cache.",
         status="prototype",
     )
     num_attention_heads: Optional[int] = Field(
@@ -807,6 +808,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
                 "the 'msa' implementation.")
+        if self.fuse_qkv_index_projection and self.indexer_kv_dtype != "fp8":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
+                "indexer_kv_dtype='fp8'.")
         return self
 
     def supports_backend(self, backend: str) -> bool:

@@ -653,7 +653,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata, spec_metadata):
+    def _prepare_attn_metadata_for_spec_dec(
+        self,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Eagle3OneModelSpecMetadata,
+    ) -> None:
         # Graph warmup runs more than once while the draft loop mutates
         # kv_lens_cuda in place. Save/restore it during warmup; capture itself
         # must record the mutation and therefore intentionally omits the save.

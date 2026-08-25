@@ -250,6 +250,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     msa_kv_indices: Optional[torch.Tensor] = None
     msa_max_score: Optional[torch.Tensor] = None
     msa_n_valid_blocks: Optional[torch.Tensor] = None
+    # Device-only overlap-correction geometry. Page starts/counts replace a
+    # token-granular [max_sequences, max_seq_len] map, avoiding hundreds of
+    # MiB of persistent graph memory at long context lengths.
+    msa_kv_page_starts: Optional[torch.Tensor] = None
+    msa_kv_page_counts: Optional[torch.Tensor] = None
+    msa_q_batch_row: Optional[torch.Tensor] = None
+    msa_q_intra: Optional[torch.Tensor] = None
+    msa_qo_lens_dev: Optional[torch.Tensor] = None
 
     # _msa_buffers_ready gates the once-only device buffers;
     # _msa_fields_ready marks that the current step's buffers are populated.
@@ -412,11 +420,17 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # replace optimistic speculative lengths after prepare(), so cache
         # slots and per-token causal bounds must be derivable without a host
         # synchronization and without allocating inside CUDA graph replay.
-        tokens_per_block = int(kv_cache_manager.tokens_per_block)
-        self.msa_req_to_token = self.get_empty(
+        self.msa_kv_page_starts = self.get_empty(
             buffers,
-            (max_num_sequences, max_blocks_per_seq * tokens_per_block),
-            cache_name="msa_req_to_token",
+            (max_num_sequences,),
+            cache_name="msa_kv_page_starts",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        self.msa_kv_page_counts = self.get_empty(
+            buffers,
+            (max_num_sequences,),
+            cache_name="msa_kv_page_counts",
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
@@ -598,14 +612,25 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         token_kv_lens = kv_lens[q_batch_row]
         q_positions = token_kv_lens - qo_lens[q_batch_row] + self.msa_q_intra[:total_q]
 
-        table_width = int(self.msa_req_to_token.shape[1])
-        table_indices = q_positions.to(torch.long).clamp(min=0, max=table_width - 1)
-        cache_slots = self.msa_req_to_token.reshape(-1).index_select(
-            0, q_batch_row * table_width + table_indices
+        page_size = self._msa_page_size
+        page_starts = self.msa_kv_page_starts[:batch_size].to(torch.long)
+        page_counts = self.msa_kv_page_counts[:batch_size].to(torch.long)
+        token_page_counts = page_counts[q_batch_row]
+        # Overlap correction only shrinks optimistic lengths, so valid rows are
+        # already in range. Keep the fallback entirely device-side to preserve
+        # CUDA-graph replay and prevent invalid metadata from becoming an OOB
+        # page-table access that poisons the process.
+        safe_positions = q_positions.to(torch.long).clamp_min(0)
+        safe_positions = torch.minimum(
+            safe_positions,
+            (token_page_counts * page_size - 1).clamp_min(0),
         )
+        logical_pages = torch.div(safe_positions, page_size, rounding_mode="floor")
+        page_table_rows = page_starts[q_batch_row] + logical_pages
+        physical_pages = self.msa_kv_indices.index_select(0, page_table_rows)
+        cache_slots = physical_pages * page_size + torch.remainder(safe_positions, page_size)
         self.msa_out_cache_loc[:total_q].copy_(cache_slots)
 
-        page_size = self._msa_page_size
         n_valid_blocks = torch.div(
             (q_positions + 1).clamp_min(1) + (page_size - 1),
             page_size,
@@ -852,8 +877,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Keep the device-side geometry needed to repair optimistic
         # speculative lengths after the overlap scheduler reports the actual
         # accepted-token counts.
-        step_width = int(req_to_token.shape[1])
-        self.msa_req_to_token[:batch_size, :step_width].copy_(req_to_token, non_blocking=True)
+        page_counts = torch.div(
+            kv_lens_cpu.to(torch.int64) + page_size - 1,
+            page_size,
+            rounding_mode="floor",
+        ).to(torch.int32)
+        page_starts = torch.cumsum(page_counts, 0) - page_counts
+        self.msa_kv_page_starts[:batch_size].copy_(page_starts, non_blocking=True)
+        self.msa_kv_page_counts[:batch_size].copy_(page_counts, non_blocking=True)
         qo_lens_long = qo_lens_cpu.to(torch.long)
         batch_rows = torch.repeat_interleave(
             torch.arange(batch_size, dtype=torch.int32), qo_lens_long
@@ -1022,9 +1053,6 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 )
             idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
             metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
-            # Lightweight metadata implementations may install their cache on
-            # first write, so refresh the handle before the proxy reads it.
-            idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
         # The FP8 indexer mirrors vLLM's unscaled E4M3 contract: normalized
         # index Q/K are cast directly and the proxy accumulates their QK scores
         # in FP32. Block ordering is invariant to the omitted positive scale.

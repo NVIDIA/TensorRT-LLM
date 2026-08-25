@@ -64,6 +64,8 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -100,8 +102,50 @@ def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
     _validate_sparse_attention_runtime_config(model_config)
 
 
+def test_validate_fused_projection_requires_fp8_main_kv_cache() -> None:
+    sparse_config = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        indexer_kv_dtype="fp8",
+        fuse_qkv_index_projection=True,
+    )
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=sparse_config,
+    )
+    with pytest.raises(ValueError, match="requires an FP8 main KV cache"):
+        _validate_sparse_attention_runtime_config(model_config)
+
+    model_config.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+    _validate_sparse_attention_runtime_config(model_config)
+
+
 def test_minimax_m3_uses_one_engine_speculative_base() -> None:
     assert issubclass(MiniMaxM3ForCausalLM, SpecDecOneEngineForCausalLM)
+
+
+def test_setup_aliases_preserves_one_engine_draft_weight_loading() -> None:
+    loaded = []
+
+    class DraftModel:
+        shares_target_kv_cache = True
+
+        def load_weights_from_target_model(self, target) -> None:
+            loaded.append(target)
+
+    target = MiniMaxM3ForCausalLM.__new__(MiniMaxM3ForCausalLM)
+    layers = [
+        SimpleNamespace(input_layernorm=object()),
+        SimpleNamespace(input_layernorm=object()),
+    ]
+    final_norm = object()
+    object.__setattr__(target, "draft_model", DraftModel())
+    object.__setattr__(target, "model", SimpleNamespace(layers=layers, norm=final_norm))
+
+    target.setup_aliases()
+
+    assert loaded == [target]
+    assert layers[0].next_layer_layernorm is layers[1].input_layernorm
+    assert layers[1].next_layer_layernorm is final_norm
 
 
 def test_eagle_capture_precedes_next_layer_norm() -> None:

@@ -23,6 +23,7 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniM
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
@@ -96,6 +97,7 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered() -> None:
 def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads() -> None:
     cfg = MiniMaxM3SparseAttentionConfig(
         implementation="msa",
+        indexer_kv_dtype="fp8",
         fuse_qkv_index_projection=True,
         num_attention_heads=64,
         num_key_value_heads=4,
@@ -108,6 +110,10 @@ def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads() -> None
     assert metadata_params.fuse_qkv_index_projection is True
     assert metadata_params.sharded_head_counts(mapping) == (32, 2)
     assert metadata_params.sharded_index_head_count(mapping) == 2
+
+    attention_dp_mapping = SimpleNamespace(tp_size=4, enable_attention_dp=True)
+    assert metadata_params.sharded_head_counts(attention_dp_mapping) == (64, 4)
+    assert metadata_params.sharded_index_head_count(attention_dp_mapping) == 4
 
     kernel_cfg = MiniMaxM3SparseConfig.from_sparse_params(
         sparse_params,
@@ -130,6 +136,71 @@ def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads() -> None
             implementation="triton",
             fuse_qkv_index_projection=True,
         )
+    with pytest.raises(ValueError, match=r"requires indexer_kv_dtype='fp8'"):
+        MiniMaxM3SparseAttentionConfig(
+            implementation="msa",
+            fuse_qkv_index_projection=True,
+        )
+
+
+def test_overlap_kv_correction_derives_slots_from_compact_page_table(monkeypatch) -> None:
+    """Decode correction stays device-only without a token-granular page map."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    monkeypatch.setattr(TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
+
+    metadata._msa_fields_ready = True
+    metadata._msa_live_batch = 2
+    metadata._msa_live_total_q = 3
+    metadata._msa_page_size = 128
+    metadata.kv_lens_cuda = torch.tensor([130, 257], dtype=torch.int32)
+    metadata.msa_q_batch_row = torch.tensor([0, 1, 1], dtype=torch.int32)
+    metadata.msa_q_intra = torch.tensor([0, 0, 1], dtype=torch.int32)
+    metadata.msa_qo_lens_dev = torch.tensor([1, 2], dtype=torch.int32)
+    metadata.msa_kv_page_starts = torch.tensor([0, 2], dtype=torch.int32)
+    metadata.msa_kv_page_counts = torch.tensor([2, 3], dtype=torch.int32)
+    metadata.msa_kv_indices = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32)
+    metadata.msa_out_cache_loc = torch.empty(3, dtype=torch.int32)
+    metadata.msa_n_valid_blocks = torch.empty(3, dtype=torch.int32)
+
+    def owner(rows: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            plan=(
+                False,
+                0,
+                rows,
+                {
+                    "kv_segment_lens": torch.zeros(rows, dtype=torch.int32),
+                    "qo_offset": torch.zeros(rows, dtype=torch.int32),
+                },
+                None,
+            )
+        )
+
+    metadata._msa_proxy_plan = owner(2)
+    metadata._msa_gqa_plan = owner(3)
+    metadata._msa_dense_plan = owner(2)
+
+    metadata.on_update_kv_lens()
+
+    torch.testing.assert_close(
+        metadata.msa_out_cache_loc,
+        torch.tensor([20 * 128 + 1, 40 * 128 + 127, 50 * 128], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata.msa_n_valid_blocks, torch.tensor([2, 2, 3], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        metadata._msa_proxy_plan.plan[3]["kv_segment_lens"], metadata.kv_lens_cuda
+    )
+    torch.testing.assert_close(
+        metadata._msa_gqa_plan.plan[3]["kv_segment_lens"],
+        torch.tensor([130, 257, 257], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        metadata._msa_dense_plan.plan[3]["qo_offset"],
+        torch.tensor([129, 255], dtype=torch.int32),
+    )
 
 
 @pytest.mark.parametrize(
@@ -556,7 +627,7 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
 
         def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
             del layer_idx
-            self.idx_k_cache = idx_k
+            self.idx_k_cache.copy_(idx_k)
 
         def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
             del layer_idx

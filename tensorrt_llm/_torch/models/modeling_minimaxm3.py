@@ -338,6 +338,24 @@ def _validate_sparse_attention_runtime_config(
             "Set the following in the LLM API configuration:\n"
             "sparse_attention_config:\n  algorithm: minimax_m3"
         )
+    if getattr(sparse_config, "fuse_qkv_index_projection", False):
+        if getattr(sparse_config, "implementation", None) != "msa":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True requires the 'msa' implementation."
+            )
+        if getattr(sparse_config, "indexer_kv_dtype", None) != "fp8":
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True requires indexer_kv_dtype='fp8'."
+            )
+        quant_config = model_config.quant_config
+        if (
+            quant_config is None
+            or quant_config.quant_mode is None
+            or not quant_config.quant_mode.has_fp8_kv_cache()
+        ):
+            raise ValueError(
+                "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 main KV cache."
+            )
 
 
 def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
@@ -1307,6 +1325,8 @@ class MiniMaxM3Attention(Attention):
             or self.attn.indexer_kv_dtype != "fp8"
         ):
             return None
+        rope = self.pos_embd_params.rope if self.pos_embd_params is not None else None
+        rotary_dim = int(rope.dim) if rope is not None else 0
         if (
             packed.dtype != torch.bfloat16
             or position_ids is None
@@ -1317,8 +1337,8 @@ class MiniMaxM3Attention(Attention):
             or self.pos_embd_params is None
             or not self.pos_embd_params.is_neox
             or self.rotary_emb is None
-            or self.pos_embd_params.rope is None
-            or int(self.pos_embd_params.rope.dim) != 64
+            or rope is None
+            or rotary_dim != 64
         ):
             return None
         norm_eps = self.q_norm.variance_epsilon
@@ -1400,7 +1420,7 @@ class MiniMaxM3Attention(Attention):
             self.num_key_value_heads,
             self.sparse_num_index_heads,
             self.head_dim,
-            64,
+            rotary_dim,
             norm_eps,
             self.q_norm.weight,
             self.k_norm.weight,
@@ -2508,7 +2528,7 @@ def _load_qkv_index_proj_weights(model: nn.Module, weights) -> List[str]:
         parent = name.rsplit(".", 1)[0]
         shards = {
             shard_name: filter_weights(f"{parent}.{checkpoint_name}", weights)
-            for shard_name, checkpoint_name in zip(shard_names, checkpoint_names)
+            for shard_name, checkpoint_name in zip(shard_names, checkpoint_names, strict=True)
         }
         module.load_five_way_weights(shards)
         loaded_modules.append(name)
@@ -2630,6 +2650,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         layer's input_layernorm; the last layer chains the final model norm so
         its output AllReduce folds the final normalization too.
         """
+        super().setup_aliases()
         layers = self.model.layers
         num_layers = len(layers)
         for idx, layer in enumerate(layers):
