@@ -39,6 +39,7 @@ Example:
 """
 
 import math
+import weakref
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -539,6 +540,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self._multi_processor_count: Optional[int] = None
         self._multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
         self._mixed_kv_cache_buffers = None
+        self._mixed_kv_cache_manager_ref = None
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -633,10 +635,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         manager = meta.kv_cache_manager
         if manager is None or not getattr(manager, "is_fp8_k_nvfp4_v", False):
             return None
-        if self._mixed_kv_cache_buffers is None:
+        manager_ref = self._mixed_kv_cache_manager_ref
+        if manager_ref is None or manager_ref() is not manager:
             self._mixed_kv_cache_buffers = manager.get_fp8_k_nvfp4_v_buffers(
                 self.attn.layer_idx
             )
+            self._mixed_kv_cache_manager_ref = weakref.ref(manager)
         return self._mixed_kv_cache_buffers
 
     def _get_mixed_block_tables(
