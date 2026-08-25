@@ -2394,8 +2394,8 @@ class PyTorchModelEngine(ModelEngine):
                             draft_len,
                             max_seq_len,
                             force_non_greedy=force_non_greedy)
-                        with self._release_batch_context(warmup_request,
-                                                        resource_manager) as batch:
+                        with self._release_batch_context(
+                                warmup_request, resource_manager) as batch:
                             if batch is None:
                                 # No KV cache space for this batch size. During KV
                                 # cache estimation this makes the profiling peak
@@ -2411,16 +2411,16 @@ class PyTorchModelEngine(ModelEngine):
                                 f"for batch size={bs}, draft_len={draft_len}, "
                                 f"max_seq_len={max_seq_len}")
                             self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
-                                self.spec_config is not None
-                                and self.spec_config.spec_dec_mode.use_one_engine())
+                                self.spec_config is not None and
+                                self.spec_config.spec_dec_mode.use_one_engine())
                             self._update_draft_inference_state_for_warmup(
                                 batch, draft_len > 0, resource_manager)
                             self.runtime_draft_len = draft_len
                             if self._is_encoder_decoder_model():
                                 prepare_cross_batch(batch, resource_manager)
                             self.forward(batch,
-                                        new_tensors_device=None,
-                                        resource_manager=resource_manager)
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
