@@ -300,7 +300,7 @@ def test_non_adjacent_predecessor_does_not_trigger_the_exclusion(
     assert 999.0 in [row.device_step_time for row in rows[0]]
 
 
-def test_unparseable_predecessor_does_not_trigger_the_exclusion(
+def test_unparsable_predecessor_does_not_trigger_the_exclusion(
     tmp_path: Path,
 ) -> None:
     _write_gen_log(
@@ -386,7 +386,7 @@ def test_na_device_step_time_is_skipped(tmp_path: Path) -> None:
     assert [row.device_step_time for row in rows[0]] == [7.3]
 
 
-def test_unparseable_num_generation_tokens_is_retained_as_none(
+def test_unparsable_num_generation_tokens_is_retained_as_none(
     tmp_path: Path,
 ) -> None:
     """Nvbugs 6487036 / 6487040: the field rendered as tensor(256).
@@ -616,9 +616,11 @@ def test_add_perf_metric_value_omits_the_family_outside_gen_only() -> None:
 
 
 def test_every_gated_metric_is_checkable() -> None:
-    """check_regression only iterates maximize + minimize; a gated name absent
-    from both is silently never checked, so the gate would look armed and be
-    dead. Pin the pair so adding a third gated statistic cannot regress it."""
+    """A gated metric absent from both lists would look armed and never be checked.
+
+    check_regression only iterates maximize + minimize, so pin the pair: adding a
+    third gated statistic cannot silently regress into a dead gate.
+    """
     checkable = set(perf_sanity.MINIMIZE_METRICS) | set(perf_sanity.MAXIMIZE_METRICS)
     for name in perf_sanity.GEN_ONLY_REGRESSION_METRICS:
         assert name in checkable, f"{name} is gated but check_regression never sees it"

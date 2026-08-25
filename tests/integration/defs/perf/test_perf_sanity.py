@@ -367,7 +367,7 @@ def _scan_gen_worker_device_step_time(
     is provably the predecessor iteration: pred_iter == cur_iter - 1.
     Predecessor state is kept per emitting rank (_ITER_RANK_RE), so ranks
     interleaved in one file are never read as each other's predecessor. If the
-    predecessor is missing, unparseable, or non-adjacent (a restarted iteration
+    predecessor is missing, unparsable, or non-adjacent (a restarted iteration
     counter, the first line after a seek), the row is KEPT.
     That is the safe direction to fail: the exclusion is an accuracy
     improvement on a metric that must keep reporting, so a scan that cannot
