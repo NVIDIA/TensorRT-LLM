@@ -128,36 +128,6 @@ def _write_safetensors_header(path, tensor_name, dtype, shape):
     path.write_bytes(struct.pack("<Q", len(payload)) + payload)
 
 
-def _make_weight_loader_test_model(*, enable_eplb=False):
-    model = torch.nn.Module()
-    model.model = torch.nn.Module()
-    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
-    layer = model.model.layers[0]
-    layer.foo = torch.nn.Module()
-    layer.foo.weight = torch.nn.Parameter(torch.zeros(2))
-
-    model.config = SimpleNamespace(
-        q_lora_rank=1,
-        num_attention_heads=1,
-        qk_nope_head_dim=1,
-        v_head_dim=1,
-        kv_lora_rank=1,
-        num_hidden_layers=1,
-        num_nextn_predict_layers=0,
-    )
-    model.model_config = SimpleNamespace(
-        mapping=SimpleNamespace(
-            tp_rank=0,
-            tp_size=1,
-            cp_rank=0,
-            cp_size=1,
-            enable_attention_dp=False,
-        ),
-        moe_load_balancer=object() if enable_eplb else None,
-    )
-    return model
-
-
 def test_deepseek_v4_config_aliases():
     config = DeepseekV4Config(
         num_hash_layers=5, sliding_window=256, head_dim=128, score_func="sigmoid", swiglu_limit=9.0
@@ -238,11 +208,34 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
 
 
 def test_deepseek_v4_eplb_weight_loader_pages_out_each_moe_layer(monkeypatch):
-    model = _make_weight_loader_test_model(enable_eplb=True)
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
     layer = model.model.layers[0]
+    layer.foo = torch.nn.Module()
+    layer.foo.weight = torch.nn.Parameter(torch.zeros(2))
     layer.mlp = torch.nn.Module()
     layer.mlp.experts = torch.nn.Module()
     layer.mlp.experts.backend = torch.nn.Module()
+    model.config = SimpleNamespace(
+        q_lora_rank=1,
+        num_attention_heads=1,
+        qk_nope_head_dim=1,
+        v_head_dim=1,
+        kv_lora_rank=1,
+        num_hidden_layers=1,
+        num_nextn_predict_layers=0,
+    )
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            cp_rank=0,
+            cp_size=1,
+            enable_attention_dp=False,
+        ),
+        moe_load_balancer=object(),
+    )
     weights = {"model.layers.0.foo.weight": torch.tensor([1.0, 2.0])}
     synchronize_calls = []
     pageout_calls = []
