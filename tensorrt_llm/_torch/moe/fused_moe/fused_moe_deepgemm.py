@@ -23,7 +23,8 @@ import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.utils import AuxStreamType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import (ActivationType, AuxStreamType,
+                                       Fp4QuantizedTensor)
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -811,6 +812,12 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
                 "DeepGemmFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
+
+        # DeepGemmFusedMoE The inter-GEMM activation is a hardcoded silu_and_mul
+        if p.activation_type != ActivationType.Swiglu:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"DeepGemmFusedMoE only supports SwiGLU (got {p.activation})")
 
         # Only FP8_BLOCK_SCALES is supported
         if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:

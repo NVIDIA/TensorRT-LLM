@@ -28,6 +28,7 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
+from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -201,7 +202,11 @@ class CuteDslMlaFmha(PhasedFmha):
         v: Optional[torch.Tensor],
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        if phase not in (None, FmhaPhase.GENERATION):
+            return False
         supported, reason = self._is_supported_with_reason(
             q,
             self.attn,

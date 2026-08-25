@@ -312,6 +312,9 @@ use `TLLM_FMHA_LIBS=fallback` or
 to force the fallback
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
+For mixed non-MLA batches, the dispatcher checks each active phase independently
+with `is_supported(..., phase=...)`; a phased library accepts only phases backed
+by its corresponding `run_*()` entry point.
 
 The `TrtllmAttention` constructor's optional `flashinfer_mla_backend` argument
 explicitly selects the MLA generation kernel inside
@@ -341,8 +344,10 @@ which does not divide 96 after K3's head padding removal.
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
-- `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
-  requests and dispatches them to phase-specific hooks.
+- `fmha/phased.py` defines `PhasedFmha`, shared phase splitting, and the
+  context/generation and MHA/MLA entry points.
+- `fmha/combined.py` composes different context and generation implementations
+  for non-MLA mixed batches.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
@@ -351,9 +356,9 @@ The FMHA package is split by role:
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
-Use `PhasedFmha` for libraries that need separate context/generation or MHA/MLA
-entry points. Use `Fmha` directly for libraries that already own the full
-request shape.
+Use `PhasedFmha` for libraries that implement one or more phase-specific entry
+points. Use `Fmha` directly for libraries that already own the full request
+shape.
 
 #### 3.2.3 MLA cached-context semantics
 
