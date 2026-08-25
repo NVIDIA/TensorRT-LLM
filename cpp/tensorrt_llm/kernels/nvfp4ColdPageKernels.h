@@ -31,8 +31,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-//! Active GPU representation at the cold-page boundary.
-enum class Nvfp4BoundaryRuntimeType : std::uint8_t
+//! Active GPU representation encoded into cold Pages.
+enum class Nvfp4ColdPageRuntimeType : std::uint8_t
 {
     kFloat16,
     kBfloat16,
@@ -40,14 +40,14 @@ enum class Nvfp4BoundaryRuntimeType : std::uint8_t
 };
 
 //! One Base Page selected for GPU-to-Host transformation.
-struct Nvfp4BoundaryOffloadPageTask
+struct Nvfp4ColdPageOffloadPageTask
 {
     std::int32_t gpuPageIndex;
     std::int32_t coldPageIndex;
 };
 
 //! One Base Page selected for Host-to-GPU transformation.
-struct Nvfp4BoundaryOnboardPageTask
+struct Nvfp4ColdPageOnboardPageTask
 {
     std::int32_t gpuPageIndex;
     std::int32_t coldPageIndex;
@@ -55,7 +55,7 @@ struct Nvfp4BoundaryOnboardPageTask
 
 //! Per-buffer geometry and scales for one NVFP4 record in HND order.
 //! `headDim` is a multiple of 16; `*OrigQuant` encodes and `*QuantOrig` decodes this buffer.
-struct Nvfp4BoundaryKernelParams
+struct Nvfp4ColdPageKernelParams
 {
     std::int32_t numKvHeads;
     std::int32_t tokensPerPage;
@@ -67,7 +67,7 @@ struct Nvfp4BoundaryKernelParams
 };
 
 //! Transformation applied to one independently addressed hot buffer.
-enum class Nvfp4BoundaryTransform : std::uint8_t
+enum class Nvfp4ColdPageTransform : std::uint8_t
 {
     kNvfp4,
     //! Byte-exact copy for an Attention side buffer such as DSA index_key.
@@ -75,7 +75,7 @@ enum class Nvfp4BoundaryTransform : std::uint8_t
 };
 
 //! Immutable transform plan for one hot buffer and its fixed-offset cold record.
-struct Nvfp4BoundaryBufferPlan
+struct Nvfp4ColdPageBufferPlan
 {
     std::uintptr_t rawBase;
     std::size_t rawSlotBytes;
@@ -84,33 +84,33 @@ struct Nvfp4BoundaryBufferPlan
     std::size_t coldScaleOffset;
     std::size_t coldPaddingOffset;
     std::uint32_t coldPaddingBytes;
-    Nvfp4BoundaryTransform transform;
-    Nvfp4BoundaryKernelParams params;
+    Nvfp4ColdPageTransform transform;
+    Nvfp4ColdPageKernelParams params;
 };
 
-inline constexpr std::uint32_t kNvfp4BoundaryMaxBuffersPerLaunch = 256;
+inline constexpr std::uint32_t kNvfp4ColdPageMaxBuffersPerLaunch = 256;
 
 //! Configure-time launch plan for one Attention lifecycle.
-struct Nvfp4BoundaryPreparedPlan
+struct Nvfp4ColdPagePreparedPlan
 {
-    std::array<Nvfp4BoundaryBufferPlan, kNvfp4BoundaryMaxBuffersPerLaunch> buffers{};
+    std::array<Nvfp4ColdPageBufferPlan, kNvfp4ColdPageMaxBuffersPerLaunch> buffers{};
     std::uint32_t numBuffers = 0;
     std::uint32_t maxHalfGroupsPerTile = 0;
     std::size_t coldPageBytes = 0;
-    Nvfp4BoundaryRuntimeType runtimeType = Nvfp4BoundaryRuntimeType::kFloat16;
+    Nvfp4ColdPageRuntimeType runtimeType = Nvfp4ColdPageRuntimeType::kFloat16;
 };
 
-//! Validate and freeze one lifecycle's boundary-transform plan.
-[[nodiscard]] Nvfp4BoundaryPreparedPlan prepareNvfp4BoundaryPlan(std::vector<Nvfp4BoundaryBufferPlan> const& buffers,
-    std::size_t coldPageBytes, Nvfp4BoundaryRuntimeType runtimeType);
+//! Validate and freeze one lifecycle's cold-page transform plan.
+[[nodiscard]] Nvfp4ColdPagePreparedPlan prepareNvfp4ColdPagePlan(std::vector<Nvfp4ColdPageBufferPlan> const& buffers,
+    std::size_t coldPageBytes, Nvfp4ColdPageRuntimeType runtimeType);
 
 //! Compress GPU Pages into mapped-Host NVFP4 records.
-void invokeNvfp4BoundaryOffloadCompress(std::vector<Nvfp4BoundaryOffloadPageTask> const& pages,
-    Nvfp4BoundaryPreparedPlan const& plan, void* coldBase, cudaStream_t stream);
+void invokeNvfp4ColdPageEncode(std::vector<Nvfp4ColdPageOffloadPageTask> const& pages,
+    Nvfp4ColdPagePreparedPlan const& plan, void* coldBase, cudaStream_t stream);
 
 //! Restore mapped-Host NVFP4 records into GPU Pages.
-void invokeNvfp4BoundaryOnboardDecompress(std::vector<Nvfp4BoundaryOnboardPageTask> const& pages,
-    Nvfp4BoundaryPreparedPlan const& plan, void const* coldBase, cudaStream_t stream);
+void invokeNvfp4ColdPageDecode(std::vector<Nvfp4ColdPageOnboardPageTask> const& pages,
+    Nvfp4ColdPagePreparedPlan const& plan, void const* coldBase, cudaStream_t stream);
 
 } // namespace kernels
 

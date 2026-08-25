@@ -1128,6 +1128,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     pp_layers=self.pp_layers,
                     num_kv_heads_per_layer=self.num_kv_heads_per_layer,
                     head_dim_per_layer=self.head_dim_per_layer,
+                    is_draft=self.is_draft,
                 )
                 if cold_page_codec_provider is not None
                 else None
@@ -1156,6 +1157,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         pp_layers=self.pp_layers,
                         num_kv_heads_per_layer=self.num_kv_heads_per_layer,
                         head_dim_per_layer=self.head_dim_per_layer,
+                        is_draft=self.is_draft,
                     )
                     if cold_page_codec_provider is not None
                     else None

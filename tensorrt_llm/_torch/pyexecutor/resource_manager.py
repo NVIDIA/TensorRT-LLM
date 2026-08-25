@@ -2718,7 +2718,7 @@ class KVCacheCompressionManager(BaseResourceManager):
     """Framework base for KV-cache compression methods in PyExecutor.
 
     Iteration-driven methods receive ResourceManager callbacks, while
-    storage-boundary methods provide a cold-page codec during cache construction.
+    storage-bound methods provide a cold-page codec during cache construction.
     Subclasses coordinate through KVCacheManagerV2 without owning its pools,
     mappings, or migration lifecycle.
     """
@@ -2765,8 +2765,9 @@ class KVCacheCompressionManager(BaseResourceManager):
         pp_layers: Sequence[int],
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
+        is_draft: bool = False,
     ) -> Optional[object]:
-        """Create a native storage-boundary codec when the algorithm provides one."""
+        """Create a native cold-page codec when the algorithm provides one."""
         return None
 
     # ================================================================== #

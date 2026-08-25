@@ -3149,7 +3149,7 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER, last=True)
     # Iteration-driven compression is the final reconciler after every native
-    # KV manager. Boundary quantization runs only at native storage migration.
+    # KV manager. Cold-page quantization runs only at native storage migration.
     if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
             in resource_manager.resource_managers):
         resource_manager.resource_managers.move_to_end(
