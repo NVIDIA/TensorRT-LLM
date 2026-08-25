@@ -120,7 +120,19 @@ def _take_cached_symm_buffer(key: tuple, ep_pg: object) -> Optional[object]:
     if cached_pg is ep_pg:
         return cached
     del _MEGA_MOE_SYMM_BUFFER_CACHE[key]
-    freed = _free_symm_buffer(cached)
+    # This runs on the next LLM's init path and the stale buffer was
+    # rendezvoused over an already-destroyed group, so a raising free must
+    # not escape and fail the new LLM -- fall through to a fresh allocation
+    # instead (no worse than the pre-fix behavior, which leaked and
+    # allocated).
+    try:
+        freed = _free_symm_buffer(cached)
+    except Exception as e:
+        logger.error(
+            f"[MegaMoE] failed to release a stale DG SymmBuffer from a "
+            f"previous EP group, allocating fresh: {e}"
+        )
+        return None
     logger.info(
         f"[MegaMoE] released stale DG SymmBuffer from a previous EP group: {freed / 2**30:.2f} GiB"
     )
