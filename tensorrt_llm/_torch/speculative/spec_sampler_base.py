@@ -149,7 +149,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         Each check gates on a non-neutral value rather than on presence, since a
         frontend may forward a default explicitly.
         """
-        if getattr(request, "py_min_length", None):
+        # py_min_length mirrors the C++ SamplingConfig field, i.e. an optional
+        # singleton list. The OpenAI frontend always forwards min_tokens (default
+        # 0), so the list is routinely present and holds the neutral value --
+        # gate on the value, not on the list being non-empty.
+        min_length = getattr(request, "py_min_length", None)
+        if min_length and min_length[0] > 0:
             raise ValueError(
                 "min_length is not supported with one-model speculative decoding. "
                 "Drop min_length from the request, or disable speculative decoding."
