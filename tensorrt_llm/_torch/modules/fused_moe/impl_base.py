@@ -60,7 +60,7 @@ def apply_moe_impl_construction_state(
     swiglu_limit_scalar: Optional[float] = None,
     layer_idx: Optional[int] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
-    init_load_balancer: bool = True,
+    init_load_balancer: bool = False,
 ) -> None:
     """Install the construction state backends used to get from ``MoE.__init__``.
 
@@ -70,11 +70,27 @@ def apply_moe_impl_construction_state(
     overwrites. Layer-only work stays on ``MoE`` / ``ConfigurableMoE``
     (``_register_layer``, ``_init_load_balancer``, ``AllReduce``, DWDP layout).
 
-    ``init_load_balancer=True`` asks for a standalone layer, which these classes
-    no longer are, so it is rejected.
+    ``init_load_balancer`` defaults to ``False`` because an execution unit never
+    owns a load balancer -- the wrapper does. Passing ``True`` asks for a
+    standalone layer, which these classes no longer are, so it is rejected.
     """
     if init_load_balancer:
         raise TypeError(STANDALONE_MOE_IMPL_ERROR.format(name=type(module).__name__))
+
+    # The EPLB fields written below are only defaults. A backend that already
+    # passed a real binding to ``MoEImplBase.__init__`` would have it silently
+    # re-derived into the non-EPLB partition (``num_slots`` collapsing to
+    # ``num_experts``, ``layer_load_balancer`` back to None) -- the exact names
+    # the quantization layer reads to size expert weights. Fail before any of
+    # this state is written.
+    if getattr(module, "eplb", None) is not None:
+        raise ValueError(
+            f"{type(module).__name__} installed an EPLB binding via "
+            f"MoEImplBase.__init__ and then called "
+            f"apply_moe_impl_construction_state(), which would overwrite it. "
+            f"Call this first and let the binding land last, or drop the "
+            f"binding."
+        )
 
     from .interface import _compute_ep_partition
 

@@ -504,6 +504,8 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
         router_logits: torch.Tensor,
         output_dtype: Optional[torch.dtype] = None,
         x_high: Optional[torch.Tensor] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
     ) -> torch.Tensor:
 
         # Use special min-latency MoE kernels when num_tokens <= 8.
@@ -526,10 +528,14 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
                     "x_high is required when x.dtype is float8_e4m3fn in Llama4FusedMoE fallback path!"
                 )
 
+        # The wrapper's scheduler defaults a missing rank list to ``[x.shape[0]]``,
+        # which is only correct at parallel_size 1; forward what the caller knows.
         return super().forward(x,
                                router_logits,
                                do_finalize=True,
-                               output_dtype=output_dtype)
+                               output_dtype=output_dtype,
+                               all_rank_num_tokens=all_rank_num_tokens,
+                               use_dp_padding=use_dp_padding)
 
 
 class Llama4MinLatencyMoE(Llama4MoE):
@@ -626,6 +632,8 @@ class Llama4MinLatencyMoE(Llama4MoE):
             hidden_states,
             router_logits,
             x_high=hidden_states_high,
+            all_rank_num_tokens=all_rank_num_tokens,
+            use_dp_padding=False,
         )
 
         return routed_output

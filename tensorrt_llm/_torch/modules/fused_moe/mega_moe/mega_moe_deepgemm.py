@@ -256,7 +256,7 @@ class MegaMoEDeepGemm(MoEImplBase):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         # DG tunables. ``activation=None`` infers Kimi K3 SiTU from the
         # pretrained config and otherwise defaults to SwiGLU.
         activation: Optional[str] = None,

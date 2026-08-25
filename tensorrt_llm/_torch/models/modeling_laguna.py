@@ -41,8 +41,8 @@ from ..modules.fused_moe import (
     create_moe,
     resolve_moe_cls,
 )
-from ..modules.fused_moe.interface import MoE as MoEInterface
 from ..modules.fused_moe.interface import MoEWeightLoadingMode
+from ..modules.fused_moe.weight_owner import is_moe_weight_owner
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.qk_norm_attention import QKNormRoPEAttention
@@ -668,7 +668,7 @@ class LagunaHfWeightMapper(HfWeightMapper):
         return weights
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
-        return isinstance(module, MoEInterface)
+        return is_moe_weight_owner(module)
 
     def handle_special_instance_module(
         self,
@@ -677,7 +677,7 @@ class LagunaHfWeightMapper(HfWeightMapper):
         module_weights: dict,
         allow_partial_loading: bool = False,
     ) -> None:
-        if isinstance(module, MoEInterface):
+        if is_moe_weight_owner(module):
             # DeepSeekFP8 block-scales MoE expects "weight_scale_inv" but NVFP4
             # MoE expects the original "weight_scale" (plus "weight_scale_2").
             use_fp8_block_rename = (

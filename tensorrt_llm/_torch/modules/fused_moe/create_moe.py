@@ -58,7 +58,7 @@ def create_moe_backend(
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
     swiglu_limit_scalar: Optional[float] = None,
-    init_load_balancer: bool = True,
+    init_load_balancer: bool = False,
     activation_type: ActivationType = ActivationType.Swiglu,
     activation: Optional[str] = None,
     situ_beta: Optional[float] = None,
@@ -70,10 +70,11 @@ def create_moe_backend(
     """
     Create a MoE backend or a self-contained MoE layer.
 
-    Execution units (``MoEImplBase`` subclasses) are only constructed as
-    backends, so they need ``init_load_balancer=False``; the old standalone-layer
-    default raises ``TypeError`` in the impl constructor. ``TritonFusedMoE`` and
-    ``VanillaMoE`` remain complete layers.
+    Execution units (``MoEImplBase`` subclasses) are only ever constructed as
+    backends, so ``init_load_balancer`` defaults to ``False`` -- ``True`` asks
+    for a standalone layer and the impl constructor rejects it with a
+    ``TypeError``. The ``TritonFusedMoE`` and ``VanillaMoE`` branches are
+    complete layers and do not take the parameter at all.
 
     Args:
         moe_cls: MoE backend or self-contained layer class to instantiate
@@ -246,8 +247,10 @@ def create_moe_backend(
             activation_type=activation_type,
         )
     elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
-        # CuteDslB12xFusedMoE subclasses CuteDslFusedMoE and shares
-        # its narrower constructor (no bias / swiglu_alpha-beta-limit args).
+        # Both are constructed through the narrower CuteDsl argument set (no
+        # bias / swiglu_alpha-beta-limit). CuteDslB12xFusedMoE now delegates to
+        # CutlassFusedMoE.__init__, which does accept those four, so widening
+        # this branch would need the allow-lists above to admit b12x first.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -473,8 +476,10 @@ def create_moe(
             "TRTLLMGenFusedMoE without backend fallback, but resolved "
             f"{moe_cls.__name__}.")
 
-    # A new execution unit becomes a legal backend the moment it inherits
-    # ``MoEImplBase``; there is no second place to register it.
+    # This dispatch needs no per-class entry: inheriting ``MoEImplBase`` is
+    # enough to be wrapped. Becoming *selectable* still needs the constructor
+    # branch in ``create_moe_backend`` above plus ``moe_resolution``'s
+    # ``IMPL_PRIORITY`` / ``BACKEND_FAMILY``.
     if issubclass(moe_cls, MoEImplBase):
         return ConfigurableMoE(
             moe_cls=moe_cls,

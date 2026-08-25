@@ -312,8 +312,10 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         #
         # When init_load_balancer=False (the wrapper path, e.g. ConfigurableMoE
         # creating an inner backend), the wrapper is responsible for the
-        # divisibility contract and we skip the check entirely — the wrapper's
-        # own _init_load_balancer will gate it.
+        # divisibility contract and we skip the check entirely — see
+        # ConfigurableMoE._reject_non_divisible_ep_backend(), which runs it
+        # against this backend's class once the backend exists. The wrapper's
+        # own _init_load_balancer cannot: it runs before that.
 
         self.moe_backend = model_config.moe_backend
         self.use_dp = model_config.mapping.enable_attention_dp

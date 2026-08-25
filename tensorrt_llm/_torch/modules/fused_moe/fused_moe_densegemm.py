@@ -194,7 +194,7 @@ class DenseGEMMFusedMoE(MoEImplBase):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         activation_type=None,
     ):
         # Eligibility (SM / quant / SwiGLU / EP / intermediate alignment) is

@@ -841,7 +841,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         layer_idx: Optional[int] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
     ):
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size

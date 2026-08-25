@@ -58,8 +58,9 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
 
     Large prefill chunks use CUTLASS; decode uses FlashInfer's b12x kernel.
 
-    Inherits ``CutlassFusedMoE`` rather than only the shared blocks, unlike its
-    siblings (CuteDsl, DeepGemm, Marlin): ``_route_to_cutlass`` sends every
+    Inherits ``CutlassFusedMoE`` rather than only the shared blocks -- the same
+    shortcut its siblings (CuteDsl, DeepGemm, Marlin) take, but here it is a
+    real dependency: ``_route_to_cutlass`` sends every
     NVFP4 prefill chunk through ``CutlassFusedMoE.quantize_input`` /
     ``CutlassFusedMoE.run_moe``, which read the whole Cutlass execution state
     (chunking stream and events, ``use_fused_finalize``, the tuner flags, the
@@ -73,9 +74,9 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
 
     # This and ``supports_moe_output_in_alltoall_workspace`` came through
     # ``CuteDslFusedMoE`` before the reparent and Cutlass answers differently on
-    # both, so both are restated to keep the declared values unchanged. Neither
-    # is reachable today (``can_implement`` rejects ``ep_size != 1`` and
-    # alltoall), but a base-class change should not flip them silently.
+    # both, so both are restated to keep the declared values unchanged. Read by
+    # ``ConfigurableMoE._reject_non_divisible_ep_backend()``; moot for this class
+    # in practice because ``can_implement`` rejects ``ep_size != 1`` outright.
     _supports_non_divisible_ep: bool = True
 
     def supports_moe_output_in_alltoall_workspace(self) -> bool:
@@ -284,8 +285,8 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
 
         # B12xMoEWrapper allocates its own output buffer for CUDA-graph
         # compatibility. If the caller provided ``moe_output`` (e.g. an
-        # alltoall workspace tensor), copy into it; CuteDslB12xFusedMoE
-        # currently rejects alltoall in __init__, so this is a defensive
+        # alltoall workspace tensor), copy into it; ``can_implement`` rejects
+        # the topologies that could pick alltoall, so this is a defensive
         # path for future workspace-driven uses.
         if moe_output is not None:
             with nvtx_range("[b12x] out_copy"):

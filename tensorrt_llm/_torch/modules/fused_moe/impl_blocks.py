@@ -124,6 +124,10 @@ class MoEWeightOwnerMixin:
     and the name.
     """
 
+    # Declared here so the mixin's own lifecycle methods never depend on a
+    # subclass constructor having assigned it first.
+    _weights_created: bool = False
+
     # ---- weight lifecycle -------------------------------------------------
     def create_weights(self) -> None:
         """Allocate expert weights through the resolved quantization method.
@@ -147,7 +151,7 @@ class MoEWeightOwnerMixin:
         that here, where ``_weights_created`` is guaranteed true.
         """
 
-    def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:
+    def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None:
         """Load one checkpoint dict into the allocated weights.
 
         ``allow_partial_loading`` is forwarded only when the quant method

@@ -20,8 +20,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_laguna import LagunaHfWeightMapper
+from tensorrt_llm._torch.modules.fused_moe.impl_base import MoEImplBase
 from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoEEligibility
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 
 pytestmark = pytest.mark.cpu_only
 
@@ -38,7 +38,15 @@ class _FakeQuantMode:
         return self._fp8_block_scales
 
 
-class _FakeMoE(MoE):
+class _FakeMoE(MoEImplBase):
+    """Stands in for the module that actually reaches the mapper at load time.
+
+    ``LagunaMoE.experts`` is a ``ConfigurableMoE``, which owns no parameters, so
+    weight loading walks down to ``experts.backend`` -- an execution unit. Basing
+    the fake on ``MoE`` would keep passing a gate that the real backend type no
+    longer satisfies.
+    """
+
     @classmethod
     def can_implement(cls, p, d):
         return MoEEligibility.ok()
@@ -48,9 +56,26 @@ class _FakeMoE(MoE):
         self.loaded_weights = None
         self.allow_partial_loading = None
 
+    def _get_quant_method(self):
+        return None
+
+    def quantize_input(self, x, **kwargs):
+        return x, None
+
+    def run_moe(self, ctx):
+        raise AssertionError("weight-mapper tests never execute the MoE")
+
     def load_weights(self, weights, allow_partial_loading: bool = False):
         self.loaded_weights = weights
         self.allow_partial_loading = allow_partial_loading
+
+
+def test_laguna_hf_weight_mapper_recognizes_execution_unit():
+    """The expert-weight gate must fire on the backend, not just on ``MoE``."""
+    mapper = LagunaHfWeightMapper()
+
+    assert mapper.is_special_instance_module(_FakeMoE())
+    assert not mapper.is_special_instance_module(nn.Linear(2, 2))
 
 
 def test_laguna_hf_weight_mapper_preprocesses_nvfp4_weights():
