@@ -78,6 +78,9 @@ def _make_reserve_creator(
         disable_mm_encoder=disable_mm_encoder,
         multimodal_config=model.model_config.multimodal_config,
     )
+    # Match ModelLoader: the model receives the effective, normalized config
+    # from TorchLlmArgs rather than retaining the caller's input object.
+    model.model_config.multimodal_config = llm_args.multimodal_config
     model_engine = _ModelEngine(
         model=model,
         mm_encoder_output_budget_bytes=mm_encoder_output_budget_bytes,
@@ -150,6 +153,7 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
         encoder_max_num_tokens=8192,
         use_mrope=False,
     )
+    creator._llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
     creator._profiling_stage_data = {"enable_mm_reqs": True}
     creator._mapping = SimpleNamespace(enable_attention_dp=False)
     creator._max_num_tokens = 18
@@ -343,12 +347,14 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
 
 
 def test_kv_cache_estimation_skips_multimodal_reserve_when_encoder_disabled():
+    model = _EncoderCacheMultimodalModel(64)
     creator = _make_reserve_creator(
-        _EncoderCacheMultimodalModel(64),
-        mm_encoder_output_budget_bytes=512,
+        model,
         disable_mm_encoder=True,
     )
 
+    assert model.model_config.multimodal_config.encoder_cache_max_bytes == 0
+    assert creator._create_dummy_encoder_inputs() == []
     assert creator._get_multimodal_encoder_memory_reserve() == 0
 
 

@@ -848,8 +848,9 @@ class KvCacheCreator:
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
-        # No local multimodal encoder (disable_mm_encoder or MM E/P disagg):
-        # nothing to profile.
+        if self._llm_args.disable_mm_encoder:
+            return []
+        # MM E/P disaggregation may remove an otherwise exposed encoder.
         if (hasattr(self._model_engine.model, "mm_encoder")
                 and self._model_engine.model.mm_encoder is None):
             return []
@@ -934,9 +935,6 @@ class KvCacheCreator:
                                                profiled_output_bytes: int = 0
                                                ) -> int:
         """Return output and cache capacity absent from the measured peak."""
-        if self._llm_args.disable_mm_encoder:
-            return 0
-
         output_budget = getattr(self._model_engine,
                                 "mm_encoder_output_budget_bytes", None)
         unprofiled_output_bytes = max(0, (output_budget or 0) -

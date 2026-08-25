@@ -908,10 +908,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         return self.llm
 
     @property
-    def mm_encoder(self) -> torch.nn.Module | None:
-        return self._vision_tower
-
-    @property
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._image_token_ids
 
@@ -939,7 +935,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
-        if self.mm_encoder is None:
+        if (self._vision_tower is None or self._multi_modal_projector is None):
             raise ValueError(
                 "Raw multimodal inputs require a local multimodal encoder.")
         mm_embeds = self._vision_forward(list(multimodal_params))

@@ -5726,7 +5726,11 @@ class TorchLlmArgs(BaseLlmArgs):
             logger.info(
                 "Setting multimodal_config.encoder_cache_max_bytes to 0 "
                 "because disable_mm_encoder=True.")
-            self.multimodal_config.encoder_cache_max_bytes = 0
+            # The cache defaults to enabled, so disabling the encoder must override it to also
+            # disable an unused cache. Although `multimodal_config` is unlikely to be used
+            # standalone outside of a `TorchLlmArgs` instance, we make a copy to be safe.
+            self.multimodal_config = self.multimodal_config.model_copy(
+                update={"encoder_cache_max_bytes": 0})
         return self
 
     @model_validator(mode="after")
