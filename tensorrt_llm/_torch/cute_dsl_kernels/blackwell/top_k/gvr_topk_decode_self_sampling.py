@@ -4594,23 +4594,15 @@ class GvrClusKernel:
         row = by
         lane = tidx & cutlass.Int32(31)
 
-        # ================= per-row varlen prologue (varlen mode only) =========
-        # Production contract (GvrMainKernel / GvrRegClusKernel discipline):
-        # row r serves request r // next_n with
-        # n = (kv_lens[req] - next_n + r % next_n + 1) >> cr_shift, clamped to
-        # the envelope launch arg n.  The sampling-ladder scalars
-        # (SMP/TGT/Q/SS2/TGT2 — dead launch args in this mode) are re-derived
-        # from this row's n by the route_dynamic() clus formulas below, with
-        # ONE deviation: the QUAD sample geometry is computed for every
-        # non-short row instead of only n > SCAP — the host only ever launches
-        # this family with n > SCAP, so the SMP == 0 no-sample path is
-        # untested; short-of-envelope rows get a small valid schedule instead
-        # (sampling only steers the rung; exactness is schedule-invariant).
-        # Every quantity is a pure function of `row`, so all CS ranks of a
-        # row's cluster (and all threads) compute identical values — the
-        # whole-body guard below is cluster-uniform and the cluster barriers
-        # inside remain aligned.  Short rows (n <= k) emit identity + (-1)
-        # tail from rank 0 here and SKIP the body entirely.
+        # ============ per-row varlen prologue — shared contract lives in ======
+        # GvrMainKernel's prologue (per-row n from kv_lens; ladder scalars are
+        # dead launch args, re-derived here by the route_dynamic() clus
+        # formulas). Clus deviation: QUAD sample geometry runs for every
+        # non-short row (host never launches clus at n <= SCAP, so SMP == 0 is
+        # untested; sampling only steers the rung — exactness is
+        # schedule-invariant). All values are pure functions of `row`, so the
+        # whole-body guard and the cluster barriers stay cluster-uniform.
+        # Short rows (n <= k): rank 0 emits identity + (-1); body is SKIPped.
         short = cutlass.Int32(0)
         prow = row
         if cutlass.const_expr(self.varlen):
@@ -5837,19 +5829,13 @@ class GvrRegClusKernel:
         rank, row, _ = cute.arch.block_idx()  # bx=rank
         lane = tid & cutlass.Int32(31)
 
-        # ================= per-row varlen prologue (varlen mode only) =========
-        # Same production contract as GvrMainKernel (see its prologue): row r
-        # serves request r // next_n with
-        # n = (kv_lens[req] - next_n + r % next_n + 1) >> cr_shift, clamped to
-        # the envelope launch arg n (the launcher admits this family only when
-        # the envelope fits its capacity window, so per-row n never exceeds
-        # capacity). Every quantity is a pure function of `row`, so all CS
-        # ranks of a row's cluster (and all threads) compute identical values
-        # -- the whole-body guard below is cluster-uniform and the cluster
-        # barriers inside remain aligned. Short rows (n <= k) emit
-        # identity + (-1) tail from rank 0 here and SKIP the body entirely: a
-        # zero-work pass would reach the degenerate crossing-overflow emitter
-        # and poison the output.
+        # ============ per-row varlen prologue — shared contract lives in ======
+        # GvrMainKernel's prologue (per-row n from kv_lens, clamped to the
+        # envelope arg; the launcher admits this family only when the envelope
+        # fits its capacity window). Pure functions of `row` keep the body
+        # guard and cluster barriers cluster-uniform. Short rows (n <= k):
+        # rank 0 emits identity + (-1) and the body is SKIPped — a zero-work
+        # pass would reach the crossing-overflow emitter and poison the output.
         short = cutlass.Int32(0)
         prow = row
         if cutlass.const_expr(self.varlen):
