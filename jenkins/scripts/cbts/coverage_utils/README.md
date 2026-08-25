@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # CBTS Layer C — Coverage Utils
 
 CI tooling that captures per-test **function/class-level** coverage (which product functions each
