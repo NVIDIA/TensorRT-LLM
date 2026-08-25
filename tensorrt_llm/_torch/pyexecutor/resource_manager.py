@@ -1140,11 +1140,6 @@ class KVCacheManager(BaseResourceManager):
         use_mrope: bool = False,
         max_beam_width: int = 1,
         encoder_output_lens: Optional[List[int]] = None,
-        # For capturable drafting loops. During normal inference, the draft model always
-        # has enough KV cache space to fit all of our draft tokens. During warmup, however,
-        # we need to make the KV cache manager aware that multiple autoregressive steps will
-        # occur.
-        num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
     ):
         _kv_draft = kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
@@ -1209,8 +1204,6 @@ class KVCacheManager(BaseResourceManager):
                                              batch_llm_requests)
                 for req_id, token_num, _ in batch_request_infos:
                     for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req_id)
-                    for _ in range(num_extra_decoding_steps):
                         self.impl.add_token(req_id)
 
             if draft_batch_request_infos and draft_kv_cache_manager is not None:

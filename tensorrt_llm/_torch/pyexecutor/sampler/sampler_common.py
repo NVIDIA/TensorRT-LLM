@@ -140,13 +140,23 @@ def _get_beam_width_out(request: LlmRequest) -> int:
 def _get_max_beam_width(request: LlmRequest) -> int:
     sampling_config = request.sampling_config
     max_beam_width = cast(int, sampling_config.beam_width)
-    if sampling_config.beam_width_array is not None:
-        max_beam_width = max(
-            max_beam_width,
-            cast(
-                int, torch.tensor(sampling_config.beam_width_array, dtype=torch.int32).max().item()
-            ),
-        )
+    # The array holds at most kMaxBeamWidthArrayLength (8) entries, so reduce it
+    # on the host. The C++ field is OptVec<vector<SizeType32>>, so it may arrive
+    # as [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength];
+    # unwrap the per-request row before reducing.
+    #
+    # Both `[]` and `[[]]` mean "no schedule" -- checkBeamWidthArray bounds only
+    # the array's length, so an empty one passes admission -- and must fall
+    # through to beam_width rather than reduce over nothing. Hence truthiness
+    # rather than `is not None`, and hence a second guard after the unwrap:
+    # the same two checks LlmRequest.get_beam_width_by_iter and
+    # PyExecutor._validate_request make.
+    beam_width_array = sampling_config.beam_width_array
+    if beam_width_array:
+        if isinstance(beam_width_array[0], (list, tuple)):
+            beam_width_array = beam_width_array[0]
+    if beam_width_array:
+        max_beam_width = max(max_beam_width, *map(int, beam_width_array))
     return max_beam_width
 
 
