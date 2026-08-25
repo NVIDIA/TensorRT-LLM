@@ -249,13 +249,6 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "vila1_5_3b_mha",
-        "VILA1.5-3B LLM",
-        num_heads=20,
-        num_kv_heads=20,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
         "llama2_13b_qwen1_5_14b_mha",
         "Llama-2-13B, Qwen1.5-14B",
         num_heads=40,
@@ -492,15 +485,6 @@ _STANDARD = [
         head_dim=128,
         mask="sliding",
         sliding_window=512,
-    ),
-    ModelAttnConfig(
-        "starcoder2_3b_gqa_swa4096",
-        "StarCoder2-3B",
-        num_heads=24,
-        num_kv_heads=2,
-        head_dim=128,
-        mask="sliding",
-        sliding_window=4096,
     ),
     ModelAttnConfig(
         "starcoder2_7b_gqa_swa4096",

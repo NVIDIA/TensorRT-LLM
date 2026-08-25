@@ -41,6 +41,8 @@ from ..pyexecutor.sampler import (
     add_token,
     int_tensor,
 )
+from ..pyexecutor.sampler.penalties import has_occurrence_penalty
+from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
 
 
@@ -108,6 +110,30 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 "min_p is not supported with one-model speculative decoding. "
                 "Drop min_p from the request, or disable speculative decoding."
             )
+        # The occurrence penalties need a [slots, vocab_size] workspace that is only
+        # allocated when the deploy opted in, so a request asking for them while the
+        # flag is off cannot be honored. Reject instead of silently decoding from an
+        # unpenalized distribution -- same reasoning as min_p above.
+        if not has_occurrence_penalty(request):
+            return
+        if not self._enable_penalty:
+            raise ValueError(
+                "repetition_penalty / presence_penalty / frequency_penalty require "
+                "'enable_penalty: true' in the speculative decoding config when using "
+                "one-model speculative decoding. Enable that flag, drop the penalties "
+                "from the request, or disable speculative decoding."
+            )
+        # Tree speculation lays each request's logits out as tree nodes, where a
+        # row's history is its root path rather than the rows before it. Applying
+        # the linear mapping there would let sibling branches penalize each other,
+        # so reject until tree-aware prefixes are implemented.
+        if not self._penalty_supported:
+            raise ValueError(
+                "repetition_penalty / presence_penalty / frequency_penalty are not "
+                "supported with tree speculative decoding (eagle_choices / dynamic "
+                "tree) yet. Drop the penalties, use a linear speculation mode, or "
+                "disable speculative decoding."
+            )
 
     @dataclass(kw_only=True)
     class Store:
@@ -118,7 +144,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
 
-    def __init__(self, args: TorchSampler.Args, *, accepted_path_len: Optional[int] = None):
+    def __init__(
+        self,
+        args: TorchSampler.Args,
+        *,
+        accepted_path_len: Optional[int] = None,
+        enable_penalty: bool = False,
+        penalty_supported: bool = True,
+    ):
         """
         Initialize the speculative sampler.
 
@@ -128,7 +161,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 can accept, used to size new_tokens. Defaults to
                 ``args.max_draft_len + 1``; see the store comment below for the
                 one mode that has to override it.
+            enable_penalty: whether the deploy enabled the occurrence penalties.
+                Only used to decide whether a request asking for them is admitted;
+                the penalties themselves are applied inside the worker.
+            penalty_supported: whether this speculation mode's row layout is one
+                the penalties can map (linear modes yes, tree modes not yet).
         """
+        self._enable_penalty = enable_penalty
+        self._penalty_supported = penalty_supported
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -231,7 +271,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
-                if TorchSampler._handle_stop_criteria(
+                if handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break

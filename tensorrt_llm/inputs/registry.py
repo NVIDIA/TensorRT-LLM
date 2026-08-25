@@ -13,14 +13,15 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
+"""Input processor registry and multimodal preprocessing helpers."""
 
 import enum
 import importlib
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Any, Callable, ClassVar, Dict, List, Optional, Protocol,
-                    Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, List, Mapping, NamedTuple,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -34,7 +35,8 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
+                         _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
@@ -55,6 +57,78 @@ def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
     except (TypeError, ValueError, RuntimeError):
         return None
     return hasher.hexdigest()
+
+
+class MultimodalEncoderItemMetadata(NamedTuple):
+    """Prompt-ordered metadata for atomic multimodal encoder items."""
+
+    item_refs: List[Tuple[str, int]]
+    """``(modality, local index)`` per atomic item, in prompt order.
+
+    ``modality`` is ``"image"``/``"video"``/``"audio"`` and the local index
+    identifies the item within that modality's processed payload (for
+    example, its row range in ``pixel_values``), so an item can be sliced
+    out for a single-item encoder call.
+
+    TODO(TRTLLM-14477): `MultimodalParams.mm_item_order` carries the same prompt-order
+    manifest for the mixed-modality full-request encode path. Single-source
+    the two representations at the input processor so one manifest serves
+    both the item-scheduling path and the full-request interleave.
+    """
+
+    encoder_token_lengths: List[int]
+    """Physical encoder attention-token cost of each item.
+
+    This is what one encoder forward actually attends over (for example,
+    pre-merger patch tokens for Qwen ViTs) and is the unit the scheduler
+    charges against ``encoder_max_num_tokens``.
+    """
+
+    output_embedding_lengths: List[int]
+    """Embedding rows each item contributes to the LLM prompt.
+
+    Must equal the item's placeholder span in the prompt (the
+    ``multimodal_embedding_lengths`` contract); used to size and split the
+    encoder output back into per-item tensors.
+    """
+
+    def validate(self) -> None:
+        """Enforce the cross-field contract on producer-supplied metadata."""
+        if not all(isinstance(values, list) for values in self):
+            raise TypeError(
+                "Multimodal encoder item metadata fields must be lists")
+        lengths = (self.encoder_token_lengths + self.output_embedding_lengths)
+        if not all(isinstance(length, int) for length in lengths):
+            raise TypeError(
+                "Multimodal encoder item lengths must contain only integers")
+        if not (len(self.item_refs) == len(self.encoder_token_lengths) == len(
+                self.output_embedding_lengths)):
+            raise ValueError(
+                "Multimodal encoder item references and lengths must align")
+        if any(length <= 0 for length in self.encoder_token_lengths):
+            raise ValueError(
+                "Multimodal encoder token lengths must be positive")
+        if any(length <= 0 for length in self.output_embedding_lengths):
+            raise ValueError(
+                "Multimodal encoder output embedding lengths must be positive")
+
+
+def get_multimodal_encoder_item_metadata(
+    multimodal_data: Optional[Dict[str, Any]],
+) -> Optional[MultimodalEncoderItemMetadata]:
+    """Return typed atomic-item metadata from Python multimodal data."""
+    if multimodal_data is None:
+        return None
+    if not isinstance(multimodal_data, dict):
+        raise TypeError("multimodal_data must be a dict")
+    metadata = multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+    if metadata is None:
+        return None
+    if not isinstance(metadata, MultimodalEncoderItemMetadata):
+        raise TypeError(f"{MULTIMODAL_ENCODER_ITEM_METADATA_KEY} must be a "
+                        "MultimodalEncoderItemMetadata")
+    metadata.validate()
+    return metadata
 
 
 class InputProcessor(Protocol):
@@ -131,21 +205,6 @@ class DefaultInputProcessor(InputProcessor):
                 token_ids = self.tokenizer.encode(
                     inputs["prompt"], allowed_special=toktoken_special_tokens)
 
-        if "query" in inputs:
-            with nvtx_range_debug("tokenize query"):
-                try:
-                    query_token_ids = self.tokenizer.encode(
-                        inputs["query"],
-                        add_special_tokens=sampling_params.add_special_tokens,
-                        **kwargs)
-                except:
-                    # Tiktoken path
-                    query_token_ids = self.tokenizer.encode(
-                        inputs["query"],
-                        allowed_special=toktoken_special_tokens)
-
-            return token_ids, {"query_token_ids": query_token_ids}
-
         return token_ids, None
 
 
@@ -178,6 +237,18 @@ class BaseMultimodalInputProcessor(ABC):
     # When True, `__call__` may route `prompt_token_ids + multi_modal_data`
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
+
+    def get_mm_encoder_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[MultimodalEncoderItemMetadata]:
+        """Return item refs, physical costs, and encoder output lengths.
+
+        Models opting into runtime MM encoder scheduling override this hook.
+        The default keeps legacy multimodal processors unchanged.
+        """
+        return None
 
     def __init__(self,
                  model_path,
@@ -598,19 +669,12 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """Build deterministic dummy multimodal inputs for KV-cache profiling.
+    """Build deterministic multimodal data for KV-cache profiling.
 
-    Modality-agnostic: a model declares the per-item token demand of each
-    modality it encodes via :meth:`get_mm_max_tokens_per_item`, and materializes
-    the worst-case dummy for a per-modality token budget via
-    :meth:`get_dummy_mm_data_for_tokens`. The profiler splits the shared
-    ``encoder_max_num_tokens`` budget across modalities in proportion to that
-    demand, so they share one encoder microbatch cap rather than each claiming
-    the whole budget. Every modality-specific decision (size inversion, item
-    count, tensor layout) lives in the concrete implementation, so vision
-    (size-based), audio (duration/frame-based), and mixed image+video+audio
-    processors all satisfy the same contract without leaking ``width``/``height``
-    into this base.
+    Concrete processors report per-modality item sizes through
+    :meth:`get_mm_max_tokens_per_item` and directly implement
+    :meth:`get_dummy_mm_data`. The profiler owns modality selection and passes
+    the selected per-modality item counts to the processor.
 
     Token unit is **encoder attention** (pre-merger), matching
     ``encoder_max_num_tokens`` and ``AttentionMetadata.max_num_tokens``.
@@ -634,21 +698,52 @@ class BaseMultimodalDummyInputsBuilder(ABC):
     def model_path(self) -> str:
         ...
 
-    def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
-        """Per-modality encoder-attention tokens of the single worst-case item.
+    def get_mm_max_tokens_per_item(
+        self,
+        max_num_encoder_tokens: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Return the largest legal item size for every encoder modality.
 
-        Keyed by modality — e.g. ``{"image": 16384}`` for a vision-only model or
-        ``{"image": 16384, "audio": 1500}`` for a mixed one. The keys enumerate
-        the modalities this model runs through its encoder(s); the values weight
-        how the profiler splits the shared encoder budget across them. (Qwen-VL
-        declares only ``"image"``: image and video share one ViT, so the image
-        worst case already covers the vision encoder.)
+        ``max_num_encoder_tokens=None`` asks for bounded startup maxima used to
+        resolve the largest atomic item. An integer asks for the largest legal
+        item of each modality under that encoder-token budget; the profiler
+        uses those values to select its workload.
 
-        Default ``{}`` → no direct encoder profiling (text-only dummy fallback);
-        a model opts in by overriding this together with
-        :meth:`get_dummy_mm_data_for_tokens`.
+        Default ``{}`` → no multimodal encoder profiling (text-only fallback);
+        a processor opts in by overriding this method together with
+        :meth:`get_dummy_mm_data`.
         """
+        if max_num_encoder_tokens is not None:
+            raise NotImplementedError
         return {}
+
+    def get_max_mm_encoder_output_embeddings(
+            self, max_num_encoder_tokens: int) -> Optional[int]:
+        """Bound encoder-output embeddings produced in one encoder iteration.
+
+        The result is the aggregate number of post-encoder embeddings across
+        every item that can be scheduled together under
+        ``max_num_encoder_tokens``. Models opting into MM encoder item
+        scheduling must override this method using their encoder geometry.
+
+        ``None`` keeps the contract unsupported for legacy processors.
+        """
+        return None
+
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Return a processor-geometry-aware encoder sequence capacity.
+
+        The keys identify model-specific attention metadata objects (for
+        example, Qwen2.5-VL has separate ``full_attention`` and
+        ``window_attention`` entries). ``None`` keeps the encoder model's
+        conservative fallback mapping. Concrete processors should return a
+        positive upper bound derived from the startup token budget and the
+        same geometry constraints used to normalize runtime media.
+
+        The default intentionally ignores the input.
+        """
+        return None
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         """Per-modality media-IO decode defaults for this model.
@@ -659,21 +754,27 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """
         return {}
 
-    def get_dummy_mm_data_for_tokens(
+    def get_dummy_mm_data(
         self,
         *,
-        max_tokens_per_modality: Dict[str, int],
+        max_num_encoder_tokens: int,
+        mm_counts: Mapping[str, int],
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
-        """Build the worst-case dummy ``multimodal_data`` per modality budget.
+        """Build processed ``multimodal_data`` for MM encoder profiling.
 
-        The modality-agnostic entry the KV-cache encoder profiler calls, sizing
-        each modality to saturate its share of the token budget.
+        Args:
+            max_num_encoder_tokens: Aggregate encoder-attention token budget.
+            mm_counts: Number of items to materialize for each modality. The
+                profiler computes these counts within the token and item-count
+                limits before calling the model-specific builder.
+            dtype: Data type for floating-point encoder inputs.
 
-        Returns the ``multimodal_data`` dict the model's encoder consumes (e.g.
-        ``{"image": {"pixel_values": ..., "image_grid_thw": ...}}`` for Qwen-VL).
-        Default raises ``NotImplementedError``; the profiler treats that as "no
-        direct profiling for this model" and falls back to a text-only dummy.
+        Returns:
+            The model-specific tensors consumed directly by the encoder.
+
+        Concrete processors construct the processed tensors consumed directly
+        by their encoder. The default keeps profiling unsupported.
         """
         raise NotImplementedError
 
@@ -692,7 +793,7 @@ class MultimodalPlaceholderPlacement(enum.Enum):
 @dataclass(frozen=True)
 class MultimodalPlaceholderMetadata:
     """
-    Metadata for the multimodal placeholder. It has 5 components:
+    Metadata for the multimodal placeholder. It has 6 components:
         - placeholder_map:
             A mapping from modality to placeholder string.
             Modality can be "image", "video", "audio", etc.
@@ -716,12 +817,21 @@ class MultimodalPlaceholderMetadata:
             user's message.
             When False (default), placeholders are bulk-prepended or appended
             according to placeholder_placement.
+        - prompt_modality_order:
+            Fixed modality-major order the chat template emits placeholders in
+            when it regroups them (e.g. Nano's Jinja counts modalities and
+            emits image → video → audio regardless of chat-part send order).
+            When set, `MultimodalDataTracker.item_order()` returns items sorted
+            by this priority so the framework's `mm_item_order == prompt order`
+            invariant holds. `None` (default) keeps chat-part send order for
+            templates that preserve it.
     """
     placeholder_map: Dict[str, str] = field(default_factory=dict)
     placeholder_placement: MultimodalPlaceholderPlacement = MultimodalPlaceholderPlacement.AFTER_TEXT
     placeholders_separator: str = "\n"
     content_format: Optional[ContentFormat] = None
     interleave_placeholders: bool = False
+    prompt_modality_order: Optional[Tuple[str, ...]] = None
 
 
 class MultimodalPlaceholderRegistry:
@@ -870,6 +980,14 @@ class MultimodalPlaceholderRegistry:
         return self._multimodal_placeholder_by_model_type[
             model_type].content_format
 
+    def get_prompt_modality_order(self,
+                                  model_type: str) -> Optional[Tuple[str, ...]]:
+        """Modality-major order the model's template emits placeholders in, or None to preserve send order."""
+        if model_type not in self._multimodal_placeholder_by_model_type:
+            return None
+        return self._multimodal_placeholder_by_model_type[
+            model_type].prompt_modality_order
+
     def get_registered_image_model_types(self) -> Tuple[str, ...]:
         self._ensure_all_providers_imported()
         return tuple(
@@ -1001,7 +1119,8 @@ def create_input_processor(
     Returns:
         An InputProcessor implementation (model-specific if registered; otherwise DefaultInputProcessor).
     """
-    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.model_config import (ModelConfig,
+                                                  hf_remote_code_lock)
     from tensorrt_llm._torch.models import get_model_architecture
 
     config = None
@@ -1041,11 +1160,18 @@ def create_input_processor(
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
-            return input_processor_cls(model_path_or_dir,
-                                       config,
-                                       tokenizer,
-                                       trust_remote_code=trust_remote_code,
-                                       **kwargs)
+            # Input processors build an AutoTokenizer/AutoProcessor with
+            # trust_remote_code; doing so copies the checkpoint's .py files
+            # into the shared HF module cache non-atomically, and a rank that
+            # imports a file another rank is still writing fails with
+            # "module ... has no attribute ...". The lock lets the first rank
+            # fill the cache and the rest load concurrently once it is complete.
+            with hf_remote_code_lock():
+                return input_processor_cls(model_path_or_dir,
+                                           config,
+                                           tokenizer,
+                                           trust_remote_code=trust_remote_code,
+                                           **kwargs)
 
     return DefaultInputProcessor(None, None, tokenizer)
 
@@ -1395,6 +1521,52 @@ def create_input_processor_with_hash(
 
         maybe_compute_mm_embed_cumsum(prompt_token_ids, extra_processed_inputs,
                                       input_processor)
+        if extra_processed_inputs is None:
+            return prompt_token_ids, extra_processed_inputs
+
+        multimodal_data = extra_processed_inputs.get("multimodal_data")
+        if (not isinstance(multimodal_data, dict)
+                or multimodal_data.get("multimodal_embedding") is not None):
+            return prompt_token_ids, extra_processed_inputs
+
+        # A processor participates in item scheduling by overriding
+        # `get_mm_encoder_item_metadata`; the base returns `None`, so its
+        # result gates routing without a separate capability flag. `getattr`
+        # because unregistered/text-only models wrap a `DefaultInputProcessor`
+        # that lacks the method entirely.
+        get_item_metadata = getattr(input_processor,
+                                    "get_mm_encoder_item_metadata", None)
+        has_raw_payload = any(
+            isinstance(multimodal_data.get(modality), dict)
+            for modality in ("image", "video", "audio"))
+        if not has_raw_payload or get_item_metadata is None:
+            return prompt_token_ids, extra_processed_inputs
+
+        item_metadata = get_item_metadata(prompt_token_ids, multimodal_data)
+        if item_metadata is None:
+            # Processor does not emit item metadata for this input; fall back
+            # to the non-item-scheduled path.
+            return prompt_token_ids, extra_processed_inputs
+        if not isinstance(item_metadata, MultimodalEncoderItemMetadata):
+            raise TypeError(
+                "get_mm_encoder_item_metadata() must return a "
+                "MultimodalEncoderItemMetadata or None for raw multimodal "
+                f"payloads, got {type(item_metadata).__name__}")
+        item_metadata.validate()
+
+        multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
+        existing_embedding_lengths = multimodal_data.get(
+            "multimodal_embedding_lengths")
+        if existing_embedding_lengths is not None:
+            if not isinstance(existing_embedding_lengths, list):
+                raise TypeError("multimodal_embedding_lengths must be a list")
+            if (existing_embedding_lengths
+                    != item_metadata.output_embedding_lengths):
+                raise ValueError(
+                    "Computed multimodal encoder embedding lengths "
+                    "do not match the existing prompt metadata")
+        multimodal_data[
+            "multimodal_embedding_lengths"] = item_metadata.output_embedding_lengths
         return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper

@@ -23,7 +23,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import namedtuple
+from collections import deque, namedtuple
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -80,7 +80,22 @@ def get_ucx_tls():
         return "cuda_copy,cuda_ipc,sm,self,tcp"
     if sm < 90:
         return "^cuda_ipc,ib,gdr_copy"
+    if sm == 90:
+        # Allow IB on Hopper: KVCacheManagerV2 KV pools are VMM allocations that
+        # CUDA IPC cannot map without fabric handles, so KV transfers need IB
+        # GPUDirect RDMA to avoid falling back to slow non-IPC emulation.
+        return "^gdr_copy"
     return "^ib,gdr_copy"
+
+
+# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
+# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
+# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
+# address handles to cross-rail peers and time out, hanging the workers.
+# Drop it at import time so worker environments (copied from os.environ)
+# fall back to standard GID-based address resolution; no-op when absent.
+if get_sm_version() == 90:
+    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
 
 def cleanup_output_files():
@@ -131,6 +146,49 @@ def scan_logs_for_fatal_errors(processes):
     return findings
 
 
+def print_first_fatal_log_context(processes, context_lines=20):
+    """Print the lines around the FIRST fatal-pattern match in each log.
+
+    The last-N-lines tail printed on failure usually shows only post-crash
+    shutdown spam ("LLM is shutting down" storms); the root cause — e.g. the
+    OOM traceback with the allocation site — is at the first match, often
+    thousands of lines earlier. Streams each log to avoid loading multi-GB
+    worker logs into memory.
+    """
+    for proc in processes:
+        log_path = getattr(proc, "log_path", None)
+        if not log_path or not os.path.exists(log_path):
+            continue
+        before = deque(maxlen=context_lines)
+        after = []
+        matched = None
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if matched is None:
+                        pat = next(
+                            (p for p in _FATAL_LOG_PATTERNS if p in line), None)
+                        if pat is None:
+                            before.append(line)
+                            continue
+                        matched = (lineno, pat)
+                        after.append(line)
+                    else:
+                        after.append(line)
+                        if len(after) > context_lines:
+                            break
+        except OSError:
+            continue
+        if matched is None:
+            continue
+        lineno, pat = matched
+        logger.error(f"-------- {log_path}: first fatal pattern '{pat}' at "
+                     f"line {lineno} (+/-{context_lines} lines) --------")
+        for line in [*before, *after]:
+            if line.strip():
+                logger.error(line.rstrip())
+
+
 def _crashed_workers(workers):
     return [
         w for w in workers
@@ -165,6 +223,20 @@ def get_default_disagg_cluster_config():
         "heartbeat_interval_sec": 1,
         "inactive_timeout_sec": 2
     }
+
+
+# Production service-discovery timings, matching the DisaggClusterConfig
+# defaults in tensorrt_llm/llmapi/disagg_utils.py. The tight 1s/2s defaults
+# above keep short functional tests snappy, but at stress-level concurrency
+# they leave <1s of heartbeat slack while the worker heartbeat task, the
+# cluster-storage /expire handler, and the expiry sweep all share event loops
+# saturated by request traffic — so workers get spuriously expired and the
+# router flaps "Cluster is not ready" (nvbugs/6472256). Stress runners must
+# use these production values instead.
+PRODUCTION_CLUSTER_TIMINGS = {
+    "heartbeat_interval_sec": 5,
+    "inactive_timeout_sec": 10,
+}
 
 
 def build_worker_config(base_config: dict[str, Any],
@@ -275,6 +347,10 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_conditional.yaml",
         "ngram":
         f"{test_configs_root}/disagg_config_ngram.yaml",
+        "sa":
+        f"{test_configs_root}/disagg_config_sa.yaml",
+        "sa_python":
+        f"{test_configs_root}/disagg_config_sa_python.yaml",
         "ctxpp2_genpp2":
         f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml",
         "ctxtp2_genpp2":
@@ -289,10 +365,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml",
         "deepseek_v3_lite_fp8_mpi":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml",
-        "deepseek_v3_lite_fp8_tp1_ucx":
-        f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_ucx.yaml",
-        "deepseek_v3_lite_fp8_tp2_ucx":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_ucx.yaml",
         "deepseek_v3_lite_fp8_nixl":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml",
         "deepseek_v3_lite_fp8_tp1":
@@ -363,8 +435,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "cancel_stress_test_large":
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
-        "llama31_8b_ucx":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
+        "llama31_8b":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
         "mamba_bs1_concurrency2":
@@ -661,6 +733,7 @@ def setup_disagg_cluster(
     startup_callback=None,
     startup_tick: int = 30,
     perf_metrics_output_dir: str | None = None,
+    disagg_cluster_overrides: dict[str, Any] | None = None,
     ctx_env: dict[str, str] | None = None,
     gen_env: dict[str, str] | None = None,
     share_gpu: bool = False,
@@ -674,6 +747,9 @@ def setup_disagg_cluster(
         env: Environment variables to pass to subprocess (workers and disagg server)
         server_start_timeout: Timeout in seconds for server to become ready
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
+        disagg_cluster_overrides: Entries merged over
+            get_default_disagg_cluster_config(), e.g. PRODUCTION_CLUSTER_TIMINGS
+            for stress runs (cluster_uri/minimal_instances are still derived below)
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -696,6 +772,8 @@ def setup_disagg_cluster(
                 speculative_model)
 
     disagg_cluster = get_default_disagg_cluster_config()
+    if disagg_cluster_overrides:
+        disagg_cluster.update(disagg_cluster_overrides)
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
     if save_log:
@@ -1752,6 +1830,37 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_sa(disaggregated_test_root, llm_venv,
+                          disaggregated_example_root, llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa",
+                           env=llm_venv._new_env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_sa_python(disaggregated_test_root, llm_venv,
+                                 disaggregated_example_root, llama_model_root):
+    """Spec-split SA (ctx no-spec, gen SA) on the V2 PYTHON transceiver path.
+
+    NIXL + transceiver_runtime PYTHON. The existing test_disaggregated_sa
+    covers this split only on the C++ DEFAULT backend.
+    """
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    run_disaggregated_test(disaggregated_example_root,
+                           "sa_python",
+                           env=llm_venv._new_env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
@@ -1957,26 +2066,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
 
 @skip_no_hopper
 @skip_arm
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
-                                                disaggregated_example_root,
-                                                llm_venv,
-                                                deepseek_v3_model_root):
-
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_tp2_ucx",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
 @skip_no_hopper
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -1994,26 +2083,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
-                           env=env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_no_hopper
-@skip_arm
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
-    env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp8_tp1_ucx",
                            env=env,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory())
@@ -2386,6 +2455,131 @@ def get_config_for_benchmark(model_root, backend):
     return serve_config
 
 
+def enforce_aiperf_error_rate(artifact_dir,
+                              max_error_rate,
+                              expected_records=None):
+    """Fail if the fraction of non-cancellation request errors exceeds max_error_rate.
+
+    aiperf exits 0 and counts HTTP 500s as completed requests, so without this
+    gate a mid-run server error storm (e.g. "Cluster is not ready" readiness
+    flapping, nvbugs/6472256) passes silently. Reads aiperf's per-record export
+    (profile_export.jsonl in artifact_dir), where each line carries an optional
+    "error" object with code/type/message. Intentional client-side cancellations
+    (HTTP 499 / RequestCancellationError) are excluded from both the numerator
+    and the denominator — stress tests cancel a fraction of requests on purpose.
+
+    Record schema validated against aiperf==0.8.0 (the pin in
+    requirements-dev.txt): each JSONL line is a MetricRecordInfo object
+    ({"metadata", "metrics", "error"}), and both cancellation construction
+    sites in aiperf's aiohttp client emit exactly error.code == 499 with
+    error.type == "RequestCancellationError". Reference gate output from the
+    35000-request DeepSeek R1 FP4 validation run (cancellation_rate=10):
+    [aiperf-gate] non-cancellation errors: 0/31561 (0.00%), cancelled: 3439.
+
+    The export must be substantive for the gate to pass: an empty or
+    unparsable export, an all-cancelled record set, or a record count far
+    below expected_records fails loudly instead of degrading into a silent
+    pass (a broken export is itself evidence of a broken run).
+    """
+    export_path = os.path.join(artifact_dir, "profile_export.jsonl")
+    # Explicit raise (not assert): asserts are stripped under python -O, which
+    # would defer the failure to open() without this diagnostic.
+    if not os.path.exists(export_path):
+        raise FileNotFoundError(
+            f"aiperf per-record export not found at {export_path}; cannot "
+            "enforce the request error-rate gate. If this aiperf "
+            "version/export level does not produce it, pass "
+            "max_error_rate=None explicitly.")
+    total = 0
+    cancelled = 0
+    decode_failures = 0
+    non_request = 0
+    # (code, type) -> [count, example message]
+    error_counts: dict[tuple, list] = {}
+    with open(export_path, "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                decode_failures += 1
+                continue
+            if not isinstance(record, dict) or ("metrics" not in record
+                                                and "error" not in record):
+                # Non-request records would inflate the denominator and
+                # under-report the rate. The aiperf==0.8.0 record export is
+                # request-only, but stay robust to future metadata additions.
+                non_request += 1
+                continue
+            total += 1
+            error = record.get("error")
+            # Schema-drift fallback: per-record metadata carries was_cancelled
+            # independently of the error object's code/type, so a cancelled
+            # request is excluded even if a future aiperf changes the error
+            # shape (or omits the error object for cancellations entirely).
+            metadata = record.get("metadata") or {}
+            was_cancelled = bool(metadata.get("was_cancelled"))
+            if not error:
+                if was_cancelled:
+                    cancelled += 1
+                continue
+            code = error.get("code")
+            err_type = error.get("type")
+            if (code == 499 or err_type == "RequestCancellationError"
+                    or was_cancelled):
+                cancelled += 1
+                continue
+            entry = error_counts.setdefault((code, err_type),
+                                            [0, error.get("message", "")])
+            entry[0] += 1
+    # Substantiveness checks: never let a broken export read as a clean run.
+    # A single truncated trailing line is tolerated; wholesale parse failure
+    # means the record format changed and the gate can no longer be trusted.
+    if decode_failures > max(1, (total + decode_failures) // 100):
+        raise AssertionError(
+            f"{export_path}: {decode_failures} of {total + decode_failures} "
+            "lines failed to parse as JSON — the export is corrupt or the "
+            "aiperf record format changed; refusing to compute an error rate "
+            "from it.")
+    if total == 0:
+        raise AssertionError(
+            f"{export_path} contained no parseable request records — the "
+            "benchmark produced no per-request accounting, which itself "
+            "indicates a broken run.")
+    if expected_records is not None and total < expected_records * 0.9:
+        raise AssertionError(
+            f"{export_path} contained only {total} records but "
+            f"~{expected_records} were expected — per-request accounting is "
+            "incomplete; refusing to compute an error rate from it.")
+    considered = total - cancelled
+    if considered <= 0:
+        raise AssertionError(
+            f"all {total} records in {export_path} were classified as "
+            "cancelled — implausible at the configured cancellation rate and "
+            "indicates a broken run or cancellation-classification drift.")
+    errors = sum(count for count, _ in error_counts.values())
+    error_rate = errors / considered
+    print(
+        f"[aiperf-gate] non-cancellation errors: {errors}/{considered} "
+        f"({error_rate:.2%}), cancelled: {cancelled}, "
+        f"decode failures: {decode_failures}, "
+        f"non-request records: {non_request}, "
+        f"threshold: {max_error_rate:.2%}",
+        flush=True)
+    if error_rate > max_error_rate:
+        breakdown = "\n".join(
+            f"  code={code} type={err_type}: {count} (e.g. {message[:200]})"
+            for (code, err_type), (count, message) in sorted(
+                error_counts.items(), key=lambda kv: -kv[1][0]))
+        raise AssertionError(
+            f"aiperf request error rate {error_rate:.2%} exceeds threshold "
+            f"{max_error_rate:.2%} ({errors} non-cancellation errors out of "
+            f"{considered} requests; {cancelled} intentional cancellations "
+            f"excluded). Error breakdown:\n{breakdown}")
+
+
 def run_disaggregated_aiperf(config_file,
                              model_path,
                              server_start_timeout=1200,
@@ -2403,6 +2597,7 @@ def run_disaggregated_aiperf(config_file,
                              threshold=0.8,
                              cancellation_rate=None,
                              cancellation_delay=None,
+                             max_error_rate=0.05,
                              env=None,
                              cwd=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
@@ -2421,6 +2616,8 @@ def run_disaggregated_aiperf(config_file,
         random_seed: Random seed for reproducibility
         accuracy_test: Whether to run accuracy test
         threshold: Threshold for accuracy test
+        max_error_rate: Fail if the fraction of non-cancellation request
+            errors recorded by aiperf exceeds this (None disables the gate)
         env: Environment variables dict
         cwd: Working directory
     """
@@ -2432,7 +2629,8 @@ def run_disaggregated_aiperf(config_file,
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              server_start_timeout=server_start_timeout,
-                             save_log=True)
+                             save_log=True,
+                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
@@ -2531,6 +2729,22 @@ def run_disaggregated_aiperf(config_file,
                 "Fatal error patterns detected in disaggregated worker/server "
                 f"logs:\n{summary}")
 
+        # Gate on the per-request error rate from aiperf's record export:
+        # aiperf exits 0 even when the server returns 500s for a large share
+        # of requests, so this is the only check that catches a mid-run error
+        # storm on this path (the fatal-pattern scan above is hang/OOM only).
+        if max_error_rate is not None:
+            # aiperf 0.8.0 derives the request count from concurrency when
+            # --request-count is not passed (max(10, concurrency * 2) for
+            # synthetic datasets; --num-dataset-entries only sizes the prompt
+            # pool). Mirror that so the completeness check also covers the
+            # default request mode instead of silently disabling.
+            expected_records = (request_count if request_count is not None else
+                                max(10, concurrency * 2))
+            enforce_aiperf_error_rate(artifact_dir,
+                                      max_error_rate,
+                                      expected_records=expected_records)
+
         if accuracy_test:
             accuracy_test_result, accuracy_value = run_accuracy_test(
                 model_path=model_path,
@@ -2567,14 +2781,17 @@ def run_disaggregated_aiperf(config_file,
                     f"worker/server logs after accuracy run:\n{summary}")
 
     except Exception:
-        # Print tail of each captured worker/server log to aid triage.
+        # Print the context around the first fatal-pattern match (the root
+        # cause, e.g. an OOM traceback) and the tail of each captured
+        # worker/server log to aid triage.
+        print_first_fatal_log_context(
+            [*ctx_workers, *gen_workers, disagg_server])
         for proc in [*ctx_workers, *gen_workers, disagg_server]:
             log_path = getattr(proc, "log_path", None)
             if not log_path or not os.path.exists(log_path):
                 continue
             logger.error(f"-------- {log_path} (last 30 lines) --------")
             try:
-                from collections import deque
                 with open(log_path, "r", errors="replace") as f:
                     for line in deque(f, maxlen=30):
                         if line.strip():
@@ -2754,13 +2971,20 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
 
-    run_disaggregated_aiperf(config_file=config_file,
-                             model_path=llama4_model_root,
-                             server_start_timeout=1200,
-                             input_tokens=128000,
-                             output_tokens=100,
-                             env=llm_venv._new_env,
-                             cwd=llm_venv.get_working_directory())
+    run_disaggregated_aiperf(
+        config_file=config_file,
+        model_path=llama4_model_root,
+        server_start_timeout=1200,
+        input_tokens=128000,
+        output_tokens=100,
+        # This repro intentionally degrades the KV
+        # transfer path (tiny max_tokens_in_buffer vs
+        # 128k inputs), so sporadic request errors are
+        # by-design; keep the test scoped to its
+        # original crash/fatal-log checks.
+        max_error_rate=None,
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory())
 
 
 @skip_pre_blackwell
@@ -3524,9 +3748,10 @@ async def _warmup_requests(server_url: str, profiles: list, count: int,
     The first request of each shape pays a one-time autotuner/compile cost
     (~20s host-steps observed on B200). Running those here, before the measured
     run, keeps them out of the accuracy/incomplete accounting and out of the
-    heartbeat-eviction path (a worker stuck in a 20s step misses the 2s cluster
-    heartbeat and gets evicted under a high-concurrency flood). Failures are
-    ignored — the only goal is to trigger the autotuner across the profile mix.
+    heartbeat-eviction path (a worker stuck in a 20s step exceeds even the 10s
+    PRODUCTION_CLUSTER_TIMINGS inactive timeout and gets evicted under a
+    high-concurrency flood). Failures are ignored — the only goal is to
+    trigger the autotuner across the profile mix.
     """
     import random
 
@@ -3601,7 +3826,8 @@ def run_disaggregated_mixed_stress(example_dir: str,
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env,
                              cwd=cwd, server_start_timeout=server_start_timeout,
-                             save_log=True, startup_callback=startup_callback)
+                             save_log=True, startup_callback=startup_callback,
+                             disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
     print(f"[startup] cluster ready in {time.monotonic() - setup_start:.1f}s",
           flush=True)
 
@@ -3618,9 +3844,10 @@ def run_disaggregated_mixed_stress(example_dir: str,
         # Pay the one-time autotuner cost before the measured run. The first
         # request of each shape triggers a ~20s autotuner host-step; left in
         # the measured run at high concurrency, a worker stuck in that step
-        # misses the 2s cluster heartbeat and is evicted mid-run, causing
-        # "Cluster is not ready" 500s. Default count = ~20s at the ~6 req/s
-        # observed in the 5k B200 run; results are discarded.
+        # exceeds even the 10s PRODUCTION_CLUSTER_TIMINGS inactive timeout
+        # and is evicted mid-run, causing "Cluster is not ready" 500s.
+        # Default count = ~20s at the ~6 req/s observed in the 5k B200 run;
+        # results are discarded.
         if warmup_request_count is None:
             warmup_request_count = 120
         print(
@@ -3896,12 +4123,10 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     setup_model_symlink(llm_venv, llama_model_root,
                         "llama-3.1-model/Llama-3.1-8B-Instruct")
 
-    config_file = get_test_config("llama31_8b_ucx", disaggregated_example_root,
+    config_file = get_test_config("llama31_8b", disaggregated_example_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
-    env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,

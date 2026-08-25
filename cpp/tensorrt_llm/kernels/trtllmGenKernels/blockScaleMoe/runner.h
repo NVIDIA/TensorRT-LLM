@@ -157,6 +157,24 @@ inline int32_t getMaxPermutedPaddedCount(
     return maxCgas * padding;
 }
 
+// Number of int32 elements to allocate for the route map (permutedIdxToTokenIdx).
+//
+// The trtllm-gen fused-permute gemm1 cubins (bmm_*_swiGlu_dynB_sm100f) speculatively load one
+// element past the end of the route map: the last CTA in the batch dimension issues a 4-byte read
+// of permutedIdxToTokenIdx[getMaxPermutedPaddedCount(...)]. The loaded value is never consumed --
+// padding rows are clamped away downstream -- but the access itself is out of bounds. It only
+// faults when the allocation happens to end on a page boundary, so whether it manifests depends on
+// the caching allocator's layout, which is what makes the resulting illegal-memory-access
+// intermittent and seemingly shape- and tactic-dependent (nvbugs/6165866).
+//
+// Until the kernels are regenerated with a guarded load, over-allocate the route map by one element
+// so the speculative read always lands inside the allocation. Only this buffer needs the padding;
+// the padded token counts that size the GEMM tensors are deliberately left untouched.
+inline int32_t getRouteMapAllocCount(int32_t maxPermutedPaddedCount)
+{
+    return maxPermutedPaddedCount + 1;
+}
+
 class Runner
 {
 public:

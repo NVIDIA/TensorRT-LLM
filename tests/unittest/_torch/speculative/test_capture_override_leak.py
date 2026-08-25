@@ -138,6 +138,3 @@ def test_override_stays_live_while_the_flag_is_set():
         (CAPTURE_TEMPERATURE, CAPTURE_TOP_K, CAPTURE_TOP_P)
     ] * len(warmup_requests)
     assert graph_meta.is_all_greedy_sample is False
-    assert not graph_meta.skip_temperature
-    assert not graph_meta.skip_top_k
-    assert not graph_meta.skip_top_p

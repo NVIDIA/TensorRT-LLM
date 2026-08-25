@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import eager_on_graph
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
 from .module import _forward_dsa_attn, forward_dsa_proj
@@ -146,3 +147,6 @@ def _mla_dsa_attn_inplace_fake(
     output: torch.Tensor,
 ) -> None:
     """Model the in-place output mutation during fake-tensor propagation."""
+
+
+maybe_bcg_mla_dsa_attn_inplace = eager_on_graph(mla_dsa_attn_inplace)

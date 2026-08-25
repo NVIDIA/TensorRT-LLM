@@ -22,6 +22,12 @@ context_servers:
     dtype: fp8
   moe_config:
     backend: TRTLLM
+    # Chunk the MoE forward at half of max_num_tokens, mirroring the non-MTP
+    # config: the ctx sizing here is identical (16640 tokens, 0.8 KV fraction,
+    # TRTLLM-Gen FP4 MoE), so a full-size chunk carries the same 7-8 GiB
+    # workspace transient that OOMs the ctx worker on 192GB B200 under
+    # 512-concurrency 8k prefill load.
+    max_num_tokens: 8320
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:

@@ -43,9 +43,9 @@ try:
 except ImportError:
     PlacementGroup = None
 
+from tensorrt_llm._torch.peft.lora.config import (
+    LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
-from tensorrt_llm.lora_helper import (LoraConfig,
-                                      get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
@@ -541,6 +541,26 @@ def _parse_binary_byte_string(value: Any) -> Any:
     return amount * multiplier
 
 
+class MultimodalEncoderSchedulingPolicy(StrEnum):
+    """Selects how a model that supports item-level MM encoder scheduling runs its encoder.
+
+    Ignored for models that do not support it (they always use legacy inline
+    encode).
+    """
+
+    DISABLED = "DISABLED"
+    """Legacy inline encode: the encoder runs inside the model forward, not as
+    a separately scheduled step. Item scheduling and its byte budget are off."""
+
+    DEFAULT = "DEFAULT"
+    """Item scheduling (``MultimodalScheduler``): the executor encodes atomic
+    MM items as a separate, budgeted step before prefill."""
+
+    EAGER = "EAGER"
+    """Item scheduling that advances encoder work for active requests before
+    LLM capacity filtering (``MultimodalEagerEncoderScheduler``)."""
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -569,14 +589,23 @@ class MultimodalConfig(StrictBaseModel):
     encoder_cache_max_bytes: NonNegativeInt = Field(
         default=134_217_728,  # 128 MiB.
         description=
-        ("Maximum bytes for the per-model cross-request multimodal encoder embedding cache. "
-         "Set to 0 to disable. String values such as '512MB' and '1GiB' use binary units. "
-         "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
-         "every item in the request must hit the cache before cached embeddings are reused. "
-         "Only single-modality requests are cacheable for the time being. "
-         "Can be combined with encoder_side_stream_max_ahead. "
-         "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
-         ),
+        ("Maximum bytes for the opt-in multimodal encoder embedding cache; 0 "
+         "disables it. String values such as '512MB' and '1GiB' use binary "
+         "units. Inline encoding caches whole single-modality requests; item "
+         "scheduling caches individual items. Compatible with side-stream "
+         "prefetch; their memory limits are additive."),
+        status="prototype",
+    )
+
+    encoder_scheduling_policy: MultimodalEncoderSchedulingPolicy = Field(
+        default=MultimodalEncoderSchedulingPolicy.DEFAULT,
+        description=(
+            "MM encoder scheduling policy for models that support item-level "
+            "encoder scheduling. DISABLED: legacy inline encode (item "
+            "scheduling and its byte budget off). DEFAULT: item scheduling. "
+            "EAGER: item scheduling that advances encoder work for active "
+            "requests before LLM capacity filtering. Ignored for models that "
+            "do not support item scheduling."),
         status="prototype",
     )
 
@@ -685,12 +714,13 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
-    sparse_num_index_heads: int = Field(
+    sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description="Number of index-attention heads (per TP rank's view).",
     )
     sparse_index_dim: int = Field(
         default=128,
+        gt=0,
         description="Per-head index Q/K dimension.",
     )
     sparse_block_size: int = Field(
@@ -718,6 +748,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    indexer_kv_dtype: Literal["bf16", "fp8"] = Field(
+        default="bf16",
+        description=
+        "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses "
+        "unscaled E4M3 values with FP32 score accumulation and is supported only "
+        "by the MSA implementation.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -740,11 +778,18 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     )
 
     @model_validator(mode="after")
-    def _validate_msa_block_size(self):
+    def _validate_msa_configuration(self):
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "
                 f"128, got {self.sparse_block_size}.")
+        if self.indexer_kv_dtype == "fp8" and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 indexer_kv_dtype='fp8' currently requires the "
+                "'msa' implementation.")
+        if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
+            raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
+                             "sparse_disable_index_value=True.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -767,6 +812,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
+            indexer_kv_dtype=self.indexer_kv_dtype,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1389,8 +1435,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: Literal[
-        "AUTO", "CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-        "DENSEGEMM", "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
+        "AUTO", "CUTLASS", "CUTEDSL", "TRTLLM", "DEEPGEMM", "DENSEGEMM",
+        "VANILLA", "TRITON", "MARLIN", "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"] = Field(
             default='AUTO',
             description="MoE backend to use. "
@@ -1584,10 +1630,6 @@ class CpConfig(StrictBaseModel):
         description=
         "FIFO version for alltoall communication. Used in HELIX parallelism. Defaults to 2."
     )
-    cp_anchor_size: Optional[int] = Field(
-        default=None, description="Anchor size for STAR attention.")
-    block_size: Optional[int] = Field(
-        default=None, description="Block size for STAR attention.")
 
     @field_validator("cp_type", mode="before")
     @classmethod
@@ -1721,6 +1763,15 @@ class AdvancedSamplingMode(StrEnum):
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
 
 
+class _MTPDraftCheckpointType(StrEnum):
+    """Internal description of where a one-model MTP drafter comes from."""
+
+    UNRESOLVED = "unresolved"
+    TARGET = "target"
+    HEAD_REPLACEMENT = "head_replacement"
+    EXTERNAL_DRAFT_MODEL = "external_draft_model"
+
+
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
@@ -1739,8 +1790,10 @@ class DecodingBaseConfig(StrictBaseModel):
                                       "speculative_model_dir"),
         description=
         "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'), "
-        "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
-    )
+        "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory. "
+        "For one-model MTP, a non-target checkpoint provides either replacement MTP heads or a complete external "
+        "draft model, depending on the target model implementation. Pointing it at the target checkpoint uses the "
+        "target's embedded mtp.* weights.")
 
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
@@ -1809,6 +1862,17 @@ class DecodingBaseConfig(StrictBaseModel):
         "filter kernels. FULL (default): per-row top_k/top_p. NO_TOPK: skip top_k. "
         "NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both.")
 
+    enable_penalty: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, enables the occurrence penalties (repetition / presence / frequency) "
+        "for one-model speculative decoding. Off by default because the penalties need a "
+        "[num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front "
+        "(CUDA graphs capture fixed buffer addresses). While off, a request that asks for "
+        "any of these penalties is rejected at admission rather than silently decoded "
+        "without them.")
+
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
@@ -1819,6 +1883,10 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
     # If set, the draft model attends directly over the target model KV cache.
     _use_shared_kv_cache: bool = PrivateAttr(False)
+    # Describes whether one-model MTP is embedded in the target, supplied as an MTP head replacement
+    # checkpoint, or supplied as an external draft model.
+    _mtp_draft_checkpoint_type: _MTPDraftCheckpointType = PrivateAttr(
+        default=_MTPDraftCheckpointType.UNRESOLVED)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -1928,6 +1996,32 @@ class DecodingBaseConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    @property
+    def uses_replacement_heads(self) -> bool:
+        """Whether `speculative_model` contains replacement MTP heads."""
+        if (not self.spec_dec_mode.is_mtp_one_model()
+                or self.speculative_model is None):
+            return False
+        return (self._mtp_draft_checkpoint_type ==
+                _MTPDraftCheckpointType.HEAD_REPLACEMENT)
+
+    @property
+    def uses_external_draft_model(self) -> bool:
+        """Whether `speculative_model` contains an external draft model."""
+        return (self.spec_dec_mode.is_mtp_one_model()
+                and self._mtp_draft_checkpoint_type
+                == _MTPDraftCheckpointType.EXTERNAL_DRAFT_MODEL)
+
+    @property
+    def needs_separate_draft_weights(self) -> bool:
+        """Whether draft weights must be loaded from ``speculative_model``.
+
+        This includes external draft models and MTP head replacement checkpoints.
+        """
+        return (self.spec_dec_mode.need_load_draft_weights()
+                or self.uses_external_draft_model
+                or self.uses_replacement_heads)
 
     @property
     def spec_dec_mode(self):
@@ -2101,8 +2195,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_one_model: Optional[bool] = Field(
         default=True,
         description=
-        "Whether to use the faster one-model implementation (draft as submodule) or the two-model implementation."
-    )
+        "Always uses the one-model implementation (draft as submodule). "
+        "Setting False is ignored and falls back to True; the two-model path "
+        "is deprecated and will be removed in a future release.")
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2134,8 +2229,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
             raise ValueError("max_draft_len must be > 0 for Eagle")
         if not self.eagle3_one_model:
             logger.warning(
-                "Eagle3 2-model is deprecated and will be removed in release 1.4."
-            )
+                "Eagle3 2-model (eagle3_one_model=False) is deprecated and "
+                "ignored; falling back to eagle3_one_model=True. "
+                "2-model will be removed in a future release.")
+            self.eagle3_one_model = True
 
         self.num_eagle_layers = self.max_draft_len
 
@@ -2543,8 +2640,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     mtp_eagle_one_model: bool = Field(
         default=True,
         description=
-        "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
-    )
+        "When using EAGLE-style MTP, always uses the one-model implementation "
+        "(drafter as submodule). Setting False is ignored and falls back to "
+        "True; the two-model path is deprecated and will be removed in a "
+        "future release.")
 
     use_dynamic_tree: bool = Field(
         default=False,
@@ -2575,8 +2674,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=None,
         init=False,
         description="Number of MTP layers in the model checkpoint. "
-        "Auto-populated from the model's pretrained config. Do not set manually."
-    )
+        "Auto-populated from the target pretrained config, or from "
+        "speculative_model's config.json when MTP heads are loaded separately. "
+        "Do not set manually.")
 
     begin_thinking_phase_token: NonNegativeInt = Field(
         default=128798,
@@ -2649,8 +2749,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def log_two_model_deprecation_warning(self):
         if not self.mtp_eagle_one_model:
             logger.warning(
-                "2-model style MTP is deprecated and will be removed in release 1.4."
-            )
+                "2-model style MTP (mtp_eagle_one_model=False) is deprecated "
+                "and ignored; falling back to mtp_eagle_one_model=True. "
+                "2-model will be removed in a future release.")
+            self.mtp_eagle_one_model = True
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -2765,6 +2867,16 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "model config (dflash_config.target_layer_ids).")
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
+
+    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
+        default="VANILLA",
+        description=
+        "Attention backend for DFlash pooled-context cross-attention. This is "
+        "independent of the backend used to construct the drafter's standard "
+        "attention modules. TRTLLM requires FlashInfer and an NVIDIA Blackwell "
+        "GPU with SM100 or SM103, and uses generated FMHA kernels with a private "
+        "paged context cache; VANILLA uses FlashAttention with a contiguous cache."
+    )
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -3626,11 +3738,6 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "`divide_length`): one speculative iteration may advance the counter "
         "by multiple accepted tokens; at most one eviction is coalesced per update."
     )
-    model_path: str = Field(
-        min_length=1,
-        description="Checkpoint path used to derive RoPE tables when converting "
-        "the official calibration and to classify kernel-masked sliding-attention "
-        "layers.")
     calibration_path: str = Field(
         min_length=1,
         description="Path to the official TriAttention calibration `.pt` "
@@ -3921,11 +4028,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
-        "is inherited as-is); 'fp8' or 'nvfp4' override it explicitly. Resolved at "
+        "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
+        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120/SM121. Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
-                                             "float32", "fp8", "nvfp4"))
+                                             "float32", "fp8", "fp8_ds_mla",
+                                             "nvfp4"))
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -4013,7 +4122,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "When False (default) the rebalance hook is skipped entirely and "
         "pool ratios remain at their warmup-derived values. Beta: enable at "
         "your own risk. Only used when using KV cache manager v2 "
-        "(experimental).")
+        "(experimental). This option is incompatible with dtype='fp8_ds_mla'.")
 
     disk_prefetch_num_reqs: int = Field(
         default=0,
@@ -4042,8 +4151,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=None,
         min_length=1,
         status="prototype",
-        description="Initial pool ratios for KV cache manager v2. Values map to "
-        "KVCacheManagerV2 pool_group_id order and must sum to 1.0. Hybrid Mamba "
+        description="Initial hot-tier byte ratios by layer group for KV cache "
+        "manager v2. Values map to KVCacheManagerV2 layer-group ID order and "
+        "must sum to 1.0. Cold tiers preserve the implied slot-count ratios. Hybrid Mamba "
         "models and DeepSeek-V4 use this directly, so avg_seq_len does not take "
         "effect when this is set.")
 
@@ -4107,13 +4217,24 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @classmethod
     def validate_dtype(cls, v: str):
         v = v.lower()
-        if v in ("auto", "fp8",
+        if v in ("auto", "fp8", "fp8_ds_mla",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
 
         raise ValueError(
-            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
-        )
+            'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
+            '"nvfp4", or valid torch.dtype string')
+
+    @model_validator(mode='after')
+    def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
+        """Reject resizing while packed sparse-MLA pool views are fixed."""
+        if self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance:
+            raise ValueError(
+                "kv_cache_config.dtype='fp8_ds_mla' is incompatible with "
+                "kv_cache_config.enable_kv_pool_rebalance=True because packed "
+                "sparse-MLA pool views are fixed at cache-manager construction time."
+            )
+        return self
 
     @field_validator('max_gpu_total_bytes')
     @classmethod
@@ -4288,14 +4409,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
         default=60000,
         description=
-        "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
-    )
+        "KV cache transfer timeout in milliseconds. Blocking sender waits use "
+        "it as an absolute deadline; blocking receive task waits use it per "
+        "task. The Python V2 transceiver requires a finite value; None remains "
+        "available to other runtimes. It is distinct from the sender future "
+        "wait slice.")
 
     kv_transfer_sender_future_timeout_ms: Optional[PositiveInt] = Field(
         default=1000,
         description=
-        "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
-    )
+        "Duration in milliseconds of each bounded sender future wait slice "
+        "while polling KV transfer completion. It does not set the overall "
+        "transfer deadline.")
 
     kv_transfer_poll_interval_ms: Optional[PositiveInt] = Field(
         default=5000,
@@ -5070,6 +5195,18 @@ class SamplerType(StrEnum):
     auto = "auto"
 
 
+class PrefillCudaGraphBackend(StrEnum):
+    """CUDA graph implementation used for prefill requests."""
+
+    DISABLED = "disabled"
+    PIECEWISE = "piecewise"
+    BREAKABLE = "breakable"
+
+
+_DEFAULT_PREFILL_CAPTURE_NUM_TOKENS = [2**i for i in range(8)
+                                       ] + [i for i in range(256, 3073, 256)]
+
+
 class TorchCompileConfig(StrictBaseModel):
     """Configuration for torch.compile."""
     enable_fullgraph: bool = Field(
@@ -5081,13 +5218,12 @@ class TorchCompileConfig(StrictBaseModel):
 
     enable_piecewise_cuda_graph: bool = Field(
         default=False,
-        description="Enable piecewise CUDA graph in torch.compile.")
+        description="Deprecated. Use prefill_cuda_graph_backend='piecewise' "
+        "instead.")
 
     capture_num_tokens: Optional[List[PositiveInt]] = Field(
         default=None,
-        description=
-        "List of num of tokens to capture the piecewise CUDA graph for. If not provided, the number of tokens will be the same as cuda_graph_config.batch_sizes."
-    )
+        description="Deprecated. Use prefill_capture_num_tokens instead.")
 
     @field_validator('capture_num_tokens')
     @classmethod
@@ -5102,16 +5238,9 @@ class TorchCompileConfig(StrictBaseModel):
         "When torch compile is enabled, userbuffers is enabled by default.")
 
     max_num_streams: PositiveInt = Field(
-        default=1,
+        default=3,
         description=
         "The maximum number of CUDA streams to use for torch.compile.")
-
-    @model_validator(mode='after')
-    def set_default_capture_num_tokens(self) -> 'TorchCompileConfig':
-        if self.enable_piecewise_cuda_graph and self.capture_num_tokens is None:
-            self.capture_num_tokens = [2**i for i in range(8)
-                                       ] + [i for i in range(256, 3073, 256)]
-        return self
 
 
 class TorchLlmArgs(BaseLlmArgs):
@@ -5217,11 +5346,13 @@ class TorchLlmArgs(BaseLlmArgs):
     encoder_max_batch_size: Optional[int] = Field(
         default=None,
         description=
-        ("Maximum encoder batch size. For encoder-decoder models, this also "
-         "controls encoder microbatch admission and limits encoder CUDA graph "
-         "batch sizes. For multimodal models, this is the shared "
-         "AttentionMetadata budget across all encoded modalities. Falls back "
-         "to `max_batch_size` when unset."),
+        ("Maximum number of top-level encoder inputs processed in one "
+         "iteration. For encoder-decoder models, each encoder request counts "
+         "as one input. For multimodal models, each atomic image, video, or "
+         "other encoder item counts as one input, even if it expands into "
+         "multiple internal attention sequences. For encoder-decoder models, "
+         "it also limits encoder CUDA graph batch sizes. Falls back to "
+         "`max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(
@@ -5229,8 +5360,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description=(
             "Maximum number of encoder tokens. For encoder-decoder models, this "
             "limits encoder CUDA graph total-token buckets. For multimodal "
-            "models, this is the shared AttentionMetadata budget across all "
-            "encoded modalities. Falls back to `max_num_tokens` when unset."),
+            "models, it limits encoder attention tokens scheduled in one "
+            "iteration and is shared across all encoded modalities. It falls "
+            "back to `max_num_tokens` when unset. Because an atomic multimodal "
+            "item cannot be split, the effective budget is raised to the "
+            "model's largest atomic item when necessary."),
         status="prototype")
 
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
@@ -5260,6 +5394,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if missing:
             raise ValueError("encoder_cuda_graph_config requires "
                              f"{' and '.join(missing)}.")
+
         return self
 
     attn_backend: str = Field(
@@ -5268,8 +5403,7 @@ class TorchLlmArgs(BaseLlmArgs):
         status="beta",
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
-        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER",
-                                             "FLASHINFER_STAR_ATTENTION"))
+        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
 
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
@@ -5357,6 +5491,20 @@ class TorchLlmArgs(BaseLlmArgs):
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
+
+    prefill_cuda_graph_backend: PrefillCudaGraphBackend = Field(
+        default=PrefillCudaGraphBackend.DISABLED,
+        description="CUDA graph implementation used for prefill requests. "
+        "Defaults to disabled.",
+        status="prototype",
+        telemetry=TelemetryField.categorical("disabled", "piecewise",
+                                             "breakable"))
+
+    prefill_capture_num_tokens: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Token-count buckets captured by the selected prefill CUDA graph implementation.",
+        status="prototype")
 
     enable_autotuner: bool = Field(
         default=True,
@@ -5572,20 +5720,6 @@ class TorchLlmArgs(BaseLlmArgs):
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
 
-    def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
-        """Return encoder runtime batch and token limits.
-
-        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
-        back to the LLM-side `max_batch_size` / `max_num_tokens` when the
-        encoder-specific knobs are not set.
-        """
-        return (
-            self.encoder_max_batch_size
-            if self.encoder_max_batch_size is not None else self.max_batch_size,
-            self.encoder_max_num_tokens
-            if self.encoder_max_num_tokens is not None else self.max_num_tokens,
-        )
-
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(
         default="pytorch",
@@ -5652,6 +5786,65 @@ class TorchLlmArgs(BaseLlmArgs):
                 "encode_only does not support piecewise CUDA graph in "
                 "TorchCompileConfig. Use cuda_graph_config for encoder CUDA "
                 "graphs or disable enable_piecewise_cuda_graph.")
+        return self
+
+    @model_validator(mode="after")
+    def normalize_prefill_cuda_graph_config(self) -> 'TorchLlmArgs':
+        """Normalize legacy piecewise CUDA graph options into prefill fields."""
+        backend_is_explicit = "prefill_cuda_graph_backend" in self.model_fields_set
+        buckets_are_explicit = "prefill_capture_num_tokens" in self.model_fields_set
+        compile_config = self.torch_compile_config
+        legacy_buckets_are_explicit = (compile_config is not None
+                                       and "capture_num_tokens"
+                                       in compile_config.model_fields_set)
+
+        if compile_config is not None and compile_config.enable_piecewise_cuda_graph:
+            if (backend_is_explicit and self.prefill_cuda_graph_backend
+                    != PrefillCudaGraphBackend.PIECEWISE):
+                raise ValueError(
+                    "torch_compile_config.enable_piecewise_cuda_graph conflicts "
+                    "with prefill_cuda_graph_backend")
+            logger.warning(
+                "TorchCompileConfig.enable_piecewise_cuda_graph is deprecated; "
+                "use prefill_cuda_graph_backend='piecewise' instead.")
+            self.prefill_cuda_graph_backend = PrefillCudaGraphBackend.PIECEWISE
+
+        legacy_buckets = (compile_config.capture_num_tokens
+                          if compile_config is not None else None)
+        if legacy_buckets_are_explicit:
+            logger.warning(
+                "TorchCompileConfig.capture_num_tokens is deprecated; use "
+                "prefill_capture_num_tokens instead.")
+            if (legacy_buckets is not None and buckets_are_explicit
+                    and self.prefill_capture_num_tokens is not None
+                    and sorted(set(legacy_buckets)) != sorted(
+                        set(self.prefill_capture_num_tokens))):
+                raise ValueError(
+                    "torch_compile_config.capture_num_tokens conflicts with "
+                    "prefill_capture_num_tokens")
+            if not buckets_are_explicit and legacy_buckets is not None:
+                self.prefill_capture_num_tokens = list(legacy_buckets)
+
+        if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
+            if self.prefill_capture_num_tokens is None:
+                self.prefill_capture_num_tokens = list(
+                    _DEFAULT_PREFILL_CAPTURE_NUM_TOKENS)
+            if self.encode_only:
+                raise ValueError(
+                    "encode_only does not support prefill CUDA graphs")
+
+        if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE:
+            if self.torch_compile_config is None:
+                self.torch_compile_config = TorchCompileConfig()
+        elif self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
+            if self.torch_compile_config is not None:
+                raise ValueError(
+                    "breakable prefill CUDA graph does not support torch_compile_config"
+                )
+            if self.enable_lora or self.lora_config is not None:
+                raise ValueError(
+                    "breakable prefill CUDA graph does not support LoRA")
+
         return self
 
     @model_validator(mode="after")
@@ -5933,8 +6126,6 @@ class TorchLlmArgs(BaseLlmArgs):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
-                if self.backend == "_autodeploy":
-                    self.speculative_config._draft_target_one_model = False
 
             # If speculative_config.draft_len_schedule is provided, cuda_graph_config.enable_padding is automatically set to True.
             # Also we add the draft_len_schedule keys into batch_sizes for better cuda graph coverage in dynamic draft length.
@@ -6124,7 +6315,7 @@ class TorchLlmArgs(BaseLlmArgs):
         assert self.quant_config is not None
         if self.kv_cache_config.dtype == "auto":
             return self
-        elif self.kv_cache_config.dtype == 'fp8':
+        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4

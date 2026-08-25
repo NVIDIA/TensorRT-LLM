@@ -11,9 +11,7 @@ This guide covers the TRT-LLM PyTorch attention stack:
 
 Use it when modifying the current implementation or adding a new model's
 attention behavior. It covers standard `Attention`, Multi-head Latent
-Attention (MLA), dense backends, and sparse backends. It does not cover
-`tensorrt_llm/_torch/attention_backend/star_flashinfer.py`, which is planned
-for deprecation.
+Attention (MLA), dense backends, and sparse backends.
 
 ## Glossary
 
@@ -134,14 +132,14 @@ both. The separate adapter types make the `Attention` and `MLA` signatures
 statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
-output allocation. DeepSeek-V4's fused epilogue is the exception: it requires
-two typed output buffers before the attention op runs, so it implements the
-optional output-preparation hook. `_create_outputs()` always returns a tensor
-list whose first entry is the standard attention output. The same list flows
-through forward, the registered custom op, and output projection; algorithms
-own the meaning of any additional entries. Context- and generation-phase
-helpers stay within each algorithm module and are not part of the generic hook
-facade.
+output allocation. DeepSeek-V4's fused epilogue instead uses the optional
+output-preparation hook to create one token-major O-LoRA output tensor. Its
+context- and generation-phase helpers allocate the private FP8 attention and
+scale buffers, then write the O-LoRA result into the corresponding token range.
+The shared MLA custom-op contract exposes exactly one mutable output tensor;
+`_create_outputs()` keeps that tensor in a single-entry list through forward
+and output projection. Phase-specific scratch buffers remain inside the
+DeepSeek-V4 algorithm module and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
@@ -204,6 +202,8 @@ The core contract is:
   - `support_fused_rope()`
   - `support_fused_qkv()`
   - `support_mla()`
+- `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
+  contract (default `0`); see below
 
 `**kwargs` is only a temporary compatibility path. It is merged into
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
@@ -211,6 +211,18 @@ an explicit `forward_args`.
 
 Those capability hooks are coarse checks. They do not prove that every
 required operator or sparse path already exists.
+
+**Workspace memory-accounting contract.** The KV-cache estimator profiles peak
+memory against an empty cache and hands the rest to the KV pool, so a workspace
+sized by a runtime quantity the profiling forward never drives to its serving
+maximum is under-reserved and can OOM mid-forward. If a backend stages such a
+buffer, declare its per-token cost via
+`runtime_workspace_bytes_per_token(model_config, mapping)` (default `0`): the
+estimator reserves it from the KV budget and the scheduler caps the driving sum.
+Keep the declared cost identical to the runtime allocation's (single source of
+truth). The one instance today is the fp8 context-MLA K/V dequant workspace,
+sized by summed attended KV length (`total_kv_len`) — which KV-cache reuse
+decouples from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
 
 ### 2.4 Capability reference
 
@@ -287,15 +299,44 @@ The main differences across backends:
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
 libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
+`FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
+DeepSeek-V4 and DSA,
 `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
 the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,msa_sparse_gqa,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback`
-or `TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_trtllm_gen` to force the fallback
+`cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
+use `TLLM_FMHA_LIBS=fallback` or
+`TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
+to force the fallback
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
+
+The `TrtllmAttention` constructor's optional `flashinfer_mla_backend` argument
+explicitly selects the MLA generation kernel inside
+`FlashInferTrtllmGenFmha` for that attention instance. It accepts
+`trtllm-gen` or `cute-dsl`; the latter uses the monolithic CuTeDSL decode
+implementation. When the argument is `None`, the ordered FMHA-library
+dispatch is preserved and FlashInfer uses `trtllm-gen` if reached. When it is
+set, the standalone `CuteDslMlaFmha` defers to the explicit FlashInfer
+selection. Selecting `cute-dsl` for an MLA layer using FP8 KV cache raises an
+exception because the current CuTeDSL kernel does not accept the
+device-resident BMM scale tensors produced for FP8 KV.
+
+`TrtllmAttention.mla_backend_policy` is an optional per-batch override hook:
+model code may install a callable
+`(static_backend, metadata, num_gen_tokens) -> backend` on an attention
+instance to adjust the selection to the batch composition.
+
+Kimi K3 defaults its absorbed-generation MLA backend to `cute-dsl` for BF16 KV
+cache (override with `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen`; other values are
+rejected at model build). FP8 KV cache forces `trtllm-gen`. K3 also installs a
+per-batch policy that falls back to `trtllm-gen` for mixed
+context/generation batches and multi-token generation (speculative
+verification), keeping `cute-dsl` for plain one-token-per-request decode. A
+mixed H=96 batch remains on `cute-dsl`: TRTLLM-Gen may select a 64-head Q tile,
+which does not divide 96 after K3's head padding removal.
 
 The FMHA package is split by role:
 
@@ -303,6 +344,8 @@ The FMHA package is split by role:
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
   requests and dispatches them to phase-specific hooks.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
+  MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
@@ -322,6 +365,9 @@ MLA fit cannot be judged from attention math alone. The module and backend must
 agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
 context behavior. Read `mla.py` and the relevant
 backend code for the current implementation details.
+
+fp8 context-MLA also stages a K/V dequant workspace sized by summed attended KV
+length; it is declared through the workspace memory-accounting contract (§2.3).
 
 #### 3.2.4 Sparse side-cache semantics
 
@@ -375,6 +421,11 @@ as the current blocker.
   How K/V are appended, what layout is assumed, how cached state is indexed and
   reused, whether chunked prefill or speculative decoding matters, and whether
   sparse side caches are required.
+
+- **Workspace memory accounting**
+  Whether the backend stages a workspace sized by a runtime quantity the KV-cache
+  profiler does not max out (e.g. `total_kv_len` under reuse) — if so, declare it
+  via `runtime_workspace_bytes_per_token` (§2.3).
 
 ### 4.3 Default bring-up order
 

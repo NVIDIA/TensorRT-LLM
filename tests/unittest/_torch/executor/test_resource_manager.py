@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from typing import NamedTuple, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -15,10 +16,12 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
@@ -27,7 +30,6 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1,
@@ -1003,6 +1005,8 @@ class TestResourceManager(unittest.TestCase):
                                                     token_nums=[64, 64],
                                                     is_gen=True,
                                                     max_num_draft_tokens=128)
+            self.assertEqual(kv_cache_manager._preprepared_dummy_request_ids,
+                             set())
             self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
             # The freed pool must serve follow-up allocations.
             requests = kv_cache_manager.add_dummy_requests([2], token_nums=[64])
@@ -1098,6 +1102,76 @@ class TestResourceManager(unittest.TestCase):
 
         # The PeftCacheManager should be created successfully with the provided stream
         self.assertTrue(peft_cache_manager.impl.enabled)
+
+
+@pytest.mark.cpu_only
+class TestKVCacheManagerPrepreparedDummies(unittest.TestCase):
+
+    @staticmethod
+    def _make_manager(is_draft: bool = False) -> KVCacheManager:
+        manager = KVCacheManager.__new__(KVCacheManager)
+        manager.mapping = Mapping()
+        manager.impl = MagicMock()
+        manager.impl.get_kv_cache_stats.return_value = SimpleNamespace(
+            free_num_blocks=8)
+        manager.is_linear_attention = False
+        manager.is_vswa = False
+        manager.num_extra_kv_tokens = 0
+        manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+        manager.is_draft = is_draft
+        manager.kv_connector_manager = None
+        manager._kv_reserve_draft_tokens = 0
+        manager._preprepared_dummy_request_ids = set()
+        return manager
+
+    @staticmethod
+    def _context_batch(request: LlmRequest) -> ScheduledRequests:
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [request]
+        return batch
+
+    def test_context_dummy_is_registered_once_and_id_can_be_reused(self):
+        manager = self._make_manager()
+
+        requests = manager.add_dummy_requests([0], token_nums=[64])
+        self.assertIsNotNone(requests)
+        request = requests[0]
+        self.assertEqual(manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 1)
+
+        manager.prepare_resources(self._context_batch(request))
+
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 1)
+
+        manager.free_resources(request)
+        self.assertEqual(manager._preprepared_dummy_request_ids, set())
+
+        manager.add_dummy_requests([0], token_nums=[64])
+        self.assertEqual(manager.impl.add_sequence_batch.call_count, 2)
+
+    def test_preprepared_dummy_ownership_is_manager_local(self):
+        target_manager = self._make_manager()
+        draft_manager = self._make_manager(is_draft=True)
+        other_manager = self._make_manager()
+
+        requests = target_manager.add_dummy_requests(
+            [0],
+            token_nums=[64],
+            draft_kv_cache_manager=draft_manager,
+        )
+        self.assertIsNotNone(requests)
+        request = requests[0]
+        self.assertEqual(target_manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(draft_manager._preprepared_dummy_request_ids, {0})
+        self.assertEqual(other_manager._preprepared_dummy_request_ids, set())
+
+        target_manager.prepare_resources(self._context_batch(request))
+        draft_manager.prepare_resources(self._context_batch(request))
+        other_manager.prepare_resources(self._context_batch(request))
+
+        self.assertEqual(target_manager.impl.add_sequence_batch.call_count, 1)
+        self.assertEqual(draft_manager.impl.add_sequence_batch.call_count, 1)
+        self.assertEqual(other_manager.impl.add_sequence_batch.call_count, 1)
 
 
 @pytest.mark.cpu_only

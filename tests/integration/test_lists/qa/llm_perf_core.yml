@@ -14,6 +14,7 @@ llm_perf_core:
 # 9: H100, H20, B200, B300, RTX6000-Server test cases
 # 10: H20, B200, B300, RTX6000-Server test cases
 # 10b: H20, B200, B300 test cases (>120G per GPU; excludes 96G RTX6000-Server)
+# 10c: B200, B300 test cases
 # 11: RTX-6000 Server test cases
 # ===============================================================================
 
@@ -352,8 +353,25 @@ llm_perf_core:
         gt: 120000
   tests:
   # deepseek_r1_0528 (FP8 645G, 8-GPU ep=8)
-  - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:8000,1000-reqs:20000-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:1000,2000-reqs:3000-ep:8-tp:8-gpus:8] TIMEOUT(100)
+
+
+# 10c: B200, B300 test cases
+- condition:
+    wildcards:
+      gpu:
+      - 'b200*'
+      - 'b300*'
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        gte: 10.0
+        lte: 10.3
+      gpu_memory:
+        gt: 120000
+  tests:
+  - perf/test_perf.py::test_perf[deepseek_r1_0528_fp8-bench-pytorch-float8-input_output_len:8000,1000-reqs:20000-ep:8-tp:8-gpus:8] TIMEOUT(120)
 
 
 # 11: RTX-6000 Server test cases

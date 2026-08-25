@@ -86,8 +86,15 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
 
     class CuteDslFusedMoE:
         @classmethod
-        def can_implement(cls, *_args, **_kwargs):
-            return False, f"CUTLASS DSL is unavailable: {import_error}"
+        def can_implement(cls, p, d):
+            from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+                MoEEligibility,
+                MoERejectReason,
+            )
+
+            return MoEEligibility.no(
+                MoERejectReason.DEP_MISSING, f"CUTLASS DSL is unavailable: {import_error}"
+            )
 
         def __init__(self, *_args, **_kwargs):
             raise RuntimeError(f"CUTLASS DSL is unavailable: {import_error}")

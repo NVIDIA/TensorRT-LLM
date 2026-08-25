@@ -26,11 +26,13 @@ the supplied-topk patches in this module.
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 from typing import Dict, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm.tools.layer_wise_benchmarks.runner import make_forward_impl_check
 
 from .builders import RoutingPlan
@@ -102,6 +104,30 @@ def _classify_native_projection(
     return "projected", f"{method_name}: unknown capability"
 
 
+def _grouped_routing_constraint(
+    routing_method: BaseMoeRoutingMethod,
+) -> Optional[Tuple[int, int]]:
+    """Return ``(n_group, topk_group)`` when the method enforces expert groups.
+
+    Only methods classified ``projected_or_exact`` mask experts by group before
+    the top-k (DeepSeek-V3 style ``noaux_tc``); for every other method the
+    grouping fields either do not exist or are not consumed by the routing
+    kernel, so the materialiser must stay unconstrained. ``n_group <= 1`` means
+    no grouping is in effect even on a grouped method.
+    """
+    method_name = type(routing_method).__name__
+    if _NATIVE_PROJECTION_CAPABILITIES.get(method_name) != "projected_or_exact":
+        return None
+    routing_impl = getattr(routing_method, "routing_impl", None)
+    if routing_impl is None:
+        return None
+    n_group = int(getattr(routing_impl, "n_group", 1) or 1)
+    topk_group = int(getattr(routing_impl, "topk_group", 1) or 1)
+    if n_group <= 1 or topk_group <= 0:
+        return None
+    return n_group, topk_group
+
+
 def _project_router_logits_for_plan(
     plan: RoutingPlan,
     src_rank: int,
@@ -147,6 +173,7 @@ def _project_router_logits_for_plan(
         moe_ep_size=moe_ep_size,
         device=device,
         scale_dtype=dtype if dtype.is_floating_point else torch.bfloat16,
+        group_constraint=_grouped_routing_constraint(routing_method),
     )
 
     # Base low / high pattern with a small monotone perturbation by k index so
@@ -200,23 +227,23 @@ def _make_supplied_topk_run_moe(
     balanced/imbalanced selection helpers.
     """
 
-    def supplied_run_moe(
-        x, token_selected_experts, token_final_scales, x_sf, router_logits, do_finalize, moe_output
-    ):
+    def supplied_run_moe(ctx, *, workspace=None):
         if getattr(moe_module, "_routing_results_replaced_at", None) is not None:
-            return run_moe_orig(
-                x,
-                token_selected_experts,
-                token_final_scales,
-                x_sf,
-                router_logits,
-                do_finalize,
-                moe_output,
-            )
+            return run_moe_orig(ctx, workspace=workspace)
+        x = ctx.x
+        do_finalize = ctx.do_finalize
         local, scales = _align_topk_to_batch(materialized_ids, materialized_scales, x.shape[0])
         local = local.to(device=x.device, dtype=torch.int32)
         scales = scales.to(device=x.device)
-        final_hidden_states = run_moe_orig(x, local, scales, x_sf, None, do_finalize, moe_output)
+        final_hidden_states = run_moe_orig(
+            replace(
+                ctx,
+                token_selected_experts=local,
+                token_final_scales=scales,
+                router_logits=None,
+            ),
+            workspace=workspace,
+        )
         if not do_finalize:
             final_hidden_states = (
                 final_hidden_states[0],

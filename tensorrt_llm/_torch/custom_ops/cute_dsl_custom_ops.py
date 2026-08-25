@@ -7271,6 +7271,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ------------------------------------------------------------------ #
     from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import \
         GvrTopKKernel as _GvrTopKKernel
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
+        is_tiered_topk_supported as _is_tiered_topk_supported
+    from ..cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_dispatch import \
+        tiered_topk as _tiered_topk
 
     class CuteDSLGvrTopKDecodeRunner:
         """Runner for the GVR Top-K cuTe DSL kernel (Blackwell SM100).
@@ -7292,77 +7296,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_seq_len: Optional[int],
             data_ptr: int,
         ) -> dict:
-            """Pick T / V / min_blocks_per_mp tuning knobs shared by
-            single-CTA / sort and LB compile paths. Returned keys match
-            ``_compile`` / ``_compile_lb`` param names for ``**tuning``
-            spreading.
-            """
-            enable_unroll_4 = True
-            enable_phase3_unroll = True
-            use_constant_hint = False
+            """Adapter over :meth:`GvrTopKKernel.pick_tuning` (the single
+            source of truth for the T / V / min_blocks_per_mp /
+            warp-reduce policy), shared by the single-CTA / sort and LB
+            compile paths. Returned keys match ``_compile`` /
+            ``_compile_lb`` param names for ``**tuning`` spreading.
 
-            # T=1024 needs 1 CTA/SM grid AND enough per-CTA vec work.
-            # Under graph capture, raise the half-prec bar so a small
-            # capture-N doesn't force T=1024 on small-N replays
-            # (~14-16% regression).
-            if max_seq_len is not None and torch_dtype != torch.float32:
-                n_thresh_t = 131072
-            else:
-                n_thresh_t = 65536
-            num_threads_per_block = (1024 if
-                                     (num_rows <= num_sms
-                                      and N_per_cta >= n_thresh_t) else 512)
-            # V=256-bit only helps fp32 at large N. Half-prec cvt
-            # doubles reg pressure (5-11% loss at K=512/1024). Caller
-            # must hand a contiguous (32B-aligned) tensor — torch.empty
-            # / row slices satisfy this; column / stride-padded layouts
-            # may not.
-            use_256bit_load = (torch_dtype == torch.float32
-                               and N_per_cta >= 16384)
-            if use_256bit_load:
+            Intentional shell divergence from ``GvrTopKKernel.launch``:
+            a 32B-misaligned logits pointer is a CONTRACT VIOLATION here
+            (assert), while ``launch`` silently downgrades to 128-bit
+            loads (dev convenience for ad-hoc tensors).
+            """
+            cfg = _GvrTopKKernel.pick_tuning(
+                torch_dtype,
+                num_rows,
+                N_per_cta,
+                num_sms,
+                graph_capture=max_seq_len is not None,
+            )
+            if cfg["use_256bit_load"]:
                 assert data_ptr % 32 == 0, (
                     f"use_256bit_load=True requires 32B-aligned "
                     f"logits.data_ptr(), got {data_ptr} % 32 = "
                     f"{data_ptr % 32}.")
-            # Warp-parallel reduce only pays at 32-warp (T=1024).
-            enable_warp_parallel_reduce = num_threads_per_block == 1024
-
-            # min_blocks_per_mp: reg-vs-occupancy 3-tier. Half-prec
-            # prefers extra CTA/SM (cvt-ILP fits in 40 regs); fp32
-            # wants mb=2 (4-LDG ILP needs ~70 regs).
-            vec_bits_host = 256 if use_256bit_load else 128
-            vec_w_host = vec_bits_host // (32 if torch_dtype == torch.float32
-                                           else 16)
-            n_vec_iters = max(1,
-                              N_per_cta // (num_threads_per_block * vec_w_host))
-            if torch_dtype == torch.float32:
-                if n_vec_iters < 4:
-                    min_blocks_per_mp = 0
-                elif num_rows <= num_sms:
-                    min_blocks_per_mp = 1
-                elif (num_sms * 2 < num_rows <= num_sms * 3
-                      and N_per_cta <= 32768):
-                    # mb=3 packs all CTAs in 1 wave; at N>=64K kernel
-                    # is bandwidth-bound and mb=2 wins instead.
-                    min_blocks_per_mp = 3
-                else:
-                    min_blocks_per_mp = 2
-            else:
-                if num_rows > num_sms:
-                    min_blocks_per_mp = 3
-                elif n_vec_iters < 4:
-                    min_blocks_per_mp = 0
-                else:
-                    min_blocks_per_mp = 1
-
             return dict(
-                enable_unroll_4=enable_unroll_4,
-                enable_phase3_unroll=enable_phase3_unroll,
-                use_constant_hint=use_constant_hint,
-                num_threads_per_block=num_threads_per_block,
-                use_256bit_load=use_256bit_load,
-                enable_warp_parallel_reduce=enable_warp_parallel_reduce,
-                min_blocks_per_mp=min_blocks_per_mp,
+                enable_unroll_4=True,
+                enable_phase3_unroll=True,
+                use_constant_hint=False,
+                num_threads_per_block=cfg["num_threads"],
+                use_256bit_load=cfg["use_256bit_load"],
+                enable_warp_parallel_reduce=cfg["enable_warp_parallel_reduce"],
+                min_blocks_per_mp=cfg["min_blocks_per_mp"],
             )
 
         @classmethod
@@ -7569,6 +7533,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             ``counters`` without ``order_row`` is rejected.
             """
+            # Tiered-GVR fast path: fp32 / next_n >= 1 (MTP) /
+            # cr in {1, 4} / npad <= 262144 decode rows route to the
+            # direct/reg/tp CuTe DSL tiers; everything else (half-prec, LB,
+            # oversize npad, hw cluster cap) falls through to the in-tree
+            # kernel below. ``order_row`` (the LJF hint dsa.py computes for
+            # num_rows >= 2 * num_sms) is accepted and ignored: the GVR
+            # tiers launch per-row CTAs and do not consume the permutation.
+            # Host-only guard — no device sync. The op signature and output
+            # contract are unchanged (unordered int32 indices, -1 pad only
+            # for degenerate rows).
+            if _is_tiered_topk_supported(logits, pre_idx, seq_lens,
+                                         output_indices, top_k, next_n,
+                                         compress_ratio, order_row, counters):
+                _tiered_topk(logits, pre_idx, seq_lens, output_indices, top_k,
+                             next_n, compress_ratio)
+                return
+
             cute_dtype = _TORCH_TO_CUTLASS_DTYPE[logits.dtype]
             num_rows = logits.shape[0]
             # seq_lens is request-level, logits is row-level (next_n
@@ -7621,21 +7602,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         f"prepare, or use the single-CTA path.")
             else:
                 if cluster_size is None:
-                    # B200 SXM5 synth-data tuning, 2026-06-10:
-                    #   N < 64K              -> 1 (sync unrecouped)
-                    #   N >= 128K, BS <= 4   -> 8 (tiny grid)
-                    #   BS * cs <= num_sms   -> cs (single-wave)
-                    #   else                 -> 1 (multi-wave loses)
-                    if N_row < 65536:
-                        cluster_size = 1
-                    elif num_rows <= 4 and N_row >= 131072:
-                        cluster_size = 8
-                    elif num_rows * 4 <= num_sms:
-                        cluster_size = 4
-                    elif num_rows * 2 <= num_sms:
-                        cluster_size = 2
-                    else:
-                        cluster_size = 1
+                    cluster_size = _GvrTopKKernel.pick_cluster_size(
+                        num_rows, N_row, num_sms)
                 if cluster_size > 1:
                     hw_max_cluster = _query_max_cluster_size()
                     if cluster_size > hw_max_cluster:
@@ -7697,7 +7665,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # ``num_rows >= 2 * num_sms``. Physical meaning: wave-2 must fit a
     # full SM-row's worth of CTAs so the sort has long-vs-short rows to
     # swap. Below that threshold the win is noise / can regress a few
-    # percent (B200 N∈{8K,16K,32K} sweep 2026-06-23).
+    # percent (measured, N in {8K,16K,32K}).
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
                              mutates_args=("output_indices", ),
                              device_types="cuda")

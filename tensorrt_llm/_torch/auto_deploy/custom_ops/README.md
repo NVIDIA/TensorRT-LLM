@@ -61,7 +61,7 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.torch_quant_nvfp4_moe` | NVFP4 quantized MoE (PyTorch backend) |
 | `torch.ops.auto_deploy.triton_moe_fused` | Fused MoE (Triton backend) |
 | `torch.ops.auto_deploy.triton_quant_fp8_moe` | FP8 quantized MoE (Triton backend) |
-| `torch.ops.auto_deploy.triton_mxfp4_moe` | MXFP4 MoE with triton-kernels matmul_ogs |
+| `torch.ops.auto_deploy.triton_mxfp4_moe` | MXFP4 MoE with triton-kernels matmul |
 | `torch.ops.auto_deploy.triton_mxfp4_moe_ep` | MXFP4 MoE with Expert Parallelism (triton-kernels) |
 | `torch.ops.auto_deploy.trtllm_moe_fused` | Fused MoE (TRT-LLM backend) |
 | `torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused` | FP8 quantized fused MoE (TRT-LLM backend) |

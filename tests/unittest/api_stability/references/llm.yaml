@@ -231,6 +231,14 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
         default: null
         status: prototype
+      prefill_cuda_graph_backend:
+        annotation: tensorrt_llm.llmapi.llm_args.PrefillCudaGraphBackend
+        default: disabled
+        status: prototype
+      prefill_capture_num_tokens:
+        annotation: Optional[List[int]]
+        default: null
+        status: prototype
       enable_autotuner:
         annotation: bool
         default: True
@@ -470,5 +478,8 @@ properties:
     annotation: str
     default: inspect._empty
   disaggregated_params:
+    annotation: dict
+    default: None
+  startup_metrics:
     annotation: dict
     default: None

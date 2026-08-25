@@ -122,8 +122,12 @@ class PostprocWorker:
 
         self._q = deque()
 
-        # Load the tokenizer and share in all records
-        self._tokenizer = load_hf_tokenizer(tokenizer_dir)
+        # Load the tokenizer and share in all records.
+        # Guard against a None tokenizer_dir: transformers'
+        # PreTrainedConfig._get_config_dict coerces it via str(None) → "None",
+        # which then becomes a HEAD request to huggingface.co/None/...
+        self._tokenizer = load_hf_tokenizer(
+            tokenizer_dir) if tokenizer_dir is not None else None
 
         # Build the user post-processing hook once, like the
         # tokenizer above; threaded onto each record in ``_handle_input``.

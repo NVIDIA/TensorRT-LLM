@@ -43,9 +43,8 @@ def _is_mm_disagg() -> bool:
 
 def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
     multimodal_data = param.multimodal_data or {}
-    modality_type = multimodal_data.get("modality_type")
-    return (modality_type in ("image", "video", "audio")
-            and multimodal_data.get(modality_type) is not None)
+    return any(
+        multimodal_data.get(m) is not None for m in ("image", "video", "audio"))
 
 
 # Processor *output* keys that transformers 5.x's
@@ -239,6 +238,22 @@ def _normalize_encoder_embeddings(
     return encoder_embeddings
 
 
+def _join_embeddings(embeddings: List[torch.Tensor]) -> torch.Tensor:
+    """Join per-item/per-request embeddings along dim 0 without a needless copy.
+
+    ``torch.cat`` always allocates, so calling it on a one-element list
+    duplicates the whole embedding. That matters here because the same rows
+    are joined several times on the way to the LLM input (per request, per
+    batch, and again in ``fuse_input_embeds``), and each redundant copy is a
+    full extra allocation live at the prefill peak. Multimodal embeddings are
+    read-only downstream -- they are sliced and scattered into the input
+    embedding buffer, never written in place -- so returning the sole tensor
+    is equivalent to concatenating it.
+    """
+    return embeddings[0] if len(embeddings) == 1 else torch.cat(embeddings,
+                                                                dim=0)
+
+
 def get_multimodal_embeddings(
     encoder_forward_fn: Callable[
         ...,
@@ -327,17 +342,16 @@ def get_multimodal_embeddings(
         # concatenate if embeds is a list of tensors
         embeds = param.multimodal_data.get("multimodal_embedding")
         if isinstance(embeds, list):
-            param.multimodal_data["multimodal_embedding"] = torch.cat(embeds,
-                                                                      dim=0)
+            param.multimodal_data["multimodal_embedding"] = _join_embeddings(
+                embeds)
 
     valid_params = [
         param for param in multimodal_params
         if param.multimodal_data.get("multimodal_embedding", None) is not None
     ]
-    all_embeddings = torch.cat([
+    all_embeddings = _join_embeddings([
         param.multimodal_data["multimodal_embedding"] for param in valid_params
-    ],
-                               dim=0)
+    ])
     return [all_embeddings]
 
 
@@ -359,7 +373,7 @@ def get_attached_multimodal_embeddings(
             continue
         # Some paths stash chunks. Slicer expects one tensor.
         if isinstance(embeds, list):
-            embeds = torch.cat(embeds, dim=0)
+            embeds = _join_embeddings(embeds)
             param.multimodal_data["multimodal_embedding"] = embeds
         if not isinstance(embeds, torch.Tensor):
             raise TypeError("multimodal_embedding must be a torch.Tensor")
@@ -368,7 +382,7 @@ def get_attached_multimodal_embeddings(
     if not attached_embeddings:
         return []
     # Match get_multimodal_embeddings output: one concatenated tensor.
-    return [torch.cat(attached_embeddings, dim=0)]
+    return [_join_embeddings(attached_embeddings)]
 
 
 def find_input_mm_embeds(
@@ -453,7 +467,7 @@ def find_input_mm_embeds(
 
     if len(mm_embeds) == 1:
         sliced = [mm_embeds[0][start:end] for start, end in slices]
-        return [torch.cat(sliced, dim=0)]
+        return [_join_embeddings(sliced)]
     return [mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)]
 
 
@@ -551,7 +565,7 @@ def fuse_input_embeds(
             return input_ids, None, extra_embeds
         return input_ids, None
 
-    mm_embed = torch.cat(mm_embeds, dim=0)
+    mm_embed = _join_embeddings(mm_embeds)
 
     # TODO: support the case where only one index tensor is provided, the other is derived as the complement (try to avoid implicit host-device synchronization)
     if text_token_indices is None or mm_token_indices is None:

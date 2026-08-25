@@ -85,9 +85,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        if self.kv_transfer_timeout_ms is None:
+            raise ValueError("KvCacheTransceiverV2 requires a finite kv_transfer_timeout_ms")
         self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
+        )
+        transfer_timeout_s = self.kv_transfer_timeout_ms / 1000.0
+        sender_wait_slice_s = (
+            self._sender_future_timeout_ms / 1000.0
+            if self._sender_future_timeout_ms is not None
+            else None
         )
         self._check_compatible()
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
@@ -115,8 +123,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # can be in-flight simultaneously. AuxBuffer holds only small CPU metadata, so a
                 # large multiplier is cheap.
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
-                tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
-                rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
+                tx_timeout_s=sender_wait_slice_s,
+                tx_overall_timeout_s=transfer_timeout_s,
+                rx_timeout_s=transfer_timeout_s,
                 # Size 0 turns bounce off; the per-transfer size gates are internal (tuned via
                 # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
                 # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
@@ -142,7 +151,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._page_table = self._transfer_worker.page_table
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
         # except under attention DP where the local count already is the total.
-        self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
+        # Helix CP ranks hold disjoint block sets, so they scale the request
+        # total the same way TP shards do (metric only).
+        self._kv_size_rank_factor = (
+            1 if mapping.enable_attention_dp else max(1, mapping.tp_size * mapping.cp_size)
+        )
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -284,11 +297,39 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
             total_blocks = (req.prompt_len + tpb - 1) // tpb
-            if block_ids.size > total_blocks:
-                block_ids = block_ids[:total_blocks]
             window_size = lg.sliding_window_size
 
             if window_size is not None:
+                allocated_blocks = (
+                    req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
+                ) // tpb
+                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
+                    block_ids,
+                    req.py_beam_width,
+                    allocated_blocks,
+                )
+                if beam0_block_ids.size > allocated_blocks:
+                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
+                    block_ids = (
+                        np.concatenate([beam0_block_ids, tail_block_ids])
+                        if tail_block_ids.size > 0
+                        else beam0_block_ids
+                    )
+                # Current PyExecutor cache managers disable KV-cache token sinks,
+                # so SWA block lists contain an evictable prompt prefix followed
+                # by the speculative scratch tail. If token sinks are enabled,
+                # this must use block-ordinal metadata to preserve the sink prefix.
+                # Remove scratch before trimming stale prompt blocks; otherwise a
+                # boundary-crossing allocation can displace initialized prompt KV.
+                scratch_blocks = max(0, allocated_blocks - total_blocks)
+                if scratch_blocks > 0:
+                    if req.py_beam_width != 1:
+                        raise ValueError("speculative scratch blocks require beam_width == 1")
+                    block_ids = (
+                        block_ids[:-scratch_blocks]
+                        if scratch_blocks < block_ids.size
+                        else np.array([], dtype=np.int64)
+                    )
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, total_blocks - stale_end)
@@ -298,7 +339,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # stale region (those blocks were already pruned, no extra skip).
                 cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
-                total_blocks = (req.prompt_len + tpb - 1) // tpb
+                if block_ids.size > total_blocks:
+                    block_ids = block_ids[:total_blocks]
                 expected_valid = total_blocks
                 cache_skip = cached_per_lg[idx] // tpb
 
@@ -330,7 +372,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
         """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
-        kv_cache_size and unblock the perf-metric timestamps that gate on it."""
+        kv_cache_size and unblock the perf-metric timestamps that gate on it.
+
+        Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
+        computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
+        every pool view of a group. The pool-0-only sizing gap for multi-pool attention groups is
+        tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
+        """
         pt = self._page_table
         if pt is None:
             return 0
@@ -490,8 +538,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
         )
 
-    def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, timed_out):
-        # TP first, then PP.  timed_out is local-only (back-off signal).
+    def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed):
+        # TP first, then PP. A local timeout remains nonterminal, so it is
+        # represented by the absence of that request from completed.
         c, f, d = self._consensus_outcome(
             to_process,
             cancelled,
@@ -503,7 +552,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if self._ctx_need_pp_sync:
             pp_allgather: Callable = getattr(self._dist, "pp_allgather")
             c, f, d = self._consensus_outcome(to_process, c, f, d, pp_allgather, True)
-        return c, f, d, timed_out
+        return c, f, d
 
     def _sync_transfer_timing(self, reqs: list):
         """Allgather timing for a batch of completed requests in one collective.
@@ -722,7 +771,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             block_all,
         )
 
-        completed, timed_out, failed, cancelled = [], [], [], []
+        completed, failed, cancelled = [], [], []
         for rid in to_process:
             session = self._send_sessions[rid]
             result = session.wait_complete(blocking=block_all)
@@ -734,16 +783,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             elif result == WaitResult.TIMEOUT:
                 logger.warning(
-                    f"TxSession rid={session.disagg_request_id} timed out after {self._sender_future_timeout_ms}ms"
+                    f"TxSession rid={session.disagg_request_id} exceeded "
+                    f"kv_transfer_timeout_ms={self.kv_transfer_timeout_ms}ms; "
+                    "keeping it in progress"
                 )
-                timed_out.append(rid)
             else:
                 logger.warning(f"TxSession rid={session.disagg_request_id} failed")
                 failed.append(rid)
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
-        cancelled, failed, completed, timed_out = self._ctx_consensus_outcome(
-            to_process, cancelled, failed, completed, timed_out
+        cancelled, failed, completed = self._ctx_consensus_outcome(
+            to_process, cancelled, failed, completed
         )
 
         for rid in cancelled:
@@ -997,10 +1047,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._wait_reqs[rid]
 
     def _check_compatible(self):
-        if self._mapping.cp_size != 1:
+        if self._mapping.cp_size != 1 and not self._mapping.has_cp_helix():
             raise ValueError(
-                f"KvCacheTransceiverV2: _check_compatible: only support context parallelism is 1: "
-                f"cp_size: {self._mapping.cp_size}"
+                f"KvCacheTransceiverV2: _check_compatible: unsupported context parallelism "
+                f"(cp_size={self._mapping.cp_size}, cp_type={self._mapping.cp_config.get('cp_type')}); "
+                f"only cp_size == 1 or helix CP is supported"
             )
 
     def commit_blocks_for_reuse(self, req) -> None:

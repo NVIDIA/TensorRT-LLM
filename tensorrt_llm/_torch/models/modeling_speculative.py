@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 import inspect
 from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
@@ -29,14 +32,20 @@ try:
         flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..pyexecutor.config_utils import (_is_sliding_attention_layer,
+                                       get_layer_attention_window)
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
+from ..speculative.dflash_attention import (get_dflash_flash_attention,
+                                            get_dflash_trtllm_gen_ops)
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              get_model_architecture, register_auto_model)
+
+_SPECULATIVE_POSITION_HEADROOM = "_speculative_position_headroom"
 
 
 def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
@@ -937,7 +946,10 @@ class DFlashForCausalLM(nn.Module):
     Reference: https://arxiv.org/pdf/2602.06036
     """
 
-    def __init__(self, draft_config):
+    def __init__(self,
+                 draft_config,
+                 *,
+                 dflash_attention_backend: str = 'VANILLA'):
         """Build the draft model, resolving its architecture from the draft config
         (falling back to a model_type-derived name when the checkpoint uses a
         custom DFlash architecture label)."""
@@ -984,10 +996,25 @@ class DFlashForCausalLM(nn.Module):
 
         self.target_layer_ids = dflash_config.get('target_layer_ids', None)
         self.block_size = getattr(pretrained_config, 'block_size', None)
+        self.dflash_attention_backend = dflash_attention_backend
+        if self.dflash_attention_backend == 'VANILLA':
+            self._dflash_flash_attention = get_dflash_flash_attention()
+        elif self.dflash_attention_backend == 'TRTLLM':
+            self._dflash_trtllm_gen_ops = get_dflash_trtllm_gen_ops()
+        else:
+            raise ValueError(
+                "DFlash attention backend must be VANILLA or TRTLLM, got "
+                f"{self.dflash_attention_backend!r}.")
+        self._dflash_trtllm_gen_workspace = None
+        self._dflash_trtllm_gen_counters = None
+        self.register_buffer("_dflash_batch_indices", None, persistent=False)
+        self.register_buffer("_dflash_block_offsets", None, persistent=False)
+        self._dflash_trtllm_gen_device = None
+        self._dflash_trtllm_gen_sm_count = None
         logger.info(
             f"DFlash draft model initialized with mask_token_id: {self.mask_token_id}, "
-            f"target_layer_ids: {self.target_layer_ids}, block_size: {self.block_size}"
-        )
+            f"target_layer_ids: {self.target_layer_ids}, block_size: {self.block_size}, "
+            f"attention_backend: {self.dflash_attention_backend}")
 
         # DSpark drafters (DFlash + low-rank Markov head + confidence head,
         # arXiv 2607.05147; reference: deepseek-ai/DeepSpec). The weights-
@@ -1074,6 +1101,7 @@ class DFlashForCausalLM(nn.Module):
         self._k_norm_stacked = None
         self._k_norm_eps = None
         self._num_attn_layers = 0
+        self._num_heads = 0
         self._head_dim = 0
         self._num_kv_heads = 0
         self._has_qk_norm = False
@@ -1083,6 +1111,45 @@ class DFlashForCausalLM(nn.Module):
         # non-causal block attention). Subclasses opt in.
         self._context_input_layernorm = False
         self._sliding_layers_causal = False
+        self._warn_inferred_attention_windows()
+
+    @staticmethod
+    def _rope_signature(attn):
+        """Return the effective RoPE configuration used by an attention layer."""
+        if attn.rotary_emb is not None:
+            return (
+                attn.rotary_emb.rope_params,
+                attn.rotary_emb.head_dim,
+                attn.rotary_emb.is_neox,
+            )
+        if attn.pos_embd_params is not None:
+            return (
+                attn.pos_embd_params.rope,
+                attn.head_dim,
+                attn.pos_embd_params.is_neox,
+            )
+        return None
+
+    def _validate_uniform_rope(self):
+        """Check that all draft layers can safely share one RoPE cache."""
+        if len(self.model.layers) == 0:
+            raise ValueError("DFlash requires at least one draft model layer.")
+
+        signatures = [
+            self._rope_signature(layer.self_attn) for layer in self.model.layers
+        ]
+
+        mismatched_layers = [
+            layer_idx
+            for layer_idx, signature in enumerate(signatures[1:], start=1)
+            if signature != signatures[0]
+        ]
+        if mismatched_layers:
+            layer_types = getattr(self.config, 'layer_types', None)
+            raise ValueError(
+                "DFlash shares one RoPE cache across draft layers, but layers "
+                f"{mismatched_layers} have a different effective RoPE "
+                f"configuration from layer 0. layer_types={layer_types}.")
 
     def _init_rope(self):
         """Initialize RoPE from the draft model's attention configuration.
@@ -1090,14 +1157,8 @@ class DFlashForCausalLM(nn.Module):
         Reuses the existing RotaryEmbedding infrastructure which correctly
         handles all RoPE variants (standard, YaRN, scaled, etc.).
         """
-        # RoPE is read from layer 0; guard that the drafter is single-layer-type
-        # (the target uses per-layer-type RoPE, the drafter does not).
-        layer_types = getattr(self.config, 'layer_types', None)
-        if layer_types is not None and len(set(layer_types)) > 1:
-            raise ValueError(
-                "DFlash _init_rope() reads RoPE from layer 0 only, but the drafter "
-                f"has heterogeneous layer_types {sorted(set(layer_types))}; per-layer "
-                "RoPE resolution is required for this checkpoint.")
+        # The flattened context-KV path shares layer 0's RoPE cache.
+        self._validate_uniform_rope()
         attn0 = self.model.layers[0].self_attn
 
         if attn0.rotary_emb is not None:
@@ -1493,6 +1554,7 @@ class DFlashForCausalLM(nn.Module):
             self._k_norm_stacked = None
             self._k_norm_eps = None
         self._num_attn_layers = len(layers_attn)
+        self._num_heads = num_heads
         self._head_dim = head_dim
         self._num_kv_heads = num_kv_heads
         self._fused_kv_weight = fused_kv_weight
@@ -1541,6 +1603,134 @@ class DFlashForCausalLM(nn.Module):
             rope_sin = rope_sin.to(dtype)
         return rope_cos, rope_sin
 
+    def _warn_inferred_attention_windows(self) -> None:
+        """Warn once at initialization when checkpoint metadata enables SWA."""
+        if getattr(self.config, 'use_sliding_window', None) is not None:
+            return
+
+        num_hidden_layers = getattr(self.config, 'num_hidden_layers', None)
+        if num_hidden_layers is None:
+            num_hidden_layers = len(self.model.layers)
+        layers_by_window = {}
+        for layer_idx in range(num_hidden_layers):
+            window = get_layer_attention_window(self.config, layer_idx)
+            if window is not None:
+                layers_by_window.setdefault(window, []).append(layer_idx)
+
+        for window, layer_indices in layers_by_window.items():
+            logger.warning(
+                "DFlash inferred pooled-context sliding-window attention from "
+                f"checkpoint config for draft layers {layer_indices}: "
+                f"window={window}. Context attention is truncated to {window} "
+                "tokens for these layers; if the drafter expects full context, "
+                "acceptance rate may drop. Set use_sliding_window explicitly "
+                "to confirm or disable windowing.")
+
+    def _get_attention_mask_args(self, layer_idx):
+        """Return FlashAttention causal and local-window arguments for a layer."""
+        layer_types = getattr(self.config, 'layer_types', None)
+        is_sliding_layer = False
+        if layer_types:
+            layer_type = layer_types[layer_idx % len(layer_types)]
+            is_sliding_layer = _is_sliding_attention_layer(layer_type)
+
+        sliding_window = get_layer_attention_window(self.config, layer_idx)
+        is_sliding_layer = is_sliding_layer or sliding_window is not None
+        if not is_sliding_layer:
+            return False, (-1, -1)
+
+        causal = self._sliding_layers_causal or sliding_window is not None
+        if sliding_window is None:
+            # Legacy drafters without an explicit window preserve their prior
+            # non-windowed behavior.
+            return causal, (-1, -1)
+        # FlashAttention's bounds are inclusive: W tokens are current + W-1 left.
+        return causal, (sliding_window - 1, 0)
+
+    def _prepare_dflash_trtllm_gen_buffers(
+        self,
+        dtype: torch.dtype,
+        device: torch.device,
+        max_batch_size: int,
+        block_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> None:
+        trtllm_gen_ops = self._dflash_trtllm_gen_ops
+        workspace_bytes = trtllm_gen_ops.get_workspace_size(
+            dtype=dtype,
+            num_tokens=max_batch_size * block_size,
+            num_gen_tokens=max_batch_size * block_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_dim,
+            max_num_requests=max_batch_size,
+            rotary_embedding_dim=0,
+            fp8_context_fmha=False,
+        )
+        device = torch.device(device)
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if self._dflash_trtllm_gen_device != device:
+            if is_capturing:
+                raise RuntimeError(
+                    "DFlash TRTLLM-Gen buffers must be prepared on the current "
+                    "device before CUDA graph capture.")
+            self._dflash_trtllm_gen_device = device
+            self._dflash_trtllm_gen_sm_count = (
+                torch.cuda.get_device_properties(device).multi_processor_count)
+
+        workspace = self._dflash_trtllm_gen_workspace
+        workspace_needs_allocation = (
+            workspace is None or workspace.device != device
+            or workspace.numel() * workspace.element_size() < workspace_bytes)
+        if workspace_needs_allocation:
+            if is_capturing:
+                raise RuntimeError(
+                    "The DFlash TRTLLM-Gen workspace must be allocated at the "
+                    "required size before CUDA graph capture.")
+            self._dflash_trtllm_gen_workspace = torch.empty(workspace_bytes,
+                                                            dtype=torch.uint8,
+                                                            device=device)
+
+        sm_count = self._dflash_trtllm_gen_sm_count
+        counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
+            num_heads, max_batch_size, sm_count)
+        counters = self._dflash_trtllm_gen_counters
+        counters_need_allocation = (counters is None
+                                    or counters.device != device
+                                    or counters.numel() *
+                                    counters.element_size() < counter_bytes)
+        if counters_need_allocation:
+            if is_capturing:
+                raise RuntimeError(
+                    "The DFlash TRTLLM-Gen counter buffer must be allocated at "
+                    "the required size before CUDA graph capture.")
+            self._dflash_trtllm_gen_counters = torch.zeros(counter_bytes,
+                                                           dtype=torch.uint8,
+                                                           device=device)
+
+        append_batch_indices = self._dflash_batch_indices
+        block_offsets = self._dflash_block_offsets
+        static_indices_need_allocation = (
+            append_batch_indices is None or block_offsets is None
+            or append_batch_indices.device != device
+            or block_offsets.device != device
+            or append_batch_indices.size(0) < max_batch_size
+            or append_batch_indices.size(1) != block_size
+            or block_offsets.numel() != block_size)
+        if static_indices_need_allocation:
+            if is_capturing:
+                raise RuntimeError(
+                    "DFlash TRTLLM-Gen index buffers must be allocated at the "
+                    "required size before CUDA graph capture.")
+            self._dflash_batch_indices = (torch.arange(
+                max_batch_size, dtype=torch.int32,
+                device=device).view(-1, 1).expand(-1, block_size).contiguous())
+            self._dflash_block_offsets = torch.arange(block_size,
+                                                      dtype=torch.int32,
+                                                      device=device)
+
     def dflash_forward(
         self,
         noise_embedding: torch.Tensor,
@@ -1549,6 +1739,8 @@ class DFlashForCausalLM(nn.Module):
         ctx_k_cache: torch.Tensor,
         ctx_v_cache: torch.Tensor,
         ctx_cache_batch_idx: torch.Tensor,
+        ctx_kv_cache: Optional[torch.Tensor] = None,
+        ctx_page_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """DFlash draft forward with cross-attention over a pooled K/V buffer.
 
@@ -1564,7 +1756,18 @@ class DFlashForCausalLM(nn.Module):
         Returns:
             [B * block_size, hidden_size]
         """
-        from flash_attn import flash_attn_with_kvcache
+        if self.dflash_attention_backend == 'TRTLLM':
+            if ctx_kv_cache is None or ctx_page_table is None:
+                raise RuntimeError(
+                    "DFlash TRTLLM-Gen requires a paged context cache and page table."
+                )
+            trtllm_gen_ops = self._dflash_trtllm_gen_ops
+        elif self.dflash_attention_backend == 'VANILLA':
+            flash_attention = self._dflash_flash_attention
+        else:
+            raise ValueError(
+                "DFlash attention backend must be VANILLA or TRTLLM, got "
+                f"{self.dflash_attention_backend!r}.")
 
         if self._fused_kv_weight is None:
             self._build_fused_kv_buffers()
@@ -1601,6 +1804,37 @@ class DFlashForCausalLM(nn.Module):
         # k/v at cache_seqlens[i]..+block_size for batch i.
         cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
         cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
+
+        if self.dflash_attention_backend == 'TRTLLM':
+            max_batch_size = ctx_page_table.size(0)
+            self._prepare_dflash_trtllm_gen_buffers(
+                hidden_states.dtype,
+                hidden_states.device,
+                max_batch_size,
+                block_size,
+                num_heads_per_rank,
+                num_kv_heads_per_rank,
+                head_dim,
+            )
+            block_tables = ctx_page_table.index_select(
+                0, cache_batch_idx_i32.long())
+            pages_per_slot = block_tables.size(1)
+            page_size = ctx_kv_cache.size(-2)
+            kv_indices = block_tables.flatten()
+            kv_indptr = torch.arange(
+                0,
+                (B + 1) * pages_per_slot,
+                pages_per_slot,
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            seq_lens_after = cache_seqlens_i32 + block_size
+            kv_last_page_len = ((seq_lens_after - 1) % page_size) + 1
+            batch_indices = self._dflash_batch_indices
+            append_batch_indices = batch_indices[:B].reshape(-1)
+            append_positions = (
+                cache_seqlens_i32.view(-1, 1) +
+                self._dflash_block_offsets).reshape(-1).contiguous()
 
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
@@ -1698,37 +1932,107 @@ class DFlashForCausalLM(nn.Module):
                                                    head_dim)
 
             # Per-layer view into the pooled ctx cache.
-            # [pool_batch, max_ctx+block, nkv, hd]; flash_attn dereferences
-            # each batch via cache_batch_idx, no gather.
-            layer_k_cache = ctx_k_cache[:, layer_idx]
-            layer_v_cache = ctx_v_cache[:, layer_idx]
-
-            # flash_attn appends k_noise/v_noise in-place at
-            # cache_seqlens[i]..+block_size for each batch i.
-            # DFlash sliding-attention draft layers use causal block attention;
-            # full-attention layers stay non-causal. Matches the vLLM reference,
-            # which overrides sliding_attention layers to causal metadata (the
-            # window itself is disabled; context K/V sit at absolute slots).
-            layer_types = getattr(self.config, 'layer_types', None)
-            causal = (self._sliding_layers_causal and bool(layer_types)
-                      and layer_types[layer_idx] == 'sliding_attention')
-            # DSpark SWA: non-causal sliding window on 'sliding_attention'
-            # layers ((-1, -1) == flash-attn default == no window otherwise).
-            # KV index == token position in the pool, so this restricts draft
-            # queries to the last swa_window context tokens + the block.
-            window_size = (self._dspark_layer_windows[layer_idx] if layer_idx
-                           < len(self._dspark_layer_windows) else (-1, -1))
-            out = flash_attn_with_kvcache(
-                q=Q_bshd,
-                k_cache=layer_k_cache,
-                v_cache=layer_v_cache,
-                k=k_noise_bshd,
-                v=v_noise_bshd,
-                cache_seqlens=cache_seqlens_i32,
-                cache_batch_idx=cache_batch_idx_i32,
-                causal=causal,
-                window_size=window_size,
-            )
+            causal, window_size = self._get_attention_mask_args(layer_idx)
+            dspark_window = (self._dspark_layer_windows[layer_idx] if layer_idx
+                             < len(self._dspark_layer_windows) else (-1, -1))
+            if dspark_window != (-1, -1):
+                window_size = dspark_window
+            if self.dflash_attention_backend == 'TRTLLM':
+                layer_cache = ctx_kv_cache[layer_idx]
+                trtllm_gen_ops.append_paged_kv_cache(
+                    append_key=k_noise_bshd.reshape(-1, num_kv_heads_per_rank,
+                                                    head_dim).contiguous(),
+                    append_value=v_noise_bshd.reshape(-1, num_kv_heads_per_rank,
+                                                      head_dim).contiguous(),
+                    batch_indices=append_batch_indices,
+                    positions=append_positions,
+                    paged_kv_cache=layer_cache,
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    kv_last_page_len=kv_last_page_len,
+                    kv_layout="HND",
+                )
+                out = torch.empty_like(Q_bshd)
+                q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
+                out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
+                window_left = window_size[0]
+                if causal:
+                    trtllm_gen_ops.batch_decode_with_kv_cache(
+                        query=q_flat,
+                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+                        workspace_buffer=self._dflash_trtllm_gen_workspace,
+                        block_tables=block_tables,
+                        seq_lens=seq_lens_after,
+                        max_seq_len=pages_per_slot * page_size,
+                        bmm1_scale=head_dim**-0.5,
+                        bmm2_scale=1.0,
+                        window_left=window_left,
+                        out=out_flat,
+                        sinks=None,
+                        enable_pdl=False,
+                        kv_layout="HND",
+                        backend="trtllm-gen",
+                        q_len_per_req=block_size,
+                        max_q_len=None,
+                        cum_seq_lens_q=None,
+                        kv_cache_sf=None,
+                        uses_shared_paged_kv_idx=True,
+                        bmm1_scale_log2=None,
+                        multi_ctas_kv_counter_buffer=self.
+                        _dflash_trtllm_gen_counters,
+                    )
+                else:
+                    cum_seq_lens_q = torch.arange(
+                        0,
+                        (B + 1) * block_size,
+                        block_size,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                    cum_seq_lens_kv = torch.cat((
+                        torch.zeros(1,
+                                    dtype=torch.int32,
+                                    device=hidden_states.device),
+                        seq_lens_after.cumsum(0, dtype=torch.int32),
+                    ))
+                    trtllm_gen_ops.batch_context_with_kv_cache(
+                        query=q_flat,
+                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+                        workspace_buffer=self._dflash_trtllm_gen_workspace,
+                        block_tables=block_tables,
+                        seq_lens=seq_lens_after,
+                        max_q_len=block_size,
+                        max_kv_len=pages_per_slot * page_size,
+                        bmm1_scale=head_dim**-0.5,
+                        bmm2_scale=1.0,
+                        batch_size=B,
+                        cum_seq_lens_q=cum_seq_lens_q,
+                        cum_seq_lens_kv=cum_seq_lens_kv,
+                        window_left=window_left,
+                        out=out_flat,
+                        sinks=None,
+                        enable_pdl=False,
+                        kv_layout="HND",
+                        kv_cache_sf=None,
+                        uses_shared_paged_kv_idx=True,
+                        causal=False,
+                        multi_ctas_kv_counter_buffer=self.
+                        _dflash_trtllm_gen_counters,
+                    )
+            else:  # VANILLA, validated before entering the layer loop.
+                layer_k_cache = ctx_k_cache[:, layer_idx]
+                layer_v_cache = ctx_v_cache[:, layer_idx]
+                out = flash_attention(
+                    q=Q_bshd,
+                    k_cache=layer_k_cache,
+                    v_cache=layer_v_cache,
+                    k=k_noise_bshd,
+                    v=v_noise_bshd,
+                    cache_seqlens=cache_seqlens_i32,
+                    cache_batch_idx=cache_batch_idx_i32,
+                    causal=causal,
+                    window_size=window_size,
+                )
             attn_output = out.reshape(B * block_size, q_size)
 
             # Per-drafter post-attention gate (no-op for generic DFlash; Laguna
@@ -1802,7 +2106,10 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
             if isinstance(dflash_config, dict):
                 config.block_size = dflash_config.get("block_size", None)
 
-    def __init__(self, draft_config):
+    def __init__(self,
+                 draft_config,
+                 *,
+                 dflash_attention_backend: str = 'VANILLA'):
         """Pin the Laguna draft-layer class and enable Laguna-specific behaviors
         (context input_layernorm, causal sliding blocks); reject non-per-head
         gating."""
@@ -1810,7 +2117,10 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         # remap to the Laguna architecture so TRT-LLM builds the Laguna layers.
         draft_config.pretrained_config.architectures = ["LagunaForCausalLM"]
         self._normalize_config(draft_config.pretrained_config)
-        super().__init__(draft_config)
+        super().__init__(
+            draft_config,
+            dflash_attention_backend=dflash_attention_backend,
+        )
         self._context_input_layernorm = True
         self._sliding_layers_causal = True
         gating = getattr(self.config, 'gating', True)
@@ -2116,11 +2426,11 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif model_config.spec_config._use_shared_kv_cache:
+    elif model_config.spec_config.uses_external_draft_model:
         if draft_config is None:
             raise ValueError(
-                "Shared-KV speculative decoding requires an external draft "
-                "model config.")
+                "MTP speculative decoding with an external draft model requires "
+                "its model config.")
         return AutoModelForCausalLM.from_config(draft_config)
     elif spec_dec_mode.is_mtp_one_model():
         return MTPForCausalLM(model_config,
@@ -2133,9 +2443,16 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     elif spec_dec_mode.is_dflash():
         draft_arches = getattr(draft_config.pretrained_config, "architectures",
                                None) or []
+        dflash_attention_backend = model_config.spec_config.attention_backend
         if any("Laguna" in arch for arch in draft_arches):
-            return DFlashLagunaForCausalLM(draft_config)
-        return DFlashForCausalLM(draft_config)
+            return DFlashLagunaForCausalLM(
+                draft_config,
+                dflash_attention_backend=dflash_attention_backend,
+            )
+        return DFlashForCausalLM(
+            draft_config,
+            dflash_attention_backend=dflash_attention_backend,
+        )
     elif spec_dec_mode.is_dspark():
         # Lazy import to avoid a cycle (modeling_dspark -> modeling_deepseekv4 ->
         # modeling_speculative). The DSpark draft reuses the target's aux streams.
@@ -2225,7 +2542,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
-                elif spec_config._use_shared_kv_cache:
+                elif spec_config.uses_external_draft_model:
                     self.draft_config = ModelConfig.from_pretrained(
                         spec_config.speculative_model,
                         trust_remote_code=True,
@@ -2237,7 +2554,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
                     self.draft_config.quant_config.kv_cache_quant_algo = \
                         model_config.quant_config.kv_cache_quant_algo
-                    self.draft_config.extra_attrs = model_config.extra_attrs
+                    self.draft_config.extra_attrs = dict(
+                        model_config.extra_attrs)
+                    self.draft_config.extra_attrs[
+                        _SPECULATIVE_POSITION_HEADROOM] = (
+                            2 * spec_config.tokens_per_gen_step)
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
                     self.draft_config = ModelConfig.from_pretrained(
@@ -2348,20 +2669,100 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         return logits
 
+    def mtp_head_module_names(self) -> List[str]:
+        """Names of the MTP heads under every alias they are reachable by.
+
+        One-model MTP registers the same head objects twice: under
+        ``draft_model.mtp_layers.{h}`` and, after the target model extends its
+        layer list, under ``model.layers.{num_hidden_layers + h}``. A load that
+        wants to leave the heads untouched has to exclude both aliases.
+        """
+        mtp_layers = getattr(self.draft_model, "mtp_layers", None)
+        if not mtp_layers:
+            return []
+        head_ids = {id(layer) for layer in mtp_layers}
+        return [
+            name for name, module in self.named_modules(remove_duplicate=False)
+            if name and id(module) in head_ids
+        ]
+
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional[BaseWeightMapper] = None,
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
+        from tensorrt_llm._torch.speculative.utils import (
+            filter_mtp_checkpoint_weights, uses_mtp_head_checkpoint)
+
+        skip_modules = ["draft_model"]
+        if uses_mtp_head_checkpoint(self.spec_config):
+            # The heads come from speculative_model in a second pass
+            # (load_draft_weights), so exclude them here. They must be
+            # *skipped* rather than tolerated via allow_partial_loading:
+            # partial loading suppresses process_weights_after_loading() on
+            # every quantized Linear/MoE it touches, which would leave the
+            # target model's quant scales (NVFP4 alphas, MoE input scales)
+            # uninitialized.
+            weights = filter_mtp_checkpoint_weights(weights)
+            skip_modules.extend(self.mtp_head_module_names())
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
-                             skip_modules=["draft_model"],
+                             skip_modules=skip_modules,
                              params_map=params_map,
                              allow_partial_loading=allow_partial_loading)
 
     def load_draft_weights(self,
                            weights: Dict,
                            weight_mapper: Optional[BaseWeightMapper] = None):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            _load_weights_impl_v2
+        from tensorrt_llm._torch.speculative.utils import (
+            remap_preprocessed_mtp_weights_for_draft_model,
+            select_mtp_checkpoint_weights,
+            skip_modules_for_separate_mtp_checkpoint, uses_mtp_head_checkpoint)
+
+        if uses_mtp_head_checkpoint(self.spec_config):
+            # Load MTP heads into draft_model only, and verify every non-shared
+            # MTP parameter has a matching tensor. The previous parent-model
+            # load used allow_partial_loading=True, which silently left MTP
+            # modules at random init when keys did not bind.
+            n_total = len(weights)
+            weights = select_mtp_checkpoint_weights(weights)
+            if not weights:
+                raise ValueError(
+                    "speculative_model was set for MTP but no 'mtp.*' weights "
+                    f"were found in {self.spec_config.speculative_model!r}. "
+                    "Expected keys like 'mtp.layers.0.*'.")
+            n_dropped = n_total - len(weights)
+            if n_dropped:
+                logger.warning(
+                    "Ignoring %d non-mtp.* tensors from speculative_model while "
+                    "loading MTP heads (kept %d mtp.* tensors).", n_dropped,
+                    len(weights))
+            if weight_mapper is None:
+                raise ValueError(
+                    "weight_mapper is required to load separate MTP heads")
+            weights = weight_mapper.preprocess_weights(weights)
+            num_hidden_layers = self.config.num_hidden_layers
+            num_mtp_layers = len(self.draft_model.mtp_layers)
+            weights = remap_preprocessed_mtp_weights_for_draft_model(
+                weights,
+                num_hidden_layers=num_hidden_layers,
+                num_mtp_layers=num_mtp_layers,
+            )
+
+            # Skip optional modules (e.g. shared_head) only when absent from
+            # this checkpoint; architectures that ship those tensors still load
+            # them under allow_partial_loading=False.
+            _load_weights_impl_v2(
+                self.draft_model,
+                weights,
+                weight_mapper,
+                skip_modules=skip_modules_for_separate_mtp_checkpoint(weights),
+                allow_partial_loading=False,
+            )
+            return
+
         args = inspect.getfullargspec(self.draft_model.load_weights).args
         if "weight_mapper" in args:
             self.draft_model.load_weights(weights=weights,
