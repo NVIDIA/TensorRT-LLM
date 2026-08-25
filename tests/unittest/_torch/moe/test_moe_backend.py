@@ -2076,8 +2076,6 @@ def test_trtllm_fp8_block_scales_fuse_shared_expert_layout(monkeypatch: pytest.M
             )
 
 
-
-
 @pytest.mark.parametrize("num_tokens", [1, 1024])
 def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
     if not torch.cuda.is_available():
