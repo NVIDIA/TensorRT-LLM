@@ -5363,6 +5363,9 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
+                 moe_config=MoeConfig(
+                     backend="TRTLLM" if get_sm_version() in (100,
+                                                              103) else "AUTO"),
                  max_batch_size=256,
                  max_num_tokens=100000,
                  kv_cache_config=kv_cache_config,
@@ -5399,6 +5402,9 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
 
         with LLM(self.MODEL_PATH,
                  attn_backend="TRTLLM",
+                 moe_config=MoeConfig(
+                     backend="TRTLLM" if get_sm_version() in (100,
+                                                              103) else "AUTO"),
                  max_batch_size=256,
                  max_num_tokens=100000,
                  tensor_parallel_size=4,
