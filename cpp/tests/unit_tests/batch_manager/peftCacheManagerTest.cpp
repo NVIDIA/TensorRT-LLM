@@ -217,7 +217,7 @@ TEST_F(PeftCacheManagerTest, adapterDataTypeRecalculatesHostByteBudgetPageCapaci
     bf16ModelConfig.setMaxLoraRank(mModelConfig->getMaxLoraRank());
 
     PeftCacheManagerConfig config(0, 2 * 8 * 92, 8, 64, 1, 1);
-    config.hostCacheSize = 100000000;
+    config.hostCacheSize = 100000000; // 100 MB (approximately 95.4 MiB)
     auto const [initialHostConfig, initialDeviceConfig]
         = PeftCacheManager::getPageManagerConfig(config, bf16ModelConfig, *mWorldConfig, *mManager);
     auto peftManager = std::make_unique<PeftCacheManager>(config, bf16ModelConfig, *mWorldConfig, *mManager);
