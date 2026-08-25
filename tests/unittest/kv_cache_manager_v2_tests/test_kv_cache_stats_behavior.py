@@ -133,11 +133,7 @@ def _create_manager(
     enable_partial_reuse: bool = True,
     block_reuse_policy: str = "all_reusable",
     enable_stats: bool = True,
-<<<<<<< HEAD
     max_util_for_resume: float = 1.0,
-    max_beam_width: int = 1,
-=======
->>>>>>> a88f2a5432 (test: trim redundant KV cache manager v2 coverage)
 ) -> KVCacheManagerV2:
     # NOTE: sizing here is by max_gpu_total_bytes, not max_tokens, so
     # max_util_for_resume is a pure resume gate with no effect on the pool size
