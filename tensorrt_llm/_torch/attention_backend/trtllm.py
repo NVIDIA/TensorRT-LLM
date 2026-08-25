@@ -704,47 +704,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.kv_lens_cuda[self.num_contexts:self.num_contexts +
                           num_gen_seqs].copy_(last_bounds)
 
-    def build_ugpu_block_offsets(
-        self,
-        source_block_offsets: Optional[torch.Tensor],
-        buffer_attr: str,
-    ) -> Optional[List[torch.Tensor]]:
-        if (not self.ugpu_enabled or source_block_offsets is None
-                or self.kv_cache_manager is None):
-            return None
-
-        num_ugpus = self.kv_cache_manager.num_ugpus
-        buffers = getattr(self, buffer_attr, None)
-        if buffers is None:
-            buffers = [
-                torch.zeros_like(source_block_offsets) for _ in range(num_ugpus)
-            ]
-            setattr(self, buffer_attr, buffers)
-
-        packed_block_offsets = []
-        num_ctx = self.num_contexts
-        for ugpu_idx in range(num_ugpus):
-            ctx_start = self.ugpu_ctx_req_splits[ugpu_idx]
-            ctx_end = self.ugpu_ctx_req_splits[ugpu_idx + 1]
-            gen_start = num_ctx + self.ugpu_gen_req_splits[ugpu_idx]
-            gen_end = num_ctx + self.ugpu_gen_req_splits[ugpu_idx + 1]
-            num_ctx_reqs = ctx_end - ctx_start
-            num_gen_reqs = gen_end - gen_start
-            num_seqs = num_ctx_reqs + num_gen_reqs
-            block_offsets = buffers[ugpu_idx]
-            block_offsets.zero_()
-            if num_seqs > 0:
-                if num_ctx_reqs > 0:
-                    block_offsets[:, :num_ctx_reqs].copy_(
-                        source_block_offsets[:, ctx_start:ctx_end],
-                        non_blocking=True)
-                if num_gen_reqs > 0:
-                    block_offsets[:, num_ctx_reqs:num_seqs].copy_(
-                        source_block_offsets[:, gen_start:gen_end],
-                        non_blocking=True)
-            packed_block_offsets.append(block_offsets)
-        return packed_block_offsets
-
     def _bind_runtime_views(
         self,
         *,
