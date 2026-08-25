@@ -25,6 +25,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
 )
 from tensorrt_llm.bindings import LlmRequestState
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _req(rid: int) -> SimpleNamespace:
     return SimpleNamespace(py_request_id=rid, state=None)
