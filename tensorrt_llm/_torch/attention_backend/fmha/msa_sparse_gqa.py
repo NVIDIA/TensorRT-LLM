@@ -271,18 +271,22 @@ def run_msa_paged_gqa(
     # Only a full pure-decode sparse batch is eligible for the configurable
     # MSA route. Mixed batches retain the Triton generation suffix because
     # their MSA plan covers only the context prefix.
-    decode_backend = getattr(getattr(attn, "sparse_params", None), "decode_backend", "default")
+    sparse_gqa_decode_backend = getattr(
+        getattr(attn, "sparse_params", None), "sparse_gqa_decode_backend", "triton"
+    )
     pure_sparse_decode = kv_block_indexes is not None and ported and gen_tok0 == 0
-    if decode_backend not in ("default", "msa", "adaptive"):
-        raise ValueError(f"Unsupported MiniMax-M3 decode backend: {decode_backend!r}.")
-    use_msa_decode = pure_sparse_decode and decode_backend == "msa"
+    if sparse_gqa_decode_backend not in ("triton", "msa", "adaptive"):
+        raise ValueError(
+            f"Unsupported MiniMax-M3 sparse GQA decode backend: {sparse_gqa_decode_backend!r}."
+        )
+    use_msa_decode = pure_sparse_decode and sparse_gqa_decode_backend == "msa"
     if use_msa_decode and plan is None:
         raise RuntimeError(
             "MiniMax-M3 selected the MSA sparse decode backend but no preplanned "
             "GQA plan is available; metadata preparation and dispatch disagree."
         )
 
-    if pure_sparse_decode and decode_backend == "adaptive":
+    if pure_sparse_decode and sparse_gqa_decode_backend == "adaptive":
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.sparse_decode_autotuner import (
             run_adaptive_sparse_decode,
         )

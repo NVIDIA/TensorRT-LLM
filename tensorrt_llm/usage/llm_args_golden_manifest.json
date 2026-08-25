@@ -1403,14 +1403,14 @@
     },
     {
       "allowed_values": [
-        "default",
+        "triton",
         "msa",
         "adaptive"
       ],
-      "annotation": "Literal['default', 'msa', 'adaptive']",
+      "annotation": "Literal['triton', 'msa', 'adaptive']",
       "converter": "",
       "kind": "categorical",
-      "path": "sparse_attention_config.decode_backend"
+      "path": "sparse_attention_config.sparse_gqa_decode_backend"
     },
     {
       "allowed_values": [],

@@ -1062,7 +1062,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             span is not None
             and not span.is_mixed
             and self._msa_params is not None
-            and self._msa_params.decode_backend != "default"
+            and self._msa_params.sparse_gqa_decode_backend != "triton"
         )
 
     def _msa_fmha_plan_rows(self) -> Optional[Tuple[int, int]]:
