@@ -47,10 +47,12 @@ namespace tensorrt_llm::batch_manager
 namespace
 {
 
-uint64_t getDeviceCacheAvailableMemory(runtime::BufferManager const& bufferManager)
+uint64_t getDeviceCacheByteBudget(PeftCacheManagerConfig const& config, runtime::BufferManager const& bufferManager)
 {
+    auto const memPercent = config.deviceCachePercent.value_or(PeftCacheManagerConfig::kDefaultDeviceCachePercent);
     auto const freeMem = std::get<0>(common::getDeviceMemoryInfo(false));
-    return freeMem + bufferManager.memoryPoolFree();
+    auto const availableMemory = freeMem + bufferManager.memoryPoolFree();
+    return static_cast<uint64_t>(static_cast<double>(memPercent) * static_cast<double>(availableMemory));
 }
 
 } // namespace
@@ -66,15 +68,15 @@ std::pair<uint64_t, uint64_t> PeftCacheManager::getMaxNumSlots(PeftCacheManagerC
     tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
     runtime::BufferManager const& bufferManager)
 {
-    auto const deviceCacheAvailableMemory = config.numDeviceModuleLayer > 0
+    auto const deviceCacheByteBudget = config.numDeviceModuleLayer > 0
         ? std::nullopt
-        : std::make_optional(getDeviceCacheAvailableMemory(bufferManager));
-    return getMaxNumSlots(config, dataType, pageWidth, max1dModSize, deviceCacheAvailableMemory);
+        : std::make_optional(getDeviceCacheByteBudget(config, bufferManager));
+    return getMaxNumSlots(config, dataType, pageWidth, max1dModSize, deviceCacheByteBudget);
 }
 
 std::pair<uint64_t, uint64_t> PeftCacheManager::getMaxNumSlots(PeftCacheManagerConfig const& config,
     tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
-    std::optional<uint64_t> deviceCacheAvailableMemory)
+    std::optional<uint64_t> deviceCacheByteBudget)
 {
     TLLM_LOG_DEBUG("max1dModeSize=%llu", max1dModSize);
     TLLM_LOG_DEBUG("pageWidth=%llu", pageWidth);
@@ -100,10 +102,8 @@ std::pair<uint64_t, uint64_t> PeftCacheManager::getMaxNumSlots(PeftCacheManagerC
     }
     else
     {
-        auto const memPercent = config.deviceCachePercent.value_or(PeftCacheManagerConfig::kDefaultDeviceCachePercent);
-        TLLM_CHECK(deviceCacheAvailableMemory.has_value());
-        totalDeviceSlots = static_cast<uint64_t>(static_cast<double>(memPercent)
-            * static_cast<double>(deviceCacheAvailableMemory.value()) / static_cast<double>(pageWidthSize));
+        TLLM_CHECK(deviceCacheByteBudget.has_value());
+        totalDeviceSlots = deviceCacheByteBudget.value() / pageWidthSize;
     }
 
     auto hostMem = totalHostSlots * pageWidthSize;
@@ -121,17 +121,16 @@ std::pair<runtime::LoraCachePageManagerConfig, runtime::LoraCachePageManagerConf
 PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager)
 {
-    auto const deviceCacheAvailableMemory = config.numDeviceModuleLayer > 0
+    auto const deviceCacheByteBudget = config.numDeviceModuleLayer > 0
         ? std::nullopt
-        : std::make_optional(getDeviceCacheAvailableMemory(bufferManager));
-    return getPageManagerConfig(
-        config, modelConfig, worldConfig, modelConfig.getDataType(), deviceCacheAvailableMemory);
+        : std::make_optional(getDeviceCacheByteBudget(config, bufferManager));
+    return getPageManagerConfig(config, modelConfig, worldConfig, modelConfig.getDataType(), deviceCacheByteBudget);
 }
 
 std::pair<runtime::LoraCachePageManagerConfig, runtime::LoraCachePageManagerConfig>
 PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig, tensorrt_llm::DataType dataType,
-    std::optional<uint64_t> deviceCacheAvailableMemory)
+    std::optional<uint64_t> deviceCacheByteBudget)
 {
 
     auto const tpSize = worldConfig.getTensorParallelism();
@@ -167,7 +166,7 @@ PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, run
     TLLM_LOG_DEBUG("max1dModSize=%llu", max1dModSize);
 
     auto [totalHostSlots, totalDeviceSlots]
-        = getMaxNumSlots(config, dataType, pageWidth, max1dModSize, deviceCacheAvailableMemory);
+        = getMaxNumSlots(config, dataType, pageWidth, max1dModSize, deviceCacheByteBudget);
 
     TLLM_CHECK_WITH_INFO(totalHostSlots >= minTotalSlots,
         "Not enough space allocated to host LoRA cache to hold 1 max sized LoRA %lu < %lu", totalHostSlots,
@@ -276,10 +275,12 @@ PeftCacheManager::PeftCacheManager(PeftCacheManagerConfig const& config, runtime
     mConfig.maxAdapterSize = std::min(mConfig.maxAdapterSize, modelConfig.getMaxLoraRank());
     if (mConfig.numDeviceModuleLayer == 0)
     {
-        mDeviceCacheAvailableMemory = getDeviceCacheAvailableMemory(bufferManager);
+        mDeviceCacheByteBudget = getDeviceCacheByteBudget(mConfig, bufferManager);
     }
-    auto [hostCacheConfig, deviceCacheConfig] = getPageManagerConfig(
-        mConfig, modelConfig, worldConfig, modelConfig.getDataType(), mDeviceCacheAvailableMemory);
+    // Allocate provisionally with the model dtype so cache capacity is available before the
+    // first adapter selects the homogeneous LoRA dtype.
+    auto [hostCacheConfig, deviceCacheConfig]
+        = getPageManagerConfig(mConfig, modelConfig, worldConfig, modelConfig.getDataType(), mDeviceCacheByteBudget);
     mHostLoraCache = std::make_unique<runtime::LoraCache>(hostCacheConfig, modelConfig, worldConfig, bufferManager);
     mDeviceLoraCache = std::make_unique<runtime::LoraCache>(deviceCacheConfig, modelConfig, worldConfig, bufferManager);
 
@@ -448,7 +449,9 @@ void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
     // reconfiguring them one at a time here would let a concurrent copyTask observe one cache
     // already switched to the new dtype while the other still holds the old one.
     auto const [hostCacheConfig, deviceCacheConfig]
-        = getPageManagerConfig(mConfig, mModelConfig, mWorldConfig, dataType, mDeviceCacheAvailableMemory);
+        = getPageManagerConfig(mConfig, mModelConfig, mWorldConfig, dataType, mDeviceCacheByteBudget);
+    // Retain the provisional allocations when dtype and page capacity already match;
+    // otherwise replace both page managers while they are still empty.
     mHostLoraCache->setDataTypeCoordinated(
         *mDeviceLoraCache, dataType, hostCacheConfig.getTotalNumPages(), deviceCacheConfig.getTotalNumPages());
     mDataType = dataType;
