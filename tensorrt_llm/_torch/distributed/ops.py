@@ -47,6 +47,9 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
+_MNNVL_NUM_LAMPORT_BUFFERS = 3
+_MNNVL_BUFFER_ALIGNMENT_BYTES = 32
+_MNNVL_MAX_BUFFER_SIZE_BYTES = ((2**32 - 1) // _MNNVL_BUFFER_ALIGNMENT_BYTES) * _MNNVL_BUFFER_ALIGNMENT_BYTES
 
 _thread_local = threading.local()
 
@@ -254,6 +257,8 @@ def get_or_scale_allreduce_mnnvl_workspace(
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
     """
 
+    if buffer_size_bytes is not None and (buffer_size_bytes < 0 or buffer_size_bytes > _MNNVL_MAX_BUFFER_SIZE_BYTES):
+        raise ValueError("[MNNVL] Required workspace size is outside the supported range")
     allreduce_mnnvl_workspaces = MNNVLAllReduce.allreduce_mnnvl_workspaces
     if mapping in allreduce_mnnvl_workspaces:
         workspace = allreduce_mnnvl_workspaces[mapping]
@@ -327,21 +332,26 @@ def _get_or_scale_allreduce_mnnvl_workspace(
             assert comm is not None
             # Safeguard against when buffer_size_bytes is None
             req_buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
-            # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
-            buffer_size_bytes = math.ceil(req_buffer_size_bytes /
-                                          (8 * 1024 * 1024)) * (8 * 1024 * 1024)
+            buffer_size_bytes = req_buffer_size_bytes
             logger.debug(
                 f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
             )
         candidate_workspace: Optional[_MnnvlWorkspace] = None
         candidate_error: Optional[Exception] = None
         try:
+            buffer_size_bytes = ((buffer_size_bytes + _MNNVL_BUFFER_ALIGNMENT_BYTES - 1) // _MNNVL_BUFFER_ALIGNMENT_BYTES) * _MNNVL_BUFFER_ALIGNMENT_BYTES
             # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
             workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
             mcast_buf_handle = _make_mnnvl_mcast_buffer(comm,
                                                         workspace_size_bytes,
                                                         mapping,
                                                         use_fabric_handle)
+            usable_size = mcast_buf_handle.get_buffer_size()
+            buffer_size_bytes = min(usable_size // NUM_LAMPORT_BUFFERS, _MNNVL_MAX_BUFFER_SIZE_BYTES)
+            buffer_size_bytes -= buffer_size_bytes % _MNNVL_BUFFER_ALIGNMENT_BYTES
+            if buffer_size_bytes < workspace_size_bytes // NUM_LAMPORT_BUFFERS:
+                raise RuntimeError("[MNNVL] Allocator returned insufficient usable capacity")
+            workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
             # We use per FP32 element in the buffer for lamport sync
             buffer = mcast_buf_handle.get_uc_buffer(
                 mapping.tp_rank,
@@ -963,7 +973,7 @@ class MNNVLAllReduce(nn.Module):
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
 
         # We use uint32_t to store workspace size related info. Safeguard against overflow.
-        if workspace_size_bytes >= 2**32 - 1:
+        if workspace_size_bytes > _MNNVL_MAX_BUFFER_SIZE_BYTES:
             # Raise an error so we can fallback to other allreduce strategies
             raise ValueError(
                 f"[MNNVL AllReduce] Required workspace {workspace_size_bytes} bytes exceeds uint32 limits "
