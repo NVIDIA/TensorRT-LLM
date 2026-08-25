@@ -412,6 +412,7 @@ def should_use_short_mha(
         return False
     if not (
         self.short_seq_mha_threshold > 0
+        and self.kv_cache_dtype != "fp8_ds_mla"
         and not self.apply_rotary_emb
         and self.mapping.cp_size == 1
         and position_ids is not None

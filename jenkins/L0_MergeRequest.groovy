@@ -152,13 +152,26 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def DISABLE_CBTS = "disable_cbts"
+@Field
+def INFRA_DRY_RUN = "infra_dry_run"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
-// Rollout switch for pre-merge Tier 2 coverage-based narrowing. Keep collection
-// enabled above while this remains off so a later pilot allowlist has fresh data.
+// Version-controlled Tier 2 rollout policy. Keep this in the infra-owned Groovy
+// boundary so changing who receives coverage-based narrowing requires infra review.
 @Field
-def ENABLE_CBTS_COVERAGE_TIER = false
+def CBTS_COVERAGE_PILOT_USERS = [
+    "crazydemo",
+    "QiJune",
+    "sunnyqgg",
+    "Barry-Delaney",
+    "xxi-nv",
+    "leslie-fang25",
+    "rosong11",
+    "tongyuantongyu",
+] as Set
+@Field
+def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -180,6 +193,7 @@ def testFilter = [
     (CBTS_RESULT): null,
     (CBTS_COVERAGE): false,
     (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
+    (INFRA_DRY_RUN): (params.InfraDryRun?.toString()?.toBoolean() ?: false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -215,6 +229,7 @@ if (runMode == "nightly_release") {
 // GenPostMergeBuilds pipelines do not update GitLab status.
 boolean enableUpdateGitlabStatus =
     !GEN_POST_MERGE_BUILDS_ONLY &&
+    !testFilter[INFRA_DRY_RUN] &&
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     !testFilter[DISABLE_MULTI_GPU_TEST] &&
@@ -353,19 +368,43 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
     }
+    if (params.program_version_name) {
+        env.NSPECT_RELEASE_VERSION = params.program_version_name
+    } else {
+        def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
+        def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
+        if (!versionMatcher.find()) {
+            error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
+        }
+        def nspectReleaseVersionSuffix = "dev"
+        if (runMode == "nightly_release") {
+            nspectReleaseVersionSuffix = "nightly"
+        } else if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+            nspectReleaseVersionSuffix = "postmerge"
+        }
+        env.NSPECT_RELEASE_VERSION = "${versionMatcher.group(1)}_${nspectReleaseVersionSuffix}"
+    }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-    if (!GEN_POST_MERGE_BUILDS_ONLY) {
+    if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
     }
-    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-    testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
-    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-    testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
-    // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
-    // Coverage runs only on the official post-merge pipeline.
-    testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (testFilter[INFRA_DRY_RUN]) {
+        pipeline.echo("Changed-file analysis is skipped for the infrastructure dry run.")
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = false
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = ""
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = []
+        pipeline.echo("CBTS is skipped for the infrastructure dry run.")
+    } else {
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
+        // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
+    testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
@@ -464,7 +503,11 @@ def preparation(pipeline, testFilter, globalVars)
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
         stage("Merge Test Waive List") {
-            mergeWaiveList(pipeline, globalVars)
+            if (testFilter[INFRA_DRY_RUN]) {
+                echo "Skipping Merge Test Waive List for the infrastructure dry run."
+            } else {
+                mergeWaiveList(pipeline, globalVars)
+            }
         }
     })
 }
@@ -547,7 +590,7 @@ def launchReleaseCheck(pipeline, globalVars)
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
-    def image = "urm.nvidia.com/docker/golang:1.22"
+    def image = "urm.nvidia.com/docker/golang:1.23"
     stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
@@ -718,7 +761,8 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT ||
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file list to empty list.")
@@ -754,7 +798,8 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     // Note: This function intentionally propagates exceptions to the caller.
     // If there is an error to get the changed file diff, skip merging the waive list.
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT ||
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file diff to empty string.")
@@ -850,9 +895,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Download the touch DB only when Tier 2 is enabled. Tier 1 rules still
-        // run while the coverage tier is disabled during the initial rollout.
-        def coverageDb = _cbtsCoverageDb(pipeline)
+        // Download the touch DB only for PRs in the coverage-tier pilot.
+        def coverageDb = _cbtsCoverageAudit(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -923,18 +967,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Resolve the optional Tier 2 input behind an explicit rollout gate. Keeping
-// this separate makes the follow-up pilot allowlist a small policy change.
-def _cbtsCoverageDb(pipeline)
-{
-    if (!ENABLE_CBTS_COVERAGE_TIER) {
-        pipeline.echo("CBTS: coverage tier disabled — running Tier 1 only")
-        return null
-    }
-    return _cbtsCoverageAudit(pipeline)
-}
-
-// Fetch the touch DB and audit it; artifact.py's {path, meta} verbatim, or null on failure.
+// Check pilot eligibility, then fetch and audit the touch DB; artifact.py's
+// {path, meta} verbatim, or null on failure.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
@@ -943,12 +977,26 @@ def _cbtsCoverageAudit(pipeline)
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
         def readyJson = ""
+        def prAuthor = ""
+        def pilotEligible = false
         withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
-            readyJson = sh(
-                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+            prAuthor = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
             ).trim()
+            pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
+            pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
+            if (pilotEligible) {
+                readyJson = sh(
+                    script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                            "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                    returnStdout: true,
+                ).trim()
+            }
+        }
+        if (!pilotEligible) {
+            pipeline.echo("CBTS: coverage tier disabled for this PR — running Tier 1 only")
+            return null
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — skipping Tier 2")
@@ -1057,6 +1105,55 @@ def _cbtsParseSelectionResult(String text)
         // Coverage tier omits multi-GPU stages; L0_Test re-adds them under this flag.
         enable_multi_gpu: data.enable_multi_gpu ?: false,
     ]
+}
+
+// Returns true when the PR touches any file that requires @NVIDIA/trt-llm-oss-compliance review
+// (mirrors the patterns in .github/CODEOWNERS under "OSS Compliance & Legal").
+def getOssComplianceFileChanged(pipeline, globalVars)
+{
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (isOfficialPostMergeJob) {
+        pipeline.echo("OSS compliance check: skipped (post-merge).")
+        return false
+    }
+
+    // Exact file matches
+    def exactFiles = [
+        "LICENSE",
+        "setup.py",
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "cpp/CMakeLists.txt",
+        "cpp/conanfile.py",
+        ".github/CODEOWNERS",
+        "jenkins/license_cpp.json",
+        "tensorrt_llm/usage/llm_args_golden_manifest.json",
+    ] as Set
+
+    // Prefix matches (directory trees and glob-style prefixes from CODEOWNERS)
+    def prefixes = [
+        "ATTRIBUTIONS-",
+        "cpp/cmake/",
+        "3rdparty/",
+        "triton_kernels/",
+        "docker/common/",
+        "tensorrt_llm/usage/",
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    def matched = changedFileList.find { file ->
+        exactFiles.contains(file) || prefixes.any { prefix -> file.startsWith(prefix) }
+    }
+    if (matched) {
+        pipeline.echo("OSS compliance file changed: ${matched}")
+        return true
+    }
+    return false
 }
 
 def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
@@ -1595,7 +1692,8 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
         ]
     }
 
-    if (env.testPhase2StageName) {
+    // Preserve an explicit empty phase override from the dry-run helper.
+    if (!additionalParameters.containsKey('testPhase2StageName') && env.testPhase2StageName) {
         parameters += [
             'testPhase2StageName': env.testPhase2StageName,
         ]
@@ -1640,16 +1738,86 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     return buildStatus
 }
 
+def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, imageParameters)
+{
+    String testFilterJson = writeJSON returnText: true, json: testFilter
+    def additionalParameters = [
+        'testFilter': testFilterJson,
+        // Keep all synthetic GPU-count stages in this helper.
+        'testPhase2StageName': '',
+    ] + imageParameters
+    stage("[Test-${arch}-Single-GPU] Remote Run") {
+        launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, platform, additionalParameters)
+    }
+}
+
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
         "Release-Check": {
             script {
-                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                if (testFilter[INFRA_DRY_RUN]) {
+                    echo "Skipping Release-Check for the infrastructure dry run."
+                    return
+                } else if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
                     return
                 }
                 launchReleaseCheck(this, globalVars)
+            }
+        },
+        "OSS-Compliance-Check": {
+            script {
+                stage("[OSS-Compliance-Check] Run") {
+                    if (!testFilter[(OSS_COMPLIANCE_FILE_CHANGED)]) {
+                        echo "Skipping OSS Compliance Check: no OSS compliance-related files changed."
+                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                        return
+                    }
+                    if (GEN_POST_MERGE_BUILDS_ONLY) {
+                        echo "Skipping OSS Compliance Check (GenPostMergeBuilds mode: builds only)"
+                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                        return
+                    }
+                    def ref = env.gitlabBranch ?: "main"
+                    def repoUrlKey = "tensorrt_llm_github_sync"
+                    withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+                        if (env.gitlabSourceRepoHttpUrl == DEFAULT_LLM_REPO) {
+                            repoUrlKey = "tensorrt_llm_internal"
+                        }
+                    }
+                    echo "Triggering OSS Compliance (PLC) scan for ref: ${ref}"
+                    try {
+                        def params = [
+                            string(name: 'ref', value: env.gitlabCommit),
+                            string(name: 'repoUrlKey', value: repoUrlKey),
+                            string(name: 'forkOwner', value: ''),
+                            string(name: 'postMergePipelineName', value: ''),
+                            string(name: 'postMergeBuildNumber', value: ''),
+                            string(name: 'scanMode', value: 'pre_merge'),
+                            string(name: 'runSourceCodeScanning', value: 'true'),
+                            string(name: 'runContainerScanning', value: 'false'),
+                            string(name: 'runSonarQube', value: 'false'),
+                        ]
+                        def logger = new Logger(pipeline)
+                        def handle = build(
+                            job: "/LLM/helpers/PLCScanningSetup",
+                            parameters: params,
+                            propagate: false
+                        )
+                        if (handle.result == "UNSTABLE") {
+                            logger.log("OSS Compliance Check downstream job is UNSTABLE, ignoring")
+                        } else if (handle.result != "SUCCESS") {
+                            error "Downstream job did not succeed"
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        catchError(buildResult: 'Failure', stageResult: 'Failure') {
+                            error "OSS Compliance Check failed: ${e.getMessage()}, please rerun."
+                        }
+                    }
+                }
             }
         },
         "x86_64-Linux": {
@@ -1677,6 +1845,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
                 if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
                     echo "Skipping x86_64 tests (PLC container scanning)"
+                    return
+                }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
                     return
                 }
 
@@ -1831,6 +2008,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping SBSA tests (PLC container scanning)"
                     return
                 }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJob(pipeline, "SBSA", testFilter, globalVars, "SBSA", imageParameters)
+                    return
+                }
 
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
@@ -1981,13 +2166,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 runMode == "nightly_release" ||
                                 env.JOB_NAME ==~ /.*PostMerge.*/,
                             'defaultTag': defaultTag,
+                            'program_version_name': env.NSPECT_RELEASE_VERSION,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildInternalRelease': false,
                                 'buildCiImage': false,
                                 'buildNgcRelease': true,
-                                'register_images': true,
                                 'wait_success_seconds': "",
                             ]
                         }
@@ -2056,9 +2241,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (runMode == "nightly_release") {
                             additionalParameters += [
                                 'buildNgcRelease': true,
-                                'register_images': true,
                                 'wait_success_seconds': "",
                             ]
+                            additionalParameters['program_version_name'] = env.NSPECT_RELEASE_VERSION
                         } else {
                             additionalParameters['nspect_id'] = ""
                         }
@@ -2137,7 +2322,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     }]}
 
-    parallelJobs.failFast = enableFailFast
+    // Preserve both architecture tracks during dry acceptance.
+    def effectiveFailFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast
+    parallelJobs.failFast = effectiveFailFast
     pipeline.parallel parallelJobs
 }
 
@@ -2161,24 +2348,26 @@ pipeline {
     post {
         unsuccessful {
             script {
-                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "failed", GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
         }
         success {
             script {
-                if (enableUpdateGitlabStatus) {
-                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
-                } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
-                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
-                    trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                if (!testFilter[INFRA_DRY_RUN]) {
+                    if (enableUpdateGitlabStatus) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
+                        trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    }
                 }
             }
         }
         aborted {
             script {
-                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
                     trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'canceled', GITLAB_PROJECT_ID, env.gitlabCommit)
                 }
             }
@@ -2231,7 +2420,11 @@ pipeline {
                     if (isReleaseCheckMode) {
                         stage("Release-Check") {
                             script {
-                                launchReleaseCheck(this, globalVars)
+                                if (testFilter[INFRA_DRY_RUN]) {
+                                    echo "Skipping Release-Check for the infrastructure dry run."
+                                } else {
+                                    launchReleaseCheck(this, globalVars)
+                                }
                             }
                         }
                     } else {

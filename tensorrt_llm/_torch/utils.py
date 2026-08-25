@@ -61,14 +61,13 @@ class ActivationType(IntEnum):
     Geglu = 6
     SwigluBias = 7
     Relu2 = 8
+    SiTu = 9
 
 
 # TRTLLM-Gen-local activation encoding, kept separate from the shared
-# ActivationType above ON PURPOSE: ActivationType mirrors the cutlass enum in
-# common.h and drives cutlass MoE kernels, whereas SiTu exists only in the
-# trtllm-gen batched-GEMM kernels. Adding SiTu to the shared ActivationType
-# would force a matching cutlass enum member that no cutlass kernel implements.
-# So SiTu stays here (TRTLLM-15177 item 1.2(a): decided keep-backend-local).
+# ActivationType above: ActivationType mirrors the CUTLASS enum in common.h,
+# while ActType_TrtllmGen mirrors the independent batched-GEMM encoding below.
+# SiTu is supported by both backends, but its numeric value is backend-local.
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
@@ -88,7 +87,8 @@ class ActType_TrtllmGen(IntEnum):
 # And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
 def is_gated_activation(activation_type: ActivationType) -> bool:
     return activation_type in [
-        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu,
+        ActivationType.SiTu
     ]
 
 
@@ -100,6 +100,22 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+@contextlib.contextmanager
+def torch_compiling(enable: bool):
+    """Scope `is_torch_compiling()` to a region, restoring the prior value.
+
+    The flag is a plain module global, not thread- or context-local, so it
+    outlives the engine that set it. Code running a model region outside an
+    engine forward must establish the value rather than inherit it.
+    """
+    prev_enable = is_torch_compiling()
+    set_torch_compiling(enable)
+    try:
+        yield
+    finally:
+        set_torch_compiling(prev_enable)
 
 
 def set_piecewise_running(enable: bool):

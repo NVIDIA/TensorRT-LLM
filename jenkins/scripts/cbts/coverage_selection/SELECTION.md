@@ -112,7 +112,7 @@ same stripping, so this introduces no assumption the pipeline does not already m
 
 | Signal | Meaning |
 |---|---|
-| `test_meta` reports incomplete | `outcome != passed`, or `saved_procs < expected_workers + 1` — the DB's own account |
+| `test_case_meta` reports incomplete | `outcome != passed`, or `saved_procs < expected_workers + 1` — the compact DB's logical completeness view |
 | Drove inference but has no `py_executor` rows | the coordinator ran but the worker's coverage never arrived |
 | Footprint < 30 functions | the record is near-empty |
 | On a `-Ray-` stage | the GPU worker is uninstrumented, only driver-side rows exist |
