@@ -1783,8 +1783,12 @@ class KimiK3MLAAttention(MLA):
 
         # K3 is NoPE. The base MLA backends still require real RoPE tables, so
         # retain their expected shape and replace every rotation with identity.
-        assert isinstance(self.mha, TrtllmAttention)
-        assert isinstance(self.mqa, TrtllmAttention)
+        if not isinstance(self.mha, TrtllmAttention) or not isinstance(self.mqa, TrtllmAttention):
+            raise ValueError(
+                "Kimi K3 MLA requires the TRTLLM attention backend; its NoPE "
+                "identity RoPE table is installed on TrtllmAttention only. Got "
+                f"mha={type(self.mha).__name__}, mqa={type(self.mqa).__name__}."
+            )
         _install_identity_rope_table(self.mha)
         _install_identity_rope_table(self.mqa)
         # Only the absorbed-generation backend (mqa) requests CuTe-DSL, so
