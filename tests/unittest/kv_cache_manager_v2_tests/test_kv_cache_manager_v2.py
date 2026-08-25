@@ -3373,22 +3373,29 @@ class TestInitRatioConfig(unittest.TestCase):
         manager.shutdown()
 
     def test_gpu_quota_below_constraint_minimum_raises(self):
-        """Configured GPU quotas below the constraint floor are rejected."""
+        """A configured GPU quota below its constraint floor is rejected."""
         num_requests = 32
         constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
         granularity = 2 << 20
-        quota_without_resume_headroom = round_up(
+        gpu_quota = round_up(
             num_requests * self.PG0_SLOT_SIZE, granularity
         ) + round_up(num_requests * self.PG1_SLOT_SIZE, granularity)
-        for gpu_quota in (0, quota_without_resume_headroom):
-            with self.subTest(gpu_quota=gpu_quota):
-                cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
-                cfg.max_util_for_resume = 0.95
+        cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
+        cfg.max_util_for_resume = 0.95
 
-                with self.assertRaisesRegex(
-                    InsufficientQuotaError, f"GPU cache tier quota {gpu_quota} is insufficient"
-                ):
-                    KVCacheManager(cfg)
+        with self.assertRaisesRegex(
+            InsufficientQuotaError, f"GPU cache tier quota {gpu_quota} is insufficient"
+        ):
+            KVCacheManager(cfg)
+
+    def test_zero_gpu_quota_raises(self):
+        """A zero configured GPU quota is rejected."""
+        cfg = self._make_config(gpu_quota=0)
+
+        with self.assertRaisesRegex(
+            InsufficientQuotaError, "GPU cache tier quota 0 is insufficient"
+        ):
+            KVCacheManager(cfg)
 
     def test_constraint_floor_overrides_infeasible_initial_pool_ratio(self):
         """A constraint's feasibility floor overrides an infeasible initial_pool_ratio.
