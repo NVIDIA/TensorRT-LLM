@@ -13,7 +13,7 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_library(kda_decode_src OBJECT kdaDecode.cu)
+add_library(kda_decode_src OBJECT kdaDecodeDispatcher.cpp kdaDecodeLegacy.cu)
 
 set_property(TARGET kda_decode_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kda_decode_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
