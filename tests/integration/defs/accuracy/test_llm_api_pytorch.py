@@ -8047,6 +8047,55 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+class TestNemotron35Lightning(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-3.5-Lightning"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+    # Test with no thinking to save time.
+    EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
+        enable_thinking=False))
+
+    @skip_no_hopper
+    def test_nvfp4_marlin_mtp3_chunked_prefill(self):
+        """Single-GPU Hopper guard for the Marlin NVFP4 path.
+
+        The checkpoint is MIXED_PRECISION: routed experts, shared experts and
+        lm_head are W4A16_NVFP4, the Mamba projections are FP8 and the MTP
+        layers are left unquantized. ``moe_config.backend=MARLIN`` plus
+        ``nvfp4_gemm_config.allowed_backends=['marlin']`` pin both the MoE and
+        the dense NVFP4 GEMMs to Marlin, which is Ada/Hopper only. Chunked
+        prefill, CUDA graphs and the overlap scheduler are enabled together so
+        the combination with MTP drafting is covered end to end.
+        """
+        max_batch_size = 32
+        mtp_config = MTPDecodingConfig(max_draft_len=3)
+        with LLM(
+                self.MODEL_PATH,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float32",
+                    free_gpu_memory_fraction=0.7,
+                ),
+                max_batch_size=max_batch_size,
+                # Chunk size below the evaluation prompt lengths so the
+                # multi-chunk Mamba/attention prefill path is actually taken.
+                enable_chunked_prefill=True,
+                max_num_tokens=1024,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=max_batch_size,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="MARLIN"),
+                nvfp4_gemm_config={"allowed_backends": ["marlin"]},
+                speculative_config=mtp_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
 @skip_pre_hopper
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     MODEL_NAME = "MiniMaxAI/MiniMax-M2"
