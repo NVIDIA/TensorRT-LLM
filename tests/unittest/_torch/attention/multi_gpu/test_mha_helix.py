@@ -18,11 +18,11 @@ import sys
 import weakref
 from dataclasses import dataclass
 
-import _torch.attention.helix_test_utils as helix_utils
+import _torch.attention.multi_gpu.helix_test_utils as helix_utils
 import cloudpickle
 import pytest
 import torch
-from _torch.attention.helix_test_utils import (
+from _torch.attention.multi_gpu.helix_test_utils import (
     CACHE_TYPE_SELF,
     activate_all_ranks_for_context,
     compute_mismatch_ratio,

@@ -69,8 +69,7 @@ measured: []
   does not add precision loss.)
 - **Verify:** correctness — fused-op output equals the unfused `cat/gather +
   quantize` reference within tolerance, incl. non-contiguous / edge strides
-  (`tests/unittest/_torch/attention/kernels/serial/test_fused_cat_fp8.py`,
-  `test_triton_gather_k_cache.py`). Perf — kernel/op count
+  (`test_fused_cat_fp8.py`, `test_triton_gather_k_cache.py`). Perf — kernel/op count
   and prep-phase time before vs after; confirm `register_fake` lets `torch.compile`
   trace the op.
 - **Rollback:** swap the call site back to the unfused `cat/split/gather + quantize`
@@ -79,7 +78,7 @@ measured: []
 - **Prior art:** PRs #11899, #12322, #8701, #13340. Files:
   `cpp/tensorrt_llm/kernels/fusedCatFp8.{cu,h}`, `fusedCatFp4.{cu,h}`,
   `cpp/tensorrt_llm/thop/fusedCatFp8Op.cpp`,
-  `tensorrt_llm/_torch/attention/backends/sparse/{dsa.py,kernel.py}`
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/{kernels.py,indexer.py}`
   (`triton_gather_k_cache`, `_prep_q_or_k`). Owning specialists:
   **kernel-cuda-specialist**, **kernel-triton-writing**. Related:
   [fold-scale-swizzle](fold-scale-swizzle-into-kernel.md) and

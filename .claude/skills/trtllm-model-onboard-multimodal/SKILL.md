@@ -212,7 +212,7 @@ Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern belo
 
 ```python
 class {Name}VisionModel(nn.Module):
-    """Multimodal encoder. Composes _torch.attention.{Attention,RotaryEmbedding} and _torch.modules.{Linear,RMSNorm,GatedMLP}."""
+    """Multimodal encoder. Composes _torch.attention.{attention.Attention, rotary_embedding.RotaryEmbedding} and _torch.modules.{linear.Linear, rms_norm.RMSNorm, gated_mlp.GatedMLP}."""
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         # Concat pixel_values across all requests, build per-image attn_metadata

@@ -322,12 +322,9 @@
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
 /tests/scripts/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
-# The two files below moved in from directories owned by the Runtime team, which
-# stays on as a co-owner so that no reviewer loses sight of a file they had.
-/tests/unittest/_torch/attention/test_mla_registry.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-runtime-devs
-# Also exercises the sliding-block-table op that the sparse cache manager owns,
+# Exercises the sliding-block-table op that the sparse cache manager owns,
 # so a change to either side routes to that team as well.
-/tests/unittest/_torch/attention/kernels/test_deepseek_v4_block_table.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/attention/kernels/test_deepseek_v4_block_table.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-kv-cache-manager-devs
 # Deliberately still under thop/: the top-k kernel this exercises gained a second
 # production consumer outside Attention (KV-cache compression), so the test's final
 # home is settled together with the kernel's, not by this move. Keeping the explicit
@@ -408,9 +405,6 @@
 /tests/unittest/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /tests/unittest/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa-function
-
-## TensorRT-LLM Pytorch - Attention
-/tensorrt_llm/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners

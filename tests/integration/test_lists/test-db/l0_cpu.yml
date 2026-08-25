@@ -25,7 +25,18 @@ l0_cpu:
   - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
   # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/kernels
+  # Everything under attention/ runs from this single entry. Three sub-trees are worth
+  # knowing about even though they are no longer split out:
+  #   kernels/parallel_hw_agnostic/       carries no skipif at all -- the suffix means the
+  #                                       kernels are hardware-agnostic, so these used to be
+  #                                       listed on one stage only
+  #   kernels/test_deepseek_v4_q_norm.py  gated by a plain CUDA-availability pytestmark plus
+  #                                       per-parameter skips; used to carry TIMEOUT (15)
+  #   multi_gpu/                          helix tests: they rebind mpi4py's serializer at
+  #                                       import time and each case spawns a 2-rank
+  #                                       MPIPoolExecutor (helix_test_utils.py:322);
+  #                                       they self-skip on device_count() < 2
+  - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   - unittest/_torch/distributed
   - unittest/_torch/executor

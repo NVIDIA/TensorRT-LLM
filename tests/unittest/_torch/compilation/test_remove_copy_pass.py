@@ -26,7 +26,7 @@ from torch.fx import Graph
 # every test must import the ops it uses itself.
 import tensorrt_llm._torch.attention.mla  # noqa: F401
 import tensorrt_llm._torch.compilation.remove_copy_pass as remove_copy_pass
-from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
+from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
     fused_sigmoid_mul_inplace,  # noqa: F401
 )
 
