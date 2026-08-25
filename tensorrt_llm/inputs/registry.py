@@ -205,21 +205,6 @@ class DefaultInputProcessor(InputProcessor):
                 token_ids = self.tokenizer.encode(
                     inputs["prompt"], allowed_special=toktoken_special_tokens)
 
-        if "query" in inputs:
-            with nvtx_range_debug("tokenize query"):
-                try:
-                    query_token_ids = self.tokenizer.encode(
-                        inputs["query"],
-                        add_special_tokens=sampling_params.add_special_tokens,
-                        **kwargs)
-                except:
-                    # Tiktoken path
-                    query_token_ids = self.tokenizer.encode(
-                        inputs["query"],
-                        allowed_special=toktoken_special_tokens)
-
-            return token_ids, {"query_token_ids": query_token_ids}
-
         return token_ids, None
 
 

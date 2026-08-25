@@ -345,6 +345,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
             token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
 
+        if self.use_fp8_ds_mla:
+            self.token_positions_cuda[: token_positions.shape[0]] = token_positions
+
         self._prepare_deepseek_v4_indices_compiled(
             token_positions,
             window_size,

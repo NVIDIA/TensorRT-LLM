@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -28,10 +27,11 @@ from ...peft.lora.layer import (MOE_LORA_MODULE_NAMES,
 from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
+from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
                             MoEStaticCapability, require_comm_plan)
-from .interface import MoE, _reject
+from .interface import _reject
 from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
@@ -60,7 +60,7 @@ def raise_moe_lora_multichunk_unsupported(num_chunks: int) -> None:
         f"increase `moe_max_num_tokens` so the MoE runs in a single chunk.")
 
 
-class CutlassFusedMoE(MoE):
+class CutlassFusedMoE(MoEImplBase):
     """
     Fused Mixture of Experts (MoE) Layer with performance tuning.
 
@@ -282,11 +282,13 @@ class CutlassFusedMoE(MoE):
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -294,6 +296,7 @@ class CutlassFusedMoE(MoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             swiglu_alpha=swiglu_alpha,
@@ -314,9 +317,9 @@ class CutlassFusedMoE(MoE):
             self.intermediate_size_per_partition = (
                 (self.intermediate_size_per_partition + 127) // 128) * 128
 
-        # Note: num_slots, expert_size_per_partition, initial_global_assignments,
-        # slot_start, slot_end, initial_local_expert_ids are all initialized by
-        # base class's _init_load_balancer() method
+        # The EPLB layout (num_slots, expert_size_per_partition, slot_start,
+        # slot_end, initial_*) comes from apply_moe_impl_construction_state();
+        # ConfigurableMoE then overwrites it via _BACKEND_SYNC_ATTRS.
 
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
@@ -862,16 +865,6 @@ class CutlassFusedMoE(MoE):
         else:
             return UnquantizedFusedMoEMethod()
 
-    def create_weights(self):
-        if self._weights_created:
-            return
-
-        self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
-
-        self._weights_created = True
-        self._check_configs()
-
     def supports_moe_output_in_alltoall_workspace(self):
         return True
 
@@ -1138,38 +1131,3 @@ class CutlassFusedMoE(MoE):
         if moe_output is not None:
             return moe_output
         return result[0]
-
-    def forward_fake(
-        self,
-        x: Union[torch.Tensor, Fp4QuantizedTensor],
-        router_logits: torch.Tensor,
-        *,
-        do_finalize: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        use_dp_padding: Optional[bool] = None,
-        **kwargs,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        return super().forward_fake(
-            x,
-            router_logits,
-            do_finalize=do_finalize,
-            output_dtype=output_dtype,
-            all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding,
-            **kwargs,
-        )
-
-    def load_weights(self,
-                     weights: List[Dict],
-                     allow_partial_loading: bool = False):
-        assert self._weights_created
-        assert len(weights) == 1
-        weights = weights[0]
-
-        kargs = {}
-        if "allow_partial_loading" in inspect.getfullargspec(
-                self.quant_method.load_weights).args:
-            kargs["allow_partial_loading"] = allow_partial_loading
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
-                                       **kargs)

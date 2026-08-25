@@ -15,10 +15,10 @@
 # limitations under the License.
 """Cosmos3 Text(+Image/Video)-to-Video(+Audio) generation.
 
-One checkpoint serves T2V, T2I, I2V/TI2V, V2V and T2AV; ``prompts/`` holds a
-prompt file per mode and ``--help`` lists the flags. See ``README.md`` in this
-directory for the checkpoints, guardrail setup, deployment configs, and a
-worked command line per mode.
+One checkpoint serves T2V, T2I, I2V/TI2V, V2V, Transfer and T2AV;
+``prompts/`` holds a prompt file per mode and ``--help`` lists the flags.
+See ``README.md`` in this directory for the checkpoints, guardrail setup,
+deployment configs, and a worked command line per mode.
 """
 
 import argparse
@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -43,6 +44,48 @@ def _resolve_path(path: str) -> str:
     if relative_to_script.is_file():
         return str(relative_to_script.resolve())
     return path
+
+
+def _load_transfer_controls(extra_params: dict[str, Any]) -> None:
+    """Read precomputed transfer controls into ``control`` bytes, client-side.
+
+    A hint may name a control file (``{"edge": "ctrl.mp4"}`` or
+    ``{"edge": {"control_path": "ctrl.mp4"}}``); the worker only accepts encoded
+    bytes, so the media is read here.
+    """
+    for key in TRANSFER_HINT_KEYS:
+        hint = extra_params.get(key)
+        if isinstance(hint, str):
+            hint = {"control_path": hint}
+        if not isinstance(hint, dict):
+            continue
+        control_path = hint.pop("control_path", None)
+        if control_path is None:
+            continue
+        if not isinstance(control_path, str) or not control_path.strip():
+            raise ValueError(
+                f"--extra_params {key}.control_path must be a non-empty file path, "
+                f"got {control_path!r}."
+            )
+        hint["control"] = Path(_resolve_path(control_path)).read_bytes()
+        extra_params[key] = hint
+
+
+def _json_object(text: str) -> dict[str, Any]:
+    """Argparse type for a JSON *object*.
+
+    ``json.loads`` alone also accepts arrays, scalars and null, which then
+    either fail deep in the merge or, for ``[]``, succeed while doing nothing.
+    """
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError(
+            f"expected a JSON object, got {type(value).__name__}: {text!r}"
+        )
+    return value
 
 
 def _is_prompt_file(value: str) -> bool:
@@ -117,14 +160,14 @@ def resolve_negative_prompt(
 
 def resolve_prompt_and_options(
     *,
-    prompt: Optional[str],
-    prompt_file: Optional[str],
-    image_path: Optional[str],
+    prompt: str | None,
+    prompt_file: str | None,
+    image_path: str | None,
     enable_audio: bool,
     output_type: str,
-) -> tuple[str, Optional[str], bool, str]:
+) -> tuple[str, str | None, bool, str]:
     """Merge CLI args with optional prompt-file defaults."""
-    prompt_data: Dict[str, Any] = {}
+    prompt_data: dict[str, Any] = {}
     if prompt_file is not None:
         prompt_data = load_prompt_file(prompt_file)
 
@@ -240,6 +283,19 @@ def main():
     parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"
     )
+    parser.add_argument(
+        "--extra_params",
+        type=_json_object,
+        default=None,
+        help=(
+            "Model-specific extra params as a JSON object, merged last (overrides "
+            "flag-derived values). Keys are validated against the pipeline's "
+            "extra_param_specs. Transfer example: "
+            '\'{"edge": true, "blur": true, "control_guidance": 1.5}\' with --video_path, '
+            'or \'{"edge": "/path/control.mp4"}\' for a precomputed control (read here and '
+            "sent as encoded bytes)."
+        ),
+    )
 
     # Guardrails
     parser.add_argument(
@@ -282,6 +338,12 @@ def main():
 
     if args.video_path is not None:
         params.extra_params["video"] = Path(args.video_path).read_bytes()
+    if args.extra_params:
+        # Merged last: explicit JSON wins over flag-derived values.
+        params.extra_params.update(args.extra_params)
+    # The pipeline fits the output to the reference's aspect when height/width
+    # are unset, so there is nothing to do client-side.
+    _load_transfer_controls(params.extra_params)
 
     params.negative_prompt = negative_prompt
 
