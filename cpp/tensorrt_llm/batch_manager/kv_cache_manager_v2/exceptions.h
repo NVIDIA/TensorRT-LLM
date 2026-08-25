@@ -113,7 +113,7 @@ public:
     }
 };
 
-// A configured tier quota cannot satisfy its minimum storage layout.
+//! A configured tier quota cannot satisfy its minimum storage layout.
 class InsufficientQuotaError : public std::invalid_argument
 {
 public:

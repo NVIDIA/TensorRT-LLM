@@ -3384,7 +3384,9 @@ class TestInitRatioConfig(unittest.TestCase):
         cfg.max_util_for_resume = 0.95
 
         with self.assertRaisesRegex(
-            InsufficientQuotaError, f"GPU cache tier quota {gpu_quota} is insufficient"
+            InsufficientQuotaError,
+            rf"^GPU cache tier quota {gpu_quota} is insufficient "
+            r"for the minimum storage layout \(requires at least \d+\)$",
         ):
             KVCacheManager(cfg)
 
@@ -3393,7 +3395,9 @@ class TestInitRatioConfig(unittest.TestCase):
         cfg = self._make_config(gpu_quota=0)
 
         with self.assertRaisesRegex(
-            InsufficientQuotaError, "GPU cache tier quota 0 is insufficient"
+            InsufficientQuotaError,
+            r"^GPU cache tier quota 0 is insufficient "
+            r"for the minimum storage layout \(requires at least \d+\)$",
         ):
             KVCacheManager(cfg)
 
