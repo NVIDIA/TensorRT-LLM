@@ -127,7 +127,7 @@ class Nvfp4ColdPagePolicy:
             layer for layer in cache_config.layers if isinstance(layer, AttentionLayerConfig)
         ]
         if not attention_layers:
-            return native.create_cold_page_codec([])
+            return native.create_nvfp4_cold_page_codec([])
 
         runtime_type = {
             DataType.HALF: native.Nvfp4ColdPageRuntimeType.FLOAT16,
@@ -140,7 +140,7 @@ class Nvfp4ColdPagePolicy:
                 f"Attention KV, not {runtime_dtype}"
             )
 
-        layer_plans = []
+        layer_layouts = []
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
             buffers_by_role = {str(buffer.role): buffer for buffer in layer.buffers}
@@ -169,11 +169,6 @@ class Nvfp4ColdPagePolicy:
             elements = num_kv_heads * tokens_per_page * head_dim
             packed_bytes = elements // _ELEMENTS_PER_BYTE
             scale_bytes = elements // _ELEMENTS_PER_SCALE
-            raw_bytes_by_role = {
-                role: _buffer_bytes(buffer, tokens_per_page)
-                for role, buffer in buffers_by_role.items()
-            }
-
             data_offsets = {
                 role: index * packed_bytes for index, role in enumerate(compressed_roles)
             }
@@ -184,47 +179,41 @@ class Nvfp4ColdPagePolicy:
             }
             cursor = scale_base + len(compressed_roles) * scale_bytes
 
-            buffer_plans = []
+            buffer_layouts = []
             for scale_index, role in enumerate(compressed_roles):
-                params = native.Nvfp4ColdPageParams()
-                params.runtime_type = runtime_type
-                params.num_kv_heads = num_kv_heads
-                params.tokens_per_page = tokens_per_page
-                params.head_dim = head_dim
-                params.nvfp4_scale_orig_quant = orig_quant[scale_index]
-                params.nvfp4_scale_quant_orig = quant_orig[scale_index]
-                params.fp8_scale_orig_quant = 1.0
-                params.fp8_scale_quant_orig = 1.0
+                scales = native.Nvfp4ColdPageScales()
+                scales.nvfp4_scale_orig_quant = orig_quant[scale_index]
+                scales.nvfp4_scale_quant_orig = quant_orig[scale_index]
+                scales.fp8_scale_orig_quant = 1.0
+                scales.fp8_scale_quant_orig = 1.0
 
-                plan = native.ColdPageBufferPlan()
-                plan.role = role
-                plan.transform = native.ColdPageTransformKind.NVFP4
-                plan.raw_bytes = raw_bytes_by_role[role]
-                plan.cold_data_offset = data_offsets[role]
-                plan.cold_scale_offset = scale_offsets[role]
-                plan.nvfp4_params = params
-                buffer_plans.append(plan)
+                buffer_layout = native.Nvfp4ColdPageBufferLayout()
+                buffer_layout.role = role
+                buffer_layout.cold_data_offset = data_offsets[role]
+                buffer_layout.cold_scale_offset = scale_offsets[role]
+                buffer_layout.scales = scales
+                buffer_layouts.append(buffer_layout)
 
             for buffer in layer.buffers:
                 role = str(buffer.role)
                 if role in compressed_roles:
                     continue
-                plan = native.ColdPageBufferPlan()
-                plan.role = role
-                plan.transform = native.ColdPageTransformKind.LOSSLESS_COPY
-                plan.raw_bytes = raw_bytes_by_role[role]
-                plan.cold_data_offset = cursor
-                plan.cold_scale_offset = 0
-                buffer_plans.append(plan)
-                cursor += raw_bytes_by_role[role]
+                buffer_layout = native.Nvfp4ColdPageBufferLayout()
+                buffer_layout.role = role
+                buffer_layout.cold_data_offset = cursor
+                buffer_layouts.append(buffer_layout)
+                cursor += _buffer_bytes(buffer, tokens_per_page)
 
             cold_page_bytes = _align_up(cursor)
-            layer_plan = native.ColdPageLayerPlan()
-            layer_plan.layer_id = layer_id
-            layer_plan.cold_page_bytes = cold_page_bytes
-            layer_plan.cold_padding_offset = cursor
-            layer_plan.cold_padding_bytes = cold_page_bytes - cursor
-            layer_plan.buffers = buffer_plans
-            layer_plans.append(layer_plan)
+            layer_layout = native.Nvfp4ColdPageLayerLayout()
+            layer_layout.layer_id = layer_id
+            layer_layout.runtime_type = runtime_type
+            layer_layout.num_kv_heads = num_kv_heads
+            layer_layout.tokens_per_page = tokens_per_page
+            layer_layout.head_dim = head_dim
+            layer_layout.cold_page_bytes = cold_page_bytes
+            layer_layout.cold_padding_offset = cursor
+            layer_layout.buffers = buffer_layouts
+            layer_layouts.append(layer_layout)
 
-        return native.create_cold_page_codec(layer_plans)
+        return native.create_nvfp4_cold_page_codec(layer_layouts)
