@@ -977,7 +977,9 @@ class TestSelectiveTransientTcpRetry:
         assert session.post.call_count == 2
         monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
         session = AsyncMock(spec=aiohttp.ClientSession)
-        client = self._make_client(session, max_retries=5)
+        with patch("tensorrt_llm.serve.openai_client.logger.info") as log_info:
+            client = self._make_client(session, max_retries=5)
+        assert "TRTLLM_DISAGG_NO_RETRY=1" in log_info.call_args.args[0]
         session.post.side_effect = aiohttp.ServerDisconnectedError()
         with pytest.raises(aiohttp.ServerDisconnectedError):
             await client.send_request(self._make_request())
