@@ -124,7 +124,9 @@ class CacheLevelManager:
         match tier:
             case CacheTier.GPU_MEM:
                 page_size = 2 << 20
-                return page_size << min(4, max(0, int(math.log(quota / (page_size * 512), 2))))
+                ratio = quota // (page_size * 512)
+                exponent = 0 if ratio <= 0 else min(4, int(math.log2(ratio)))
+                return page_size << exponent
             case CacheTier.HOST_MEM:
                 return HostCacheLevelStorage.POOL_SIZE_GRANULARITY
             case CacheTier.DISK:
