@@ -99,8 +99,7 @@ void initBindings(nb::module_& m)
         },
         "Lamport initialize all buffers", nb::call_guard<nb::gil_scoped_release>());
     m.def(
-        "lamport_initialize",
-        [](intptr_t buffer, size_t size)
+        "lamport_initialize", [](intptr_t buffer, size_t size)
         { tensorrt_llm::kernels::ar_fusion::lamport_initialize(reinterpret_cast<void*>(buffer), size, 0); },
         "Lmaport initialize buffer", nb::call_guard<nb::gil_scoped_release>());
     m.def(
@@ -204,7 +203,8 @@ void initBindings(nb::module_& m)
             nb::arg("local_protocol_reset_succeeded"),
             "Collectively publish or abort a pending internal MNNVL restore after protocol reset.",
             nb::call_guard<nb::gil_scoped_release>())
-        .def("is_mapped", &tensorrt_llm::runtime::McastGPUBuffer::isMapped);
+        .def("is_mapped", &tensorrt_llm::runtime::McastGPUBuffer::isMapped)
+        .def("get_buffer_size", &tensorrt_llm::runtime::McastGPUBuffer::getBufferSize);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")
         .value("NONE", tensorrt_llm::kernels::AllReduceFusionOp::NONE)
@@ -249,11 +249,9 @@ void initBindings(nb::module_& m)
             "Allocate LOCALITY_DOMAIN localized memory and return pointer as integer address",
             nb::call_guard<nb::gil_scoped_release>())
         .def(
-            "locality_domain_free",
-            [](tensorrt_llm::locality_domain::LocalizationHandle& self, uintptr_t ptr)
-            { self.localityDomainFree(reinterpret_cast<void*>(ptr)); },
-            nb::arg("ptr"), "Free LOCALITY_DOMAIN localized memory from integer address",
-            nb::call_guard<nb::gil_scoped_release>())
+            "locality_domain_free", [](tensorrt_llm::locality_domain::LocalizationHandle& self, uintptr_t ptr)
+            { self.localityDomainFree(reinterpret_cast<void*>(ptr)); }, nb::arg("ptr"),
+            "Free LOCALITY_DOMAIN localized memory from integer address", nb::call_guard<nb::gil_scoped_release>())
         .def(
             "create_localized_allocation_handle",
             [](tensorrt_llm::locality_domain::LocalizationHandle& self, size_t size, int localityDomainId,
@@ -262,9 +260,9 @@ void initBindings(nb::module_& m)
             {
                 CUmemGenericAllocationHandle const handle = usage.has_value()
                     ? self.createLocalizedAllocationHandle(
-                        size, localityDomainId, requestedHandleTypes, gpuDirectRDMACapable, *usage)
+                          size, localityDomainId, requestedHandleTypes, gpuDirectRDMACapable, *usage)
                     : self.createLocalizedAllocationHandle(
-                        size, localityDomainId, requestedHandleTypes, gpuDirectRDMACapable);
+                          size, localityDomainId, requestedHandleTypes, gpuDirectRDMACapable);
                 return static_cast<uintptr_t>(handle);
             },
             nb::arg("size"), nb::arg("locality_domain_id"), nb::arg("requested_handle_types"),
@@ -322,8 +320,7 @@ void initBindings(nb::module_& m)
             "Get (localized partition SM count, full-device SM count), or (0, 0) when unavailable",
             nb::call_guard<nb::gil_scoped_release>())
         .def(
-            "get_reserved_remainder_stream",
-            [](tensorrt_llm::locality_domain::LocalizationHandle& self) -> uintptr_t
+            "get_reserved_remainder_stream", [](tensorrt_llm::locality_domain::LocalizationHandle& self) -> uintptr_t
             { return reinterpret_cast<uintptr_t>(self.getReservedRemainderStream()); },
             "Get the borrowed process-lifetime remainder Green Context stream, or 0 when unavailable",
             nb::call_guard<nb::gil_scoped_release>());
