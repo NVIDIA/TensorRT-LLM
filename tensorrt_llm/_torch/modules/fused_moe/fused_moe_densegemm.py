@@ -195,12 +195,10 @@ class DenseGEMMFusedMoE(MoEImplBase):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         init_load_balancer: bool = False,
-        activation_type=None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         # Eligibility (SM / quant / SwiGLU / EP / intermediate alignment) is
         # owned by ``can_implement``; do not re-assert it here.
-        if activation_type is None:
-            activation_type = ActivationType.Swiglu
 
         # `apply_router_weight_on_input` is accepted for create_moe_backend()
         # API compatibility. It is not a field of MoEProblem/MoEDeployment, so

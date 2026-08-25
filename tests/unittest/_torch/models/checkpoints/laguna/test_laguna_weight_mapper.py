@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -21,7 +22,12 @@ from torch import nn
 
 from tensorrt_llm._torch.models.modeling_laguna import LagunaHfWeightMapper
 from tensorrt_llm._torch.modules.fused_moe.impl_base import MoEImplBase
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoEEligibility
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEProblem,
+    MoERunContext,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -48,29 +54,29 @@ class _FakeMoE(MoEImplBase):
     """
 
     @classmethod
-    def can_implement(cls, p, d):
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return MoEEligibility.ok()
 
-    def __init__(self):
+    def __init__(self) -> None:
         nn.Module.__init__(self)
-        self.loaded_weights = None
-        self.allow_partial_loading = None
+        self.loaded_weights: Optional[list[dict]] = None
+        self.allow_partial_loading: Optional[bool] = None
 
-    def _get_quant_method(self):
+    def _get_quant_method(self) -> object:
         return None
 
-    def quantize_input(self, x, **kwargs):
+    def quantize_input(self, x: torch.Tensor, **kwargs: object) -> tuple[torch.Tensor, None]:
         return x, None
 
-    def run_moe(self, ctx):
+    def run_moe(self, ctx: MoERunContext) -> torch.Tensor:
         raise AssertionError("weight-mapper tests never execute the MoE")
 
-    def load_weights(self, weights, allow_partial_loading: bool = False):
+    def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None:
         self.loaded_weights = weights
         self.allow_partial_loading = allow_partial_loading
 
 
-def test_laguna_hf_weight_mapper_recognizes_execution_unit():
+def test_laguna_hf_weight_mapper_recognizes_execution_unit() -> None:
     """The expert-weight gate must fire on the backend, not just on ``MoE``."""
     mapper = LagunaHfWeightMapper()
 

@@ -706,7 +706,7 @@ class ConfigurableMoE(MoE):
 
     # ========== Backend Validation ==========
 
-    def validate_backend(self, backend: Union[MoE, MoEImplBase]):
+    def validate_backend(self, backend: MoE | MoEImplBase | None) -> None:
         """Validate MoE backend compatibility with this ConfigurableMoE.
 
         Generic checks (always run):

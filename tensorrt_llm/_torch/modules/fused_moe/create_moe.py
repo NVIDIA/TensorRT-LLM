@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Optional, Union
+from typing import Dict, Optional
 
 import torch
 
@@ -66,7 +66,7 @@ def create_moe_backend(
     trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
-) -> Union[MoE, MoEImplBase, VanillaMoE]:
+) -> MoE | MoEImplBase | VanillaMoE:
     """
     Create a MoE backend or a self-contained MoE layer.
 
@@ -383,7 +383,7 @@ def create_moe(
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
     communication_method: Optional[str] = None,
-) -> Union[MoE, VanillaMoE]:
+) -> MoE | VanillaMoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
 

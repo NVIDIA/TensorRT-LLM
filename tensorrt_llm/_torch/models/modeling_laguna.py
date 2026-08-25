@@ -68,7 +68,7 @@ class LagunaGate(nn.Module):
         top_k: int,
         dtype: Optional[torch.dtype] = None,
         moe_backend_cls: Optional[MoEImplClass] = None,
-    ):
+    ) -> None:
         super().__init__()
         self.top_k = top_k
         self.moe_backend_cls = moe_backend_cls

@@ -18,7 +18,7 @@ Records rejected candidates; falls back when the requested backend cannot serve.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Tuple, Union
 
 import torch
 
@@ -69,7 +69,7 @@ WIDEEP_DEPRECATION_MESSAGE = (
 #: ``ConfigurableMoE.backend``, and ``VanillaMoE`` the PyTorch reference path --
 #: an ``nn.ModuleList`` that inherits neither, so a two-way union would exclude
 #: the backend the other two are checked against. ``create_moe`` re-exports it.
-MoEImplClass = Union[Type[MoE], Type[MoEImplBase], Type[VanillaMoE]]
+MoEImplClass = type[MoE] | type[MoEImplBase] | type[VanillaMoE]
 
 # Global priority: specialized first, broad fallbacks last.
 IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
