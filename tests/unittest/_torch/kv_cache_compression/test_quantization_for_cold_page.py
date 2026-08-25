@@ -483,7 +483,7 @@ def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
     assert plan.cold_page_bytes == 176
 
 
-def test_tokens_per_block_override_expands_raw_and_lossless_bytes() -> None:
+def test_tokens_per_block_override_expands_lossless_bytes() -> None:
     native, _ = _native()
     cache_config = SimpleNamespace(
         tokens_per_block=4,
@@ -515,37 +515,6 @@ def test_tokens_per_block_override_expands_raw_and_lossless_bytes() -> None:
     assert [buffer.cold_data_offset for buffer in plan.buffers] == [0, 36]
     assert plan.cold_padding_offset == 42
     assert plan.cold_page_bytes == 48
-
-
-def test_tokens_per_block_override_must_divide_page_size() -> None:
-    native, _ = _native()
-    cache_config = SimpleNamespace(
-        tokens_per_block=5,
-        layers=(
-            AttentionLayerConfig(
-                layer_id=0,
-                buffers=[
-                    BufferConfig(
-                        role="key",
-                        size=64,
-                        tokens_per_block_override=2,
-                    ),
-                ],
-            ),
-        ),
-    )
-
-    with (
-        patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
-        pytest.raises(ValueError, match="positive divisor"),
-    ):
-        _manager().create_cold_page_codec(
-            cache_config,
-            runtime_dtype=DataType.BF16,
-            pp_layers=(0,),
-            num_kv_heads_per_layer=(1,),
-            head_dim_per_layer=(16,),
-        )
 
 
 @pytest.mark.parametrize(

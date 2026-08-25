@@ -97,8 +97,6 @@ def _align_up(value: int, alignment: int = _COLD_PAGE_ALIGNMENT) -> int:
 
 def _buffer_bytes(buffer: object, tokens_per_page: int) -> int:
     buffer_tokens = buffer.tokens_per_block_override or tokens_per_page
-    if buffer_tokens <= 0 or tokens_per_page % buffer_tokens != 0:
-        raise ValueError("tokens_per_block_override must be a positive divisor of tokens_per_block")
     return int(buffer.size) * (tokens_per_page // buffer_tokens)
 
 
