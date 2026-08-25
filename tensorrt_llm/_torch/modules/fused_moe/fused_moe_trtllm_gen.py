@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -141,7 +141,7 @@ class TRTLLMGenFusedMoE(MoE):
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
-        """TRTLLM-Gen kernels: SM100/SM103, bfloat16 activations.
+        """TRTLLM-Gen kernels: the SM100 (Blackwell) family, bfloat16 activations.
 
         Quantized coverage is ``_SUPPORTED_QUANT_ALGOS``. The unquantized BF16
         path is served by a FlashInfer kernel, so it is available only where
@@ -150,11 +150,14 @@ class TRTLLMGenFusedMoE(MoE):
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
-        # TRTLLMGenFusedMoE requires SM in {100, 103}
-        if sm_version not in {100, 103}:
+        # The cubin drop is sm_100f (family-compatible) plus arch-specific
+        # sm_100a/sm_103a, so the whole SM100 family is servable; the C++
+        # selector (KernelRunner.cpp isSMCompatible) picks sm_100f on family
+        # members without their own arch build.
+        if not is_sm_100f(sm_version):
             return _reject(
                 MoERejectReason.SM_UNSUPPORTED,
-                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
+                f"TRTLLMGenFusedMoE requires the SM100 family, got SM{sm_version}"
             )
 
         # forward_impl asserts x.dtype == torch.bfloat16
@@ -380,8 +383,8 @@ class TRTLLMGenFusedMoE(MoE):
             raise ValueError(
                 "TRTLLM-Gen SiTu requires bfloat16 activations, got "
                 f"{self.dtype}.")
-        if get_sm_version() not in {100, 103}:
-            raise ValueError("TRTLLM-Gen SiTu requires SM100 or SM103, got "
+        if not is_sm_100f():
+            raise ValueError("TRTLLM-Gen SiTu requires the SM100 family, got "
                              f"SM{get_sm_version()}.")
         quant_algo = (None if self.quant_config is None else
                       self.quant_config.quant_algo)
@@ -714,8 +717,7 @@ class TRTLLMGenFusedMoE(MoE):
                 or isinstance(x, MxFp8QuantizedTensor)):
             return None
 
-        sm_version = get_sm_version()
-        if (not 100 <= sm_version < 110 or not self.has_w4a8_mxfp4_mxfp8
+        if (not is_sm_100f() or not self.has_w4a8_mxfp4_mxfp8
                 or not isinstance(self.op_backend, TRTLLMOpBackend)
                 or not isinstance(self.routing_method,
                                   DeepSeekV3MoeRoutingMethod)):

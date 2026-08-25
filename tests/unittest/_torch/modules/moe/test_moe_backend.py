@@ -85,7 +85,7 @@ from tensorrt_llm._torch.utils import (
     MxFp8QuantizedTensor,
     is_gated_activation,
 )
-from tensorrt_llm._utils import get_sm_version, mpi_rank
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -498,8 +498,8 @@ def test_marlin_override_quant_config_degrades_per_layer():
 # are the contracts that hold without running a cubin.
 
 _situ_supported = pytest.mark.skipif(
-    get_sm_version() not in (100, 103),
-    reason="TRTLLM-Gen SiTu cubins only exist for SM100/SM103",
+    not is_sm_100f(),
+    reason="TRTLLM-Gen SiTu cubins are sm_100f: the SM100 family only",
 )
 
 # Kimi K3 defaults. The gate-side SiTu beta is the cubin's ``alpha``, the

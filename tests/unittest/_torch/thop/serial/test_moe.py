@@ -68,8 +68,8 @@ def _nvfp4_situ_tactics(num_tokens):
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %
+    not (100 <= getSMVersion() < 110),
+    reason="The SiTu kernels are sm_100f (SM100 family). Current SM is %d." %
     getSMVersion(),
 )
 @pytest.mark.parametrize("get_tactics",
@@ -2699,8 +2699,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %
+    not (100 <= getSMVersion() < 110),
+    reason="The SiTu kernels are sm_100f (SM100 family). Current SM is %d." %
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 8, 256])
