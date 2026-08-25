@@ -35,7 +35,6 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor,
                                           create_input_processor,
-                                          create_input_processor_with_hash,
                                           get_multimodal_encoder_item_metadata)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
@@ -380,6 +379,12 @@ def _set_moe_a2a_warmup(in_warmup: bool) -> None:
 
 class PyTorchModelEngine(ModelEngine):
 
+    # Class-level default: the `moe_load_balancer_iter_info` property is also
+    # read on objects that never run __init__ (engine shells built with
+    # `object.__new__`), and `__init__` itself reads it via the `is_warmup`
+    # setter before the model is loaded.
+    moe_load_balancer: Optional[MoeLoadBalancer] = None
+
     def __init__(
         self,
         *,
@@ -400,7 +405,7 @@ class PyTorchModelEngine(ModelEngine):
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None
-        self.ub_buffers = None
+        self._cleanup_done = False
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -509,12 +514,6 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_format=llm_args.checkpoint_format,
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
-        self.input_processor_with_hash = create_input_processor_with_hash(
-            self.input_processor,
-            encoder_cache_enabled=(
-                llm_args.multimodal_config is not None
-                and llm_args.multimodal_config.encoder_cache_max_bytes > 0),
-        )
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
@@ -534,7 +533,7 @@ class PyTorchModelEngine(ModelEngine):
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
             if isinstance(moe_load_balancer, MoeLoadBalancer):
-                setattr(self, "moe_load_balancer", moe_load_balancer)
+                self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
         self._validate_breakable_cuda_graph_compatibility()
@@ -573,7 +572,6 @@ class PyTorchModelEngine(ModelEngine):
             self.llm_args, self.mm_encoder_item_scheduling_enabled)
         self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
                                                                    int]] = None
-        self.max_mm_encoder_output_embeddings: Optional[int] = None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
         # Item scheduling bounds four distinct MM encoder resources. They are
         # owned in different places and measured in different units, so they
@@ -746,9 +744,6 @@ class PyTorchModelEngine(ModelEngine):
             self._encoder_cuda_graph_padding_enabled)
                                      if encoder_cuda_graph_seq_lens else [])
 
-        self._max_cuda_graph_seq_len = (self._cuda_graph_seq_lens[-1]
-                                        if self._cuda_graph_seq_lens else 0)
-
         use_encoder_cuda_graph = ((self._is_encoder_decoder_model()
                                    or self._is_encode_only)
                                   and self.encoder_cuda_graph_config is not None
@@ -845,9 +840,11 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
         self.previous_request_ids = []
         self.has_previous_device_draft = False
-        self.previous_accepted_tokens_cuda = torch.empty((self.batch_size, ),
-                                                         dtype=torch.int,
-                                                         device='cuda')
+
+        self._encoder_decoder_host_buffer_pool: List[Dict[str, Any]] = []
+        self._encoder_decoder_input_fast_path_static_eligible: Optional[
+            bool] = None
+        self._encoder_decoder_position_id_offset: Optional[int] = None
 
         sparse_params = (self.sparse_attention_config.to_sparse_params(
             pretrained_config=self.model.model_config.pretrained_config)
@@ -1188,16 +1185,14 @@ class PyTorchModelEngine(ModelEngine):
 
     @property
     def moe_load_balancer_iter_info(self):
-        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
-                                                     None)
+        moe_load_balancer = self.moe_load_balancer
         if moe_load_balancer is not None:
             return moe_load_balancer.enable_statistic, moe_load_balancer.enable_update_weights
         return False, False
 
     @moe_load_balancer_iter_info.setter
     def moe_load_balancer_iter_info(self, value: Tuple[bool, bool]):
-        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
-                                                     None)
+        moe_load_balancer = self.moe_load_balancer
         if moe_load_balancer is not None:
             moe_load_balancer.set_iter_info(enable_statistic=value[0],
                                             enable_update_weights=value[1])
@@ -3402,7 +3397,6 @@ class PyTorchModelEngine(ModelEngine):
                 "A model with MM encoder item scheduling must implement "
                 "get_max_mm_encoder_output_embeddings() and return a positive "
                 "aggregate embedding capacity")
-        self.max_mm_encoder_output_embeddings = max_output_embeddings
         bytes_per_embedding = self._resolve_bytes_per_mm_encoder_embedding()
         self.bytes_per_mm_encoder_embedding = bytes_per_embedding
         return max_output_embeddings * bytes_per_embedding
@@ -3567,28 +3561,21 @@ class PyTorchModelEngine(ModelEngine):
         2. The model module reference.
         3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
         4. Input processors.
-        5. Userbuffers (``ub.ub_deallocate`` per buffer); on per-buffer
-           failure the unfreed buffers are kept attached so a deterministic
-           retry doesn't double-free already-released ones, and the
-           collected errors are re-raised after the loop.
 
         Idempotency:
             Subsequent calls are no-ops (guarded by ``_cleanup_done``).
             The flag is set only at the end, so a partial cleanup that
             raises mid-way will be retried on the next call.
 
-        Raises:
-            RuntimeError: If one or more userbuffer deallocations fail
-                (chained from the first error). All other steps are
-                best-effort and either succeed or leak silently with
-                their errors logged at warning level by callees.
-
         Called from:
-            - :meth:`PyExecutor.shutdown` (deterministic teardown).
-            - :meth:`__del__` (best-effort fallback during garbage
-              collection / interpreter shutdown).
+            :meth:`__del__`, and only from there. ``PyExecutor.shutdown``
+            deliberately does *not* call this: it is also invoked mid-init by
+            ``configure_kv_cache_capacity``, which reads ``model`` right
+            afterwards, so clearing ``model`` here would break it. That path
+            calls :meth:`_release_cuda_graphs` and then drops its reference
+            instead.
         """
-        if getattr(self, "_cleanup_done", False):
+        if self._cleanup_done:
             return
 
         # Cleanup is not truly atomic: released CUDA/GMS resources cannot be
@@ -3604,26 +3591,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self._release_cuda_graphs()
         self.input_processor = None
-        self.input_processor_with_hash = None
-
-        ub_buffers = getattr(self, 'ub_buffers', None)
-        if ub_buffers:
-            remaining_ub_buffers = []
-            ub_errors = []
-            for u in ub_buffers:
-                try:
-                    ub.ub_deallocate(u.addr)
-                except RuntimeError as e:
-                    # Keep failed buffers attached so a deterministic
-                    # cleanup() call can retry without double-freeing buffers
-                    # that were already deallocated successfully.
-                    remaining_ub_buffers.append(u)
-                    ub_errors.append(e)
-            self.ub_buffers = remaining_ub_buffers or None
-            if ub_errors:
-                raise RuntimeError(
-                    "Failed to deallocate one or more userbuffers during "
-                    "PyTorchModelEngine cleanup") from ub_errors[0]
 
         # Release model weights.
         release_gc()
@@ -3632,15 +3599,16 @@ class PyTorchModelEngine(ModelEngine):
     def __del__(self) -> None:
         """Best-effort cleanup during garbage collection.
 
-        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (raised
-        when one or more userbuffer deallocations fail) and
-        ``AttributeError`` (typical on partially-initialized engines
-        torn down during interpreter shutdown when module references
-        have already been cleared); both are logged and swallowed
-        because destructors cannot reliably surface exceptions.
+        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (which a
+        release step such as :meth:`_release_cuda_graphs` or
+        ``ModelLoader.cleanup`` may raise) and ``AttributeError`` (typical
+        on partially-initialized engines torn down during interpreter
+        shutdown when module references have already been cleared); both
+        are logged and swallowed because destructors cannot reliably
+        surface exceptions.
 
-        Deterministic callers (``PyExecutor.shutdown``) should call
-        :meth:`cleanup` directly so they see any failure.
+        This is the only production caller of :meth:`cleanup` -- see the
+        note there on why ``PyExecutor.shutdown`` must not call it.
         """
         try:
             self.cleanup()
@@ -4242,8 +4210,7 @@ class PyTorchModelEngine(ModelEngine):
             new_tokens_device: Optional[torch.Tensor],
             next_draft_tokens_device: Optional[torch.Tensor]) -> bool:
         """Return whether the TRT-like persistent input path is sufficient."""
-        static_eligible = getattr(
-            self, '_encoder_decoder_input_fast_path_static_eligible', None)
+        static_eligible = self._encoder_decoder_input_fast_path_static_eligible
         if static_eligible is None:
             static_eligible = (
                 hasattr(batch_manager_bindings,
@@ -4274,10 +4241,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _acquire_encoder_decoder_host_buffers(self) -> Dict[str, Any]:
         """Acquire pinned staging whose preceding asynchronous copies finished."""
-        pool = getattr(self, '_encoder_decoder_host_buffer_pool', None)
-        if pool is None:
-            pool = []
-            self._encoder_decoder_host_buffer_pool = pool
+        pool = self._encoder_decoder_host_buffer_pool
         for buffers in pool:
             event = buffers['event']
             if event is None or event.query():
@@ -4330,9 +4294,7 @@ class PyTorchModelEngine(ModelEngine):
             resource_manager: Optional[ResourceManager]):
         """Prepare a simple BART batch with native collation and reused buffers."""
         buffers = self._acquire_encoder_decoder_host_buffers()
-        position_id_offset = getattr(self,
-                                     '_encoder_decoder_position_id_offset',
-                                     None)
+        position_id_offset = self._encoder_decoder_position_id_offset
         if position_id_offset is None:
             position_id_offset = self._get_position_id_offset()
             self._encoder_decoder_position_id_offset = position_id_offset
@@ -7166,8 +7128,7 @@ class PyTorchModelEngine(ModelEngine):
         Returns:
             Dict with 'logits' tensor and any other model outputs.
         """
-        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
-                                                     None)
+        moe_load_balancer = self.moe_load_balancer
 
         batch_size = len(inputs['seq_lens'])
         with self.encoder_cuda_graph_runner.pad_batch(
@@ -7312,8 +7273,7 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager = None
             spec_metadata = None
 
-        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
-                                                     None)
+        moe_load_balancer = self.moe_load_balancer
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata,
@@ -7515,10 +7475,6 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
-
-    def _get_spec_worker(self):
-        """Access the spec_worker from DecoderModelForCausalLM (one-model spec dec)."""
-        return getattr(self.model, 'spec_worker', None)
 
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
@@ -7999,8 +7955,7 @@ class PyTorchModelEngine(ModelEngine):
                 model_inputs['seq_lens'], key[1])
             model_inputs['attn_metadata'] = graph_attn_metadata
 
-            moe_load_balancer: MoeLoadBalancer = getattr(
-                self, 'moe_load_balancer', None)
+            moe_load_balancer = self.moe_load_balancer
             with with_shared_pool(runner.get_graph_pool()):
                 capture_outputs = None
                 if runner.needs_capture(key):
