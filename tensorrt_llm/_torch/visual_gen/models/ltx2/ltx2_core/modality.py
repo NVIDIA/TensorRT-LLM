@@ -21,3 +21,4 @@ class Modality:
     context: torch.Tensor  # Text embeddings
     enabled: bool = True
     context_mask: torch.Tensor | None = None
+    sigma: torch.Tensor | None = None  # (B,): per-batch noise level for prompt AdaLN

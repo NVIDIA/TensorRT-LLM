@@ -42,4 +42,5 @@ class DiffusionStepProtocol(Protocol):
         denoised_sample: torch.Tensor,
         sigmas: torch.Tensor,
         step_index: int,
+        **kwargs,
     ) -> torch.Tensor: ...

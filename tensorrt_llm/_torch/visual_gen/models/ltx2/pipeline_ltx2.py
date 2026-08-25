@@ -8,7 +8,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import safetensors.torch
 import torch
@@ -26,7 +26,11 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
-from .ltx2_core.connector import Embeddings1DConnectorConfigurator, GemmaFeaturesExtractorProjLinear
+from .ltx2_core.connector import (
+    AudioEmbeddings1DConnectorConfigurator,
+    Embeddings1DConnectorConfigurator,
+    GemmaFeaturesExtractorProjLinear,
+)
 from .ltx2_core.guiders import MultiModalGuider, MultiModalGuiderParams
 from .ltx2_core.modality import Modality
 from .ltx2_core.patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
@@ -35,6 +39,8 @@ from .ltx2_core.perturbations import (
     PerturbationConfig,
     build_stg_perturbation_config,
 )
+from .ltx2_core.diffusion_steps import Res2sDiffusionStep
+from .ltx2_core.res2s import get_res2s_coefficients
 from .ltx2_core.rope import LTXRopeType
 from .ltx2_core.scheduler_adapter import NativeSchedulerAdapter
 from .ltx2_core.types import (
@@ -48,11 +54,24 @@ from .parallel_vae import tile_parallel_decode
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
+LTX2_SAMPLER_EULER = "euler"
+LTX2_SAMPLER_RES2S = "res2s"
+LTX2_DISTILLED_LORA_STAGE_1_STRENGTH_DEFAULT = 0.0
+LTX2_DISTILLED_LORA_STAGE_2_STRENGTH_DEFAULT = 1.0
+LTX23_DISTILLED_LORA_STAGE_1_STRENGTH = 0.25
+LTX23_DISTILLED_LORA_STAGE_2_STRENGTH = 0.5
+_LTX2_SUPPORTED_SAMPLERS = {LTX2_SAMPLER_EULER, LTX2_SAMPLER_RES2S}
+_LTX23_CHECKPOINT_MARKERS = ("ltx-2.3", "ltx2.3", "ltx_2.3")
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def ltx2_force_one_stage_enabled() -> bool:
     return os.environ.get(LTX2_FORCE_ONE_STAGE_ENV, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _is_ltx23_checkpoint(checkpoint_path: Path) -> bool:
+    path_text = str(checkpoint_path).lower()
+    return any(marker in path_text for marker in _LTX23_CHECKPOINT_MARKERS)
 
 
 def _get_ltx2_auxiliary_search_dir(checkpoint_path: Path) -> Optional[Path]:
@@ -131,10 +150,16 @@ def resolve_ltx2_pipeline_extra_attrs(
         logger.info(f"Discovered LTX2 spatial upsampler: {resolved_upsampler_path}")
     if not distilled_lora_path:
         logger.info(f"Discovered LTX2 distilled LoRA: {resolved_lora_path}")
-    return {
+    attrs: Dict[str, Any] = {
         "spatial_upsampler_path": resolved_upsampler_path,
         "distilled_lora_path": resolved_lora_path,
     }
+    if _is_ltx23_checkpoint(checkpoint_path):
+        if extra_attrs.get("distilled_lora_strength_stage_1") is None:
+            attrs["distilled_lora_strength_stage_1"] = LTX23_DISTILLED_LORA_STAGE_1_STRENGTH
+        if extra_attrs.get("distilled_lora_strength_stage_2") is None:
+            attrs["distilled_lora_strength_stage_2"] = LTX23_DISTILLED_LORA_STAGE_2_STRENGTH
+    return attrs
 
 
 def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -> None:
@@ -151,6 +176,72 @@ def _assert_resolution(height: int, width: int, *, is_two_stage: bool = False) -
             f"For {'two-stage' if is_two_stage else 'one-stage'} pipelines, "
             f"height and width must be multiples of {divisor}."
         )
+
+
+def _normalize_ltx2_sampler(sampler: str) -> str:
+    normalized = (sampler or LTX2_SAMPLER_EULER).lower()
+    if normalized not in _LTX2_SUPPORTED_SAMPLERS:
+        raise ValueError(
+            f"Unsupported LTX2 sampler {sampler!r}; expected one of "
+            f"{sorted(_LTX2_SUPPORTED_SAMPLERS)}"
+        )
+    return normalized
+
+
+def _highest_precision_float(device: torch.device) -> torch.dtype:
+    return torch.float32 if torch.device(device).type == "mps" else torch.float64
+
+
+def _channelwise_normalize(x: torch.Tensor) -> torch.Tensor:
+    return x.sub_(x.mean(dim=(-2, -1), keepdim=True)).div_(x.std(dim=(-2, -1), keepdim=True))
+
+
+def _get_res2s_noise(x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    device = torch.device(getattr(generator, "device", x.device))
+    noise = torch.randn(
+        x.shape,
+        generator=generator,
+        dtype=_highest_precision_float(device),
+        device=device,
+    )
+    noise = (noise - noise.mean()) / noise.std()
+    return _channelwise_normalize(noise)
+
+
+def _post_process_ltx2_latent(
+    denoised: torch.Tensor,
+    denoise_mask: torch.Tensor | None,
+    clean_latent: torch.Tensor | None,
+) -> torch.Tensor:
+    if denoise_mask is None or clean_latent is None:
+        return denoised
+    mask = denoise_mask
+    while mask.dim() < denoised.dim():
+        mask = mask.unsqueeze(-1)
+    return (denoised * mask + clean_latent.float() * (1 - mask)).to(denoised.dtype)
+
+
+def _inject_res2s_sde_noise(
+    *,
+    sample: torch.Tensor,
+    denoised_sample: torch.Tensor,
+    denoise_mask: torch.Tensor | None,
+    clean_latent: torch.Tensor | None,
+    sigmas: torch.Tensor,
+    step_index: int,
+    noise_generator: torch.Generator,
+    stepper: Res2sDiffusionStep,
+    eta: float,
+) -> torch.Tensor:
+    x_next = stepper.step(
+        sample=sample,
+        denoised_sample=denoised_sample,
+        sigmas=sigmas,
+        step_index=step_index,
+        noise=_get_res2s_noise(sample, noise_generator),
+        eta=eta,
+    )
+    return _post_process_ltx2_latent(x_next, denoise_mask, clean_latent)
 
 
 _LTX2_PREFETCHED_SAFETENSORS: Set[str] = set()
@@ -418,6 +509,7 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
                 context=v.context.clone(),
                 enabled=v.enabled,
                 context_mask=v.context_mask.clone() if v.context_mask is not None else None,
+                sigma=v.sigma.clone() if v.sigma is not None else None,
             )
         return v
 
@@ -455,6 +547,8 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
             dst.timesteps.copy_(src.timesteps)
             dst.positions.copy_(src.positions)
             dst.context.copy_(src.context)
+            if src.sigma is not None and dst.sigma is not None:
+                dst.sigma.copy_(src.sigma)
             if src.context_mask is not None and dst.context_mask is not None:
                 dst.context_mask.copy_(src.context_mask)
             return dst
@@ -597,11 +691,14 @@ def _load_component_weights(
     "LTX2Pipeline",
     hf_ids=[
         "Lightricks/LTX-2",
+        "Lightricks/LTX-2.3",
     ],
     defaults={
         "text_encoder_path": "google/gemma-3-12b-it",
         "spatial_upsampler_path": None,
         "distilled_lora_path": None,
+        "distilled_lora_strength_stage_1": None,
+        "distilled_lora_strength_stage_2": None,
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
@@ -733,6 +830,216 @@ class LTX2Pipeline(BasePipeline):
         _, embedded_ts = module.adaln_single(scaled_ts, hidden_dtype=torch.bfloat16)
         return embedded_ts
 
+    def _call_ltx2_denoiser_with_cfg(
+        self,
+        *,
+        latents: torch.Tensor,
+        audio_latents: torch.Tensor | None,
+        step_index: int,
+        timestep: torch.Tensor,
+        cfg_config: dict[str, Any],
+        forward_fn: Callable[..., Any],
+        guidance_scale: float,
+        guidance_rescale: float,
+        do_cfg: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        extra_stream_latents = {"audio": audio_latents} if audio_latents is not None else {}
+        if cfg_config["enabled"]:
+            denoised, extra_denoised, _, _ = self._denoise_step_cfg_parallel(
+                latents,
+                extra_stream_latents,
+                step_index,
+                timestep,
+                cfg_config["local_embeds"],
+                forward_fn,
+                guidance_scale,
+                guidance_rescale,
+                cfg_config["seq_parallel_size"],
+                cfg_config["local_extras"],
+            )
+        else:
+            denoised, extra_denoised, _, _ = self._denoise_step_standard(
+                latents,
+                extra_stream_latents,
+                step_index,
+                timestep,
+                cfg_config["prompt_embeds"],
+                forward_fn,
+                guidance_scale,
+                guidance_rescale,
+                cfg_config["local_extras"],
+                do_cfg=do_cfg,
+            )
+        return denoised, extra_denoised.get("audio")
+
+    def _res2s_denoise(
+        self,
+        *,
+        latents: torch.Tensor,
+        audio_latents: torch.Tensor | None,
+        sigmas: torch.Tensor,
+        forward_fn: Callable[..., Any],
+        cfg_config: dict[str, Any],
+        guidance_scale: float,
+        guidance_rescale: float,
+        do_cfg: bool,
+        model_dtype: torch.dtype,
+        video_denoise_mask: torch.Tensor | None = None,
+        video_clean_latent: torch.Tensor | None = None,
+        eta: float = 0.5,
+        noise_seed: int = -1,
+        noise_seed_substep: int | None = None,
+        bongmath: bool = True,
+        bongmath_max_iter: int = 100,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the LTX-2.3 res_2s denoising loop over existing TRTLLM denoisers."""
+
+        if noise_seed_substep is None:
+            noise_seed_substep = noise_seed + 10000
+
+        state_device = latents.device
+        sigmas = sigmas.to(device=state_device, dtype=torch.float32)
+        n_full_steps = len(sigmas) - 1
+        if sigmas[-1] == 0:
+            sigmas = torch.cat([sigmas[:-1], sigmas.new_tensor([0.0011, 0.0])])
+
+        hp = _highest_precision_float(state_device)
+        hs = -torch.log(sigmas[1:].to(hp).cpu() / sigmas[:-1].to(hp).cpu())
+        phi_cache: dict[tuple[int, float], float] = {}
+        stepper = Res2sDiffusionStep()
+        step_noise_generator = torch.Generator(device=state_device).manual_seed(noise_seed)
+        substep_noise_generator = torch.Generator(device=state_device).manual_seed(
+            noise_seed_substep
+        )
+
+        def _timestep(sigma: torch.Tensor, batch: int) -> torch.Tensor:
+            return sigma.to(state_device, dtype=torch.float32).reshape(()).expand(batch)
+
+        for step_index, _ in self._profile_denoise_steps(range(n_full_steps)):
+            sigma = sigmas[step_index].to(hp)
+            sigma_next = sigmas[step_index + 1].to(hp)
+
+            x_anchor_video = latents.clone().to(hp)
+            x_anchor_audio = audio_latents.clone().to(hp) if audio_latents is not None else None
+
+            denoised_video_1, denoised_audio_1 = self._call_ltx2_denoiser_with_cfg(
+                latents=latents,
+                audio_latents=audio_latents,
+                step_index=step_index,
+                timestep=_timestep(sigmas[step_index], latents.shape[0]),
+                cfg_config=cfg_config,
+                forward_fn=forward_fn,
+                guidance_scale=guidance_scale,
+                guidance_rescale=guidance_rescale,
+                do_cfg=do_cfg,
+            )
+
+            h = hs[step_index].item()
+            a21, b1, b2 = get_res2s_coefficients(h, phi_cache, c2=0.5)
+            sub_sigma = torch.sqrt(sigma * sigma_next)
+
+            eps_1_video = denoised_video_1.to(hp) - x_anchor_video
+            x_mid_video = x_anchor_video + h * a21 * eps_1_video
+            x_mid_video = _inject_res2s_sde_noise(
+                sample=x_anchor_video,
+                denoised_sample=x_mid_video,
+                denoise_mask=video_denoise_mask,
+                clean_latent=video_clean_latent,
+                sigmas=torch.stack([sigma, sub_sigma]).to(state_device, dtype=torch.float32),
+                step_index=0,
+                noise_generator=substep_noise_generator,
+                stepper=stepper,
+                eta=0.5,
+            )
+
+            x_mid_audio = None
+            eps_1_audio = None
+            if x_anchor_audio is not None and denoised_audio_1 is not None:
+                eps_1_audio = denoised_audio_1.to(hp) - x_anchor_audio
+                x_mid_audio = x_anchor_audio + h * a21 * eps_1_audio
+                x_mid_audio = _inject_res2s_sde_noise(
+                    sample=x_anchor_audio,
+                    denoised_sample=x_mid_audio,
+                    denoise_mask=None,
+                    clean_latent=None,
+                    sigmas=torch.stack([sigma, sub_sigma]).to(state_device, dtype=torch.float32),
+                    step_index=0,
+                    noise_generator=substep_noise_generator,
+                    stepper=stepper,
+                    eta=0.5,
+                )
+
+            if bongmath and h < 0.5 and sigma > 0.03:
+                for _ in range(bongmath_max_iter):
+                    x_anchor_video = x_mid_video - h * a21 * eps_1_video
+                    eps_1_video = denoised_video_1.to(hp) - x_anchor_video
+                    if x_mid_audio is not None and eps_1_audio is not None:
+                        x_anchor_audio = x_mid_audio - h * a21 * eps_1_audio
+                        eps_1_audio = denoised_audio_1.to(hp) - x_anchor_audio
+
+            denoised_video_2, denoised_audio_2 = self._call_ltx2_denoiser_with_cfg(
+                latents=x_mid_video.to(model_dtype),
+                audio_latents=x_mid_audio.to(model_dtype) if x_mid_audio is not None else None,
+                step_index=0,
+                timestep=_timestep(sub_sigma.to(state_device), x_mid_video.shape[0]),
+                cfg_config=cfg_config,
+                forward_fn=forward_fn,
+                guidance_scale=guidance_scale,
+                guidance_rescale=guidance_rescale,
+                do_cfg=do_cfg,
+            )
+
+            eps_2_video = denoised_video_2.to(hp) - x_anchor_video
+            x_next_video = x_anchor_video + h * (b1 * eps_1_video + b2 * eps_2_video)
+            latents = _inject_res2s_sde_noise(
+                sample=x_anchor_video,
+                denoised_sample=x_next_video,
+                denoise_mask=video_denoise_mask,
+                clean_latent=video_clean_latent,
+                sigmas=sigmas,
+                step_index=step_index,
+                noise_generator=step_noise_generator,
+                stepper=stepper,
+                eta=eta,
+            ).to(model_dtype)
+
+            if (
+                x_anchor_audio is not None
+                and eps_1_audio is not None
+                and denoised_audio_2 is not None
+            ):
+                eps_2_audio = denoised_audio_2.to(hp) - x_anchor_audio
+                x_next_audio = x_anchor_audio + h * (b1 * eps_1_audio + b2 * eps_2_audio)
+                audio_latents = _inject_res2s_sde_noise(
+                    sample=x_anchor_audio,
+                    denoised_sample=x_next_audio,
+                    denoise_mask=None,
+                    clean_latent=None,
+                    sigmas=sigmas,
+                    step_index=step_index,
+                    noise_generator=step_noise_generator,
+                    stepper=stepper,
+                    eta=eta,
+                ).to(model_dtype)
+
+        if sigmas[-1] == 0:
+            denoised_video, denoised_audio = self._call_ltx2_denoiser_with_cfg(
+                latents=latents,
+                audio_latents=audio_latents,
+                step_index=n_full_steps,
+                timestep=_timestep(sigmas[n_full_steps], latents.shape[0]),
+                cfg_config=cfg_config,
+                forward_fn=forward_fn,
+                guidance_scale=guidance_scale,
+                guidance_rescale=guidance_rescale,
+                do_cfg=do_cfg,
+            )
+            latents = denoised_video.to(model_dtype)
+            if denoised_audio is not None:
+                audio_latents = denoised_audio.to(model_dtype)
+
+        return latents, audio_latents
+
     # ------------------------------------------------------------------
     # Transformer init (called from BasePipeline.__init__)
     # ------------------------------------------------------------------
@@ -789,6 +1096,9 @@ class LTX2Pipeline(BasePipeline):
                 cfg, "audio_positional_embedding_max_pos", [20]
             ),
             av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
+            caption_proj_before_connector=getattr(cfg, "caption_proj_before_connector", False),
+            cross_attention_adaln=getattr(cfg, "cross_attention_adaln", False),
+            use_prompt_adaln_single=getattr(cfg, "use_prompt_adaln_single", True),
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
@@ -988,7 +1298,7 @@ class LTX2Pipeline(BasePipeline):
             )
             self.video_connector = self.video_connector.to(device=device, dtype=dtype)
 
-            self.audio_connector = Embeddings1DConnectorConfigurator.from_config(config)
+            self.audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)
             _load_component_weights(
                 sft_paths,
                 self.audio_connector,
@@ -1167,18 +1477,31 @@ class LTX2Pipeline(BasePipeline):
         text_encoder_hidden_states = torch.stack(text_encoder_hidden_states, dim=-1)
         sequence_lengths = prompt_attention_mask.sum(dim=-1)
 
-        prompt_embeds = self._pack_text_embeds(
-            text_encoder_hidden_states,
-            sequence_lengths,
-            device=self.device,
-            padding_side=self.tokenizer.padding_side,
-            scale_factor=scale_factor,
-        )
-        prompt_embeds = prompt_embeds.to(dtype=self.dtype)
+        if getattr(getattr(self, "feature_extractor", None), "uses_raw_hidden_states", False):
+            prompt_embeds = text_encoder_hidden_states.to(dtype=self.dtype)
+        else:
+            prompt_embeds = self._pack_text_embeds(
+                text_encoder_hidden_states,
+                sequence_lengths,
+                device=self.device,
+                padding_side=self.tokenizer.padding_side,
+                scale_factor=scale_factor,
+            )
+            prompt_embeds = prompt_embeds.to(dtype=self.dtype)
 
-        _, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+        seq_len = prompt_embeds.shape[1]
+        if prompt_embeds.ndim == 4:
+            _, _, hidden_dim, num_layers = prompt_embeds.shape
+            prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1, 1)
+            prompt_embeds = prompt_embeds.view(
+                batch_size * num_videos_per_prompt,
+                seq_len,
+                hidden_dim,
+                num_layers,
+            )
+        else:
+            prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+            prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
 
         prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
         prompt_attention_mask = prompt_attention_mask.repeat(num_videos_per_prompt, 1)
@@ -1201,9 +1524,16 @@ class LTX2Pipeline(BasePipeline):
         additive_mask = (1 - attention_mask.to(prompt_embeds.dtype)) * -1000000.0
         additive_mask = additive_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
 
-        projected = self.feature_extractor(prompt_embeds)
-        video_embeds, video_mask = self.video_connector(projected, additive_mask)
-        audio_embeds, _ = self.audio_connector(projected, additive_mask)
+        projected = self.feature_extractor(prompt_embeds, attention_mask)
+        if isinstance(projected, tuple):
+            video_projected, audio_projected = projected
+            if audio_projected is None:
+                audio_projected = video_projected
+        else:
+            video_projected = projected
+            audio_projected = projected
+        video_embeds, video_mask = self.video_connector(video_projected, additive_mask)
+        audio_embeds, _ = self.audio_connector(audio_projected, additive_mask)
 
         return video_embeds, audio_embeds, video_mask
 
@@ -1360,7 +1690,13 @@ class LTX2Pipeline(BasePipeline):
                 type="float",
                 default=0.0,
                 range=(0.0, 1.0),
-                description="CFG rescale factor for multi-modal guidance.",
+                description="Video CFG rescale factor for multi-modal guidance.",
+            ),
+            "audio_rescale_scale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                range=(0.0, 1.0),
+                description="Audio CFG rescale factor for multi-modal guidance.",
             ),
             "guidance_skip_step": ExtraParamSchema(
                 type="int",
@@ -1371,6 +1707,26 @@ class LTX2Pipeline(BasePipeline):
                 type="bool",
                 default=False,
                 description="Use Gemma3 LLM to enhance the prompt before generation.",
+            ),
+            "sampler": ExtraParamSchema(
+                type="str",
+                default=LTX2_SAMPLER_EULER,
+                description="Denoising sampler: 'euler' or 'res2s'.",
+            ),
+            "res2s_eta": ExtraParamSchema(
+                type="float",
+                default=0.5,
+                description="SDE eta used by the LTX-2.3 res2s sampler.",
+            ),
+            "res2s_noise_seed": ExtraParamSchema(
+                type="int",
+                default=-1,
+                description="Step-level SDE noise seed for the LTX-2.3 res2s sampler.",
+            ),
+            "res2s_noise_seed_substep": ExtraParamSchema(
+                type="int",
+                default=None,
+                description="Substep SDE noise seed for the LTX-2.3 res2s sampler.",
             ),
         }
 
@@ -1396,8 +1752,13 @@ class LTX2Pipeline(BasePipeline):
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
             rescale_scale=extra["rescale_scale"],
+            audio_rescale_scale=extra["audio_rescale_scale"],
             guidance_skip_step=extra["guidance_skip_step"],
             enhance_prompt=extra["enhance_prompt"],
+            sampler=extra["sampler"],
+            res2s_eta=extra["res2s_eta"],
+            res2s_noise_seed=extra["res2s_noise_seed"],
+            res2s_noise_seed_substep=extra["res2s_noise_seed_substep"],
         )
 
     # ------------------------------------------------------------------
@@ -1460,8 +1821,13 @@ class LTX2Pipeline(BasePipeline):
         stg_blocks: Optional[List[int]] = None,
         modality_scale: float = 1.0,
         rescale_scale: float = 0.0,
+        audio_rescale_scale: float = 0.0,
         guidance_skip_step: int = 0,
         enhance_prompt: bool = False,
+        sampler: str = LTX2_SAMPLER_EULER,
+        res2s_eta: float = 0.5,
+        res2s_noise_seed: int = -1,
+        res2s_noise_seed_substep: int | None = None,
     ):
         """Generate video (and audio) from text, optionally conditioned on an image.
 
@@ -1476,6 +1842,7 @@ class LTX2Pipeline(BasePipeline):
             image_cond_strength: Conditioning strength for the image
                 (``1.0`` = fully conditioned first frame).
         """
+        sampler = _normalize_ltx2_sampler(sampler)
         if image is not None:
             _assert_resolution(height, width, is_two_stage=False)
         pipeline_start = time.time()
@@ -1500,7 +1867,7 @@ class LTX2Pipeline(BasePipeline):
             cfg_scale=max(guidance_scale, 7.0) if guidance_scale > 1.0 else 1.0,
             stg_scale=stg_scale,
             stg_blocks=stg_blocks or [],
-            rescale_scale=rescale_scale,
+            rescale_scale=audio_rescale_scale,
             modality_scale=modality_scale,
             skip_step=guidance_skip_step,
         )
@@ -1797,10 +2164,11 @@ class LTX2Pipeline(BasePipeline):
                 Modality(
                     latent=v_latents_bf,
                     timesteps=v_timestep,
-                    positions=video_positions,
-                    context=v_context,
-                    context_mask=mask,
-                )
+                      positions=video_positions,
+                      context=v_context,
+                      context_mask=mask,
+                      sigma=timestep_val,
+                  )
                 if v_latents_bf is not None
                 else None
             )
@@ -1809,10 +2177,11 @@ class LTX2Pipeline(BasePipeline):
                 Modality(
                     latent=a_latents_bf,
                     timesteps=timestep_val,
-                    positions=audio_positions,
-                    context=a_context,
-                    context_mask=mask,
-                )
+                      positions=audio_positions,
+                      context=a_context,
+                      context_mask=mask,
+                      sigma=timestep_val,
+                  )
                 if a_latents_bf is not None
                 else None
             )
@@ -1994,32 +2363,63 @@ class LTX2Pipeline(BasePipeline):
         # When using multi-modal guidance, we handle everything inside
         # forward_fn, so tell BasePipeline not to apply its own CFG.
         effective_guidance = 1.0 if use_multi_modal_guidance else guidance_scale
-
-        timer.mark_denoise_start()
-        result = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=video_embeds,
-            neg_prompt_embeds=neg_video_embeds if not use_multi_modal_guidance else None,
-            guidance_scale=effective_guidance,
-            forward_fn=forward_fn,
-            timesteps=timesteps,
-            guidance_rescale=guidance_rescale,
-            extra_cfg_tensors=(
-                {
-                    "audio_embeds": (audio_embeds, neg_audio_embeds),
-                    "attention_mask": (connector_mask, neg_connector_mask),
-                }
-                if not use_multi_modal_guidance and do_cfg
-                else None
-            ),
-            extra_streams={
-                "audio": (audio_latents, audio_scheduler),
-            },
+        extra_cfg_tensors = (
+            {
+                "audio_embeds": (audio_embeds, neg_audio_embeds),
+                "attention_mask": (connector_mask, neg_connector_mask),
+            }
+            if not use_multi_modal_guidance and do_cfg
+            else None
         )
 
-        latents, extra_stream_latents = result
-        audio_latents = extra_stream_latents["audio"]
+        timer.mark_denoise_start()
+        if sampler == LTX2_SAMPLER_RES2S:
+            cfg_config = self._setup_cfg_config(
+                effective_guidance,
+                video_embeds,
+                neg_video_embeds if not use_multi_modal_guidance else None,
+                extra_cfg_tensors,
+            )
+            do_base_cfg = (
+                not cfg_config["enabled"]
+                and effective_guidance > 1.0
+                and neg_video_embeds is not None
+                and not use_multi_modal_guidance
+            )
+            latents, audio_latents = self._res2s_denoise(
+                latents=latents,
+                audio_latents=audio_latents,
+                sigmas=self.scheduler.sigmas,
+                forward_fn=forward_fn,
+                cfg_config=cfg_config,
+                guidance_scale=effective_guidance,
+                guidance_rescale=guidance_rescale,
+                do_cfg=do_base_cfg,
+                model_dtype=self.dtype,
+                video_denoise_mask=denoise_mask,
+                video_clean_latent=clean_latent,
+                eta=res2s_eta,
+                noise_seed=res2s_noise_seed,
+                noise_seed_substep=res2s_noise_seed_substep,
+            )
+        else:
+            result = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=video_embeds,
+                neg_prompt_embeds=neg_video_embeds if not use_multi_modal_guidance else None,
+                guidance_scale=effective_guidance,
+                forward_fn=forward_fn,
+                timesteps=timesteps,
+                guidance_rescale=guidance_rescale,
+                extra_cfg_tensors=extra_cfg_tensors,
+                extra_streams={
+                    "audio": (audio_latents, audio_scheduler),
+                },
+            )
+
+            latents, extra_stream_latents = result
+            audio_latents = extra_stream_latents["audio"]
 
         timer.mark_post_start()
 

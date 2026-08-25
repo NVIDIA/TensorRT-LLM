@@ -13,17 +13,19 @@ Major modifications:
 from .adaln import AdaLayerNormSingle
 from .attention import Attention, FeedForward, GELUApprox
 from .connector import (
+    AudioEmbeddings1DConnectorConfigurator,
     Embeddings1DConnector,
     Embeddings1DConnectorConfigurator,
     GemmaFeaturesExtractorProjLinear,
 )
-from .diffusion_steps import EulerDiffusionStep
+from .diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
 from .modality import Modality
 from .normalization import NormType, PixelNorm, build_normalization_layer
 from .patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
 from .protocols import DiffusionStepProtocol, Patchifier, SchedulerProtocol
 from .rope import LTXRopeType, apply_rotary_emb, precompute_freqs_cis
 from .scheduler_adapter import NativeSchedulerAdapter
+from .res2s import get_res2s_coefficients, phi
 from .schedulers import LTX2Scheduler
 from .text_projection import PixArtAlphaTextProjection
 from .timestep_embedding import (
@@ -48,6 +50,7 @@ from .utils_ltx2 import rms_norm, to_velocity
 __all__ = [
     "AdaLayerNormSingle",
     "Attention",
+    "AudioEmbeddings1DConnectorConfigurator",
     "AudioLatentShape",
     "AudioPatchifier",
     "DiffusionStepProtocol",
@@ -67,6 +70,7 @@ __all__ = [
     "PixArtAlphaCombinedTimestepSizeEmbeddings",
     "PixArtAlphaTextProjection",
     "PixelNorm",
+    "Res2sDiffusionStep",
     "SchedulerProtocol",
     "SpatioTemporalScaleFactors",
     "TimestepEmbedding",
@@ -80,6 +84,8 @@ __all__ = [
     "apply_rotary_emb",
     "build_normalization_layer",
     "get_pixel_coords",
+    "get_res2s_coefficients",
+    "phi",
     "precompute_freqs_cis",
     "rms_norm",
     "to_velocity",

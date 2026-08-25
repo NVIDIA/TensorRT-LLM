@@ -11,6 +11,7 @@ import unittest
 
 import pytest
 import torch
+import torch.nn as nn
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.mapping import Mapping
@@ -1096,6 +1097,70 @@ class TestLTX2CacheDiTWrapperPassthrough(unittest.TestCase):
             torch.equal(a_direct, a_wrap),
             f"Audio differs. Max abs diff: {(a_direct - a_wrap).abs().max():.6e}",
         )
+
+
+@pytest.mark.cpu_only
+def test_ltx23_cross_attention_adaln_checkpoint_weights_are_retained():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+        LTXModel,
+        LTXModelType,
+    )
+
+    model = LTXModel(
+        model_type=LTXModelType.AudioVideo,
+        model_config=_create_model_config(),
+        cross_attention_adaln=True,
+        **AUDIO_VIDEO_CONFIG,
+    )
+    param_shapes = {name: tuple(param.shape) for name, param in model.named_parameters()}
+    weight_key = next(
+        name for name in param_shapes if name.endswith("adaln_single.linear.weight")
+    )
+    target_shape = param_shapes[weight_key]
+    source = torch.arange(
+        int(torch.tensor(target_shape).prod().item()), dtype=torch.float32
+    ).reshape(target_shape)
+    prompt_key = "transformer_blocks.0.prompt_scale_shift_table"
+    prompt_source = torch.ones(param_shapes[prompt_key])
+
+    adapted = model._adapt_cross_attention_adaln_checkpoint_weights(
+        {
+            weight_key: source,
+            prompt_key: prompt_source,
+        }
+    )
+
+    assert tuple(adapted[weight_key].shape) == target_shape
+    torch.testing.assert_close(adapted[weight_key], source)
+    torch.testing.assert_close(adapted[prompt_key], prompt_source)
+
+
+@pytest.mark.cpu_only
+def test_ltx23_cross_attention_adaln_checkpoint_weights_slice_legacy_targets():
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+        LTXModel,
+        LTXModelType,
+    )
+
+    model = LTXModel(
+        model_type=LTXModelType.AudioVideo,
+        model_config=_create_model_config(),
+        **AUDIO_VIDEO_CONFIG,
+    )
+    param_shapes = {name: tuple(param.shape) for name, param in model.named_parameters()}
+    weight_key = next(
+        name for name in param_shapes if name.endswith("adaln_single.linear.weight")
+    )
+    target_shape = param_shapes[weight_key]
+    source_shape = (target_shape[0] + 3, *target_shape[1:])
+    source = torch.arange(
+        int(torch.tensor(source_shape).prod().item()), dtype=torch.float32
+    ).reshape(source_shape)
+
+    adapted = model._adapt_cross_attention_adaln_checkpoint_weights({weight_key: source})
+
+    assert tuple(adapted[weight_key].shape) == target_shape
+    torch.testing.assert_close(adapted[weight_key], source[: target_shape[0]])
 
 
 if __name__ == "__main__":

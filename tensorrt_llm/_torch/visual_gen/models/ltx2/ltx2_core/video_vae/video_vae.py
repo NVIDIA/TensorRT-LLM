@@ -246,6 +246,21 @@ class VideoEncoder(nn.Module):
         return self.per_channel_statistics.normalize(mean)
 
 
+def _decoder_bottleneck_channels(
+    base_channels: int, decoder_blocks: List[Tuple[str, int | dict]]
+) -> int:
+    channel_multiplier = 1
+    for block_name, block_params in decoder_blocks:
+        block_config = (
+            {"num_layers": block_params} if isinstance(block_params, int) else block_params
+        )
+        if block_name in ("compress_time", "compress_space", "compress_all"):
+            channel_multiplier *= block_config.get("multiplier", 1)
+        elif block_name == "res_x_y":
+            channel_multiplier *= block_config.get("multiplier", 2)
+    return base_channels * channel_multiplier
+
+
 def _make_decoder_block(
     block_name: str,
     block_config: dict[str, Any],
@@ -295,17 +310,21 @@ def _make_decoder_block(
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_time":
+        out_channels = in_channels // block_config.get("multiplier", 1)
         block = DepthToSpaceUpsample(
             dims=convolution_dimensions,
             in_channels=in_channels,
             stride=(2, 1, 1),
+            out_channels_reduction_factor=block_config.get("multiplier", 1),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_space":
+        out_channels = in_channels // block_config.get("multiplier", 1)
         block = DepthToSpaceUpsample(
             dims=convolution_dimensions,
             in_channels=in_channels,
             stride=(1, 2, 2),
+            out_channels_reduction_factor=block_config.get("multiplier", 1),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_all":
@@ -337,6 +356,7 @@ class VideoDecoder(nn.Module):
         causal: bool = False,
         timestep_conditioning: bool = False,
         decoder_spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
+        base_channels: int = 128,
     ):
         super().__init__()
         self.video_downscale_factors = SpatioTemporalScaleFactors(time=8, width=32, height=32)
@@ -348,13 +368,7 @@ class VideoDecoder(nn.Module):
         self.per_channel_statistics = PerChannelStatistics(latent_channels=in_channels)
         self.decode_noise_scale = 0.025
         self.decode_timestep = 0.05
-        feature_channels = in_channels
-        for block_name, block_params in list(reversed(decoder_blocks)):
-            block_config = block_params if isinstance(block_params, dict) else {}
-            if block_name == "res_x_y":
-                feature_channels = feature_channels * block_config.get("multiplier", 2)
-            if block_name == "compress_all":
-                feature_channels = feature_channels * block_config.get("multiplier", 1)
+        feature_channels = _decoder_bottleneck_channels(base_channels, decoder_blocks)
         self.conv_in = make_conv_nd(
             dims=convolution_dimensions,
             in_channels=in_channels,

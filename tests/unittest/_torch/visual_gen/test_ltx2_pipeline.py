@@ -14,6 +14,7 @@ Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 """
 
 import gc
+import math
 import json
 import os
 from types import SimpleNamespace
@@ -1733,6 +1734,100 @@ class TestTwoStageCommonWarmupShapes:
             h, w, f = shape
             assert h % 64 == 0, f"Warmup height {h} not divisible by 64"
             assert w % 64 == 0, f"Warmup width {w} not divisible by 64"
+
+
+@pytest.mark.cpu_only
+class TestLTX23Res2S:
+    @staticmethod
+    def _reference_phi(j: int, neg_h: float) -> float:
+        if abs(neg_h) < 1e-10:
+            return 1.0 / math.factorial(j)
+        remainder = sum(neg_h**k / math.factorial(k) for k in range(j))
+        return (math.exp(neg_h) - remainder) / (neg_h**j)
+
+    def test_res2s_coefficients_match_reference_formula(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.res2s import (
+            get_res2s_coefficients,
+        )
+
+        h = 0.375
+        c2 = 0.5
+        a21, b1, b2 = get_res2s_coefficients(h, {}, c2=c2)
+        phi_1_c2 = self._reference_phi(1, -h * c2)
+        phi_1_full = self._reference_phi(1, -h)
+        phi_2_full = self._reference_phi(2, -h)
+
+        assert a21 == pytest.approx(c2 * phi_1_c2)
+        assert b2 == pytest.approx(phi_2_full / c2)
+        assert b1 == pytest.approx(phi_1_full - b2)
+
+    def test_res2s_diffusion_step_matches_reference_formula(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.diffusion_steps import (
+            Res2sDiffusionStep,
+        )
+
+        sample = torch.tensor([0.2, -0.4, 0.8], dtype=torch.float32)
+        denoised = torch.tensor([0.1, -0.2, 0.5], dtype=torch.float32)
+        noise = torch.tensor([0.05, -0.25, 0.1], dtype=torch.float32)
+        sigmas = torch.tensor([1.0, 0.5], dtype=torch.float32)
+        eta = 0.5
+
+        sigma, sigma_next = sigmas
+        sigma_up = sigma_next * eta
+        sigma_signal = 1 - sigma_next
+        sigma_residual = torch.sqrt((sigma_next**2 - sigma_up**2).clamp(min=0))
+        alpha_ratio = sigma_signal + sigma_residual
+        sigma_down = sigma_residual / alpha_ratio
+        eps_next = (sample - denoised) / (sigma - sigma_next)
+        denoised_next = sample - sigma * eps_next
+        expected = alpha_ratio * (denoised_next + sigma_down * eps_next) + sigma_up * noise
+
+        actual = Res2sDiffusionStep().step(
+            sample=sample,
+            denoised_sample=denoised,
+            sigmas=sigmas,
+            step_index=0,
+            noise=noise,
+            eta=eta,
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_res2s_denoise_uses_reference_substep_eta_and_bongmath(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2
+
+        pipeline = pipeline_ltx2.LTX2Pipeline.__new__(pipeline_ltx2.LTX2Pipeline)
+        pipeline._profile_denoise_steps = lambda steps: ((step, None) for step in steps)
+        pipeline._call_ltx2_denoiser_with_cfg = lambda **kwargs: (
+            torch.zeros_like(kwargs["latents"]),
+            None,
+        )
+
+        injections = []
+
+        def fake_inject(**kwargs):
+            injections.append((kwargs["eta"], kwargs["sample"].clone()))
+            if len(injections) == 1:
+                return kwargs["denoised_sample"] + 0.1
+            return kwargs["denoised_sample"]
+
+        monkeypatch.setattr(pipeline_ltx2, "_inject_res2s_sde_noise", fake_inject)
+        pipeline._res2s_denoise(
+            latents=torch.ones(1, 1, dtype=torch.float32),
+            audio_latents=None,
+            sigmas=torch.tensor([1.0, 0.8], dtype=torch.float32),
+            forward_fn=lambda *args, **kwargs: None,
+            cfg_config={},
+            guidance_scale=1.0,
+            guidance_rescale=0.0,
+            do_cfg=False,
+            model_dtype=torch.float32,
+            eta=0.9,
+            bongmath=True,
+            bongmath_max_iter=1,
+        )
+
+        assert [eta for eta, _ in injections] == [0.5, 0.9]
+        assert injections[1][1].item() > 1.0
 
 
 if __name__ == "__main__":

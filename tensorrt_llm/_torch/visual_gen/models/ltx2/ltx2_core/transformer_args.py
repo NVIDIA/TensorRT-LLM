@@ -17,7 +17,6 @@ from .rope import (
     _generate_freq_grid_pytorch,
     precompute_freqs_cis,
 )
-from .text_projection import PixArtAlphaTextProjection
 
 
 @dataclass(frozen=True)
@@ -32,6 +31,7 @@ class TransformerArgs:
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
+    prompt_timestep: torch.Tensor | None = None
     # Optional [B, S_full_padded] bool mask (True=valid, False=pad) for the
     # audio modality when Ulysses padding is engaged (T_a padded to be
     # divisible by ulysses_size). Identical across Ulysses ranks (full-seq).
@@ -50,7 +50,7 @@ class TransformerArgsPreprocessor:
         self,
         patchify_proj: torch.nn.Module,
         adaln: AdaLayerNormSingle,
-        caption_projection: PixArtAlphaTextProjection,
+        caption_projection: torch.nn.Module,
         inner_dim: int,
         max_pos: list[int],
         num_attention_heads: int,
@@ -59,9 +59,11 @@ class TransformerArgsPreprocessor:
         double_precision_rope: bool,
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
+        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
+        self.prompt_adaln = prompt_adaln
         self.caption_projection = caption_projection
         self.inner_dim = inner_dim
         self.max_pos = max_pos
@@ -78,12 +80,26 @@ class TransformerArgsPreprocessor:
         timestep: torch.Tensor,
         batch_size: int,
         hidden_dtype: torch.dtype,
+        adaln: AdaLayerNormSingle | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         timestep = timestep * self.timestep_scale_multiplier
-        timestep, embedded_timestep = self.adaln(timestep.flatten(), hidden_dtype=hidden_dtype)
+        timestep, embedded_timestep = (adaln or self.adaln)(
+            timestep.flatten(), hidden_dtype=hidden_dtype
+        )
         timestep = timestep.view(batch_size, -1, timestep.shape[-1])
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
         return timestep, embedded_timestep
+
+    @staticmethod
+    def _sigma_from_modality(modality: Modality, batch_size: int) -> torch.Tensor:
+        sigma = modality.sigma if modality.sigma is not None else modality.timesteps
+        if sigma.ndim == 0:
+            return sigma.expand(batch_size)
+        if sigma.ndim > 1:
+            return sigma.reshape(sigma.shape[0], -1).amax(dim=1)
+        if sigma.shape[0] == 1 and batch_size != 1:
+            return sigma.expand(batch_size)
+        return sigma
 
     def _prepare_context(
         self,
@@ -170,6 +186,12 @@ class TransformerArgsPreprocessor:
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
+        prompt_timestep = None
+        if self.prompt_adaln is not None:
+            sigma = self._sigma_from_modality(modality, x.shape[0])
+            prompt_timestep, _ = self._prepare_timestep(
+                sigma, x.shape[0], modality.latent.dtype, self.prompt_adaln
+            )
         return TransformerArgs(
             x=x,
             context=static_context,
@@ -181,6 +203,7 @@ class TransformerArgsPreprocessor:
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
             enabled=modality.enabled,
+            prompt_timestep=prompt_timestep,
         )
 
 
@@ -191,7 +214,7 @@ class MultiModalTransformerArgsPreprocessor:
         self,
         patchify_proj: torch.nn.Module,
         adaln: AdaLayerNormSingle,
-        caption_projection: PixArtAlphaTextProjection,
+        caption_projection: torch.nn.Module,
         cross_scale_shift_adaln: AdaLayerNormSingle,
         cross_gate_adaln: AdaLayerNormSingle,
         inner_dim: int,
@@ -205,6 +228,7 @@ class MultiModalTransformerArgsPreprocessor:
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
         av_ca_timestep_scale_multiplier: int,
+        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -218,6 +242,7 @@ class MultiModalTransformerArgsPreprocessor:
             double_precision_rope=double_precision_rope,
             positional_embedding_theta=positional_embedding_theta,
             rope_type=rope_type,
+            prompt_adaln=prompt_adaln,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln

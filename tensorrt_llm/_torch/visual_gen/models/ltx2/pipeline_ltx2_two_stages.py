@@ -41,10 +41,15 @@ from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
 from .parallel_vae import tile_parallel_decode
 from .pipeline_ltx2 import (
+    LTX2_DISTILLED_LORA_STAGE_1_STRENGTH_DEFAULT,
+    LTX2_DISTILLED_LORA_STAGE_2_STRENGTH_DEFAULT,
+    LTX2_SAMPLER_EULER,
+    LTX2_SAMPLER_RES2S,
     LTX2Pipeline,
     _assert_resolution,
-    _find_safetensors_files,
     _LTX2CUDAGraphRunner,
+    _find_safetensors_files,
+    _normalize_ltx2_sampler,
     _prefetch_ltx2_safetensors_files,
 )
 from .transformer_ltx2 import Stage2Groups
@@ -482,11 +487,19 @@ def _scale_like(scale: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
     return scale.to(device=reference.device, dtype=reference.dtype).reshape(reference.shape)
 
 
+def _get_lora_stage_strength(extra_attrs: Dict[str, Any], name: str, default: float) -> float:
+    value = extra_attrs.get(name, default)
+    if value is None:
+        value = default
+    return float(value)
+
+
 def _apply_lora_deltas(
     module: torch.nn.Module,
     deltas: Dict[str, torch.Tensor],
     sign: float = 1.0,
     save_bf16_weights: bool = False,
+    scale: float = 1.0,
 ) -> tuple:
     """Add (sign=+1) or remove (sign=-1) pre-computed LoRA deltas.
 
@@ -514,6 +527,10 @@ def _apply_lora_deltas(
     trip.  *snapshot_required_count* is the number of weights that must be
     restored from saved snapshots.
     """
+    scale = float(scale)
+    if scale == 0.0:
+        return 0, {}, 0
+
     applied = 0
     snapshot_required = 0
     saved_state: Dict[str, Any] = {}
@@ -537,6 +554,8 @@ def _apply_lora_deltas(
 
     try:
         for name, delta in deltas.items():
+            if scale != 1.0:
+                delta = delta * scale
             param_name = name if name in state else f"{name}.weight"
             if param_name not in state:
                 continue
@@ -658,6 +677,7 @@ def _subtract_dense_lora_deltas(
     module: torch.nn.Module,
     deltas: Dict[str, torch.Tensor],
     saved_state: Dict[str, Any],
+    scale: float = 1.0,
 ) -> int:
     """Remove LoRA deltas from dense floating-point weights.
 
@@ -688,6 +708,45 @@ def _subtract_dense_lora_deltas(
         )
         restored += 1
 
+    return restored
+
+
+def _restore_applied_lora_deltas(
+    module: torch.nn.Module,
+    deltas: Dict[str, torch.Tensor],
+    saved_state: Dict[str, Any],
+    snapshot_required: int,
+    applied_count: int,
+    *,
+    scale: float,
+    stage_name: str,
+) -> int:
+    if snapshot_required and not saved_state:
+        raise RuntimeError(
+            f"LoRA state was not saved; cannot safely restore {stage_name} weights."
+        )
+
+    snapshot_restored = 0
+    if snapshot_required:
+        # Restore every LoRA-touched parameter from its snapshot. Packed FP4
+        # also restores the original quant_method.
+        _restore_lora_state(module, saved_state)
+        snapshot_restored = _count_saved_lora_weight_tensors(saved_state)
+
+    # BF16 weights that were not snapshotted are restored by subtracting LoRA
+    # deltas. FP8 and FP4 are exact snapshot restores.
+    dense_restored = _subtract_dense_lora_deltas(
+        module,
+        deltas,
+        saved_state,
+        scale=scale,
+    )
+    restored = snapshot_restored + dense_restored
+    if restored != applied_count:
+        raise RuntimeError(
+            f"Restored {restored} LoRA-touched weights after {stage_name}, "
+            f"but {applied_count} were applied."
+        )
     return restored
 
 
@@ -797,11 +856,18 @@ class _PersistentLoRAWeightCache:
         cls,
         module: torch.nn.Module,
         deltas: Dict[str, torch.Tensor],
+        scale: float = 1.0,
     ) -> "_PersistentLoRAWeightCache":
+        scale = float(scale)
+        if scale == 0.0:
+            return cls([])
+
         state, module_dict = cls._module_state(module)
         entries: List[_PersistentLoRAParamState] = []
 
         for name, delta in deltas.items():
+            if scale != 1.0:
+                delta = delta * scale
             param_name = name if name in state else f"{name}.weight"
             if param_name not in state:
                 continue
@@ -1066,6 +1132,14 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             return
         if not getattr(self, "_distilled_lora_deltas", {}):
             return
+        if getattr(self, "_distilled_lora_strength_stage_1", 0.0) != 0.0:
+            raise RuntimeError(
+                "LTX-2 two-stage CUDA graph does not support non-persistent "
+                "stage-1 distilled LoRA weights. Disable CUDA graph or set "
+                "distilled_lora_strength_stage_1=0."
+            )
+        if getattr(self, "_distilled_lora_strength_stage_2", 0.0) == 0.0:
+            return
         if getattr(self, "_distilled_lora_weight_cache", None) is not None:
             return
 
@@ -1188,9 +1262,25 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             self.spatial_upsampler = None
 
         # --- Distilled LoRA (pre-compute deltas) ---
+        extra_attrs = self.pipeline_config.extra_attrs
+        self._distilled_lora_strength_stage_1 = _get_lora_stage_strength(
+            extra_attrs,
+            "distilled_lora_strength_stage_1",
+            LTX2_DISTILLED_LORA_STAGE_1_STRENGTH_DEFAULT,
+        )
+        self._distilled_lora_strength_stage_2 = _get_lora_stage_strength(
+            extra_attrs,
+            "distilled_lora_strength_stage_2",
+            LTX2_DISTILLED_LORA_STAGE_2_STRENGTH_DEFAULT,
+        )
         self._distilled_lora_deltas: Dict[str, torch.Tensor] = {}
         self._distilled_lora_weight_cache: Optional[_PersistentLoRAWeightCache] = None
         if distilled_lora_path:
+            logger.info(
+                "Distilled LoRA strengths: "
+                f"stage1={self._distilled_lora_strength_stage_1}, "
+                f"stage2={self._distilled_lora_strength_stage_2}"
+            )
             logger.info("Waiting for distilled LoRA pre-compute...")
             if lora_future is None:
                 raise RuntimeError("Distilled LoRA pre-compute was not started.")
@@ -1198,25 +1288,37 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             logger.info(
                 f"Distilled LoRA ready: {len(self._distilled_lora_deltas)} parameter deltas"
             )
-            try:
-                self._distilled_lora_weight_cache = _PersistentLoRAWeightCache.build(
-                    self.transformer,
-                    self._distilled_lora_deltas,
-                )
-            except torch.cuda.OutOfMemoryError as exc:
-                logger.warning(
-                    "Persistent LTX-2 LoRA weights disabled after CUDA OOM "
-                    f"during cache build: {exc}"
-                )
-                torch.cuda.empty_cache()
-                self._distilled_lora_weight_cache = None
-            else:
-                self._distilled_lora_weight_cache.bind_original()
+            if self._distilled_lora_strength_stage_2 == 0.0:
                 logger.info(
-                    "Persistent LTX-2 LoRA weights ready: "
-                    f"{self._distilled_lora_weight_cache.applied_count} params, "
-                    f"precision_counts={self._distilled_lora_weight_cache.precision_counts()}"
+                    "Persistent LTX-2 LoRA weights disabled because stage-2 "
+                    "distilled LoRA strength is 0."
                 )
+            elif self._distilled_lora_strength_stage_1 != 0.0:
+                logger.info(
+                    "Persistent LTX-2 LoRA weights disabled because stage-1 "
+                    "distilled LoRA mutates weights before stage 2."
+                )
+            else:
+                try:
+                    self._distilled_lora_weight_cache = _PersistentLoRAWeightCache.build(
+                        self.transformer,
+                        self._distilled_lora_deltas,
+                        scale=self._distilled_lora_strength_stage_2,
+                    )
+                except torch.cuda.OutOfMemoryError as exc:
+                    logger.warning(
+                        "Persistent LTX-2 LoRA weights disabled after CUDA OOM "
+                        f"during cache build: {exc}"
+                    )
+                    torch.cuda.empty_cache()
+                    self._distilled_lora_weight_cache = None
+                else:
+                    self._distilled_lora_weight_cache.bind_original()
+                    logger.info(
+                        "Persistent LTX-2 LoRA weights ready: "
+                        f"{self._distilled_lora_weight_cache.applied_count} params, "
+                        f"precision_counts={self._distilled_lora_weight_cache.precision_counts()}"
+                    )
         self._assert_cuda_graph_safe_lora_bindings()
 
     # ------------------------------------------------------------------
@@ -1244,8 +1346,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
             rescale_scale=extra["rescale_scale"],
+            audio_rescale_scale=extra["audio_rescale_scale"],
             guidance_skip_step=extra["guidance_skip_step"],
             enhance_prompt=extra["enhance_prompt"],
+            sampler=extra["sampler"],
+            res2s_eta=extra["res2s_eta"],
+            res2s_noise_seed=extra["res2s_noise_seed"],
+            res2s_noise_seed_substep=extra["res2s_noise_seed_substep"],
         )
 
     # ------------------------------------------------------------------
@@ -1273,8 +1380,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         stg_blocks: Optional[List[int]] = None,
         modality_scale: float = 1.0,
         rescale_scale: float = 0.0,
+        audio_rescale_scale: float = 0.0,
         guidance_skip_step: int = 0,
         enhance_prompt: bool = False,
+        sampler: str = LTX2_SAMPLER_EULER,
+        res2s_eta: float = 0.5,
+        res2s_noise_seed: int = -1,
+        res2s_noise_seed_substep: int | None = None,
     ):
         """Generate video and audio via two stages.
 
@@ -1284,6 +1396,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                  (distilled sigma schedule, no guidance, distilled LoRA)
                  → decode.
         """
+        sampler = _normalize_ltx2_sampler(sampler)
+
         # Optional prompt enhancement (applied once and reused for both stages).
         self._lora_cuda_graph_state = "original"
         if enhance_prompt:
@@ -1326,28 +1440,72 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # Stage 1: denoise at half resolution
         # ================================================================
         timer.mark_denoise_start()
-        out = super().forward(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height_s1,
-            width=width_s1,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            guidance_rescale=guidance_rescale,
-            seed=seed,
-            output_type="latent",
-            max_sequence_length=max_sequence_length,
-            image=image,
-            image_cond_strength=image_cond_strength,
-            stg_scale=stg_scale,
-            stg_blocks=stg_blocks,
-            modality_scale=modality_scale,
-            rescale_scale=rescale_scale,
-            guidance_skip_step=guidance_skip_step,
-            enhance_prompt=enhance_prompt,
-        )
+        stage1_lora_count = 0
+        stage1_lora_state: Dict[str, Any] = {}
+        stage1_snapshot_required = 0
+        stage1_lora_merged = False
+        try:
+            if self._distilled_lora_deltas and self._distilled_lora_strength_stage_1 != 0.0:
+                transformer_device = next(self.transformer.parameters()).device
+                preload_free_gib = getattr(self, "_bf16_snapshot_preload_free_gib", None)
+                save_bf16_weights = _should_save_bf16_weights(
+                    device=transformer_device,
+                    preload_free_gib=preload_free_gib,
+                )
+                stage1_lora_count, stage1_lora_state, stage1_snapshot_required = _apply_lora_deltas(
+                    self.transformer,
+                    self._distilled_lora_deltas,
+                    sign=1.0,
+                    save_bf16_weights=save_bf16_weights,
+                    scale=self._distilled_lora_strength_stage_1,
+                )
+                stage1_lora_merged = True
+                logger.info(
+                    "Merged distilled LoRA "
+                    f"({stage1_lora_count} params, strength="
+                    f"{self._distilled_lora_strength_stage_1}) for stage 1"
+                )
+
+            out = super().forward(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                height=height_s1,
+                width=width_s1,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                guidance_rescale=guidance_rescale,
+                seed=seed,
+                output_type="latent",
+                max_sequence_length=max_sequence_length,
+                image=image,
+                image_cond_strength=image_cond_strength,
+                stg_scale=stg_scale,
+                stg_blocks=stg_blocks,
+                modality_scale=modality_scale,
+                rescale_scale=rescale_scale,
+                audio_rescale_scale=audio_rescale_scale,
+                guidance_skip_step=guidance_skip_step,
+                enhance_prompt=enhance_prompt,
+                sampler=sampler,
+                res2s_eta=res2s_eta,
+                res2s_noise_seed=res2s_noise_seed,
+                res2s_noise_seed_substep=res2s_noise_seed_substep,
+            )
+        finally:
+            if stage1_lora_merged:
+                _restore_applied_lora_deltas(
+                    self.transformer,
+                    self._distilled_lora_deltas,
+                    stage1_lora_state,
+                    stage1_snapshot_required,
+                    stage1_lora_count,
+                    scale=self._distilled_lora_strength_stage_1,
+                    stage_name="stage 1",
+                )
+                self._lora_cuda_graph_state = "original"
+                logger.info("Un-merged distilled LoRA after stage 1")
 
         # Every rank computes the full stage-1 latents (all-rank denoise loop +
         # per-forward gather) and output_type="latent" returns them on every
@@ -1397,10 +1555,15 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     self._distilled_lora_deltas,
                     sign=1.0,
                     save_bf16_weights=save_bf16_weights,
+                    scale=self._distilled_lora_strength_stage_2,
                 )
                 dense_lora_merge_completed = True
                 self._lora_cuda_graph_state = "merged"
-                logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
+                logger.info(
+                    "Merged distilled LoRA "
+                    f"({n} params, strength={self._distilled_lora_strength_stage_2}) "
+                    "for stage 2 (BF16 weights)"
+                )
 
             if self.transformer._has_stage2:
                 # The switch atomically moves the graph-key topology with the
@@ -1427,6 +1590,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 max_sequence_length=max_sequence_length,
                 image=image,
                 image_cond_strength=image_cond_strength,
+                sampler=sampler,
+                res2s_eta=res2s_eta,
+                res2s_noise_seed=res2s_noise_seed,
+                res2s_noise_seed_substep=res2s_noise_seed_substep,
                 timer=timer,
             )
         finally:
@@ -1437,30 +1604,15 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 self._lora_cuda_graph_state = "original"
                 logger.info("Re-bound persistent distilled LoRA original weights after stage 2")
             elif dense_lora_merge_completed:
-                if snapshot_required and not saved_lora_state:
-                    raise RuntimeError(
-                        "LoRA state was not saved; cannot safely restore stage 2 weights."
-                    )
-
-                snapshot_restored = 0
-                if snapshot_required:
-                    # Restore every LoRA-touched parameter from its snapshot. Packed
-                    # FP4 also restores the original quant_method.
-                    _restore_lora_state(self.transformer, saved_lora_state)
-                    snapshot_restored = _count_saved_lora_weight_tensors(saved_lora_state)
-
-                # BF16 weights that were not snapshotted are restored by
-                # subtracting LoRA deltas. FP8 and FP4 are exact snapshot restores.
-                dense_restored = _subtract_dense_lora_deltas(
+                _restore_applied_lora_deltas(
                     self.transformer,
                     self._distilled_lora_deltas,
                     saved_lora_state,
+                    snapshot_required,
+                    n,
+                    scale=self._distilled_lora_strength_stage_2,
+                    stage_name="stage 2",
                 )
-                restored = snapshot_restored + dense_restored
-                if restored != n:
-                    raise RuntimeError(
-                        f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
-                    )
                 self._lora_cuda_graph_state = "original"
                 logger.info("Un-merged distilled LoRA after stage 2")
             else:
@@ -1586,6 +1738,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         max_sequence_length: int,
         image: Optional[Union[str, torch.Tensor]] = None,
         image_cond_strength: float = 1.0,
+        sampler: str = LTX2_SAMPLER_EULER,
+        res2s_eta: float = 0.5,
+        res2s_noise_seed: int = -1,
+        res2s_noise_seed_substep: int | None = None,
         timer: Optional[_TwoStagePhaseTimer] = None,
     ) -> tuple:
         """Run stage 2 refinement denoising on upsampled latents.
@@ -1599,6 +1755,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         """
         logger.info("Stage 2: refinement denoising...")
         generator = torch.Generator(device=self.device).manual_seed(seed)
+        stage1_audio_latents = audio_latents
 
         # --- Text conditioning: reuse Stage 1 encoder output ---
         # Gemma3 + Connector outputs depend only on prompt text, not on
@@ -1721,78 +1878,134 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         if timer is not None:
             timer.mark_stage2_start()
 
-        # --- Euler denoising loop (no guidance) ---
-        # Stage 2 runs its own loop rather than BasePipeline.denoise(), so it
-        # drives the profiler windows itself. Without this a numeric range
-        # would capture stage 1 only and the trace would silently omit half
-        # the denoising.
-        for i, _ in self._profile_denoise_steps(range(len(sigmas) - 1)):
-            with nvtx_range(f"refinement_step {i}"):
-                sigma = sigmas[i]
-                sigma_next = sigmas[i + 1]
-                dt = sigma_next - sigma
-                timestep = sigma.unsqueeze(0).expand(v_working.shape[0])
+        def stage2_forward_fn(
+            video_latents,
+            extra_stream_latents,
+            step_index,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
+        ):
+            audio_latents_in = extra_stream_latents.get("audio")
+            if denoise_mask is not None:
+                v_timestep = denoise_mask * timestep.reshape(-1, 1)
+            else:
+                v_timestep = timestep
 
-                if denoise_mask is not None:
-                    v_timestep = denoise_mask * sigma
-                else:
-                    v_timestep = timestep
+            video_mod = Modality(
+                latent=video_latents.to(self.dtype),
+                timesteps=v_timestep,
+                  positions=video_positions,
+                  context=encoder_hidden_states,
+                  context_mask=extra_tensors.get("attention_mask", connector_mask),
+                  sigma=timestep,
+              )
 
-                video_mod = Modality(
-                    latent=v_working.to(self.dtype),
-                    timesteps=v_timestep,
-                    positions=video_positions,
-                    context=video_embeds,
-                    context_mask=connector_mask,
-                )
+            audio_mod = None
+            if audio_latents_in is not None:
+                audio_mod = Modality(
+                    latent=audio_latents_in.to(self.dtype),
+                    timesteps=timestep,
+                      positions=audio_positions,
+                      context=extra_tensors.get("audio_embeds", audio_embeds),
+                      context_mask=extra_tensors.get("attention_mask", connector_mask),
+                      sigma=timestep,
+                  )
 
-                audio_mod = None
-                if a_working is not None:
-                    audio_mod = Modality(
-                        latent=a_working.to(self.dtype),
-                        timesteps=timestep,
-                        positions=audio_positions,
-                        context=audio_embeds,
-                        context_mask=connector_mask,
+            vel_v, vel_a = self.transformer(
+                video=video_mod,
+                audio=audio_mod,
+                text_cache=_s2_static,
+                step_index=step_index,
+            )
+
+            sigma_v = timestep.float()
+            while sigma_v.dim() < vel_v.dim():
+                sigma_v = sigma_v.unsqueeze(-1)
+            denoised_v = video_latents.float() - vel_v.float() * sigma_v
+            if denoise_mask is not None and clean_latent is not None:
+                dm = denoise_mask.unsqueeze(-1)
+                denoised_v = denoised_v * dm + clean_latent.float() * (1.0 - dm)
+
+            denoised_a = None
+            if vel_a is not None and audio_latents_in is not None:
+                sigma_a = timestep.float()
+                while sigma_a.dim() < vel_a.dim():
+                    sigma_a = sigma_a.unsqueeze(-1)
+                denoised_a = audio_latents_in.float() - vel_a.float() * sigma_a
+
+            return denoised_v, {"audio": denoised_a}
+
+        if sampler == LTX2_SAMPLER_RES2S:
+            cfg_config = {
+                "enabled": False,
+                "prompt_embeds": video_embeds,
+                "local_extras": {
+                    "audio_embeds": audio_embeds,
+                    "attention_mask": connector_mask,
+                },
+                "seq_parallel_size": 1,
+            }
+            v_working, a_working = self._res2s_denoise(
+                latents=v_working,
+                audio_latents=a_working,
+                sigmas=sigmas,
+                forward_fn=stage2_forward_fn,
+                cfg_config=cfg_config,
+                guidance_scale=1.0,
+                guidance_rescale=0.0,
+                do_cfg=False,
+                model_dtype=self.dtype,
+                video_denoise_mask=denoise_mask,
+                video_clean_latent=clean_latent,
+                eta=res2s_eta,
+                noise_seed=res2s_noise_seed,
+                noise_seed_substep=res2s_noise_seed_substep,
+            )
+        else:
+            # Stage 2 runs its own loop rather than BasePipeline.denoise(), so it
+            # drives the profiler windows itself. Without this a numeric range
+            # would capture stage 1 only and the trace would silently omit half
+            # the denoising.
+            for i, _ in self._profile_denoise_steps(range(len(sigmas) - 1)):
+                with nvtx_range(f"refinement_step {i}"):
+                    sigma = sigmas[i]
+                    sigma_next = sigmas[i + 1]
+                    dt = sigma_next - sigma
+                    timestep = sigma.unsqueeze(0).expand(v_working.shape[0])
+                    denoised_v, denoised_extra = stage2_forward_fn(
+                        v_working,
+                        {"audio": a_working} if a_working is not None else {},
+                        i,
+                        timestep,
+                        video_embeds,
+                        {
+                            "audio_embeds": audio_embeds,
+                            "attention_mask": connector_mask,
+                        },
                     )
 
-                vel_v, vel_a = self.transformer(
-                    video=video_mod,
-                    audio=audio_mod,
-                    text_cache=_s2_static,
-                    step_index=i,
-                )
+                    sigma_v = sigma.float()
+                    while sigma_v.dim() < denoised_v.dim():
+                        sigma_v = sigma_v.unsqueeze(-1)
+                    velocity_v = (v_working.float() - denoised_v) / sigma_v
+                    v_working = (v_working.float() + velocity_v * dt).to(v_working.dtype)
 
-                # Video: velocity → x0 → post-process → Euler step
-                sigma_v = sigma.float()
-                while sigma_v.dim() < vel_v.dim():
-                    sigma_v = sigma_v.unsqueeze(-1)
-
-                denoised_v = v_working.float() - vel_v.float() * sigma_v
-
-                if denoise_mask is not None and clean_latent is not None:
-                    dm = denoise_mask.unsqueeze(-1)
-                    denoised_v = denoised_v * dm + clean_latent.float() * (1.0 - dm)
-
-                velocity_v = (v_working.float() - denoised_v) / sigma_v
-                v_working = (v_working.float() + velocity_v * dt).to(v_working.dtype)
-
-                # Audio: velocity → x0 → Euler step
-                if vel_a is not None and a_working is not None:
-                    sigma_a = sigma.float()
-                    while sigma_a.dim() < vel_a.dim():
-                        sigma_a = sigma_a.unsqueeze(-1)
-                    denoised_a = a_working.float() - vel_a.float() * sigma_a
-                    velocity_a = (a_working.float() - denoised_a) / sigma_a
-                    a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
+                    denoised_a = denoised_extra.get("audio")
+                    if denoised_a is not None and a_working is not None:
+                        sigma_a = sigma.float()
+                        while sigma_a.dim() < denoised_a.dim():
+                            sigma_a = sigma_a.unsqueeze(-1)
+                        velocity_a = (a_working.float() - denoised_a) / sigma_a
+                        a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
 
         if timer is not None:
             timer.mark_stage2_end()
 
         # --- Unpatchify ---
         video_out = self.video_patchifier.unpatchify(v_working, video_shape)
-        audio_out = None
-        if a_working is not None:
+        audio_out = stage1_audio_latents if sampler == LTX2_SAMPLER_RES2S else None
+        if audio_out is None and a_working is not None:
             audio_out = self.audio_patchifier.unpatchify(a_working, audio_shape)
 
         logger.info("Stage 2 refinement complete")
