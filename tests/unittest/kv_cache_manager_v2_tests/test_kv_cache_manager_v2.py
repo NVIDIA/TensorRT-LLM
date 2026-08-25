@@ -3377,9 +3377,9 @@ class TestInitRatioConfig(unittest.TestCase):
         num_requests = 32
         constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
         granularity = 2 << 20
-        gpu_quota = round_up(
-            num_requests * self.PG0_SLOT_SIZE, granularity
-        ) + round_up(num_requests * self.PG1_SLOT_SIZE, granularity)
+        gpu_quota = round_up(num_requests * self.PG0_SLOT_SIZE, granularity) + round_up(
+            num_requests * self.PG1_SLOT_SIZE, granularity
+        )
         cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
         cfg.max_util_for_resume = 0.95
 
