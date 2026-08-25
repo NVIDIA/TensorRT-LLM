@@ -468,7 +468,7 @@ CONF
         export POST_INSTALL_HOOK=${hook}
         # The hook instruments the installed TRT-LLM libs at install time; the
         # workload then runs once and emits .fdata under \$BOLT_FDATA_DIR/<host>.
-        # POC: TLLM_BOLT_CLEAR_COUNTERS=1 makes the workload zero BOLT counters
+        # TLLM_BOLT_CLEAR_COUNTERS=1 makes the workload zero BOLT counters
         # after warmup (see tensorrt_llm/_torch/bolt_profiling.py) so the profile
         # excludes startup/JIT. Forwarded as an in-container export -> reaches the
         # ranks for single-node agg workloads; multi-node also needs a

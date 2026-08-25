@@ -18,14 +18,9 @@
 #
 # This is the single source of truth for the TRT-LLM BOLT recipe (instrument /
 # merge / optimize / install). It depends only on a public `llvm-bolt` toolchain
-# and a TensorRT-LLM install tree -- NOT on custom-build-flavours, JET, or any
-# NVIDIA-internal network. External developers can therefore run the full flow
-# offline to re-BOLT their own build against their own workloads.
-#
-# NOTE(license): the stage structure here is adapted from the NVIDIA-internal
-# custom-build-flavours `bolt_prepare/env.sh`. Whether to keep this vendored copy
-# as the long-term source of truth, depend on the upstream repo, or replace it is
-# an open decision to settle before GA.
+# and a TensorRT-LLM install tree -- no NVIDIA-internal tooling or network access.
+# External developers can therefore run the full flow offline to re-BOLT their own
+# build against their own workloads.
 #
 # Usage:
 #   source bolt_lib.sh
@@ -365,10 +360,10 @@ optimize_libraries() {
     [[ -d "$profile_dir" ]] || { log_error "Missing profile dir $profile_dir"; return 1; }
     log_info "Using profiles from: $profile_dir"
 
-    # NOTE: The rich profile-quality / staleness decomposition lives in the
-    # internal custom-build-flavours analysis layer and is applied on top of
-    # this engine in CI. Here we surface BOLT's own -report-stale + -dyno-stats
-    # output, which is enough for a local re-BOLT.
+    # NOTE: The rich profile-quality / staleness decomposition lives in an
+    # internal analysis layer applied on top of this engine in CI. Here we
+    # surface BOLT's own -report-stale + -dyno-stats output, which is enough
+    # for a local re-BOLT.
     local optimized=0 lib
     for lib in "$BOLT_WORK_DIR/original/"*.so*; do
         [[ -f "$lib" ]] || continue

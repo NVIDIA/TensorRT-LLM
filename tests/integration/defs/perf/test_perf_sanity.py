@@ -893,11 +893,11 @@ class ClientConfig:
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
         self.iterations = client_config_data.get("iterations", 1)
-        # BOLT POC knob: extend the measured serving window (num_requests =
+        # BOLT knob: extend the measured serving window (num_requests =
         # concurrency * iterations) without touching the shared perf-sanity
-        # config, so we can test whether a longer run dilutes startup in the
-        # profile. Set by the BOLT profile-gen job via EXTRA_CONTAINER_EXPORTS;
-        # unset/absent (every normal build) is a no-op.
+        # config, so a longer run dilutes startup in the profile. Set by the
+        # BOLT profile-gen job via EXTRA_CONTAINER_EXPORTS; unset/absent
+        # (every normal build) is a no-op.
         try:
             _bolt_iter_mult = int(os.environ.get("BOLT_ITER_MULT", "1") or "1")
         except ValueError:

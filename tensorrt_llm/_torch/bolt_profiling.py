@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""POC: constrain LLVM BOLT instrumentation profiles to steady state.
+"""Constrain LLVM BOLT instrumentation profiles to steady state.
 
 When TensorRT-LLM libraries are BOLT-instrumented, the profile counters
 accumulate from process start, so a single workload run produces `.fdata`
@@ -55,8 +55,8 @@ from tensorrt_llm.logger import logger
 CLEAR_COUNTERS_ENV = "TLLM_BOLT_CLEAR_COUNTERS"
 
 #: When "1", raise instead of warn-and-skip if the counters can't be cleared.
-#: Used for the POC so a run that silently fails to clear fails LOUDLY (letting
-#: us confirm whether the symbol is resolvable) rather than producing an
+#: The profile-gen job sets this so a run that silently fails to clear fails
+#: LOUDLY (confirming the symbol is resolvable) rather than producing an
 #: un-cleared profile that looks fine. Off by default -> production stays inert.
 CLEAR_STRICT_ENV = "TLLM_BOLT_CLEAR_STRICT"
 
