@@ -609,6 +609,7 @@ class MNNVLAllReduce(nn.Module):
     workspace_lock = threading.Lock()
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
+        AllReduceFusionOp.RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -723,7 +724,9 @@ class MNNVLAllReduce(nn.Module):
             all_reduce_params.scale,  # scale
             int(fusion_op),
         )
-        return tuple(outputs) if is_fusion else outputs[0]
+        if fusion_op in (AllReduceFusionOp.NONE, AllReduceFusionOp.RMS_NORM):
+            return outputs[0]
+        return tuple(outputs)
 
 
 class AllReduce(nn.Module):
@@ -760,6 +763,7 @@ class AllReduce(nn.Module):
 
             All strategies support the following operations:
                 - NONE (AllReduce only)
+                - RMS_NORM
                 - RESIDUAL_RMS_NORM
                 - RESIDUAL_RMS_NORM_QUANT_FP8
                 - RESIDUAL_RMS_NORM_QUANT_NVFP4
