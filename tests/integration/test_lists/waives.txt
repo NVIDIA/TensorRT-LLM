@@ -369,8 +369,6 @@ unittest/_torch/visual_gen/multi_gpu/test_ring_attention.py::TestRingAttention::
 unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py::test_capture_smoke SKIP (https://nvbugs/6385134)
 unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py::TestWanPipelineParallel::test_cfg2_attn2d2x1_ulysses2_pvae8 SKIP (https://nvbugs/6644465)
 unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py SKIP (https://nvbugs/6626445)
-unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5BCombinedOptimizations::test_fp8_cache_dit_trtllm SKIP (https://nvbugs/6661914)
-unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py::TestWan22TI2V5B_T2V_PipelineCorrectness::test_cosine_similarity SKIP (https://nvbugs/6661914)
 unittest/auto_deploy/multigpu/custom_ops SKIP (https://nvbugs/6403920)
 unittest/auto_deploy/singlegpu/models/test_glm4_moe_modeling.py::test_glm4_moe_decoder_layer_equivalence[1-dtype0-1-8] SKIP (https://nvbugs/6566730)
 unittest/auto_deploy/singlegpu/models/test_glm4_moe_modeling.py::test_glm4_moe_moe_equivalence[dtype0-1-8] SKIP (https://nvbugs/6566730)
