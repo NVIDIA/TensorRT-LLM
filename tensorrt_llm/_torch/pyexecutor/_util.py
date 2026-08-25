@@ -845,9 +845,6 @@ class KvCacheCreator:
             incompat: List[str] = []
             python_v2_backend = (os.environ.get(
                 "TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() == "python")
-            # Encoder-decoder cross KV remains request-scoped (beam width 1),
-            # and V2 does not yet replicate its beam-0 row into decoder beams.
-            encoder_decoder = getattr(model_config, "is_encoder_decoder", False)
             # Sparse attention: ModelEngine only forwards cache_indirection when
             # the metadata type is exactly TrtllmAttentionMetadata, and every
             # sparse backend uses a subclass, so beams would read beam 0's
@@ -858,9 +855,8 @@ class KvCacheCreator:
             # over that handoff is not supported yet — with block reuse it trips
             # "prepopulatedPromptLen >= promptLen" on the generation side.
             if (self._max_beam_width is not None and self._max_beam_width > 1
-                    and (python_v2_backend or encoder_decoder
-                         or is_hybrid_linear(config) or self._is_disagg
-                         or sparse_attn_config is not None)):
+                    and (python_v2_backend or is_hybrid_linear(config)
+                         or self._is_disagg or sparse_attn_config is not None)):
                 incompat.append("max_beam_width > 1")
             if incompat:
                 incompat_str = ", ".join(incompat)
@@ -2248,6 +2244,7 @@ class KvCacheCreator:
             sparse_attention_config=None,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=1,
+            max_copy_beam_width=self._max_beam_width,
             kv_connector_manager=None,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
@@ -2561,6 +2558,7 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
+        max_copy_beam_width: Optional[int] = None,
         estimating_kv_cache: bool = False,
         enable_kv_cache_stats: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
@@ -2749,6 +2747,7 @@ def _create_kv_cache_manager(
             model_engine._max_cuda_graph_batch_size
             if model_engine is not None else max_cuda_graph_batch_size)
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
