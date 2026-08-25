@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -653,21 +652,6 @@ class TRTLLMGenFusedMoE(MoEImplBase):
             self.swiglu_alpha.data.fill_(float(
                 self.trtllm_gen_activation_alpha))
             self.swiglu_beta.data.fill_(float(self.trtllm_gen_activation_beta))
-
-    def load_weights(self,
-                     weights: List[Dict],
-                     allow_partial_loading: bool = False):
-        assert self._weights_created
-
-        assert len(weights) == 1
-        weights = weights[0]
-
-        kargs = {}
-        if "allow_partial_loading" in inspect.getfullargspec(
-                self.quant_method.load_weights).args:
-            kargs["allow_partial_loading"] = allow_partial_loading
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
-                                       **kargs)
 
     def try_fused_kimi_route_quant(
         self,

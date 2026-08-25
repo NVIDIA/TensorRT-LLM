@@ -65,6 +65,13 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
     ``CutlassFusedMoE.run_moe``, which read the whole Cutlass execution state
     (chunking stream and events, ``use_fused_finalize``, the tuner flags, the
     LoRA slot helpers, ``_tuner_shapes``, ``_run_moe_w4a16_nvfp4``).
+
+    Two ``CuteDslFusedMoE.__init__`` side effects are deliberately dropped, not
+    restated: the ``AuxStreamType.MoeOutputMemset`` / ``EventType`` entries, and
+    the ``swiglu_limit_scalar or inf`` fallback. Both are read only by
+    ``CuteDslFusedMoE.run_moe_nvfp4*``, which the ``run_moe`` override below
+    never reaches. Restate them before routing any CuteDSL path through this
+    class -- ``event_dict`` can now be None and ``swiglu_limit_scalar`` unset.
     """
 
     # Restated rather than inherited: the LoRA gate this replaces compared the

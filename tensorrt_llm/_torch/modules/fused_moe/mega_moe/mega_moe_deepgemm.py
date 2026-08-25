@@ -646,13 +646,6 @@ class MegaMoEDeepGemm(MoEImplBase):
             raise NotImplementedError("MegaMoEDeepGemm supports W4A8_MXFP4_MXFP8 quantization only")
         return W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
 
-    def create_weights(self):
-        if self._weights_created:
-            return
-        self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
-        self._weights_created = True
-
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:
         if self.quant_method is None:
             self.create_weights()

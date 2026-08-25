@@ -27,7 +27,7 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, is_gated_activation
 from .impl_blocks import MoEEplbWeightLayoutMixin, MoEExecutionContractMixin, MoEWeightOwnerMixin
 from .impl_contract import MoEDeployment, MoEEligibility, MoEEplbBinding, MoEProblem, MoERunContext
-from .interface import MoESchedulerKind, MoEWeightLoadingMode
+from .interface import MoESchedulerKind, MoEWeightLoadingMode, _compute_ep_partition
 from .routing import BaseMoeRoutingMethod
 
 if TYPE_CHECKING:
@@ -92,8 +92,6 @@ def apply_moe_impl_construction_state(
             f"binding."
         )
 
-    from .interface import _compute_ep_partition
-
     module.routing_method = routing_method
     module.num_experts = num_experts
     module.hidden_size = hidden_size
@@ -130,8 +128,10 @@ def apply_moe_impl_construction_state(
     module.parallel_size = module.mapping.tp_size
     module.intermediate_size_per_partition = intermediate_size // module.tp_size
 
-    # AllReduce belongs to the layer, not to an execution unit. Keep the
-    # attribute so the getattr sites that still probe it read None.
+    # AllReduce belongs to the layer, not to an execution unit. The attribute is
+    # kept so an inherited ``MoE`` code path reading ``self.all_reduce`` sees the
+    # same None it saw when ``reduce_results`` was False, rather than an
+    # AttributeError from a completely different-looking place.
     module.all_reduce = None
     module.enable_dummy_allreduce = os.environ.get("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
 

@@ -272,15 +272,6 @@ class DenseGEMMFusedMoE(MoEImplBase):
             f"but no quantization config was provided."
         )
 
-    def create_weights(self):
-        if self._weights_created:
-            return
-
-        self.quant_method = self._get_quant_method()
-        self.quant_method.create_weights(self)
-
-        self._weights_created = True
-
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         assert self._weights_created
         assert len(weights) == 1
