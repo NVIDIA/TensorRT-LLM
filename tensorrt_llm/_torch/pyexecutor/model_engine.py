@@ -510,6 +510,7 @@ class PyTorchModelEngine(ModelEngine):
             **input_processor_kwargs)
 
         self.moe_load_balancer: Optional[MoeLoadBalancer] = None
+        self.model_loader: Optional[ModelLoader] = None
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
@@ -3578,7 +3579,7 @@ class PyTorchModelEngine(ModelEngine):
         # rolled back.  Keep each handle live until its own release succeeds,
         # so a failed cleanup can be retried without double-freeing resources
         # that were already released.
-        model_loader = getattr(self, "model_loader", None)
+        model_loader = self.model_loader
         if model_loader is not None:
             model_loader.cleanup()
             self.model_loader = None

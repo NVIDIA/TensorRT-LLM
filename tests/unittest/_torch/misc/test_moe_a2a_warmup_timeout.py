@@ -14,8 +14,7 @@ class _WarmupFlagStub:
     stub exercises the real code path without either.
 
     The stub borrows the property objects without inheriting, so it has to
-    declare moe_load_balancer itself: the engine declares it at class level,
-    but that default is not visible to a non-subclass.
+    declare moe_load_balancer itself.
     """
 
     is_warmup = PyTorchModelEngine.is_warmup
