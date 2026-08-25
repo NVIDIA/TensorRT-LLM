@@ -436,9 +436,5 @@ class BlockHashMixin:
         LoRA request can never match a worker's published blocks.
         """
         lora_request = getattr(request, "lora_request", None)
-        if lora_request is None:
-            return None
         adapter_id = getattr(lora_request, "adapter_id", None)
-        if adapter_id is None and isinstance(lora_request, dict):
-            adapter_id = lora_request.get("lora_int_id")
         return None if adapter_id is None else int(adapter_id)

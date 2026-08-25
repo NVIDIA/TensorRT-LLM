@@ -528,7 +528,7 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
 
 
-def test_cache_salt_id_derivation_matches_worker_path():
+def test_cache_salt_id_derivation_matches_worker_path() -> None:
     """Pin the router's salt derivation to the ENGINE's.
 
     The worker keys its radix tree (and therefore every block hash it
@@ -549,7 +549,7 @@ def test_cache_salt_id_derivation_matches_worker_path():
     assert KVCacheManagerV2._derive_reuse_salt(None) is None
 
 
-def test_get_request_lora_id_extraction(servers):
+def test_get_request_lora_id_extraction(servers) -> None:
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 tokens_per_block=4)
@@ -557,14 +557,12 @@ def test_get_request_lora_id_extraction(servers):
         CompletionRequest(model="TinyLlama", prompt=[1, 2, 3])) is None
     request = SimpleNamespace(lora_request=SimpleNamespace(adapter_id=7))
     assert router._get_request_lora_id(request) == 7
-    request = SimpleNamespace(lora_request={"lora_int_id": 9})
-    assert router._get_request_lora_id(request) == 9
 
 
 @pytest.mark.parametrize("cache_salt", [None, "tenant-a"])
 @pytest.mark.parametrize("lora_task_id", [None, 7])
 def test_router_block_hashes_round_trip_worker_event_hashes(
-        servers, cache_salt, lora_task_id):
+        servers, cache_salt, lora_task_id) -> None:
     """Round trip over {no salt, salt} x {no lora, lora}, all hash algos.
 
     The block hashes the router computes for a request must equal the block
@@ -635,6 +633,63 @@ def test_router_block_hashes_round_trip_worker_event_hashes(
             hash_algo=hash_algo,
             cache_salt_id=router_salt_id,
             lora_task_id=router_lora_id) == [expected]
+
+
+@pytest.mark.parametrize("cache_salt", [None, "tenant-a"])
+def test_routing_key_sync_carries_lora_and_salt_to_block_hashes(
+        servers, cache_salt) -> None:
+    """Drive the changed call site in ``KvCacheAwareRouter._routing_key_sync``.
+
+    The round-trip test above pins ``_compute_block_hashes`` against the
+    worker's published hashes but calls it directly, so it cannot notice the
+    ``cache_salt_id=...`` / ``lora_task_id=...`` arguments being dropped from
+    ``_routing_key_sync``. This test goes through ``_routing_key_sync`` itself
+    and compares its ``block_hashes_by_algo`` with the worker-side hashes for
+    the same LoRA (and optionally salted) request.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import \
+        KVCacheManagerV2
+    from tensorrt_llm.executor.request import LoRARequest
+
+    tokens_per_block = 4
+    lora_task_id = 7
+    tokens = list(range(1, 34))  # 33 tokens -> 8 blocks (last token dropped)
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=tokens_per_block)
+    for server in servers:
+        router._server_state[server].set_hash_algo(KV_CACHE_HASH_ALGO_V2)
+
+    # Worker side: v2 event hashes over a ReuseScope carrying both ids.
+    salt_id = KVCacheManagerV2._derive_reuse_salt(cache_salt)
+    scope = ReuseScope(lora_id=lora_task_id, salt=salt_id)
+    worker_v2 = [
+        block_key.hex()
+        for token_block, block_key in sequence_to_blockchain_keys(
+            tokens_per_block, scope, tokens[:-1]) if token_block
+    ]
+
+    lora_request = LoRARequest(lora_name="adapter", lora_int_id=lora_task_id)
+    if cache_salt is None:
+        request = CompletionRequest(model="TinyLlama",
+                                    prompt=list(tokens),
+                                    lora_request=lora_request)
+    else:
+        # cache_salt only exists on ChatCompletionRequest, which needs a
+        # tokenizer; mirror the stand-in used by
+        # test_kv_cache_aware_router_routes_with_cache_salt.
+        request = SimpleNamespace(model="TinyLlama",
+                                  prompt=list(tokens),
+                                  cache_salt=cache_salt,
+                                  lora_request=lora_request)
+
+    key = router._routing_key_sync(request)
+    assert key["block_hashes_by_algo"] == {KV_CACHE_HASH_ALGO_V2: [worker_v2]}
+    assert key["num_tokens"] == len(tokens)
+    assert key["conv_key"] is None
+    # Sensitivity: the same call site without the ids would produce these.
+    assert key["block_hashes_by_algo"][KV_CACHE_HASH_ALGO_V2] != \
+        router._compute_block_hashes([tokens], hash_algo=KV_CACHE_HASH_ALGO_V2)
 
 
 @pytest.mark.asyncio
