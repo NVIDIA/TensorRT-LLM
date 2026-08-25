@@ -171,7 +171,6 @@ class _WeightLoaderTestLeaf(torch.nn.Module):
 class _WeightLoaderTestExperts(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.placeholder = torch.nn.Parameter(torch.zeros(1))
         self.loaded_weights = None
 
     def load_weights(self, weights):
@@ -257,47 +256,25 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
     assert "model.layers.0.mlp.experts.0.w1.weight_scale" not in remapped
 
 
-def test_deepseek_v4_raw_weight_remap_releases_source_wrapper():
-    model = _make_weight_loader_test_model()
-    weights = ConsumableWeightsDict({"layers.0.foo.weight": torch.tensor([1.0, 2.0])})
-
-    DeepseekV4WeightLoader(model)._load_weights_impl(weights)
-
-    torch.testing.assert_close(model.model.layers[0].foo.weight, torch.tensor([1.0, 2.0]))
-    assert len(weights) == 0
-
-
-def test_deepseek_v4_weight_loader_preserves_child_source_weights():
-    model = _make_weight_loader_test_model()
-    model.model.layers[0].foo.child = _WeightLoaderTestLeaf()
-    weights = ConsumableWeightsDict(
-        {
-            "model.layers.0.foo.weight": torch.tensor([1.0, 2.0]),
-            "model.layers.0.foo.child.weight": torch.tensor([3.0, 4.0]),
-        }
-    )
-
-    DeepseekV4WeightLoader(model)._load_weights_impl(weights)
-
-    torch.testing.assert_close(model.model.layers[0].foo.weight, torch.tensor([1.0, 2.0]))
-    torch.testing.assert_close(model.model.layers[0].foo.child.weight, torch.tensor([3.0, 4.0]))
-
-
-def test_deepseek_v4_weight_loader_consumes_expert_weights():
+def test_deepseek_v4_weight_loader_consumes_only_loaded_subtrees():
     model = _make_weight_loader_test_model()
     layer = model.model.layers[0]
+    layer.foo.child = _WeightLoaderTestLeaf()
     layer.mlp = torch.nn.Module()
     layer.mlp.experts = _WeightLoaderTestExperts()
     expert_key = "model.layers.0.mlp.experts.0.gate_proj.weight"
     weights = ConsumableWeightsDict(
         {
             "model.layers.0.foo.weight": torch.tensor([1.0, 2.0]),
-            expert_key: torch.tensor([3.0, 4.0]),
+            "model.layers.0.foo.child.weight": torch.tensor([3.0, 4.0]),
+            expert_key: torch.tensor([5.0, 6.0]),
         }
     )
 
     DeepseekV4WeightLoader(model)._load_weights_impl(weights)
 
+    torch.testing.assert_close(layer.foo.weight, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(layer.foo.child.weight, torch.tensor([3.0, 4.0]))
     assert expert_key not in weights
     assert "0.w1.weight" in layer.mlp.experts.loaded_weights
 

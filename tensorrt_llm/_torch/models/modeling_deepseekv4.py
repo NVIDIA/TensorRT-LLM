@@ -581,14 +581,7 @@ class DeepseekV4WeightLoader:
                 num_hidden_layers=self.config.num_hidden_layers,
                 kv_lora_rank=self.config.kv_lora_rank,
             )
-            if isinstance(weights, ConsumableWeightsDict):
-                # The remapped dictionary now owns every source tensor. Drop
-                # the original key set before continuing so it cannot retain
-                # a second set of mmap-backed tensor references.
-                weights.clear()
-                weights = ConsumableWeightsDict(remapped_weights)
-            else:
-                weights = remapped_weights
+            weights = ConsumableWeightsDict.take_ownership(weights, remapped_weights)
             # Synthesize defaults (with correct shape pulled from the model)
             # for parameters the model has but the V4 checkpoint omits. We do
             # this in one place vs scattering zero-fills through the per-
