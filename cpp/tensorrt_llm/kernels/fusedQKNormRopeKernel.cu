@@ -93,6 +93,7 @@ __device__ __forceinline__ void storeFp8HeadElements64(
     __nv_fp8_e4m3* out, int64_t offsetThread, float const (&elements)[numElemsPerThread])
 {
     static_assert(numElemsPerThread == 4, "MiniMax-M3 FP8 store expects four elements per thread");
+    static_assert(sizeof(__nv_fp8x2_storage_t) == 2, "MiniMax-M3 FP8 pair storage must be 16 bits");
     // Form the final pointer with 64-bit arithmetic before one aligned 32-bit
     // store. Production coalesced paged-cache offsets can exceed INT32_MAX
     // FP8 elements even though each individual head row is small.
@@ -372,6 +373,7 @@ namespace
 constexpr int kMinimaxM3HeadDim = 128;
 constexpr int kMinimaxM3RotaryDim = 64;
 constexpr int kMinimaxM3PageSize = 128;
+static_assert((kMinimaxM3PageSize & (kMinimaxM3PageSize - 1)) == 0, "page size must be a power of two");
 constexpr int kMinimaxM3ElemsPerThread = kMinimaxM3HeadDim / 32;
 
 // MiniMax-M3-only direct-cache specialization for eager pure prefill. The
@@ -437,7 +439,7 @@ __global__ void minimaxM3Fp8QKNormRopeKVInsertKernel(__nv_bfloat16 const* qkvInp
         {
             return;
         }
-        int const page = slot >> 7;
+        int const page = slot / kMinimaxM3PageSize;
         if (page >= numPages)
         {
             return;
@@ -631,7 +633,7 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     {
         return;
     }
-    int const page = slot >> 7;
+    int const page = slot / kMinimaxM3PageSize;
     if (page >= numPages)
     {
         return;
