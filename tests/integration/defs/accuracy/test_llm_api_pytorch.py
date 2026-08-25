@@ -21,7 +21,7 @@ from unittest import mock
 import pytest
 import torch
 from datasets import load_dataset
-from defs.conftest import get_sm_version, is_sm_100f, skip_pre_rubin
+from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import LLM
@@ -2768,7 +2768,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_rubin
+    @pytest.mark.skipif(get_sm_version() != 107,
+                        reason="fine-grained sync requires SM107")
     @parametrize_with_ids("torch_compile", [False])
     @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False, False),
@@ -2776,9 +2777,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("moe_backend", ["TRTLLM"])
     @parametrize_with_ids("enable_autotuner", [False, True])
-    def test_nvfp4_fine_grained_sync(self, fp8kv, attention_dp, cuda_graph,
-                                     overlap_scheduler, torch_compile,
-                                     mtp_nextn, moe_backend, enable_autotuner):
+    def test_nvfp4_fine_grained_sync(self, fp8kv: bool, attention_dp: bool,
+                                     cuda_graph: bool, overlap_scheduler: bool,
+                                     torch_compile: bool, mtp_nextn: int,
+                                     moe_backend: str,
+                                     enable_autotuner: bool) -> None:
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -5415,7 +5418,8 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_rubin
+    @pytest.mark.skipif(get_sm_version() != 107,
+                        reason="fine-grained sync requires SM107")
     @pytest.mark.parametrize("enable_autotuner", [False, True],
                              ids=["no_autotuner", "autotuner"])
     @pytest.mark.parametrize("activation_dtype", ["mxfp8"], ids=["mxfp8"])
@@ -5423,9 +5427,10 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         (False, False),
         (True, True),
     ])
-    def test_w4a8_mxfp4_fine_grained_sync(self, enable_autotuner,
-                                          activation_dtype, cuda_graph,
-                                          overlap_scheduler):
+    def test_w4a8_mxfp4_fine_grained_sync(self, enable_autotuner: bool,
+                                          activation_dtype: str,
+                                          cuda_graph: bool,
+                                          overlap_scheduler: bool) -> None:
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -5442,15 +5447,17 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_rubin
+    @pytest.mark.skipif(get_sm_version() != 107,
+                        reason="fine-grained sync requires SM107")
     @pytest.mark.parametrize("enable_autotuner", [False, True],
                              ids=["no_autotuner", "autotuner"])
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (False, False),
         (True, True),
     ])
-    def test_w4a16_mxfp4_fine_grained_sync(self, enable_autotuner, cuda_graph,
-                                           overlap_scheduler):
+    def test_w4a16_mxfp4_fine_grained_sync(self, enable_autotuner: bool,
+                                           cuda_graph: bool,
+                                           overlap_scheduler: bool) -> None:
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -6066,15 +6073,18 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "a preempted request lost prompt content that it recalls "
             f"uncontended: {missing_con} -- possible KV corruption across "
             f"suspend/resume; common_prefix_tokens={prefixes}")
-    @skip_pre_rubin
+
+    @pytest.mark.skipif(get_sm_version() != 107,
+                        reason="fine-grained sync requires SM107")
     @pytest.mark.parametrize("enable_autotuner", [False, True],
                              ids=["no_autotuner", "autotuner"])
     @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
         (False, False),
         (True, True),
     ])
-    def test_w4_1gpu_fine_grained_sync(self, enable_autotuner, cuda_graph,
-                                       overlap_scheduler, mocker):
+    def test_w4_1gpu_fine_grained_sync(self, enable_autotuner: bool,
+                                       cuda_graph: bool,
+                                       overlap_scheduler: bool, mocker) -> None:
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})

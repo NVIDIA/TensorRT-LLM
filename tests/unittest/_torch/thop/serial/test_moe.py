@@ -16,7 +16,7 @@
 import os
 import sys
 from contextlib import contextmanager
-from typing import Tuple
+from typing import Iterator, Tuple
 
 import pytest
 import torch
@@ -40,7 +40,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 
 @contextmanager
-def fine_grained_sync_env(enabled: bool):
+def fine_grained_sync_env(enabled: bool) -> Iterator[None]:
     """Toggle TLLM_USE_FINE_GRAINED_SYNC for the duration of a test case.
 
     C++ side reads this env var fresh on each kernel-option construction
