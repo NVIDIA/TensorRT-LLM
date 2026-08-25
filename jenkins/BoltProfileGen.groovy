@@ -17,9 +17,9 @@
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 // =============================================================================
-// BoltProfileGen.groovy - helper job: BOLT profile generation (phase 2).
+// BoltProfileGen.groovy - helper job: BOLT profile generation.
 //
-// Pulls the phase-1 BOLT-compatible tarball produced by Build.groovy, then fans
+// Pulls the BOLT-compatible tarball produced by Build.groovy, then fans
 // out one perf-sanity run per workload: each drives the perf harness
 // (jenkins/scripts/perf/local/run_disagg.sh) for an existing test id, with the
 // generic POST_INSTALL_HOOK (scripts/bolt/internal/perf_instrument_hook.sh)
@@ -28,7 +28,7 @@
 // + packages the promotable bundle.
 //
 // Run on-demand today (manual / bot-triggered); there is no auto-trigger.
-// APPLY_PROFILES (default on) re-BOLTs the phase-1 tarball in the same run
+// APPLY_PROFILES (default on) re-BOLTs that tarball in the same run
 // ("consume immediately after generating"); PROMOTE (opt-in) publishes the
 // packaged bundle to the branch-keyed Artifactory path so premerge can pull
 // `latest` (apply_latest.sh). Wiring the postmerge trigger is the remaining
@@ -44,7 +44,7 @@ import com.nvidia.bloom.Utils
 
 LLM_ROOT = "llm"
 
-// Phase-1 tarball location (passed from the parent via artifactPath, same as
+// Input tarball location (passed from the parent via artifactPath, same as
 // Build/L0_Test). The promoted bundle goes to a stable BRANCH-keyed path.
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
@@ -57,12 +57,12 @@ AGENT_IMAGE = env.dockerImage ? env.dockerImage.replace("aarch64", "x86_64") : e
 
 // ---- bolt-specific params (passed by launchJob additionalParameters) --------
 // targetArch        : aarch64-linux-gnu | x86_64-linux-gnu
-// boltRef           : source ref/commit the phase-1 tarball was built from
+// boltRef           : source ref/commit the tarball was built from
 // branch            : branch name for the branch-keyed promote path
 // slurmPlatform     : SlurmConfig platform string (GPU + multi-node for sbsa)
-// boltTarName       : phase-1 TARNAME to profile (e.g. TensorRT-LLM-GH200.tar.gz)
+// boltTarName       : TARNAME to profile (e.g. TensorRT-LLM-GH200.tar.gz)
 // promote           : "true" to publish the bundle to the branch `latest` path
-// applyProfiles     : "true" to re-BOLT the phase-1 tarball in the same run
+// applyProfiles     : "true" to re-BOLT the tarball in the same run
 TARGET_ARCH   = params.targetArch   ?: env.targetArch ?: AARCH64_TRIPLE
 BOLT_REF      = params.boltRef      ?: (env.artifactCommit ?: env.gitlabCommit ?: "unknown")
 BRANCH        = params.branch       ?: (env.gitlabTargetBranch ?: "main")
@@ -82,7 +82,7 @@ NUM_NODES     = params.numNodes     ?: "2"   // legacy single-workload wiring (u
 // (opt-in): the postmerge trigger sets promote=true; the premerge "generate +
 // consume without promoting" override leaves it false. See promoteBundle().
 PROMOTE       = (params.promote ?: "false").toString()
-// applyProfiles: after merge, re-BOLT the phase-1 tarball with the just-generated
+// applyProfiles: after merge, re-BOLT the input tarball with the just-generated
 // bundle -> bolted tarball on the cluster ("consume immediately after generating").
 // The merge job (slurm_merge.sh) runs apply_bolt.py when BOLT_APPLY=1.
 APPLY_PROFILES = (params.applyProfiles ?: "true").toString()
@@ -260,9 +260,9 @@ def b64BashRemoteCmdStdin(String script, String scriptPath)
 // ---------------------------------------------------------------------------
 def submitProfileGen(pipeline)
 {
-    // The phase-1 tarball to profile:
+    // The tarball to profile:
     def llmTarfile = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}/${BOLT_TARNAME}"
-    pipeline.echo("Phase-1 tarball: ${llmTarfile}")
+    pipeline.echo("Input tarball: ${llmTarfile}")
 
     SlurmPartition partition = SlurmConfig.resolvePlatform(SLURM_PLATFORM)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -279,7 +279,7 @@ def submitProfileGen(pipeline)
     def outDir = "${fdataRoot}/_bundle"
     def bundle = "${outDir}/bolt-profile-${BOLT_REF}-${TRIPLE}.tar.gz"
 
-    // Bootstrap on the frontend entirely from the phase-1 tarball (no agent->
+    // Bootstrap on the frontend entirely from that tarball (no agent->
     // cluster file copy): extract the full source tree + wheel (the perf harness
     // runs from the checkout, install_mode=wheel), and stage llvm-bolt once
     // (shared, reused by the per-node instrument hook + merge). The merge job
@@ -292,7 +292,7 @@ def submitProfileGen(pipeline)
         Utils.exec(pipeline, timeout: false, numRetries: 2,
             script: Utils.sshUserCmd(remote, "\"mkdir -p ${ws}/builds ${ws}/runs\""))
 
-        // Download the phase-1 tarball from Artifactory to the cluster frontend.
+        // Download the tarball from Artifactory to the cluster frontend.
         // curl (not wget): --speed-time/--speed-limit aborts a STALLED transfer
         // (< ~10KB/s for 120s) and --retry restarts it, so a flaky cross-region
         // link can't hang the job (Utils.exec runs with timeout:false). NO -C -:
@@ -534,7 +534,7 @@ def pollSlurm(pipeline, remote, String jobId, String label)
 // ---------------------------------------------------------------------------
 // Promote the produced bundle to the branch-keyed Artifactory path so premerge
 // can pull `latest` (apply_latest.sh). Runs CLUSTER-SIDE: the frontend already
-// reaches Artifactory (it pulled the phase-1 tarball), and there is no BSL
+// reaches Artifactory (it pulled the input tarball), and there is no BSL
 // remote->agent download primitive, so uploading in place avoids copying the
 // bundle back to the agent just to re-upload it.
 //
