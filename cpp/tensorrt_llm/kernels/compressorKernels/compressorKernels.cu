@@ -662,8 +662,10 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 
 // Generate explicit template instantiations.
 #define INST_DECODE(HD, KV_EB, STATE_EB, CR, NN, NRW)                                                                  \
-    template __global__ void pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW>(void const*, float const*, void*, \
-        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int);
+    template __global__ void pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW>(void const* __restrict__,         \
+        float const* __restrict__, void* __restrict__, void* __restrict__, int32_t const* __restrict__,                \
+        int32_t const* __restrict__, void* __restrict__, int32_t const* __restrict__, int32_t const* __restrict__,     \
+        int32_t const* __restrict__, int, int, int);
 FOREACH_DECODE_CONFIG(INST_DECODE)
 #undef INST_DECODE
 
@@ -1169,9 +1171,10 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
 // token loop; CR=4 stays single-warp because the reduction is too small to amortize
 // the merge overhead.
 #define INST_PREFILL(HD, KV_EB, STATE_EB, CR, NRW)                                                                     \
-    template __global__ void prefillReductionKernel<HD, KV_EB, STATE_EB, CR, NRW>(void const*, float const*, void*,    \
-        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int32_t const*,  \
-        int, int, int, int);
+    template __global__ void prefillReductionKernel<HD, KV_EB, STATE_EB, CR, NRW>(void const* __restrict__,            \
+        float const* __restrict__, void* __restrict__, void* __restrict__, int32_t const* __restrict__,                \
+        int32_t const* __restrict__, void* __restrict__, int32_t const* __restrict__, int32_t const* __restrict__,     \
+        int32_t const* __restrict__, int32_t const* __restrict__, int, int, int, int);
 
 #define INST_PREFILL_DTYPES(HD, CR, NRW)                                                                               \
     INST_PREFILL(HD, 2, 2, CR, NRW)                                                                                    \
@@ -1740,9 +1743,11 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
 // scale types only support bf16 input since the compressor output is bf16.
 // Each combination is instantiated with ROTATE_ACTIVATION=true and false.
 #define INST_PPS(HD, EB, CST, AR)                                                                                      \
-    template __global__ void postProcessScatterKernel<HD, EB, CST, AR>(void const*, void*, void const*, float,         \
-        float const*, int32_t const*, int, int, void*, int32_t const*, int32_t const*, int32_t const*, int32_t const*, \
-        bool const*, int, int, int, int, int, int, void*, void*);
+    template __global__ void postProcessScatterKernel<HD, EB, CST, AR>(void const* __restrict__, void* __restrict__,   \
+        void const* __restrict__, float, float const* __restrict__, int32_t const* __restrict__, int, int,             \
+        void* __restrict__, int32_t const* __restrict__, int32_t const* __restrict__, int32_t const* __restrict__,     \
+        int32_t const* __restrict__, bool const* __restrict__, int, int, int, int, int, int, void* __restrict__,       \
+        void* __restrict__);
 
 #define INST_PPS_AR(HD, EB, CST)                                                                                       \
     INST_PPS(HD, EB, CST, true)                                                                                        \

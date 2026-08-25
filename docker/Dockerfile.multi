@@ -15,8 +15,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=26.05-py3
-ARG TRITON_BASE_TAG=26.05-py3
+ARG BASE_TAG=26.07-py3
+ARG TRITON_BASE_TAG=26.07-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -44,7 +44,6 @@ FROM base AS devel
 #
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
-
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER

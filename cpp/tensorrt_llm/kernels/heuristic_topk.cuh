@@ -1876,18 +1876,24 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 // as a "specialization after instantiation" build error against
 // cudafe1.stub.c. Header is included only by heuristicTopKDecode.cu (one TU)
 // so no ODR concern.
-template __global__ void gvrTopKKernel<512>(float const*, int, int const*, int, int, float*, int*);
-template __global__ void gvrTopKKernel<1024>(float const*, int, int const*, int, int, float*, int*);
-template __global__ void gvrTopKKernel<2048>(float const*, int, int const*, int, int, float*, int*);
-template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 512>(
-    __nv_bfloat16 const*, int, int const*, int, int, __nv_bfloat16*, int*);
-template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 1024>(
-    __nv_bfloat16 const*, int, int const*, int, int, __nv_bfloat16*, int*);
-template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 2048>(
-    __nv_bfloat16 const*, int, int const*, int, int, __nv_bfloat16*, int*);
-template __global__ void gvrTopKKernelDtype<__half, 512>(__half const*, int, int const*, int, int, __half*, int*);
-template __global__ void gvrTopKKernelDtype<__half, 1024>(__half const*, int, int const*, int, int, __half*, int*);
-template __global__ void gvrTopKKernelDtype<__half, 2048>(__half const*, int, int const*, int, int, __half*, int*);
+template __global__ void gvrTopKKernel<512>(float const* __restrict__, int const, int const* __restrict__, int const,
+    int const, float* __restrict__, int* __restrict__);
+template __global__ void gvrTopKKernel<1024>(float const* __restrict__, int const, int const* __restrict__, int const,
+    int const, float* __restrict__, int* __restrict__);
+template __global__ void gvrTopKKernel<2048>(float const* __restrict__, int const, int const* __restrict__, int const,
+    int const, float* __restrict__, int* __restrict__);
+template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 512>(__nv_bfloat16 const* __restrict__, int const,
+    int const* __restrict__, int const, int const, __nv_bfloat16* __restrict__, int* __restrict__);
+template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 1024>(__nv_bfloat16 const* __restrict__, int const,
+    int const* __restrict__, int const, int const, __nv_bfloat16* __restrict__, int* __restrict__);
+template __global__ void gvrTopKKernelDtype<__nv_bfloat16, 2048>(__nv_bfloat16 const* __restrict__, int const,
+    int const* __restrict__, int const, int const, __nv_bfloat16* __restrict__, int* __restrict__);
+template __global__ void gvrTopKKernelDtype<__half, 512>(__half const* __restrict__, int const, int const* __restrict__,
+    int const, int const, __half* __restrict__, int* __restrict__);
+template __global__ void gvrTopKKernelDtype<__half, 1024>(__half const* __restrict__, int const,
+    int const* __restrict__, int const, int const, __half* __restrict__, int* __restrict__);
+template __global__ void gvrTopKKernelDtype<__half, 2048>(__half const* __restrict__, int const,
+    int const* __restrict__, int const, int const, __half* __restrict__, int* __restrict__);
 
 // ============================================================================
 // Launch Wrapper
