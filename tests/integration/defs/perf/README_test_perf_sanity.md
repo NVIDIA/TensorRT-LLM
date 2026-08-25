@@ -27,7 +27,9 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 | `MINIMIZE_METRICS` | 14 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + the five gen_only-only `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` |
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
 
-**Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated **only** on `d_mean_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The other four device-step-time statistics are uploaded for diagnosis but are **not** gated.
+**Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
+
+A newly added gated metric has no baseline history, and `check_regression` skips any metric whose baseline is absent or non-positive (`continue`), so the median cannot fail a build until enough runs accrue.
 
 #### `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (gen_only only)
 

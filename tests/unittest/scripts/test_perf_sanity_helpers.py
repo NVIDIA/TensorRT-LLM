@@ -566,3 +566,18 @@ def test_add_perf_metric_value_omits_the_family_outside_gen_only() -> None:
     perf_sanity.add_perf_metric_value(new_data, metrics, False, "e2e")
 
     assert not [key for key in new_data if "gen_worker_per_iter" in key]
+
+
+def test_every_gated_metric_is_checkable() -> None:
+    """check_regression only iterates maximize + minimize; a gated name absent
+    from both is silently never checked, so the gate would look armed and be
+    dead. Pin the pair so adding a third gated statistic cannot regress it."""
+    checkable = set(perf_sanity.MINIMIZE_METRICS) | set(perf_sanity.MAXIMIZE_METRICS)
+    for name in perf_sanity.GEN_ONLY_REGRESSION_METRICS:
+        assert name in checkable, f"{name} is gated but check_regression never sees it"
+
+
+def test_every_gated_metric_is_actually_emitted() -> None:
+    """A gated metric the log never carries is skipped by 'not in new_data'."""
+    emitted = {f"d_{name}" for name in perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS}
+    assert set(perf_sanity.GEN_ONLY_REGRESSION_METRICS) <= emitted

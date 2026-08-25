@@ -186,9 +186,10 @@ SPEC_DECODING_PERF_METRIC_LOG_QUERIES = {
 # The distribution is published, not just the mean, because the mean alone is
 # not self-diagnosing: a single anomalous iteration can move it by >30% while
 # the workload is unchanged (nvbugs 6627789), and the only way a reader can
-# tell that from a real regression is to see the spread next to it. Only the
-# mean is regression-gated (see regression_metrics in the gen_only branch);
-# the other four are uploaded for diagnosis.
+# tell that from a real regression is to see the spread next to it. The mean
+# and median are both regression-gated (see regression_metrics in the gen_only
+# branch) because they fail on different shapes of slowdown; std/p75/p99 are
+# uploaded for diagnosis only.
 #
 # One statistic per line, and the leading words must stay mutually exclusive:
 # parse_metrics_from_output breaks out of the regex loop on the first match per
@@ -213,13 +214,29 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 }
 
 # Every gen_only device-step-time metric, in log-line order. The mean is first
-# because it is the gated one and the only one check_test_failure keys on.
+# because it is the one check_test_failure keys on; mean and median are both
+# regression-gated, std/p75/p99 are diagnostic.
 GEN_ONLY_DEVICE_STEP_TIME_METRICS = (
     "mean_gen_worker_per_iter_device_step_time",
     "median_gen_worker_per_iter_device_step_time",
     "std_gen_worker_per_iter_device_step_time",
     "p75_gen_worker_per_iter_device_step_time",
     "p99_gen_worker_per_iter_device_step_time",
+)
+
+# The regression gate for disagg gen_only lanes. Mean and median are both gated
+# because they fail on different shapes of slowdown: the mean catches a cost
+# spread thinly across many iterations, the median catches a shift in the typical
+# iteration while ignoring outliers. A real slowdown moves both; a single
+# anomalous iteration moves only the mean, so the pair is self-diagnosing on the
+# CI report itself. std/p75/p99 are uploaded for diagnosis but not gated.
+#
+# Every name here must also appear in MINIMIZE_METRICS (or MAXIMIZE_METRICS):
+# check_regression only iterates those two lists, so a gated name absent from
+# both is silently never checked. test_perf_sanity_helpers.py pins that.
+GEN_ONLY_REGRESSION_METRICS = (
+    "d_mean_gen_worker_per_iter_device_step_time",
+    "d_median_gen_worker_per_iter_device_step_time",
 )
 
 # Per-iter prev_device_step_time logged by each gen worker. Example line:
@@ -556,7 +573,7 @@ MINIMIZE_METRICS = [
     # gen_only-only: per-iter device step time across gen workers. Lower is
     # better for all five, including the spread statistics -- a tighter
     # distribution is a more trustworthy measurement as well as a steadier
-    # workload. Only the mean is listed in regression_metrics; the other four
+    # workload. Mean and median are listed in regression_metrics; std/p75/p99
     # get baselines but cannot fail a build (see check_regression).
     "d_mean_gen_worker_per_iter_device_step_time",
     "d_median_gen_worker_per_iter_device_step_time",
@@ -2534,8 +2551,10 @@ class PerfSanityTestConfig:
                         f"is missing 'Mean Avg Decoded Tokens per Iter' in benchmark output. "
                     )
                 # gen_only tests must report mean_gen_worker_per_iter_device_step_time
-                # (parsed from gen_server_*.log). It is the sole regression metric for
-                # gen_only, so a missing value must hard-fail rather than silently upload.
+                # (parsed from gen_server_*.log). It is a regression metric for gen_only,
+                # so a missing value must hard-fail rather than silently upload. Checking
+                # the mean alone is sufficient: all five statistics come from the same
+                # _DeviceStepTimeStats, so the mean is absent only if all of them are.
                 if (
                     self.runtime == "multi_node_disagg_server"
                     and self.server_configs[server_idx][2].benchmark_mode == "gen_only"
@@ -2723,7 +2742,11 @@ class PerfSanityTestConfig:
         if self.runtime == "multi_node_disagg_server" and any(
             sc[2].benchmark_mode == "gen_only" for sc in self.server_configs
         ):
-            regression_metrics = ["d_mean_gen_worker_per_iter_device_step_time"]
+            # See GEN_ONLY_REGRESSION_METRICS for why the median is gated too.
+            # It has no baseline history yet, and check_regression skips any
+            # metric whose baseline is absent or non-positive, so it stays inert
+            # until enough runs accrue -- it cannot fail a build before then.
+            regression_metrics = list(GEN_ONLY_REGRESSION_METRICS)
         else:
             regression_metrics = list(REGRESSION_METRICS)
             has_spec_decoding = any(
