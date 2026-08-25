@@ -2221,10 +2221,12 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         if block_reuse:
             ctx_cfg["kv_cache_config"]["enable_block_reuse"] = True
             gen_cfg["kv_cache_config"]["enable_block_reuse"] = True
-            ctx_cfg["kv_cache_config"]["mamba_state_config"][
-                "periodic_snapshot_interval"] = 256
-            gen_cfg["kv_cache_config"]["mamba_state_config"][
-                "periodic_snapshot_interval"] = 256
+            ctx_cfg["kv_cache_config"]["mamba_state_config"] = {
+                "periodic_snapshot_interval": 256
+            }
+            gen_cfg["kv_cache_config"]["mamba_state_config"] = {
+                "periodic_snapshot_interval": 256
+            }
         with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
