@@ -3621,20 +3621,31 @@ class TestTopPDecay:
 
     @pytest.mark.parametrize(
         "beam_width_array, expected_max_width",
-        [([], 1), (None, 1), ([1], 1), ([1, 2], 2), ([3, 5, 7], 7)],
+        [
+            ([], 1),
+            (None, 1),
+            ([1], 1),
+            ([1, 2], 2),
+            ([3, 5, 7], 7),
+            # The C++ field is OptVec<vector<SizeType32>>, so a request can
+            # carry the nested [batchSize, maxBeamWidthArrayLength] form.
+            ([[1, 2]], 2),
+            ([[3, 5, 7]], 7),
+        ],
     )
     def test_beam_width_array_max_handles_empty(
-        self, beam_width_array: list[int] | None, expected_max_width: int
+        self, beam_width_array: list[int] | list[list[int]] | None, expected_max_width: int
     ) -> None:
         # An empty beam_width_array reaches the sampler: the executor's
         # checkBeamWidthArray bounds only the array's length, so [] passes
         # admission. _get_max_beam_width must fall back to beam_width instead of
         # reducing over the empty array, and must still take the array's maximum
         # when it has entries.
-        params = SamplingParams(top_p=0.9)
-        if beam_width_array is not None:
-            params.beam_width_array = beam_width_array
-        request = self._mock_request(params)
+        request = self._mock_request(SamplingParams(top_p=0.9))
+        # Set the array on the C++ SamplingConfig rather than on SamplingParams:
+        # the field is OptVec<vector<SizeType32>> there, so it also carries the
+        # nested form, which SamplingParams' list[int] annotation cannot express.
+        request.sampling_config.beam_width_array = beam_width_array
         assert _get_max_beam_width(request) == expected_max_width
         # The same request must survive admission: top_p_decay is unset, but
         # TopPDecayHandler.validate_request resolves the sampling params -- and

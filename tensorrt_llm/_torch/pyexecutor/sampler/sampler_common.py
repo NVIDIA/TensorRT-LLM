@@ -144,8 +144,15 @@ def _get_max_beam_width(request: LlmRequest) -> int:
     # on the host. Truthiness rather than `is not None`: an empty array carries
     # no schedule (SamplingConfig::checkBeamWidthArray bounds only its length),
     # and max() over an empty sequence would raise.
-    if sampling_config.beam_width_array:
-        max_beam_width = max(max_beam_width, *map(int, sampling_config.beam_width_array))
+    beam_width_array = sampling_config.beam_width_array
+    if beam_width_array:
+        # The C++ field is OptVec<vector<SizeType32>>, i.e. it may arrive as
+        # [maxBeamWidthArrayLength] or [batchSize, maxBeamWidthArrayLength];
+        # unwrap the per-request row the same way PyExecutor._validate_request
+        # does before reducing.
+        if isinstance(beam_width_array[0], (list, tuple)):
+            beam_width_array = beam_width_array[0]
+        max_beam_width = max(max_beam_width, *map(int, beam_width_array))
     return max_beam_width
 
 
