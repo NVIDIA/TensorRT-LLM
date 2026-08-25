@@ -3187,8 +3187,9 @@ class TestInitRatioConfig(unittest.TestCase):
     SSM_CONV_SLOT_SIZE = 829440
     ATTN_SLOT_SIZE = 245760
 
+    @classmethod
     def _make_config(
-        self,
+        cls,
         gpu_quota: int = 128 << 20,
         typical_step: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
@@ -3216,9 +3217,9 @@ class TestInitRatioConfig(unittest.TestCase):
             layers.append(
                 AttentionLayerConfig(
                     layer_id=LayerId(lid),
-                    buffers=[BufferConfig(role=Role.KEY, size=self.PG0_SLOT_SIZE)],
-                    sliding_window_size=self.WINDOW_SIZE,
-                    num_sink_tokens=self.SINK_TOKENS,
+                    buffers=[BufferConfig(role=Role.KEY, size=cls.PG0_SLOT_SIZE)],
+                    sliding_window_size=cls.WINDOW_SIZE,
+                    num_sink_tokens=cls.SINK_TOKENS,
                 )
             )
             lid += 1
@@ -3226,12 +3227,12 @@ class TestInitRatioConfig(unittest.TestCase):
             layers.append(
                 AttentionLayerConfig(
                     layer_id=LayerId(lid),
-                    buffers=[BufferConfig(role=Role.KEY, size=self.PG1_SLOT_SIZE)],
+                    buffers=[BufferConfig(role=Role.KEY, size=cls.PG1_SLOT_SIZE)],
                 )
             )
             lid += 1
         return KVCacheManagerConfig(
-            tokens_per_block=self.TOKENS_PER_BLOCK,
+            tokens_per_block=cls.TOKENS_PER_BLOCK,
             cache_tiers=cache_tiers,
             layers=layers,
             typical_step=typical_step,
@@ -3371,24 +3372,6 @@ class TestInitRatioConfig(unittest.TestCase):
         for kv_cache in kv_caches:
             kv_cache.close()
         manager.shutdown()
-
-    def test_gpu_quota_below_constraint_minimum_raises(self):
-        """Configured GPU quotas below the constraint floor are rejected."""
-        num_requests = 32
-        constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
-        granularity = 2 << 20
-        quota_without_resume_headroom = round_up(
-            num_requests * self.PG0_SLOT_SIZE, granularity
-        ) + round_up(num_requests * self.PG1_SLOT_SIZE, granularity)
-        for gpu_quota in (0, quota_without_resume_headroom):
-            with self.subTest(gpu_quota=gpu_quota):
-                cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
-                cfg.max_util_for_resume = 0.95
-
-                with self.assertRaisesRegex(
-                    InsufficientQuotaError, f"GPU cache tier quota {gpu_quota} is insufficient"
-                ):
-                    KVCacheManager(cfg)
 
     def test_constraint_floor_overrides_infeasible_initial_pool_ratio(self):
         """A constraint's feasibility floor overrides an infeasible initial_pool_ratio.
@@ -3826,6 +3809,31 @@ class TestInitRatioConfig(unittest.TestCase):
         for kv in kv_caches:
             kv.close()
         manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "gpu_quota",
+    [
+        pytest.param(0, id="zero"),
+        pytest.param(
+            round_up(32 * TestInitRatioConfig.PG0_SLOT_SIZE, 2 << 20)
+            + round_up(32 * TestInitRatioConfig.PG1_SLOT_SIZE, 2 << 20),
+            id="without_resume_headroom",
+        ),
+    ],
+)
+def test_gpu_quota_below_constraint_minimum_raises(gpu_quota: int) -> None:
+    """Configured GPU quotas below the constraint floor are rejected."""
+    init_cuda_once()
+    num_requests = 32
+    constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
+    cfg = TestInitRatioConfig._make_config(gpu_quota=gpu_quota, constraints=[constraint])
+    cfg.max_util_for_resume = 0.95
+
+    with pytest.raises(
+        InsufficientQuotaError, match=f"GPU cache tier quota {gpu_quota} is insufficient"
+    ):
+        KVCacheManager(cfg)
 
 
 class TestScratchReuse(TestKVCacheManagerV2):
