@@ -507,6 +507,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
+    # (headDimQk, headDimV, tokens_per_block) whose trtllm-gen MLA decode kernel is
+    # slower than the thop.attention fallback, so this backend declines them.
+    SLOWER_MLA_GENERATION_KERNELS = {
+        (576, 512, 32),
+    }
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
@@ -621,6 +626,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        tokens_per_block: int,
+        mla_backend: str,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -656,6 +663,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        # Scoped to trtllm-gen: SLOWER_MLA_GENERATION_KERNELS was measured on that
+        # kernel. Callers pass the backend that will actually run this batch, so a
+        # cute-dsl batch stays selectable while a batch a policy downgraded to
+        # trtllm-gen is still gated.
+        if (
+            mla_backend == "trtllm-gen"
+            and (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS
+        ):
+            return (
+                False,
+                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
+                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
+                f"tokens_per_block={tokens_per_block}.",
             )
 
         return True, ""
@@ -836,8 +858,15 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                     f"Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
                 )
             if is_mla_enable:
+                # The effective backend, not the configured one: a policy may downgrade
+                # cute-dsl to trtllm-gen for this batch, and it is the kernel that
+                # actually runs that the gate is about. MLA reaches here only as
+                # generation-only (checked above), so num_gen_tokens == q.size(0),
+                # matching prepare_workspace's is_gen_only branch.
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    tokens_per_block=tokens_per_block,
+                    mla_backend=self._get_effective_mla_backend(meta, q.size(0)),
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )
