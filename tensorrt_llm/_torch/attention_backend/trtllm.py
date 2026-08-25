@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend.fmha import (
-    Fmha, get_enabled_fmha_lib_classes)
+    CombinedFmha, Fmha, FmhaPhase, PhasedFmha, get_enabled_fmha_lib_classes)
 from tensorrt_llm._torch.attention_backend.fmha.interface import (
     MlaBackendPolicy, _CuteDslMlaStagingKey)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
@@ -1526,6 +1526,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self.fmha_libs: List[Fmha] = []
+        self.phased_fmha_libs: List[PhasedFmha] = []
+        self.non_phased_fmha_libs: List[Fmha] = []
+        self.combined_fmha: Optional[CombinedFmha] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1792,6 +1795,100 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         for fmha_cls in get_enabled_fmha_lib_classes():
             if fmha_cls.is_available(self):
                 self.fmha_libs.append(fmha_cls(self))
+
+        self.phased_fmha_libs = [
+            fmha for fmha in self.fmha_libs if isinstance(fmha, PhasedFmha)
+        ]
+        self.non_phased_fmha_libs = [
+            fmha for fmha in self.fmha_libs if not isinstance(fmha, PhasedFmha)
+        ]
+        self.combined_fmha = (CombinedFmha(self) if self.phased_fmha_libs
+                              and not self.is_mla_enable else None)
+
+    def _select_non_mla_fmha(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        has_context = metadata.num_contexts > 0
+        has_generation = metadata.num_generations > 0
+        if not has_context and not has_generation:
+            return None
+
+        context_fmha = None
+        generation_fmha = None
+        for fmha in self.fmha_libs:
+            if isinstance(fmha, PhasedFmha):
+                if (has_context and context_fmha is None and fmha.is_supported(
+                        q,
+                        k,
+                        v,
+                        metadata,
+                        forward_args,
+                        phase=FmhaPhase.CONTEXT,
+                )):
+                    context_fmha = fmha
+                if (has_generation and generation_fmha is None
+                        and fmha.is_supported(
+                            q,
+                            k,
+                            v,
+                            metadata,
+                            forward_args,
+                            phase=FmhaPhase.GENERATION,
+                        )):
+                    generation_fmha = fmha
+
+                if (has_context and context_fmha is None) or (
+                        has_generation and generation_fmha is None):
+                    continue
+                if context_fmha is None:
+                    return generation_fmha
+                if generation_fmha is None or context_fmha is generation_fmha:
+                    return context_fmha
+
+                self.combined_fmha.set_fmha_impls(
+                    context_fmha,
+                    generation_fmha,
+                )
+                return self.combined_fmha
+            if fmha.is_supported(q, k, v, metadata, forward_args):
+                return fmha
+        return None
+
+    def _select_mla_fmha(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[Fmha]:
+        if forward_args.attention_input_type == AttentionInputType.context_only:
+            phase = FmhaPhase.CONTEXT
+        elif forward_args.attention_input_type == AttentionInputType.generation_only:
+            phase = FmhaPhase.GENERATION
+        else:
+            return None
+
+        for fmha in self.fmha_libs:
+            if isinstance(fmha, PhasedFmha):
+                supported = fmha.is_supported(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    phase=phase,
+                )
+            else:
+                supported = fmha.is_supported(q, k, v, metadata, forward_args)
+            if supported:
+                return fmha
+        return None
 
     def forward(
         self,
@@ -2092,13 +2189,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not self.fmha_libs:
             self.create_fmha_libs()
 
-        for fmha in self.fmha_libs:
-            if fmha.is_supported(q, k, v, metadata, forward_args):
-                fmha.forward(q, k, v, metadata, forward_args)
-                break
+        fmha: Optional[Fmha] = None
+        if self.is_mla_enable:
+            fmha = self._select_mla_fmha(q, k, v, metadata, forward_args)
         else:
+            fmha = self._select_non_mla_fmha(
+                q,
+                k,
+                v,
+                metadata,
+                forward_args,
+            )
+
+        if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
+        fmha.forward(q, k, v, metadata, forward_args)
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat
