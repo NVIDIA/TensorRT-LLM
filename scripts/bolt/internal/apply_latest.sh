@@ -17,7 +17,7 @@
 # apply_latest.sh - premerge "consume the latest bundle" step.
 #
 # Pulls the branch-keyed `latest` BOLT profile bundle promoted by postmerge and
-# applies it to a phase-1 BOLT-compatible tarball, producing a bolted tarball
+# applies it to a BOLT-compatible tarball, producing a bolted tarball
 # (no recompile; apply_bolt.py swaps bolted ELFs into the wheel + tree).
 #
 # STRICT/FATAL by design. This runs only when the caller has opted into BOLT

@@ -139,7 +139,7 @@ find_tensorrt_llm_libs() {
 }
 
 # A shared library/binary is BOLT-applicable only if it carries relocations
-# (.rela.text), which the phase-1 ENABLE_BOLT_COMPATIBLE=ON build emits.
+# (.rela.text), which the ENABLE_BOLT_COMPATIBLE=ON build emits.
 is_bolt_applicable() {
     local lib="$1"
     local sections

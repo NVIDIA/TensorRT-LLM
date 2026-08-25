@@ -484,7 +484,7 @@ def runLLMBuild(
     }
 
     // BOLT consume (premerge): opt-in via BOLT_CONSUME. Pull the branch's latest
-    // postmerge-promoted profile bundle and re-BOLT the just-packed phase-1
+    // postmerge-promoted profile bundle and re-BOLT the just-packed
     // tarball IN PLACE, so the artifact that gets uploaded (and every downstream
     // test) exercises the bolted binaries. No-op unless BOLT_CONSUME=true, so
     // normal builds are unaffected. STRICT by design: apply_latest.sh exits

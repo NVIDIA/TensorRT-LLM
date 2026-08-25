@@ -13,10 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Phase-3 BOLT apply / repack (the "BOLTed build" step).
+"""BOLT apply / repack (the "BOLTed build" step).
 
-Takes a phase-1 BOLT-compatible release tarball (the original, relocs-carrying
-ELFs) plus a phase-2 profile bundle (per-ELF .yaml/.fdata + manifest), runs
+Takes a BOLT-compatible release tarball (the original, relocs-carrying
+ELFs) plus a merged profile bundle (per-ELF .yaml/.fdata + manifest), runs
 `llvm-bolt` on each in-scope ELF, substitutes the bolted binaries back into the
 wheel AND the TensorRT-LLM/ layout, and repacks a new tarball under a bolted
 TARNAME. No recompile.
@@ -315,7 +315,7 @@ def main() -> int:
         "--tarball",
         required=True,
         type=Path,
-        help="phase-1 BOLT-compatible release tarball (TensorRT-LLM*.tar.gz)",
+        help="BOLT-compatible release tarball (TensorRT-LLM*.tar.gz)",
     )
     ap.add_argument(
         "--profiles",

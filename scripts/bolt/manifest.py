@@ -16,7 +16,7 @@
 """Build and verify the BOLT profile bundle manifest.
 
 The manifest pins a profile bundle to the exact bits it was generated from so
-that phase 3 (apply) and offline customer re-BOLT can detect drift. It records:
+that apply and offline customer re-BOLT can detect drift. It records:
 
   - arch / triple / glibc
   - LLVM/BOLT version used

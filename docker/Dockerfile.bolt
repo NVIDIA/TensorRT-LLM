@@ -19,7 +19,7 @@
 # offline, without needing internal Artifactory access. This is a single thin
 # COPY layer; there is NO recompile and NO change to the underlying image.
 #
-# The bundle is the phase-2 output of the BoltProfileGen job (per-library
+# The bundle is the output of the BoltProfileGen job (per-library
 # `<lib>.yaml` / `<lib>.fdata` + `manifest.json`), fetched into the build context
 # by scripts/bolt/internal/artifactory.sh (see jenkins/BuildDockerImage.groovy).
 # Apply it to a from-source build with scripts/bolt/apply_bolt.py --profiles

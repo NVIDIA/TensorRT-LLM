@@ -209,7 +209,7 @@ To produce a BOLT'd build:
 
 ```bash
 python3 scripts/bolt/apply_bolt.py \
-    --tarball <phase1 BOLT-compatible tarball> \
+    --tarball <BOLT-compatible tarball> \
     --profiles "$TRTLLM_BOLT_PROFILES" \
     --manifest "$TRTLLM_BOLT_PROFILES/manifest.json" \
     --output bolt-<tarball>

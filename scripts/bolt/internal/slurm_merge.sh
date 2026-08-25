@@ -19,13 +19,13 @@
 # Pairs with the per-workload perf-harness collect runs (the POST_INSTALL_HOOK
 # perf_instrument_hook.sh). After N per-workload runs have each written their
 # .fdata to $FDATA_ROOT/<workload>/<host>/, this single job:
-#   1. Reconstructs the ORIGINAL (pre-instrument) libs by installing the phase-1
+#   1. Reconstructs the ORIGINAL (pre-instrument) libs by installing the input
 #      wheel and backing up the in-scope ELFs (setup_env + backup_libraries; NO
 #      instrument -- merge only needs the originals to convert .fdata -> .yaml).
 #   2. Gathers EVERY workload's per-host .fdata into one set, tagging the pid
 #      field with <workload>-<host> so cross-workload/-node PIDs never collide.
 #   3. Merges per-lib, builds the manifest, and packages the promotable bundle.
-#   4. (BOLT_APPLY=1) re-BOLTs the phase-1 tarball with the just-merged profiles
+#   4. (BOLT_APPLY=1) re-BOLTs the input tarball with the just-merged profiles
 #      into a bolted tarball -- postmerge "consume immediately after generating".
 #
 # Submit with: sbatch --nodes=1 scripts/bolt/internal/slurm_merge.sh
@@ -68,7 +68,7 @@ esac
 TARBALL_NAME="${TARBALL_NAME:-TensorRT-LLM-GH200.tar.gz}"
 CONTAINER_NAME="bolt_merge_${SLURM_JOB_ID}"
 GATHERED="$FDATA_ROOT/_merged"
-# Merge only needs the toolkit, the phase-1 tarball (+llvm), and the fdata root.
+# Merge only needs the toolkit, the input tarball (+llvm), and the fdata root.
 MOUNTS="$TOOLKIT_HOST:/workspace/bolt,$BUILDS_HOST:/builds,$FDATA_ROOT:$FDATA_ROOT,$RUNDIR:$RUNDIR"
 
 mkdir -p "$GATHERED" "$OUT_DIR" "$RUNDIR"
@@ -167,7 +167,7 @@ srun --ntasks=1 --ntasks-per-node=1 --nodes=1 \
             "$gathered" "'"$BOLT_REF"'" "'"$TRIPLE"'" "'"$OUT_DIR"'"
 
         # 5) APPLY (postmerge "consume immediately after generating", opt-in via
-        #    BOLT_APPLY=1): re-BOLT the phase-1 tarball with the just-merged
+        #    BOLT_APPLY=1): re-BOLT the input tarball with the just-merged
         #    profiles into a bolted tarball. No recompile -- apply_bolt.py swaps the
         #    bolted ELFs into the wheel + tree and repacks. Everything it needs (the
         #    tarball, profiles, llvm-bolt) is already staged in this job.

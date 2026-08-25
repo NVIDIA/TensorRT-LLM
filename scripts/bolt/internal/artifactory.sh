@@ -36,7 +36,7 @@
 #                  this configures jf automatically; else assumes jf is
 #                  preconfigured. (The CI postmerge path in BoltProfileGen.groovy
 #                  instead uploads cluster-side via curl + urm-artifactory-creds.)
-#   pull-latest -> anonymous curl (read), matching Build.groovy's phase-1 tarball
+#   pull-latest -> anonymous curl (read), matching Build.groovy's tarball
 #                  download from the same repo; needs no creds and no jf, so it
 #                  runs in the premerge build pod as-is.
 
@@ -124,7 +124,7 @@ cmd_pull_latest() {
     local url="$base/$(promote_dir "$branch" "$triple")/latest.tar.gz"
     mkdir -p "$dest"
     log "Pulling $url -> $dest"
-    # Anonymous download (like jenkins/Build.groovy's phase-1 tarball from the same
+    # Anonymous download (like jenkins/Build.groovy's tarball from the same
     # sw-tensorrt-generic repo): the read path needs no creds, so this works in the
     # build pod without a configured `jf`. Use curl if present, else fall back to
     # wget -- the image-overlay build pod (BuildDockerImage.overlayBoltBundle) has no
