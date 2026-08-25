@@ -14,12 +14,21 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/kdaDecode/kdaDecodeInternal.h"
+
+#include "tensorrt_llm/common/cudaUtils.h"
+
 #include <cooperative_groups.h>
 #include <cuda/barrier>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
+
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::kdaDecode
+{
 
 namespace
 {
@@ -35,9 +44,6 @@ constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
 constexpr int kChunkRows = 32;
 constexpr int kChunks = kDim / kChunkRows;
-constexpr float kLowerBound = -5.0f;
-constexpr float kQScale = 0.08838834764831845f;
-constexpr float kOutputNormEpsilon = 1.0e-5f;
 
 enum class KernelSchedule : int
 {
@@ -73,31 +79,6 @@ struct Sum2
 {
     float x;
     float y;
-};
-
-struct KernelArguments
-{
-    __nv_bfloat16 const* x_q;
-    __nv_bfloat16 const* x_k;
-    __nv_bfloat16 const* x_v;
-    __nv_bfloat16 const* w_q_t;
-    __nv_bfloat16 const* w_k_t;
-    __nv_bfloat16 const* w_v_t;
-    __nv_bfloat16 const* bias_q;
-    __nv_bfloat16 const* bias_k;
-    __nv_bfloat16 const* bias_v;
-    __nv_bfloat16 const* cs_q;
-    __nv_bfloat16 const* cs_k;
-    __nv_bfloat16 const* cs_v;
-    float const* a_log;
-    __nv_bfloat16 const* g;
-    float const* dt_bias;
-    __nv_bfloat16 const* beta;
-    __nv_bfloat16 const* onorm_g;
-    float const* onorm_weight;
-    float* state;
-    __nv_bfloat16* out;
-    int batch;
 };
 
 __device__ __forceinline__ float bf16_load(__nv_bfloat16 const* ptr, int index)
@@ -596,7 +577,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
 }
 
 template <KernelSchedule kSchedule>
-cudaError_t launch_kernel_schedule(KernelArguments const& arguments, cudaStream_t stream)
+cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t stream)
 {
     constexpr bool kUseCpAsyncBulk = kSchedule == KernelSchedule::kSingleCtaTwoStageCpAsyncBulk
         || kSchedule == KernelSchedule::kSingleCtaFourStageCpAsyncBulk;
@@ -616,99 +597,86 @@ cudaError_t launch_kernel_schedule(KernelArguments const& arguments, cudaStream_
         }
     }
 
+    cudaLaunchAttribute clusterAttribute{};
+    cudaLaunchConfig_t config{};
+    config.gridDim = kUseCluster ? dim3(kClusterBlocks, params.batchSize, kHeads) : dim3(params.batchSize, kHeads);
+    config.blockDim = dim3(kThreads);
+    config.dynamicSmemBytes = kDynamicSharedBytes;
+    config.stream = stream;
     if constexpr (kUseCluster)
     {
-        cudaLaunchAttribute cluster_attribute{};
-        cluster_attribute.id = cudaLaunchAttributeClusterDimension;
-        cluster_attribute.val.clusterDim.x = kClusterBlocks;
-        cluster_attribute.val.clusterDim.y = 1;
-        cluster_attribute.val.clusterDim.z = 1;
-
-        cudaLaunchConfig_t config{};
-        config.gridDim = dim3(kClusterBlocks, arguments.batch, kHeads);
-        config.blockDim = dim3(kThreads);
-        config.dynamicSmemBytes = 0;
-        config.stream = stream;
-        config.attrs = &cluster_attribute;
+        clusterAttribute.id = cudaLaunchAttributeClusterDimension;
+        clusterAttribute.val.clusterDim.x = kClusterBlocks;
+        clusterAttribute.val.clusterDim.y = 1;
+        clusterAttribute.val.clusterDim.z = 1;
+        config.attrs = &clusterAttribute;
         config.numAttrs = 1;
-
-        const cudaError_t launch_status = cudaLaunchKernelEx(&config, kda_decode_native_kernel<kSchedule>,
-            arguments.x_q, arguments.x_k, arguments.x_v, arguments.w_q_t, arguments.w_k_t, arguments.w_v_t,
-            arguments.bias_q, arguments.bias_k, arguments.bias_v, arguments.cs_q, arguments.cs_k, arguments.cs_v,
-            arguments.a_log, arguments.g, arguments.dt_bias, arguments.beta, arguments.onorm_g, arguments.onorm_weight,
-            arguments.state, arguments.out, kLowerBound, kQScale, kOutputNormEpsilon);
-        if (launch_status != cudaSuccess)
-        {
-            return launch_status;
-        }
-        return cudaGetLastError();
     }
 
-    kda_decode_native_kernel<kSchedule><<<dim3(arguments.batch, kHeads), dim3(kThreads), kDynamicSharedBytes, stream>>>(
-        arguments.x_q, arguments.x_k, arguments.x_v, arguments.w_q_t, arguments.w_k_t, arguments.w_v_t,
-        arguments.bias_q, arguments.bias_k, arguments.bias_v, arguments.cs_q, arguments.cs_k, arguments.cs_v,
-        arguments.a_log, arguments.g, arguments.dt_bias, arguments.beta, arguments.onorm_g, arguments.onorm_weight,
-        arguments.state, arguments.out, kLowerBound, kQScale, kOutputNormEpsilon);
+    cudaError_t const launchStatus = cudaLaunchKernelEx(&config, kda_decode_native_kernel<kSchedule>,
+        static_cast<__nv_bfloat16 const*>(params.xQ), static_cast<__nv_bfloat16 const*>(params.xK),
+        static_cast<__nv_bfloat16 const*>(params.xV), static_cast<__nv_bfloat16 const*>(params.wQT),
+        static_cast<__nv_bfloat16 const*>(params.wKT), static_cast<__nv_bfloat16 const*>(params.wVT),
+        static_cast<__nv_bfloat16 const*>(params.biasQ), static_cast<__nv_bfloat16 const*>(params.biasK),
+        static_cast<__nv_bfloat16 const*>(params.biasV), static_cast<__nv_bfloat16 const*>(params.convStateQ),
+        static_cast<__nv_bfloat16 const*>(params.convStateK), static_cast<__nv_bfloat16 const*>(params.convStateV),
+        params.logA, static_cast<__nv_bfloat16 const*>(params.gate), params.dtBias,
+        static_cast<__nv_bfloat16 const*>(params.beta), static_cast<__nv_bfloat16 const*>(params.outputNormGate),
+        params.outputNormWeight, params.state, static_cast<__nv_bfloat16*>(params.output), params.lowerBound,
+        params.scale, params.outputNormEps);
+    if (launchStatus != cudaSuccess)
+    {
+        return launchStatus;
+    }
     return cudaGetLastError();
 }
 
-bool has_null_pointer(KernelArguments const& arguments)
+void validateBlackwellParams(KdaDecodeParams const& params)
 {
-    return arguments.x_q == nullptr || arguments.x_k == nullptr || arguments.x_v == nullptr
-        || arguments.w_q_t == nullptr || arguments.w_k_t == nullptr || arguments.w_v_t == nullptr
-        || arguments.bias_q == nullptr || arguments.bias_k == nullptr || arguments.bias_v == nullptr
-        || arguments.cs_q == nullptr || arguments.cs_k == nullptr || arguments.cs_v == nullptr
-        || arguments.a_log == nullptr || arguments.g == nullptr || arguments.dt_bias == nullptr
-        || arguments.beta == nullptr || arguments.onorm_g == nullptr || arguments.onorm_weight == nullptr
-        || arguments.state == nullptr || arguments.out == nullptr;
+    TLLM_CHECK_WITH_INFO(params.batchSize > 0, "Blackwell KDA decode requires a non-empty batch");
+    TLLM_CHECK_WITH_INFO(params.numHeads == kHeads && params.numValueHeads == kHeads,
+        "Blackwell KDA decode currently requires numHeads == "
+        "numValueHeads == 12");
+    TLLM_CHECK_WITH_INFO(
+        params.ssmStateIndices == nullptr, "Blackwell KDA decode does not yet support indexed recurrent state");
+    TLLM_CHECK_WITH_INFO(params.cuSeqlens != nullptr, "Blackwell KDA decode requires cuSeqlens");
+    TLLM_CHECK_WITH_INFO(
+        params.stateSlotStride == kFlat * kDim, "Blackwell KDA decode requires a contiguous recurrent-state pool");
+    TLLM_CHECK_WITH_INFO(params.applyOutputNorm, "Blackwell KDA decode requires output normalization");
+    TLLM_CHECK_WITH_INFO(!params.updateConvCache, "Blackwell KDA decode does not yet support updateConvCache=true");
+    TLLM_CHECK_WITH_INFO(params.useLowerBound, "Blackwell KDA decode requires the lower-bound gate");
+    TLLM_CHECK_WITH_INFO(params.applyBetaSigmoid, "Blackwell KDA decode requires beta sigmoid in the kernel");
+}
+
+template <KernelSchedule kSchedule>
+void launchBlackwellKernel(KdaDecodeParams const& params, cudaStream_t stream)
+{
+    validateBlackwellParams(params);
+    TLLM_CUDA_CHECK(launchKernelSchedule<kSchedule>(params, stream));
 }
 
 } // namespace
 
-extern "C" cudaError_t launch_kda_decode_native_cuda(void const* x_q, void const* x_k, void const* x_v,
-    void const* w_q_t, void const* w_k_t, void const* w_v_t, void const* bias_q, void const* bias_k, void const* bias_v,
-    void const* cs_q, void const* cs_k, void const* cs_v, float const* a_log, void const* g, float const* dt_bias,
-    void const* beta, void const* onorm_g, float const* onorm_weight, float* state, void* out, int batch, int schedule,
-    cudaStream_t stream)
+void launchKdaDecodeBlackwellSingleCta(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    const KernelArguments arguments{
-        reinterpret_cast<__nv_bfloat16 const*>(x_q),
-        reinterpret_cast<__nv_bfloat16 const*>(x_k),
-        reinterpret_cast<__nv_bfloat16 const*>(x_v),
-        reinterpret_cast<__nv_bfloat16 const*>(w_q_t),
-        reinterpret_cast<__nv_bfloat16 const*>(w_k_t),
-        reinterpret_cast<__nv_bfloat16 const*>(w_v_t),
-        reinterpret_cast<__nv_bfloat16 const*>(bias_q),
-        reinterpret_cast<__nv_bfloat16 const*>(bias_k),
-        reinterpret_cast<__nv_bfloat16 const*>(bias_v),
-        reinterpret_cast<__nv_bfloat16 const*>(cs_q),
-        reinterpret_cast<__nv_bfloat16 const*>(cs_k),
-        reinterpret_cast<__nv_bfloat16 const*>(cs_v),
-        a_log,
-        reinterpret_cast<__nv_bfloat16 const*>(g),
-        dt_bias,
-        reinterpret_cast<__nv_bfloat16 const*>(beta),
-        reinterpret_cast<__nv_bfloat16 const*>(onorm_g),
-        onorm_weight,
-        state,
-        reinterpret_cast<__nv_bfloat16*>(out),
-        batch,
-    };
-    if (batch <= 0 || has_null_pointer(arguments))
-    {
-        return cudaErrorInvalidValue;
-    }
-
-    switch (static_cast<KernelSchedule>(schedule))
-    {
-    case KernelSchedule::kSingleCtaCpAsync:
-        return launch_kernel_schedule<KernelSchedule::kSingleCtaCpAsync>(arguments, stream);
-    case KernelSchedule::kSingleCtaTwoStageCpAsyncBulk:
-        return launch_kernel_schedule<KernelSchedule::kSingleCtaTwoStageCpAsyncBulk>(arguments, stream);
-    case KernelSchedule::kSingleCtaFourStageCpAsyncBulk:
-        return launch_kernel_schedule<KernelSchedule::kSingleCtaFourStageCpAsyncBulk>(arguments, stream);
-    case KernelSchedule::kFourCtaThreadBlockClusterCpAsync:
-        return launch_kernel_schedule<KernelSchedule::kFourCtaThreadBlockClusterCpAsync>(arguments, stream);
-    default: return cudaErrorInvalidValue;
-    }
+    launchBlackwellKernel<KernelSchedule::kSingleCtaCpAsync>(params, stream);
 }
+
+void launchKdaDecodeBlackwellTwoStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
+{
+    launchBlackwellKernel<KernelSchedule::kSingleCtaTwoStageCpAsyncBulk>(params, stream);
+}
+
+void launchKdaDecodeBlackwellFourStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
+{
+    launchBlackwellKernel<KernelSchedule::kSingleCtaFourStageCpAsyncBulk>(params, stream);
+}
+
+void launchKdaDecodeBlackwellFourCtaCluster(KdaDecodeParams const& params, cudaStream_t stream)
+{
+    launchBlackwellKernel<KernelSchedule::kFourCtaThreadBlockClusterCpAsync>(params, stream);
+}
+
+} // namespace kernels::kdaDecode
+
+TRTLLM_NAMESPACE_END
