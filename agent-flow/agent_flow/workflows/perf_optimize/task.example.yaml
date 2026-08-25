@@ -86,9 +86,9 @@ profile:
 #                               # Only rounds with stale/unproven runtime
 #                               # evidence pay for a profile, so this bounds
 #                               # items attempted far more tightly than GPU hours
-#   max_items_per_round: 3      # items applied per round, ONE AT A TIME (each
-#                               # keeps its own evaluator gate + revert); 1
-#                               # reproduces the original one-item-per-round loop
+#   max_items_per_round: 3      # maximum roadmap items selected per round
+#   item_execution: parallel    # parallel: isolated workers then Integrator;
+#                               # serial: one worker at a time, accepted directly
 #   max_attempts_per_item: 3    # total optimizer attempts per item: evaluator
 #                               # PUSH_BACK verdicts retry up to this bound (an
 #                               # explicit REJECT fails the item immediately)

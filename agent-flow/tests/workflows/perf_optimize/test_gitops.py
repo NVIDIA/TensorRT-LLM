@@ -137,6 +137,30 @@ def test_discard_uncommitted_spares_gitignored_artifacts(repo):
     assert gitops.worktree_clean(repo) is True
 
 
+def test_worktree_reset_and_fast_forward(repo, tmp_path):
+    base = gitops.rev_parse_head(repo)
+    gitops.create_branch(repo, "perf-optimize/campaign")
+    item_worktree = tmp_path / "item-worktree"
+    gitops.create_worktree(
+        repo,
+        item_worktree,
+        "perf-optimize/campaign-round-1-item-opt-001",
+        base,
+    )
+    (item_worktree / "src.py").write_text("x = 2\n", encoding="utf-8")
+    candidate = gitops.commit_all(item_worktree, "candidate")
+    assert candidate != base
+
+    gitops.fast_forward(repo, "perf-optimize/campaign-round-1-item-opt-001")
+    assert (repo / "src.py").read_text(encoding="utf-8") == "x = 2\n"
+
+    (item_worktree / "src.py").write_text("broken\n", encoding="utf-8")
+    gitops.reset_to(item_worktree, candidate)
+    assert (item_worktree / "src.py").read_text(encoding="utf-8") == "x = 2\n"
+    gitops.remove_worktree(repo, item_worktree)
+    assert not item_worktree.exists()
+
+
 def test_git_errors_raise_with_context(repo):
     with pytest.raises(gitops.GitOpsError, match="checkout"):
         gitops.checkout(repo, "no-such-branch")

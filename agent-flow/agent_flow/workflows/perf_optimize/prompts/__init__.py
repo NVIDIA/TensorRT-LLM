@@ -15,6 +15,7 @@ from ._common import (
 from .analyzer import SYSTEM_PROMPT as ANALYZER_SYSTEM_PROMPT
 from .benchmarker import SYSTEM_PROMPT as BENCHMARKER_SYSTEM_PROMPT
 from .evaluator import SYSTEM_PROMPT as EVALUATOR_SYSTEM_PROMPT
+from .integrator import SYSTEM_PROMPT as INTEGRATOR_SYSTEM_PROMPT
 from .optimizer import SYSTEM_PROMPT as OPTIMIZER_SYSTEM_PROMPT
 from .projector import SYSTEM_PROMPT as PROJECTOR_SYSTEM_PROMPT
 from .projector import build_projector_prompt
@@ -36,6 +37,7 @@ class PromptBundle:
     analyzer: str
     optimizer: str
     evaluator: str
+    integrator: str
     qa: str
     reporter: str
 
@@ -47,6 +49,7 @@ class PromptBundle:
         analyzer: str = "",
         optimizer: str = "",
         evaluator: str = "",
+        integrator: str = "",
         qa: str = "",
         reporter: str = "",
     ) -> "PromptBundle":
@@ -68,6 +71,7 @@ class PromptBundle:
             analyzer=_append(self.analyzer, analyzer),
             optimizer=_append(self.optimizer, optimizer),
             evaluator=_append(self.evaluator, evaluator),
+            integrator=_append(self.integrator, integrator),
             qa=_append(self.qa, qa),
             reporter=_append(self.reporter, reporter),
         )
@@ -79,6 +83,7 @@ DEFAULT_PROMPTS = PromptBundle(
     analyzer=ANALYZER_SYSTEM_PROMPT,
     optimizer=OPTIMIZER_SYSTEM_PROMPT,
     evaluator=EVALUATOR_SYSTEM_PROMPT,
+    integrator=INTEGRATOR_SYSTEM_PROMPT,
     qa=QA_SYSTEM_PROMPT,
     reporter=REPORTER_SYSTEM_PROMPT,
 )
@@ -176,6 +181,7 @@ def build_perf_optimize_prompts(
             analyzer=EXECUTION_SLURM_BOOTSTRAP,
             optimizer=EXECUTION_SLURM_BOOTSTRAP,
             evaluator=EXECUTION_SLURM_BOOTSTRAP,
+            integrator=EXECUTION_SLURM_BOOTSTRAP,
             qa=EXECUTION_SLURM_BOOTSTRAP,
         )
     if include_sol:
@@ -208,6 +214,7 @@ __all__ = [
     "BENCHMARKER_SYSTEM_PROMPT",
     "DEFAULT_PROMPTS",
     "EVALUATOR_SYSTEM_PROMPT",
+    "INTEGRATOR_SYSTEM_PROMPT",
     "OPTIMIZER_SYSTEM_PROMPT",
     "PROJECTOR_SYSTEM_PROMPT",
     "PromptBundle",
