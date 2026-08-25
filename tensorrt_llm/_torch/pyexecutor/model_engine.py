@@ -43,6 +43,9 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           PrefillCudaGraphBackend,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
+
+# isort: split
+from tensorrt_llm.llmapi.llm_args import validate_token_encoder_bucket_config
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -4134,41 +4137,29 @@ class PyTorchModelEngine(ModelEngine):
             encoder_cuda_graph_seq_lens: List[int]) -> None:
         """Reject an encoder graph config the model cannot complete.
 
-        A fixed-shape feature encoder derives both bucket lists from the
-        model's encoder output length, so only a token-driven encoder needs the
-        user to supply them — and for that encoder the buckets are the whole
-        key space, so a config missing them can only ever run eager. Raise
-        rather than degrade silently: the request to capture was explicit.
+        A feature encoder derives both bucket lists from the model, so only a
+        token encoder needs them supplied — and there they are the whole key
+        space, so a config missing them can only run eager. The request to
+        capture was explicit, so raise rather than degrade silently.
 
-        Encode-only is the exception. Its buckets arrive through
+        Encode-only warns instead: its buckets arrive through
         `cuda_graph_config` (see `__init__`), a slot that has always accepted a
-        batch-sizes-only `EncodeCudaGraphConfig` and run eager, so raising here
-        would break deployments that predate feature mode. Warn instead — the
-        silence was itself the defect.
+        batch-sizes-only config and run eager, so raising would break
+        deployments predating feature mode.
         """
         if (self.encoder_cuda_graph_config is None
                 or self._model_encoder_graph_spec() is not None):
             return
-        missing = []
-        if not encoder_cuda_graph_num_tokens:
-            missing.append("num_tokens/max_num_token")
-        if not encoder_cuda_graph_seq_lens:
-            missing.append("seq_lens/max_seq_len")
-        if not missing:
+        bucket_config_error = validate_token_encoder_bucket_config(
+            encoder_cuda_graph_num_tokens,
+            encoder_cuda_graph_seq_lens,
+            stays_eager=self._is_encode_only)
+        if bucket_config_error is None:
             return
         if self._is_encode_only:
-            logger.warning(
-                f"Encoder CUDA graph configuration has {' and '.join(missing)} "
-                f"unset. This model's encoder consumes packed tokens, so it "
-                f"needs both dimensions; the encode step stays eager.")
+            logger.warning(bucket_config_error)
             return
-        raise ValueError(
-            f"Encoder CUDA graph configuration has {' and '.join(missing)} "
-            f"unset. This model's encoder consumes packed tokens, so it needs "
-            f"both dimensions: specify e.g. "
-            f"EncodeCudaGraphConfig(max_batch_size=64, num_tokens=[128, 256, "
-            f"512], max_seq_len=128, enable_padding=True), or drop "
-            f"encoder_cuda_graph_config to run the encoder eagerly.")
+        raise ValueError(bucket_config_error)
 
     def _encoder_graph_spec(
         self

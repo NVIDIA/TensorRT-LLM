@@ -7,6 +7,7 @@ from collections import defaultdict
 from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 from unittest.mock import patch
 
@@ -1939,8 +1940,10 @@ class TestTorchLlmArgsCudaGraphSettings:
 
         # Batch sizes alone are valid. An encoder whose input is a fixed-shape
         # per-request feature tensor (Whisper) derives num_tokens / seq_lens
-        # from the model, and only the model engine knows which kind of encoder
-        # a model has, so those buckets are checked there, not here.
+        # from the model, so which kind of encoder the model has decides
+        # whether they are required — a question the config cannot answer.
+        # `LLM._reject_token_encoder_config_without_buckets` asks the model
+        # class, and the model engine asks the loaded model.
         feature_args = TorchLlmArgs(
             model=llama_model_path,
             encoder_max_batch_size=4,
@@ -1986,6 +1989,94 @@ class TestTorchLlmArgsCudaGraphSettings:
                     enable_padding=True,
                 ),
             )
+
+    @staticmethod
+    def _bucketless_encoder_llm(architectures, is_encoder_decoder=True):
+        """A bare LLM carrying only what the bucket pre-check reads."""
+        llm = TorchLLM.__new__(TorchLLM)
+        llm.args = TorchLlmArgs(
+            model=llama_model_path,
+            encoder_max_batch_size=4,
+            encoder_cuda_graph_config=EncodeCudaGraphConfig(
+                batch_sizes=[1, 4],
+                enable_padding=True,
+            ),
+        )
+        llm._hf_model_config = (SimpleNamespace(
+            architectures=architectures, is_encoder_decoder=is_encoder_decoder)
+                                if architectures is not None else None)
+        return llm
+
+    def test_token_encoder_without_buckets_is_rejected_before_weights_load(
+            self):
+        # The model class settles token-vs-feature without an instance, so
+        # the user learns now rather than after weights load.
+        class _TokenEncoder:
+            pass
+
+        llm = self._bucketless_encoder_llm(["T5ForConditionalGeneration"])
+        with patch(
+                "tensorrt_llm._torch.models.modeling_utils."
+                "get_registered_model_class",
+                return_value=_TokenEncoder):
+            with pytest.raises(ValueError, match="consumes packed tokens"):
+                llm._reject_token_encoder_config_without_buckets()
+
+    def test_feature_encoder_without_buckets_is_accepted(self):
+        # Whisper derives both lists from the model: the same config is
+        # complete for it, and rejecting it would break every Whisper run.
+        class _FeatureEncoder:
+
+            def encoder_graph_spec(self):
+                return ((480000, ), torch.float32, 1500)
+
+        llm = self._bucketless_encoder_llm(["WhisperForConditionalGeneration"])
+        with patch(
+                "tensorrt_llm._torch.models.modeling_utils."
+                "get_registered_model_class",
+                return_value=_FeatureEncoder):
+            llm._reject_token_encoder_config_without_buckets()
+
+    @pytest.mark.parametrize("architectures", [[], ["SomeUnregisteredArch"]])
+    def test_an_unresolved_architecture_defers_to_the_model_engine(
+            self, architectures):
+        # Out-of-tree models register in the worker, not here. Guessing would
+        # reject a feature encoder the engine goes on to accept.
+        llm = self._bucketless_encoder_llm(architectures)
+        with patch(
+                "tensorrt_llm._torch.models.modeling_utils."
+                "get_registered_model_class",
+                return_value=None):
+            llm._reject_token_encoder_config_without_buckets()
+
+    @pytest.mark.parametrize("field,value", [
+        ("model_kwargs", {
+            "architectures": ["WhisperForConditionalGeneration"]
+        }),
+        ("checkpoint_format", "MX"),
+        ("checkpoint_loader", object()),
+    ])
+    def test_a_loader_that_picks_the_class_is_never_second_guessed(
+            self, field, value):
+        # These all reach `checkpoint_loader.load_config()`, where the engine
+        # gets its class, so the on-disk architecture may not be the one it
+        # builds. The registry must not even be consulted.
+        llm = self._bucketless_encoder_llm(["T5ForConditionalGeneration"])
+        setattr(llm.args, field, value)
+        with patch("tensorrt_llm._torch.models.modeling_utils."
+                   "get_registered_model_class") as resolve:
+            llm._reject_token_encoder_config_without_buckets()
+        resolve.assert_not_called()
+
+    def test_a_decoder_only_model_is_left_to_the_model_engine(self):
+        # No encoder at all: the engine's "consumes packed tokens" wording
+        # would only mislead, and skipping keeps the model import off this path.
+        llm = self._bucketless_encoder_llm(["LlamaForCausalLM"],
+                                           is_encoder_decoder=False)
+        with patch("tensorrt_llm._torch.models.modeling_utils."
+                   "get_registered_model_class") as resolve:
+            llm._reject_token_encoder_config_without_buckets()
+        resolve.assert_not_called()
 
     def test_cuda_graph_config_infers_encode_mode_from_raw_dict(self):
         args = TorchLlmArgs(

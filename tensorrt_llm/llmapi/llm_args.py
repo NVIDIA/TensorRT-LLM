@@ -454,6 +454,36 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         return sizes
 
 
+def validate_token_encoder_bucket_config(
+        num_tokens: Optional[List[int]],
+        seq_lens: Optional[List[int]],
+        *,
+        stays_eager: bool = False) -> Optional[str]:
+    """Why a packed-token encoder cannot capture with these buckets, or None.
+
+    Answers for token encoders (T5, BART) only; a fixed-shape feature encoder
+    derives both dimensions from the model, so the caller establishes which
+    kind it has first. Returned rather than raised because callers differ:
+    encode-only warns and stays eager (`stays_eager`), the rest raise.
+    """
+    missing = []
+    if not num_tokens:
+        missing.append("num_tokens/max_num_token")
+    if not seq_lens:
+        missing.append("seq_lens/max_seq_len")
+    if not missing:
+        return None
+    head = (f"Encoder CUDA graph configuration has {' and '.join(missing)} "
+            "unset. This model's encoder consumes packed tokens, so it needs "
+            "both dimensions")
+    if stays_eager:
+        return f"{head}; the encode step stays eager."
+    return (f"{head}: specify e.g. EncodeCudaGraphConfig(max_batch_size=64, "
+            "num_tokens=[128, 256, 512], max_seq_len=128, "
+            "enable_padding=True), or drop encoder_cuda_graph_config to run "
+            "the encoder eagerly.")
+
+
 # For CudaGraphConfig's backward compatibility
 CudaGraphConfig = DecodeCudaGraphConfig
 

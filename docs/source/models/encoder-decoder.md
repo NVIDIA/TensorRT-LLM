@@ -440,9 +440,9 @@ decoder sequences after beam expansion.
 Which encoder buckets you must supply depends on the model. A text encoder,
 such as BART or T5, packs a variable number of tokens per request, so
 `num_tokens` and `seq_lens` are part of its key space and are required; leaving
-either unset is rejected when the model engine initializes, which happens in
-the worker after weights load rather than at `LLM(...)` construction — only the
-engine knows which kind of encoder the model has. An encoder whose input is a
+either unset is rejected at `LLM(...)` for any architecture TensorRT-LLM
+recognizes, and at model engine initialization otherwise, since only the loaded
+model states with certainty which kind of encoder it has. An encoder whose input is a
 fixed-shape per-request feature tensor, such as Whisper's fixed 30-second
 zero-padded audio waveform (the mel transform runs inside the encoder, so the
 per-request input is the waveform itself, not a spectrogram), produces the same
