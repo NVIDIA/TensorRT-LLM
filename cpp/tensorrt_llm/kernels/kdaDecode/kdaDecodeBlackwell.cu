@@ -330,7 +330,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     {
         int const column = tid;
         int const head_column = head_offset + column;
-        int const cache_base = batch_index * kFlat * kConvCacheWidth + head_column;
+        int const cache_base = (batch_index * kFlat + head_column) * kConvCacheWidth;
         float const exp_a = __shfl_sync(0xffffffffu, lane == 0 ? __expf(a_log[head]) : 0.0f, 0);
 
         float q_accumulator = bf16_load(bias_q, head_column);
@@ -338,7 +338,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
 #pragma unroll
         for (int width = 0; width < kConvCacheWidth; ++width)
         {
-            int const cache_index = cache_base + width * kFlat;
+            int const cache_index = cache_base + width;
             q_accumulator += bf16_load(cs_q, cache_index) * bf16_load(w_q_t, width * kFlat + head_column);
             k_accumulator += bf16_load(cs_k, cache_index) * bf16_load(w_k_t, width * kFlat + head_column);
         }
@@ -357,12 +357,12 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         int const local_row = tid - kVThreadBase;
         int const row = kUseCluster ? cluster_rank * kLocalVThreads + local_row : local_row;
         int const head_row = head_offset + row;
-        int const cache_base = batch_index * kFlat * kConvCacheWidth + head_row;
+        int const cache_base = (batch_index * kFlat + head_row) * kConvCacheWidth;
         float v_accumulator = bf16_load(bias_v, head_row);
 #pragma unroll
         for (int width = 0; width < kConvCacheWidth; ++width)
         {
-            int const cache_index = cache_base + width * kFlat;
+            int const cache_index = cache_base + width;
             v_accumulator += bf16_load(cs_v, cache_index) * bf16_load(w_v_t, width * kFlat + head_row);
         }
         int const token_index = (batch_index * kHeads + head) * kDim + row;
