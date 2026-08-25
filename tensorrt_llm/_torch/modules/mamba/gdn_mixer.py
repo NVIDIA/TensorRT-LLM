@@ -57,12 +57,10 @@ from .mamba2_metadata import Mamba2Metadata
 # (and cached) so importing this module never initializes CUDA.
 @functools.lru_cache(maxsize=1)
 def _resolve_chunk_gated_delta_rule():
-    # FLASHINFER_CHUNK_GATED_DELTA_RULE is checked alongside the arch: flashinfer
-    # builds the GDN kernels only when its own ``import cutlass.cute`` succeeds,
-    # so on a supported arch with an incomplete CuTe-DSL install the symbol is
-    # simply absent and the adapter below would raise AttributeError at the
-    # kernel call. That is the same "installed on a supported arch" question the
-    # arch check already answers for one half of.
+    # The arch is necessary but not sufficient: on a supported arch whose
+    # flashinfer was built without the CuTe DSL the kernel is simply absent and
+    # the adapter would raise AttributeError at the call, so pair the arch check
+    # with the symbol probe (as the sibling decode/verify gates already do).
     if (
         os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
         and is_flashinfer_gdn_supported_arch()

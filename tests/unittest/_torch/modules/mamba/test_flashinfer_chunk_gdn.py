@@ -10,6 +10,8 @@ across the call shapes used by ``Qwen3NextGatedDeltaNet.forward_extend``.
 import pytest
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import FLASHINFER_CHUNK_GATED_DELTA_RULE
+
 # Skip rules ---------------------------------------------------------------
 
 
@@ -21,9 +23,14 @@ def _supported_arch() -> bool:
     return major in (9, 10)
 
 
+# These tests call the adapter directly rather than through gdn_mixer's
+# resolver, so they need its symbol probe themselves: without the CuTe DSL
+# flashinfer exports no chunk_gated_delta_rule on any arch, and the adapter can
+# then only raise AttributeError.
 skip_unsupported = pytest.mark.skipif(
-    not _supported_arch(),
-    reason="FlashInfer GDN prefill requires SM90 (Hopper) or SM100 (Blackwell)",
+    not _supported_arch() or FLASHINFER_CHUNK_GATED_DELTA_RULE is None,
+    reason="FlashInfer GDN prefill requires SM90 (Hopper) or SM100 (Blackwell) "
+    "and a flashinfer build that exports chunk_gated_delta_rule",
 )
 
 

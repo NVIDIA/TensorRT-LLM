@@ -6,12 +6,12 @@ from ..logger import logger
 
 IS_FLASHINFER_AVAILABLE = False
 
-# flashinfer builds its CuTe-DSL kernels only when its own ``import
-# cutlass.cute`` succeeds, so IS_FLASHINFER_AVAILABLE cannot answer for the
-# symbols they publish: the package imports fine (mamba2_mixer hard-depends on
-# selective_state_update) while these two are absent. Resolving them here, next
-# to the flag they qualify, keeps callers from mistaking "package present" for
-# "symbol present" -- whether as an import target or as a dispatch predicate.
+# IS_FLASHINFER_AVAILABLE is a package-level probe and cannot answer for these
+# two: flashinfer builds its CuTe-DSL kernels only when its own ``import
+# cutlass.cute`` succeeds, so the package imports fine (mamba2_mixer hard-depends
+# on selective_state_update) while both symbols are absent. Resolved here, next
+# to the flag they qualify, so no consumer re-derives the contract -- whether as
+# an import target or as a dispatch predicate.
 FLASHINFER_SSD_COMBINED = None
 FLASHINFER_CHUNK_GATED_DELTA_RULE = None
 

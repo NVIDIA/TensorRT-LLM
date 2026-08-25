@@ -44,11 +44,10 @@ skip_no_flashinfer = pytest.mark.skipif(
     reason="FlashInfer SSD requires SM100+ with flashinfer installed",
 )
 
-# The probe above imports the flashinfer package, which cannot speak for
-# SSDCombined: flashinfer exports that class only when its own
-# ``import cutlass.cute`` succeeds. Tests going through
-# mamba_chunk_scan_combined stay covered on such an install because they take
-# the Triton path, so only the test that builds the kernel directly needs this.
+# The probe above only imports the package, which cannot speak for SSDCombined.
+# Tests going through mamba_chunk_scan_combined stay covered without the class
+# because they take the Triton path, so only the test that builds the kernel
+# directly needs this.
 skip_no_flashinfer_ssd_kernel = pytest.mark.skipif(
     FLASHINFER_SSD_COMBINED is None,
     reason="flashinfer.mamba does not export SSDCombined without the CuTe DSL",
