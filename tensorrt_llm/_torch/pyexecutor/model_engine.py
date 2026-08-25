@@ -73,7 +73,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
-from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
@@ -4692,7 +4692,6 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq: List[int],
             total_num_tokens: int,
             num_generation_tokens: int,
-            request_accepted_path: Optional[Dict[int, Any]] = None,
             num_extend_ctx_requests: int = 0):
         """
         Common metadata preparation logic for incremental updates.
@@ -4743,10 +4742,6 @@ class PyTorchModelEngine(ModelEngine):
 
         # Prepare speculative metadata
         if spec_metadata is not None:
-            # Set request_accepted_path if Eagle3
-            if isinstance(spec_metadata, Eagle3SpecMetadata):
-                spec_metadata.request_accepted_path = request_accepted_path
-
             spec_metadata.num_tokens = total_num_tokens
             spec_metadata.prepare()
 
@@ -4983,7 +4978,6 @@ class PyTorchModelEngine(ModelEngine):
                                              device='cpu',
                                              pin_memory=prefer_pinned())
 
-        request_accepted_path = {}
         num_extend_dummy_requests = 0
         num_previous_batch = 0
 
@@ -4992,9 +4986,6 @@ class PyTorchModelEngine(ModelEngine):
                               self.attn_backend) and spec_config.is_linear_tree)
 
         for idx, request in enumerate(extend_requests):
-            request_accepted_path[request.py_request_id] = \
-                request.py_num_accepted_draft_tokens_indices
-
             base_past_seen = request.max_beam_num_tokens - 1
 
             if use_extend_ctx:
@@ -5076,7 +5067,6 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             total_num_tokens=virtual_num_tokens,
             num_generation_tokens=num_generation_tokens,
-            request_accepted_path=request_accepted_path,
             num_extend_ctx_requests=num_extend_ctx_requests)
 
         # No padding because there are only generation requests.
@@ -5356,9 +5346,6 @@ class PyTorchModelEngine(ModelEngine):
         cross_encoder_seq_lens: List[int] = [
         ]  # new encoder K/V tokens per decoder sequence
         cross_encoder_cached_tokens_per_seq: List[int] = []
-        # if using tree decoding, we need to store the request type and accepted path for each request,
-        # which will be used to update the hidden_states_read_indices.
-        request_accepted_path = {}  # per request
 
         # Variables for updating the inputs of draft model
         # Base values for gather_ids computation
@@ -5447,9 +5434,6 @@ class PyTorchModelEngine(ModelEngine):
             gather_ids.append(len(input_ids) - 1)
             sequence_lengths.append(len(prompt_tokens))
             num_accepted_draft_tokens.append(len(prompt_tokens) - 1)
-            request_accepted_path[
-                request.
-                py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num -
@@ -5636,9 +5620,6 @@ class PyTorchModelEngine(ModelEngine):
                     padding_gen_slots.append(request.py_seq_slot)
                 request.py_needs_onehot_draft_probs = False  # consume once
             request_ids.append(request.py_request_id)
-            request_accepted_path[
-                request.
-                py_request_id] = request.py_num_accepted_draft_tokens_indices
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
@@ -5770,9 +5751,6 @@ class PyTorchModelEngine(ModelEngine):
                     request.py_num_accepted_draft_tokens)
 
             sequence_lengths.append(1 + self.original_max_draft_len)
-            request_accepted_path[
-                request.
-                py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num -
@@ -6498,8 +6476,6 @@ class PyTorchModelEngine(ModelEngine):
             if context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(
                     context_prompt_lookahead)
-            if isinstance(spec_metadata, Eagle3SpecMetadata):
-                spec_metadata.request_accepted_path = request_accepted_path
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
@@ -7431,9 +7407,7 @@ class PyTorchModelEngine(ModelEngine):
                 sd_max_total = self._spec_dec_max_total_draft_tokens
 
             # Fill slot-ID buffer for update_spec_dec_param
-            if (spec_tree_manager is not None
-                    and spec_tree_manager.use_dynamic_tree
-                    and not self.is_draft_model):
+            if spec_tree_manager is not None and not self.is_draft_model:
                 spec_tree_manager.slot_storage.fill_all_slot_ids(
                     scheduled_requests.context_requests,
                     scheduled_requests.generation_requests,
@@ -7559,7 +7533,6 @@ class PyTorchModelEngine(ModelEngine):
 
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None
-                    and spec_tree_manager.use_dynamic_tree
                     and not self.is_draft_model):
                 spec_tree_manager.slot_storage.fill_all_slot_ids(
                     execution_requests.context_requests,

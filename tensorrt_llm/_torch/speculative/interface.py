@@ -448,7 +448,7 @@ class SpecMetadata:
     max_num_requests: int
     # The number of draft layers. (Also the number of draft tokens for the linear tree.)
     max_draft_len: int
-    # The max number of draft tokens for the static tree and dynamic tree   .
+    # The max number of draft tokens for the dynamic tree.
     max_total_draft_tokens: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
@@ -494,11 +494,9 @@ class SpecMetadata:
     # The number of layers
     num_layers: int = 0
 
-    # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
-    # NOTE: For the linear tree, though it can be treated as a special case of static tree.
-    # NOTE: But we do not set `is_spec_dec_tree` to True for this cases.
-    # NOTE: i.e., for the linear tree, is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
-    # whether the spec-dec mode is a tree (can be static tree or dynamic tree).
+    # whether the spec-dec mode is a tree.
+    # NOTE: The linear tree is not treated as a tree here: for the linear tree,
+    # NOTE: is_spec_dec_tree == False and is_spec_dec_dynamic_tree == False.
     is_spec_dec_tree: bool = False
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False

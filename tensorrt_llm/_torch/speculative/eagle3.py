@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
 import torch.nn.functional as F
@@ -94,15 +94,11 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.is_first_draft = True
         self.spec_tree_manager = None
 
-        if isinstance(config,
-                      EagleDecodingConfig) and (config.eagle_choices is not None
-                                                or config.use_dynamic_tree):
+        if isinstance(config, EagleDecodingConfig) and config.use_dynamic_tree:
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
-                use_dynamic_tree=config.use_dynamic_tree,
                 max_draft_len=self.max_draft_len,
                 max_total_draft_tokens=self.max_total_draft_tokens,
-                eagle_choices=config.eagle_choices,
                 dynamic_tree_max_topK=config.dynamic_tree_max_topK,
             )
 
@@ -174,10 +170,8 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
         )
         self.spec_tree_manager = SpecTreeManager(
             max_num_requests=max_num_requests,
-            use_dynamic_tree=config.use_dynamic_tree,
             max_draft_len=config.max_draft_len,
             max_total_draft_tokens=config.tokens_per_gen_step - 1,
-            eagle_choices=config.eagle_choices,
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
         )
 
@@ -218,12 +212,7 @@ class Eagle3SpecMetadata(SpecMetadata):
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
     is_mtp_eagle: bool = False
 
-    eagle_choices: Optional[List[List[int]]] = None
     max_total_draft_tokens: int = 0
-    # This is to store the request type and accepted path for each request.
-    # For each request, {key: request_ids, value: accepted_path}
-    # 'accepted_path' is a list of accepted tokens indices.
-    request_accepted_path: Optional[Dict[int, List[int]]] = None
 
     def __post_init__(self):
         if self.is_draft_model:
@@ -255,14 +244,9 @@ class Eagle3SpecMetadata(SpecMetadata):
         self.hidden_states_read_indices_host = None
         self.hidden_states_write_indices_host = None
 
-        if self.eagle_choices is not None:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = False
-
     def prepare(self):
         super().prepare()
         is_first_draft = self.eagle3_resource_manager.is_first_draft
-        spec_tree_manager = self.eagle3_resource_manager.spec_tree_manager
         # Update start indices
         # Here, we assume the sequence lengths (seq_lens) during the draft model
         # forward will not exceed those of the target model. So pre-allocate
@@ -284,45 +268,12 @@ class Eagle3SpecMetadata(SpecMetadata):
         for req_id, seq_len in zip(self.request_ids, self.seq_lens):
             slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
             start_idx = self.eagle3_resource_manager.start_indices[slot_id]
-            # 1) target model or (is_first_draft and is_linear_tree)
+            # 1) target model or is_first_draft
             # If this is the first draft or the target model forward, we need to
             # read/write all of the hidden states
-            if not self.is_draft_model or (is_first_draft
-                                           and spec_tree_manager is None):
+            if not self.is_draft_model or is_first_draft:
                 hidden_states_read_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
-                hidden_states_write_indices.extend(
-                    list(range(start_idx, start_idx + seq_len)))
-            # 2）is_first_draft and draft_token_tree
-            # After target model forward, some draft tokens will be accepted.
-            # These draft tokens' hidden states will be used for draft model's first drafter layer.
-            elif is_first_draft and spec_tree_manager is not None:
-                assert req_id in self.request_accepted_path.keys(
-                ), f"Request {req_id} not found in request_accepted_path"
-                # 'node_idx + 1' is because we '-1' in sampler.py for kv cache rewind. Now we add it back.
-                accepted_path = [
-                    node_idx + 1
-                    for node_idx in self.request_accepted_path[req_id]
-                ]
-
-                if accepted_path == []:
-                    # Case 1: This is a context request, We need to read all the hidden states.
-                    # Case 2: This is a generation request, but no accepted tokens are accepted. Actually only the first token's hidden states is needed. The others are just padding tokens.
-                    hidden_states_read_indices.extend(
-                        list(range(start_idx, start_idx + seq_len)))
-                else:
-                    # This is a generation request. And there are draft tokens accepted.
-                    # We only read the accepted tokens' hidden states.
-                    accepted_path = [0] + accepted_path  # add the root node
-                    accepted_path_pad = accepted_path + [0] * (
-                        seq_len - len(accepted_path))
-                    assert len(accepted_path_pad) == seq_len
-                    hidden_states_read_indices.extend([
-                        start_idx + accepted_draft_token_offset
-                        for accepted_draft_token_offset in accepted_path_pad
-                    ])
-
-                # For the write indices, we just write all the hidden states.
                 hidden_states_write_indices.extend(
                     list(range(start_idx, start_idx + seq_len)))
             # otherwise: only read the last token
@@ -396,7 +347,6 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     spec_resource_manager: Optional[Eagle3ResourceManager] = None
     # Dynamic tree flags
     use_dynamic_tree: bool = False
-    eagle_choices: Optional[List[List[int]]] = None
     # Slot IDs for each request; populated in prepare() when spec_resource_manager
     # is present (required for relaxed acceptance, mirrors MTPSpecMetadata.slot_ids).
     slot_ids: Optional[torch.Tensor] = None
@@ -483,15 +433,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         )
 
         # Set tree flags based on config
-        if self.use_dynamic_tree:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = True
-        elif self.eagle_choices is not None:
-            self.is_spec_dec_tree = True
-            self.is_spec_dec_dynamic_tree = False
-        else:
-            self.is_spec_dec_tree = False
-            self.is_spec_dec_dynamic_tree = False
+        self.is_spec_dec_tree = self.use_dynamic_tree
+        self.is_spec_dec_dynamic_tree = self.use_dynamic_tree
 
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture

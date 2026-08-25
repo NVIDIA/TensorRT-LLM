@@ -1946,13 +1946,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[List[List[int]]]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.eagle_choices"
-    },
-    {
-      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
