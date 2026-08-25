@@ -907,20 +907,25 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
 
     kv_slice = transceiver._create_kv_slice(request)
 
-    assert kv_slice.mamba_state_index is None
+    # No mamba layer group → no STATE entries in block_ids
+    assert all(ids.size == 0 for ids in kv_slice.block_ids_per_layer_groups)
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
+    from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {123: 7}
     manager.get_state_indices = MagicMock(
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
+    # Provide a mamba layer group so _create_kv_slice places the slot ID
+    mamba_lg = SimpleNamespace(kind=CacheKind.STATE)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
-    transceiver._page_table = SimpleNamespace(layer_groups=[])
+    transceiver._page_table = SimpleNamespace(layer_groups=[mamba_lg])
     request = SimpleNamespace(
         is_generation_only_request=lambda: False,
         prompt_len=0,
@@ -929,7 +934,8 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
 
     kv_slice = transceiver._create_kv_slice(request)
 
-    assert kv_slice.mamba_state_index == 7
+    # Slot index 7 should be in the STATE group's block_ids
+    assert kv_slice.block_ids_per_layer_groups[0][0] == 7
     manager.get_state_indices.assert_not_called()
 
 

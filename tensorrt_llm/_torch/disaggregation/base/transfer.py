@@ -64,7 +64,6 @@ class KVSlice:
         default_factory=list
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
-    mamba_state_index: Optional[int] = None
 
 
 class SessionStatus(Enum):
