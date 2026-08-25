@@ -54,6 +54,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
+from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .impl_contract import MoECommPlan, MoERunContext
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
@@ -380,11 +381,29 @@ class ExternalCommMoEScheduler(MoEScheduler):
             or moe.comm is not None
             or FORCE_SEPARATED_ROUTING
         )
+        supports_post_quant = moe.comm is None or moe.comm.supports_post_quant_dispatch()
+        used_fused_route_quant = False
         if requires_separated_routing:
-            # Separated routing: ConfigurableMoE calls routing_method
-            token_selected_experts, token_final_scales = moe.routing_method.apply(
-                router_logits, input_ids
-            )
+            if (
+                supports_post_quant
+                and isinstance(moe.backend, TRTLLMGenFusedMoE)
+                and not moe._using_load_balancer()
+                and not moe.apply_router_weight_on_input
+            ):
+                fused_result = moe.backend.try_fused_kimi_route_quant(x, router_logits)
+            else:
+                fused_result = None
+
+            if fused_result is None:
+                # Separated routing: ConfigurableMoE calls routing_method.
+                token_selected_experts, token_final_scales = moe.routing_method.apply(
+                    router_logits, input_ids
+                )
+                if token_final_scales is not None and isinstance(moe.backend, TRTLLMGenFusedMoE):
+                    token_final_scales = token_final_scales.to(torch.bfloat16)
+            else:
+                token_selected_experts, token_final_scales, x, x_sf = fused_result
+                used_fused_route_quant = True
 
             token_selected_experts = token_selected_experts.to(torch.int32)
 
@@ -490,8 +509,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
         if moe.comm is not None:
-            supports_post_quant = moe.comm.supports_post_quant_dispatch()
-
             # Debug: optional dummy AllReduce to break load-balancing artifacts
             if moe.enable_dummy_allreduce:
                 moe.dummy_allreduce()
@@ -504,7 +521,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
             if supports_post_quant:
                 # Quantize -> Dispatch
-                x, x_sf = moe.backend.quantize_input(x)
+                if not used_fused_route_quant:
+                    x, x_sf = moe.backend.quantize_input(x)
 
                 # W4AFP8 + DeepEPLowLatency needs pre_quant_scale_1; other strategies
                 # absorb the kwarg via **kwargs so unconditional passing is safe.
@@ -537,7 +555,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No comm: just quantize
-            x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+            if not used_fused_route_quant:
+                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
@@ -638,7 +657,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
         )
 
         # ========== Empty-chunk substitution (DP only) ==========
-        chunked_used = torch.ones(num_chunks, dtype=torch.bool)
+        # Host-only bookkeeping, so keep it in Python state. A tensor here
+        # costs an allocation per call plus a Tensor.__bool__ dispatch per
+        # chunk read below, on a path that runs once per MoE layer per step.
+        # It is also a latent hazard: the tensor only lands on the host
+        # because no device is requested, and a CUDA one would turn each read
+        # into a device-to-host sync that is illegal under CUDA Graph capture.
+        chunked_used = [True] * num_chunks
         if moe.use_dp:
             # The split heuristic guarantees chunk 0 has >= 1 token, so it can
             # stand in for any empty chunk on this rank. Without substitution,

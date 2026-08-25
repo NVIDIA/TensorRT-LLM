@@ -42,6 +42,8 @@ import textwrap
 import typing
 from dataclasses import fields
 
+import pytest
+
 from tensorrt_llm._torch.attention_backend.fmha.fallback import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
@@ -49,6 +51,9 @@ from tensorrt_llm._torch.attention_backend.fmha.fallback import (
 )
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+
+pytestmark = pytest.mark.cpu_only
+
 
 # Roots used as the LHS of attribute chains at the call site. Match the
 # names inside ``FallbackFmha.forward``.

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,15 +62,6 @@ class TestGpt2Medium(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8(self):
         self.run(quant_algo=QuantAlgo.FP8)
-
-
-class TestStarcoder2_3B(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "bigcode/starcoder2-3b"
-    MODEL_PATH = f"{llm_models_root()}/starcoder2-3b"
-    EXAMPLE_FOLDER = "models/core/gpt"
-
-    def test_auto_dtype(self):
-        self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype='auto')
 
 
 class TestStarcoder2_15B(CliFlowAccuracyTestHarness):
@@ -216,72 +207,6 @@ class TestPhi2(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     def test_tp2(self):
         self.run(tp_size=2)
-
-
-@skip_post_blackwell
-class TestPhi3Mini4kInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-@skip_post_blackwell
-class TestPhi3Mini128kInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3-mini-128k-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-mini-128k-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-@skip_post_blackwell
-class TestPhi3Small8kInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3-small-8k-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-small-8k-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-@skip_post_blackwell
-class TestPhi3Small128kInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3-small-128k-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-small-128k-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-@skip_post_blackwell
-class TestPhi3_5MiniInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3.5-mini-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3.5/Phi-3.5-mini-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-4-mini-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
-
-    @pytest.mark.skip_less_device(2)
-    def test_tp2(self):
-        # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
-        # TODO: update once https://nvbugs/5393849 is fixed.
-        MODEL_NAME = "microsoft/Phi-4-mini-instruct-tp2"
-        self.run(tasks=[MMLU(MODEL_NAME)], tp_size=2)
 
 
 # Long sequence length test:
@@ -619,97 +544,6 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype_tp8(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
-
-
-class TestMistral7B(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mistral-7B-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/mistral-7b-v0.1"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    @skip_pre_blackwell
-    def test_beam_search(self):
-        self.run(extra_acc_spec="beam_width=4",
-                 extra_build_args=["--gemm_plugin=auto", "--max_beam_width=4"],
-                 extra_summarize_args=["--num_beams=4"])
-        import gc
-
-        import torch
-        for num_beams in [1, 2]:
-            gc.collect()
-            torch.cuda.empty_cache()
-            self.extra_acc_spec = f"beam_width={num_beams}"
-            self.extra_summarize_args = [f"--num_beams={num_beams}"]
-            self.evaluate()
-
-
-class TestMixtral8x7B(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mixtral-8x7B-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/Mixtral-8x7B-v0.1"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_tp2(self):
-        self.run(dtype='auto', tp_size=2)
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_fp8_tp2(self):
-        self.run(quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2)
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(40000)
-    def test_fp8_tp2pp2(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 pp_size=2)
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(40000)
-    def test_fp8_tp2pp2_manage_weights(self):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 kv_cache_quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 pp_size=2,
-                 extra_build_args=["--fast_build"])
-
-    @skip_pre_blackwell
-    def test_nvfp4_prequantized(self, mocker):
-        mocker.patch.object(
-            self.__class__, "MODEL_PATH",
-            f"{llm_models_root()}/nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1")
-        self.run(tasks=[MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.NVFP4,
-                 kv_cache_quant_algo=QuantAlgo.FP8)
-
-
-class TestMixtral8x22B(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "mistralai/Mixtral-8x22B-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/Mixtral-8x22B-v0.1"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-    @skip_pre_ada
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_fp8_tp2pp2(self, timeout_manager):
-        self.run(tasks=[CnnDailymail(self.MODEL_NAME),
-                        MMLU(self.MODEL_NAME)],
-                 quant_algo=QuantAlgo.FP8,
-                 tp_size=2,
-                 pp_size=2,
-                 extra_convert_args=["--calib_size=32"],
-                 extra_build_args=["--gemm_plugin=auto"],
-                 timeout_manager=timeout_manager)
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Native TRTLLM-Gen SiTU MoE dispatch for the in-tree Kimi K3 sparse MoE block.
+"""Test-only native SiTU dispatch for the Kimi K3 sparse MoE reference.
 
 The K3 MoE block has two mutually exclusive kernel paths:
 
@@ -127,7 +127,7 @@ def pack_routed_expert_weights(
     """Pad + shuffle checkpoint MXFP4 expert weights into the TRTLLM-Gen layout.
 
     Inputs are the per-expert MXFP4 tensors as stored by
-    :class:`KimiK3RoutedExpertBank` (HF layout, group_size=32):
+    the test reference's routed expert bank (HF layout, group_size=32):
 
     * ``w1_packed``/``w3_packed``: ``uint8 [E, I, H // 2]`` (w1 = gate, w3 = up)
     * ``w1_scales``/``w3_scales``: ``uint8 [E, I, H // 32]`` (E8M0 biased exponents)

@@ -34,6 +34,9 @@ import importlib
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
+
 # Each entry is (module_path, symbol_name).  The test ID shows both.
 DYNAMO_IMPORTS = [
     # -- top-level --

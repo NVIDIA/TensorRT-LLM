@@ -18,6 +18,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
@@ -28,6 +29,8 @@ from mpi4py import MPI
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
 from tensorrt_llm._utils import (get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm,
                                  torch_dtype_to_binding)
@@ -35,8 +38,6 @@ from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1)
@@ -48,7 +49,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
                        nvtx_range)
 from ...logger import logger
-from ...mapping import CpType, Mapping
+from ...mapping import Mapping
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
@@ -208,6 +210,10 @@ def get_pp_layers(
 
 
 def request_context(is_draft: bool, scheduled_requests: ScheduledRequests):
+    # The non-draft scope has nothing to do, and this runs on the executor's
+    # per-iteration path, so return before executing the class statement below.
+    if not is_draft:
+        return nullcontext()
 
     class RequestContext:
 
@@ -347,6 +353,11 @@ class KVCacheManager(BaseResourceManager):
             self.indexer_k_cache_local_layer_mask = None
 
         self.kv_connector_manager = kv_connector_manager
+        # Dummy requests can reserve their V1 sequence before they enter the
+        # normal context prepare path. Track that ownership per manager so the
+        # same sequence is not registered twice, while a separate draft or
+        # cross-cache manager can still prepare its own copy.
+        self._preprepared_dummy_request_ids: set[int] = set()
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -456,8 +467,7 @@ class KVCacheManager(BaseResourceManager):
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
-            w > 0 for w in self.max_attention_window_vec)
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
@@ -972,9 +982,11 @@ class KVCacheManager(BaseResourceManager):
             # its budget is handled separately.
             self.fit_token_budget(scheduled_batch)
 
-    def _context_seq_len(self, req: LlmRequest, is_cross: bool,
-                         is_star_cp: bool) -> Optional[int]:
+    def _context_seq_len(self, req: LlmRequest,
+                         is_cross: bool) -> Optional[int]:
         """Return the sequence length to pass to add_sequence_batch, or None to skip this request."""
+        if req.py_request_id in self._preprepared_dummy_request_ids:
+            return None
         if is_cross:
             if (getattr(req, "py_skip_cross_kv_projection", False)
                     or not req.is_first_context_chunk
@@ -986,12 +998,6 @@ class KVCacheManager(BaseResourceManager):
                     "Cross KV cache allocation requires "
                     f"encoder_output_len for request {req.py_request_id}.")
             return int(encoder_output_len)
-        if is_star_cp:
-            if req.ctx_iters != 0:
-                return None
-            seq_len = sum(len(ctx_block) for ctx_block in req.ctx_blocks)
-            return seq_len + (len(req.query_id) if self.mapping.cp_rank
-                              == self.mapping.cp_size - 1 else 0)
         if not req.is_first_context_chunk or not self._kv_connector_should_add_sequence(
                 req):
             return None
@@ -1003,8 +1009,6 @@ class KVCacheManager(BaseResourceManager):
         if self.kv_cache_type == CacheTypeCpp.CROSS:
             return self._prepare_cross_resources(scheduled_batch)
 
-        is_star_cp = ('cp_type' in self.mapping.cp_config
-                      and CpType.STAR == self.mapping.cp_config['cp_type'])
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
@@ -1014,7 +1018,7 @@ class KVCacheManager(BaseResourceManager):
             # claim-then-onboard strategy that prevents host offloading from
             # evicting reusable blocks in the radix tree.
             batch_request_infos, batch_llm_requests = self._collect_context_sequences(
-                scheduled_batch, is_cross=False, is_star_cp=is_star_cp)
+                scheduled_batch, is_cross=False)
 
             if batch_request_infos:
                 self.impl.add_sequence_batch(batch_request_infos,
@@ -1073,7 +1077,7 @@ class KVCacheManager(BaseResourceManager):
                 scheduled_batch, self)
 
     def _collect_context_sequences(self, scheduled_batch: ScheduledRequests,
-                                   is_cross: bool, is_star_cp: bool):
+                                   is_cross: bool):
         """Build the (request_info, llm_request) lists for add_sequence_batch.
 
         Cross (encoder) sequences are sized from encoder_output_len with a beam
@@ -1083,7 +1087,7 @@ class KVCacheManager(BaseResourceManager):
         batch_request_infos = []
         batch_llm_requests = []
         for req in scheduled_batch.context_requests:
-            seq_len = self._context_seq_len(req, is_cross, is_star_cp)
+            seq_len = self._context_seq_len(req, is_cross)
             if seq_len is None:
                 continue
             beam_width = 1 if is_cross else req.py_beam_width
@@ -1103,7 +1107,7 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
             batch_request_infos, batch_llm_requests = self._collect_context_sequences(
-                scheduled_batch, is_cross=True, is_star_cp=False)
+                scheduled_batch, is_cross=True)
             if batch_request_infos:
                 self.impl.add_sequence_batch(batch_request_infos,
                                              batch_llm_requests)
@@ -1283,6 +1287,14 @@ class KVCacheManager(BaseResourceManager):
                 raise cleanup_error
             raise
 
+        if batch_request_infos:
+            self._preprepared_dummy_request_ids.update(
+                req_id for req_id, _, _ in batch_request_infos)
+        if (draft_batch_request_infos
+                and isinstance(draft_kv_cache_manager, KVCacheManager)):
+            draft_kv_cache_manager._preprepared_dummy_request_ids.update(
+                req_id for req_id, _, _ in draft_batch_request_infos)
+
         return requests
 
     def update_resources(self,
@@ -1333,8 +1345,10 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        return self.impl.remove_sequence(request.py_request_id, request,
-                                         pin_on_release)
+        result = self.impl.remove_sequence(request.py_request_id, request,
+                                           pin_on_release)
+        self._preprepared_dummy_request_ids.discard(request.py_request_id)
+        return result
 
     def store_blocks_for_reuse(self,
                                request: LlmRequest,

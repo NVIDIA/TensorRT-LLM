@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for the base multimodal input-processor mixins.
 
 A concrete multimodal input processor inherits both
@@ -14,12 +17,11 @@ Token-counting (`BaseMultimodalInputProcessor`):
 
 Dummy contract (`BaseMultimodalDummyInputsBuilder`):
 
-* Defaults — the modality-agnostic profiler hooks
-  ``get_mm_max_tokens_per_item`` (returns ``{}``) and
-  ``get_dummy_mm_data_for_tokens`` (raises ``NotImplementedError``) mean
-  "no direct encoder profiling" (text-only dummy fallback) until a subclass
-  opts in. Modality-specific helpers (vision's ``get_size_for_max_tokens`` /
-  ``get_dummy_mm_data_for_size``) live on the concrete processor.
+* Defaults — ``get_mm_max_tokens_per_item`` returns ``{}`` and
+  ``get_dummy_mm_data`` raises ``NotImplementedError``. Together they mean
+  "no multimodal profiling" until a concrete processor opts in.
+* The profiler selects the workload; a concrete processor receives the
+  resulting per-modality counts and materializes the processed tensors.
 """
 
 from types import SimpleNamespace
@@ -123,7 +125,7 @@ def test_get_mm_max_tokens_per_item_default_empty():
     assert _StubBuilder().get_mm_max_tokens_per_item() == {}
 
 
-def test_get_dummy_mm_data_for_tokens_default_raises_not_implemented():
+def test_get_dummy_mm_data_default_raises_not_implemented():
     builder = _StubBuilder()
     with pytest.raises(NotImplementedError):
-        builder.get_dummy_mm_data_for_tokens(max_tokens_per_modality={"image": 1024})
+        builder.get_dummy_mm_data(max_num_encoder_tokens=1024, mm_counts={"image": 4})

@@ -106,12 +106,6 @@
   "examples/llm-api/llm_sparse_attention.py": {
     "D212": 1
   },
-  "examples/llm-api/star_attention.py": {
-    "D210": 1,
-    "D300": 1,
-    "D403": 1,
-    "D415": 1
-  },
   "examples/longbench/eval_longbench_v1.py": {
     "D202": 1,
     "D212": 1,
@@ -343,7 +337,7 @@
     "D212": 1,
     "E722": 1
   },
-  "tensorrt_llm/executor/ray_executor.py": {
+  "tensorrt_llm/executor/ray/executor.py": {
     "D205": 1,
     "D212": 2,
     "E712": 1

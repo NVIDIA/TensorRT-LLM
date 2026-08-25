@@ -174,7 +174,9 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
-                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202505221445_docker_dind_withbash
+                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202608172149_docker_dind_mtu_helper
+                    command: ['/usr/local/bin/dind-mtu']
+                    args: ['start']
                     tty: true
                     resources:
                       requests:
@@ -331,6 +333,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
 
     // Step 2: Build the images
     stage ("Install Package") {
+        sh(label: "Validate Docker bridge MTU", script: "/usr/local/bin/dind-mtu validate")
         sh "pwd && ls -alh"
         sh "env | sort"
         sh "apk add make git"
@@ -846,7 +849,7 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                            def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
+                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {
                                 echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
@@ -856,17 +859,20 @@ pipeline {
                                 trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
                             }
                             def nspect_env = params.nspect_env ? params.nspect_env : "prod"
-                            def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                            def nspectReleaseVersion = params.program_version_name ?: "PostMerge"
                             def cmd = """./nspect/nspect.py \
                                 --env ${nspect_env} \
                                 --nspect_id ${params.nspect_id} \
-                                --program_version_name '${program_version_name}' \
+                                --program_version_name '${nspectReleaseVersion}' \
                                 """
                             if (params.register_images) {
-                                cmd += "--register "
+                                cmd += "--add_version "
                             }
                             if (params.osrb_ticket) {
                                 cmd += "--osrb_ticket ${params.osrb_ticket} "
+                            }
+                            if (params.export_compliance_bug) {
+                                cmd += "--export_compliance_bug '${params.export_compliance_bug}' "
                             }
                             if (params.wait_success_seconds) {
                                 cmd += "--check_launch_api "
@@ -874,7 +880,10 @@ pipeline {
                             }
                             cmd += "--image "
                             cmd += imageKeyToTag.values().join(" ")
-                            withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                            withCredentials([
+                                usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET'),
+                                usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')
+                            ]) {
                                 trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
                             }
                         }

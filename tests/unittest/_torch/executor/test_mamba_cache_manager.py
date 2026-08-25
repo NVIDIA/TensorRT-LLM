@@ -313,23 +313,82 @@ def test_kimi_explicit_v2_manager_geometry(monkeypatch: pytest.MonkeyPatch) -> N
     assert kwargs["layer_mask"] == [False, True, False, True]
     assert kwargs["num_kv_heads"] == 1
     assert kwargs["head_dim"] == 40
+    assert kwargs["max_num_tokens"] == 256
     assert "kda_replay_num_spec" not in kwargs
 
 
-@pytest.mark.xfail(
-    reason="The Kimi route in _create_kv_cache_manager passes "
-    "model_type='qwen3_next' unconditionally; MambaHybridCacheManagerV2 "
-    "swallows it via **kwargs and falls back to the 'x_b_c' "
-    "conv_state_layout instead of the KDA [q|k|v] sectioning. Runtime-side "
-    "layout selection is a follow-up (TRTLLM-14813).",
-    strict=True,
-)
 def test_kimi_explicit_v2_manager_uses_qkv_convolution_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """TRTLLM-15216: MambaHybridCacheManagerV2 takes the KDA conv-state
+    sectioning by `conv_state_layout`, not by `model_type`. Passing
+    `model_type` instead is silently swallowed by **kwargs and leaves the
+    default 'x_b_c' layout, i.e. a wrong KDA conv state with no error."""
     _, kwargs = _capture_kimi_v2_manager_ctor(monkeypatch)
     assert kwargs["conv_state_layout"] == "q_k_v"
     assert "model_type" not in kwargs
+
+
+def test_kimi_v1_manager_still_selects_qwen3_next_model_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The V1 managers have no `conv_state_layout` parameter; they must keep
+    getting `model_type='qwen3_next'` (TRTLLM-15216 regression guard)."""
+    captured: dict[str, object] = {}
+
+    class RecordingV1Manager(CppMambaHybridCacheManager):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["kwargs"] = kwargs
+
+    model_config = _kimi_model_config()
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingV1Manager,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=64,
+        max_seq_len=2048,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+    kwargs = captured["kwargs"]
+    assert kwargs["model_type"] == "qwen3_next"
+    assert "conv_state_layout" not in kwargs
+
+
+def test_v2_manager_rejects_model_type_kwarg() -> None:
+    """MambaHybridCacheManagerV2 must fail loudly when handed the V1 managers'
+    `model_type` instead of `conv_state_layout` — silently absorbing it into
+    **kwargs is how the TRTLLM-15216 wrong-layout bug went unnoticed."""
+    with pytest.raises(TypeError, match="conv_state_layout"):
+        MambaHybridCacheManagerV2(
+            16,  # mamba_d_state
+            4,  # mamba_d_conv
+            8,  # mamba_num_heads
+            1,  # mamba_n_groups
+            16,  # mamba_head_dim
+            2,  # mamba_num_layers
+            [True, True],  # mamba_layer_mask
+            torch.float16,
+            torch.float16,
+            KvCacheConfig(),
+            CacheTypeCpp.SELF,
+            num_layers=0,
+            num_kv_heads=1,
+            head_dim=16,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+            model_type="qwen3_next",
+        )
 
 
 @pytest.mark.parametrize(
@@ -444,9 +503,12 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
 
     assert captured_cpp["use_replay_state_update"] is True
     assert captured_cpp["model_type"] == "qwen3_next"
+    assert captured_cpp["max_num_tokens"] == 256
     assert captured_mixed["use_replay_state_update"] is False
     assert captured_mixed["model_type"] == "qwen3_next"
+    assert captured_mixed["max_num_tokens"] == 256
     assert captured_v2["use_replay_state_update"] is True
+    assert captured_v2["max_num_tokens"] == 256
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
     fallback_logs = [str(call.args[0]) for call in info_log.call_args_list]
@@ -768,6 +830,64 @@ def test_kimi_without_v2_preference_uses_mixed_manager(
     assert llm_args.kv_cache_config.tokens_per_block == 64
     assert (
         get_kv_cache_manager_cls(_kimi_model_config(), llm_args.kv_cache_config)
+        is MixedMambaHybridCacheManager
+    )
+
+
+def test_kimi_preferred_transceiver_runtime() -> None:
+    """K3 must resolve transceiver_runtime='auto' to the Python transceiver:
+    only KvCacheTransceiverV2 can move the KDA recurrent state."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+
+    assert KimiLinearForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
+
+
+@pytest.mark.parametrize(
+    "cache_transceiver_config",
+    [
+        None,
+        CacheTransceiverConfig(backend="NIXL"),  # runtime left at 'auto'
+        CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP"),
+        CacheTransceiverConfig(backend="UCX", transceiver_runtime="CPP"),
+        CacheTransceiverConfig(backend="UCX", transceiver_runtime="PYTHON"),
+    ],
+    ids=["no_config", "auto_unresolved", "explicit_cpp", "ucx_cpp", "ucx_python"],
+)
+def test_kimi_disagg_rejects_non_python_transceiver_route(
+    monkeypatch: pytest.MonkeyPatch, cache_transceiver_config
+) -> None:
+    """Any K3 disagg route that does not reach the Python NIXL transceiver
+    must fail loudly instead of returning a manager the C++ transceiver
+    would drive without KDA state transfer (silent wrong results). The
+    'auto_unresolved' case covers paths that skip model-default resolution
+    (e.g. AutoDeploy), where 'auto' falls back to the C++ runtime."""
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    with pytest.raises(ValueError, match="Kimi K3 disaggregated serving requires"):
+        get_kv_cache_manager_cls(
+            _kimi_model_config(),
+            KvCacheConfig(enable_block_reuse=False),
+            is_disagg=True,
+            cache_transceiver_config=cache_transceiver_config,
+        )
+
+
+def test_kimi_disagg_python_nixl_routes_to_mixed_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    assert (
+        get_kv_cache_manager_cls(
+            _kimi_model_config(),
+            KvCacheConfig(enable_block_reuse=False),
+            is_disagg=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"
+            ),
+        )
         is MixedMambaHybridCacheManager
     )
 
@@ -1643,6 +1763,7 @@ def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
 
 def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
@@ -1672,6 +1793,7 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._has_cp_helix = False
     mgr.max_batch_size = 2
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.local_num_mamba_layers = 1
@@ -1870,6 +1992,7 @@ def test_expect_snapshot_points_binding_round_trip():
 def test_v2_hybrid_pool_ratio_controls_allocated_memory():
     def allocated_memory(pool_ratio):
         mgr = object.__new__(MambaHybridCacheManagerV2)
+        mgr._has_cp_helix = False
         mgr.kv_cache_type = CacheTypeCpp.SELF
         mgr.head_dim_per_layer = [64, 64]
         mgr.pp_layers = [0, 1]
@@ -3328,6 +3451,7 @@ def _build_zero_mamba_hybrid(
         head_dim=64,
         tokens_per_block=32,
         max_seq_len=128,
+        max_num_tokens=96,
         max_batch_size=2,
         mapping=mapping,
         spec_config=None,
@@ -3360,6 +3484,7 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     # On the early-exit branch, num_layers is forwarded as-is.
     assert mgr.num_layers == 4
     assert mgr.num_local_layers == 2
+    assert mgr.max_num_tokens == 96
     assert all(
         config.window_size != LinearCacheType.RECURRENT_STATES.value
         for config in mgr.pool_configurations

@@ -49,6 +49,7 @@ __all__ = [
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
     "KimiK25ForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
     "KimiLinearForCausalLM",
     "LagunaForCausalLM",
     "LlamaForCausalLM",

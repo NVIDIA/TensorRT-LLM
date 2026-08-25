@@ -145,6 +145,10 @@ deepseek-ai/DeepSeek-V4-Flash:
   #   95.11 reference still holds for the hypothesis test.
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 95.11
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 95.11
 deepseek-ai/DeepSeek-V4-Flash-Base:
   # Base (pretrained, non-instruct) checkpoint, so GSM8K lands well below the
   # instruct DeepSeek-V4-Flash above. GSM8K measurements from
@@ -254,6 +258,10 @@ Qwen/Qwen3.6-35B-A3B:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 95.0
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DFlash
+    accuracy: 95.0
 Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
@@ -282,11 +290,6 @@ nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 92.42
-nvidia/Nemotron-H-8B-Base-8K:
-  - accuracy: 46.20
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 85.78
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8
@@ -331,18 +334,6 @@ mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 89.23
-microsoft/Phi-4-multimodal-instruct:
-  - accuracy: 81.19
-  - quant_algo: FP8
-    accuracy: 80.82
-  - quant_algo: NVFP4
-    accuracy: 69.33
-microsoft/Phi-4-multimodal-instruct-long-rope:
-  - accuracy: 75.85
-microsoft/Phi-4-mini-instruct:
-  - accuracy: 82.30
-mistralai/Codestral-22B-v0.1:
-  - accuracy: 67.10
 openai/gpt-oss-120b:
   - accuracy: 90.3
 openai/gpt-oss-20b:
@@ -409,8 +400,6 @@ GPT-OSS/20B-NVFP4:
     accuracy: 85.0
 ByteDance-Seed/Seed-OSS-36B-Instruct:
   - accuracy: 90.8
-bigcode/starcoder2-3b:
-  - accuracy: 20.2
 bigcode/starcoder2-7b:
   - accuracy: 26.5
 bigcode/starcoder2-15b:
@@ -526,22 +515,3 @@ zai-org/GLM-5.2:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 90
-# Step-3.7-Flash text decoder (MoE) GSM8K, full 1319-sample split, TP4/EP4 with
-# TRTLLM attention + MoE backends. FP8 measured on the FP8 block-scale
-# checkpoint; NVFP4 measured on the modelopt NVFP4 export (FP8 KV cache). MTP
-# (mtp_nextn=3) is lossless for both FP8 and NVFP4 and reuses the non-spec
-# baseline accuracy.
-stepfun-ai/Step-3.7-Flash:
-  - accuracy: 88
-  - quant_algo: FP8_BLOCK_SCALES
-    accuracy: 88
-  - quant_algo: FP8_BLOCK_SCALES
-    spec_dec_algo: MTP
-    accuracy: 88
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    accuracy: 88
-  - quant_algo: NVFP4
-    kv_cache_quant_algo: FP8
-    spec_dec_algo: MTP
-    accuracy: 88

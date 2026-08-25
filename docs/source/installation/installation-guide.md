@@ -45,7 +45,7 @@ driver version. For additional information, refer to the [CUDA Forward Compatibi
 
 ```bash
 # By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
-pip3 install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+pip3 install torch==2.12.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
 sudo apt-get -y install libopenmpi-dev
 
@@ -68,7 +68,8 @@ Before installing the latest version, uninstall any previous CUTLASS DSL install
 [CUTLASS DSL installation guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html#installation):
 
 ```bash
-pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13
+pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+    nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13
 ```
 
 ```bash

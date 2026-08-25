@@ -26,13 +26,19 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_nvfp4_marlin_supported_sm
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, is_gated_activation, relu2
 from .fused_moe_cutlass import CutlassFusedMoE
-from .impl_contract import MoERunContext, MoEStaticCapability
-from .interface import _warn_and_return
+from .impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEProblem,
+    MoERejectReason,
+    MoERunContext,
+    MoEStaticCapability,
+)
+from .interface import _reject
 from .quantization import NVFP4MarlinFusedMoEMethod
 
 # Block size for moe_align_block_size — must match TILE_M in the kernel
@@ -69,33 +75,43 @@ class MarlinFusedMoE(CutlassFusedMoE):
     }
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        sm_version = get_sm_version()
-
-        if quant_algo not in cls._QUANT_SUPPORT_TABLE:
-            return _warn_and_return(
-                f"MarlinFusedMoE only supports NVFP4 or W4A16_NVFP4 (got quant_algo={quant_algo})"
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        if p.quant_algo not in cls._QUANT_SUPPORT_TABLE:
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
+                f"MarlinFusedMoE only supports NVFP4 or W4A16_NVFP4 "
+                f"(got quant_algo={p.quant_algo})",
             )
 
-        if not is_nvfp4_marlin_supported_sm(sm_version):
-            return _warn_and_return(
-                f"MarlinFusedMoE only supports SM89-SM99 (Ada/Hopper), got SM{sm_version}"
+        if not is_nvfp4_marlin_supported_sm(d.env.sm):
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
+                f"MarlinFusedMoE only supports SM89-SM99 (Ada/Hopper), got SM{d.env.sm}",
             )
 
-        if swiglu_gptoss_style:
-            return _warn_and_return("MarlinFusedMoE does not support swiglu_gptoss_style")
-
-        if dtype_activation != torch.bfloat16:
-            return _warn_and_return(
-                f"MarlinFusedMoE W4A16 requires bfloat16 activations, got {dtype_activation}"
+        if p.swiglu_gptoss_style:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "MarlinFusedMoE does not support swiglu_gptoss_style",
             )
 
-        return True, None
+        if p.dtype_act != torch.bfloat16:
+            return _reject(
+                MoERejectReason.DTYPE_UNSUPPORTED,
+                f"MarlinFusedMoE W4A16 requires bfloat16 activations, got {p.dtype_act}",
+            )
+
+        # Sorted-token dispatch has no EPLB slot layout, so a layer that
+        # registered a load balancer cannot run here. Answered from ``d``
+        # rather than from ``self._supports_load_balancer()``, which could
+        # only be consulted after the object existed.
+        if d.eplb_enabled:
+            return _reject(
+                MoERejectReason.EPLB_UNSUPPORTED,
+                "MarlinFusedMoE has no EPLB slot layout",
+            )
+
+        return MoEEligibility.ok()
 
     def quantize_input(
         self, x: torch.Tensor | Fp4QuantizedTensor, post_quant_comm: bool = True, **kwargs

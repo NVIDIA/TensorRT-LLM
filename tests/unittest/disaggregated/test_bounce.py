@@ -221,48 +221,65 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
 
 
 # --------------------------------------------------------------------------- #
-# fan-in safety gate — equal total//num_writers split only for uniform TP-by-head
+# fan-in safety gate — equal total//num_writers split only for uniform writers
 # --------------------------------------------------------------------------- #
-def test_fanin_bounce_safe_gate():
+def test_fanin_bounce_safe_gate() -> None:
     """Restrict multi-writer equal-split bounce to uniform TP-by-head.
 
-    PP (overlap_pp_size>1 -> unequal per-writer sizes) and duplicate_head_factor>1
-    (MLA / duplicate TP heads -> some ranks don't send KV yet count in
-    expected_transfers) must fall back to the per-fragment path.
+    Uneven PP splits and duplicate_head_factor>1 (MLA / duplicate TP heads ->
+    some ranks don't send KV yet count in expected_transfers) must fall back to
+    the per-fragment path.
     """
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup, pp, ranks=(0,)):
+    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
         return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
 
-    def ri(lpp, page_table=None):
+    def ri(lpp: list[int], page_table: SimpleNamespace | None = None) -> SimpleNamespace:
         return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
 
-    def pt(mapper_kind):
+    def pt(mapper_kind: MapperKind) -> SimpleNamespace:
         view = SimpleNamespace(mapper_kind=mapper_kind)
         return SimpleNamespace(layer_groups=[SimpleNamespace(pool_views=[view])])
 
     # single PP stage (overlap_pp_size <= 1): only duplicate_head_factor matters
-    assert safe(ov(1, 1), ri([24])) is True
-    assert safe(ov(1, 0), ri([24])) is True
-    assert safe(ov(2, 1), ri([24])) is False  # duplicate heads / MLA -> some don't send
+    assert safe(ov(1, 1), ri([24]), None) is True
+    assert safe(ov(1, 0), ri([24]), None) is True
+    assert safe(ov(2, 1), ri([24]), None) is False  # duplicate heads / MLA -> some don't send
     # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
-    assert safe(ov(1, 4), ri([20, 20, 20, 20])) is True
+    assert safe(ov(1, 4), ri([20, 20, 20, 20]), None) is True
     # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
-    assert safe(ov(1, 4), ri([20, 20, 20, 19])) is False
+    assert safe(ov(1, 4), ri([20, 20, 20, 19]), None) is False
     # incomplete per-stage info (single element for a multi-stage fan-in) -> conservative fall back
-    assert safe(ov(1, 4), ri([20])) is False
+    assert safe(ov(1, 4), ri([20]), None) is False
     # duplicate heads blocks even an otherwise-even PP split
-    assert safe(ov(2, 4), ri([20, 20, 20, 20])) is False
+    assert safe(ov(2, 4), ri([20, 20, 20, 20]), None) is False
     # replicated views (one elected sender per destination) make multi-writer
     # contributions unequal -> fall back; single-writer overlap stays safe,
-    # and sharded-only view schemes are unaffected
-    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED))) is False
-    assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED))) is True
-    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.NHD))) is True
+    # and sharded-only view schemes are unaffected. Both page tables must be
+    # checked because the representative peer rank may be a fully masked PP
+    # stage while another sender stage owns the replicated rows.
+    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED)), None) is False
+    assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED)), None) is True
+    assert (
+        safe(
+            ov(1, 1, ranks=(0, 1)),
+            ri([24], pt(MapperKind.NHD)),
+            pt(MapperKind.REPLICATED),
+        )
+        is False
+    )
+    assert (
+        safe(
+            ov(1, 1, ranks=(0, 1)),
+            ri([24], pt(MapperKind.NHD)),
+            pt(MapperKind.NHD),
+        )
+        is True
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +386,33 @@ def _recv_req(block_counts, rid=1, slice_id=0):
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
 class TestFanInReserve:
+    def test_block_bytes_include_distinct_physical_pools_once(self) -> None:
+        entries = np.array([], dtype=BUFFER_ENTRY_DTYPE)
+        page_table = KVCachePageTable(
+            tokens_per_block=32,
+            layer_groups=[
+                AttentionLayerGroup(
+                    pool_group_idx=0,
+                    local_layers=[LocalLayer(local_layer_id=0, global_layer_id=0)],
+                    pool_views=[
+                        PoolView(pool_idx=0, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                        PoolView(pool_idx=1, buffer_entries=entries),
+                    ],
+                )
+            ],
+            pool_groups=[
+                PhysicalPoolGroup(
+                    pools=[
+                        PhysicalPool(base_address=0x200000, slot_bytes=100, num_slots=8),
+                        PhysicalPool(base_address=0x300000, slot_bytes=25, num_slots=8),
+                    ]
+                )
+            ],
+        )
+
+        assert btr.block_bytes_per_group(page_table) == [125]
+
     def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])  # total = 2 * 100 = 200
@@ -663,9 +707,12 @@ def _k3_page_table() -> KVCachePageTable:
     )
 
 
-def _k3_rank_info():
-    # MambaPolicy only reads tp_size / tp_rank / attention.enable_attention_dp.
-    return SimpleNamespace(tp_size=1, tp_rank=0, attention=None)
+def _k3_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0):
+    # MambaPolicy reads tp_size / tp_rank / cp_size / cp_rank /
+    # attention.enable_attention_dp.
+    return SimpleNamespace(
+        tp_size=tp_size, tp_rank=tp_rank, cp_size=cp_size, cp_rank=cp_rank, attention=None
+    )
 
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
@@ -752,6 +799,81 @@ class TestHybridK3Bounce:
             )
             == 0
         )
+
+
+# --------------------------------------------------------------------------- #
+# MambaPolicy under decode-CP (helix): shard grid, pairing, receiver sizing
+# --------------------------------------------------------------------------- #
+class TestMambaHelixCP:
+    def test_mamba_tp_helix_grid_is_cp_minor(self):
+        # cp == 1 keeps the plain TP grid; cp > 1 flattens tp*cp CP-minor.
+        assert MambaPolicy._mamba_tp(_k3_rank_info()) == (1, 0)
+        assert MambaPolicy._mamba_tp(_k3_rank_info(cp_size=32, cp_rank=5)) == (32, 5)
+        assert MambaPolicy._mamba_tp(_k3_rank_info(tp_size=2, tp_rank=1, cp_size=4, cp_rank=3)) == (
+            8,
+            7,
+        )
+
+    def test_equal_width_unpaired_sender_sends_nothing(self):
+        # Regression lock for the fan-in collapse: with equal shard widths the
+        # mapper is a whole-slot copy, so an unpaired sender must return empty
+        # frags instead of overwriting the receiver slot with the wrong heads.
+        pt = _k3_page_table()
+        for sender_rank in range(2):
+            for gen_cp_rank in range(2):
+                frags = MambaPolicy.collect_frags(
+                    self_page_table=pt,
+                    peer_page_table=pt,
+                    src_slot=5,
+                    dst_slot=3,
+                    self_ri=_k3_rank_info(tp_size=2, tp_rank=sender_rank),
+                    peer_ri=_k3_rank_info(cp_size=2, cp_rank=gen_cp_rank),
+                )
+                if sender_rank == gen_cp_rank:
+                    assert sum(frags[2]) == _K3_KDA_PAYLOAD_BYTES
+                else:
+                    assert frags == ([], [], [])
+
+    def test_narrow_to_wide_pairing_follows_covering_tree(self):
+        # Sender grid 2, receiver grid 4: receiver g pairs with sender g // 2.
+        pt = _k3_page_table()
+        for sender_rank in range(2):
+            for gen_cp_rank in range(4):
+                frags = MambaPolicy.collect_frags(
+                    self_page_table=pt,
+                    peer_page_table=pt,
+                    src_slot=5,
+                    dst_slot=3,
+                    self_ri=_k3_rank_info(tp_size=2, tp_rank=sender_rank),
+                    peer_ri=_k3_rank_info(cp_size=4, cp_rank=gen_cp_rank),
+                )
+                if gen_cp_rank // 2 == sender_rank:
+                    assert frags[2], (sender_rank, gen_cp_rank)
+                else:
+                    assert frags == ([], [], [])
+
+    def test_receiver_payload_bytes_is_receiver_local(self):
+        # The reservation must equal the receiver's own slot bytes over the
+        # overlapping layers, with no dependency on sender rank identity.
+        pt = _k3_page_table()
+        assert MambaPolicy.receiver_payload_bytes(pt, pt, dst_slot=3) == _K3_KDA_PAYLOAD_BYTES
+        assert MambaPolicy.receiver_payload_bytes(pt, pt, dst_slot=None) == 0
+        pure_attn = KVCachePageTable(
+            tokens_per_block=32,
+            layer_groups=[pt.layer_groups[0]],
+            pool_groups=pt.pool_groups,
+        )
+        assert MambaPolicy.receiver_payload_bytes(pure_attn, pt, dst_slot=3) == 0
+        # ... and matches what the paired equal-width sender actually ships.
+        _, _, sizes = MambaPolicy.collect_frags(
+            self_page_table=pt,
+            peer_page_table=pt,
+            src_slot=5,
+            dst_slot=3,
+            self_ri=_k3_rank_info(tp_size=2, tp_rank=1),
+            peer_ri=_k3_rank_info(cp_size=2, cp_rank=1),
+        )
+        assert sum(sizes) == MambaPolicy.receiver_payload_bytes(pt, pt, dst_slot=3)
 
 
 # --------------------------------------------------------------------------- #

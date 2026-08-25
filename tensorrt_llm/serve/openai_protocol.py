@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
@@ -32,7 +47,7 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (BaseModel, ConfigDict, Field, PositiveInt,
+from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
                       field_validator, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
@@ -49,6 +64,25 @@ from tensorrt_llm.scheduling_params import AgentHierarchy
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
+
+# Beam-search stopping mode as exposed over HTTP, mirroring the HuggingFace
+# Transformers interface. The engine encodes it as an integer, but that encoding
+# is an implementation detail and is kept out of the public schema.
+EarlyStopping: TypeAlias = Union[bool, Literal["never"]]
+
+
+def _early_stopping_to_int(value: Optional[EarlyStopping]) -> Optional[int]:
+    """Translate the HF-style tri-state into the engine's integer encoding.
+
+    Mirrors ``BeamSearchEarlyStop``: ``False`` -> 0, ``True`` -> 1,
+    ``"never"`` -> 2. ``None`` stays unset so the engine picks its default.
+    """
+    if value is None:
+        return None
+    if value == "never":
+        return 2
+    # NB: bool is a subclass of int, so this yields 1/0 for True/False.
+    return int(value)
 
 
 def ensure_request_chat_template_allowed(request: Any,
@@ -203,7 +237,6 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_dp_rank: Optional[int] = None
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
-    conversation_id: Optional[str] = None
     ctx_usage: Optional[UsageInfo] = None
     # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
     # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
@@ -534,8 +567,12 @@ class CompletionRequest(OpenAIBaseModel):
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    length_penalty: float = 1.0
-    early_stopping: bool = False
+    # Unset by default so the engine picks its own beam-search defaults, as it
+    # does for requests coming through the Python API. Sending concrete values
+    # here would put every served request on the length-normalized, exhaustive
+    # beam-search path.
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[EarlyStopping] = None
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -620,7 +657,7 @@ class CompletionRequest(OpenAIBaseModel):
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            early_stopping=self.early_stopping,
+            early_stopping=_early_stopping_to_int(self.early_stopping),
             stop_token_ids=self.stop_token_ids,
             include_stop_str_in_output=self.include_stop_str_in_output,
             ignore_eos=self.ignore_eos,
@@ -890,8 +927,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    length_penalty: float = 1.0
-    early_stopping: bool = False
+    # Unset by default so the engine picks its own beam-search defaults, as it
+    # does for requests coming through the Python API. Sending concrete values
+    # here would put every served request on the length-normalized, exhaustive
+    # beam-search path.
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[EarlyStopping] = None
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -1036,7 +1077,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p=self.min_p,
             repetition_penalty=self.repetition_penalty,
             length_penalty=self.length_penalty,
-            early_stopping=self.early_stopping,
+            early_stopping=_early_stopping_to_int(self.early_stopping),
             stop_token_ids=self.stop_token_ids,
             include_stop_str_in_output=self.include_stop_str_in_output,
             ignore_eos=self.ignore_eos,
@@ -1533,7 +1574,6 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
-        conversation_id=tllm_disagg_params.conversation_id,
     )
 
 
@@ -1558,7 +1598,6 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
-        conversation_id=disaggregated_params.conversation_id,
     )
 
 
@@ -1647,6 +1686,71 @@ class ImageGenerationRequest(OpenAIBaseModel):
         Either both are sent (structured resolution wins over ``size``)
         or neither is sent (``size`` or pipeline default applies).
         """
+        if (self.width is None) != (self.height is None):
+            raise ValueError(
+                "width and height must be sent together; got width="
+                f"{self.width!r}, height={self.height!r}")
+        return self
+
+
+class ImageEditRequest(OpenAIBaseModel):
+    """OpenAI-compatible image editing request.
+
+    The server accepts the OpenAI multipart shape and a JSON/base64
+    shape for tests and non-SDK clients. Model-specific knobs travel
+    through ``extra_params`` and are validated by the loaded visual
+    generation pipeline.
+    """
+
+    prompt: str
+    image: Union[str, UploadFile, List[Union[str, UploadFile]]] = Field(
+        description="Input image or images to edit.")
+    mask: Optional[Union[str, UploadFile]] = Field(
+        default=None,
+        description=
+        "Optional edit mask. Currently accepted for compatibility but unsupported.",
+    )
+    response_format: Literal["url", "b64_json"] = "url"
+    output_format: Literal["png", "webp", "jpeg"] = Field(
+        default="png",
+        validation_alias=AliasChoices("output_format", "format"),
+        description="Edited image content encoding format.",
+    )
+    seed: Optional[int] = Field(default=None,
+                                ge=0,
+                                description="Random seed for reproducibility.")
+
+    size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+
+    num_inference_steps: Optional[int] = Field(default=None, gt=0)
+    guidance_scale: Optional[float] = Field(default=None, gt=0)
+    max_sequence_length: Optional[int] = Field(default=None, gt=0)
+    negative_prompt: Optional[str] = None
+    n: Optional[int] = Field(
+        default=None,
+        gt=0,
+        le=10,
+        description=("Number of edited images to generate. Capped at 10 to "
+                     "match the OpenAI images API."),
+    )
+
+    extra_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Model-specific parameters forwarded to the underlying pipeline. "
+            "See per-model docs for accepted keys."),
+    )
+
+    model: Optional[str] = None
+    quality: Optional[Literal["standard", "hd"]] = None
+    user: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check_paired_dimensions(self):
+        if isinstance(self.image, list) and not self.image:
+            raise ValueError("image must contain at least one input image")
         if (self.width is None) != (self.height is None):
             raise ValueError(
                 "width and height must be sent together; got width="

@@ -681,6 +681,9 @@ class CUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
@@ -872,6 +875,56 @@ class CUDAGraphRunner:
             spec_res_mgr.add_dummy_requests([dummy_request_id])
         self.padding_dummy_requests[runtime_draft_len] = dummy_request
         return dummy_request
+
+    def _padding_dummy_managers(
+            self,
+            resource_manager: ResourceManager) -> List[BaseResourceManager]:
+        """The managers ``_get_or_create_padding_dummy`` registers a dummy with.
+
+        Kept next to the creation path so the two stay in step.  Duplicates are
+        dropped by identity: freeing the same manager twice for one request is
+        not safe in general.
+        """
+        candidates = [
+            resource_manager.get_resource_manager(
+                self.config.kv_cache_manager_key),
+            get_draft_kv_cache_manager(self.spec_config, resource_manager),
+            resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER),
+        ]
+        if self.is_encoder_decoder:
+            candidates.append(
+                resource_manager.get_resource_manager(
+                    ResourceManagerType.CROSS_KV_CACHE_MANAGER))
+
+        managers: List[BaseResourceManager] = []
+        for manager in candidates:
+            if manager is not None and not any(manager is seen
+                                               for seen in managers):
+                managers.append(manager)
+        return managers
+
+    def release_padding_dummy(self, resource_manager: ResourceManager,
+                              runtime_draft_len: int) -> bool:
+        """Releases the padding dummy for ``runtime_draft_len`` from every
+        manager that allocated part of it, and drops it from the runner so a
+        later padded step re-creates it.
+
+        One dummy request ID is spread across up to four managers -- the main
+        KV cache manager, the one-model draft KV cache manager, the
+        speculative resource manager slot and the encoder-decoder cross-KV
+        cache manager.  Releasing only the main one leaves the others holding
+        the ID, and re-creation reuses the same
+        ``CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len``.
+
+        Returns True if a dummy was held for that draft length.
+        """
+        dummy_request = self.padding_dummy_requests.pop(runtime_draft_len, None)
+        if dummy_request is None:
+            return False
+        for manager in self._padding_dummy_managers(resource_manager):
+            manager.free_resources(dummy_request)
+        return True
 
     def _can_pad_any_batch(self, runtime_draft_len: int) -> bool:
         """Returns True when _get_padded_batch can pad at least one feasible
@@ -1771,6 +1824,9 @@ class EncoderCUDAGraphRunner:
                 return output
 
             graph = torch.cuda.CUDAGraph()
+            # Do not keep the eager result live from this runner across graph
+            # setup/capture; release its reference before entering.
+            output = None
             with torch.cuda.graph(graph,
                                   pool=self.memory_pool,
                                   capture_error_mode="thread_local"):

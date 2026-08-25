@@ -80,8 +80,9 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to_torch
 from ...logger import logger
-from ...mapping import CpType, Mapping
+from ...mapping import Mapping
 from ..utils import maybe_compile
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -271,6 +272,31 @@ def _compute_auto_host_tier_quota(
             f"device quota {quota / (1 << 30):.2f}GiB"
         )
         host_quota = quota
+    return host_quota
+
+
+def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
+    """Reduce the auto-provisioned host cache tier quota to the fleet minimum.
+
+    ``_compute_auto_host_tier_quota`` reads rank-local host state
+    (``SC_AVPHYS_PAGES``, ``RLIMIT_MEMLOCK``), so co-scheduled ranks can arrive
+    at divergent host quotas (observed up to 10x). Divergent host-tier
+    retention makes per-rank MAX_UTILIZATION schedulers disagree about which
+    suspended requests can resume, which wedges collectives on
+    non-attention-DP TP. Reducing to the fleet minimum makes the
+    most-constrained rank set the value for everyone, mirroring the device
+    quota sync. A single-rank job needs no collective and is returned as-is.
+
+    Args:
+        host_quota: This rank's locally-computed host tier quota in bytes.
+        mapping: Parallelism mapping; ``world_size`` selects whether a
+            collective is needed.
+
+    Returns:
+        The globally-agreed host tier quota in bytes (the fleet ``MIN``).
+    """
+    if mapping.world_size > 1:
+        host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
     return host_quota
 
 
@@ -741,6 +767,10 @@ def _copy_swa_block_offsets_with_scratch_compiled(
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
+    # Declared on the class so it is present even when an instance is built without running __init__.
+    _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -779,9 +809,6 @@ class KVCacheManagerV2(BaseResourceManager):
             "kv_connector_manager is not supported for KVCacheManagerV2"
         )
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
-        assert not (mapping.cp_config.get("cp_type") == CpType.STAR), (
-            "Star attention is not supported for KVCacheManagerV2"
-        )
 
         self.kv_cache_type = kv_cache_type
         self.pp_layers, self.num_layers = get_pp_layers(
@@ -816,6 +843,34 @@ class KVCacheManagerV2(BaseResourceManager):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.tokens_per_block = tokens_per_block
+        # Helix super-block ledger: bookkeeping runs in GLOBAL tokens, one
+        # ledger block = cp_size physical pages (one per rank), while
+        # self.tokens_per_block stays the PHYSICAL kernel page size.
+        self._has_cp_helix = mapping.has_cp_helix()
+        self._helix_cp_rank = mapping.cp_rank if self._has_cp_helix else 0
+        self._helix_cp_size = mapping.cp_size if self._has_cp_helix else 1
+        self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
+        if self._has_cp_helix:
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support block reuse with "
+                    "helix context parallelism: a ledger block's bytes span "
+                    "all CP ranks, so publishing it requires a group-wide "
+                    "protocol. Set kv_cache_config.enable_block_reuse=False."
+                )
+            if is_draft:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support a draft cache "
+                    "manager with helix context parallelism."
+                )
+            if mapping.enable_attention_dp:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support attention-DP with "
+                    "helix context parallelism: disagg transfer-completion "
+                    "consensus is skipped under attention-DP, so the "
+                    "scheduler's request view would not be rank-invariant "
+                    "across the CP group."
+                )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
@@ -939,7 +994,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"unique values={set(self.head_dim_per_layer)}"
                 )
 
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
 
         max_util_for_resume = kv_cache_config.max_util_for_resume
         quota = sys.maxsize
@@ -994,10 +1049,9 @@ class KVCacheManagerV2(BaseResourceManager):
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
-            # evict and later restore KV cache pages.  Without a host tier,
-            # suspended pages have nowhere to be offloaded and resume()
-            # always fails, causing a scheduling deadlock where no
-            # generation request can ever make progress.
+            # evict and later restore KV cache pages. Without a secondary
+            # tier, suspended held pages cannot migrate out of GPU, so
+            # suspension cannot free capacity and scheduling can deadlock.
             #
             # Automatically provision a host tier matching the GPU quota so
             # suspend/resume works out of the box.  Cap at available host
@@ -1029,6 +1083,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{local_ranks} co-located rank(s) on this node, "
                 f"available host memory {mem_available / (1 << 30):.2f}GiB"
             )
+            # Reduce the rank-local auto quota to the fleet minimum; see
+            # _sync_host_tier_quota for why divergence wedges collectives.
+            host_quota = _sync_host_tier_quota(host_quota, mapping)
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
@@ -1053,31 +1110,36 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
         )
         config = self._build_cache_config(config)
+        has_host_cache_tier = any(
+            isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
+        )
 
         self.kv_cache_manager_py_config = config
 
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
-            if len(cache_tiers) > 1:
+            if has_host_cache_tier:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
                     "tier (cuMemHostRegister may have failed). "
                     "Retrying without host cache tier."
                 )
-                cache_tiers_gpu_only = [t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)]
-                config = replace(config, cache_tiers=cache_tiers_gpu_only)
-                cache_tiers = cache_tiers_gpu_only
+                cache_tiers_without_host = [
+                    tier for tier in config.cache_tiers if not isinstance(tier, HostCacheTierConfig)
+                ]
+                config = replace(config, cache_tiers=cache_tiers_without_host)
                 self.kv_cache_manager_py_config = config
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
                 raise
+        self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()
             )
             self.event_manager.add_created_event(
-                self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
+                self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
             )
 
@@ -1110,6 +1172,7 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
+        self._request_stats_enabled_ids: set[int] = set()
 
         # Tracks the draft length allocated by try_allocate_generation per
         # request.  Used by extend_capacity_for_tokens to compute the exact
@@ -1146,7 +1209,9 @@ class KVCacheManagerV2(BaseResourceManager):
         max_seq_capacity = (
             self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
         )
-        self.max_blocks_per_seq = (max_seq_capacity + tokens_per_block - 1) // tokens_per_block
+        self.max_blocks_per_seq = (
+            max_seq_capacity + self._ledger_tokens_per_block - 1
+        ) // self._ledger_tokens_per_block
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
@@ -1420,6 +1485,17 @@ class KVCacheManagerV2(BaseResourceManager):
         return layer_sizes, attention_windows
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
+        """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
+        tokens = self._get_max_tokens_from_quota_impl(quota)
+        if self._has_cp_helix and not math.isinf(tokens):
+            # Floor to whole physical pages before scaling: a ledger block
+            # allocates one full page on every CP rank, so a partial
+            # trailing page in the rank-local budget is never usable.
+            tokens = int(tokens) // self.tokens_per_block * self.tokens_per_block
+            tokens *= self._helix_cp_size
+        return tokens
+
+    def _get_max_tokens_from_quota_impl(self, quota: int) -> float:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
@@ -1453,6 +1529,16 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
+        """Token capacity (GLOBAL tokens under helix) -> rank-local byte quota."""
+        if self._has_cp_helix:
+            # Round up to whole ledger blocks first: allocation is page-
+            # granular on every rank, so a request of N global tokens costs
+            # ceil(N / ledger_tpb) full physical pages per rank.
+            blocks = -(-int(max_tokens) // self._ledger_tokens_per_block)
+            max_tokens = blocks * self.tokens_per_block
+        return self._get_quota_from_max_tokens_impl(max_tokens)
+
+    def _get_quota_from_max_tokens_impl(self, max_tokens: int) -> int:
         layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
@@ -1875,7 +1961,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         return KVCacheManagerConfigPy(
-            tokens_per_block=tokens_per_block,
+            # Used by the backend only for token<->block arithmetic and
+            # radix hashing; BufferConfig.size above stays the physical page.
+            tokens_per_block=self._ledger_tokens_per_block,
             cache_tiers=cache_tiers,
             layers=layer_configs,
             typical_step=typical_step,
@@ -2124,6 +2212,17 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
     ) -> int:
+        """Clamp ``token_num_upper_bound`` to the allocatable token capacity.
+
+        Unit note: under helix the backend runs on the ledger
+        ``tokens_per_block``, so the returned capacity (like
+        ``token_num_upper_bound`` and ``max_seq_len``) is in GLOBAL ledger
+        tokens - the coordinate request lengths are expressed in. Callers
+        that additionally bound the result by per-forward budgets (e.g.
+        ``max_num_tokens``) stay consistent because a helix context forward
+        replicates all tokens on every rank, so both bounds constrain the
+        same request-length variable.
+        """
         extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
@@ -2153,7 +2252,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return max_num_pages // self.kv_factor
 
     def commit_scheduled_kv_cache_stats(self, scheduled_batch: ScheduledRequests) -> None:
-        if self.is_draft or not self.enable_stats:
+        if self.is_draft or (not self.enable_stats and not self._request_stats_enabled_ids):
             return
         dirty_req_ids = self.impl.get_dirty_stats_kv_cache_ids()
         for req in scheduled_batch.all_requests():
@@ -2162,7 +2261,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 if kv_cache is None:
                     continue
                 request_stats = kv_cache.commit_pending_stats()
-                if not req.is_dummy and not request_stats.empty:
+                if (
+                    (self.enable_stats or req.return_perf_metrics)
+                    and not req.is_dummy
+                    and not request_stats.empty
+                ):
                     req.update_kv_cache_perf_metrics(
                         request_stats.alloc_total_blocks,
                         request_stats.alloc_new_blocks,
@@ -2198,6 +2301,33 @@ class KVCacheManagerV2(BaseResourceManager):
                 draft_len = self.max_total_draft_tokens
         return draft_len
 
+    def _helix_local_len(self, global_len: int) -> int:
+        """Tokens of the first ``global_len`` owned by this CP rank
+        (continuation round-robin: page b lives on rank b %% cp)."""
+        phys = self.tokens_per_block
+        full, rem = divmod(global_len, self._ledger_tokens_per_block)
+        return full * phys + min(max(rem - self._helix_cp_rank * phys, 0), phys)
+
+    def _set_helix_rank_fields(self, req: LlmRequest) -> None:
+        """Derive the per-rank helix fields from the global position.
+
+        The decode-step index is manager-owned (committed in
+        ``try_allocate_generation`` on successful resize) rather than derived
+        from ``py_decoding_iter``: the sampler advances that counter after
+        scheduling under the overlap loop, so a schedule-time read is one
+        step behind and would repeat the first decode position, overwriting
+        the first generated token's KV. Assumes one new token per step
+        (draft-token modes are rejected under helix).
+        """
+        step = req.py_helix_decode_group_index + 1
+        pos = req.total_input_len_cp + step - 1
+        owner = (pos // self.tokens_per_block) % self._helix_cp_size
+        active = owner == self._helix_cp_rank
+        req.py_helix_is_inactive_rank = not active
+        # Convention shared with model_engine: the active rank's seqlen
+        # includes the in-flight token (past_seen = seqlen - 1 there).
+        req.seqlen_this_rank_cp = self._helix_local_len(pos) + (1 if active else 0)
+
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
@@ -2222,7 +2352,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
         draft_len = self._effective_draft_len(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        is_helix_req = self._has_cp_helix and not req.is_dummy_request
+        if is_helix_req:
+            self._set_helix_rank_fields(req)
+        if not kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity)):
+            return False
+        if is_helix_req:
+            # Commit only on success so a same-pass retry recomputes the
+            # same step instead of skipping one.
+            req.py_helix_decode_group_index += 1
+        return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
@@ -2240,6 +2379,9 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
+        if self._has_cp_helix and not req.is_dummy_request and req.py_helix_decode_group_index > 0:
+            # The forward pass for this step is skipped; give the step back.
+            req.py_helix_decode_group_index -= 1
         draft_len = self._allocated_draft_lens.pop(
             req.py_request_id, self._effective_draft_len(req)
         )
@@ -2341,7 +2483,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     tokens,
                     cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
-                    expected_prompt_length=req.prompt_len - 1,
+                    enable_request_stats=req.return_perf_metrics,
+                    expected_prompt_length=(
+                        req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+                    )
+                    - 1,
                 )
                 if kv_cache is None:
                     return False
@@ -2379,6 +2525,13 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
+        if self._has_cp_helix and not req.is_dummy_request:
+            raise ValueError(
+                "resize_context is not helix-aware: its rank-local chunk "
+                "target would under-size the global ledger. Helix requests "
+                "are disagg-generation-only and must never take the context "
+                "path."
+            )
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -2412,11 +2565,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # prompt_len is the full incoming prompt length, robust to block
         # reuse (which may leave a non-zero context_current_position).
-        target = req.prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        # Helix requests carry the rank-local strided slice in prompt_len;
+        # the global ledger sizes off the full prompt instead.
+        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        success = kv_cache.resize(capacity, req.prompt_len)
+        success = kv_cache.resize(capacity, prompt_len)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
@@ -2465,7 +2621,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache (move to host tier)."""
+        """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
@@ -2512,6 +2668,13 @@ class KVCacheManagerV2(BaseResourceManager):
                         cache_salt=req.cache_salt,
                         is_dummy=req.is_dummy,
                     )
+                    if kv_cache is None:
+                        # Saturated IndexMapper (e.g. slots held by disagg
+                        # generation transfers in flight): skip mirroring this
+                        # request for now; it is retried next iteration once
+                        # slots free up, before the request runs any spec-dec
+                        # forward that needs the mirror.
+                        continue
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -2627,6 +2790,32 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return _introspection.storage_statistics(self.impl, cache_level)
 
+    def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
+        """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
+
+        Ordered by cold pool-group id. Cold levels number their pool groups independently of the hot
+        level, so these ids are meaningful only within the cold view. KVCM uses one mapping for every
+        cold level, and the grouping is fixed at construction, so it is queried from level 1 once.
+        """
+        if self._cold_pool_group_membership_cache is None:
+            membership: tuple[tuple[int, frozenset[int]], ...] = ()
+            if len(self.impl.cache_tier_list) > 1:
+                grouped: dict[int, set[int]] = defaultdict(set)
+                mapping = _introspection.life_cycle_pool_group_indices(self.impl, CacheLevel(1))
+                for life_cycle_id, pool_group_id in enumerate(mapping):
+                    grouped[pool_group_id].add(life_cycle_id)
+                membership = tuple(sorted((pg, frozenset(lcs)) for pg, lcs in grouped.items()))
+            self._cold_pool_group_membership_cache = membership
+        return self._cold_pool_group_membership_cache
+
+    @staticmethod
+    def _stats_slot_sizes(pool_group_stats: object) -> tuple[int, ...]:
+        """Return slot sizes from either the native or pure-Python statistics object."""
+        slot_sizes = getattr(pool_group_stats, "slot_sizes", None)
+        if slot_sizes is None:
+            slot_sizes = getattr(pool_group_stats, "slot_size")
+        return tuple(slot_sizes)
+
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
         # life cycle (== layer group) -> pool group is static structure exposed by
         # the public pool_group_descs API; no introspection needed.
@@ -2717,9 +2906,10 @@ class KVCacheManagerV2(BaseResourceManager):
             setattr(stats, field_name, getattr(delta, field_name))
         stats.iter_cache_hit_rate = KVCacheManagerV2._iteration_cache_hit_rate(stats)
 
+    @staticmethod
     def _build_iteration_stats(
-        self,
         pool_group_ids: Iterable[int],
+        secondary_pool_group_ids: Sequence[tuple[int, ...]],
         primary_stats,
         secondary_stats_by_level,
         primary_peak_stats,
@@ -2727,6 +2917,14 @@ class KVCacheManagerV2(BaseResourceManager):
         delta,
         field_names=KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     ):
+        """Aggregate block stats over ``pool_group_ids`` at the hot level and ``secondary_pool_group_ids``
+        at each cold level.
+
+        Hot and cold levels number their pool groups independently, so a cold level cannot be indexed
+        with hot ids; ``secondary_pool_group_ids`` carries each cold level's own ids and must be
+        parallel to ``secondary_stats_by_level``. Only the cold-pool-group view reports cold blocks, so
+        the hot-keyed callers pass ``()`` here and leave the ``secondary_*`` fields at zero.
+        """
         pool_group_ids = tuple(pool_group_ids)
         stats = KvCacheIterationStats()
         stats.primary_max_num_blocks = sum(
@@ -2748,40 +2946,43 @@ class KVCacheManagerV2(BaseResourceManager):
         stats.primary_peak_evictable_num_blocks = sum(
             primary_peak_stats[pool_group_id].evictable for pool_group_id in pool_group_ids
         )
+        secondary_levels = tuple(zip(secondary_stats_by_level, secondary_pool_group_ids))
+        secondary_peak_levels = tuple(zip(secondary_peak_stats_by_level, secondary_pool_group_ids))
+
         stats.secondary_max_num_blocks = sum(
             level_stats[pool_group_id].total
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_free_num_blocks = sum(
             level_stats[pool_group_id].available
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_used_num_blocks = (
             stats.secondary_max_num_blocks - stats.secondary_free_num_blocks
         )
         stats.secondary_evictable_num_blocks = sum(
             level_stats[pool_group_id].evictable
-            for level_stats in secondary_stats_by_level
-            for pool_group_id in pool_group_ids
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_free_num_blocks = sum(
             peak_stats[pool_group_id].available
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_used_num_blocks = sum(
             peak_stats[pool_group_id].unavailable
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
         stats.secondary_peak_evictable_num_blocks = sum(
             peak_stats[pool_group_id].evictable
-            for peak_stats in secondary_peak_stats_by_level
-            for pool_group_id in pool_group_ids
+            for peak_stats, level_pool_group_ids in secondary_peak_levels
+            for pool_group_id in level_pool_group_ids
         )
-        self._apply_iteration_stats_delta(stats, delta, field_names)
+        KVCacheManagerV2._apply_iteration_stats_delta(stats, delta, field_names)
         return stats
 
     def _collect_iteration_stats_deltas(
@@ -2839,6 +3040,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         stats = self._build_iteration_stats(
             pool_group_ids,
+            (),
             primary_stats,
             secondary_stats_by_level,
             primary_peak_stats,
@@ -2860,17 +3062,13 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_group_delta,
     ) -> KVCacheV2PoolGroupIterationStats:
         primary_pool_group_stats = primary_stats[pool_group_id]
-        slot_size = (
-            primary_pool_group_stats.slot_sizes
-            if hasattr(primary_pool_group_stats, "slot_sizes")
-            else primary_pool_group_stats.slot_size
-        )
         return KVCacheV2PoolGroupIterationStats(
             pool_group_id=pool_group_id,
-            slot_size=tuple(slot_size),
+            slot_size=self._stats_slot_sizes(primary_pool_group_stats),
             window_sizes=windows_by_pool_group.get(pool_group_id, ()),
             stats=self._build_iteration_stats(
                 (pool_group_id,),
+                (),
                 primary_stats,
                 secondary_stats_by_level,
                 primary_peak_stats,
@@ -2879,6 +3077,60 @@ class KVCacheManagerV2(BaseResourceManager):
                 KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
             ),
         )
+
+    def _build_cold_pool_group_iteration_stats(
+        self,
+        life_cycle_metadata,
+        primary_stats,
+        secondary_stats_by_level,
+        primary_peak_stats,
+        secondary_peak_stats_by_level,
+    ) -> dict[int, KVCacheV2PoolGroupIterationStats]:
+        """Report every cold pool group in its own numbering, summed over all cold levels.
+
+        The window and hot-pool-group views drop a cold group that spans several hot groups, since
+        attributing it to any one of them would double count. This view has no such gap, so host and
+        disk blocks are always accounted for somewhere.
+
+        The returned ``pool_group_id`` is a *cold* pool-group index. It is unrelated to the hot index
+        of the same name in the by-pool-group view, because hot and cold levels number their groups
+        independently; ``window_sizes`` is the correlation key shared by both views.
+        """
+        # No cold tiers means nothing to report, and the pool-group mapping need not be queried.
+        if not secondary_stats_by_level:
+            return {}
+        cold_members = self._cold_pool_group_membership()
+        if not cold_members:
+            return {}
+        assert all(
+            len(level_stats) == len(cold_members) for level_stats in secondary_stats_by_level
+        )
+
+        report: dict[int, KVCacheV2PoolGroupIterationStats] = {}
+        for cold_pool_group_id, life_cycles in cold_members:
+            level_ids = [(cold_pool_group_id,) for _ in secondary_stats_by_level]
+            cold_stats = secondary_stats_by_level[0][cold_pool_group_id]
+            window_sizes = {
+                life_cycle_metadata[life_cycle_id][1]
+                for life_cycle_id in life_cycles
+                if life_cycle_metadata.get(life_cycle_id, (None, None, None))[1] is not None
+            }
+            report[cold_pool_group_id] = KVCacheV2PoolGroupIterationStats(
+                pool_group_id=cold_pool_group_id,
+                slot_size=self._stats_slot_sizes(cold_stats),
+                window_sizes=tuple(sorted(window_sizes)),
+                stats=self._build_iteration_stats(
+                    (),
+                    level_ids,
+                    primary_stats,
+                    secondary_stats_by_level,
+                    primary_peak_stats,
+                    secondary_peak_stats_by_level,
+                    None,
+                    KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS,
+                ),
+            )
+        return report
 
     def _build_attention_life_cycle_iteration_stats(
         self,
@@ -2898,6 +3150,7 @@ class KVCacheManagerV2(BaseResourceManager):
             window_size=window_size,
             kind=kind,
             stats=self._build_iteration_stats(
+                (),
                 (),
                 primary_stats,
                 secondary_stats_by_level,
@@ -3055,7 +3308,16 @@ class KVCacheManagerV2(BaseResourceManager):
         stats_by_life_cycle = dict(sorted(stats_by_life_cycle.items()))
 
         return KVCacheV2IterationStatsReport(
-            stats_by_window, stats_by_pool_group, stats_by_life_cycle
+            stats_by_window,
+            stats_by_pool_group,
+            stats_by_life_cycle,
+            self._build_cold_pool_group_iteration_stats(
+                life_cycle_metadata,
+                primary_stats,
+                secondary_stats_by_level,
+                primary_peak_stats,
+                secondary_peak_stats_by_level,
+            ),
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
@@ -3083,6 +3345,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
+        # Materialize the blocks backing the declared history instead of treating it as
+        # already committed. Only meaningful together with is_gen.
+        #
+        # Set when the caller writes the history itself and needs those blocks backed,
+        # instead of letting sliding-window pools keep only the last window_size.
+        materialize_history: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         kv_reserve_draft_tokens: Optional[int] = None,
@@ -3120,8 +3388,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
+            if self._has_cp_helix:
+                # Keep the frozen dummy fields self-consistent (the active
+                # rank's past_seen = seqlen - 1 must stay >= 1).
+                token_num = max(token_num, 2)
             # token_num - 1 is the past history length in generation.
-            history_hint = max(0, token_num - 1) if is_gen else None
+            history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
             encoder_input_tokens = (
                 [1] * encoder_output_len if encoder_output_len is not None else None
@@ -3159,7 +3431,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
-                if is_gen:
+                if is_gen and not materialize_history:
                     kv_cache.enable_swa_scratch_reuse = False
                 # Need to hint the committed history to activate stale-block
                 # optimization and match the solver's pool budget.
@@ -3191,6 +3463,20 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
+                if self._has_cp_helix:
+                    # Frozen fields (V1 parity): dummies never pass the
+                    # per-step derivation — last CP rank active, shared
+                    # synthetic global length.
+                    if self._helix_cp_rank == self._helix_cp_size - 1:
+                        req.py_helix_is_inactive_rank = False
+                        req.prompt_len = token_num - 1
+                    else:
+                        req.py_helix_is_inactive_rank = True
+                        req.prompt_len = token_num
+                    req.py_prompt_len = req.prompt_len
+                    req.seqlen_this_rank_cp = req.prompt_len
+                    req.total_input_len_cp = token_num * self._helix_cp_size - 1
+                    req.py_decoding_iter = 1
                 if prepare_resource:
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
@@ -3253,6 +3539,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._request_stats_enabled_ids.discard(request.py_request_id)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -3496,6 +3783,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        self._request_stats_enabled_ids.clear()
         self.impl.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
@@ -3625,7 +3913,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 else kv_cache.capacity - rewind_len
             )
             history_length = (
-                None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1
+                None
+                # Reuse (history's consumer) is disabled under helix, and
+                # max_beam_num_tokens mixes rank-local and global counts.
+                if self.kv_compression_manages_history or self._has_cp_helix
+                else req.max_beam_num_tokens - 1
             )
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
@@ -3688,6 +3980,7 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         cache_salt: str | None = None,
         is_dummy: bool = False,
+        enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
@@ -3704,13 +3997,17 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
+        enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
             id=request_id,
+            enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
         )
         self.kv_cache_map[request_id] = kv_cache
+        if enable_request_stats and not self.enable_stats:
+            self._request_stats_enabled_ids.add(request_id)
         if is_dummy:
             self.impl.mark_stats_excluded(request_id)
             kv_cache.discard_pending_stats()

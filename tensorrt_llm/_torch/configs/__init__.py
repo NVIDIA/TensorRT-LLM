@@ -23,6 +23,7 @@ from tensorrt_llm._torch.configs.gemma4 import (
     Gemma4UnifiedTextConfig,
     Gemma4UnifiedVisionConfig,
 )
+from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
@@ -55,11 +56,13 @@ def _register_custom_configs_with_transformers() -> None:
         "kimi_k2": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
         "gemma4_assistant": Gemma4AssistantConfig,
-        # Kimi K3 text config ("kimi_linear"). The composite "kimi_k3"
-        # model_type is flattened to the text config by
-        # pyexecutor.config_utils.load_pretrained_config; registering the
-        # text config here lets AutoConfig / AutoTokenizer resolve
-        # "kimi_linear" without trust_remote_code.
+        # Kimi K3 composite multimodal config ("kimi_k3") and its text config
+        # ("kimi_linear"). pyexecutor.config_utils.load_pretrained_config keeps
+        # the composite KimiK3Config when the checkpoint ships text+vision
+        # sub-configs and multimodal is not disabled, and otherwise flattens to
+        # the text config. Registering both here lets AutoConfig / AutoTokenizer
+        # resolve them without trust_remote_code.
+        "kimi_k3": KimiK3Config,
         "kimi_linear": KimiLinearConfig,
         "laguna": LagunaConfig,
         # minicpmv4_6 is only registered in transformers>=5.7.0; register our
@@ -93,6 +96,8 @@ __all__ = [
     "Gemma4UnifiedConfig",
     "Gemma4UnifiedTextConfig",
     "Gemma4UnifiedVisionConfig",
+    "KimiK3Config",
+    "KimiK3VisionConfig",
     "KimiLinearConfig",
     "LagunaConfig",
     "MiniCPMV4_6Config",
