@@ -253,8 +253,8 @@ class DeepSeekR1Parser(BaseReasoningParser):
     def _partial_tag_suffix_len(text: str, *tags: str) -> int:
         """Longest suffix of ``text`` that is a proper prefix of any tag.
 
-        A complete tag is never held here (length is at most ``len(tag) - 1``)
-        so full delimiters are always handled by ``find`` in ``parse_delta``.
+        A complete tag is never held here (length is at most ``len(tag) - 1``);
+        complete delimiters are handled separately by ``parse_delta``.
         """
         best = 0
         for tag in tags:
@@ -470,6 +470,7 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
                          chat_template_kwargs=chat_template_kwargs)
         self.reasoning_start = "<mm:think>"
         self.reasoning_end = "</mm:think>"
+        self._at_stream_start = True
 
     def parse(self, text: str) -> ReasoningParserResult:
         end_idx = text.find(self.reasoning_end)
@@ -484,6 +485,29 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
         if reasoning_content.startswith(self.reasoning_start):
             reasoning_content = reasoning_content[len(self.reasoning_start):]
         return self._create_reasoning_end_result(content, reasoning_content)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        """Consume the optional no-reasoning sentinel at stream start."""
+        if self._at_stream_start:
+            text = self._buffer + delta_text
+            if self.reasoning_end.startswith(text):
+                self._buffer = text
+                return ReasoningParserResult()
+            self._at_stream_start = False
+            if text.startswith(self.reasoning_end):
+                self._buffer = ""
+                remainder = text[len(self.reasoning_end):]
+                if not remainder:
+                    return ReasoningParserResult()
+                return super().parse_delta(remainder)
+        return super().parse_delta(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        """Discard a complete leading no-reasoning sentinel at stream end."""
+        if self._at_stream_start and self._buffer == self.reasoning_end:
+            self._buffer = ""
+            return ReasoningParserResult()
+        return super().finish()
 
 
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
@@ -624,7 +648,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         # optionally accumulating reasoning tokens and returning them as
         # content at the end of streaming.
         self._accumulated_reasoning = ""
-        self._found_closing_tag = False
+        self._has_nonempty_content = False
 
     def _maybe_swap_content(
             self, result: ReasoningParserResult) -> ReasoningParserResult:
@@ -660,50 +684,37 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
             reasoning = remaining + delta_text[:tool_idx]
             content = delta_text[tool_idx:]
             if self._force_nonempty_content:
-                self._found_closing_tag = True
+                self._has_nonempty_content = True
                 self._accumulated_reasoning = ""
             return ReasoningParserResult(content=content,
                                          reasoning_content=reasoning)
 
-        was_in_reasoning = self.in_reasoning
         result = super().parse_delta(delta_text)
         if self._force_nonempty_content:
-            if result.reasoning_content:
+            if result.reasoning_content and not self._has_nonempty_content:
                 self._accumulated_reasoning += result.reasoning_content
-            if was_in_reasoning and not self.in_reasoning:
-                self._found_closing_tag = True
+            if result.content.strip():
+                self._has_nonempty_content = True
                 self._accumulated_reasoning = ""
         return result
 
     def finish(self) -> ReasoningParserResult:
         """Called when the stream ends.
 
-        If no closing think tag was found and force_nonempty_content is
-        set, returns the full accumulated reasoning as content so the
-        response is never empty. If no closing tag was found and
-        force_nonempty_content is not set, returns any remaining buffer
-        as reasoning_content since we are still in reasoning mode.
-
-        If the closing tag was already found (or reasoning was never
-        entered), flushes any remaining buffer as content."""
-        if self.in_reasoning and not self._found_closing_tag:
-            remaining = self._buffer
-            self._buffer = ""
-            if self._force_nonempty_content:
-                all_content = self._accumulated_reasoning + remaining
-                self._accumulated_reasoning = ""
-                self.in_reasoning = False
-                return ReasoningParserResult(content=all_content)
-            self._accumulated_reasoning = ""
-            self.in_reasoning = False
-            if remaining:
-                return ReasoningParserResult(reasoning_content=remaining)
-            return ReasoningParserResult()
-        remaining = self._buffer
-        self._buffer = ""
-        if remaining:
-            return ReasoningParserResult(content=remaining)
-        return ReasoningParserResult()
+        The parent classifies any held delimiter fragment. If the stream ends
+        in unfinished reasoning with force_nonempty_content set and no
+        non-whitespace content was emitted, return all reasoning as content so
+        the response is never empty.
+        """
+        ended_with_closing_tag = (self.in_reasoning
+                                  and self._buffer == self.reasoning_end)
+        result = super().finish()
+        if (self._force_nonempty_content and self.in_reasoning
+                and not ended_with_closing_tag
+                and not self._has_nonempty_content):
+            return ReasoningParserResult(content=self._accumulated_reasoning +
+                                         result.reasoning_content)
+        return result
 
     def parse(self, text: str) -> ReasoningParserResult:
         result = super().parse(text)
@@ -1000,6 +1011,13 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
 
         raise RuntimeError(
             "Unreachable code reached in `KimiK2ReasoningParser.parse_delta`")
+
+    def finish(self) -> ReasoningParserResult:
+        """Emit a complete buffered tool marker as visible content."""
+        if self.in_reasoning and self._buffer == self.tool_section_start:
+            self._buffer = ""
+            return ReasoningParserResult(content=self.tool_section_start)
+        return super().finish()
 
 
 @register_reasoning_parser("kimi_k3")

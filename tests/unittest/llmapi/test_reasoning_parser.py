@@ -124,6 +124,7 @@ def _stream_parse_deltas(parser_key: str,
         ("qwen3", "Hello"),
         ("qwen3", ""),
         ("qwen3", R1_START),
+        ("qwen3", R1_END),
         ("deepseek-r1", R1_START),
     ])
 def test_deepseek_r1_reasoning_parser_stream_matches_non_stream_one_shot(
@@ -211,8 +212,8 @@ def test_qwen3_multi_delta_preamble_already_emitted() -> None:
 def test_interleaved_second_think_with_content_prefix_same_delta() -> None:
     """Content before a later <think> in the same delta must not be dropped.
 
-    CodeRabbit #17296 follow-up: after the first reasoning block,
-    ``"y<think>z"`` should keep ``y`` as content and ``z`` as reasoning.
+    After the first reasoning block, ``"y<think>z"`` should keep ``y`` as
+    content and ``z`` as reasoning.
     """
     parser = ReasoningParserFactory.create_reasoning_parser("deepseek-r1")
     # First block: reason1</think>
@@ -251,8 +252,8 @@ def test_qwen3_interleaved_second_think_with_content_prefix_same_delta(
 def test_interleaved_partial_second_think_across_deltas() -> None:
     """Partial second ``<think>`` must buffer across deltas after first block.
 
-    CodeRabbit follow-up: ``reason1</think>mid<th`` then ``ink>reason2`` must
-    not emit ``ink>reason2`` as content.
+    ``reason1</think>mid<th`` then ``ink>reason2`` must not emit
+    ``ink>reason2`` as content.
     """
     parser = ReasoningParserFactory.create_reasoning_parser("deepseek-r1")
     r1 = parser.parse_delta(f"reason1{R1_END}mid<th")
@@ -267,12 +268,45 @@ def test_interleaved_partial_second_think_across_deltas() -> None:
     assert r4.content == "tail"
 
 
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, len("</mm:think>answer")])
+def test_minimax_m3_bare_sentinel_stream_matches_parse(chunk_size: int) -> None:
+    """The leading no-reasoning sentinel must not leak into content."""
+    text = "</mm:think>answer"
+    expected = ReasoningParserFactory.create_reasoning_parser(
+        "minimax_m3").parse(text)
+    content, reasoning_context = _stream_parse("minimax_m3", text, chunk_size)
+    assert content == expected.content == "answer"
+    assert reasoning_context == expected.reasoning_content == ""
+
+
+@pytest.mark.parametrize("chunk_size",
+                         [1, 2, 5, len("<mm:think>r</mm:think>a")])
+def test_minimax_m3_tagged_stream_matches_parse(chunk_size: int) -> None:
+    """Bare-sentinel handling must preserve the normal tagged stream."""
+    text = "<mm:think>r</mm:think>a"
+    expected = ReasoningParserFactory.create_reasoning_parser(
+        "minimax_m3").parse(text)
+    content, reasoning_context = _stream_parse("minimax_m3", text, chunk_size)
+    assert content == expected.content == "a"
+    assert reasoning_context == expected.reasoning_content == "r"
+
+
+def test_minimax_m3_bare_sentinel_at_end_of_stream_is_discarded() -> None:
+    """A complete leading sentinel with no content still marks no reasoning."""
+    parser = ReasoningParserFactory.create_reasoning_parser("minimax_m3")
+    result = parser.parse_delta("</mm:think>")
+    assert result.content == ""
+    assert result.reasoning_content == ""
+    result = parser.finish()
+    assert result.content == ""
+    assert result.reasoning_content == ""
+
+
 def test_deepseek_r1_reasoning_parser_finish_flushes_partial_tag() -> None:
     """A partial tag arriving alongside text must still be flushed.
 
-    Such a delta fills `_buffer` through the `rfind` branch of `parse_delta`,
-    which one-character-at-a-time streaming never reaches - and it is the
-    shape a real stream delivers.
+    This exercises a realistic multi-character delta ending in a partial
+    closing delimiter.
     """
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         "deepseek-r1")
@@ -413,6 +447,28 @@ def test_kimi_k2_reasoning_parser_stream(delta_texts: list, content: list,
             f"Step {i}: delta={delta_text!r}, expected content={content[i]!r}, got {result.content!r}"
         assert result.reasoning_content == reasoning_context[i], \
             f"Step {i}: delta={delta_text!r}, expected reasoning={reasoning_context[i]!r}, got {result.reasoning_content!r}"
+
+
+@pytest.mark.parametrize(
+    ("marker", "finish_content", "finish_reasoning"),
+    [
+        (TOOL_START, TOOL_START, ""),
+        (TOOL_START[:-1], "", TOOL_START[:-1]),
+    ],
+)
+def test_kimi_k2_reasoning_parser_finish_tool_marker(
+        marker: str, finish_content: str, finish_reasoning: str) -> None:
+    """A complete tool marker ends reasoning; a partial marker stays text."""
+    parser = ReasoningParserFactory.create_reasoning_parser("kimi_k2")
+    result = parser.parse_delta(f"{R1_START}reasoning")
+    assert result.content == ""
+    assert result.reasoning_content == "reasoning"
+    result = parser.parse_delta(marker)
+    assert result.content == ""
+    assert result.reasoning_content == ""
+    result = parser.finish()
+    assert result.content == finish_content
+    assert result.reasoning_content == finish_reasoning
 
 
 @pytest.mark.parametrize(
@@ -975,6 +1031,72 @@ def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,
     result = reasoning_parser.finish()
     assert result.content == finish_content
     assert result.reasoning_content == finish_reasoning
+
+
+def test_nano_v3_force_nonempty_does_not_duplicate_after_interleaved_content(
+) -> None:
+    """Visible content between reasoning blocks prevents the fallback copy."""
+    parser = ReasoningParserFactory.create_reasoning_parser(
+        "nano-v3", {"force_nonempty_content": True})
+    result = parser.parse_delta(f"r1{R1_END}mid{R1_START}r2")
+    assert result.content == "mid"
+    assert result.reasoning_content == "r1r2"
+    result = parser.finish()
+    assert result.content == ""
+    assert result.reasoning_content == ""
+
+
+@pytest.mark.parametrize("intervening_content", ["", " \n"])
+def test_nano_v3_force_nonempty_falls_back_after_contentless_reopen(
+        intervening_content: str) -> None:
+    """A close/reopen without visible content retains the fallback copy."""
+    delta_sequences = [
+        [f"r1{R1_END}{intervening_content}{R1_START}r2"],
+        ["r1", R1_END, intervening_content, R1_START, "r2"],
+    ]
+    for deltas in delta_sequences:
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            "nano-v3", {"force_nonempty_content": True})
+        content = reasoning = ""
+        for delta in deltas:
+            result = parser.parse_delta(delta)
+            content += result.content
+            reasoning += result.reasoning_content
+        assert content == intervening_content
+        assert reasoning == "r1r2"
+        result = parser.finish()
+        assert result.content == "r1r2"
+        assert result.reasoning_content == ""
+
+
+@pytest.mark.parametrize("partial_end", ["<", "</thin"])
+def test_nano_v3_force_nonempty_keeps_unfinished_tag_in_reasoning(
+        partial_end: str) -> None:
+    """A later unfinished reasoning block keeps its buffered tag fragment."""
+    parser = ReasoningParserFactory.create_reasoning_parser(
+        "nano-v3", {"force_nonempty_content": True})
+    result = parser.parse_delta(f"r1{R1_END}mid{R1_START}r2{partial_end}")
+    assert result.content == "mid"
+    assert result.reasoning_content == "r1r2"
+    result = parser.finish()
+    assert result.content == ""
+    assert result.reasoning_content == partial_end
+
+
+@pytest.mark.parametrize("force_nonempty_content", [False, True])
+def test_nano_v3_finish_consumes_buffered_closing_tag(
+        force_nonempty_content: bool) -> None:
+    """A closing delimiter buffered as the final delta must not be emitted."""
+    parser = ReasoningParserFactory.create_reasoning_parser(
+        "nano-v3", {"force_nonempty_content": force_nonempty_content})
+    result = parser.parse_delta("reasoning")
+    assert result.reasoning_content == "reasoning"
+    result = parser.parse_delta(R1_END)
+    assert result.content == ""
+    assert result.reasoning_content == ""
+    result = parser.finish()
+    assert result.content == ""
+    assert result.reasoning_content == ""
 
 
 # ---------------------------------------------------------------------------
