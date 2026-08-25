@@ -38,8 +38,12 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3DecoderLayer,
+    MiniMaxM3ForCausalLM,
     MiniMaxM3Model,
+    MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
+    _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
     _validate_sparse_attention_runtime_config,
@@ -50,6 +54,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     get_text_config,
     is_minimax_m3_vl_config,
 )
+from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
@@ -92,6 +97,49 @@ def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
     )
 
     _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_minimax_m3_uses_one_engine_speculative_base() -> None:
+    assert issubclass(MiniMaxM3ForCausalLM, SpecDecOneEngineForCausalLM)
+
+
+def test_eagle_capture_precedes_next_layer_norm() -> None:
+    class CaptureMetadata:
+        def __init__(self) -> None:
+            self.captured = None
+
+        def is_layer_capture(self, layer_idx: int) -> bool:
+            return layer_idx == 25
+
+        def maybe_capture_hidden_states(self, layer_idx, hidden_states, residual) -> None:
+            self.captured = (layer_idx, hidden_states.clone(), residual.clone())
+
+    layer = SimpleNamespace(
+        layer_idx=25,
+        _apply_pre_feed_forward_norm=lambda hidden, residual: (hidden + 1, residual + 2),
+        block_sparse_moe=lambda hidden, unused_metadata, **unused_kwargs: hidden + 3,
+        _feed_forward_all_reduce_params=lambda: None,
+        _apply_next_layer_layernorm=lambda hidden, residual: (hidden + 10, residual + 20),
+    )
+    spec_metadata = CaptureMetadata()
+    hidden_states = torch.tensor([1.0])
+    residual = torch.tensor([2.0])
+
+    output, output_residual = MiniMaxM3DecoderLayer.forward_MoE(
+        layer,
+        hidden_states,
+        SimpleNamespace(),
+        residual,
+        spec_metadata,
+    )
+
+    assert spec_metadata.captured is not None
+    layer_idx, captured_hidden, captured_residual = spec_metadata.captured
+    assert layer_idx == 25
+    torch.testing.assert_close(captured_hidden, torch.tensor([5.0]))
+    torch.testing.assert_close(captured_residual, torch.tensor([4.0]))
+    torch.testing.assert_close(output, torch.tensor([15.0]))
+    torch.testing.assert_close(output_residual, torch.tensor([24.0]))
 
 
 def test_model_init_validates_sparse_attention_runtime_config() -> None:
@@ -571,6 +619,56 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
         assert "attn_metadata" in msg or "kv_cache_manager" in msg, msg
     else:  # pragma: no cover
         raise AssertionError("sparse forward must raise RuntimeError when attn_metadata is None")
+
+
+def test_minimax_m3_five_way_projection_shard_geometry():
+    module = SimpleNamespace(
+        tp_size=2,
+        tp_rank=1,
+        total_num_kv_heads=4,
+        total_num_index_heads=4,
+    )
+    shard_geometry = MiniMaxM3QKVIndexerLinear._shard_geometry
+    assert shard_geometry(module, "q") == (2, 1)
+    assert shard_geometry(module, "k") == (2, 1)
+    assert shard_geometry(module, "v") == (2, 1)
+    assert shard_geometry(module, "index_q") == (2, 1)
+    assert shard_geometry(module, "index_k") == (1, 0)
+
+    # At TP8, each of four KV/index-Q heads is replicated on two ranks.
+    module.tp_size = 8
+    module.tp_rank = 5
+    assert shard_geometry(module, "k") == (4, 2)
+    assert shard_geometry(module, "index_q") == (4, 2)
+    assert shard_geometry(module, "index_k") == (1, 0)
+
+
+def test_minimax_m3_five_way_loader_returns_exact_generic_skip():
+    projection = object.__new__(MiniMaxM3QKVIndexerLinear)
+    nn.Module.__init__(projection)
+    captured = {}
+    projection.load_five_way_weights = lambda shards: captured.update(shards)
+
+    model = nn.Module()
+    model.sparse = nn.Module()
+    model.sparse.qkv_proj = projection
+    weights = {
+        f"sparse.{name}_proj.weight": torch.empty(1)
+        for name in ("q", "k", "v", "index_q", "index_k")
+    }
+
+    loaded_modules = _load_qkv_index_proj_weights(model, weights)
+
+    assert loaded_modules == ["sparse.qkv_proj"]
+    assert set(captured) == {"q", "k", "v", "index_q", "index_k"}
+    assert all(set(shard) == {"weight"} for shard in captured.values())
+    assert weights == {}
+
+    mapper = MiniMaxM3HfWeightMapper()
+    mapper.add_skip_modules(loaded_modules)
+    mapper._model = SimpleNamespace(config=SimpleNamespace(tie_word_embeddings=False))
+    assert mapper.should_skip_module("sparse.qkv_proj")
+    assert not mapper.should_skip_module("dense.qkv_proj")
 
 
 @pytest.mark.gpu

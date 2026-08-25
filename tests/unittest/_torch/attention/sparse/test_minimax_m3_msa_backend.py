@@ -18,6 +18,7 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
 )
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
 from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
@@ -88,6 +89,45 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered() -> None:
     for sparse_index_dim in (0, -1):
         with pytest.raises(ValueError, match=r"greater than 0"):
             MiniMaxM3SparseAttentionConfig(sparse_index_dim=sparse_index_dim)
+
+
+def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads() -> None:
+    cfg = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        fuse_qkv_index_projection=True,
+        num_attention_heads=64,
+        num_key_value_heads=4,
+    )
+    sparse_params = cfg.to_sparse_params()
+    metadata_params = cfg.to_sparse_metadata_params()
+    mapping = SimpleNamespace(tp_size=2, enable_attention_dp=False)
+
+    assert sparse_params.fuse_qkv_index_projection is True
+    assert metadata_params.fuse_qkv_index_projection is True
+    assert metadata_params.sharded_head_counts(mapping) == (32, 2)
+    assert metadata_params.sharded_index_head_count(mapping) == 2
+
+    kernel_cfg = MiniMaxM3SparseConfig.from_sparse_params(
+        sparse_params,
+        num_q_heads=32,
+        num_kv_heads=2,
+        head_dim=128,
+    )
+    assert kernel_cfg.num_index_heads == 2
+
+    compatibility_cfg = MiniMaxM3SparseAttentionConfig(
+        implementation="msa",
+        num_attention_heads=64,
+        num_key_value_heads=4,
+    )
+    compatibility_metadata = compatibility_cfg.to_sparse_metadata_params()
+    assert compatibility_metadata.sharded_index_head_count(mapping) == 4
+
+    with pytest.raises(ValueError, match=r"requires the 'msa' implementation"):
+        MiniMaxM3SparseAttentionConfig(
+            implementation="triton",
+            fuse_qkv_index_projection=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -489,7 +529,7 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
 
     class FakeIndexer:
         def select_blocks(self, *args: object, **kwargs: object) -> torch.Tensor:
-            del args
+            captured["index_k_cache"] = args[1]
             captured["head_major_output"] = kwargs["head_major_output"]
             return torch.zeros(num_tokens, 1, 16, dtype=torch.int32)
 
@@ -541,6 +581,7 @@ def test_run_indexer_routes_head_major_output_by_batch_mode(
 
     assert result.shape == (num_tokens, 1, 16)
     assert captured["head_major_output"] is expected_head_major
+    assert captured["index_k_cache"] is metadata.idx_k_cache
 
 
 @pytest.mark.parametrize(
@@ -608,3 +649,42 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed(
     assert not index_k_strided.is_contiguous()
     assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
     assert torch.equal(strided_scores, packed_scores)
+
+
+def test_msa_scratch_sizing_covers_spec_verify_tokens() -> None:
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = None
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 8
+    metadata.msa_max_score = torch.zeros(4 * 16 * 2)
+
+    with pytest.raises(ValueError, match=r"msa_max_score backing store"):
+        metadata._ensure_msa_decode_scratch_buffers(
+            num_index_heads=4,
+            max_batch=2,
+            capture_graph=False,
+            required_max_k_tiles=16,
+        )
+
+
+def test_per_token_valid_blocks_multi_token_decode() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        per_token_valid_blocks,
+    )
+
+    qo_lens = torch.tensor([4], dtype=torch.int32)
+    kv_lens = torch.tensor([10], dtype=torch.int32)
+    qo_offset = torch.tensor([6], dtype=torch.int32)
+    n_valid = per_token_valid_blocks(qo_lens, kv_lens, qo_offset, causal=True, block_size=2)
+    assert n_valid.tolist() == [4, 4, 5, 5]
+
+    qo_lens = torch.tensor([1, 3], dtype=torch.int32)
+    kv_lens = torch.tensor([9, 6], dtype=torch.int32)
+    n_valid = per_token_valid_blocks(qo_lens, kv_lens, kv_lens - qo_lens, causal=True, block_size=4)
+    assert n_valid.tolist() == [3, 1, 2, 2]
+
+
+def test_msa_target_requires_separate_32_token_draft_cache() -> None:
+    assert MiniMaxM3KVCacheManagerV2.supports_shared_draft_layers is False
+    assert MiniMaxM3KVCacheManagerV2.draft_manager_tokens_per_block == 32

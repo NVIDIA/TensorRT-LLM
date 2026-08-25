@@ -150,6 +150,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``sparse_index_dim`` — width of the index-K/V vectors.
     """
 
+    # INDEX_KEY is coalesced into the target's V2 pool. Dense Eagle3 draft
+    # layers cannot consume the synthetic AttentionOp view of that layout, so
+    # they require their own ordinary KV manager even under attention DP.
+    supports_shared_draft_layers = False
+
+    # MSA requires 128-token target pages. The dense Eagle3 generation kernel
+    # uses its validated 32-token page geometry in the separate draft manager.
+    draft_manager_tokens_per_block = 32
+
     def __init__(
         self,
         *args,
