@@ -33,6 +33,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 from tensorrt_llm.logger import logger
+
 if TYPE_CHECKING:
     from .config import DiffusionPipelineConfig
     from .pipeline import BasePipeline
