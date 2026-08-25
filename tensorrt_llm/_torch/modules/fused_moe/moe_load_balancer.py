@@ -1,4 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
+import mmap
 import os
 import threading
 from contextlib import AbstractContextManager, nullcontext
@@ -20,30 +36,72 @@ from ...utils import EventType
 from ..multi_stream_utils import do_multi_stream
 
 
-def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
-    """
-    Convert a tensor to a MoeWeight object.
+class _FileBackedSharedMemory:
+    """Shared, mmap-backed storage with the ``SharedMemory`` interface."""
 
-    Args:
-        t: The tensor to convert
+    def __init__(self,
+                 name: str,
+                 directory: str,
+                 create: bool = False,
+                 size: int = 0):
+        if os.path.basename(name) != name:
+            raise ValueError(f"Invalid EPLB shared-memory name: {name}")
+        os.makedirs(directory, exist_ok=True)
+        self._path = os.path.join(directory, name)
+        self._unlinked = False
+        flags = os.O_RDWR
+        if create:
+            flags |= os.O_CREAT | os.O_EXCL
+        fd = os.open(self._path, flags, 0o600)
+        try:
+            if create:
+                if size <= 0:
+                    raise ValueError(
+                        f"EPLB shared-memory size must be positive, got {size}")
+                os.posix_fallocate(fd, 0, size)
+            else:
+                size = os.fstat(fd).st_size
+            self._mmap = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
+        finally:
+            os.close(fd)
+
+    @property
+    def buf(self):
+        return self._mmap
+
+    def flush(self):
+        """Write dirty expert pages back before loading the next layer."""
+        self._mmap.flush()
+
+    def close(self):
+        self._mmap.close()
+
+    def unlink(self):
+        if self._unlinked:
+            return
+        try:
+            os.unlink(self._path)
+        except FileNotFoundError:
+            pass
+        self._unlinked = True
+
+
+def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
+    """Convert a tensor to a MoeWeight object for EPLB weight migration.
+
+    Expert weights are migrated as flat byte sequences regardless of their
+    logical strides. Both row-major (standard) and column-major (DeepGemm
+    FP8 block scales) tensors are handled uniformly: the ``numel * element_size``
+    raw storage bytes starting at ``data_ptr()`` are described as a single-row
+    matrix so the C++ engine always takes the ``cudaMemcpyAsync`` fast path.
     """
-    assert t.dim() <= 2, "t.dim() should be less than or equal to 2"
-    shape = [1, 1]
-    pitch = 1
-    elt_size = torch.tensor([], dtype=t.dtype).element_size()
-    if t.dim() == 2:
-        shape[0] = t.size(0)
-        shape[1] = t.size(1)
-        pitch = t.stride(0)
-    elif t.dim() == 1:
-        shape[1] = t.size(0)
-        pitch = t.size(0)
-    else:
-        pass
+    assert t.storage_offset() == 0, (
+        f"tensor must start at storage offset zero, got {t.storage_offset()}")
+    total_bytes = t.numel() * t.element_size()
     mw = _tbr.MoeWeight()
-    mw.height = shape[0]
-    mw.width = shape[1] * elt_size
-    mw.pitch = pitch * elt_size
+    mw.height = 1
+    mw.width = total_bytes
+    mw.pitch = total_bytes
     mw.weight_ptr = t.data_ptr()
     return mw
 
@@ -84,6 +142,13 @@ class HostMoeTensorSharer:
 
         self.loaded_shared_weights = []
 
+        self.file_backed_directory = os.getenv("TRTLLM_EPLB_SHM_DIR")
+        if self.file_backed_directory is not None:
+            logger.info_once(
+                "Using file-backed storage for online EPLB host weights at "
+                f"{self.file_backed_directory}",
+                key="eplb_file_backed_storage")
+
     def set_shared_memory_base_name(self, shared_memory_base_name):
         """
         Set the shared memory base name for the layer.
@@ -92,6 +157,17 @@ class HostMoeTensorSharer:
             shared_memory_base_name: The base name for the shared memory
         """
         self.shared_memory_base_name = shared_memory_base_name
+
+    @staticmethod
+    def get_flat_storage_view(t: torch.Tensor) -> torch.Tensor:
+        """Return a 1-D view of *t* in raw storage order, without copying.
+
+        ``as_strided((numel,), (1,))`` reads elements 0, 1, …, numel-1
+        directly from the underlying storage, preserving the original byte
+        sequence for both row-major and column-major tensors.  The caller
+        must ensure ``t.storage_offset() == 0``.
+        """
+        return t.detach().as_strided((t.numel(), ), (1, ))
 
     def get_shared_memory_name(self, rank: Optional[int] = None):
         """
@@ -107,6 +183,17 @@ class HostMoeTensorSharer:
                           str), "self.shared_memory_base_name must be a string"
         shared_memory_name = f"{self.shared_memory_base_name}_l{self.layer_id}_lr{rank}_all"
         return shared_memory_name
+
+    def _open_shared_memory(self,
+                            name: str,
+                            create: bool = False,
+                            size: int = 0):
+        if self.file_backed_directory is not None:
+            return _FileBackedSharedMemory(name,
+                                           self.file_backed_directory,
+                                           create=create,
+                                           size=size)
+        return shared_memory.SharedMemory(name=name, create=create, size=size)
 
     def pre_register_host_tensor_with_shape(self, expert_id: int, name: str,
                                             dtype, tensor_shape):
@@ -146,9 +233,12 @@ class HostMoeTensorSharer:
             name: The name of the weight
             t: The weight tensor
         """
-        assert len(
-            t.shape) <= 2, "tensor_shape dim must be less than or equal to 2"
-        assert t.is_contiguous() == True, "t.is_contiguous() must be True"
+        # Store a 1-D view of the raw storage bytes so that both row-major
+        # (standard) and column-major (DeepGemm FP8 block scales) tensors are
+        # migrated with the same code path.  as_strided avoids a copy here;
+        # finalize_layer_weights will call .contiguous().cpu() to materialise
+        # the data into the POSIX shared-memory segment.
+        t = self.get_flat_storage_view(t)
         assert (expert_id, name) not in self.shared_tensors.keys()
         assert self.expert_start <= expert_id < self.expert_end
         self.shared_tensors[(expert_id, name)] = t
@@ -192,19 +282,19 @@ class HostMoeTensorSharer:
 
         shm_name = self.get_shared_memory_name()
         try:
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
+            shm = self._open_shared_memory(shm_name,
+                                           create=True,
+                                           size=total_size)
         except FileExistsError:
             tensorrt_llm.logger.warning(
                 f'Found exist EPLB shared memory name: {shm_name}, unlinking...'
             )
-            existing_shm = shared_memory.SharedMemory(name=shm_name)
+            existing_shm = self._open_shared_memory(shm_name)
             existing_shm.close()
             existing_shm.unlink()
-            shm = shared_memory.SharedMemory(name=shm_name,
-                                             create=True,
-                                             size=total_size)
+            shm = self._open_shared_memory(shm_name,
+                                           create=True,
+                                           size=total_size)
         self.own_shm = shm
 
         offset = 0
@@ -227,6 +317,12 @@ class HostMoeTensorSharer:
                 ), f"key={key} already exists"
                 self.host_weights[key] = st
                 offset += aligned_size
+        # Online EPLB can stage hundreds of GiB per node. Explicitly make
+        # completed file-backed layers writeback-eligible before materializing
+        # the next layer, otherwise dirty mmap pages can exhaust the Slurm
+        # memory cgroup during checkpoint loading.
+        if isinstance(shm, _FileBackedSharedMemory):
+            shm.flush()
         self.shared_tensors = {}
 
         for raw_weight in self.loaded_shared_weights:
@@ -245,7 +341,7 @@ class HostMoeTensorSharer:
                 continue
 
             shm_name = self.get_shared_memory_name(rank)
-            shm = shared_memory.SharedMemory(name=shm_name)
+            shm = self._open_shared_memory(shm_name)
             self.imported_shms.append(shm)
 
             rank_expert_start = rank * self.expert_count // self.local_size
@@ -281,7 +377,8 @@ class HostMoeTensorSharer:
         """
         for shm in self.imported_shms:
             shm.close()
-            resource_tracker.unregister(shm._name, "shared_memory")
+            if isinstance(shm, shared_memory.SharedMemory):
+                resource_tracker.unregister(shm._name, "shared_memory")
         self.imported_shms = None
         if self.own_shm:
             self.own_shm.close()
@@ -293,6 +390,12 @@ class HostMoeTensorSharer:
         if self.own_shm:
             self.own_shm.unlink()
             self.own_shm = None
+
+
+class _MoeLoadBalancerRuntimeState:
+
+    def __init__(self) -> None:
+        self.active = False
 
 
 class SingleLayerMoeLoadBalancer:
@@ -308,7 +411,8 @@ class SingleLayerMoeLoadBalancer:
             expert_count: int,
             updates_enabled: bool = True,
             repeated_count=1,
-            aux_stream: Optional[torch.cuda.Stream] = None):
+            aux_stream: Optional[torch.cuda.Stream] = None,
+            runtime_state: Optional[_MoeLoadBalancerRuntimeState] = None):
         """
         Initialize a SingleLayerMoeLoadBalancer instance.
 
@@ -318,6 +422,7 @@ class SingleLayerMoeLoadBalancer:
             expert_count: total number of experts
             updates_enabled: whether to enable weight updates
             repeated_count: the repeated count of current layer, used when forward is repeated more than once like MTP.
+            runtime_state: shared state indicating whether this forward runs online EPLB synchronization
         """
         self.single_layer_load_balancer_impl = single_layer_load_balancer_impl
         self.single_layer_load_balancer_ptr = single_layer_load_balancer_impl.get_pointer(
@@ -325,6 +430,7 @@ class SingleLayerMoeLoadBalancer:
         self.expert_count = expert_count
         self.updates_enabled = updates_enabled
         self.repeated_count = repeated_count
+        self.runtime_state = runtime_state
         layer_id = self.single_layer_load_balancer_impl.get_layer_id()
         self.host_tensor_sharer = HostMoeTensorSharer(
             layer_id, expert_count,
@@ -388,6 +494,10 @@ class SingleLayerMoeLoadBalancer:
 
     def is_dynamic_routing(self):
         return self.updates_enabled
+
+    def is_runtime_active(self):
+        return self.updates_enabled and (self.runtime_state is None
+                                         or self.runtime_state.active)
 
     def need_load_shared_weights(self):
         return self.is_dynamic_routing()
@@ -519,6 +629,8 @@ class SingleLayerMoeLoadBalancer:
         """
         Start to wait for the GPU stage to complete.
         """
+        if not self.is_runtime_active():
+            return
         assert self.func_called_count["start_wait_gpu_stage"] == 0
         self.func_called_count["start_wait_gpu_stage"] += 1
         if self.updates_enabled:
@@ -537,6 +649,8 @@ class SingleLayerMoeLoadBalancer:
         """
         Done waiting for the GPU stage to complete.
         """
+        if not self.is_runtime_active():
+            return
         assert self.func_called_count["start_wait_gpu_stage"] == 1
         assert self.func_called_count["done_wait_gpu_stage"] == 0
         self.func_called_count["done_wait_gpu_stage"] += 1
@@ -548,6 +662,8 @@ class SingleLayerMoeLoadBalancer:
         """
         Start to set the CPU stage.
         """
+        if not self.is_runtime_active():
+            return
         assert self.func_called_count["done_wait_gpu_stage"] == 1
         assert self.func_called_count["start_set_cpu_stage"] == 0
         self.func_called_count["start_set_cpu_stage"] += 1
@@ -567,6 +683,8 @@ class SingleLayerMoeLoadBalancer:
         """
         Done setting the CPU stage.
         """
+        if not self.is_runtime_active():
+            return
         assert self.func_called_count["start_set_cpu_stage"] == 1
         for name in self.func_called_count:
             self.func_called_count[name] = 0
@@ -585,6 +703,8 @@ class SingleLayerMoeLoadBalancer:
             is_first_stage: Whether this is the first stage
             is_last_stage: Whether this is the last stage
         """
+        if not self.is_runtime_active():
+            return
         assert self.func_called_count["done_wait_gpu_stage"] == 1
         assert self.func_called_count["update_statistic_with_global_ids"] == 0
         self.func_called_count["update_local_statistic"] += 1
@@ -616,6 +736,8 @@ class SingleLayerMoeLoadBalancer:
         Returns:
             The local statistic tensor if using statistic else None
         """
+        if not self.is_runtime_active():
+            return None
         assert self.func_called_count["update_local_statistic"] > 0
         self.func_called_count["get_local_statistic_tensor"] += 1
         if self.updates_enabled:
@@ -634,6 +756,8 @@ class SingleLayerMoeLoadBalancer:
         Args:
             gathered_local_statistic_tensor: gathered local statistics info, should have shape (world_size, self.expert_count)
         """
+        if not self.is_runtime_active():
+            return
         assert self.func_called_count["get_local_statistic_tensor"] > 0
         assert self.func_called_count["update_statistic_with_local_ids"] == 0
         assert self.func_called_count["update_statistic_with_global_ids"] == 0
@@ -670,6 +794,8 @@ class SingleLayerMoeLoadBalancer:
             is_last_stage: Whether this is the last stage
             allreduce: The allreduce object
         """
+        if not self.is_runtime_active():
+            return
         assert self.func_called_count["done_wait_gpu_stage"] == 1
         assert self.func_called_count[
             "update_statistic_with_gathered_statistic"] == 0
@@ -704,6 +830,8 @@ class SingleLayerMoeLoadBalancer:
             is_first_stage: Whether this is the first stage
             is_last_stage: Whether this is the last stage
         """
+        if not self.is_runtime_active():
+            return
         assert self.func_called_count["done_wait_gpu_stage"] == 1
         assert self.func_called_count[
             "update_statistic_with_gathered_statistic"] == 0
@@ -737,7 +865,7 @@ class SingleLayerMoeLoadBalancer:
         Returns:
             A tensor of routed slot IDs
         """
-        if self.is_dynamic_routing():
+        if self.is_runtime_active():
             assert self.func_called_count["done_wait_gpu_stage"] == 1
             self.func_called_count["route"] += 1
         return torch.ops.trtllm.moe_load_balance_routing(
@@ -773,7 +901,8 @@ class MoeLoadBalancer:
                  ep_rank: int,
                  ep_size: int,
                  layer_updates_per_iter: int,
-                 shared_memory_base_name: Optional[str] = None):
+                 shared_memory_base_name: Optional[str] = None,
+                 iteration_interval: Optional[int] = None):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -782,11 +911,20 @@ class MoeLoadBalancer:
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
             shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
+            iteration_interval: Number of model forwards between online EPLB statistic/update iterations
         """
         self.is_shutdown = True
+        if iteration_interval is None:
+            iteration_interval = int(
+                os.getenv('TRTLLM_EPLB_ITERATION_INTERVAL', '1'))
+        if iteration_interval < 1:
+            raise ValueError(
+                f"iteration_interval must be positive, got {iteration_interval}"
+            )
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.layer_updates_per_iter = layer_updates_per_iter
+        self.iteration_interval = iteration_interval
         self.load_balancer_impl = _tbr.MoeLoadBalancer(ep_rank, ep_size,
                                                        layer_updates_per_iter)
         self._previous_balancer = None
@@ -797,7 +935,9 @@ class MoeLoadBalancer:
         self.is_shutdown = False
 
         self.iter_id = 0
+        self.forward_iter_id = 0
         self.in_iter = False
+        self.runtime_state = _MoeLoadBalancerRuntimeState()
 
         self.enable_statistic = False
         self.enable_update_weights = False
@@ -870,7 +1010,8 @@ class MoeLoadBalancer:
             expert_count,
             updates_enabled=updates_enabled,
             repeated_count=repeat_count,
-            aux_stream=aux_stream)
+            aux_stream=aux_stream,
+            runtime_state=self.runtime_state)
         single_layer_load_balancer.set_shared_memory_base_name(
             self.shared_memory_base_name)
         self.single_layer_load_balancers.append(single_layer_load_balancer)
@@ -913,6 +1054,28 @@ class MoeLoadBalancer:
         if enable_update_weights is not None:
             self.enable_update_weights = enable_update_weights
 
+    def get_next_iter_mode(self) -> str:
+        """Return the online EPLB action for the next model forward."""
+        if self.iteration_interval == 1:
+            return 'sample'
+        if not self.enable_statistic and not self.enable_update_weights:
+            return 'skip'
+        phase = self.forward_iter_id % self.iteration_interval
+        if phase == 0:
+            return 'sample'
+        if phase == 1:
+            return 'drain'
+        return 'skip'
+
+    def requires_eager_forward(self) -> bool:
+        """Whether the next forward must run eager for EPLB synchronization."""
+        return self.is_dynamic_routing() and self.get_next_iter_mode() != 'skip'
+
+    def advance_forward_iter(self) -> None:
+        if self.iteration_interval > 1 and (self.enable_statistic
+                                            or self.enable_update_weights):
+            self.forward_iter_id += 1
+
     def reconfigure_mask_only(self, dead_ranks: list[int]) -> None:
         """
         Reconfigure EPLB routing so slots on dead EP ranks are unreachable.
@@ -926,14 +1089,19 @@ class MoeLoadBalancer:
                 "Cannot reconfigure EPLB mask while an iteration is active")
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
 
-    def start_iter(self):
+    def start_iter(self,
+                   enable_statistic: Optional[bool] = None,
+                   enable_update_weights: Optional[bool] = None):
         """
         Start a new iteration.
         """
         assert self.in_iter == False, "already in forward"
         self.in_iter = True
-        self.load_balancer_impl.start_iter(self.iter_id, self.enable_statistic,
-                                           self.enable_update_weights)
+        self.runtime_state.active = True
+        statistic = self.enable_statistic if enable_statistic is None else enable_statistic
+        update_weights = self.enable_update_weights if enable_update_weights is None else enable_update_weights
+        self.load_balancer_impl.start_iter(self.iter_id, statistic,
+                                           update_weights)
 
     def end_iter(self):
         """
@@ -945,6 +1113,7 @@ class MoeLoadBalancer:
         assert self.in_iter, "not in forward, cannot end_iter"
         self.load_balancer_impl.end_iter(self.iter_id)
         self.in_iter = False
+        self.runtime_state.active = False
         self.iter_id += 1
 
     def shutdown(self):
@@ -968,7 +1137,10 @@ class MoeLoadBalancer:
         Returns:
             A string representation of the load balancer
         """
-        return f"MoeLoadBalancer(ep_rank={self.ep_rank}, ep_size={self.ep_size}, layer_updates_per_iter={self.layer_updates_per_iter})"
+        return (
+            f"MoeLoadBalancer(ep_rank={self.ep_rank}, ep_size={self.ep_size}, "
+            f"layer_updates_per_iter={self.layer_updates_per_iter}, "
+            f"iteration_interval={self.iteration_interval})")
 
     def __enter__(self):
         """
@@ -1059,8 +1231,8 @@ def maybe_create_moe_load_balancer(
             layer_updates_per_iter=model_config.moe_load_balancer.
             layer_updates_per_iter)
         logger.info(
-            f"Created MoE LoadBalancer, layer_updates_per_iter={model_config.moe_load_balancer.layer_updates_per_iter}..."
-        )
+            f"Created MoE LoadBalancer, layer_updates_per_iter={model_config.moe_load_balancer.layer_updates_per_iter}, "
+            f"iteration_interval={moe_load_balancer.iteration_interval}...")
     return moe_load_balancer
 
 
@@ -1073,6 +1245,7 @@ class MoeLoadBalancerIterContext:
         self.moe_load_balancer = moe_load_balancer
         self.enable_statistic = enable_statistic
         self.enable_updates = enable_updates
+        self.iter_mode = 'skip'
 
     def __enter__(self):
         """
@@ -1085,7 +1258,15 @@ class MoeLoadBalancerIterContext:
         ):
             self.moe_load_balancer.set_iter_info(self.enable_statistic,
                                                  self.enable_updates)
-            self.moe_load_balancer.start_iter()
+            self.iter_mode = self.moe_load_balancer.get_next_iter_mode()
+            if self.iter_mode == 'sample':
+                self.moe_load_balancer.start_iter()
+            elif self.iter_mode == 'update':
+                self.moe_load_balancer.start_iter(enable_statistic=False,
+                                                  enable_update_weights=True)
+            elif self.iter_mode == 'drain':
+                self.moe_load_balancer.start_iter(enable_statistic=False,
+                                                  enable_update_weights=False)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -1102,7 +1283,9 @@ class MoeLoadBalancerIterContext:
         """
         if self.moe_load_balancer is not None and not self.moe_load_balancer.is_static_routing(
         ):
-            self.moe_load_balancer.end_iter()
+            if self.iter_mode != 'skip':
+                self.moe_load_balancer.end_iter()
+            self.moe_load_balancer.advance_forward_iter()
         return False
 
 
