@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/common/config.h"
 
+#include <memory>
+
 namespace tensorrt_llm::runtime
 {
 class McastDeviceMemory;
@@ -29,11 +31,11 @@ namespace common
 {
 using McastDeviceMemory = tensorrt_llm::runtime::McastDeviceMemory;
 // Register a buffer with the McastDeviceMemory class. This function does not check if the ptr belongs to the buffer!
-void registerMcastDevMemBuffer(void* ptr, McastDeviceMemory* buf);
+void registerMcastDevMemBuffer(void* ptr, std::shared_ptr<McastDeviceMemory> const& buf);
 void unregisterMcastDevMemBuffer(McastDeviceMemory* buf);
 // Find the buffer object from the given pointer, if it has been registered. This function does not take any size
 // information. Thus a derived pointer cannot used as the key.
-McastDeviceMemory* findMcastDevMemBuffer(void* ptr);
+std::shared_ptr<McastDeviceMemory> findMcastDevMemBuffer(void* ptr);
 
 } // namespace common
 
