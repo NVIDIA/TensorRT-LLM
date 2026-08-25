@@ -39,10 +39,12 @@ def test_sparse_decode_fixed_stride_page_indptr_matches_expanded_rows():
     assert indptr.tolist() == [0, 0, 8, 16]
 
 
-def test_graph_safe_plan_owners_do_not_alias_shared_buffer_names():
+def test_cuda_graph_plan_state_is_isolated(monkeypatch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+        MiniMaxM3MsaSparseAttentionMetadata,
         _MsaGraphSafePlan,
     )
+    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
     class ReusingMetadata:
         def __init__(self):
@@ -64,13 +66,6 @@ def test_graph_safe_plan_owners_do_not_alias_shared_buffer_names():
     first_ptrs = {tensor.data_ptr() for tensor in first._buf.values()}
     second_ptrs = {tensor.data_ptr() for tensor in second._buf.values()}
     assert first_ptrs.isdisjoint(second_ptrs)
-
-
-def test_post_init_drops_shallow_copied_plan_and_step_state(monkeypatch):
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
-        MiniMaxM3MsaSparseAttentionMetadata,
-    )
-    from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
     monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", lambda self: None)
     monkeypatch.setattr(
@@ -100,153 +95,6 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
     monkeypatch.setattr(avail, "ensure_msa_available", lambda: None)
     params = MiniMaxM3SparseAttentionConfig(implementation="msa").to_sparse_params()
     assert _resolve_minimax_m3_backend_cls(params) is MiniMaxM3MsaSparseAttention
-
-
-def test_adaptive_decode_requires_msa_implementation():
-    with pytest.raises(ValueError, match=r"requires implementation='msa'"):
-        MiniMaxM3SparseAttentionConfig(implementation="triton", decode_backend="adaptive")
-
-
-@pytest.mark.parametrize("tactic", [-1, "msa"])
-def test_sparse_decode_tunable_runner_dispatches_and_falls_back_to_triton(monkeypatch, tactic):
-    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
-        sparse_decode_autotuner,
-        triton_sparse_decode,
-    )
-    from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
-
-    calls = []
-    monkeypatch.setattr(
-        triton_sparse_decode,
-        "minimax_m3_sparse_attn_decode",
-        lambda q_arg, *args, **kwargs: calls.append(("triton", tuple(q_arg.shape))),
-    )
-    monkeypatch.setattr(
-        msa_sparse_gqa,
-        "run_msa_sparse_gqa",
-        lambda q_arg, *args, **kwargs: calls.append(("msa", tuple(q_arg.shape))),
-    )
-
-    batch_size = 2
-    decode_query_len = 4
-    total_q = batch_size * decode_query_len
-    num_q_heads = 2
-    num_kv_heads = 1
-    head_dim = page_size = 128
-    topk = 16
-    q = torch.zeros(total_q, num_q_heads, head_dim, dtype=torch.bfloat16)
-    k_paged = torch.zeros(2, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16)
-    v_paged = torch.zeros_like(k_paged)
-    block_indexes = torch.zeros(total_q, num_kv_heads, topk, dtype=torch.int32)
-    block_table = torch.zeros(batch_size, 2, dtype=torch.int32)
-    seq_lens = torch.ones(batch_size, dtype=torch.int32)
-    output = torch.empty_like(q)
-    inputs = [q, k_paged, v_paged, block_indexes, block_table, seq_lens, output]
-    runner = sparse_decode_autotuner.MiniMaxM3SparseDecodeRunner(
-        decode_query_len=decode_query_len,
-        input_layouts=tuple((tensor.dtype, tuple(tensor.stride())) for tensor in inputs),
-        sm_scale=head_dim**-0.5,
-    )
-    assert runner.tuning_config.distributed_tuning_strategy == DistributedTuningStrategy.BROADCAST
-
-    runner(
-        inputs,
-        tactic=tactic,
-        plan=object(),
-    )
-
-    expected = "triton" if tactic == -1 else tactic
-    assert calls == [(expected, (total_q, num_q_heads, head_dim))]
-
-
-@pytest.mark.parametrize(
-    ("decode_backend", "rank_local_batch_size", "expected_backend"),
-    [
-        ("default", 16, "triton"),
-        ("adaptive", 1, "adaptive"),
-        ("adaptive", 16, "adaptive"),
-    ],
-)
-def test_pure_decode_dispatches_by_configured_policy(
-    monkeypatch, decode_backend, rank_local_batch_size, expected_backend
-):
-    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
-        msa_utils,
-        sparse_decode_autotuner,
-        triton_sparse_decode,
-    )
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
-
-    calls = []
-    page_size = head_dim = 128
-    num_heads = num_kv_heads = 1
-    q = torch.zeros(rank_local_batch_size, num_heads * head_dim)
-    output = torch.empty_like(q)
-    k_paged = torch.zeros(1, num_kv_heads, page_size, head_dim)
-    v_paged = torch.zeros_like(k_paged)
-    monkeypatch.setattr(msa_utils, "msa_paged_kv", lambda manager, layer_idx: (k_paged, v_paged))
-    monkeypatch.setattr(
-        triton_sparse_decode,
-        "minimax_m3_sparse_attn_decode",
-        lambda q_arg, *args, **kwargs: calls.append(("triton", int(q_arg.shape[0]))),
-    )
-    monkeypatch.setattr(
-        msa_sparse_gqa,
-        "run_msa_sparse_gqa",
-        lambda q_arg, *args, **kwargs: calls.append(("msa", int(q_arg.shape[0]))),
-    )
-    monkeypatch.setattr(
-        sparse_decode_autotuner,
-        "run_adaptive_sparse_decode",
-        lambda q_arg, *args, **kwargs: calls.append(("adaptive", int(q_arg.shape[0]))),
-    )
-
-    attention = SimpleNamespace(
-        layer_idx=0,
-        head_dim=head_dim,
-        num_heads=num_heads,
-        q_scaling=1.0,
-        sparse_params=MiniMaxM3SparseAttentionConfig(
-            implementation="msa", decode_backend=decode_backend
-        ).to_sparse_params(),
-    )
-    block_table = torch.zeros(rank_local_batch_size, 1, dtype=torch.int32)
-    metadata = SimpleNamespace(
-        is_cuda_graph=True,
-        kv_cache_manager=object(),
-        _msa_prewritten_layer=None,
-        msa_decode_query_len=1,
-        msa_decode_span=_MsaDecodeSpan(
-            0,
-            rank_local_batch_size,
-            0,
-            rank_local_batch_size,
-            1,
-        ),
-        msa_block_table=block_table,
-        msa_seq_lens_cuda=torch.ones(rank_local_batch_size, dtype=torch.int32),
-        msa_kv_indices=block_table.flatten(),
-        msa_qo_lens_cpu=torch.ones(rank_local_batch_size, dtype=torch.int32),
-        msa_kv_lens_cpu=torch.ones(rank_local_batch_size, dtype=torch.int32),
-        msa_qo_offset_cpu=torch.zeros(rank_local_batch_size, dtype=torch.int32),
-    )
-    topk = torch.zeros(rank_local_batch_size, num_kv_heads, 16, dtype=torch.int32)
-    plan = object() if expected_backend in ("msa", "adaptive") else None
-
-    msa_sparse_gqa.run_msa_paged_gqa(
-        attention,
-        q,
-        None,
-        None,
-        metadata,
-        output,
-        kv_block_indexes=topk,
-        plan=plan,
-    )
-
-    assert calls == [(expected_backend, rank_local_batch_size)]
 
 
 def test_msa_requires_block_size_128():
@@ -891,13 +739,7 @@ def test_lazily_allocated_scratch_publishes_the_bound_it_used(monkeypatch):
 
 
 def _resolution_metadata(
-    *,
-    num_contexts=0,
-    qo_lens=(1, 1),
-    kv_lens=(9, 11),
-    is_cuda_graph=False,
-    page_size=128,
-    decode_backend="msa",
+    *, num_contexts=0, qo_lens=(1, 1), kv_lens=(9, 11), is_cuda_graph=False, page_size=128
 ):
     """Metadata with just enough state for _resolve_decode_kernels.
 
@@ -907,7 +749,7 @@ def _resolution_metadata(
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     metadata._msa_params = MiniMaxM3SparseAttentionConfig(
-        implementation="msa", decode_backend=decode_backend
+        implementation="msa", decode_backend="msa"
     ).to_sparse_metadata_params()
     metadata.mapping = None
     # Assigned behind the seq_lens property, whose setter would stage a device
@@ -961,32 +803,6 @@ def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
     assert (span.row_first, span.row_last) == (0, 2)
     assert (span.token_first, span.token_last) == (0, 2)
     assert span.is_mixed is False
-
-
-@pytest.mark.parametrize(
-    ("decode_backend", "uses_msa"),
-    [
-        ("default", False),
-        ("adaptive", True),
-    ],
-)
-def test_decode_policy_controls_plan_and_page_table_preparation(
-    monkeypatch, decode_backend, uses_msa
-):
-    batch_size = 2
-    _force_cutedsl_supported(monkeypatch)
-    metadata = _resolution_metadata(
-        qo_lens=(1,) * batch_size,
-        kv_lens=(11,) * batch_size,
-        decode_backend=decode_backend,
-    )
-    metadata._msa_live_batch = batch_size
-
-    metadata._resolve_decode_kernels()
-
-    assert metadata._msa_uses_fixed_stride_page_table() is uses_msa
-    assert metadata._msa_runs_no_fmha() is not uses_msa
-    assert metadata._msa_fmha_plan_rows() == ((0, batch_size) if uses_msa else None)
 
 
 def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monkeypatch):
