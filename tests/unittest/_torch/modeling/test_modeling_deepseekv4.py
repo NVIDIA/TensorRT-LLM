@@ -1328,10 +1328,10 @@ def _make_cos_sin(device: torch.device) -> torch.Tensor:
 def _reference(
     q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, num_heads: int
 ) -> torch.Tensor:
-    """RMS-norm, round to BF16, rotate the tail, and scale for FP8.
+    """RMS-norm, round to the input dtype, rotate and round again, then scale for FP8.
 
-    The BF16 round matches the unfused norm-store/RoPE-load path and is required
-    before quantization to preserve DeepSeek-V4 model accuracy.
+    The two input-dtype rounds match the unfused norm-store/RoPE-load and
+    RoPE-store/quantization-load boundaries.
     """
     num_tokens = q.shape[0]
     x = q.view(num_tokens, num_heads, HEAD_DIM).float()
@@ -1349,6 +1349,7 @@ def _reference(
     rotated = torch.empty_like(rope)
     rotated[..., 0::2] = cos * even - sin * odd
     rotated[..., 1::2] = cos * odd + sin * even
+    rotated = rotated.to(q.dtype).float()
 
     return torch.cat([nope, rotated * QUANT_SCALE], dim=-1)
 
@@ -1395,8 +1396,8 @@ def _assert_matches(quant_q, q_pe, reference, num_heads):
     expected = reference.to(torch.float8_e4m3fn).float()
 
     differing = got != expected
-    frac = differing.float().mean().item()
-    assert frac < 0.01, f"{frac:.4%} of FP8 codes differ from the reference"
+    num_differing = int(differing.sum().item())
+    assert num_differing <= 16, f"{num_differing} FP8 codes differ from the reference"
 
     if differing.any():
         scale = torch.maximum(got.abs(), expected.abs()).clamp_min(1e-6)
@@ -1414,7 +1415,8 @@ def _assert_matches(quant_q, q_pe, reference, num_heads):
     [(4, 2), (6, 3)],
     ids=["heads4_seqlen2_pow2", "heads6_seqlen3_divide"],
 )
-def test_fused_rope_generation_positions(num_heads: int, seq_len: int) -> None:
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_rope_generation_positions(num_heads: int, seq_len: int, dtype: torch.dtype) -> None:
     """Uniform query length: position = cache_len[batch] - seq_len + local_token.
 
     The parameters flip both power-of-two shortcuts the kernel takes (`row /
@@ -1426,7 +1428,7 @@ def test_fused_rope_generation_positions(num_heads: int, seq_len: int) -> None:
     num_seqs = 3
     num_tokens = num_seqs * seq_len
 
-    q = torch.randn((num_tokens, num_heads * HEAD_DIM), dtype=torch.bfloat16, device=device)
+    q = torch.randn((num_tokens, num_heads * HEAD_DIM), dtype=dtype, device=device)
     cos_sin = _make_cos_sin(device)
     cache_seq_lens = torch.tensor([16, 40, 71], dtype=torch.int32, device=device)
 
@@ -1444,7 +1446,10 @@ def test_fused_rope_generation_positions(num_heads: int, seq_len: int) -> None:
     [(4, 0), (6, 5)],
     ids=["heads4_fresh_prefill", "heads6_chunked_prefill"],
 )
-def test_fused_rope_context_positions(num_heads: int, cached_offset: int) -> None:
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_rope_context_positions(
+    num_heads: int, cached_offset: int, dtype: torch.dtype
+) -> None:
     """Ragged: position = local_token + (cache_len[seq] - current_seq_len).
 
     `cached_offset > 0` is the chunked-prefill / block-reuse case, where part of
@@ -1463,7 +1468,7 @@ def test_fused_rope_context_positions(num_heads: int, cached_offset: int) -> Non
     cache_seq_lens = torch.tensor(
         [s + cached_offset for s in seq_lens], dtype=torch.int32, device=device
     )
-    q = torch.randn((num_tokens, num_heads * HEAD_DIM), dtype=torch.bfloat16, device=device)
+    q = torch.randn((num_tokens, num_heads * HEAD_DIM), dtype=dtype, device=device)
     cos_sin = _make_cos_sin(device)
 
     quant_q, q_pe = _run_op(q, num_heads, cos_sin, cache_seq_lens, 0, cu_q_seqlens)

@@ -89,11 +89,16 @@ struct Vec2Traits<__nv_bfloat16>
 };
 
 template <typename T>
+__device__ __forceinline__ float2 roundToInput(float2 value)
+{
+    auto const rounded = Vec2Traits<T>::fromFloat2(value);
+    return Vec2Traits<T>::toFloat2(rounded);
+}
+
+template <typename T>
 __device__ __forceinline__ float2 normalizeAndRoundToInput(float2 value, float normScale)
 {
-    float2 const normalized{value.x * normScale, value.y * normScale};
-    auto const rounded = Vec2Traits<T>::fromFloat2(normalized);
-    return Vec2Traits<T>::toFloat2(rounded);
+    return roundToInput<T>(float2{value.x * normScale, value.y * normScale});
 }
 
 __device__ __forceinline__ float warpReduceSum(float value)
@@ -283,10 +288,9 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
     sumSquares = warpReduceSum(sumSquares);
     float const normScale = rsqrtf(sumSquares / static_cast<float>(kHeadDim) + eps);
 
-    // Preserve the legacy two-kernel precision contract: RMSNorm stores T
-    // (bf16 or half), then the quantization/RoPE kernel reloads T before the
-    // FP8 conversion. Skipping this round changes enough FP8 codes to regress
-    // DeepSeek-V4 model accuracy.
+    // Preserve the legacy multi-kernel precision contract: RMSNorm stores T
+    // (bf16 or half) before RoPE/quantization, and RoPE stores T again before
+    // the standalone FP8 conversion. Skipping either round changes FP8 codes.
 
     // Position depends on the token, which every lane of the warp shares, so this is
     // warp-uniform and hoisted out of the store loop.
@@ -366,7 +370,9 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
                     float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairBase + j];
                     float2 const rotated{
                         coef.x * normalized.x - coef.y * normalized.y, coef.x * normalized.y + coef.y * normalized.x};
-                    out.pairs[j] = __nv_fp8x2_e4m3(float2{rotated.x * quantScale, rotated.y * quantScale});
+                    float2 const roundedRotated = roundToInput<T>(rotated);
+                    out.pairs[j]
+                        = __nv_fp8x2_e4m3(float2{roundedRotated.x * quantScale, roundedRotated.y * quantScale});
                 }
                 *reinterpret_cast<typename Fp8VecStore<kEltsPerVec>::Type*>(nopeOut + vecIdx * kEltsPerVec)
                     = out.packed;
@@ -406,8 +412,9 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
                 float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairIdx];
                 float2 const rotated{
                     coef.x * normalized.x - coef.y * normalized.y, coef.x * normalized.y + coef.y * normalized.x};
+                float2 const roundedRotated = roundToInput<T>(rotated);
                 nopeOutPair[kNopePairs + ropePairIdx]
-                    = __nv_fp8x2_e4m3(float2{rotated.x * quantScale, rotated.y * quantScale});
+                    = __nv_fp8x2_e4m3(float2{roundedRotated.x * quantScale, roundedRotated.y * quantScale});
             }
             else
             {
