@@ -68,6 +68,8 @@ std::pair<uint64_t, uint64_t> PeftCacheManager::getMaxNumSlots(PeftCacheManagerC
     tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
     runtime::BufferManager const& bufferManager)
 {
+    // A positive numDeviceModuleLayer selects explicit logical capacity; zero selects
+    // percentage-based capacity and therefore requires a device byte budget.
     auto const deviceCacheByteBudget = config.numDeviceModuleLayer > 0
         ? std::nullopt
         : std::make_optional(getDeviceCacheByteBudget(config, bufferManager));
@@ -121,6 +123,8 @@ std::pair<runtime::LoraCachePageManagerConfig, runtime::LoraCachePageManagerConf
 PeftCacheManager::getPageManagerConfig(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
     runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager)
 {
+    // A positive numDeviceModuleLayer selects explicit logical capacity; zero selects
+    // percentage-based capacity and therefore requires a device byte budget.
     auto const deviceCacheByteBudget = config.numDeviceModuleLayer > 0
         ? std::nullopt
         : std::make_optional(getDeviceCacheByteBudget(config, bufferManager));
