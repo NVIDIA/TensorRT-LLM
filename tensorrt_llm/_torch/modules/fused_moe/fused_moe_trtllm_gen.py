@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
@@ -31,12 +30,12 @@ from ...model_config import ModelConfig
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
                       Fp4QuantizedTensor, MxFp8QuantizedTensor)
 from ..gated_mlp import GatedMLP
+from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
                             require_comm_plan)
 from .impl_environment import MoEDep
-from .interface import (FORCE_SEPARATED_ROUTING, MoE, MoEWeightLoadingMode,
-                        _reject)
+from .interface import FORCE_SEPARATED_ROUTING, MoEWeightLoadingMode, _reject
 from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
 
 # isort: off
@@ -60,7 +59,7 @@ class RoutingParams:
     routed_scaling_factor: Optional[float]
 
 
-class TRTLLMGenFusedMoE(MoE):
+class TRTLLMGenFusedMoE(MoEImplBase):
     """
     Fused Mixture of Experts (MoE) Layer with performance tuning.
 
@@ -238,13 +237,15 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
         swiglu_limit_scalar: Optional[float] = None,
-        init_load_balancer: bool = True,
+        init_load_balancer: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
         trtllm_gen_activation_alpha: Optional[float] = None,
         trtllm_gen_activation_beta: Optional[float] = None,
     ):
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -280,12 +281,6 @@ class TRTLLMGenFusedMoE(MoE):
         self.use_flashinfer = self._check_flashinfer_backend_support()
         backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
         self.op_backend: MoEOpBackend = get_op_backend(backend_name)
-
-        # Note: Load balancer initialization is handled by base class _init_load_balancer()
-        # If no load balancer is available, the base class will set:
-        # - self.num_slots = self.num_experts
-        # - self.expert_size_per_partition = self.num_experts // self.ep_size
-        # - self.initial_global_assignments, self.slot_start, self.slot_end, etc.
 
         self._weights_created = False
         self.num_fused_shared_expert = 0
@@ -657,21 +652,6 @@ class TRTLLMGenFusedMoE(MoE):
             self.swiglu_alpha.data.fill_(float(
                 self.trtllm_gen_activation_alpha))
             self.swiglu_beta.data.fill_(float(self.trtllm_gen_activation_beta))
-
-    def load_weights(self,
-                     weights: List[Dict],
-                     allow_partial_loading: bool = False):
-        assert self._weights_created
-
-        assert len(weights) == 1
-        weights = weights[0]
-
-        kargs = {}
-        if "allow_partial_loading" in inspect.getfullargspec(
-                self.quant_method.load_weights).args:
-            kargs["allow_partial_loading"] = allow_partial_loading
-        self.quant_method.load_weights(self, weights, self.weight_loading_mode,
-                                       **kargs)
 
     def try_fused_kimi_route_quant(
         self,

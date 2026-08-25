@@ -559,7 +559,6 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_tree=is_spec_dec_tree,
             max_draft_len=max_total_draft_tokens,
             max_total_draft_tokens=max_total_draft_tokens,
-            model_is_wrapped=False,
             spec_tree_manager=spec_tree_mgr,
         )
 
@@ -633,7 +632,6 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=is_tree_phase1,
             max_draft_len=gen_input_ids_1.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_1.size(-1) - 1,
-            model_is_wrapped=False,
             spec_metadata=spec_metadata_phase1,
             spec_tree_manager=spec_tree_mgr_phase1)
 
@@ -708,7 +706,6 @@ class TestLlama(unittest.TestCase):
             is_spec_dec_dynamic_tree=is_tree_ref,
             max_draft_len=gen_input_ids_ref.size(-1) - 1,
             max_total_draft_tokens=gen_input_ids_ref.size(-1) - 1,
-            model_is_wrapped=False,
             spec_metadata=spec_metadata_ref,
             spec_tree_manager=spec_tree_mgr_ref)
 

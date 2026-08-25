@@ -213,8 +213,11 @@ class KVCacheManagerConfig:
 
     initial_pool_ratio: list[float] | None = None
     """
-    User-provided initial memory partitioning between pool groups. When set, this
-    takes precedence over typical_step and constraints for initial sizing.
+    One positive, normalized hot-tier byte-quota weight per layer group. Cold-tier
+    initialization preserves the implied layer-group slot-count proportions while
+    accounting for cold page sizes. When set, this takes precedence over typical_step
+    and constraints for initial ratio selection; constraints remain hot-level feasibility
+    floors.
     """
 
     swa_scratch_reuse: SwaScratchReuseConfig | None = None

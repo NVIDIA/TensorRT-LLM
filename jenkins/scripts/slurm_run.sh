@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Set up error handling
 set -xEeuo pipefail
@@ -15,9 +29,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
     fi
 fi
 
-# Aggregated mode will run install together with pytest in slurm_run.sh
+# Aggregated mode and infrastructure dry runs install in slurm_run.sh.
 # Disaggregated mode will run install separately in slurm_install.sh
-if [[ "$stageName" != *Disagg* ]]; then
+if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]; then
     installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
     source "$installScriptPath"
     slurm_install_setup
@@ -71,6 +85,61 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
         fi
     done
 fi
+
+# The install lock in slurm_install.sh lives under $resourcePathNode (/tmp), so it
+# is node-local: its wait loop only fences $SLURM_LOCALID peers on the same node,
+# and a node can never observe another node's lock. Nothing else stops one node
+# from reaching `eval $pytestCommand` below while another is still installing, and
+# the per-rank work above skews the ranks further (non-zero ranks cover the
+# coverage-config write with a blind `sleep 30`, and slurm_setup_runtime_env shells
+# out to pip3). Pytest's first action is `import tensorrt_llm`, whose module-scope
+# MPI collective must be entered by every rank; under --mpi=pmix -- added exactly
+# when nodeCount > 1 -- that collective has a 300s fence timeout, so the skew
+# aborts every rank instead of merely running late. Fence every rank on the shared
+# $jobWorkspace so they enter pytest together.
+slurm_wait_all_ranks() {
+    local numRanks="${SLURM_NTASKS:-1}"
+    if [ "$numRanks" -le 1 ] || [ -z "${jobWorkspace:-}" ]; then
+        return 0
+    fi
+
+    # Keyed per job *and* per step: $jobWorkspace outlives a single step, so
+    # markers from another job, or from an earlier step of this job, must not
+    # satisfy the count. Slurm assigns one step id per step across all of its
+    # nodes, so every rank of a step agrees on this path.
+    local readyDir="$jobWorkspace/run_ready_job_${SLURM_JOB_ID:-local}_step_${SLURM_STEP_ID:-0}"
+    mkdir -p "$readyDir"
+    touch "$readyDir/rank_${SLURM_PROCID}.ready"
+
+    # Bounded so a dead rank fails the stage loudly instead of hanging until the
+    # partition walltime kills it; the ceiling exceeds the 2700s pip3 retry budget
+    # in slurm_install.sh so a merely slow rank still releases the barrier.
+    local timeoutSecs=3600
+    local deadline=$((SECONDS + timeoutSecs))
+    local markers ready
+    while true; do
+        # Counted with a glob rather than `ls | wc -l`: under `set -Eeuo pipefail` a
+        # failing `ls` propagates into the assignment and fires the ERR trap. The
+        # touch above guarantees at least one match, so no nullglob is needed.
+        markers=("$readyDir"/*.ready)
+        ready=${#markers[@]}
+        if [ "$ready" -ge "$numRanks" ]; then
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "ERROR: rank ${SLURM_PROCID} timed out after ${timeoutSecs}s waiting for" \
+                 "all $numRanks ranks to be ready; ready: $ready/$numRanks"
+            return 1
+        fi
+        # One rank reports progress; all of them would spam the log every 10s.
+        if [ "$SLURM_PROCID" -eq 0 ]; then
+            echo "(Waiting for all $numRanks ranks to be ready) ready: $ready/$numRanks"
+        fi
+        sleep 10
+    done
+}
+
+slurm_wait_all_ranks
 
 # Turn off "exit on error" so the following lines always run
 set +e

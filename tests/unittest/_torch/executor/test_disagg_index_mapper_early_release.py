@@ -24,7 +24,8 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, PyExecutor
+from tensorrt_llm._torch.disaggregation.executor.transfer_manager import AsyncTransferManager
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
 
