@@ -55,6 +55,9 @@ def _wait_for_process_exit(pid: int, timeout: float = 10.0) -> None:
 
 
 def _pause() -> None:
+    # Keep the fixture process alive without polling or holding a Python lock.
+    # SIGKILL terminates the process while blocked and never returns; the loop
+    # only handles an unrelated caught signal that returns normally.
     while True:
         signal.pause()
 
@@ -114,6 +117,10 @@ def _run_owned_worker_coordinator(
                     patch.object(
                         executor_module,
                         "find_free_port",
+                        # DiffusionRemoteClient requests the distributed master,
+                        # request ZMQ, and response ZMQ ports in this order. The
+                        # patched networking paths below never bind these ports;
+                        # fixed placeholders keep construction deterministic.
                         side_effect=[29500, 29501, 29502],
                     ),
                     patch.object(
