@@ -94,6 +94,7 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
 
     monkeypatch.setattr(avail, "ensure_msa_available", lambda: None)
     params = MiniMaxM3SparseAttentionConfig(implementation="msa").to_sparse_params()
+    assert params.sparse_gqa_decode_backend == "adaptive"
     assert _resolve_minimax_m3_backend_cls(params) is MiniMaxM3MsaSparseAttention
 
 
@@ -749,7 +750,7 @@ def _resolution_metadata(
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     metadata._msa_params = MiniMaxM3SparseAttentionConfig(
-        implementation="msa", decode_backend="msa"
+        implementation="msa", sparse_gqa_decode_backend="msa"
     ).to_sparse_metadata_params()
     metadata.mapping = None
     # Assigned behind the seq_lens property, whose setter would stage a device
@@ -1302,7 +1303,7 @@ def _mixed_batch_sparse_gqa_case(*, page_size, head_dim, num_kv_heads, group, to
     attention.num_heads = num_heads
     attention.q_scaling = 1.0
     attention.sparse_params = MiniMaxM3SparseAttentionConfig(
-        implementation="msa", decode_backend="msa"
+        implementation="msa", sparse_gqa_decode_backend="msa"
     ).to_sparse_params()
 
     fields = dict(
@@ -1431,7 +1432,7 @@ def test_pure_decode_sparse_gqa_uses_preplanned_msa_and_matches_triton(monkeypat
     attention.num_heads = num_heads
     attention.q_scaling = 1.0
     attention.sparse_params = MiniMaxM3SparseAttentionConfig(
-        implementation="msa", decode_backend="msa"
+        implementation="msa", sparse_gqa_decode_backend="msa"
     ).to_sparse_params()
     metadata = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(

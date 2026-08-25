@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 _INIT_SCORE = 1e30
 _LOCAL_SCORE = 1e29
 
-MiniMaxM3DecodeBackend = Literal["default", "msa", "adaptive"]
+MiniMaxM3SparseGQADecodeBackend = Literal["triton", "msa", "adaptive"]
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class MiniMaxM3SparseParams(SparseParams):
     score_type: str = "max"
     disable_index_value: bool = True
     implementation: Literal["triton", "msa"] = "triton"
-    decode_backend: MiniMaxM3DecodeBackend = "default"
+    sparse_gqa_decode_backend: MiniMaxM3SparseGQADecodeBackend = "adaptive"
     indexer_kv_dtype: Literal["bf16", "fp8"] = "bf16"
     fuse_qkv_index_projection: bool = False
 
@@ -67,7 +67,7 @@ class MiniMaxM3SparseMetadataParams(SparseMetadataParams):
     num_index_heads: int = 4
     topk: int = 16
     fuse_qkv_index_projection: bool = False
-    decode_backend: MiniMaxM3DecodeBackend = "default"
+    sparse_gqa_decode_backend: MiniMaxM3SparseGQADecodeBackend = "adaptive"
 
     def sharded_head_counts(self, mapping: Optional["Mapping"] = None) -> Tuple[int, int]:
         """Return per-rank (num_q_heads, num_kv_heads) for mapping.
