@@ -3967,7 +3967,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
-        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120/SM121. Resolved at "
+        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",

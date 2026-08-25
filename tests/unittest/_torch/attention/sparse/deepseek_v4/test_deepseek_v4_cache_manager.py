@@ -69,7 +69,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
             window_size=128,
         )
         pretrained_config = SimpleNamespace(
-            kv_lora_rank=448,
+            kv_lora_rank=512,
             qk_rope_head_dim=64,
         )
         quant_config = None

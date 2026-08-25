@@ -311,19 +311,16 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             f"Set kv_cache_config.tokens_per_block to 128 or 256."
         )
 
-        explicit_fp8_ds_mla = kv_cache_config.dtype == "fp8_ds_mla"
-        # Hopper FlashMLA consumes the same footer-scale layout introduced for
-        # SM120/SM121, but keeps the model's 128-token default block size.
-        self.use_fp8_ds_mla = explicit_fp8_ds_mla or get_sm_version() == 90
-        if explicit_fp8_ds_mla:
-            assert tokens_per_block == 256, (
-                f"FlashInfer DSv4 FMHA requires tokens_per_block=256, got {tokens_per_block}."
-            )
-        if self.use_fp8_ds_mla and kv_cache_config.enable_kv_pool_rebalance:
+        self.use_fp8_ds_mla = kv_cache_config.dtype == "fp8_ds_mla"
+        if get_sm_version() == 90 and not self.use_fp8_ds_mla:
             raise ValueError(
-                "DeepSeek-V4 footer-scale KV cache is incompatible with "
-                "kv_cache_config.enable_kv_pool_rebalance=True because its packed pool views "
-                "are fixed at cache-manager construction time."
+                "DeepSeek-V4 on Hopper requires kv_cache_config.dtype='fp8_ds_mla'; "
+                f"got {kv_cache_config.dtype!r}."
+            )
+        if self.use_fp8_ds_mla and tokens_per_block != 256:
+            raise ValueError(
+                "DeepSeek-V4 fp8_ds_mla KV cache requires tokens_per_block=256, "
+                f"got {tokens_per_block}."
             )
 
         self.index_head_dim = sparse_attn_config.index_head_dim
@@ -1431,7 +1428,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             has_fp8_kv_cache = False
         indexer_k_dtype = model_config.sparse_attention_config.indexer_k_dtype
         kv_cache_config = kwargs.get("kv_cache_config")
-        use_fp8_ds_mla = get_sm_version() == 90 or (
+        use_fp8_ds_mla = (
             kv_cache_config is not None
             and getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
         )

@@ -63,8 +63,8 @@ for larger KV cache budgets, longer context windows, or higher throughput target
 `--tp_size`, `--ep_size`, `--max_num_tokens`, and the KV cache memory fraction for your deployment
 target.
 
-DeepSeek-V4 requires KV cache block sizes of 128 or 256 tokens. TensorRT LLM defaults DeepSeek-V4 to
-`tokens_per_block=128`, but scripts that set their own KV cache config should pass this explicitly.
+Hopper uses the `fp8_ds_mla` cache layout, which requires `tokens_per_block=256`. Other Blackwell
+cache layouts support 128- or 256-token blocks.
 
 
 ## Downloading the Model Weights
@@ -113,7 +113,7 @@ python quickstart_advanced.py \
   --model_dir <YOUR_MODEL_DIR> \
   --tp_size 8 \
   --moe_ep_size 8 \
-  --tokens_per_block 128 \
+  --tokens_per_block 256 \
   --max_num_tokens 8192 \
   --max_seq_len 4096 \
   --kv_cache_fraction 0.5
@@ -146,7 +146,7 @@ def main():
         moe_expert_parallel_size=8,
         custom_tokenizer="deepseek_v4",
         kv_cache_config=KvCacheConfig(
-            tokens_per_block=128,
+            tokens_per_block=256,
             free_gpu_memory_fraction=0.5,
         ),
         max_seq_len=4096,
@@ -177,7 +177,7 @@ python quickstart_advanced.py \
   --model_dir <YOUR_MODEL_DIR> \
   --tp_size 8 \
   --moe_ep_size 8 \
-  --tokens_per_block 128 \
+  --tokens_per_block 256 \
   --max_num_tokens 8192 \
   --max_seq_len 4096 \
   --kv_cache_fraction 0.5 \
@@ -214,7 +214,7 @@ attention_dp_config:
   enable_balance: true
   timeout_iters: 60
 kv_cache_config:
-  tokens_per_block: 128
+  tokens_per_block: 256
   dtype: fp8
   free_gpu_memory_fraction: 0.9
 cuda_graph_config:
@@ -263,7 +263,7 @@ dataset subcommand such as `mmlu`, `gsm8k`, or `gpqa_diamond`.
 ```bash
 cat > ./deepseek_v4_config.yml <<EOF
 kv_cache_config:
-  tokens_per_block: 128
+  tokens_per_block: 256
   free_gpu_memory_fraction: 0.5
 moe_config:
   backend: TRTLLM
@@ -331,7 +331,7 @@ Create a serving config:
 ```bash
 cat > ./deepseek_v4_serve.yml <<EOF
 kv_cache_config:
-  tokens_per_block: 128
+  tokens_per_block: 256
   free_gpu_memory_fraction: 0.5
 enable_attention_dp: true
 attention_dp_config:
@@ -457,7 +457,8 @@ or user-provided `sparse_attention_config`.
 
 DeepSeek-V4 KV cache requires:
 
-- `tokens_per_block` set to `128` or `256`.
+- Hopper: `dtype=fp8_ds_mla` and `tokens_per_block=256`.
+- Blackwell: `tokens_per_block` set to `128` or `256`.
 - `max_beam_width=1`.
 - Hopper (`SM90`) or Blackwell (`SM100+`) GPUs.
 
@@ -474,9 +475,11 @@ configuration.
 
 ## Notes and Troubleshooting
 
+- `DeepSeek-V4 on Hopper requires kv_cache_config.dtype='fp8_ds_mla'`: remove an explicit BF16/FP8
+  KV cache override or set `dtype: fp8_ds_mla` and `tokens_per_block: 256` in the YAML config.
 - `DeepseekV4CacheManager requires tokens_per_block in [128, 256]`: pass
-  `--tokens_per_block 128` in `quickstart_advanced.py` or set
-  `kv_cache_config.tokens_per_block: 128` in YAML.
+  `--tokens_per_block 256` in `quickstart_advanced.py` or set
+  `kv_cache_config.tokens_per_block: 256` in YAML.
 - Out-of-memory during initialization or prefill: reduce `max_batch_size`, `max_num_tokens`, or
   `kv_cache_config.free_gpu_memory_fraction`. For bring-up on 8xB200, set `max_seq_len` explicitly
   instead of using the checkpoint's 1M-token context length.

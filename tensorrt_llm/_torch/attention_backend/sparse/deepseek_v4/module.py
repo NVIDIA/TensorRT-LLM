@@ -131,9 +131,6 @@ def initialize_sparse_attn(self) -> None:
     sm_version = _get_validated_sm_version()
     if sm_version == 90:
         self._dsv4_flash_mla = DeepSeekV4FlashMLA(self.mqa, self.mqa.compress_ratio)
-        compressor = getattr(self.mqa, "compressor", None)
-        if compressor is not None:
-            compressor.enable_footer_scale_cache()
     self._disable_dsv4_epilogue_fusion = os.environ.get(
         "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION", ""
     ).strip().lower() in ("1", "true", "on")
@@ -432,8 +429,8 @@ def _is_fused_q_fp8_quant_enabled(
         return False
     if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
         return False
-    # Footer-scale sparse MLA consumes the BF16 query and canonical latent rows.
-    if self.kv_cache_dtype == "fp8_ds_mla" or getattr(self, "_dsv4_flash_mla", None) is not None:
+    # fp8_ds_mla (FlashInfer sparse MLA) does not use the fused Q FP8 path.
+    if self.kv_cache_dtype == "fp8_ds_mla":
         return False
     return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
