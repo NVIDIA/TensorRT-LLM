@@ -70,6 +70,12 @@ def _validate_mla_generation_backend(backend: str, num_heads: int) -> None:
     FP8-KV-cache override or a `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen` request).
     Without this check the conflict only surfaces as a FlashInfer error deep
     in attention warmup.
+
+    The bound mirrors FlashInfer's validation gate verbatim: it predicts
+    FlashInfer's rejection, it is not a verified support claim for the head
+    counts outside the range. For Kimi K3 the open side above 128 is
+    unreachable anyway — per-rank Q heads never exceed 96 (all heads
+    replicated under attention-DP, `96 / tp_size` under TEP head sharding).
     """
     if backend == "trtllm-gen" and 64 < num_heads < 128:
         raise ValueError(
