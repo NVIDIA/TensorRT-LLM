@@ -199,7 +199,7 @@ class TestParseDataUri:
         def outcome(value):
             try:
                 return ("ok", parse_data_uri(value))
-            except Exception as exc:  # noqa: BLE001 - comparing failure modes
+            except ValueError as exc:
                 return (type(exc), str(exc))
 
         assert outcome(url) == outcome(urlparse(url))
