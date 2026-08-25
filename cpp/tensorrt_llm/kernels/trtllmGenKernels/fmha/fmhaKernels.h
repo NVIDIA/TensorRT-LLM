@@ -562,7 +562,7 @@ public:
                 fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr,
                 fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr, fmhaData.mMetaData.kvPageIdxD,
                 fmhaData.mScales.outputScaleD, fmhaData.mInputBuffers.dsv4InvRopeCosSinCacheD,
-                fmhaData.mScales.dsv4OScaleFp32D, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
+                fmhaData.mScales.dsv4OScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
                 fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
                 fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
                 fmhaData.mMetaData.sparseMlaTopKLensPtrD, fmhaData.mScales.sageAttnSfsQPtrD,
@@ -571,7 +571,8 @@ public:
                 fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
                 fmhaData.mOutputBuffers.partialStatsPtrD, fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD,
                 fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
-                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mScales.kvSfScale,
+                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax,
+                fmhaData.mMetaData.skipCorrThreshold, fmhaData.mScales.kvSfScale,
                 fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO, options.mUseBlockSparseAttention,
                 options.mUsesSharedPagedKvIdx);
 
@@ -858,6 +859,7 @@ private:
         fmhaData.mMetaData.sparseMlaTopKLensPtrD = params.ptrSparseMlaTopKLens;
         fmhaData.mMetaData.kvPageIdxD = params.kvPageIdxPtr;
         fmhaData.mMetaData.inflateMax = 0.0F; // Default value for inflate max
+        fmhaData.mMetaData.skipCorrThreshold = 0.0F; // 0 disables threshold-based skip correction
         fmhaData.mMetaData.startTokenIdxSfO = params.mSfStartTokenIdx;
 
         // Fill Scales
@@ -870,7 +872,7 @@ private:
         if (params.mDsv4EpilogueFusion.enabled)
         {
             fmhaData.mInputBuffers.dsv4InvRopeCosSinCacheD = params.mDsv4EpilogueFusion.cosSinCache;
-            fmhaData.mScales.dsv4OScaleFp32D = static_cast<float*>(params.oSfPtr);
+            fmhaData.mScales.dsv4OScaleD = static_cast<float*>(params.oSfPtr);
         }
         // Sage Attention scaling factors
         fmhaData.mScales.sageAttnSfsQPtrD = params.sageAttnSfsQPtr;
