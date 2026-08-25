@@ -61,6 +61,28 @@ def _select_mla_generation_backend(quant_config: Optional[QuantConfig]) -> str:
     return backend
 
 
+def _validate_mla_generation_backend(backend: str, num_heads: int) -> None:
+    """Fail fast when `backend` can never run at this per-rank head count.
+
+    FlashInfer's `trtllm_batch_decode_with_kv_cache_mla` rejects
+    `64 < num_heads_q < 128` for every batch shape, and the per-batch policy
+    never demotes away from an explicit `trtllm-gen` selection (the
+    FP8-KV-cache override or a `TLLM_K3_MLA_GEN_BACKEND=trtllm-gen` request).
+    Without this check the conflict only surfaces as a FlashInfer error deep
+    in attention warmup.
+    """
+    if backend == "trtllm-gen" and 64 < num_heads < 128:
+        raise ValueError(
+            "Kimi K3 MLA: the trtllm-gen generation backend cannot run with "
+            f"{num_heads} query heads per rank (trtllm-gen MLA decode rejects "
+            "64 < num_heads_q < 128; under attention-DP every rank keeps all "
+            "heads). trtllm-gen was selected explicitly — by the FP8-KV-cache "
+            f"override or by {_KIMI_K3_MLA_GEN_BACKEND_ENV}=trtllm-gen. Use "
+            "tensor-parallel head sharding (TEP) so each rank has <= 64 "
+            "heads, or a BF16 KV cache with the default cute-dsl backend."
+        )
+
+
 def _kimi_k3_mla_decode_backend_policy(
     requested_backend: str,
     metadata: TrtllmAttentionMetadata,
@@ -298,6 +320,11 @@ class KimiK3MLAAttention(MLA):
         # Only the absorbed-generation backend (mqa) requests CuTe-DSL, so
         # only it needs K3's per-batch fallback policy; mha keeps the
         # default trtllm-gen selection.
+        # Validate here rather than in _select_mla_generation_backend: the
+        # per-rank head count (replicated under attention-DP, sharded under
+        # TEP) is only authoritative once the base MLA module has built its
+        # generation backend.
+        _validate_mla_generation_backend(self.mqa.flashinfer_mla_backend, self.mqa.num_heads)
         self.mqa.mla_backend_policy = partial(
             _kimi_k3_mla_decode_backend_policy,
             num_heads=self.mqa.num_heads,
