@@ -511,12 +511,6 @@ LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelC
     }
 }
 
-void LoraCache::setDataType(tensorrt_llm::DataType dataType)
-{
-    std::scoped_lock lock(mPagesMutex, mCacheMutex);
-    setDataTypeLocked(dataType);
-}
-
 void LoraCache::setDataTypeCoordinated(
     LoraCache& other, tensorrt_llm::DataType dataType, SizeType32 totalNumPages, SizeType32 otherTotalNumPages)
 {

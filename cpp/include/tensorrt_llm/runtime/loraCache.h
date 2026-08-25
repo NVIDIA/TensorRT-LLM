@@ -187,14 +187,6 @@ public:
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     /**
-     * \brief Reinitialize an empty cache to store the given data type.
-     *
-     * The page geometry remains unchanged. This is intended for selecting a
-     * homogeneous LoRA cache dtype before the first task is inserted.
-     */
-    void setDataType(tensorrt_llm::DataType dataType);
-
-    /**
      * \brief Reinitialize this cache and another cache (e.g. a host/device pair) to store the
      * given data type and page capacities as a single atomic operation.
      *
