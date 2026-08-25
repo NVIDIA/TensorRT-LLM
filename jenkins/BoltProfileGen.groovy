@@ -86,11 +86,13 @@ PROMOTE       = (params.promote ?: "false").toString()
 // bundle -> bolted tarball on the cluster ("consume immediately after generating").
 // The merge job (slurm_merge.sh) runs apply_bolt.py when BOLT_APPLY=1.
 APPLY_PROFILES = (params.applyProfiles ?: "true").toString()
-// BOLT POC knob: multiply each workload's client `iterations` (num_requests =
-// concurrency * iterations) to lengthen the measured serving window without
-// editing the shared perf-sanity configs. Default 1 (no change). Consumed by
+// Multiply each workload's client `iterations` (num_requests = concurrency *
+// iterations) to lengthen the measured serving window without editing the shared
+// perf-sanity configs. Default 64: the point where the aggregated workloads'
+// steady-state function set converges. Disagg wants its own value, so this should
+// split into per-mode knobs once those workloads are re-enabled. Consumed by
 // tests/integration/defs/perf/test_perf_sanity.py via EXTRA_CONTAINER_EXPORTS.
-BOLT_ITER_MULT = (params.boltIterMult ?: env.boltIterMult ?: "1").toString()
+BOLT_ITER_MULT = (params.boltIterMult ?: env.boltIterMult ?: "64").toString()
 
 TRIPLE = TARGET_ARCH
 
