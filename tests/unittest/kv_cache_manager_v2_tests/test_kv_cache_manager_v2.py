@@ -3379,9 +3379,7 @@ class TestInitRatioConfig(unittest.TestCase):
         granularity = 2 << 20
         quota_without_resume_headroom = round_up(
             num_requests * self.PG0_SLOT_SIZE, granularity
-        ) + round_up(
-            num_requests * self.PG1_SLOT_SIZE, granularity
-        )
+        ) + round_up(num_requests * self.PG1_SLOT_SIZE, granularity)
         for gpu_quota in (0, quota_without_resume_headroom):
             with self.subTest(gpu_quota=gpu_quota):
                 cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
