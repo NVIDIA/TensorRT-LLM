@@ -15,16 +15,12 @@ if TYPE_CHECKING:
 
 
 class _STFTFn(nn.Module):
-    def __init__(
-        self, filter_length: int, hop_length: int, win_length: int
-    ) -> None:
+    def __init__(self, filter_length: int, hop_length: int, win_length: int) -> None:
         super().__init__()
         self.hop_length = hop_length
         self.win_length = win_length
         n_freqs = filter_length // 2 + 1
-        self.register_buffer(
-            "forward_basis", torch.zeros(n_freqs * 2, 1, filter_length)
-        )
+        self.register_buffer("forward_basis", torch.zeros(n_freqs * 2, 1, filter_length))
 
     def forward(self, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if y.dim() == 2:
@@ -97,11 +93,7 @@ class VocoderWithBWE(nn.Module):
         with torch.autocast(device_type=mel_spec.device.type, dtype=torch.float32):
             x = self.vocoder(mel_spec.float())
             length_low_rate = x.shape[-1]
-            output_length = (
-                length_low_rate
-                * self.output_sampling_rate
-                // self.input_sampling_rate
-            )
+            output_length = length_low_rate * self.output_sampling_rate // self.input_sampling_rate
 
             remainder = length_low_rate % self.hop_length
             if remainder:
@@ -110,9 +102,5 @@ class VocoderWithBWE(nn.Module):
             mel = self._compute_mel(x)
             residual = self.bwe_generator(mel.transpose(2, 3))
             skip = self.resampler(x)
-            assert residual.shape == skip.shape, (
-                f"residual {residual.shape} != skip {skip.shape}"
-            )
-            return torch.clamp(residual + skip, -1, 1)[..., :output_length].to(
-                input_dtype
-            )
+            assert residual.shape == skip.shape, f"residual {residual.shape} != skip {skip.shape}"
+            return torch.clamp(residual + skip, -1, 1)[..., :output_length].to(input_dtype)

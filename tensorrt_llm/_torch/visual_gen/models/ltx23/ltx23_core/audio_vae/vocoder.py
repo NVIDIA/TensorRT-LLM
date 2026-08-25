@@ -66,9 +66,7 @@ class Vocoder(nn.Module):
             for kernel_size, dilations in zip(
                 resblock_kernel_sizes, resblock_dilation_sizes, strict=True
             ):
-                self.resblocks.append(
-                    AMPBlock1(channels, kernel_size, tuple(dilations))
-                )
+                self.resblocks.append(AMPBlock1(channels, kernel_size, tuple(dilations)))
 
         self.act_post = Activation1d(SnakeBeta(final_channels))
         self.conv_post = nn.Conv1d(
@@ -91,20 +89,13 @@ class Vocoder(nn.Module):
             x = upsample(x)
             start = i * self.num_kernels
             outputs = torch.stack(
-                [
-                    self.resblocks[index](x)
-                    for index in range(start, start + self.num_kernels)
-                ]
+                [self.resblocks[index](x) for index in range(start, start + self.num_kernels)]
             )
             x = outputs.mean(dim=0)
 
         x = self.conv_post(self.act_post(x))
         if self.apply_final_activation:
-            x = (
-                torch.tanh(x)
-                if self.use_tanh_at_final
-                else torch.clamp(x, -1, 1)
-            )
+            x = torch.tanh(x) if self.use_tanh_at_final else torch.clamp(x, -1, 1)
         return x
 
 
@@ -142,8 +133,7 @@ class LTX23VocoderConfigurator:
             actual = cfg.get(key)
             if actual != expected:
                 raise ValueError(
-                    "LTX-2.3 vocoder config mismatch: "
-                    f"expected {key}={expected!r}, got {actual!r}"
+                    f"LTX-2.3 vocoder config mismatch: expected {key}={expected!r}, got {actual!r}"
                 )
 
         cfg = config.get("vocoder", {})

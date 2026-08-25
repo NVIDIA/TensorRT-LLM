@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from test_common.llm_data import llm_models_root
+from test_ltx23_transformer import _positions
 
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig, VisualGenArgs
@@ -30,12 +31,6 @@ CHECKPOINT_PATH_BF16 = os.environ.get("LTX23_MODEL_PATH", os.path.join(_MODELS_R
 GEMMA3_PATH = os.environ.get(
     "LTX23_TEXT_ENCODER_PATH", os.path.join(_MODELS_ROOT, "gemma", "gemma-3-12b-it")
 )
-
-
-def _positions(*sizes, device):
-    grids = torch.meshgrid(*[torch.arange(s) for s in sizes], indexing="ij")
-    idx = torch.stack([g.flatten() for g in grids]).float()
-    return torch.stack([idx, idx + 1], dim=-1).unsqueeze(0).to(device)
 
 
 def _ltx23_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):

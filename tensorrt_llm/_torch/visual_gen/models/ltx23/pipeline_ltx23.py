@@ -10,7 +10,6 @@ import torch
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.autotuner import autotune
-from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -29,6 +28,7 @@ from ..ltx2.ltx2_core.types import (
 )
 from ..ltx2.ltx2_core.video_vae import TilingConfig
 from ..ltx2.pipeline_ltx2 import (
+    LTX2Pipeline,
     _find_safetensors_files,
     _load_component_weights,
     _load_ltx2_transformer_weights,
@@ -135,13 +135,9 @@ class _LTX23CUDAGraphRunner(_LTX2CUDAGraphRunner):
             dst.sigma.copy_(src.sigma)
             dst.positions.copy_(src.positions)
             dst.context.copy_(src.context)
-            _LTX23CUDAGraphRunner._copy_optional_tensor(
-                dst.context_mask, src.context_mask
-            )
+            _LTX23CUDAGraphRunner._copy_optional_tensor(dst.context_mask, src.context_mask)
             return dst
-        if isinstance(src, LTX23TextConditioning) and isinstance(
-            dst, LTX23TextConditioning
-        ):
+        if isinstance(src, LTX23TextConditioning) and isinstance(dst, LTX23TextConditioning):
             copy_tensor = _LTX23CUDAGraphRunner._copy_optional_tensor
             copy_pair = _LTX23CUDAGraphRunner._copy_tensor_pair
             copy_tensor(dst.video_context, src.video_context)
@@ -201,6 +197,7 @@ def detect_native_ltx_pipeline(config: dict) -> str:
 class LTX23Pipeline(BasePipeline):
     """Text-to-video pipeline for the LTX-2.3 checkpoint (native single-file safetensors)."""
 
+    _cuda_graph_runner_cls = _LTX23CUDAGraphRunner
     # Connectors share the transformer prefix but load as separate components.
     _TRANSFORMER_PREFIX = "model.diffusion_model."
     _TRANSFORMER_EXCLUDE_PREFIXES = [
@@ -272,24 +269,10 @@ class LTX23Pipeline(BasePipeline):
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
         )
-    def _setup_cuda_graphs(self):
-        """Wrap the transformer with LTX-2.3-aware CUDA graph capture/replay."""
-        if not self.pipeline_config.cuda_graph.enable:
-            return
 
-        runner = _LTX23CUDAGraphRunner(
-            CUDAGraphRunnerConfig(use_cuda_graph=True),
-        )
-        self.transformer.register_cuda_graph_extra_key_fns(runner)
-        compile_note = (
-            " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
-        )
-        logger.info(
-            "CUDA graph runner: wrapping transformer.forward "
-            f"(LTX-2.3 Modality-aware){compile_note}"
-        )
-        self.transformer.forward = runner.wrap(self.transformer.forward)
-        self._cuda_graph_runners["transformer"] = runner
+    def _setup_cuda_graphs(self):
+        """Reuse LTX-2 wrap/log; this class supplies `_LTX23CUDAGraphRunner`."""
+        LTX2Pipeline._setup_cuda_graphs(self)
 
     def _init_transformer(self) -> None:
         attn_cfg = getattr(self.pipeline_config, "attention", None)
@@ -421,46 +404,46 @@ class LTX23Pipeline(BasePipeline):
     ) -> None:
         skip_components = skip_components or []
 
+        def _load(module, prefixes, load_dtype):
+            _load_component_weights(sft_paths, module, prefixes)
+            return module.to(device=device, dtype=load_dtype)
+
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading native video decoder...")
-            self.video_decoder = LTX23VideoDecoderConfigurator.from_config(config)
-            _load_component_weights(sft_paths, self.video_decoder, ["vae.decoder.", "vae."])
-            self.video_decoder = self.video_decoder.to(device=device, dtype=dtype)
+            self.video_decoder = _load(
+                LTX23VideoDecoderConfigurator.from_config(config),
+                ["vae.decoder.", "vae."],
+                dtype,
+            )
 
         logger.info("Loading native text feature extractor + connectors...")
-        self.feature_extractor = LTX23GemmaFeaturesExtractor.from_config(config)
-        _load_component_weights(sft_paths, self.feature_extractor, "text_embedding_projection.")
-        self.feature_extractor = self.feature_extractor.to(device=device, dtype=dtype)
-
-        self.video_connector = LTX23VideoConnectorConfigurator.from_config(config)
-        _load_component_weights(
-            sft_paths,
-            self.video_connector,
+        self.feature_extractor = _load(
+            LTX23GemmaFeaturesExtractor.from_config(config),
+            "text_embedding_projection.",
+            dtype,
+        )
+        self.video_connector = _load(
+            LTX23VideoConnectorConfigurator.from_config(config),
             "model.diffusion_model.video_embeddings_connector.",
+            dtype,
         )
-        self.video_connector = self.video_connector.to(device=device, dtype=dtype)
-
-        self.audio_connector = LTX23AudioConnectorConfigurator.from_config(config)
-        _load_component_weights(
-            sft_paths,
-            self.audio_connector,
+        self.audio_connector = _load(
+            LTX23AudioConnectorConfigurator.from_config(config),
             "model.diffusion_model.audio_embeddings_connector.",
+            dtype,
         )
-        self.audio_connector = self.audio_connector.to(device=device, dtype=dtype)
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading native audio decoder...")
-            self.audio_decoder = AudioDecoderConfigurator.from_config(config)
-            _load_component_weights(
-                sft_paths, self.audio_decoder, ["audio_vae.decoder.", "audio_vae."]
+            self.audio_decoder = _load(
+                AudioDecoderConfigurator.from_config(config),
+                ["audio_vae.decoder.", "audio_vae."],
+                dtype,
             )
-            self.audio_decoder = self.audio_decoder.to(device=device, dtype=dtype)
-
-
             logger.info("Loading native vocoder (BigVGAN-v2 + BWE)...")
-            self.vocoder = LTX23VocoderConfigurator.from_config(config)
-            _load_component_weights(sft_paths, self.vocoder, "vocoder.")
-            self.vocoder = self.vocoder.to(device=device, dtype=torch.float32)
+            self.vocoder = _load(
+                LTX23VocoderConfigurator.from_config(config), "vocoder.", torch.float32
+            )
 
         patch_size = self.transformer._transformer_config.get("patch_size", 1)
         self.video_patchifier = VideoLatentPatchifier(patch_size=patch_size)
@@ -718,6 +701,7 @@ class LTX23Pipeline(BasePipeline):
                 text_cache=text_cache,
                 timestep=timestep_val.new_tensor(0.0),
             )
+
             # x0 prediction (rectified flow): x0 = sample - v * sigma.
             def to_x0(latent, velocity):
                 sigma = timestep_val.float()

@@ -119,7 +119,6 @@ class LTX23VideoDecoder(LTX2VideoDecoder):
         causal: bool = False,
         spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
     ):
-
         super().__init__(
             convolution_dimensions=convolution_dimensions,
             in_channels=in_channels,

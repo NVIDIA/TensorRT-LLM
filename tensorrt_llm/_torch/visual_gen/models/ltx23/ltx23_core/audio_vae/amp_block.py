@@ -19,41 +19,28 @@ class AMPBlock1(nn.Module):
     ) -> None:
         super().__init__()
 
-        def get_padding(dilation_value: int) -> int:
-            return (kernel_size * dilation_value - dilation_value) // 2
+        def convs(dilations: tuple[int, ...]) -> nn.ModuleList:
+            return nn.ModuleList(
+                [
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size,
+                        1,
+                        dilation=d,
+                        padding=(kernel_size * d - d) // 2,
+                    )
+                    for d in dilations
+                ]
+            )
 
-        self.convs1 = nn.ModuleList(
-            [
-                nn.Conv1d(
-                    channels,
-                    channels,
-                    kernel_size,
-                    1,
-                    dilation=dilation_value,
-                    padding=get_padding(dilation_value),
-                )
-                for dilation_value in dilation
-            ]
-        )
-        self.convs2 = nn.ModuleList(
-            [
-                nn.Conv1d(
-                    channels,
-                    channels,
-                    kernel_size,
-                    1,
-                    dilation=1,
-                    padding=get_padding(1),
-                )
-                for _ in dilation
-            ]
-        )
-        self.acts1 = nn.ModuleList(
-            [Activation1d(SnakeBeta(channels)) for _ in self.convs1]
-        )
-        self.acts2 = nn.ModuleList(
-            [Activation1d(SnakeBeta(channels)) for _ in self.convs2]
-        )
+        def acts(n: int) -> nn.ModuleList:
+            return nn.ModuleList([Activation1d(SnakeBeta(channels)) for _ in range(n)])
+
+        self.convs1 = convs(dilation)
+        self.convs2 = convs((1,) * len(dilation))
+        self.acts1 = acts(len(self.convs1))
+        self.acts2 = acts(len(self.convs2))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for conv1, conv2, act1, act2 in zip(

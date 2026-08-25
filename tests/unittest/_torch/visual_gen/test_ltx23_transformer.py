@@ -84,10 +84,10 @@ def _build_model(model_type_name, config, dtype=torch.bfloat16):
     return model
 
 
-def _positions(*sizes):
+def _positions(*sizes, device=_DEVICE):
     grids = torch.meshgrid(*[torch.arange(s) for s in sizes], indexing="ij")
     idx = torch.stack([g.flatten() for g in grids]).float()
-    return torch.stack([idx, idx + 1], dim=-1).unsqueeze(0).to(_DEVICE)
+    return torch.stack([idx, idx + 1], dim=-1).unsqueeze(0).to(device)
 
 
 def _modality(n_tokens, in_channels, ctx_dim, positions, dtype, sigma, text_len=8):

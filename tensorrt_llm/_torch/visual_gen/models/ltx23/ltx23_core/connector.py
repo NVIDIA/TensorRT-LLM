@@ -49,12 +49,12 @@ class LTX23GemmaFeaturesExtractor(torch.nn.Module):
         self.video_aggregate_embed = torch.nn.Linear(in_features, video_dim, bias=True)
         self.audio_aggregate_embed = torch.nn.Linear(in_features, audio_dim, bias=True)
 
+    def _project(self, linear: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        return linear(x * math.sqrt(linear.out_features / self.embedding_dim))
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        v_scale = math.sqrt(self.video_aggregate_embed.out_features / self.embedding_dim)
-        a_scale = math.sqrt(self.audio_aggregate_embed.out_features / self.embedding_dim)
-        return (
-            self.video_aggregate_embed(x * v_scale),
-            self.audio_aggregate_embed(x * a_scale),
+        return self._project(self.video_aggregate_embed, x), self._project(
+            self.audio_aggregate_embed, x
         )
 
     @classmethod

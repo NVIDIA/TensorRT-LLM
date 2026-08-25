@@ -18,9 +18,6 @@ Video LPIPS and audio log-mel L1 against goldens. Override paths with
 LTX23_MODEL_PATH, LTX23_TEXT_ENCODER_PATH, and LTX23_GOLDEN_DIR.
 """
 
-import contextlib
-import gc
-import json
 import os
 import subprocess
 import sys
@@ -30,17 +27,20 @@ import numpy as np
 import pytest
 import soundfile as sf
 import torch
-from defs.conftest import llm_models_root
-
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
-VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
-    REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
+from defs.examples.visual_gen.visual_gen_test_utils import (
+    REPO_ROOT,
+    _assert_lpips_below_threshold,
+    _cleanup_cuda,
+    _lpips_deterministic_algorithms,
+    _lpips_model_path,
+    _run_lpips_eval,
+    _save_lpips_video_mp4,
+    _skip_if_missing,
 )
 
-_MODELS_ROOT = str(llm_models_root())
-LTX23_MODEL_PATH = os.environ.get("LTX23_MODEL_PATH", os.path.join(_MODELS_ROOT, "LTX-2.3"))
+LTX23_MODEL_PATH = os.environ.get("LTX23_MODEL_PATH", _lpips_model_path("LTX-2.3"))
 LTX23_TEXT_ENCODER_PATH = os.environ.get(
-    "LTX23_TEXT_ENCODER_PATH", os.path.join(_MODELS_ROOT, "gemma", "gemma-3-12b-it")
+    "LTX23_TEXT_ENCODER_PATH", _lpips_model_path("gemma", "gemma-3-12b-it")
 )
 
 LTX23_GOLDEN_DIR = os.environ.get(
@@ -64,94 +64,6 @@ LTX23_LPIPS_SEED = 42
 
 LTX23_LPIPS_THRESHOLD = 0.05
 LTX23_AUDIO_MEL_L1_THRESHOLD = float(os.environ.get("LTX23_AUDIO_MEL_L1_THRESHOLD", "0.45"))
-
-
-def _skip_if_missing(path, label, is_dir=False):
-    exists = os.path.isdir(path) if is_dir else os.path.exists(path)
-    if not exists:
-        pytest.skip(f"{label} not found: {path}")
-
-
-@contextlib.contextmanager
-def _lpips_deterministic_algorithms():
-    prev_det = torch.are_deterministic_algorithms_enabled()
-    prev_warn = torch.is_deterministic_algorithms_warn_only_enabled()
-    prev_cublas = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
-    try:
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        yield
-    finally:
-        torch.use_deterministic_algorithms(prev_det, warn_only=prev_warn)
-        if prev_cublas is None:
-            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
-        else:
-            os.environ["CUBLAS_WORKSPACE_CONFIG"] = prev_cublas
-
-
-def _save_lpips_video_mp4(video, output_path, frame_rate):
-    """Encode with H.264. A codec fallback would make LPIPS measure artifacts."""
-    from tensorrt_llm.media.encoding import save_video
-
-    try:
-        save_video(video, output_path, frame_rate=frame_rate)
-    except RuntimeError as err:
-        if "MP4 format requires ffmpeg" not in str(err):
-            raise
-        raise RuntimeError(f"ffmpeg is unavailable for LPIPS video encoding: {err}") from err
-    assert os.path.isfile(output_path), f"LTX-2.3 did not produce video {output_path}"
-
-
-def _run_lpips_eval(tmp_dir, sample_id, prompt, reference_path, generated_path):
-    """Score generated against golden video with the shared LPIPS eval script."""
-    dataset_path = os.path.join(tmp_dir, f"{sample_id}_dataset.json")
-    output_json = os.path.join(tmp_dir, f"{sample_id}_lpips_results.json")
-    with open(dataset_path, "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "samples": [
-                    {
-                        "id": sample_id,
-                        "media_type": "video",
-                        "prompt": prompt,
-                        "reference_video_path": str(reference_path),
-                        "generated_video_path": str(generated_path),
-                    }
-                ]
-            },
-            fh,
-            indent=2,
-        )
-
-    with _lpips_deterministic_algorithms():
-        env = os.environ.copy()
-        env["PYTHONPATH"] = (
-            f"{REPO_ROOT}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else REPO_ROOT
-        )
-        result = subprocess.run(
-            [
-                sys.executable,
-                VISUAL_GEN_LPIPS_EVAL_SCRIPT,
-                "--dataset",
-                str(dataset_path),
-                "--output-json",
-                str(output_json),
-                "--json",
-            ],
-            cwd=REPO_ROOT,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    if result.returncode != 0:
-        raise RuntimeError(f"LPIPS eval script failed for {sample_id}:\n{result.stdout}")
-
-    with open(output_json, encoding="utf-8") as fh:
-        score = float(json.load(fh)["mean_lpips_score"])
-    print(f"\n[E2E {sample_id} video LPIPS] score: {score:.6f}")
-    return score
 
 
 def _save_wav(audio, path, sample_rate):
@@ -196,7 +108,7 @@ def _generate_ltx23_av(video_out_path, audio_out_path):
     _skip_if_missing(LTX23_TEXT_ENCODER_PATH, "LTX-2.3 text encoder (gemma-3-12b-it)", is_dir=True)
 
     # Force eager: nested @torch.compile is not turned off by TorchCompileConfig.
-    with _lpips_deterministic_algorithms(), torch.compiler.set_stance("force_eager"):
+    with _lpips_deterministic_algorithms(fully_eager=True):
         args = VisualGenArgs(
             model=LTX23_MODEL_PATH,
             pipeline_config={"text_encoder_path": LTX23_TEXT_ENCODER_PATH},
@@ -220,8 +132,7 @@ def _generate_ltx23_av(video_out_path, audio_out_path):
             audio_rate = out.audio_sample_rate
         finally:
             del pipeline
-            gc.collect()
-            torch.cuda.empty_cache()
+            _cleanup_cuda()
 
     _save_lpips_video_mp4(video, video_out_path, frame_rate=LTX23_LPIPS_FRAME_RATE)
     assert audio is not None, "LTX-2.3 render returned no audio"
@@ -243,11 +154,9 @@ def test_ltx23_video_lpips_against_golden(tmp_path, ltx23_av_candidate):
     _skip_if_missing(LTX23_GOLDEN_VIDEO, "LTX-2.3 LPIPS golden video")
     video_path, _ = ltx23_av_candidate
     score = _run_lpips_eval(
-        str(tmp_path), "ltx23", LTX23_LPIPS_PROMPT, LTX23_GOLDEN_VIDEO, video_path
+        tmp_path, "ltx23", "video", LTX23_LPIPS_PROMPT, LTX23_GOLDEN_VIDEO, video_path
     )
-    assert score < LTX23_LPIPS_THRESHOLD, (
-        f"LTX-2.3 video LPIPS too high: {score:.6f} (expected < {LTX23_LPIPS_THRESHOLD:.6f})"
-    )
+    _assert_lpips_below_threshold(score, LTX23_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

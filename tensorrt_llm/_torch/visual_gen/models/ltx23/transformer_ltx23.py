@@ -188,6 +188,64 @@ class LTX23TransformerBlock(nn.Module):
         )
         return apply_fused_gate_resid(x, ff(scaled), gate[0], gate[1], self._fuse_adaln)
 
+    def _apply_video_audio_cross_attention(
+        self,
+        query_x,
+        query_pre,
+        kv_pre,
+        query_stream,
+        kv_stream,
+        query_table,
+        kv_table,
+        attn,
+        is_a2v: bool,
+    ):
+        q_scale_a2v, q_shift_a2v, q_scale_v2a, q_shift_v2a, gate = _get_av_ca_ada_table_ts_pairs(
+            query_table,
+            query_x.shape[0],
+            query_stream.cross_scale_shift_timestep,
+            query_stream.cross_gate_timestep,
+        )
+        kv_scale_a2v, kv_shift_a2v, kv_scale_v2a, kv_shift_v2a, _ = _get_av_ca_ada_table_ts_pairs(
+            kv_table,
+            kv_pre.shape[0],
+            kv_stream.cross_scale_shift_timestep,
+            kv_stream.cross_gate_timestep,
+        )
+        if is_a2v:
+            scale_q, shift_q = q_scale_a2v, q_shift_a2v
+            scale_kv, shift_kv = kv_scale_a2v, kv_shift_a2v
+        else:
+            scale_q, shift_q = q_scale_v2a, q_shift_v2a
+            scale_kv, shift_kv = kv_scale_v2a, kv_shift_v2a
+
+        q_norm = apply_fused_rmsnorm_shift_scale(
+            query_pre,
+            scale_q[0],
+            scale_q[1],
+            shift_q[0],
+            shift_q[1],
+            self.norm_eps,
+            self._fuse_adaln,
+        )
+        kv_norm = apply_fused_rmsnorm_shift_scale(
+            kv_pre,
+            scale_kv[0],
+            scale_kv[1],
+            shift_kv[0],
+            shift_kv[1],
+            self.norm_eps,
+            self._fuse_adaln,
+        )
+        k, v = attn.project_kv(kv_norm, pe=kv_stream.cross_positional_embeddings)
+        out = attn(
+            q_norm,
+            pre_projected_kv=(k, v),
+            pe=query_stream.cross_positional_embeddings,
+            timestep=query_stream.timesteps,
+        )
+        return apply_fused_gate_resid(query_x, out, gate[0], gate[1], self._fuse_adaln)
+
     def forward(
         self,
         video,
@@ -226,88 +284,29 @@ class LTX23TransformerBlock(nn.Module):
         if run_a2v or run_v2a:
             vx_pre, ax_pre = vx, ax
             if run_a2v:
-                scale_v_a2v, shift_v_a2v, _, _, gate_a2v = _get_av_ca_ada_table_ts_pairs(
-                    self.scale_shift_table_a2v_ca_video,
-                    vx.shape[0],
-                    video.cross_scale_shift_timestep,
-                    video.cross_gate_timestep,
-                )
-                a2v_vx = apply_fused_rmsnorm_shift_scale(
+                vx = self._apply_video_audio_cross_attention(
+                    vx,
                     vx_pre,
-                    scale_v_a2v[0],
-                    scale_v_a2v[1],
-                    shift_v_a2v[0],
-                    shift_v_a2v[1],
-                    self.norm_eps,
-                    self._fuse_adaln,
-                )
-                scale_a_a2v, shift_a_a2v, _, _, _ = _get_av_ca_ada_table_ts_pairs(
-                    self.scale_shift_table_a2v_ca_audio,
-                    ax.shape[0],
-                    audio.cross_scale_shift_timestep,
-                    audio.cross_gate_timestep,
-                )
-                a2v_ax = apply_fused_rmsnorm_shift_scale(
                     ax_pre,
-                    scale_a_a2v[0],
-                    scale_a_a2v[1],
-                    shift_a_a2v[0],
-                    shift_a_a2v[1],
-                    self.norm_eps,
-                    self._fuse_adaln,
+                    video,
+                    audio,
+                    self.scale_shift_table_a2v_ca_video,
+                    self.scale_shift_table_a2v_ca_audio,
+                    self.audio_to_video_attn,
+                    is_a2v=True,
                 )
-                k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
-                    a2v_ax, pe=audio.cross_positional_embeddings
-                )
-                a2v_out = self.audio_to_video_attn(
-                    a2v_vx,
-                    pre_projected_kv=(k_a2v, v_a2v),
-                    pe=video.cross_positional_embeddings,
-                    timestep=video.timesteps,
-                )
-                vx = apply_fused_gate_resid(vx, a2v_out, gate_a2v[0], gate_a2v[1], self._fuse_adaln)
-
             if run_v2a:
-                _, _, scale_a_v2a, shift_a_v2a, gate_v2a = _get_av_ca_ada_table_ts_pairs(
-                    self.scale_shift_table_a2v_ca_audio,
-                    ax.shape[0],
-                    audio.cross_scale_shift_timestep,
-                    audio.cross_gate_timestep,
-                )
-                v2a_ax = apply_fused_rmsnorm_shift_scale(
+                ax = self._apply_video_audio_cross_attention(
+                    ax,
                     ax_pre,
-                    scale_a_v2a[0],
-                    scale_a_v2a[1],
-                    shift_a_v2a[0],
-                    shift_a_v2a[1],
-                    self.norm_eps,
-                    self._fuse_adaln,
-                )
-                _, _, scale_v_v2a, shift_v_v2a, _ = _get_av_ca_ada_table_ts_pairs(
-                    self.scale_shift_table_a2v_ca_video,
-                    vx.shape[0],
-                    video.cross_scale_shift_timestep,
-                    video.cross_gate_timestep,
-                )
-                v2a_vx = apply_fused_rmsnorm_shift_scale(
                     vx_pre,
-                    scale_v_v2a[0],
-                    scale_v_v2a[1],
-                    shift_v_v2a[0],
-                    shift_v_v2a[1],
-                    self.norm_eps,
-                    self._fuse_adaln,
+                    audio,
+                    video,
+                    self.scale_shift_table_a2v_ca_audio,
+                    self.scale_shift_table_a2v_ca_video,
+                    self.video_to_audio_attn,
+                    is_a2v=False,
                 )
-                k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
-                    v2a_vx, pe=video.cross_positional_embeddings
-                )
-                v2a_out = self.video_to_audio_attn(
-                    v2a_ax,
-                    pre_projected_kv=(k_v2a, v_v2a),
-                    pe=audio.cross_positional_embeddings,
-                    timestep=audio.timesteps,
-                )
-                ax = apply_fused_gate_resid(ax, v2a_out, gate_v2a[0], gate_v2a[1], self._fuse_adaln)
 
         if run_vx:
             vx = self._ffn(vx, video, self.ff, self.scale_shift_table)
@@ -323,33 +322,34 @@ class LTX23TransformerBlock(nn.Module):
 class LTX23Model(LTXModel):
     """LTX-2.3 transformer: 9-slot AdaLN, prompt AdaLN, Identity caption projection."""
 
+    def _init_stream(self, dim, in_channels, out_channels, norm_eps, prefix=""):
+        setattr(self, f"{prefix}patchify_proj", self._make_linear(in_channels, dim))
+        setattr(
+            self,
+            f"{prefix}adaln_single",
+            AdaLayerNormSingle(dim, embedding_coefficient=9, make_linear=self._make_linear),
+        )
+        setattr(
+            self,
+            f"{prefix}prompt_adaln_single",
+            AdaLayerNormSingle(dim, embedding_coefficient=2, make_linear=self._make_linear),
+        )
+        setattr(self, f"{prefix}caption_projection", nn.Identity())
+        setattr(self, f"{prefix}scale_shift_table", nn.Parameter(torch.empty(2, dim)))
+        setattr(
+            self,
+            f"{prefix}norm_out",
+            nn.LayerNorm(dim, elementwise_affine=False, eps=norm_eps),
+        )
+        setattr(self, f"{prefix}proj_out", self._make_linear(dim, out_channels))
+
     def _init_video(self, in_channels, out_channels, caption_channels, norm_eps):
-        self.patchify_proj = self._make_linear(in_channels, self.inner_dim)
-        self.adaln_single = AdaLayerNormSingle(
-            self.inner_dim, embedding_coefficient=9, make_linear=self._make_linear
-        )
-        self.prompt_adaln_single = AdaLayerNormSingle(
-            self.inner_dim, embedding_coefficient=2, make_linear=self._make_linear
-        )
-        self.caption_projection = nn.Identity()
-        self.scale_shift_table = nn.Parameter(torch.empty(2, self.inner_dim))
-        self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
-        self.proj_out = self._make_linear(self.inner_dim, out_channels)
+        self._init_stream(self.inner_dim, in_channels, out_channels, norm_eps)
 
     def _init_audio(self, in_channels, out_channels, caption_channels, norm_eps):
-        self.audio_patchify_proj = self._make_linear(in_channels, self.audio_inner_dim)
-        self.audio_adaln_single = AdaLayerNormSingle(
-            self.audio_inner_dim, embedding_coefficient=9, make_linear=self._make_linear
+        self._init_stream(
+            self.audio_inner_dim, in_channels, out_channels, norm_eps, prefix="audio_"
         )
-        self.audio_prompt_adaln_single = AdaLayerNormSingle(
-            self.audio_inner_dim, embedding_coefficient=2, make_linear=self._make_linear
-        )
-        self.audio_caption_projection = nn.Identity()
-        self.audio_scale_shift_table = nn.Parameter(torch.empty(2, self.audio_inner_dim))
-        self.audio_norm_out = nn.LayerNorm(
-            self.audio_inner_dim, elementwise_affine=False, eps=norm_eps
-        )
-        self.audio_proj_out = self._make_linear(self.audio_inner_dim, out_channels)
 
     def _init_transformer_blocks(
         self,
@@ -402,6 +402,38 @@ class LTX23Model(LTXModel):
         sigma_scaled = sigma * self.timestep_scale_multiplier
         prompt_ts, _ = adaln(sigma_scaled.flatten(), hidden_dtype=dtype)
         return prompt_ts.view(batch_size, -1, prompt_ts.shape[-1])
+
+    def _prepare_stream(self, modality, text_cache, is_audio: bool):
+        if modality is None:
+            return None, None
+        if is_audio:
+            preprocessor = self.audio_args_preprocessor
+            context, mask = text_cache.audio_context, text_cache.audio_mask
+            pe, cross_pe = text_cache.audio_pe, text_cache.audio_cross_pe
+            adaln = self.audio_prompt_adaln_single
+        else:
+            preprocessor = self.video_args_preprocessor
+            context, mask = text_cache.video_context, text_cache.video_mask
+            pe, cross_pe = text_cache.video_pe, text_cache.video_cross_pe
+            adaln = self.prompt_adaln_single
+        args = preprocessor.prepare(modality, context, mask, pe, cross_pe)
+        prompt_ts = self._compute_prompt_timestep(
+            adaln, modality.sigma, modality.latent.shape[0], modality.latent.dtype
+        )
+        return args, prompt_ts
+
+    def _stream_output(self, args, is_audio: bool):
+        if args is None:
+            return None
+        if is_audio:
+            table, norm, proj = (
+                self.audio_scale_shift_table,
+                self.audio_norm_out,
+                self.audio_proj_out,
+            )
+        else:
+            table, norm, proj = self.scale_shift_table, self.norm_out, self.proj_out
+        return self._process_output(table, norm, proj, args.x, args.embedded_timestep)
 
     def prepare_text_cache(
         self,
@@ -460,46 +492,8 @@ class LTX23Model(LTXModel):
         timestep: torch.Tensor | None = None,
         step_index=None,
     ):
-        video_args = (
-            self.video_args_preprocessor.prepare(
-                video,
-                text_cache.video_context,
-                text_cache.video_mask,
-                text_cache.video_pe,
-                text_cache.video_cross_pe,
-            )
-            if video is not None
-            else None
-        )
-        audio_args = (
-            self.audio_args_preprocessor.prepare(
-                audio,
-                text_cache.audio_context,
-                text_cache.audio_mask,
-                text_cache.audio_pe,
-                text_cache.audio_cross_pe,
-            )
-            if audio is not None
-            else None
-        )
-
-        video_prompt_ts = (
-            self._compute_prompt_timestep(
-                self.prompt_adaln_single, video.sigma, video.latent.shape[0], video.latent.dtype
-            )
-            if video is not None
-            else None
-        )
-        audio_prompt_ts = (
-            self._compute_prompt_timestep(
-                self.audio_prompt_adaln_single,
-                audio.sigma,
-                audio.latent.shape[0],
-                audio.latent.dtype,
-            )
-            if audio is not None
-            else None
-        )
+        video_args, video_prompt_ts = self._prepare_stream(video, text_cache, is_audio=False)
+        audio_args, audio_prompt_ts = self._prepare_stream(audio, text_cache, is_audio=True)
 
         for block in self.transformer_blocks:
             video_args, audio_args = block(
@@ -509,26 +503,7 @@ class LTX23Model(LTXModel):
                 audio_prompt_timestep=audio_prompt_ts,
             )
 
-        vx = (
-            self._process_output(
-                self.scale_shift_table,
-                self.norm_out,
-                self.proj_out,
-                video_args.x,
-                video_args.embedded_timestep,
-            )
-            if video_args is not None
-            else None
+        return (
+            self._stream_output(video_args, is_audio=False),
+            self._stream_output(audio_args, is_audio=True),
         )
-        ax = (
-            self._process_output(
-                self.audio_scale_shift_table,
-                self.audio_norm_out,
-                self.audio_proj_out,
-                audio_args.x,
-                audio_args.embedded_timestep,
-            )
-            if audio_args is not None
-            else None
-        )
-        return vx, ax

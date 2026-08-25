@@ -17,9 +17,7 @@ def _sinc(x: torch.Tensor) -> torch.Tensor:
     )
 
 
-def kaiser_sinc_filter1d(
-    cutoff: float, half_width: float, kernel_size: int
-) -> torch.Tensor:
+def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> torch.Tensor:
     even = kernel_size % 2 == 0
     half_size = kernel_size // 2
     delta_f = 4 * half_width
@@ -32,9 +30,7 @@ def kaiser_sinc_filter1d(
         beta = 0.0
     window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
     time = (
-        torch.arange(-half_size, half_size) + 0.5
-        if even
-        else torch.arange(kernel_size) - half_size
+        torch.arange(-half_size, half_size) + 0.5 if even else torch.arange(kernel_size) - half_size
     )
     if cutoff == 0:
         filter_ = torch.zeros_like(time)
@@ -66,9 +62,7 @@ class LowPassFilter1d(nn.Module):
         self.stride = stride
         self.padding = padding
         self.padding_mode = padding_mode
-        self.register_buffer(
-            "filter", kaiser_sinc_filter1d(cutoff, half_width, kernel_size)
-        )
+        self.register_buffer("filter", kaiser_sinc_filter1d(cutoff, half_width, kernel_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, n_channels, _ = x.shape
@@ -104,24 +98,13 @@ class UpSample1d(nn.Module):
             self.pad_right = self.kernel_size - ratio
             time_axis = (torch.arange(self.kernel_size) / ratio - width) * rolloff
             time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width)
-            window = (
-                torch.cos(time_clamped * math.pi / lowpass_filter_width / 2) ** 2
-            )
-            sinc_filter = (
-                torch.sinc(time_axis) * window * rolloff / ratio
-            ).view(1, 1, -1)
+            window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2) ** 2
+            sinc_filter = (torch.sinc(time_axis) * window * rolloff / ratio).view(1, 1, -1)
         else:
-            self.kernel_size = (
-                int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-            )
+            self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
             self.pad = self.kernel_size // ratio - 1
-            self.pad_left = (
-                self.pad * self.stride + (self.kernel_size - self.stride) // 2
-            )
-            self.pad_right = (
-                self.pad * self.stride
-                + (self.kernel_size - self.stride + 1) // 2
-            )
+            self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
+            self.pad_right = self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
             sinc_filter = kaiser_sinc_filter1d(
                 cutoff=0.5 / ratio,
                 half_width=0.6 / ratio,
@@ -133,12 +116,8 @@ class UpSample1d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, n_channels, _ = x.shape
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        filt = self.filter.to(dtype=x.dtype, device=x.device).expand(
-            n_channels, -1, -1
-        )
-        x = self.ratio * F.conv_transpose1d(
-            x, filt, stride=self.stride, groups=n_channels
-        )
+        filt = self.filter.to(dtype=x.dtype, device=x.device).expand(n_channels, -1, -1)
+        x = self.ratio * F.conv_transpose1d(x, filt, stride=self.stride, groups=n_channels)
         return x[..., self.pad_left : -self.pad_right]
 
 
@@ -146,9 +125,7 @@ class DownSample1d(nn.Module):
     def __init__(self, ratio: int = 2, kernel_size: int | None = None) -> None:
         super().__init__()
         self.ratio = ratio
-        self.kernel_size = (
-            int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-        )
+        self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
         self.lowpass = LowPassFilter1d(
             cutoff=0.5 / ratio,
             half_width=0.6 / ratio,
@@ -189,15 +166,11 @@ class SnakeBeta(nn.Module):
         super().__init__()
         self.alpha_logscale = alpha_logscale
         self.alpha = nn.Parameter(
-            torch.zeros(in_features)
-            if alpha_logscale
-            else torch.ones(in_features) * alpha
+            torch.zeros(in_features) if alpha_logscale else torch.ones(in_features) * alpha
         )
         self.alpha.requires_grad = alpha_trainable
         self.beta = nn.Parameter(
-            torch.zeros(in_features)
-            if alpha_logscale
-            else torch.ones(in_features) * alpha
+            torch.zeros(in_features) if alpha_logscale else torch.ones(in_features) * alpha
         )
         self.beta.requires_grad = alpha_trainable
         self.eps = 1e-9
