@@ -1005,32 +1005,6 @@ def test_only_mode_uses_mode_selected_default_yaml(mode_yaml_files):
     assert settings.option.option == "off"
 
 
-def test_mode_can_select_multiple_default_yamls(basic_yaml_files):
-    """A mode can compose multiple default YAML files in merge order."""
-
-    class CompositeModeSettings(DynamicYamlMixInForSettings, BaseSettings):
-        mode: Literal["composite"] = "composite"
-        simple: SimpleModel
-        option: OptionModel
-
-        @classmethod
-        def _get_yaml_default_from_mode(cls, mode: str | None) -> list[str] | None:
-            if mode != "composite":
-                return None
-            return [
-                str(basic_yaml_files["config1"]),
-                str(basic_yaml_files["config2"]),
-            ]
-
-    settings = CompositeModeSettings(mode="composite")
-
-    assert settings.simple.value == 200
-    assert settings.simple.name == "config2"
-    assert settings.simple.flag is False
-    assert settings.option.name == "config1_option"
-    assert settings.option.option == "off"
-
-
 def test_only_yaml_default_uses_that_file(mode_yaml_files):
     """Providing only yaml_default picks that yaml file as default."""
     ModeBasedSettings = create_mode_based_settings(

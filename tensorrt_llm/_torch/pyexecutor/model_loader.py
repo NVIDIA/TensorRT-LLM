@@ -1558,6 +1558,10 @@ class ModelLoader:
             # have to reach the config the model is actually built from.
             update_spec_config_from_model_config(self.spec_config,
                                                  config.pretrained_config)
+        if self.llm_args.use_nanojet:
+            from ..nanojet_utils import initialize_nanojet
+
+            initialize_nanojet(config)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[

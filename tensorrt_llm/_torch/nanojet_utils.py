@@ -13,19 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lazy access to nanojet.
-
-Nothing here imports nanojet at module load. TensorRT LLM scans its custom-op and transform
-packages unconditionally, so an eager import would mean every install pays for nanojet —
-attempting it, failing, and logging — whether or not the user asked for a nanojet pass. The
-import happens on the first call, which only comes from a nanojet transform or backend that
-was explicitly enabled.
-"""
+"""Lazy access to NanoJet and its TensorRT-LLM integration contract."""
 
 import platform
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..logger import logger
+
+if TYPE_CHECKING:
+    from .model_config import ModelConfig
 
 _CONTRACT = None
 _AVAILABLE: Optional[bool] = None
@@ -59,42 +55,53 @@ def is_nanojet_available() -> bool:
 
 _MODELS_WITH_TUNE_CONFIGS_APPLIED: set = set()
 
-# nanojet files its tuned tiles under these names; TensorRT LLM spells the algorithm its own
-# way in ``quant_algo``.
-_QUANT_ALGO_TO_NANOJET = {"FP8": "fp8", "FP8_BLOCK_SCALES": "blockwise_fp8"}
+
+def _register_compilation_passes() -> None:
+    from .compilation.patterns import register_custom_pass_registrar
+    from .compilation.patterns.nanojet import register_nanojet_fusions
+
+    register_custom_pass_registrar("nanojet", register_nanojet_fusions)
 
 
-def ensure_tune_configs(factory) -> None:
-    """Load nanojet's tuned CUTLASS tiles for the model this factory built. Idempotent.
+def initialize_nanojet(model_config: "ModelConfig") -> None:
+    """Validate NanoJet's checkpoint contract and initialize its Python ops."""
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-    Called from every nanojet transform so no combination of enabled passes can miss it.
-    A missing config or unrecognized quantization leaves the kernels on default tiles.
-    """
-    if not is_nanojet_available():
+    from .custom_ops.nanojet import register_nanojet_ops
+
+    if model_config.get_quant_config().quant_algo != QuantAlgo.FP8:
+        raise ValueError("NanoJet requires a prequantized per-tensor FP8 checkpoint")
+    if not register_nanojet_ops():
+        raise RuntimeError("NanoJet requested, but nanojet_kernels is not importable")
+    _register_compilation_passes()
+    model_config.extra_attrs["nanojet_enabled"] = True
+    ensure_tune_configs(model_config)
+
+
+def ensure_tune_configs(model_config) -> None:
+    """Load NanoJet's tuned CUTLASS tiles for a model config. Idempotent."""
+    pretrained_config = model_config.pretrained_config
+    get_text_config = getattr(pretrained_config, "get_text_config", None)
+    if callable(get_text_config):
+        pretrained_config = get_text_config()
+    head_dim = getattr(pretrained_config, "head_dim", None)
+    if not isinstance(head_dim, int):
+        head_dim = pretrained_config.hidden_size // pretrained_config.num_attention_heads
+    shape = {
+        "hidden_size": pretrained_config.hidden_size,
+        "intermediate_size": pretrained_config.intermediate_size,
+        "head_dim": head_dim,
+        "num_attention_heads": pretrained_config.num_attention_heads,
+        "num_key_value_heads": pretrained_config.num_key_value_heads,
+    }
+    model_identity = (
+        pretrained_config.model_type,
+        tuple(sorted(shape.items())),
+    )
+    if model_identity in _MODELS_WITH_TUNE_CONFIGS_APPLIED:
         return
-    try:
-        model_config, _ = factory._get_model_config()
-        quantization = _QUANT_ALGO_TO_NANOJET.get(factory.get_quant_config().get("quant_algo"))
-        if quantization is None:
-            return
-        shape = dict(
-            hidden_size=model_config.hidden_size,
-            intermediate_size=model_config.intermediate_size,
-            head_dim=getattr(
-                model_config,
-                "head_dim",
-                model_config.hidden_size // model_config.num_attention_heads,
-            ),
-            num_attention_heads=model_config.num_attention_heads,
-            num_key_value_heads=model_config.num_key_value_heads,
-        )
-        model_identity = (model_config.model_type, quantization, tuple(sorted(shape.items())))
-        if model_identity in _MODELS_WITH_TUNE_CONFIGS_APPLIED:
-            return
-        _MODELS_WITH_TUNE_CONFIGS_APPLIED.add(model_identity)
-        _CONTRACT.apply_tune_configs(model_config.model_type, quantization, shape)
-    except Exception as error:
-        logger.warning(f"could not apply nanojet tune configs: {type(error).__name__}: {error}")
+    _MODELS_WITH_TUNE_CONFIGS_APPLIED.add(model_identity)
+    _CONTRACT.apply_tune_configs(pretrained_config.model_type, "fp8", shape)
 
 
 def nanojet_supports(op: str, **constraints) -> bool:

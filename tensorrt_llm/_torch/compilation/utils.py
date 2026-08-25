@@ -227,6 +227,9 @@ def inplace_info():
             1: "fused_q",
             2: "q_pe"
         },
+        "nanojet_gemm_fp8_add_": {
+            1: "residual"
+        },
     }
     for op_name, mutates_args in optional_inplace_infos.items():
         op = get_optional_trtllm_op(op_name)
