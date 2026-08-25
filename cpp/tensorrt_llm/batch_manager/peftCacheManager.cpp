@@ -452,6 +452,8 @@ void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
     // locks both caches' mCacheMutex to verify they agree on dtype before copying a task, so
     // reconfiguring them one at a time here would let a concurrent copyTask observe one cache
     // already switched to the new dtype while the other still holds the old one.
+    // Recalculate both page configurations for the selected adapter dtype while preserving
+    // the configured host and device byte budgets.
     auto const [hostCacheConfig, deviceCacheConfig]
         = getPageManagerConfig(mConfig, mModelConfig, mWorldConfig, dataType, mDeviceCacheByteBudget);
     // Retain the provisional allocations when dtype and page capacity already match;
