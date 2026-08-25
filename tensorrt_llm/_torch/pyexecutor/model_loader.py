@@ -7,7 +7,7 @@ import os
 import sys
 import traceback
 import warnings
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from enum import Enum
 from typing import Any, Callable, Iterator, Optional, Tuple
@@ -465,12 +465,19 @@ def _construct_checkpoint_loader(
     return checkpoint_loader
 
 
-def _open_checkpoint_weight_session(checkpoint_loader, checkpoint_dir: str,
-                                    **kwargs):
+@contextmanager
+def _legacy_weight_session(checkpoint_loader: Any, checkpoint_dir: str,
+                           **kwargs: Any) -> Iterator[dict[str, Any]]:
+    yield checkpoint_loader.load_weights(checkpoint_dir, **kwargs)
+
+
+def _open_checkpoint_weight_session(
+        checkpoint_loader: Any, checkpoint_dir: str,
+        **kwargs: Any) -> AbstractContextManager[dict[str, Any]]:
     """Preserve duck-typed loaders that predate the session interface."""
     if getattr(type(checkpoint_loader), "open_weight_session", None) is None:
-        return nullcontext(
-            checkpoint_loader.load_weights(checkpoint_dir, **kwargs))
+        return _legacy_weight_session(checkpoint_loader, checkpoint_dir,
+                                      **kwargs)
     return checkpoint_loader.open_weight_session(checkpoint_dir, **kwargs)
 
 
@@ -1800,9 +1807,9 @@ class ModelLoader:
                 ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
                 **load_weights_kwargs) as weights:
             weights_preloaded = checkpoint_loader.is_weights_preloaded()
-            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                model, config)
             if weights:
+                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                    model, config)
                 with timing_metric(
                         ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
                         self._metrics):

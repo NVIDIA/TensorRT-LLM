@@ -14,7 +14,11 @@ from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoad
 from tensorrt_llm._torch.models.checkpoints.mistral.checkpoint_loader import MistralCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
-from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader, _construct_checkpoint_loader
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    ModelLoader,
+    _construct_checkpoint_loader,
+    _open_checkpoint_weight_session,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -232,9 +236,15 @@ def test_construct_checkpoint_loader_detects_custom_hf_wrapper(
 class _SessionCheckpointLoader:
     checkpoint_format = "HF"
 
-    def __init__(self, events: list[str], checkpoint_dir: str = "/checkpoint") -> None:
+    def __init__(
+        self,
+        events: list[str],
+        checkpoint_dir: str = "/checkpoint",
+        weights: dict[str, object] | None = None,
+    ) -> None:
         self.events = events
         self.checkpoint_dir = checkpoint_dir
+        self.weights = {"model.weight": object()} if weights is None else weights
 
     @contextmanager
     def open_weight_session(
@@ -244,7 +254,7 @@ class _SessionCheckpointLoader:
         assert "mapping" in kwargs
         self.events.append("session_enter")
         try:
-            yield {"model.weight": object()}
+            yield self.weights
         finally:
             self.events.append("session_exit")
 
@@ -255,6 +265,19 @@ class _SessionCheckpointLoader:
         del model, config
         self.events.append("mapper_init")
         return object()
+
+
+def test_legacy_weight_session_defers_load_until_enter() -> None:
+    weights = {"model.weight": object()}
+    mapping = object()
+    checkpoint_loader = SimpleNamespace(load_weights=MagicMock(return_value=weights))
+
+    session = _open_checkpoint_weight_session(checkpoint_loader, "/checkpoint", mapping=mapping)
+
+    checkpoint_loader.load_weights.assert_not_called()
+    with session as loaded_weights:
+        assert loaded_weights is weights
+    checkpoint_loader.load_weights.assert_called_once_with("/checkpoint", mapping=mapping)
 
 
 def test_model_loader_session_spans_mapper_and_materialization() -> None:
@@ -283,6 +306,29 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
     ]
     assert "checkpoint_preparation_seconds" in loader.metrics
     assert "weight_population_seconds" in loader.metrics
+
+
+def test_preloaded_empty_weights_do_not_initialize_mapper() -> None:
+    events = []
+    checkpoint_loader = _SessionCheckpointLoader(events, weights={})
+    checkpoint_loader.is_weights_preloaded = MagicMock(return_value=True)
+    loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
+    loader.weight_mapper = None
+    loader._call_load_weights = MagicMock()
+
+    weights_preloaded = loader._materialize_checkpoint_weights(
+        checkpoint_loader,
+        "/checkpoint",
+        MagicMock(),
+        object(),
+        {"mapping": object()},
+    )
+
+    assert weights_preloaded
+    assert loader.weight_mapper is None
+    assert "mapper_init" not in events
+    loader._call_load_weights.assert_not_called()
 
 
 def test_draft_session_spans_mapper_and_materialization(
