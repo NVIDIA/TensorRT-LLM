@@ -1,9 +1,11 @@
 import json
 import os
 import sys
+import tempfile
 
 import openai
 import pytest
+import yaml
 
 from .openai_server import RemoteOpenAIServer
 
@@ -50,9 +52,29 @@ def model_name() -> str:
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str):
+def extra_llm_api_options_file():
+    # A named ``tool_choice`` constrains the forced call's arguments with
+    # JSON-schema guided decoding. Without a backend configured the constraint
+    # is silently dropped, so the server rejects the request outright -- these
+    # tests need it enabled.
+    temp_file_path = os.path.join(tempfile.gettempdir(),
+                                  "tool_call_extra_llm_api_options.yaml")
+    try:
+        with open(temp_file_path, "w") as f:
+            yaml.dump({"guided_decoding_backend": "xgrammar"}, f)
+        yield temp_file_path
+    finally:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+@pytest.fixture(scope="module")
+def server(model_name: str, extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
-    args = ["--tool_parser", "qwen3"]
+    args = [
+        "--tool_parser", "qwen3", "--extra_llm_api_options",
+        extra_llm_api_options_file
+    ]
     with RemoteOpenAIServer(model_path, cli_args=args) as remote_server:
         yield remote_server
 
@@ -119,3 +141,218 @@ async def test_tool_parser_streaming(client: openai.AsyncOpenAI,
     assert parameters
     args = json.loads(parameters)
     get_current_temperature(**args)
+
+
+# --------------------------------------------------------------------------
+# Named tool_choice (forced function call) — TRTLLM-12758
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_named_tool_choice_forces_function_call(
+        client: openai.AsyncOpenAI, model_name: str):
+    """OpenAI/Azure spec: tool_choice={"type":"function","function":{"name":"X"}}
+    must force the model to emit a tool_call to function X.
+    """
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[{
+            "role": "user",
+            # Prompt that on its own would not normally produce a tool call.
+            "content": "Just say hi.",
+        }],
+        tools=TOOLS,
+        tool_choice={
+            "type": "function",
+            "function": {
+                "name": "get_current_temperature"
+            },
+        },
+    )
+    message = response.choices[0].message
+    assert message.tool_calls, (f"Expected forced tool_calls, got: {message}")
+    assert len(message.tool_calls) == 1
+    forced_call = message.tool_calls[0]
+    assert forced_call.function.name == "get_current_temperature"
+    # Arguments must be valid JSON matching the schema (location is required).
+    args = json.loads(forced_call.function.arguments)
+    assert "location" in args
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_named_tool_choice_missing_function_returns_400(
+        client: openai.AsyncOpenAI, model_name: str):
+    """Forcing a function name that is not present in `tools` must fail with
+    HTTP 400 and an error message that identifies the missing function."""
+    with pytest.raises(openai.BadRequestError) as exc:
+        await client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role": "user",
+                "content": "Hello"
+            }],
+            tools=TOOLS,
+            tool_choice={
+                "type": "function",
+                "function": {
+                    "name": "function_that_does_not_exist"
+                },
+            },
+        )
+    assert exc.value.status_code == 400
+    assert "function_that_does_not_exist" in str(exc.value)
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_tool_choice_auto_unchanged(client: openai.AsyncOpenAI,
+                                          model_name: str):
+    """Regression: tool_choice='auto' continues to work unchanged."""
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[{
+            "role": "user",
+            "content": "What's the temperature in San Francisco now?",
+        }],
+        tools=TOOLS,
+        tool_choice="auto",
+    )
+    assert response.choices[0].finish_reason == "tool_calls"
+    assert response.choices[0].message.tool_calls
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_tool_choice_none_unchanged(client: openai.AsyncOpenAI,
+                                          model_name: str):
+    """Regression: tool_choice='none' continues to work unchanged (no tool calls)."""
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[{
+            "role":
+            "user",
+            "content":
+            "Reply with the single word 'hello' and nothing else.",
+        }],
+        tools=TOOLS,
+        tool_choice="none",
+    )
+    # finish_reason should not be "tool_calls" when explicitly disabled.
+    assert response.choices[0].finish_reason != "tool_calls"
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_named_tool_choice_streaming(client: openai.AsyncOpenAI,
+                                           model_name: str):
+    """Streaming counterpart of the forced-function-call test: the very first
+    tool-call delta must carry the forced function name and a tool-call id;
+    subsequent deltas stream the JSON ``arguments`` of the same call."""
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[{
+            "role": "user",
+            # A prompt that on its own would not produce a tool call.
+            "content": "Just say hi.",
+        }],
+        tools=TOOLS,
+        tool_choice={
+            "type": "function",
+            "function": {
+                "name": "get_current_temperature"
+            },
+        },
+        stream=True,
+    )
+
+    tool_id = None
+    tool_name = None
+    arguments = ""
+    finish_reason = None
+
+    async for chunk in response:
+        choice = chunk.choices[0]
+        if choice.delta.tool_calls:
+            tc = choice.delta.tool_calls[0]
+            # All deltas must be on the same tool-call index.
+            assert tc.index == 0
+            if tc.id:
+                # ID may arrive on the first chunk only.
+                assert tool_id is None, "tool_call id sent more than once"
+                tool_id = tc.id
+            if tc.function.name:
+                assert tool_name is None, "tool_call name sent more than once"
+                tool_name = tc.function.name
+            if tc.function.arguments:
+                arguments += tc.function.arguments
+        if choice.finish_reason:
+            finish_reason = choice.finish_reason
+
+    assert tool_id is not None
+    assert tool_name == "get_current_temperature"
+    assert finish_reason == "tool_calls"
+    args = json.loads(arguments)
+    assert "location" in args
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_named_tool_choice_with_response_format_is_rejected(
+        client: openai.AsyncOpenAI, model_name: str):
+    """A named tool_choice cannot be combined with client guided decoding.
+
+    The forced path installs its own JSON-schema guided decoding plus a
+    begin-prefix. When ``response_format`` already set a guided-decoding mode
+    the forced path is skipped, so nothing constrains the output -- but the
+    post-processor would still synthesize a tool call, reporting arguments
+    that are really unconstrained assistant text. Reject instead.
+    """
+    with pytest.raises(openai.BadRequestError) as exc_info:
+        await client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role": "user",
+                "content": "What's the temperature in San Francisco now?",
+            }],
+            tools=TOOLS,
+            tool_choice={
+                "type": "function",
+                "function": {
+                    "name": "get_current_temperature"
+                },
+            },
+            response_format={"type": "json_object"},
+        )
+    assert exc_info.value.status_code == 400
+    assert "guided-decoding" in str(exc_info.value)
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_named_tool_choice_with_prompt_token_ids_b64_is_rejected(
+        client: openai.AsyncOpenAI, model_name: str):
+    """``prompt_token_ids_b64`` must be rejected like ``prompt_token_ids``.
+
+    The begin-prefix is only appended on the text-prompt branch, so a
+    pre-tokenized request never receives it. The base64 form is decoded after
+    the guard runs, so checking ``prompt_token_ids`` alone let it through.
+    """
+    with pytest.raises(openai.BadRequestError) as exc_info:
+        await client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role":
+                "user",
+                "content":
+                "ignored; prompt_token_ids_b64 takes precedence",
+            }],
+            tools=TOOLS,
+            tool_choice={
+                "type": "function",
+                "function": {
+                    "name": "get_current_temperature"
+                },
+            },
+            extra_body={
+                # base64 of an int32 buffer -- content is irrelevant, the
+                # request must be rejected before it is decoded.
+                "prompt_token_ids_b64": "AQAAAAIAAAADAAAA",
+            },
+        )
+    assert exc_info.value.status_code == 400
+    assert "prompt_token_ids" in str(exc_info.value)

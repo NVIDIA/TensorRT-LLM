@@ -1,3 +1,4 @@
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
@@ -89,6 +90,19 @@ class ChatPostprocArgs(PostprocArgs):
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
     has_tool_call: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
+    # Per-output flag tracking whether the streaming forced-call path has
+    # already emitted the opening delta (with id and function name). The id is
+    # generated once on the first non-empty delta; subsequent deltas omit it
+    # and only stream argument fragments.
+    forced_tool_name_sent: dict[int, bool] = field(default_factory=dict)
+    # Streaming forced-call bookkeeping, per output index: the raw text seen so
+    # far, how much of it has already been streamed as ``arguments``, and
+    # whether the arguments value has finished. Together these let the stream
+    # stop at the end of the JSON value instead of forwarding whatever the
+    # model generates afterwards.
+    forced_tool_args_buffer: dict[int, str] = field(default_factory=dict)
+    forced_tool_args_sent_len: dict[int, int] = field(default_factory=dict)
+    forced_tool_args_done: dict[int, bool] = field(default_factory=dict)
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
     # Cache per-request stream metadata so every chunk reuses the same response
@@ -262,6 +276,32 @@ def _forced_call_name(calls: List[ToolCallItem], forced_name: str) -> str:
     return forced_name
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
+def forced_tool_arguments_end(text: str) -> Optional[int]:
+    """Return the index just past the first complete JSON value in ``text``.
+
+    The forced-tool-call path prefix-injects ``{"name": X, "arguments":`` into
+    the prompt, so generation starts inside a tool-call object. A model that
+    keeps going after the arguments closes the *outer* object too and then
+    emits the parser's end tag and ordinary assistant text -- all of which
+    would otherwise be reported as ``function.arguments``.
+
+    Returns ``None`` while ``text`` is not yet a complete JSON value, so a
+    streaming caller can keep buffering.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return None
+    leading_ws = len(text) - len(stripped)
+    try:
+        _, end = _JSON_DECODER.raw_decode(text, leading_ws)
+    except ValueError:
+        return None
+    return end
+
+
 @nvtx_range_debug("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase,
                                args: ChatPostprocArgs) -> List[str]:
@@ -331,17 +371,59 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
         forced_tool = _forced_tool_choice(args)
         if forced_tool and not _forced_choice_uses_tool_parser(args):
-            # Forced calls constrained to bare JSON arguments: raw deltas are
-            # the arguments stream. The response carries a tool call, so the
-            # final chunk must report finish_reason="tool_calls".
-            args.has_tool_call[i] = True
-            delta_message = DeltaMessage(tool_calls=[
-                DeltaToolCall(
-                    function=DeltaFunctionCall(name=forced_tool.function.name,
-                                               arguments=delta_text),
-                    index=i,
-                ),
-            ], )
+            # Forced call constrained by JSON-schema guided decoding: the
+            # deltas stream the arguments value. Buffer them so the stream can
+            # stop at the end of that value -- generation starts inside the
+            # tool call, so a model that overruns goes on to close the
+            # enclosing object, emit the parser's end tag and then plain
+            # prose, none of which belongs in ``arguments``.
+            forced_name = forced_tool.function.name
+            delta_arguments = ""
+            if delta_text and not args.forced_tool_args_done.get(i, False):
+                buffered = args.forced_tool_args_buffer.get(i, "") + delta_text
+                args.forced_tool_args_buffer[i] = buffered
+                arguments_end = forced_tool_arguments_end(buffered)
+                if arguments_end is None:
+                    limit = len(buffered)
+                else:
+                    limit = arguments_end
+                    args.forced_tool_args_done[i] = True
+                already_sent = args.forced_tool_args_sent_len.get(i, 0)
+                delta_arguments = buffered[already_sent:limit]
+                args.forced_tool_args_sent_len[i] = max(already_sent, limit)
+
+            tool_calls = []
+            if delta_arguments:
+                if not args.forced_tool_name_sent.get(i, False):
+                    args.forced_tool_name_sent[i] = True
+                    tool_calls.append(
+                        DeltaToolCall(
+                            id=make_tool_call_id(id_type=args.tool_call_id_type,
+                                                 func_name=forced_name,
+                                                 idx=0),
+                            index=0,
+                            type="function",
+                            function=DeltaFunctionCall(
+                                name=forced_name,
+                                arguments=delta_arguments,
+                            ),
+                        ))
+                else:
+                    tool_calls.append(
+                        DeltaToolCall(
+                            index=0,
+                            function=DeltaFunctionCall(
+                                arguments=delta_arguments, ),
+                        ))
+            # finish_reason may only flip once a call has actually been
+            # streamed. A run that ends before any arguments arrived (token
+            # budget, abort) would otherwise report "tool_calls" with no call.
+            if args.forced_tool_name_sent.get(i, False):
+                args.has_tool_call[i] = True
+            if not tool_calls and not output.finish_reason and not has_token_delta:
+                continue
+            delta_message = DeltaMessage(
+                tool_calls=tool_calls if tool_calls else None)
         else:
             delta_text, calls = apply_tool_parser(args,
                                                   i,
@@ -379,16 +461,16 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                             arguments=call_item.parameters,
                         ),
                     ))
-            # Keep token-bearing chunks visible even when detokenization has no
-            # text to flush yet.
-            if (tool_calls or delta_text or reasoning_delta_text
-                    or output.finish_reason or has_token_delta):
-                delta_message = DeltaMessage(
-                    content=delta_text,
-                    reasoning_content=reasoning_delta_text,
-                    tool_calls=tool_calls if tool_calls else None)
-            else:
-                continue
+        # Keep token-bearing chunks visible even when detokenization has no
+        # text to flush yet.
+        if (tool_calls or delta_text or reasoning_delta_text
+                or output.finish_reason or has_token_delta):
+            delta_message = DeltaMessage(
+                content=delta_text,
+                reasoning_content=reasoning_delta_text,
+                tool_calls=tool_calls if tool_calls else None)
+        else:
+            continue
 
         choice = ChatCompletionResponseStreamChoice(
             index=i,
@@ -458,16 +540,28 @@ def chat_response_post_processor(
 
         forced_tool = _forced_tool_choice(args)
         if forced_tool and not _forced_choice_uses_tool_parser(args):
-            # Forced calls constrained to bare JSON arguments: the whole text
-            # is the arguments payload. The response carries a tool call, so
-            # finish_reason must be "tool_calls".
+            # Forced call constrained by JSON-schema guided decoding: the text
+            # is the arguments value. Keep only that value -- guided decoding
+            # should already stop generation there, but a model that overruns
+            # would otherwise have the enclosing brace, the parser's end tag
+            # and its trailing prose reported as ``arguments``, which then
+            # fails to parse as JSON for the caller.
+            if text is None:
+                text = ""
+            arguments_end = forced_tool_arguments_end(text)
+            arguments = text if arguments_end is None else text[:arguments_end]
             args.has_tool_call[output.index] = True
             message = ChatMessage(
                 role=role,
                 content="",
                 tool_calls=[
-                    ToolCall(function=FunctionCall(
-                        name=forced_tool.function.name, arguments=text))
+                    ToolCall(id=make_tool_call_id(
+                        id_type=args.tool_call_id_type,
+                        func_name=forced_tool.function.name,
+                        idx=0),
+                             function=FunctionCall(
+                                 name=forced_tool.function.name,
+                                 arguments=arguments))
                 ])
         elif forced_tool:
             # The parser extracts the forced call from the model's native
@@ -499,14 +593,15 @@ def chat_response_post_processor(
                                       content=text,
                                       reasoning_content=reasoning_text)
         else:
-            if text is None:
-                text = ""
             text, calls = apply_tool_parser(args, output.index, text, False)
             tool_calls = [
                 ToolCall(function=FunctionCall(name=call.name or "",
                                                arguments=call.parameters))
                 for call in calls
             ]
+            # Only the non-forced path builds ``message`` here; each forced
+            # branch above builds its own. Keeping this outside the ``else``
+            # would clobber those and read ``tool_calls`` unbound.
             message = ChatMessage(role=role,
                                   content=text,
                                   reasoning_content=reasoning_text,
