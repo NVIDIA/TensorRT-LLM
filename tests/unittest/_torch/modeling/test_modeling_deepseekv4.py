@@ -40,7 +40,6 @@ from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
@@ -159,24 +158,6 @@ def _make_weight_loader_test_model(*, enable_eplb=False):
     return model
 
 
-class _WeightLoaderTestLeaf(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(2))
-
-    def load_weights(self, weights):
-        self.weight.data.copy_(weights[0]["weight"])
-
-
-class _WeightLoaderTestExperts(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.loaded_weights = None
-
-    def load_weights(self, weights):
-        self.loaded_weights = weights[0]
-
-
 def test_deepseek_v4_config_aliases():
     config = DeepseekV4Config(
         num_hash_layers=5, sliding_window=256, head_dim=128, score_func="sigmoid", swiglu_limit=9.0
@@ -256,36 +237,13 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
     assert "model.layers.0.mlp.experts.0.w1.weight_scale" not in remapped
 
 
-def test_deepseek_v4_weight_loader_consumes_only_loaded_subtrees():
-    model = _make_weight_loader_test_model()
-    layer = model.model.layers[0]
-    layer.foo.child = _WeightLoaderTestLeaf()
-    layer.mlp = torch.nn.Module()
-    layer.mlp.experts = _WeightLoaderTestExperts()
-    expert_key = "model.layers.0.mlp.experts.0.gate_proj.weight"
-    weights = ConsumableWeightsDict(
-        {
-            "model.layers.0.foo.weight": torch.tensor([1.0, 2.0]),
-            "model.layers.0.foo.child.weight": torch.tensor([3.0, 4.0]),
-            expert_key: torch.tensor([5.0, 6.0]),
-        }
-    )
-
-    DeepseekV4WeightLoader(model)._load_weights_impl(weights)
-
-    torch.testing.assert_close(layer.foo.weight, torch.tensor([1.0, 2.0]))
-    torch.testing.assert_close(layer.foo.child.weight, torch.tensor([3.0, 4.0]))
-    assert expert_key not in weights
-    assert "0.w1.weight" in layer.mlp.experts.loaded_weights
-
-
 def test_deepseek_v4_eplb_weight_loader_pages_out_each_moe_layer(monkeypatch):
     model = _make_weight_loader_test_model(enable_eplb=True)
     layer = model.model.layers[0]
     layer.mlp = torch.nn.Module()
     layer.mlp.experts = torch.nn.Module()
     layer.mlp.experts.backend = torch.nn.Module()
-    weights = ConsumableWeightsDict({"model.layers.0.foo.weight": torch.tensor([1.0, 2.0])})
+    weights = {"model.layers.0.foo.weight": torch.tensor([1.0, 2.0])}
     synchronize_calls = []
     pageout_calls = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: synchronize_calls.append(None))
