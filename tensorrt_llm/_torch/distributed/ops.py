@@ -1146,6 +1146,7 @@ class AllReduce(nn.Module):
 
             All strategies support the following operations:
                 - NONE (AllReduce only)
+                - RMS_NORM
                 - RESIDUAL_RMS_NORM
                 - RESIDUAL_RMS_NORM_QUANT_FP8
                 - RESIDUAL_RMS_NORM_QUANT_NVFP4
