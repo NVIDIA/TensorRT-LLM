@@ -15,23 +15,22 @@
 
 import asyncio
 import os
-import select
 import signal
-import subprocess
 import sys
 import threading
 import time
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from utils.spawn_process import SpawnProcessContext, spawn_process, wait_forever
 
 from tensorrt_llm._torch.visual_gen import executor as executor_module
 from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
 
 _THREADING_EVENT = threading.Event
-_LIFECYCLE_HELPER = Path(__file__).with_name("_executor_lifecycle_helper.py")
-_SUBPROCESS_TIMEOUT = 180.0
 
 
 def _pre_set_event() -> threading.Event:
@@ -55,88 +54,185 @@ def _wait_for_process_exit(pid: int, timeout: float = 10.0) -> None:
     assert not _process_is_running(pid)
 
 
-def _start_lifecycle_helper(*args: str) -> subprocess.Popen:
-    return subprocess.Popen(
-        [sys.executable, str(_LIFECYCLE_HELPER), *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+def _pause() -> None:
+    while True:
+        signal.pause()
 
 
-def _wait_for_helper_messages(
-    process: subprocess.Popen,
-    required_prefixes: tuple[str, ...],
-) -> dict[str, str]:
-    assert process.stdout is not None
-    messages = {}
-    output = []
-    deadline = time.monotonic() + _SUBPROCESS_TIMEOUT
-    while set(messages) != set(required_prefixes) and time.monotonic() < deadline:
-        ready, _, _ = select.select([process.stdout], [], [], 0.1)
-        if not ready:
-            if process.poll() is not None:
-                break
-            continue
-        line = process.stdout.readline()
-        if not line:
-            break
-        decoded_line = line.decode(errors="replace").rstrip()
-        output.append(decoded_line)
-        if decoded_line.startswith("error:"):
-            pytest.fail(f"lifecycle helper failed: {decoded_line}\n" + "\n".join(output))
-        for prefix in required_prefixes:
-            if decoded_line.startswith(prefix):
-                messages[prefix] = decoded_line.removeprefix(prefix)
+def _parent_bound_worker(
+    parent_pid: int,
+    lifecycle_context: SpawnProcessContext,
+    **_kwargs,
+) -> None:
+    blocked_signals = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    if signal.SIGINT in blocked_signals or signal.SIGTERM in blocked_signals:
+        raise RuntimeError("worker inherited blocked termination signal")
+    executor_module._set_worker_parent_death_signal(parent_pid)
+    executor_module._start_parent_process_watchdog(parent_pid)
+    lifecycle_context.send("worker", os.getpid())
+    _pause()
 
-    missing = set(required_prefixes) - set(messages)
-    if missing:
-        pytest.fail(
-            f"lifecycle helper did not report {sorted(missing)}; "
-            f"returncode={process.poll()}, output={output}"
+
+def _parent_death_worker(
+    parent_pid: int,
+    lifecycle_context: SpawnProcessContext,
+) -> None:
+    executor_module._set_worker_parent_death_signal(parent_pid)
+    lifecycle_context.send("worker", os.getpid())
+    _pause()
+
+
+def _lightweight_background(client: DiffusionRemoteClient) -> None:
+    client.event_loop_ready.set()
+    client.shutdown_event.wait()
+
+
+def _run_owned_worker_coordinator(
+    lifecycle_context: SpawnProcessContext,
+    fail_owner_wait_once: bool,
+) -> None:
+    parent_pid = os.getpid()
+    context = executor_module._get_mp_context("spawn")
+
+    if not fail_owner_wait_once:
+        args = SimpleNamespace(parallel_config=SimpleNamespace(n_workers=1))
+        startup_error = []
+        clients = []
+        worker_target = partial(
+            _parent_bound_worker,
+            lifecycle_context=lifecycle_context,
         )
-    return messages
 
+        def construct_client_from_temporary_thread() -> None:
+            try:
+                with (
+                    patch.object(
+                        executor_module,
+                        "_detect_external_launch",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        executor_module,
+                        "find_free_port",
+                        side_effect=[29500, 29501, 29502],
+                    ),
+                    patch.object(
+                        executor_module,
+                        "get_ip_address",
+                        return_value="127.0.0.1",
+                    ),
+                    patch.object(
+                        executor_module,
+                        "_get_mp_context",
+                        return_value=context,
+                    ),
+                    patch.object(
+                        executor_module,
+                        "run_diffusion_worker",
+                        worker_target,
+                    ),
+                    patch.object(
+                        DiffusionRemoteClient,
+                        "_serve_forever_thread",
+                        _lightweight_background,
+                    ),
+                    patch.object(DiffusionRemoteClient, "_wait_ready"),
+                    patch.object(executor_module, "_register_atexit"),
+                ):
+                    clients.append(DiffusionRemoteClient(args=args))
+            except BaseException as error:
+                startup_error.append(error)
 
-def _kill_process_group(process: subprocess.Popen) -> None:
-    if process.poll() is None:
+        constructor = threading.Thread(target=construct_client_from_temporary_thread)
+        constructor.start()
+        constructor.join(timeout=30.0)
+        if constructor.is_alive() or startup_error or not clients:
+            raise RuntimeError(f"client startup failed: {startup_error!r}")
+        lifecycle_context.send("constructor")
+        _pause()
+
+    worker = context.Process(
+        target=_parent_bound_worker,
+        kwargs={
+            "parent_pid": parent_pid,
+            "lifecycle_context": lifecycle_context,
+        },
+    )
+    initial_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    owner = executor_module._WorkerProcessOwner([worker], initial_signal_mask)
+    owner_wait_failed = threading.Event()
+    wait_for_release = owner._wait_for_release
+
+    def fail_once() -> None:
+        if not owner_wait_failed.is_set():
+            owner_wait_failed.set()
+            raise RuntimeError("injected owner wait failure")
+        wait_for_release()
+
+    owner._wait_for_release = fail_once
+    startup_error = []
+
+    def construct_from_temporary_thread() -> None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    try:
-        process.wait(timeout=10.0)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=10.0)
-    if process.stdout is not None:
-        process.stdout.close()
+            owner.start()
+            owner.wait_for_spawn(timeout=30.0)
+        except BaseException as error:
+            startup_error.append(error)
+
+    constructor = threading.Thread(target=construct_from_temporary_thread)
+    constructor.start()
+    constructor.join(timeout=30.0)
+    if constructor.is_alive() or startup_error:
+        raise RuntimeError(f"owner startup failed: {startup_error!r}")
+    if not owner_wait_failed.wait(timeout=30.0):
+        raise RuntimeError("owner wait failure was not observed")
+    lifecycle_context.send("constructor")
+    _pause()
+
+
+def _run_process_watchdog(
+    lifecycle_context: SpawnProcessContext,
+    watched_pid: int,
+) -> None:
+    watchdog = executor_module._start_parent_process_watchdog(watched_pid)
+    if watchdog is None:
+        raise RuntimeError("process watchdog did not start")
+    lifecycle_context.send("ready")
+    _pause()
+
+
+def _run_parent_death_coordinator(
+    lifecycle_context: SpawnProcessContext,
+) -> None:
+    context = executor_module._get_mp_context("spawn")
+    worker = context.Process(
+        target=_parent_death_worker,
+        args=(os.getpid(), lifecycle_context),
+    )
+    worker.start()
+    worker.join()
 
 
 def _assert_owned_worker_lifecycle(fail_owner_wait_once: bool) -> None:
-    coordinator = _start_lifecycle_helper(
-        "owned-worker",
-        str(int(fail_owner_wait_once)),
-    )
     worker_pid = None
     try:
-        messages = _wait_for_helper_messages(
-            coordinator,
-            ("constructor:done", "worker:"),
-        )
-        worker_pid = int(messages["worker:"])
+        with spawn_process(
+            _run_owned_worker_coordinator,
+            fail_owner_wait_once,
+        ) as coordinator:
+            messages = coordinator.receive_many("constructor", "worker")
+            worker_pid = messages["worker"]
 
-        # The temporary constructor thread is gone. The dedicated process
-        # owner must keep the thread-scoped PDEATHSIG from firing.
-        time.sleep(1.0)
-        assert coordinator.poll() is None
-        assert _process_is_running(worker_pid)
+            # The temporary constructor thread is gone. The dedicated process
+            # owner must keep the thread-scoped PDEATHSIG from firing.
+            time.sleep(1.0)
+            assert coordinator.is_alive
+            assert _process_is_running(worker_pid)
 
-        coordinator.kill()
-        assert coordinator.wait(timeout=_SUBPROCESS_TIMEOUT) == -signal.SIGKILL
-        _wait_for_process_exit(worker_pid)
+            coordinator.kill()
+            assert coordinator.wait() == -signal.SIGKILL
+            _wait_for_process_exit(worker_pid)
     finally:
-        _kill_process_group(coordinator)
         if worker_pid is not None and _process_is_running(worker_pid):
             os.kill(worker_pid, signal.SIGKILL)
 
@@ -183,20 +279,16 @@ def test_worker_kills_itself_if_coordinator_exits_before_registration() -> None:
     reason="pidfd process monitoring is Linux-specific",
 )
 def test_process_watchdog_kills_worker_when_watched_process_exits() -> None:
-    watched = subprocess.Popen(
-        [sys.executable, "-c", "import signal; signal.pause()"],
-        start_new_session=True,
-    )
-    worker = _start_lifecycle_helper("process-watchdog", str(watched.pid))
-    try:
-        _wait_for_helper_messages(worker, ("ready",))
+    with (
+        spawn_process(wait_forever) as watched,
+        spawn_process(_run_process_watchdog, watched.pid) as worker,
+    ):
+        watched.receive("ready")
+        worker.receive("ready")
 
         watched.kill()
-        assert watched.wait(timeout=_SUBPROCESS_TIMEOUT) == -signal.SIGKILL
-        assert worker.wait(timeout=_SUBPROCESS_TIMEOUT) == -signal.SIGKILL
-    finally:
-        _kill_process_group(watched)
-        _kill_process_group(worker)
+        assert watched.wait() == -signal.SIGKILL
+        assert worker.wait() == -signal.SIGKILL
 
 
 def test_worker_arms_both_parent_death_guards_before_initialization() -> None:
@@ -249,18 +341,16 @@ def test_worker_arms_both_parent_death_guards_before_initialization() -> None:
 
 @pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-specific")
 def test_worker_is_killed_when_coordinator_is_sigkilled() -> None:
-    coordinator = _start_lifecycle_helper("parent-death")
     worker_pid = None
     try:
-        messages = _wait_for_helper_messages(coordinator, ("worker:",))
-        worker_pid = int(messages["worker:"])
+        with spawn_process(_run_parent_death_coordinator) as coordinator:
+            worker_pid = coordinator.receive("worker")
 
-        coordinator.kill()
-        assert coordinator.wait(timeout=_SUBPROCESS_TIMEOUT) == -signal.SIGKILL
+            coordinator.kill()
+            assert coordinator.wait() == -signal.SIGKILL
 
-        _wait_for_process_exit(worker_pid)
+            _wait_for_process_exit(worker_pid)
     finally:
-        _kill_process_group(coordinator)
         if worker_pid is not None and _process_is_running(worker_pid):
             os.kill(worker_pid, signal.SIGKILL)
 
