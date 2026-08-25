@@ -145,7 +145,6 @@ full:B200/accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggre
 full:B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_chunked_prefill[latency] SKIP (https://nvbugs/6650388)
 full:B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_piecewise_cuda_graph[mtp3_fp8kv_chunked] SKIP (https://nvbugs/6650388)
 full:B200/accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4[torch_compile=True] SKIP (https://nvbugs/6525010)
-full:B200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_auto_dtype[tp_size=8-ep_size=8] SKIP (https://nvbugs/6384747)
 full:B200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[use_msa=False] SKIP (https://nvbugs/6424188)
 full:B200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=False] SKIP (https://nvbugs/6424188)
 full:B200/accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] SKIP (https://nvbugs/6572838)
