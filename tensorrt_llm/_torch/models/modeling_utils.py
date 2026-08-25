@@ -1206,6 +1206,48 @@ def filter_weights(prefix, weights: Dict):
     return result
 
 
+def _get_load_weights_num_workers() -> Optional[int]:
+    """Return the per-rank module-loading worker limit, or None for the default.
+
+    Weight loading runs one ThreadPoolExecutor per rank, which without an
+    explicit limit defaults to as many as 32 workers (CPython's
+    ``min(32, cpu_count + 4)``; the count is the machine's, not the rank's
+    share of it). The limit is per rank, so four ranks on a node can have four
+    times that many module loads in flight. Each one holds its own host-side
+    working set while it stages and transforms a module's weights, and every
+    rank's is charged to the same host-memory cgroup -- which is how a large
+    checkpoint exhausts host memory while the GPUs are nowhere near full.
+
+    ``TLLM_LOAD_WEIGHTS_NUM_WORKERS`` bounds that overlap. Unset or blank keeps
+    the executor default; a positive integer trades loading parallelism for
+    host-memory headroom; anything else raises, so a typo cannot look like it
+    took effect. ``TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL`` takes precedence
+    and skips the pool entirely -- this variable is the range in between.
+
+    Set it when ranks share a constrained cgroup. Tune it against node
+    ``memory.peak`` and the slowest rank's init time, not per-process RSS,
+    which does not see shared page cache. ``4`` measured well on a four-rank
+    node but is a starting point, not a default; retune per checkpoint and
+    topology.
+    """
+    env_name = "TLLM_LOAD_WEIGHTS_NUM_WORKERS"
+    value = os.environ.get(env_name)
+    if value is None or not value.strip():
+        return None
+
+    try:
+        num_workers = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}") from error
+    if num_workers <= 0:
+        raise ValueError(
+            f"{env_name} must be a positive integer, got {value!r}")
+    logger.info(
+        f"Limiting concurrent module weight loading to {num_workers} workers")
+    return num_workers
+
+
 def run_concurrently(func,
                      args_list,
                      reduce_func=None,
@@ -1404,7 +1446,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=_get_load_weights_num_workers())
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
@@ -1537,4 +1582,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             for name, module in model.named_modules(remove_duplicate=False)
             if name not in serial_load_modules
         ]
-        run_concurrently(load_single_module, args_list, pbar=pbar)
+        run_concurrently(load_single_module,
+                         args_list,
+                         pbar=pbar,
+                         num_workers=_get_load_weights_num_workers())

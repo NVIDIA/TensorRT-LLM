@@ -31,6 +31,11 @@ from .interface import MoE
 # class a backend used to have would stop recognising it *silently* -- the
 # weights would simply not be loaded, with no exception and a model that still
 # constructs and still runs on random expert weights.
+#
+# ``VanillaMoE`` is deliberately absent: it holds expert weights as an
+# ``nn.ModuleList`` of per-expert submodules, is never wrapped in
+# ``ConfigurableMoE``, and so has no ``.backend`` path to rewrite. Sites that do
+# need it name it explicitly (``modeling_utils.apply_layerwise_quant_config``).
 _MOE_WEIGHT_OWNER_TYPES = (MoE, MoEImplBase)
 
 

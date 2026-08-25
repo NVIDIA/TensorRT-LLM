@@ -85,7 +85,7 @@ Two ready-to-run multi-agent workflows ship as subpackages of
 PlanDrafter ⇄ PlanReviewer [⇄ Human]  →  Coder ⇄ Reviewer  →  QA  ✔
 ```
 
-![Agent-team workflow](./agent_flow/workflows/agent_team/agent-team.svg)
+![Agent-team workflow](./agent_flow/workflows/agent_team/docs/agent-team.svg)
 
 ### Run the modeling-bringup workflow
 
