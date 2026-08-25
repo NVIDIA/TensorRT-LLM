@@ -76,7 +76,6 @@ from ..modules.fused_moe import (
     resolve_moe_cls,
 )
 from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -1697,7 +1696,6 @@ class DeepseekV4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({"alltoall_result_do_sum": False} if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output
@@ -2546,12 +2544,13 @@ class DeepseekV4Model(DecoderModel):
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        return {
-            "kv_cache_config": {
-                "tokens_per_block": 128,
-                "enable_swa_scratch_reuse": True,
-            }
+        kv_cache_defaults = {
+            "tokens_per_block": 128,
+            "enable_swa_scratch_reuse": True,
         }
+        if llm_args is not None and llm_args.kv_cache_config.dtype == "fp8_ds_mla":
+            kv_cache_defaults["tokens_per_block"] = 256
+        return {"kv_cache_config": kv_cache_defaults}
 
     @classmethod
     def get_preferred_kv_cache_manager_version(

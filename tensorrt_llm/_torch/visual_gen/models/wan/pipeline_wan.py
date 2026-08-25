@@ -621,19 +621,21 @@ class WanPipeline(BasePipeline):
             else:
                 current_model = self.transformer
 
-            # Build per-patch 2D timestep for Wan 2.2 TI2V-5B
+            # Build the Wan 2.2 TI2V-5B timestep: per-patch 2D for I2V, per-batch 1D for T2V
             if self.is_wan22_5b:
                 _, ph, pw = self.transformer.config.patch_size
-                nf = latents.shape[2]
-                nh = latents.shape[3] // ph
-                nw = latents.shape[4] // pw
                 if is_i2v:
                     # I2V: timestep 0 for reference image, current_t for noisy frames
                     patch_ts = i2v_first_frame_mask[0, 0, :, ::ph, ::pw] * current_t
                     timestep = patch_ts.flatten().unsqueeze(0).expand(latents.shape[0], -1)
                 else:
-                    # T2V: current_t for all frames
-                    timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+                    # T2V: current_t is uniform across all patches, so keep the
+                    # timestep 1-D per batch. The transformer broadcasts one
+                    # modulation row per batch element instead of embedding
+                    # batch*seq_len identical rows, and a 1-D timestep keeps
+                    # TeaCache's timestep-embedding hook working (diffusers'
+                    # get_timestep_embedding requires a 1-D input).
+                    timestep = current_t.reshape(1).expand(latents.shape[0])
 
             with self.offloader.context_if_requested(transformer_component_name):
                 if _vsa_active and _vsa_builder is not None:

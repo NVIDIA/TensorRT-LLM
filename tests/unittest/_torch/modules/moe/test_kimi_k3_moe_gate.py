@@ -71,3 +71,35 @@ def test_fused_routing_matches_eager_reference():
         rtol=2e-3,
         atol=2e-3,
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="Kimi fused route+MXFP8 quant requires an SM10x architecture",
+)
+@pytest.mark.parametrize("num_tokens", [1, 5, 64])
+def test_fused_route_quant_matches_unfused_chain(num_tokens):
+    torch.manual_seed(0x5EED + num_tokens)
+    scores = torch.randn(num_tokens, 896, dtype=torch.float32, device="cuda")
+    bias = torch.randn(896, dtype=torch.float32, device="cuda")
+    hidden_states = torch.randn(num_tokens, 3584, dtype=torch.bfloat16, device="cuda")
+    routed_scaling_factor = 2.446
+
+    ref_scales, ref_experts = torch.ops.trtllm.noaux_tc_op(
+        scores, bias, 1, 1, 16, routed_scaling_factor
+    )
+    ref_quantized, ref_quant_scales = torch.ops.trtllm.mxfp8_quantize(
+        hidden_states, False, alignment=256
+    )
+
+    experts, scales, quantized, quant_scales = torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+        scores,
+        bias,
+        hidden_states,
+        routed_scaling_factor,
+    )
+
+    assert torch.equal(experts, ref_experts)
+    assert torch.equal(scales.view(torch.int16), ref_scales.to(torch.bfloat16).view(torch.int16))
+    assert torch.equal(quantized.view(torch.uint8), ref_quantized.view(torch.uint8))
+    assert torch.equal(quant_scales, ref_quant_scales.view(num_tokens, -1))

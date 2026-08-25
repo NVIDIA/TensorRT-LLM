@@ -36,6 +36,7 @@ import PIL.Image
 import pytest
 import torch
 
+import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
     COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
@@ -53,6 +54,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     _load_reference_image,
     _normalize_condition_video_latent_indexes,
 )
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
@@ -989,6 +991,118 @@ class TestCosmos3V2V:
             )
 
 
+class TestCosmos3TransferRouting:
+    def test_transfer_rejects_an_image_reference(self):
+        """`_forward_transfer` takes no image, so a request carrying both used
+        to have its image silently dropped. The sibling guards already reject
+        transfer with image output and with audio; this one completes them."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
+
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        # __new__ skips __init__, where the real pipeline resolves this.
+        pipeline.family = QWEN3_RECIPE.name
+        pipeline.audio_gen = False
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+        pipeline.sampling = FakeSampling()
+        pipeline._forward_transfer = lambda **kwargs: None
+        # A precomputed control and no video: an existing guard already rejects
+        # image+video, so this is the shape where the image used to reach
+        # `_forward_transfer` and be discarded.
+        cfg = resolve_transfer_config(
+            {"edge": _V2V_FIXTURE_MP4.read_bytes()},
+            SimpleNamespace(num_frames=93, guidance_scale=None),
+            None,
+        )
+
+        with pytest.raises(ValueError, match="cannot be combined with an image reference"):
+            pipeline.forward(
+                prompt="bounce",
+                image="frame.png",
+                transfer_config=cfg,
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=None,
+                use_guardrails=False,
+            )
+
+    def test_transfer_use_system_prompt_defaults_off(self):
+        """Reference parity: transfer defaults ``use_system_prompt=False`` even
+        when a video input is present — V2V's default-True rule must not leak
+        into the transfer branch (vllm-omni ``_forward_transfer`` defaults False).
+        An explicit request value is still honored."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
+
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        # __new__ skips __init__, where the real pipeline resolves this.
+        pipeline.family = QWEN3_RECIPE.name
+        pipeline.audio_gen = False
+
+        class FakeSampling:
+            is_distilled = False
+            checkpoint_flow_shift = 1.0
+
+            def validate_request(self, num_inference_steps, guidance_scale):
+                return None
+
+            def generation_default_overrides(self):
+                return {}
+
+        pipeline.sampling = FakeSampling()
+        captured = {}
+
+        def fake_forward_transfer(**kwargs):
+            captured.update(kwargs)
+            return None
+
+        pipeline._forward_transfer = fake_forward_transfer
+        cfg = resolve_transfer_config(
+            {"edge": True}, SimpleNamespace(num_frames=93, guidance_scale=None), None
+        )
+
+        for explicit, expected in ((None, False), (True, True)):
+            captured.clear()
+            pipeline.forward(
+                prompt="bounce",
+                video=_V2V_FIXTURE_MP4.read_bytes(),
+                transfer_config=cfg,
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=explicit,
+                use_guardrails=False,
+            )
+            assert captured["use_system_prompt"] is expected
+
+
 @pytest.mark.integration
 @pytest.mark.cosmos3_t2i
 @pytest.mark.high_cuda_memory
@@ -1096,6 +1210,48 @@ class TestCosmos3BatchRejected:
                 frame_rate=FRAME_RATE,
                 use_guardrails=False,
             )
+
+
+class TestCosmos3TextGuardrailBlocked:
+    """A blocked prompt must return an empty output, not raise.
+
+    The block exits before the text encoder, transformer and VAE run, so the
+    path is reachable on a bare instance carrying only the config-derived
+    attributes ``forward()`` reads on the way there.
+    """
+
+    @staticmethod
+    def _blocked_pipeline():
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.audio_gen = False
+        pipeline.audio_scheduler = None
+        pipeline.family = QWEN3_RECIPE.name
+        # All-None policy is the documented pre-load placeholder.
+        pipeline.sampling = Cosmos3SamplingPolicy()
+        pipeline.default_use_system_prompt = False
+        # ``rank`` and ``device`` are read-only properties: rank resolves to 0
+        # with no distributed init, device comes off the transformer stub.
+        # The guardrail model is not under test, so a checker that reports
+        # "unsafe" for any input drives the path without an unsafe prompt.
+        pipeline.safety_checker = SimpleNamespace(check_text_safety=lambda _prompt: False)
+        pipeline._scheduler_for = lambda *args, **kwargs: None
+        return pipeline
+
+    # Without CUDA the phase timer is a no-op and the test passes vacuously.
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CudaPhaseTimer needs CUDA")
+    def test_blocked_prompt_returns_empty_output(self, monkeypatch):
+        # The module-wide disable fixture forces use_guardrails False; without
+        # restoring it here the guardrail never runs and nothing is exercised.
+        monkeypatch.setattr(pipe_mod, "TRTLLM_DISABLE_COSMOS3_GUARDRAILS", False)
+
+        result = self._blocked_pipeline().forward(
+            prompt="a calm sunny meadow", seed=SEED, use_guardrails=True
+        )
+
+        assert result.video is None
+        assert result.image is None
+        assert (result.pre_denoise, result.denoise, result.post_denoise) == (0.0, 0.0, 0.0)
 
 
 @pytest.mark.integration

@@ -111,6 +111,29 @@ class AgentLayer(Module):
             return await self._invoke_persistent(content)
         return await self._invoke_once(content)
 
+    def reset_session(self) -> None:
+        """Drop the persistent session so the next call starts a fresh one.
+
+        The next ``forward``/``aforward`` builds a new client from the
+        same config — same system prompt, tools, and hooks, but no
+        conversation history. Lets a long-lived layer be re-scoped to
+        units of work (e.g. one session per work item) without rebuilding
+        the layer. No-op for stateless layers and before a session's
+        first turn.
+        """
+        if self._persistent_client is None:
+            return
+        if self._runner.started:
+            self._runner.call(self._drop_persistent_client)
+            return
+        anyio.run(self._drop_persistent_client)
+
+    async def areset_session(self) -> None:
+        """Async variant of :meth:`reset_session` for ``aforward`` callers."""
+        if self._persistent_client is None:
+            return
+        await self._drop_persistent_client()
+
     def _build_request(self, content: str) -> AgentRequest:
         if self.prompt_builder is None:
             return build_request(content, system_prompt=self.config.system_prompt)
@@ -280,6 +303,7 @@ class AgentLayer(Module):
                 hooks=self.config.backend.hooks,
                 disallowed_tools=self._resolve_disallowed_tools(),
                 extra_mcp_servers=self.config.backend.extra_mcp_servers,
+                cwd=self.config.backend.cwd,
             ) as client:
                 yield backend, client
 
@@ -310,6 +334,7 @@ class AgentLayer(Module):
                     hooks=self.config.backend.hooks,
                     disallowed_tools=self._resolve_disallowed_tools(),
                     extra_mcp_servers=self.config.backend.extra_mcp_servers,
+                    cwd=self.config.backend.cwd,
                 )
             )
             self._persistent_client = client

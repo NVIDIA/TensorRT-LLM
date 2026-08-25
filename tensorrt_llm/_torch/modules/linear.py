@@ -14,7 +14,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
-from tensorrt_llm._torch.peft.lora.layer import LoraLayer, add_lora_result
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
@@ -33,6 +33,18 @@ from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_supported_sm,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
+from .low_m_gemm import LOW_M_GEMM_ACTIVE, apply_low_m_gemm
+
+
+def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
+    """Fast pre-filter: check the global enable flag and M upper bound only."""
+    if not LOW_M_GEMM_ACTIVE:
+        return False
+    if input.ndim < 1:
+        return False
+    k = int(input.shape[-1])
+    return k > 0 and input.numel() <= _LOW_M_GEMM_MAX_M * k
 
 
 class WeightMode(str, enum.Enum):
@@ -516,6 +528,25 @@ class LinearMethodBase(ABC):
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
+    """Linear method for unquantized (BF16 / FP16 / FP32) weights.
+
+    BF16 GEMM dispatch (priority order, Blackwell SM100/SM103)
+    ----------------------------------------------------------
+    1. **low-m GEMM** (``TRTLLM_LOW_M_GEMM_BACKEND=auto``, M ≤ 32)
+       CuTe-DSL low-m GEMM kernel for small-M decode batches on Blackwell.
+       Orthogonal to ``use_cute_dsl_bf16_gemm`` — must be enabled
+       independently via the env var.
+
+    2. **persistent GEMM** (``Linear(use_cute_dsl_bf16_gemm=True)``)
+       ``trtllm::cute_dsl_bf16_gemm_blackwell`` persistent CuTe-DSL kernel.
+
+    3. **cublas_mm** (``Linear(use_custom_cublas_mm=True)``)
+       ``trtllm::cublas_mm``; use when TP AllReduce fuse via NCCL
+       symmetric-memory window is needed (``output_buffer_kind=NCCL_WINDOW``).
+
+    4. **F.linear** (default)
+       PyTorch cuBLASLt; general-purpose fallback for all other cases.
+    """
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
@@ -543,6 +574,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
+        # kernel and returns None to fall through to the normal GEMM path.
+        # Skip when use_custom_cublas_mm is set: that path may allocate output
+        # in an NCCL symmetric-memory window for TP all-reduce fusion, which
+        # the low-M dispatcher does not support.
+        if _should_apply_low_m_gemm(input) and not getattr(
+                module, "use_custom_cublas_mm", False):
+            output = apply_low_m_gemm(module, input, module.weight, bias)
+            if output is not None:
+                return output
         # CuTe DSL BF16 GEMM path for Blackwell
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
@@ -3787,10 +3828,16 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
-        output = self.quant_method.apply(self, input, bias)
         if self.lora is not None and bool(lora_params):
-            lora_result = self.lora(input, lora_params, layer_idx)
-            output = add_lora_result(output, lora_result)
+            output = LoraLayer.forward_with_base(
+                lambda: self.quant_method.apply(self, input, bias),
+                (self.lora, ),
+                input,
+                lora_params,
+                layer_idx,
+            )
+        else:
+            output = self.quant_method.apply(self, input, bias)
         return output
 
     def apply_linear_allreduce(self,

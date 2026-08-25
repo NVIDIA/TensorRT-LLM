@@ -545,10 +545,20 @@ class AttentionPolicy:
         return not (
             self._mismatch("is_mla", a.is_mla, b.is_mla)
             or self._fail_if(
-                self._ri.cp_size != 1 or peer_ri.cp_size != 1,
-                "cp_size must be 1 for both ranks",
+                self._ri.cp_size != 1 and peer_ri.cp_size != 1,
+                "cp_size must be 1 on at least one side (helix pairs a cp=1 "
+                "context instance with a cp=N generation instance)",
                 local=self._ri.cp_size,
                 peer=peer_ri.cp_size,
+            )
+            or self._fail_if(
+                (self._ri.cp_size != 1 or peer_ri.cp_size != 1)
+                and a.tokens_per_block != b.tokens_per_block,
+                "helix block-interleaved transfer requires equal "
+                "tokens_per_block on both sides (block boundaries must "
+                "coincide for [cp_rank::cp_size] ownership)",
+                local=a.tokens_per_block,
+                peer=b.tokens_per_block,
             )
             or self._mismatch("element_bytes", a.element_bytes, b.element_bytes)
             or self._fail_if(

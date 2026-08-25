@@ -28,9 +28,10 @@ l0_cpu:
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   - unittest/_torch/distributed
   - unittest/_torch/executor
-  - unittest/_torch/lora
+  - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/multimodal
@@ -38,6 +39,7 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_utils.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
@@ -47,6 +49,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
+  - unittest/_torch/visual_gen/test_quant_static_guard.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_tensor_payload.py
   - unittest/_torch/visual_gen/test_trtllm_serve_endpoints.py
@@ -75,12 +78,14 @@ l0_cpu:
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
+  - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/test_bench_async.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_executor.py
   - unittest/llmapi/test_gc_utils.py
+  - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_llm_quant.py
@@ -92,6 +97,7 @@ l0_cpu:
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_report_addr.py
+  - unittest/llmapi/test_session_prefetcher.py
   - unittest/llmapi/test_utils.py
   - unittest/metrics/test_collector.py
   - unittest/models/test_quant_config_utils.py
