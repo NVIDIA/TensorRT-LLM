@@ -1081,6 +1081,17 @@ class ClientConfig:
         self.model_name = model_name
         self.concurrency = client_config_data.get("concurrency", 1)
         self.iterations = client_config_data.get("iterations", 1)
+        # BOLT knob: extend the measured serving window (num_requests =
+        # concurrency * iterations) without touching the shared perf-sanity
+        # config, so a longer run dilutes startup in the profile. Set by the
+        # BOLT profile-gen job via EXTRA_CONTAINER_EXPORTS; unset/absent
+        # (every normal build) is a no-op.
+        try:
+            _bolt_iter_mult = int(os.environ.get("BOLT_ITER_MULT", "1") or "1")
+        except ValueError:
+            _bolt_iter_mult = 1
+        if _bolt_iter_mult > 1:
+            self.iterations *= _bolt_iter_mult
         self.isl = client_config_data.get("isl", 1024)
         self.osl = client_config_data.get("osl", 1024)
         self.random_range_ratio = client_config_data.get("random_range_ratio", 0.0)
