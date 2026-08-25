@@ -1127,7 +1127,17 @@
             "dtypeC": "bf16",
             "tileScheduler": "persistent",
             "numStagesMma": 2,
-            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB,": [
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
+            ],
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutB": [
                 [
                     64,
                     64,
@@ -1143,16 +1153,6 @@
                     256,
                     6,
                     "128x4"
-                ]
-            ],
-            "mmaK,smVersion": [
-                [
-                    64,
-                    "100f"
-                ],
-                [
-                    128,
-                    "107a"
                 ]
             ]
         },
@@ -1197,16 +1197,6 @@
             "dtypeC": "bf16",
             "tileScheduler": "persistent",
             "numStagesMma": 2,
-            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutA,": [
-                [
-                    128,
-                    128,
-                    128,
-                    256,
-                    6,
-                    "128x4"
-                ]
-            ],
             "mmaK,smVersion": [
                 [
                     64,
@@ -1215,6 +1205,16 @@
                 [
                     128,
                     "107a"
+                ]
+            ],
+            "mmaN,tileN,epilogueTileN,tileK,numStages,sfLayoutA": [
+                [
+                    128,
+                    128,
+                    128,
+                    256,
+                    6,
+                    "128x4"
                 ]
             ]
         },
@@ -2839,16 +2839,6 @@
             ],
             "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,useTmaOobOpt,fineGrainedForceValid,fineGrainedProducer,patchPzo": [
                 [
-                    64,
-                    "100f",
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                    false
-                ],
-                [
                     128,
                     "107a",
                     true,
@@ -2940,10 +2930,6 @@
             ],
             "mmaK,smVersion": [
                 [
-                    64,
-                    "100f"
-                ],
-                [
                     128,
                     "107a"
                 ]
@@ -3017,14 +3003,6 @@
             ],
             "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,gridWaitForPrimaryEarlyExit,fineGrainedConsumerB": [
                 [
-                    64,
-                    "100f",
-                    true,
-                    true,
-                    true,
-                    false
-                ],
-                [
                     128,
                     "107a",
                     true,
@@ -3087,10 +3065,6 @@
                 ]
             ],
             "mmaK,smVersion": [
-                [
-                    64,
-                    "100f"
-                ],
                 [
                     128,
                     "107a"
@@ -3188,16 +3162,6 @@
             ],
             "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,useTmaOobOpt,fineGrainedForceValid,fineGrainedProducer,patchPzo": [
                 [
-                    32,
-                    "100f",
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
-                    false
-                ],
-                [
                     64,
                     "107a",
                     true,
@@ -3265,10 +3229,6 @@
                 ]
             ],
             "mmaK,smVersion": [
-                [
-                    32,
-                    "100f"
-                ],
                 [
                     64,
                     "107a"
@@ -3365,14 +3325,6 @@
             ],
             "mmaK,smVersion,gridTriggerSecondaryB,gridWaitForPrimaryB,gridWaitForPrimaryEarlyExit,fineGrainedConsumerB": [
                 [
-                    32,
-                    "100f",
-                    true,
-                    true,
-                    true,
-                    false
-                ],
-                [
                     64,
                     "107a",
                     true,
@@ -3435,10 +3387,6 @@
                 ]
             ],
             "mmaK,smVersion": [
-                [
-                    32,
-                    "100f"
-                ],
                 [
                     64,
                     "107a"
