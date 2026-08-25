@@ -78,6 +78,26 @@ def test_mixed_kv_uses_shared_block_table_for_selected_pool() -> None:
     assert selected.is_contiguous()
 
 
+def test_mixed_kv_buffer_lookup_uses_global_layer_index() -> None:
+    requested_layers: list[int] = []
+    buffers = object()
+
+    def get_buffers(layer_idx: int) -> object:
+        requested_layers.append(layer_idx)
+        return buffers
+
+    manager = SimpleNamespace(
+        is_fp8_k_nvfp4_v=True,
+        get_fp8_k_nvfp4_v_buffers=get_buffers,
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: SimpleNamespace(layer_idx=11, local_layer_idx=3)
+    fmha._mixed_kv_cache_buffers = None
+
+    assert fmha._get_mixed_kv_cache(SimpleNamespace(kv_cache_manager=manager)) is buffers
+    assert requested_layers == [11]
+
+
 def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:
     # The kernel keeps one counter per head per decoder sequence. Sizing off the
     # request count alone under-allocates under beam search, but only once the

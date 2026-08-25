@@ -635,7 +635,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return None
         if self._mixed_kv_cache_buffers is None:
             self._mixed_kv_cache_buffers = manager.get_fp8_k_nvfp4_v_buffers(
-                self.attn.local_layer_idx
+                self.attn.layer_idx
             )
         return self._mixed_kv_cache_buffers
 
