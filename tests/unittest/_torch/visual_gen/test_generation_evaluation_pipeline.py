@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from tensorrt_llm.visual_gen.generation_evaluation import (
+from tensorrt_llm.evaluate.visual_gen.qwen_image_bench import (
     ImageGenerationEvaluationPipeline,
     QwenImageBenchResult,
     aggregate_total_score,

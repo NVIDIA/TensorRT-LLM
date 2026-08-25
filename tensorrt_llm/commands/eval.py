@@ -19,29 +19,11 @@ import click
 import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
-from ..evaluate import (
-    AALCR,
-    AIME2025,
-    AIME2026,
-    GSM8K,
-    HLE,
-    MMLU,
-    MMMU,
-    ArenaHard,
-    CnnDailymail,
-    CoVoST2,
-    GPQADiamond,
-    GPQAExtended,
-    GPQAMain,
-    GPQANemoSkills,
-    IFBench,
-    ImageGenerationEval,
-    JsonModeEval,
-    LongBenchV1,
-    LongBenchV2,
-    MMMUPro,
-    SciCode,
-)
+from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
+                        ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
+                        GPQAExtended, GPQAMain, GPQANemoSkills, IFBench,
+                        ImageGenerationEval, JsonModeEval, LongBenchV1,
+                        LongBenchV2, MMMUPro, SciCode)
 from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
@@ -143,14 +125,16 @@ _CLICK_TO_LLM_ARG = {
               default=None,
               help="The revision to use for the HuggingFace model "
               "(branch name, tag name, or commit id).")
-@click.option("--config",
+@click.option("--visual_gen_args",
+              "--config",
               "--extra_llm_api_options",
               "extra_llm_api_options",
               type=str,
               default=None,
               help="Path to a YAML configuration file. Explicit CLI flags "
-              "take precedence over values in this file. Can be specified "
-              "as either --config or --extra_llm_api_options.")
+              "take precedence over values in this file. Specify this as "
+              "--visual_gen_args. --config and --extra_llm_api_options are "
+              "supported aliases.")
 @click.option("--disable_kv_cache_reuse",
               is_flag=True,
               default=False,

@@ -6,10 +6,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+import click
+import pytest
 from click.testing import CliRunner
 
 import tensorrt_llm.commands.eval as eval_cmd
-from tensorrt_llm.visual_gen.generation_evaluation import QwenImageBenchResult
+from tensorrt_llm.evaluate.visual_gen.config import split_generator_config
+from tensorrt_llm.evaluate.visual_gen.evaluators import build_image_evaluator
+from tensorrt_llm.evaluate.visual_gen.types import QwenImageBenchResult
 
 
 @dataclass
@@ -76,15 +80,39 @@ def test_image_generation_eval_help_does_not_construct_text_llm(monkeypatch):
     assert "--evaluator-options" in result.output
 
 
+def test_visual_gen_args_is_documented_primary_config_option():
+    result = CliRunner().invoke(eval_cmd.main, ["--help"])
+
+    assert result.exit_code == 0
+    assert result.output.index("--visual_gen_args") < result.output.index("--config")
+
+
+def test_config_alias_reaches_image_generation_eval_help():
+    result = CliRunner().invoke(
+        eval_cmd.main,
+        [
+            "--model",
+            "generator",
+            "--config",
+            "generator.yaml",
+            "image_generation_eval",
+            "--help",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "--evaluator" in result.output
+
+
 def test_image_generation_eval_cli_runs_pipeline_with_fakes(tmp_path, monkeypatch):
-    from tensorrt_llm.evaluate import image_generation_eval
+    from tensorrt_llm.evaluate.visual_gen import image_generation_eval
 
     generator = _FakeGenerator()
     evaluator = _FakeEvaluator()
     generator_config = tmp_path / "generator.yaml"
     generator_config.write_text("generation_params:\n  seed: 123\n", encoding="utf-8")
     evaluator_config = tmp_path / "evaluator.yaml"
-    evaluator_config.write_text("type: qwen_image_bench\n", encoding="utf-8")
+    evaluator_config.write_text("max_batch_size: 1\n", encoding="utf-8")
     prompts = tmp_path / "prompts.jsonl"
     prompts.write_text(
         "\n".join(
@@ -114,7 +142,7 @@ def test_image_generation_eval_cli_runs_pipeline_with_fakes(tmp_path, monkeypatc
         [
             "--model",
             "generator",
-            "--config",
+            "--visual_gen_args",
             str(generator_config),
             "image_generation_eval",
             "--evaluator",
@@ -145,6 +173,20 @@ def test_image_generation_eval_cli_runs_pipeline_with_fakes(tmp_path, monkeypatc
     assert summary["metadata"]["evaluator_model"] == "judge"
     assert summary["aggregate_score"] == 100.0
     assert summary["results"][0]["id"] == "a"
-    assert summary["results"][0]["image_path"] == expected_images[0]
+    assert summary["results"][0]["image_path"] == "generated_images/0000.png"
     assert (output_dir / "generated_images" / "0000.png").read_text() == "image:first"
     assert (output_dir / "results.jsonl").exists()
+
+
+def test_generator_config_rejects_backend_selector():
+    with pytest.raises(click.BadParameter, match="Do not set a generator backend"):
+        split_generator_config({"backend": "pytorch"})
+
+
+@pytest.mark.parametrize("selector_key", ["model", "type", "backend"])
+def test_evaluator_options_reject_selector_fields(tmp_path, selector_key):
+    evaluator_config = tmp_path / "evaluator.yaml"
+    evaluator_config.write_text(f"{selector_key}: bad\n", encoding="utf-8")
+
+    with pytest.raises(click.BadParameter, match="Do not set model, type, or backend"):
+        build_image_evaluator("qwen-image-bench", str(evaluator_config))
