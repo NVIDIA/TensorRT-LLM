@@ -371,7 +371,6 @@ unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu 
 unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=DEP-comm=IGNORE-e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=DeepSeekV3] SKIP (https://nvbugs/6644479)
 unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb -k "MEGAMOE_CUTEDSL" SKIP (https://nvbugs/6644478)
 unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb[parallel=DEP-comm=IGNORE-e8_k2_h512_i512-seq=8-dtype=torch.bfloat16-backend=MEGAMOE_CUTEDSL-quant=NVFP4-routing=Renormalize-slots=16-eplb=dynamic] SKIP (https://nvbugs/6644477)
-unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM" SKIP (https://nvbugs/6464169)
 unittest/_torch/modules/test_w4a16_nvfp4_linear.py::test_nvfp4_attention_keeps_high_precision_output_for_hopper_marlin SKIP (https://nvbugs/6581071)
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)

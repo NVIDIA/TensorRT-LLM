@@ -208,8 +208,11 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     at::Tensor expanded_idx_to_permuted_idx
         = at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
 
-    at::Tensor permuted_idx_to_token_idx
-        = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_device, std::nullopt);
+    // Sized via getRouteMapAllocCount: the gemm1 cubins read one element past the end of the route
+    // map, see the comment on that helper.
+    at::Tensor permuted_idx_to_token_idx = at::detail::empty_cuda(
+        {tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getRouteMapAllocCount(max_num_padded_tokens)},
+        at::ScalarType::Int, routing_device, std::nullopt);
     // expert_weights is the routing kernel's topk-weights output and is consumed by moe_finalize,
     // which requires `dtype == scale_dtype` against gemm2_output. Track args.mDtypeOut so the two
     // buffers stay in lock-step automatically; do NOT tie this to the bias dtype, which is allowed
