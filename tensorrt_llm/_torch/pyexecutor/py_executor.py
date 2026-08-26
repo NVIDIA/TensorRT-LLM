@@ -2671,8 +2671,7 @@ class PyExecutor:
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
-                    self._check_disagg_transfer_progress_when_idle(
-                        is_idle=scheduled_batch.batch_size == 0)
+                    self._check_disagg_transfer_progress_when_idle()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -3623,9 +3622,7 @@ class PyExecutor:
             return self.dist.tp_allgather(local_status)
         return [local_status]
 
-    def _check_disagg_transfer_progress_when_idle(self,
-                                                  is_idle: bool = False
-                                                  ) -> None:
+    def _check_disagg_transfer_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
 
         Generation transfers are not polled here: the loop head already ran
@@ -3634,13 +3631,11 @@ class PyExecutor:
         """
         # A synchronous GEN receive is rank-local and blocking, so entering
         # the context progress collective is unsafe unless GEN transfer is
-        # async or context is skipped entirely (gen-only-no-context bench).
+        # async, context is skipped entirely (gen-only-no-context bench), or
+        # there's only one rank to diverge from.
         if (not self._uses_async_disagg_gen_transfer()
-                and not self._is_disagg_gen_only_no_context_benchmark()):
-            # A single-rank CTX worker cannot diverge on a collective.
-            if (is_idle and self._dist_size(self.dist, "world_size") == 1 and
-                    self.async_transfer_manager.has_any_inflight_requests()):
-                self._check_disagg_ctx_cache_transfer_status(0)
+                and not self._is_disagg_gen_only_no_context_benchmark()
+                and self._dist_size(self.dist, "world_size") > 1):
             return
 
         self._check_disagg_ctx_cache_transfer_status(0)
@@ -3824,8 +3819,7 @@ class PyExecutor:
             # into the transfer window this iteration.
             self._prepare_disagg_gen_init(admitted_disagg_gen_init_requests)
 
-            self._check_disagg_transfer_progress_when_idle(
-                is_idle=scheduled_batch.batch_size == 0)
+            self._check_disagg_transfer_progress_when_idle()
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the
