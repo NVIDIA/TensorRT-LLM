@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 from typing import Optional, Tuple
 
@@ -42,6 +43,34 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+
+try:
+    # Unified norm-site producer (CuTe DSL, SM100): fuses the residual
+    # prologue INTO the norm3 site of the per-batch (temb.ndim == 3) path,
+    # which today runs an add kernel in front of the fused LN kernel
+    # (kernel-level A/B: one-kernel 533.6/556.1 us vs route 557.3/576.3 us
+    # bf16/fp4 at [2, 32760, 5120], B200). norm1 (plain) and norm2 (the
+    # gate+resid route measured a tie, 553 vs 564 us) keep the in-tree
+    # fused_adaptive_layernorm paths - rows the incumbent wins are never
+    # wired (fallback rule).
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.norm_producer import (
+        fused_norm_producer as _fused_norm_producer,
+    )
+
+    _NORM_PRODUCER_IMPORT_OK = True
+except Exception:
+    _fused_norm_producer = None
+    _NORM_PRODUCER_IMPORT_OK = False
+
+
+@functools.lru_cache(maxsize=None)
+def _norm_producer_available() -> bool:
+    """The norm producer kernel is SM100-only; checked lazily so model
+    construction on other devices (or CPU/meta init) never trips it."""
+    if not _NORM_PRODUCER_IMPORT_OK or not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() == (10, 0)
+
 
 try:
     # Available in transformers<5
@@ -388,6 +417,9 @@ class WanBlock(nn.Module):
         self._norm2_fp4_scale: Optional[torch.Tensor] = None
         self._norm3_fp4_scale: Optional[torch.Tensor] = None
         self._fused_ln_supported = hidden_size == 5120
+        # gate+resid norm sites (norm2/norm3) route to the unified norm
+        # producer; norm1 (no prologue) keeps fused_adaptive_layernorm.
+        self._use_norm_producer = _NORM_PRODUCER_IMPORT_OK and self._fused_ln_supported
 
         self._pertoken_adaln = WanPerTokenAdaLN(
             hidden_size,
@@ -666,7 +698,33 @@ class WanBlock(nn.Module):
 
         # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
         # quant) reshaped back to [B, S, D]; self.ffn consumes it.
-        if self._fused_ln_supported:
+        if self._use_norm_producer and _norm_producer_available():
+            # One kernel for the residual add + modulated no-affine LN
+            # (+ optional NVFP4 store). residual_out is bit-identical to the
+            # eager `x + attn2_proj` (plain bf16 add - this site does NOT
+            # upcast in the model code).
+            x = x.contiguous()
+            attn2_proj = attn2_proj.contiguous()
+            if self._norm3_fp4_scale is not None and x.shape[0] * x.shape[1] >= 128:
+                _q4, _sf, x = _fused_norm_producer(
+                    attn2_proj,
+                    residual=x,
+                    shift=c_shift_msa,
+                    scale=c_scale_msa,
+                    store="nvfp4_static",
+                    global_scale=self._norm3_fp4_scale,
+                    eps=self.norm3.variance_epsilon,
+                )
+                normed = Fp4QuantizedTensor(_q4, _sf)
+            else:
+                normed, x = _fused_norm_producer(
+                    attn2_proj,
+                    residual=x,
+                    shift=c_shift_msa,
+                    scale=c_scale_msa,
+                    eps=self.norm3.variance_epsilon,
+                )
+        elif self._fused_ln_supported:
             x = x + attn2_proj
             normed = self._fused_adaln_quant(
                 x,
