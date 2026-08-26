@@ -115,8 +115,7 @@ def _build_kernel() -> tuple[Any, Any, Any]:
         xo = tl.load(x_ptr + base + c_odd, mask=rm, other=0.0).to(tl.float32)
         xe = xe * (1.0 / (1.0 + tl.exp(-xe)))
         xo = xo * (1.0 / (1.0 + tl.exp(-xo)))
-        # Match torch SiLU on a BF16 VAE activation. This is a register-only
-        # rounding point; it does not reintroduce the eliminated BF16 tensor.
+        # Match torch SiLU on a BF16 VAE activation at its BF16 rounding point.
         xe = xe.to(tl.bfloat16).to(tl.float32)
         xo = xo.to(tl.bfloat16).to(tl.float32)
         amax = tl.maximum(tl.max(tl.abs(xe), axis=2), tl.max(tl.abs(xo), axis=2))
@@ -138,9 +137,9 @@ def _build_kernel() -> tuple[Any, Any, Any]:
             mask=rmask[:, None] & kmask[None, :],
         )
 
-    # Tier B additionally folds WanRMSNorm (channel-wise L2 normalize * sqrt(C) * gamma) into
-    # the same pass. The L2 reduction is per-row over all C; the FP4 block scale is per-16.
-    # gamma is padded to Cp with 0 and pad channels of x are 0, so both reductions ignore pad.
+    # Fold WanRMSNorm (channel-wise L2 normalize * sqrt(C) * gamma) into the
+    # same pass. The L2 reduction is per-row over all C; the FP4 block scale is
+    # per-16. Gamma and input padding are zero, so both reductions ignore it.
     @triton.autotune(configs=_CONFIGS, key=["C", "M"])
     @triton.jit
     def _rmsnorm_silu_nvfp4_quant_kernel(
@@ -277,7 +276,7 @@ def rmsnorm_silu_nvfp4_quant(
     gamma: torch.Tensor,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused WanRMSNorm(channel-wise) -> SiLU -> NVFP4 quantize (tier B).
+    """Fused WanRMSNorm(channel-wise) -> SiLU -> NVFP4 quantize.
 
     Args:
         x2d: BF16 ``[M, C]`` *pre-norm* activation (C == padded Cp; pad channels 0).

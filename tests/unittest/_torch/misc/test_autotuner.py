@@ -608,8 +608,7 @@ def test_load_cache_failure_preserves_live_state(tmp_path):
                 "device_name": "replacement-device",
                 "device_capability": [10, 0],
             },
-            # Cache sections must be mappings. This fails only after the
-            # replacement metadata has been parsed and staged.
+            # Cache sections must be mappings.
             "shared": [],
             "rank_0": {},
         }))

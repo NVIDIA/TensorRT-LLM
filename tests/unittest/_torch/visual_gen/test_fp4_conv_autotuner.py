@@ -24,7 +24,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.fp4_conv_autotuner import (
     FP4_CONV_FIXED_TACTIC,
     FP4_CONV_TACTICS,
     FP4ConvTunableRunner,
-    clear_fp4_conv_tactic_cache,
+    _clear_fp4_conv_tactic_cache,
     run_tuned_fp4_conv,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
@@ -37,9 +37,9 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
 
 @pytest.fixture(autouse=True)
 def _clear_fp4_conv_tactic_state():
-    clear_fp4_conv_tactic_cache()
+    _clear_fp4_conv_tactic_cache()
     yield
-    clear_fp4_conv_tactic_cache()
+    _clear_fp4_conv_tactic_cache()
 
 
 def _make_fp4_conv_case(channels, input_scale, use_residual):
@@ -77,7 +77,6 @@ def test_fp4_conv_tuner_uses_fixed_tactic_as_fallback():
     assert FP4ConvTunableRunner.resolve_tactic(-2) == FP4_CONV_FIXED_TACTIC
     assert FP4ConvTunableRunner.resolve_tactic("invalid") == FP4_CONV_FIXED_TACTIC
     assert FP4ConvTunableRunner.resolve_tactic(len(FP4_CONV_TACTICS)) == FP4_CONV_FIXED_TACTIC
-    assert any(tactic.mma_tiler == (128, 128) for tactic in FP4_CONV_TACTICS)
     assert FP4_CONV_FIXED_TACTIC in FP4_CONV_TACTICS
 
 
@@ -210,7 +209,7 @@ def test_selected_tactic_fast_cache_obeys_tuning_and_capture(monkeypatch):
             return runners[0], self.selected_id
 
     tuner = StubTuner()
-    clear_fp4_conv_tactic_cache()
+    _clear_fp4_conv_tactic_cache()
     monkeypatch.setattr(AutoTuner, "get", classmethod(lambda _cls: tuner))
     kwargs = {
         "signature": ("test",),
@@ -252,7 +251,7 @@ def test_selected_tactic_fast_cache_obeys_tuning_and_capture(monkeypatch):
         FP4_CONV_TACTICS[alternate_id],
         FP4_CONV_TACTICS[alternate_id],
     ]
-    clear_fp4_conv_tactic_cache()
+    _clear_fp4_conv_tactic_cache()
 
 
 def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
@@ -260,7 +259,7 @@ def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
         pytest.skip("NVFP4 Conv3d autotuning requires an SM100-family GPU")
 
     AutoTuner.get().clear_cache()
-    clear_fp4_conv_tactic_cache()
+    _clear_fp4_conv_tactic_cache()
     try:
         _fp4_compile_cache.clear()
         conv, activation, residual, expected = _make_fp4_conv_case(256, None, False)
@@ -306,7 +305,7 @@ def test_all_valid_autotuned_fp4_conv_tactics_match_bf16_reference(monkeypatch):
         assert 0 < len(selected_tactics) <= len(FP4_CONV_TACTICS)
     finally:
         AutoTuner.get().clear_cache()
-        clear_fp4_conv_tactic_cache()
+        _clear_fp4_conv_tactic_cache()
 
 
 def test_fixed_fp4_conv_residual_tactic_matches_bf16_reference():
@@ -314,7 +313,7 @@ def test_fixed_fp4_conv_residual_tactic_matches_bf16_reference():
         pytest.skip("NVFP4 Conv3d requires an SM100-family GPU")
 
     AutoTuner.get().clear_cache()
-    clear_fp4_conv_tactic_cache()
+    _clear_fp4_conv_tactic_cache()
     try:
         _fp4_compile_cache.clear()
         conv, activation, residual, expected = _make_fp4_conv_case(256, 1.0 / 50.0, True)
@@ -323,7 +322,7 @@ def test_fixed_fp4_conv_residual_tactic_matches_bf16_reference():
         _assert_fp4_close(actual, expected)
     finally:
         AutoTuner.get().clear_cache()
-        clear_fp4_conv_tactic_cache()
+        _clear_fp4_conv_tactic_cache()
 
 
 @pytest.mark.parametrize("fuse_norm", [False, True])

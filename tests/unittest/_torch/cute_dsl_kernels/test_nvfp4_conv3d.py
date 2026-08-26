@@ -59,7 +59,7 @@ def _require_sm100() -> None:
                 "fallback_cluster_shape_mn": (2, 1),
                 "use_2cta_instrs": True,
             },
-            id="256x256-2cta-product-tactic",
+            id="256x256-2cta",
         ),
     ],
 )
@@ -72,7 +72,7 @@ def _require_sm100() -> None:
         pytest.param(True, 1.0, id="bias-residual"),
     ],
 )
-def test_nvfp4_conv3d_provider_refcheck(
+def test_nvfp4_conv3d_reference(
     ncdhw: tuple[int, int, int, int, int],
     ktrs: tuple[int, int, int, int],
     upper_pad_dhw: tuple[int, int, int],
@@ -81,7 +81,7 @@ def test_nvfp4_conv3d_provider_refcheck(
     use_bias: bool,
     beta: float,
 ) -> None:
-    """Validate representative tactics and epilogues with the provider's BF16 reference."""
+    """Run the built-in BF16 check across representative tactics and epilogues."""
     _require_sm100()
 
     runtime_us = run(

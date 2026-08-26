@@ -290,8 +290,7 @@ class PersistentDenseGemmKernelDynamicPreferredCluster(PersistentDenseGemmKernel
         - Preferred cluster layout computation
         - Multicast CTA counts for both preferred and fallback clusters
         """
-        # Call parent class setup for  basic attributes (Including compute stages already configured for CLC dynamic scheduler)
-        # TODO: test cluster specific epi_tile, now using fallback_cta_tile_mnk to create rpi_tile
+        # Set up the base CLC scheduler attributes.
         super()._setup_attributes()
 
         # Compute preferred cluster layout (in addition to fallback already set by parent)
@@ -1058,13 +1057,6 @@ class PersistentDenseGemmKernelDynamicPreferredCluster(PersistentDenseGemmKernel
 
                 num_tiles_executed = tile_sched.num_tiles_executed
                 if cutlass.const_expr(self.use_tma_store):
-                    # {$nv-internal-release begin}
-                    # (EPI_TILE_M, EPI_TILE_N, STAGE)
-                    # sC = storage.sC.get_tensor(
-                    #     c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
-                    # )
-                    # {$nv-internal-release end}
-
                     acc_consumer_state = utils.gemm.sm100.epilogue_tma_store(
                         self,
                         tidx,

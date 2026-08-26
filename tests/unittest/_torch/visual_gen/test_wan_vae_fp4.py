@@ -86,8 +86,8 @@ def test_fused_rmsnorm_silu_nvfp4_quant_matches_trtllm_quantize() -> None:
     torch.testing.assert_close(actual[1], expected[1].reshape_as(actual[1]), rtol=0, atol=0)
 
 
-def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None:
-    """Run the VAE wrapper through its real CuTe ABI on a partial output tile."""
+def test_nvfp4_wan_conv_bias_residual_and_spatial_padding() -> None:
+    """Run the VAE wrapper through its CuTe ABI on a partial output tile."""
     _require_sm100()
     torch.manual_seed(0)
     base = WanCausalConv3d(192, 96, 3, padding=1).cuda().to(torch.bfloat16).eval()
@@ -107,7 +107,7 @@ def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    # Exercise product weight prequantization, KTRSC layout, SFB swizzle, and
+    # Exercise weight prequantization, KTRSC layout, SFB swizzle, and
     # alpha scaling with a nonzero convolution while reusing the same tactic.
     base = WanCausalConv3d(192, 96, 3, padding=1).cuda().to(torch.bfloat16).eval()
     with torch.no_grad():
@@ -120,7 +120,7 @@ def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None
         spatial_padding=(1, 0),
         residual=residual,
     ).float()
-    # Build the asymmetric-padding BF16 reference explicitly so this product
+    # Build the asymmetric-padding BF16 reference explicitly so this wrapper
     # test does not depend on the parallel halo optimization's Conv3d API.
     padded_activation = F.pad(activation, (0, 0, 0, 0, 2, 0))
     expected = F.conv3d(
@@ -141,7 +141,7 @@ def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None
 
 
 def test_nvfp4_wan_conv_reuses_cubin_across_runtime_shapes() -> None:
-    """The provider's runtime-shape kernel serves compatible C and H/W values."""
+    """One compiled kernel serves compatible channel and spatial shapes."""
     _require_sm100()
     saved_cache = dict(_fp4_compile_cache)
     try:

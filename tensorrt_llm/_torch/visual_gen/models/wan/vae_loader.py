@@ -165,9 +165,8 @@ def _load_nvfp4_wan_vae(
     """Load ModelOpt weights and replace their quantized Conv3d modules.
 
     Quantized weights are first dequantized into the native state dict, then
-    requantized in the KTRSC layout consumed by the CuTe kernel. Consequently,
-    this path is accuracy-gated as a TensorRT-LLM implementation rather than
-    expected to preserve ModelOpt's original packed bytes.
+    requantized in the KTRSC layout consumed by the CuTe kernel. The original
+    ModelOpt packed bytes are therefore not preserved.
     """
     from .wan_vae import WanCausalConv3d, dequant_fp4_conv_weight, swap_wan_convs_to_fp4
 

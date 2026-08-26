@@ -775,7 +775,7 @@ class NVFP4WanCausalConv3d(WanCausalConv3d):
     Weight is pre-quantized once (lazily on first forward). ``input_scale`` (the ModelOpt
     calibrated divisor-form scale) enables STATIC activation quant; otherwise dynamic.
     Construction takes ownership of ``base`` parameters; callers must replace and discard
-    ``base`` rather than reuse or mutate it.
+    ``base`` rather than reuse or mutate it. ``norm_gamma`` is snapshotted at construction.
     """
 
     def __init__(
@@ -806,14 +806,13 @@ class NVFP4WanCausalConv3d(WanCausalConv3d):
             self._fp4_static_gs_val = 1.0 / float(input_scale)
         else:
             self._fp4_static_gs_val = None
-        # Absorb the residual block's preceding SiLU (tier A) or RMSNorm+SiLU (tier B) into the
-        # activation quantize (fused, single pass). Only on the static path (fixed calibrated
-        # ``gs``); dynamic convs keep the un-fused path (block still applies norm/SiLU).
+        # Static activation scales allow the preceding SiLU or RMSNorm+SiLU to
+        # be folded into activation quantization. Dynamic convolutions retain
+        # the standalone input operations.
         static = self._fp4_static_gs_val is not None
         self._absorb_norm = (
             bool(absorb_norm) and static and norm_gamma is not None and norm_scale is not None
         )
-        # Tier B implies tier A (SiLU is also fused); tier A alone otherwise.
         self._absorb_silu = self._absorb_norm or (bool(absorb_silu) and static)
         self.register_buffer("_norm_gamma", norm_gamma, persistent=False)
         self._norm_scale = float(norm_scale) if norm_scale is not None else None
@@ -1034,10 +1033,14 @@ def swap_wan_convs_to_fp4(
             input_scale = input_scales.get(conv_name)
             gamma = scale = None
             residual_conv = isinstance(parent, WanResidualBlock) and attr in norm_attr
-            fuse_residual_inputs = residual_conv and (not parent.training or parent.dropout.p == 0)
-            norm = getattr(parent, norm_attr[attr], None) if residual_conv else None
-            if isinstance(norm, WanRMSNorm) and not isinstance(norm.bias, nn.Parameter):
-                gamma = norm.gamma.detach().reshape(-1)
+            fuse_residual_inputs = residual_conv and parent.dropout.p == 0
+            norm = getattr(parent, norm_attr[attr], None) if fuse_residual_inputs else None
+            if (
+                input_scale is not None
+                and isinstance(norm, WanRMSNorm)
+                and not isinstance(norm.bias, nn.Parameter)
+            ):
+                gamma = norm.gamma.detach().reshape(-1).clone()
                 scale = norm.scale
             replacement = NVFP4WanCausalConv3d(
                 conv,
@@ -1209,9 +1212,8 @@ class WanResidualBlock(nn.Module):
             raise ValueError("feat_idx is required when feat_cache is provided")
 
         residual = self.conv_shortcut(x)
-        # conv1/conv2 may fuse SiLU (tier A: pass pre-SiLU=post-norm) or RMSNorm+SiLU (tier B:
-        # pass raw pre-norm) into their NVFP4 quantize. Both commute with the causal cat+pad
-        # (SiLU(0)=RMSNorm(0)=0), so feat_cache holds the pre-fused-op activation.
+        # Fused SiLU and RMSNorm+SiLU commute with causal concatenation and
+        # zero-padding, so feat_cache holds the pre-fusion activation.
         if getattr(self.conv1, "absorbs_norm", False):
             pass  # conv1 applies norm1 + SiLU
         elif getattr(self.conv1, "absorbs_silu", False):

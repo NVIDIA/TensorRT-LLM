@@ -38,15 +38,12 @@ class FP4ConvTactic:
 
 
 FP4_CONV_FIXED_TACTIC = FP4ConvTactic((256, 256), (2, 1), (2, 1), True)
-# A cache miss must preserve the provider-recommended product configuration.
+# Use the validated fixed configuration when no tuned selection is available.
 FP4_CONV_FALLBACK_TACTIC = FP4_CONV_FIXED_TACTIC
 
-# NVFP4 alignment fixes the M tile at 128 for 1CTA and 256 for 2CTA; 64 for
-# 1CTA and 128 for 2CTA are not valid. N is less constrained, so sweep the four
-# provider-supported tiles from 64 through 256. A 2CTA instruction requires
-# cluster-M to be divisible by two for both preferred and fallback shapes. The
-# provider measured comparable performance for 2x1x1 and 2x2x1 CGAs on current
-# cases, so keep the recommended 2x1x1 shape to bound JIT and profiling cost.
+# NVFP4 alignment fixes the M tile at 128 for 1CTA and 256 for 2CTA. Sweep N
+# tiles from 64 through 256. A 2CTA instruction requires cluster-M to be
+# divisible by two for both preferred and fallback shapes.
 FP4_CONV_TACTICS: tuple[FP4ConvTactic, ...] = (
     FP4ConvTactic((128, 64), (1, 1), (1, 1), False),
     FP4ConvTactic((128, 128), (1, 1), (1, 1), False),
@@ -62,22 +59,44 @@ _failed_tactics: dict[tuple[object, ...], set[int]] = {}
 
 
 def _tactic_set_key() -> tuple[tuple[object, ...], ...]:
-    """Persist the ordered tactic definitions, not a hand-maintained version."""
+    """Persist the ordered tactic definitions."""
     return tuple(astuple(tactic) for tactic in FP4_CONV_TACTICS)
 
 
-def clear_fp4_conv_tactic_cache() -> None:
-    """Clear phase-local selections and failed-candidate records."""
+def _clear_fp4_conv_tactic_cache() -> None:
+    """Clear in-process selections and failed-candidate records."""
     _selected_tactics.clear()
     _failed_tactics.clear()
+
+
+def _launch_fallback_tactic(
+    *,
+    signature: tuple[object, ...],
+    problem_shape: tuple[int, ...],
+    failed_tactic: FP4ConvTactic,
+    error: Exception,
+    compile_tactic: Callable[[FP4ConvTactic], object],
+    launch: Callable[[object], None],
+) -> FP4ConvTactic:
+    try:
+        torch.cuda.synchronize()
+    except RuntimeError as sync_error:
+        logger.debug(
+            f"Wan NVFP4 Conv3d CUDA synchronize failed after tactic {failed_tactic}: {sync_error}"
+        )
+    logger.warning_once(
+        f"Wan NVFP4 Conv3d tactic {failed_tactic} failed for {signature}, "
+        f"{problem_shape}; using the fallback tactic: {error}",
+        key=("wan_nvfp4_conv3d", "runtime_fallback", signature, problem_shape, failed_tactic),
+    )
+    launch(compile_tactic(FP4_CONV_FALLBACK_TACTIC))
+    return FP4_CONV_FALLBACK_TACTIC
 
 
 class FP4ConvTunableRunner(TunableRunner):
     """Tune precompiled CuTe Conv3d launch tactics for one runtime shape."""
 
-    # The runner closes over exact live tensor/layout objects. Keep dynamic
-    # profiles and cold-L2 tensor cloning disabled; neither can update those
-    # closure-bound objects safely.
+    # The launch closures bind live tensor and layout objects.
     tuning_config = TuningConfig(use_cuda_graph=False)
 
     def __init__(
@@ -201,7 +220,20 @@ def run_tuned_fp4_conv(
     elif (cached_selection := _selected_tactics.get(selection_key)) is not None:
         generation, tactic = cached_selection
         if generation == tuner.profiling_cache.generation:
-            launch(compile_tactic(tactic))
+            try:
+                launch(compile_tactic(tactic))
+            except Exception as error:
+                if tactic == FP4_CONV_FALLBACK_TACTIC:
+                    raise
+                tactic = _launch_fallback_tactic(
+                    signature=signature,
+                    problem_shape=problem_shape,
+                    failed_tactic=tactic,
+                    error=error,
+                    compile_tactic=compile_tactic,
+                    launch=launch,
+                )
+                _selected_tactics[selection_key] = (generation, tactic)
             return output, tactic
         _selected_tactics.pop(selection_key, None)
 
@@ -219,11 +251,22 @@ def run_tuned_fp4_conv(
         FP4ConvTunableRunner.tuning_config,
         inputs,
     )
-    selected_runner(inputs, tactic=tactic_id)
     tactic = runner.resolve_tactic(tactic_id)
-    # This is only a phase-local shortcut. During tuning the authoritative
-    # shared entry may still change (including a cross-rank post-merge), while
-    # capture/replay needs every call to pass through choose_one().
+    try:
+        selected_runner(inputs, tactic=tactic_id)
+    except Exception as error:
+        if tactic == FP4_CONV_FALLBACK_TACTIC:
+            raise
+        tactic = _launch_fallback_tactic(
+            signature=signature,
+            problem_shape=problem_shape,
+            failed_tactic=tactic,
+            error=error,
+            compile_tactic=compile_tactic,
+            launch=launch,
+        )
+    # Cache only selections tied to the current profiling-cache generation.
+    # Tuning and capture/replay must continue through choose_one().
     if not bypass_fast_cache:
         _selected_tactics[selection_key] = (tuner.profiling_cache.generation, tactic)
     logger.debug_once(
