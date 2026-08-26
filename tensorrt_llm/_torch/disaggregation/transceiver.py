@@ -520,17 +520,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return {rid for rid, c in cnt.items() if c == n_ranks}
 
     def _consensus_outcome(
-        self, to_process, cancelled, failed, completed, allgather: Callable, need_sync: bool
+        self,
+        to_process,
+        cancelled,
+        failed,
+        completed,
+        allgather: Callable,
+        need_sync: bool,
+        locally_retirable: Optional[list] = None,
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
-        # Batch the three id lists into one allgather to cut the per-step collective count.
+        # Batch the outcome lists into one allgather to cut the per-step collective count.
+        local_outcome = [list(cancelled), list(failed), list(completed)]
+        if locally_retirable is not None:
+            local_outcome.append(list(locally_retirable))
         if not need_sync:
-            all_c, all_f, all_done = [list(cancelled)], [list(failed)], [list(completed)]
+            packed = [local_outcome]
         else:
-            packed = list(allgather([list(cancelled), list(failed), list(completed)]))
-            all_c = [p[0] for p in packed]
-            all_f = [p[1] for p in packed]
-            all_done = [p[2] for p in packed]
+            packed = list(allgather(local_outcome))
+        all_c = [p[0] for p in packed]
+        all_f = [p[1] for p in packed]
+        all_done = [p[2] for p in packed]
         n = len(all_c)
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
@@ -542,11 +552,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         new_completed = [
             rid for rid in to_process if rid in global_completed and rid not in terminal
         ]
+        if locally_retirable is not None:
+            globally_retirable = self._intersection([p[3] for p in packed], n)
+            new_cancelled = [rid for rid in new_cancelled if rid in globally_retirable]
+            new_failed = [rid for rid in new_failed if rid in globally_retirable]
         return new_cancelled, new_failed, new_completed
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
+        # A failure/cancellation may be global, but reuse is safe only after
+        # every participating rank has drained its local physical accessor.
+        locally_retirable = []
+        for rid in to_process:
+            session = self._recv_sessions[rid]
+            if not getattr(session, "_enforce_physical_ownership", False):
+                locally_retirable.append(rid)
+                continue
+            resources_drained = getattr(session, "resources_drained", None)
+            if resources_drained is not None and resources_drained():
+                locally_retirable.append(rid)
         return self._consensus_outcome(
-            to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._gen_allgather,
+            self._gen_need_sync,
+            locally_retirable,
         )
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed):
@@ -880,6 +911,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     req.set_kv_cache_size(session.kv_cache_size_bytes)
                 completed.append(rid)
             elif result == WaitResult.FAILED:
+                # RxSession.wait_complete() already withholds FAILED while an
+                # ownership-enabled accessor remains active. Keep the caller
+                # boundary fail-closed as well so alternate/test session
+                # implementations cannot authorize request retirement early.
+                if getattr(session, "_enforce_physical_ownership", False):
+                    resources_drained = getattr(session, "resources_drained", None)
+                    if resources_drained is None or not resources_drained():
+                        continue
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
 
