@@ -232,6 +232,10 @@ class _ReceiveOperationOwner:
                 return
             self._expected_writers = expected_writers
             self._writer_cohort = cohort
+
+    def finish_publication(self) -> None:
+        """Record that every authorized REQUEST_DATA message was sent."""
+        with self._lock:
             self._publication_pending = False
 
     def cancel_unpublished(self) -> bool:
@@ -286,7 +290,7 @@ class _ReceiveOperationOwner:
     @property
     def resources_drained(self) -> bool:
         with self._lock:
-            writers_drained = self._expected_writers is None or (
+            writers_drained = self._expected_writers is not None and (
                 len(self._writer_results) == self._expected_writers
             )
             return (
@@ -1694,6 +1698,9 @@ class KVRecvTask:
     def seal_writer_cohort(self, writer_cohort: Optional[set[int]] = None) -> None:
         self._get_physical_owner().seal_writer_cohort(self.expected_transfers, writer_cohort)
 
+    def finish_publication(self) -> None:
+        self._get_physical_owner().finish_publication()
+
     def cancel_unpublished(self) -> bool:
         return self._get_physical_owner().cancel_unpublished()
 
@@ -2253,6 +2260,11 @@ class RxSession(RxSessionBase):
         self._aux_count = 0
         self._aux_status: TaskStatus = TaskStatus.INIT
         self._sender_endpoints: set[str] = set()
+        # Serialize REQUEST_DATA publication with cancellation notification
+        # without holding the session state lock across a potentially blocking
+        # network send. The ordering is publication -> cancellation whenever
+        # publication wins the state transition.
+        self._publication_lock = threading.Lock()
         self.lock = threading.Lock()
         self._receiver.setup_session(self)
 
@@ -2293,23 +2305,27 @@ class RxSession(RxSessionBase):
         publish: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Seal and publish a writer cohort unless cancellation won first."""
-        with self.lock:
-            if self._closed or self._terminal_status is not None:
-                return False
-            task = self._kv_tasks[slice_id]
-            task.seal_writer_cohort(writer_cohort)
-            task.status = TaskStatus.TRANSFERRING
-            self._sender_endpoints.update(sender_endpoints)
+        with self._publication_lock:
+            with self.lock:
+                if self._closed or self._terminal_status is not None:
+                    return False
+                task = self._kv_tasks[slice_id]
+                task.seal_writer_cohort(writer_cohort)
+                task.status = TaskStatus.TRANSFERRING
+                self._sender_endpoints.update(sender_endpoints)
             if publish is not None:
                 publish()
+            task.finish_publication()
             return True
 
-    def mark_transferring(self, slice_id: int) -> None:
+    def mark_transferring(self, slice_id: int, writer_cohort: Optional[set[int]] = None) -> None:
         if not self._enforce_physical_ownership:
             with self.lock:
                 self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
             return
-        if not self.try_begin_transfer(slice_id, set()):
+        if writer_cohort is None:
+            raise ValueError("ownership-mode publication requires an explicit writer cohort")
+        if not self.try_begin_transfer(slice_id, set(), writer_cohort):
             raise RuntimeError(
                 f"RxSession {self.disagg_request_id} became terminal before publication"
             )
@@ -2596,7 +2612,8 @@ class RxSession(RxSessionBase):
     def notify_cancel(self, sender_endpoints: Optional[set[str]] = None) -> None:
         if sender_endpoints is None:
             sender_endpoints = self.capture_cancel_targets()
-        self._receiver.send_cancel_to_senders(self.disagg_request_id, sender_endpoints)
+        with self._publication_lock:
+            self._receiver.send_cancel_to_senders(self.disagg_request_id, sender_endpoints)
 
     def cancel(self) -> None:
         """Cancel locally, then notify every writer without holding the lock."""
@@ -2678,11 +2695,18 @@ class RxSession(RxSessionBase):
         return self
 
     def __exit__(self, _exc_type, _exc, _tb):
-        self.close()
+        if not self.close():
+            logger.warning(
+                f"RxSession {self.disagg_request_id} refused close while resources remain active"
+            )
 
     def __del__(self):
         try:
-            self.close()
+            if not self.close():
+                logger.warning(
+                    f"RxSession {self.disagg_request_id} refused destructor close while "
+                    "resources remain active"
+                )
         except Exception as e:
             logger.warning(f"RxSession.__del__: exception during close: {e}")
 

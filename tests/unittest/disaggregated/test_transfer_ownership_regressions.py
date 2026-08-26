@@ -117,7 +117,11 @@ class _ReceiverProbe:
     def dispatch_task(self, task: KVRecvTask) -> None:
         assert self._session is not None
         task.expected_transfers = 2
-        self._session.mark_transferring(task.slice_id)
+        assert self._session.try_begin_transfer(
+            task.slice_id,
+            set(),
+            writer_cohort={0, 1},
+        )
 
     def send_cancel_to_senders(self, _unique_rid: int, _sender_endpoints: set[str]) -> None:
         self.cancel_count += 1
@@ -273,6 +277,7 @@ def test_remote_cancel_resolves_strong_owned_session() -> None:
     receiver._pre_cancelled_rids = set()
     receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
+    receiver._shutdown = True
     receiver.send_cancel_to_senders = Mock()
     session = _make_rx_session(receiver, rid)
 
@@ -334,6 +339,27 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
 
 
 @pytest.mark.cpu_only
+def test_out_of_cohort_writer_cannot_authorize_reuse() -> None:
+    receiver = _ReceiverProbe()
+    session = _make_rx_session(receiver, rid=82)
+    session.receive(KVSlice(is_last_slice=True))
+
+    with pytest.raises(RuntimeError, match="outside the sealed cohort"):
+        session.process_kv_agent_result(
+            peer_rank=2,
+            sender_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+        )
+
+    assert not session.resources_drained()
+    # Invalid evidence intentionally fails closed. Avoid a noisy best-effort
+    # destructor close for this hand-built, resource-free unit-test fixture.
+    session._closed = True
+    receiver._session = None
+
+
+@pytest.mark.cpu_only
 def test_cancel_after_publication_cannot_overtake_request_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -344,6 +370,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     protocol_order: list[str] = []
     receive_errors: list[Exception] = []
     cancel_errors: list[Exception] = []
+    result_errors: list[Exception] = []
     initial_cancel_outcome: str | None = None
 
     receiver = object.__new__(Receiver)
@@ -404,8 +431,8 @@ def test_cancel_after_publication_cannot_overtake_request_data(
         params=DisaggregatedParams(disagg_request_id=rid, ctx_dp_rank=0),
         receiver=receiver,
     )
-    session_lock = _TrackingLock(race_outcomes)
-    session.lock = session_lock
+    publication_lock = _TrackingLock(race_outcomes)
+    session._publication_lock = publication_lock
 
     def receive() -> None:
         try:
@@ -414,29 +441,52 @@ def test_cancel_after_publication_cannot_overtake_request_data(
             receive_errors.append(error)
 
     def cancel() -> None:
-        session_lock.tracked_thread_id = threading.get_ident()
+        publication_lock.tracked_thread_id = threading.get_ident()
         try:
             session.cancel()
         except Exception as error:
             cancel_errors.append(error)
 
+    def finish_writer() -> None:
+        try:
+            session.process_kv_agent_result(
+                peer_rank=0,
+                sender_slice_id=0,
+                is_last_slice=True,
+                status=AgentResult.FAILED,
+            )
+        except Exception as error:
+            result_errors.append(error)
+
     receive_thread = threading.Thread(target=receive, daemon=True)
     cancel_thread = threading.Thread(target=cancel, daemon=True)
+    result_thread = threading.Thread(target=finish_writer, daemon=True)
     receive_thread.start()
     try:
         assert request_data_started.wait(timeout=10)
         cancel_thread.start()
         initial_cancel_outcome = race_outcomes.get(timeout=10)
+        result_thread.start()
+        result_thread.join(timeout=10)
+        assert not result_thread.is_alive(), (
+            "a blocked REQUEST_DATA send held the session state lock and stalled result handling"
+        )
+        assert not session.resources_drained(), (
+            "terminal writer evidence authorized reuse before REQUEST_DATA publication finished"
+        )
     finally:
         finish_request_data.set()
         receive_thread.join(timeout=10)
         cancel_thread.join(timeout=10)
+        result_thread.join(timeout=10)
 
     assert not receive_thread.is_alive()
     assert not cancel_thread.is_alive()
     assert receive_errors == []
     assert cancel_errors == []
+    assert result_errors == []
     assert initial_cancel_outcome == "blocked"
+    assert session.resources_drained()
     assert protocol_order == ["request_data_started", "request_data_sent", "cancel_sent"], (
         "cancellation overtook an already-authorized REQUEST_DATA publication"
     )
@@ -463,3 +513,46 @@ def test_cancel_before_dispatch_releases_late_idle_reservation() -> None:
     )
     assert session.status == SessionStatus.CANCELLED
     assert task.resources_drained
+
+
+@pytest.mark.cpu_only
+def test_cancel_request_retains_session_when_close_refuses() -> None:
+    rid = 83
+    request = SimpleNamespace(
+        request_id=rid,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
+    )
+    session = SimpleNamespace(
+        cancel=Mock(),
+        has_transferring_tasks=Mock(return_value=False),
+        close=Mock(return_value=False),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+
+    assert transceiver.cancel_request(request) is False
+    assert transceiver._recv_sessions[rid] is session
+    assert transceiver._recv_reqs[rid] is request
+    session.close.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_collect_done_waits_for_physical_drain() -> None:
+    rid = 84
+    drained = False
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        is_completed=Mock(return_value=False),
+        has_failed=Mock(return_value=True),
+        resources_drained=lambda: drained,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+
+    assert transceiver._collect_done({rid: session}, {rid: object()}) == ([], [])
+
+    drained = True
+    assert transceiver._collect_done({rid: session}, {rid: object()}) == ([], [rid])
