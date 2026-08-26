@@ -5491,15 +5491,25 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # to host when a competing request needs the slots, and on resume are
         # onboarded with their host page-index buffers RECONNECTED
         kv_cache_config = KvCacheConfig(
-            # Hard cap sized for ~one request's full context+decode. It sits above
-            # a single request's peak (~context + 128 decode) but below even two
-            # requests' *context*, so the four concurrent requests cannot co-reside:
-            # three are admitted then suspended (ACTIVE->SUSPENDED, pages
-            # LOCKED->HELD) and resumed one at a time.
+            # Sized so the four concurrent requests contend: each alone fits, but
+            # the pool cannot hold all four at their decode peak, so the scheduler
+            # must preempt (ACTIVE->SUSPENDED, pages LOCKED->HELD) and resume.
+            #
+            # NOTE: max_tokens is NOT the resulting pool size. The V2 manager
+            # converts it to a byte quota and then inflates it by
+            # 1 / max_util_for_resume -- see the _get_quota_from_max_tokens call
+            # in tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py and the
+            # note in _util.py::_configure_helix_kv_cache_capacity. With 0.7
+            # below, the pool is sized for roughly 512/0.7 tokens. GPT-OSS is
+            # also a SWA model, so the token->byte rate is not uniform across
+            # layers. Whether any given pair of requests can co-reside is
+            # therefore NOT derivable from this knob -- read `pool_tokens` in the
+            # [I-10 sizing] diagnostic below instead.
             max_tokens=512,
             free_gpu_memory_fraction=0.5,
-            # Bounce resume() when the tier is near-full so a suspended request
-            # genuinely defers then is recalled (V2-only knob).
+            # Refuse resume() once the hot tier is above this utilization, so a
+            # suspended request genuinely defers before being recalled (V2-only).
+            # Also doubles as the pool-inflation factor described above.
             max_util_for_resume=0.7,
             enable_block_reuse=False,
             host_cache_size=4 * (1 << 30),
@@ -5514,8 +5524,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   enable_iter_perf_stats=True,
                   moe_config=MoeConfig(backend="CUTLASS"))
 
-        # Several distinct long prompts; each alone fits the ~1-request pool,
-        # but together they cannot be co-resident, forcing suspend/resume.
+        # Several distinct long prompts. Each alone fits the pool; together they
+        # cannot all stay resident at their decode peak, which is what forces
+        # suspend/resume. The contention comes from context + 128 decode across
+        # four requests plus the max_util_for_resume gate -- not from two bare
+        # contexts failing to co-reside (see the sizing note above).
         base = (
             "In large language model inference, the key-value cache stores the "
             "attention keys and values computed for each token so they are not "
@@ -5538,23 +5551,32 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         # the request that owns the pool
         sampling = SamplingParams(max_tokens=128, temperature=0.0)
 
-        def _drain_stats() -> tuple[int, int, int, int]:
+        def _drain_stats() -> tuple[int, int, int, int, int]:
             # Single drain: llm.get_stats() consumes the per-iteration records,
             # so suspend/resume counts AND offload/onboard bytes must be summed
             # in one pass. iterSuspendedRequests/iterResumedRequests are manager-
             # level (top-level of each record); offload/onboard are per pool
             # group. Both are V2-only.
-            suspended = resumed = offload = onboard = 0
+            suspended = resumed = offload = onboard = pool_tokens = 0
             for s in llm.get_stats(timeout=10):
                 suspended += s.get("iterSuspendedRequests", 0)
                 resumed += s.get("iterResumedRequests", 0)
+                # Measured pool size, for the [I-10 sizing] diagnostic. This is
+                # the allocated GPU pool the manager actually built; do NOT
+                # re-derive it from max_tokens (see the sizing note on
+                # kv_cache_config above). kvCacheStats is emitted for every
+                # backend, so this needs no V2-only key.
+                kvs = s.get("kvCacheStats") or {}
+                pool_tokens = max(
+                    pool_tokens,
+                    kvs.get("maxNumBlocks", 0) * kvs.get("tokensPerBlock", 0))
                 pgs = s.get("kvCacheIterationStatsByPoolGroup")
                 if not pgs:
                     continue
                 for pg in pgs.values():
                     offload += pg.get("iterOffloadBytes", 0)
                     onboard += pg.get("iterOnboardBytes", 0)
-            return suspended, resumed, offload, onboard
+            return suspended, resumed, offload, onboard, pool_tokens
 
         def _common_prefix_len(a: list[int], b: list[int]) -> int:
             # Diagnostic only -- do NOT turn this into an assertion. Contended
@@ -5577,7 +5599,32 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 r = llm.generate([p], sampling)
                 ref_ids.append(list(r[0].outputs[0].token_ids))
                 ref_txt.append(r[0].outputs[0].text)
-            _drain_stats()  # discard the reference runs' stats
+            _, _, _, _, pool_tokens = _drain_stats()  # discard ref-run stats
+            # Sizing ground truth, printed before the contended phase so it is
+            # visible even if that phase fails. `pool_tokens` is measured, not
+            # derived from max_tokens -- see the sizing note on kv_cache_config.
+            ctx_lens = [len(llm.tokenizer.encode(p)) for p in prompts]
+            peak_per_request = min(ctx_lens) + sampling.max_tokens
+            concurrent_peak = len(prompts) * peak_per_request
+            print(f"[I-10 sizing] pool_tokens={pool_tokens} "
+                  f"ctx_lens={ctx_lens} decode={sampling.max_tokens} "
+                  f"peak_per_request={peak_per_request} "
+                  f"concurrent_peak={concurrent_peak}")
+            # Workload precondition: the pool cannot hold all four requests at
+            # their decode peak, which is what forces the scheduler to preempt.
+            # Checked against the *measured* pool, never against max_tokens --
+            # the manager inflates that knob by 1 / max_util_for_resume, so a
+            # config-derived bound is wrong by ~1.43x (see the sizing note on
+            # kv_cache_config). Observed on B200/H100 at 1588 vs 736, a ~2.2x
+            # margin; the deliberately weaker two-request form (794 vs 736) is
+            # only ~8% and too tight to gate CI on. Failing here means the
+            # workload stopped being contended, NOT that the KV path broke.
+            assert concurrent_peak > pool_tokens, (
+                f"workload precondition failed: the pool ({pool_tokens} tokens) "
+                f"can hold all {len(prompts)} requests at their decode peak "
+                f"({concurrent_peak} tokens), so nothing forces preemption -- "
+                f"retune max_tokens / prompt length; this is not a KV-path "
+                f"failure")
             # Contended: all prompts in flight against a ~1-request pool, so the
             # scheduler must suspend/resume (and may offload/onboard) to serve them.
             # Bounded wait: a V2 scheduler deadlock (all requests suspended, none
@@ -5585,7 +5632,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             # with no diagnostics. TimeoutError here IS the deadlock signal.
             futures = [llm.generate_async(p, sampling) for p in prompts]
             contended = [f.result(timeout=600) for f in futures]
-            suspended, resumed, offload, onboard = _drain_stats()
+            suspended, resumed, offload, onboard, _ = _drain_stats()
 
         con_ids = [list(r.outputs[0].token_ids) for r in contended]
         con_txt = [r.outputs[0].text for r in contended]
