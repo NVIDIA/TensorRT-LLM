@@ -18,7 +18,10 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_cute_dsl_mla_helix_stats_and_empty_local_kv(input_dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("split_kv", [1, 4])
+def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
+    input_dtype: torch.dtype, split_kv: int
+) -> None:
     import cutlass
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
@@ -105,14 +108,13 @@ def test_cute_dsl_mla_helix_stats_and_empty_local_kv(input_dtype: torch.dtype) -
             workspace,
             softmax_stats,
         ],
-        tactic=((128, 128), (128, 256), 4, False),
+        tactic=((128, 128), (128, 256), split_kv, False),
         softmax_scale=softmax_scale,
         output_scale=1.0,
     )
 
     # The existing Helix sanitizer makes a rank with no local pages the identity
-    # contribution even though the unchanged MLA kernel may leave its output
-    # row undefined. The stats wrapper itself emits the canonical empty pair.
+    # contribution even though the MLA kernel may leave an empty row undefined.
     sanitized_output, sanitized_stats = _helix_sanitize_empty_kv(
         output_storage.view(batch_size, -1),
         softmax_stats,

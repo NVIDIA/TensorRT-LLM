@@ -9037,8 +9037,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         BlackwellMultiHeadLatentAttentionForwardFP8
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp16 import \
         BlackwellMultiHeadLatentAttentionForwardFP16
-    from ..cute_dsl_kernels.blackwell.attention.mla.mla_softmax_stats import \
-        MLAWithSoftmaxStats
 
     class CuteDSLNVMlaDecodeBlackwellRunner(TunableRunner):
         """Generic TunableRunner for the Blackwell CuTe DSL MLA decode kernels.
@@ -9590,10 +9588,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
                     fold_sq=fold_sq,
+                    emit_softmax_stats=self.emit_softmax_stats,
                 )
-                compiled_kernel = (MLAWithSoftmaxStats(mla)
-                                   if softmax_stats_kernel is not None else mla)
-
                 q_latent_ct = cute.runtime.from_dlpack(
                     q_latent,
                     assumed_align=16).mark_layout_dynamic(leading_dim=1)
@@ -9637,7 +9633,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     o_ct,
                     lse_ct,
                 ]
-                if softmax_stats_ct is not None:
+                compile_target = mla
+                if self.emit_softmax_stats:
+                    compile_target = mla.run_with_softmax_stats
                     compile_args.append(softmax_stats_ct)
                 compile_args.extend([
                     workspace_ct,
@@ -9650,7 +9648,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ])
                 CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[cache_key] = (
                     cute.compile(
-                        compiled_kernel,
+                        compile_target,
                         *compile_args,
                         options="--opt-level 2",
                     ))
@@ -9666,7 +9664,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 o,
                 lse,
             ]
-            if softmax_stats_kernel is not None:
+            if self.emit_softmax_stats:
                 runtime_args.append(softmax_stats_kernel)
             runtime_args.extend([
                 split_workspace if
