@@ -150,7 +150,7 @@ class FP4ConvTunableRunner(TunableRunner):
                     # configuration; clear any pending error before continuing.
                     try:
                         torch.cuda.synchronize()
-                    except Exception as sync_error:
+                    except RuntimeError as sync_error:
                         logger.debug(
                             "Wan NVFP4 Conv3d CUDA synchronize failed after "
                             f"tactic {tactic_id} compilation: {sync_error}"

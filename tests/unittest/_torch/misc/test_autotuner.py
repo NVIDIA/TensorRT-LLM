@@ -586,8 +586,7 @@ def test_load_cache_skips_non_literal_tactic():
 
 def test_load_cache_failure_preserves_live_state(tmp_path):
     """A failed replacement must not partially mutate the live cache."""
-    cache = AutoTuner.get().profiling_cache
-    cache.clear()
+    cache = autotuner.AutoTunerProfilingCache()
     old_key = ("old_op", "Runner", "0", ((1, 128), ))
     cache[old_key] = (0, 7, 0.001)
     cache.independent_op.add("old_op")
