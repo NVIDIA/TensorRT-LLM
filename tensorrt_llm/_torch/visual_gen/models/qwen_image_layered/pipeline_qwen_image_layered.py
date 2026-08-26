@@ -16,9 +16,11 @@
 
 import math
 import time
+from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+import PIL.Image
 import torch
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
@@ -29,7 +31,6 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     RoleSpec,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 
 from .transformer_qwen_image_layered import QwenImageLayeredTransformer2DModel
@@ -365,7 +366,7 @@ class QwenImageLayeredPipeline(BasePipeline):
             return [QwenImageLayeredPipeline._load_image_input(item) for item in image]
         if isinstance(image, bytes):
             # Layer decomposition needs the alpha channel, not a flattened RGB.
-            return ImageMediaIO(format="pil", mode="RGBA").load_bytes(image)
+            return PIL.Image.open(BytesIO(image)).convert("RGBA")
         if hasattr(image, "convert") and getattr(image, "mode", None) != "RGBA":
             return image.convert("RGBA")
         return image

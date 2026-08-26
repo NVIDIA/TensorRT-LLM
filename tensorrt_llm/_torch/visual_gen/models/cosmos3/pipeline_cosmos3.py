@@ -18,6 +18,7 @@ import json
 import math
 import os
 import time
+from io import BytesIO
 from typing import Any, Iterable, List, Optional, Union
 
 import PIL.Image
@@ -45,7 +46,6 @@ from tensorrt_llm._torch.visual_gen.utils import (
     synchronize_media_prepare_status,
 )
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
@@ -246,7 +246,7 @@ def _load_reference_image(data: bytes):
     upload would be reported as a server fault.
     """
     try:
-        return ImageMediaIO(format="pil").load_bytes(data)
+        return PIL.Image.open(BytesIO(data)).convert("RGB")
     except OSError as exc:
         raise ValueError(
             f"Image reference could not be decoded; it may be truncated, "

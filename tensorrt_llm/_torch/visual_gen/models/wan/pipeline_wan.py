@@ -15,6 +15,7 @@
 
 import os
 import time
+from io import BytesIO
 from typing import List, Optional, Union
 
 import diffusers
@@ -43,7 +44,6 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, R
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 
 from .transformer_wan import WanTransformer3DModel
@@ -816,7 +816,7 @@ class WanPipeline(BasePipeline):
 
         # Load and preprocess image
         if isinstance(image, bytes):
-            image = ImageMediaIO(format="pil", drop_alpha=True).load_bytes(image)
+            image = PIL.Image.open(BytesIO(image)).convert("RGB")
         image = (
             self.video_processor.preprocess(image, height=height, width=width)
             .to(self.device, dtype=self.vae.dtype)

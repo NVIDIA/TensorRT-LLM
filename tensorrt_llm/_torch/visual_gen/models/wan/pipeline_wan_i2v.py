@@ -16,6 +16,7 @@
 import json
 import os
 import time
+from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
 import diffusers
@@ -39,7 +40,6 @@ from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
-from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 
 # Supported Wan I2V 14B models:
@@ -728,13 +728,10 @@ class WanImageToVideoPipeline(BasePipeline):
         last_image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ) -> torch.Tensor:
         """Encode image(s) using CLIP image encoder (Wan 2.1 I2V only)."""
-        # drop_alpha keeps diffusers' semantics: convert("RGB") drops the alpha
-        # channel rather than compositing it onto white.
-        media_io = ImageMediaIO(format="pil", drop_alpha=True)
         if isinstance(image, bytes):
-            image = media_io.load_bytes(image)
+            image = PIL.Image.open(BytesIO(image)).convert("RGB")
         if isinstance(last_image, bytes):
-            last_image = media_io.load_bytes(last_image)
+            last_image = PIL.Image.open(BytesIO(last_image)).convert("RGB")
 
         images_to_encode = [image] if last_image is None else [image, last_image]
 
@@ -766,14 +763,14 @@ class WanImageToVideoPipeline(BasePipeline):
 
         # Load and preprocess image(s)
         if isinstance(image, bytes):
-            image = ImageMediaIO(format="pil", drop_alpha=True).load_bytes(image)
+            image = PIL.Image.open(BytesIO(image)).convert("RGB")
         image = self.video_processor.preprocess(image, height=height, width=width).to(
             self.device, dtype=torch.float32
         )
 
         if last_image is not None:
             if isinstance(last_image, bytes):
-                last_image = ImageMediaIO(format="pil", drop_alpha=True).load_bytes(last_image)
+                last_image = PIL.Image.open(BytesIO(last_image)).convert("RGB")
             last_image = self.video_processor.preprocess(last_image, height=height, width=width).to(
                 self.device, dtype=torch.float32
             )

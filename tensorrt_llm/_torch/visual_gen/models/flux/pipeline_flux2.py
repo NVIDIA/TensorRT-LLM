@@ -22,6 +22,7 @@ import json
 import os
 import time
 from contextlib import contextmanager
+from io import BytesIO
 from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -45,7 +46,6 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm.inputs.media_io import ImageMediaIO, convert_image_mode
 from tensorrt_llm.logger import logger
 
 from .transformer_flux2 import Flux2Transformer2DModel
@@ -763,16 +763,13 @@ class Flux2Pipeline(BasePipeline):
         if not inputs:
             raise ValueError("`image` must contain at least one reference image.")
 
-        # drop_alpha keeps diffusers' semantics: convert("RGB") drops the alpha
-        # channel rather than compositing it onto white.
-        media_io = ImageMediaIO(format="pil", drop_alpha=True)
         images = []
         for index, item in enumerate(inputs):
             try:
                 if isinstance(item, PIL.Image.Image):
-                    images.append(convert_image_mode(item, "RGB", drop_alpha=True))
+                    images.append(item.convert("RGB"))
                 elif isinstance(item, bytes):
-                    images.append(media_io.load_bytes(item))
+                    images.append(PIL.Image.open(BytesIO(item)).convert("RGB"))
                 else:
                     raise ValueError(
                         "Reference images must be PIL images or encoded bytes; "
