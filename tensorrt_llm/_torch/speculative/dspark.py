@@ -759,6 +759,18 @@ class DSparkWorker(DFlashWorker):
                 f"{type(draft_model).__name__} declares one."
             )
 
+    def _draft_block_width(self, draft_model) -> int:
+        """Block width under the dspark ``shift_label`` convention.
+
+        shift_label reads slots 0..K-1, so K draft tokens fit in K slots and
+        the base class' K+1 over-demands by one -- enough to reject a block-7
+        checkpoint at max_draft_len=7, which is how both published DSpark
+        drafters are meant to run.
+        """
+        if getattr(draft_model, "_dspark_shift_label", False):
+            return self.max_draft_len
+        return super()._draft_block_width(draft_model)
+
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
     ) -> torch.Tensor:

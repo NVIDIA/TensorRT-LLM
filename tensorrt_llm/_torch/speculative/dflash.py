@@ -324,11 +324,12 @@ class DFlashWorker(SpecWorkerBase):
             self.max_draft_len + 1
         )
         # what the draft forward actually computes
-        self._compute_block_size = self.max_draft_len + 1
-        if self.max_draft_len + 1 > self._resolved_block_size:
+        self._compute_block_size = self._draft_block_width(draft_model)
+        if self._compute_block_size > self._resolved_block_size:
+            slack = self._compute_block_size - self.max_draft_len
             raise ValueError(
                 f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
-                f"Lower max_draft_len to at most {self._resolved_block_size - 1}."
+                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
                 f"Current max_draft_len={self.max_draft_len}."
             )
 
@@ -797,6 +798,16 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _draft_block_width(self, draft_model) -> int:
+        """Block slots the draft forward must compute for K draft tokens.
+
+        Plain DFlash reads slots 1..K, so slot 0 is pure overhead and the
+        forward needs K+1. Families whose slot convention differs override
+        this alongside :meth:`_draft_slot_ids` — the two must agree, since
+        the width bounds the slots the gather is allowed to name.
+        """
+        return self.max_draft_len + 1
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
