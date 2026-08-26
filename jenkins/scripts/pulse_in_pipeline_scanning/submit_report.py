@@ -23,10 +23,23 @@ class BuildMetadata(TypedDict):
     build_number: str
     ref: str
     platform: NotRequired[str]
+    scan_mode: NotRequired[str]
 
 
 def safe(value, default=None):
     return value if value else default
+
+
+def _triage_branch(build_metadata: BuildMetadata) -> str:
+    """Return the branch to use when looking up existing triage records.
+
+    Pre-merge scans run against a per-PR commit hash, which never matches a
+    previously triaged branch. Look up against "main" instead so pre-merge
+    scans can reuse tickets already triaged there.
+    """
+    if build_metadata.get("scan_mode") == "pre_merge":
+        return "main"
+    return build_metadata["ref"]
 
 
 def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -> tuple[dict, dict]:
@@ -93,7 +106,7 @@ def submit_source_code_vulns(
 ) -> list:
     """Triage untriaged source-code vulnerabilities, save all docs to ES, return untriaged risks."""
     SCAN_TYPE = "source_code_vulnerability"
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
     ts = int(start_datetime.timestamp() * 1000)
 
     bulk_documents = []
@@ -168,7 +181,7 @@ def submit_source_code_licenses(
     is_permissive, is_nvidia_proprietary).
     """
     SCAN_TYPE = "source_code_license"
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
     ts = int(start_datetime.timestamp() * 1000)
 
     map_preapproved = get_preapproved_deps_map(SCAN_TYPE)
@@ -271,7 +284,7 @@ def submit_container_vulns(
 ) -> list:
     """Triage untriaged container vulnerabilities, save all docs to ES, return untriaged risks."""
     SCAN_TYPE = "container_vulnerability"
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    triaged_deps = get_triaged_deps(SCAN_TYPE, _triage_branch(build_metadata))
     ts = int(start_datetime.timestamp() * 1000)
 
     release_data = load_json(input_file)
@@ -345,7 +358,9 @@ def submit_container_licenses(
     base_data = load_json(base_input_file)
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
-    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"], container=release_image)
+    triaged_deps = get_triaged_deps(
+        SCAN_TYPE, _triage_branch(build_metadata), container=release_image
+    )
     ts = int(start_datetime.timestamp() * 1000)
 
     trtllm_deps = diff_licenses(SCAN_TYPE, input_file, base_input_file)

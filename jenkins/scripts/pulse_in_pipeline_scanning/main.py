@@ -63,6 +63,7 @@ SUBMIT_KWARG = {
         "build_url": args.build_url,
         "build_number": args.build_number,
         "ref": args.ref,
+        "scan_mode": args.scan_mode,
     },
     "start_datetime": datetime.now(timezone.utc),
 }
