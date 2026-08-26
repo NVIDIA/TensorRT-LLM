@@ -24,20 +24,36 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 GB = 1 << 30
 
 
-def test_one_model_draft_dtype_override_is_copy_on_write():
+@pytest.mark.parametrize(
+    "manager_dtype,target_dtype,expected_draft_dtype",
+    [
+        ("fp8", "nvfp4", "fp8"),
+        (None, "nvfp4", "nvfp4"),
+        ("fp8", "auto", "auto"),
+        ("fp8", "fp8", "fp8"),
+    ],
+)
+def test_one_model_draft_dtype_override_is_copy_on_write(
+    manager_dtype: str | None,
+    target_dtype: str,
+    expected_draft_dtype: str,
+) -> None:
     creator = object.__new__(KvCacheCreator)
 
     class _HybridTargetManager:
-        draft_manager_kv_cache_dtype = "fp8"
+        pass
+
+    if manager_dtype is not None:
+        _HybridTargetManager.draft_manager_kv_cache_dtype = manager_dtype
 
     creator._kv_cache_manager_cls = _HybridTargetManager
-    target = KvCacheConfig(dtype="nvfp4", tokens_per_block=128)
+    target = KvCacheConfig(dtype=target_dtype, tokens_per_block=128)
 
     draft = creator._get_one_model_draft_kv_cache_config(target)
 
-    assert target.dtype == "nvfp4"
+    assert target.dtype == target_dtype
     assert target.tokens_per_block == 128
-    assert draft.dtype == "fp8"
+    assert draft.dtype == expected_draft_dtype
     assert draft.tokens_per_block == 128
 
 

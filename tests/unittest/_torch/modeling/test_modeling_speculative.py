@@ -29,21 +29,27 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
-def test_draft_kv_cache_quant_algo_override_updates_all_layers():
+def test_draft_kv_cache_quant_algo_override_updates_all_layers() -> None:
     target = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
         extra_attrs={"draft_kv_cache_quant_algo_override": QuantAlgo.FP8},
     )
-    layer_quant = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    layer_quant_0 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    layer_quant_1 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
     draft = SimpleNamespace(
         quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
-        quant_config_dict={"model.layers.0": layer_quant},
+        quant_config_dict={
+            "model.layers.0": layer_quant_0,
+            "model.layers.1": layer_quant_1,
+        },
     )
 
     _set_draft_kv_cache_quant_algo(draft, target)
 
     assert draft.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
-    assert layer_quant.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant_0.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant_1.kv_cache_quant_algo == QuantAlgo.FP8
+    assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
 class _FakeDraftModel(nn.Module):

@@ -273,12 +273,7 @@ def test_minimax_m3_nvfp4_horizontal_producer_matches_production_quantize(
     )
 
 
-def test_minimax_m3_nvfp4_horizontal_producer_rejects_non_m3_head_ratio():
-    from tensorrt_llm._utils import get_sm_version
-
-    if get_sm_version() not in (100, 103):
-        pytest.skip("NVFP4 quantization requires Blackwell")
-
+def test_minimax_m3_nvfp4_horizontal_producer_rejects_non_m3_head_ratio() -> None:
     num_tokens, num_heads_q, num_kv_heads, num_pages = 1, 8, 2, 4
     total_heads = num_heads_q + 3 * num_kv_heads + 1
     packed = torch.randn(
@@ -310,7 +305,39 @@ def test_minimax_m3_nvfp4_horizontal_producer_rejects_non_m3_head_ratio():
         )
 
 
-def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay():
+def test_minimax_m3_nvfp4_horizontal_producer_rejects_mismatched_page_counts() -> None:
+    num_tokens, num_heads_q, num_kv_heads, num_pages = 1, 16, 1, 4
+    total_heads = num_heads_q + 3 * num_kv_heads + 1
+    packed = torch.randn(
+        num_tokens,
+        total_heads * 128,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    data_cache, scale_cache, index_cache = _nvfp4_caches(num_pages, num_kv_heads)
+    slots = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    inv_scales = torch.ones(3, dtype=torch.float32, device="cuda")
+    weights = [torch.ones(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
+    rope_cache = _rope_cache(8)
+    position_ids = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+
+    with pytest.raises(RuntimeError, match="same number of pages"):
+        _run_nvfp4(
+            packed,
+            data_cache,
+            scale_cache,
+            index_cache[:-1],
+            slots,
+            inv_scales,
+            num_heads_q,
+            num_kv_heads,
+            *weights,
+            rope_cache,
+            position_ids,
+        )
+
+
+def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay() -> None:
     from tensorrt_llm._utils import get_sm_version
 
     if get_sm_version() not in (100, 103):
@@ -331,21 +358,6 @@ def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay():
     weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
     rope_cache = _rope_cache(512)
     data_cache, scale_cache, index_cache = _nvfp4_caches(num_pages, num_kv_heads)
-
-    with pytest.raises(RuntimeError, match="same number of pages"):
-        _run_nvfp4(
-            packed,
-            data_cache,
-            scale_cache,
-            index_cache[:-1],
-            slots,
-            inv_scales,
-            num_heads_q,
-            num_kv_heads,
-            *weights,
-            rope_cache,
-            position_ids,
-        )
 
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

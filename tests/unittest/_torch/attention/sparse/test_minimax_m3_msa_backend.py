@@ -75,6 +75,34 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered():
         )
 
 
+def test_msa_main_kv_fp8_probe_retries_legacy_layout_signature() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+        MiniMaxM3MsaSparseAttentionMetadata,
+    )
+
+    class _LegacyManager:
+        def get_buffers(self, layer_idx: int) -> torch.Tensor:
+            assert layer_idx == 0
+            return torch.empty(1, 2, 1, 1, 1, dtype=torch.float8_e4m3fn)
+
+    metadata = SimpleNamespace(kv_cache_manager=_LegacyManager())
+    assert MiniMaxM3MsaSparseAttentionMetadata._msa_main_kv_is_fp8(metadata)
+
+
+def test_msa_main_kv_fp8_probe_does_not_hide_manager_errors() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+        MiniMaxM3MsaSparseAttentionMetadata,
+    )
+
+    class _BrokenManager:
+        def get_buffers(self, layer_idx: int, kv_layout: str | None = None) -> torch.Tensor:
+            raise RuntimeError(f"broken layer {layer_idx} layout {kv_layout}")
+
+    metadata = SimpleNamespace(kv_cache_manager=_BrokenManager())
+    with pytest.raises(RuntimeError, match="broken layer 0 layout HND"):
+        MiniMaxM3MsaSparseAttentionMetadata._msa_main_kv_is_fp8(metadata)
+
+
 def test_fused_qkv_index_projection_is_explicit_and_shards_index_heads():
     cfg = MiniMaxM3SparseAttentionConfig(
         implementation="msa",

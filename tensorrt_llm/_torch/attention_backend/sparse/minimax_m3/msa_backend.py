@@ -590,12 +590,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             buffers = kv_cache_manager.get_buffers(0, kv_layout="HND")
         except TypeError:
             buffers = kv_cache_manager.get_buffers(0)
-        except Exception:
+        if buffers is None:
             return False
-        try:
-            return buffers[:, 0].dtype == torch.float8_e4m3fn
-        except Exception:
-            return False
+        return buffers[:, 0].dtype == torch.float8_e4m3fn
 
     def _msa_main_kv_is_nvfp4(self) -> bool:
         """Whether the main paged K/V cache uses packed NVFP4 storage."""
