@@ -19,7 +19,10 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
     select_qsa_paged_tokens,
     select_qsa_tokens,
 )
-from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import triton_qsa_decode_pre_indexer
+from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
+    triton_qsa_decode_pre_indexer,
+    triton_qsa_prefill_compress,
+)
 from tensorrt_llm._torch.attention_backend.sparse.qsa.module import _query_chunk_size
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2, MambaRole
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
@@ -88,6 +91,74 @@ def test_expand_qsa_blocks_appends_incomplete_tail() -> None:
         [4, 5, 6, 7, 0, 1, 2, 3, 8, 9, -1],
         [0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1],
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_prefill_compress_matches_gemma_norm_with_identity_rope() -> None:
+    torch.manual_seed(42)
+    tokens_per_block = 8
+    num_tokens = 16
+    head_dim = 16
+    compress_ratio = 4
+    eps = 1e-6
+    index_cache = torch.randn(
+        2,
+        tokens_per_block,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    original = index_cache.clone()
+    position_cache = torch.zeros(
+        2,
+        tokens_per_block,
+        3,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+    position_cache.view(num_tokens, 3).copy_(positions[:, None].expand(-1, 3))
+    block_table = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+    logical_positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+    request_indices = torch.zeros(num_tokens, device="cuda", dtype=torch.int32)
+    norm_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+    rotary_pairs = head_dim // 4
+    cos_sin = torch.cat(
+        (
+            torch.ones(num_tokens, rotary_pairs, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(num_tokens, rotary_pairs, device="cuda", dtype=torch.bfloat16),
+        ),
+        dim=1,
+    )
+
+    triton_qsa_prefill_compress(
+        logical_positions=logical_positions,
+        request_indices=request_indices,
+        block_table=block_table,
+        index_cache=index_cache,
+        position_cache=position_cache,
+        k_norm_weight=norm_weight,
+        cos_sin=cos_sin,
+        eps=eps,
+        tokens_per_block=tokens_per_block,
+        compress_ratio=compress_ratio,
+        mrope_section=None,
+    )
+
+    actual = index_cache.view(num_tokens, head_dim)
+    expected = original.view(num_tokens, head_dim).clone()
+    for anchor in range(compress_ratio - 1, num_tokens, compress_ratio):
+        pooled = (
+            original.view(num_tokens, head_dim)[anchor - compress_ratio + 1 : anchor + 1]
+            .float()
+            .mean(dim=0)
+            .to(torch.bfloat16)
+        )
+        normalized = pooled.float() * torch.rsqrt(pooled.float().square().mean() + eps)
+        expected[anchor] = (normalized * (norm_weight.float() + 1.0)).to(torch.bfloat16)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_qsa_selection_is_causal_and_score_ordered() -> None:
