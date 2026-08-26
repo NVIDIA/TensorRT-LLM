@@ -109,22 +109,23 @@ def _merge_extra_params(
         params.extra_params = None
 
 
-def _local_media_path_is_disallowed() -> bool:
-    """Whether ``format='path'`` is turned off for HTTP requests.
+def local_media_path_is_disallowed() -> bool:
+    """Whether server-side filesystem paths are refused at the HTTP boundary.
 
-    A ``path`` reference asks the server to read its own disk, which is what a
-    co-located client wants and what a remote one has no business doing. Which
-    of the two a deployment has is not something the code can know, so it is
-    allowed by default and turned off with
-    ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``. The local Python API is unaffected
-    either way: this gate is the HTTP boundary's.
+    One switch for both directions, because both are the same trust question:
+    a ``path`` reference has the server read its own disk, and
+    ``response_format='path'`` has it disclose where it wrote. Either is what a
+    co-located client wants and what a remote one has no business doing, and
+    the code cannot tell the two deployments apart, so both are allowed by
+    default and turned off together with ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``.
+    The local Python API is unaffected: this gate is the HTTP boundary's.
     """
     raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
     if raw not in ("0", "1"):
         logger.warning(
             "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
             f"{raw!r}. Expected '0' or '1'. Treating as '0' "
-            "(reference format='path' allowed)."
+            "(server-side paths allowed)."
         )
     return raw == "1"
 
@@ -143,7 +144,7 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
     content = getattr(ref, "content", None)
     if not isinstance(content, str):
         raise ValueError("reference item must carry a 'content' string.")
-    if ref.format == "path" and _local_media_path_is_disallowed():
+    if ref.format == "path" and local_media_path_is_disallowed():
         raise ValueError(
             "reference format='path' is disallowed on this server "
             "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it reads server-side files "
@@ -384,7 +385,7 @@ def _apply_deprecated_input_reference(
     if hasattr(input_reference, "file"):  # multipart upload — form implied
         payload = input_reference.file.read()
     else:
-        if input_reference_format == "path" and _local_media_path_is_disallowed():
+        if input_reference_format == "path" and local_media_path_is_disallowed():
             raise ValueError(
                 "reference format='path' is disallowed on this server "
                 "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it reads server-side "

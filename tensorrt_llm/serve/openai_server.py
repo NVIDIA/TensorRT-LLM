@@ -107,7 +107,8 @@ from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
+from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
+                                                 parse_visual_gen_params)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -3226,20 +3227,12 @@ class OpenAIServer(_VideoRoutesMixin):
             self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
-        ``path`` discloses absolute server-side filesystem paths, so it can be
-        turned off via ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` on shared /
-        untrusted deployments (enabled by default). Returns ``None`` when
-        allowed.
+        Shares the switch with ``format='path'`` on the request side; see
+        :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
         """
         if response_format != "path":
             return None
-        raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
-        if raw not in ("0", "1"):
-            logger.warning(
-                "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
-                f"{raw!r}. Expected '0' or '1'. Treating as '0' "
-                "(response_format='path' enabled).")
-        if raw == "1":
+        if local_media_path_is_disallowed():
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
                 "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "

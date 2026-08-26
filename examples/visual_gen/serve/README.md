@@ -293,7 +293,7 @@ You can customize these by:
     {"image_reference": {"content": "iVBORw0KGgoAAAANSUhEUg...", "format": "base64"}}
     ```
 
-  - `"path"` reads a file on the *server*, so it is only meaningful for a co-located client; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject it. `"url"` is fetched through the SSRF-guarded loader (private-address block, redirect re-validation, timeout, size cap).
+  - `"path"` reads a file on the *server*, so it is only meaningful for a co-located client; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject it (the same switch also disables `response_format="path"`). `"url"` is fetched through the SSRF-guarded loader (private-address block, redirect re-validation, timeout, size cap).
   - `format` here is the *input* wire form; the top-level `format` selects the *output* encoding.
   - `role` disambiguates a model that accepts the same modality in more than one role — Wan 2.1 I2V takes a first frame and an optional last frame. Roles and lists need a JSON body; a multipart upload is a single file with no role.
 
@@ -310,7 +310,7 @@ You can customize these by:
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
 
-> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400.
+> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400. One switch covers both directions: it also rejects a reference sent with `format="path"`.
 
 #### Tensor-format consumer contract
 
