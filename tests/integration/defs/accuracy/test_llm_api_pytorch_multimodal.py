@@ -228,7 +228,6 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
-@skip_pre_blackwell
 @pytest.mark.skipif(
     not is_sm_100f(),
     reason="Gemma4 shared-KV MTP requires FlashInfer trtllm-gen on the SM100 family",
