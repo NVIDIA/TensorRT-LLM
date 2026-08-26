@@ -4030,6 +4030,17 @@ class PyTorchModelEngine(ModelEngine):
                         restore=True,
                     )
 
+                if (self.mapping.has_cp_helix() and getattr(
+                        inputs['attn_metadata'], '_helix_spec_tokens_valid',
+                        False)):
+                    # Mirror of the helix position correction in
+                    # _preprocess_inputs (capture symmetry, like position_ids
+                    # above). The recompute's OVERWRITES (slots/bounds/
+                    # kv_lens) need no reversal: every consumer buffer is
+                    # rewritten from host state at the next step's prepare.
+                    inputs['attn_metadata'].helix_position_offsets[:previous_batch_tokens] -= (
+                        self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
             num_tokens = attn_metadata.num_tokens

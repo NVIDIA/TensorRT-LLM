@@ -684,10 +684,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         owner = torch.div(pos, phys, rounding_mode='floor') % cp_size
         active = owner == cp_rank
         local_before = self.helix_local_len_vec(pos)
+        # Scalar overload: no per-step allocation (these ops are captured
+        # into the CUDA graph; keep them allocation-free).
         self.helix_local_slots[num_ctx_tokens:num_ctx_tokens +
                                num_gen_tokens].copy_(
-                                   torch.where(active, local_before,
-                                               local_before.new_full((), -1)))
+                                   torch.where(active, local_before, -1))
         self.helix_kv_bounds[num_ctx_tokens:num_ctx_tokens +
                              num_gen_tokens].copy_(
                                  self.helix_local_len_vec(pos + 1))
