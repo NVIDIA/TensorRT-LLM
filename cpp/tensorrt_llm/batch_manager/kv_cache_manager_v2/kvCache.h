@@ -186,8 +186,7 @@ public:
     // Returns false if utilization too high or out of memory.
     bool resume(std::optional<CUstream> stream = std::nullopt);
 
-    // Suspend: detach from CUDA stream and unlock pages. The storage manager
-    // owns any subsequent cache-tier placement decisions.
+    // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     void suspend();
 
     // Close: release all blocks back to KvCacheManager.
@@ -479,7 +478,6 @@ private:
     };
 
     std::vector<ActivePage> _activePages() const;
-    void _releaseActivePageLocks();
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
 
     bool _shortcutSetCapacity(int capacity);

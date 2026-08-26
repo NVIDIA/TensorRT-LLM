@@ -331,7 +331,7 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
 
     sched = SimpleNamespace(
         has_cp_helix=True,
-        _try_allocate_generation=lambda req: False,
+        kv_cache_manager=SimpleNamespace(try_allocate_generation=lambda req: False),
     )
     req = SimpleNamespace(
         py_request_id=7,
@@ -352,7 +352,6 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
             recompute_paused=[],
             inflight_request_ids=set(),
             scheduled_beam_width=0,
-            has_pending_completions=False,
         )
 
 

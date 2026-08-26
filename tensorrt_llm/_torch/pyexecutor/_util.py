@@ -1649,9 +1649,8 @@ class KvCacheCreator:
         per-manager cache costs are unavailable), the input configs are returned
         unchanged.
 
-        The affine fixed (intercept) cost models guaranteed GPU-resident state
-        (e.g. Mamba state that cannot be offloaded while making progress). It
-        is only charged against ``max_gpu_total_bytes``; for any
+        The affine fixed (intercept) cost models GPU-resident state (e.g. mamba
+        SSM state). It is only charged against ``max_gpu_total_bytes``; for any
         other budget (e.g. ``host_cache_size``, which is host offload memory the
         GPU-resident state never occupies) the intercept is dropped so the split
         stays proportional to the per-token cost.
@@ -1701,8 +1700,8 @@ class KvCacheCreator:
                     f"smaller than the combined fixed cost "
                     f"({intercept_total / GB:.2f} GiB, e.g. mamba SSM state) "
                     f"for target+draft. Increase free_gpu_memory_fraction or "
-                    f"max_gpu_total_bytes, or reduce the managers' guaranteed "
-                    f"resident-state requirements.")
+                    f"max_gpu_total_bytes, or reduce max_batch_size (the fixed "
+                    f"cost scales with batch size).")
             # Defensive: non-GPU budgets zero out the intercept above, so with a
             # positive budget this branch is currently unreachable for them. It
             # remains as a safety net guaranteeing that, should a non-GPU budget

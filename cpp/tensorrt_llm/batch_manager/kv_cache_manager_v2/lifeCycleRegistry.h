@@ -54,6 +54,14 @@ struct AttnLifeCycle
         return {start, std::max(start, windowStart)};
     }
 
+    // Attention appends blocks as a sequence advances, so its per-sequence slot
+    // count is not constant. Even a sliding window is only an upper bound: the
+    // count still grows until the window fills.
+    [[nodiscard]] bool hasConstStateSize() const noexcept
+    {
+        return false;
+    }
+
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
         return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks;
@@ -89,6 +97,13 @@ struct SsmLifeCycle
         return {BlockOrdinal{0}, BlockOrdinal{historyLength / tokensPerBlock}};
     }
 
+    // A recurrent state is exactly one slot per sequence, independent of
+    // capacity and history length.
+    [[nodiscard]] bool hasConstStateSize() const noexcept
+    {
+        return true;
+    }
+
     bool operator==(SsmLifeCycle const&) const noexcept
     {
         return true;
@@ -109,6 +124,13 @@ using LifeCycle = std::variant<AttnLifeCycle, SsmLifeCycle>;
 inline HalfOpenRange<BlockOrdinal> getStaleRange(LifeCycle const& lc, int historyLength, int tokensPerBlock)
 {
     return std::visit([&](auto const& v) { return v.getStaleRange(historyLength, tokensPerBlock); }, lc);
+}
+
+// Free function: whether the per-sequence slot count is invariant as a sequence
+// advances. Mirrors getStaleRange.
+inline bool hasConstStateSize(LifeCycle const& lc) noexcept
+{
+    return std::visit([](auto const& v) { return v.hasConstStateSize(); }, lc);
 }
 
 // Compute the range of blocks that should use scratch (shared) slots during SWA prefill.

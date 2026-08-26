@@ -244,9 +244,8 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
-        # Constraints are hot-level feasibility floors. Pools containing attention
-        # reserve the headroom enforced by _KVCache.resume, while pure SSM pools use
-        # their full capacity. Other levels need one structural slot per pool group.
+        # Constraints are hot-level feasibility floors. Other levels need only one
+        # structural slot per pool group.
         self._min_slots = self._compute_pool_group_min_slots_from_constraints(
             constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
@@ -315,13 +314,6 @@ class StorageManager:
 
     def get_pool_group_index(self, life_cycle: LifeCycleId) -> PoolGroupIndex:
         return self._life_cycle_grouping[life_cycle]
-
-    def pool_group_needs_resume_headroom(self, pool_group: PoolGroupIndex) -> bool:
-        """Return whether a pool group contains an attention life cycle."""
-        return any(
-            self.get_pool_group_index(life_cycle) == pool_group
-            for life_cycle, _ in self.life_cycles.attention_life_cycles()
-        )
 
     def new_gpu_slots(
         self,
@@ -500,6 +492,7 @@ class StorageManager:
                 )
                 fallen_held_cnt = len(held_pages[pg_idx])
                 if fallen_held_cnt > old_free_cnt + evictable_cnt:
+                    # Do we need to revert the eviction we did before? Maybe not.
                     raise OutOfPagesError(
                         "Too many held pages are being evicted to the last-level cache for group {pg_idx}"
                     )
@@ -539,7 +532,6 @@ class StorageManager:
                 fallen_pages[pg_idx].clear()
         else:
             assert all(len(g) == 0 for g in held_pages)
-            evicted_at_this_level = [list(pages) for pages in evicted]
             for pg_idx in typed_range(self.num_pool_groups):
                 old_free_cnt = storage.get_num_free_slots(pg_idx)
                 e = evicted[pg_idx]
@@ -553,26 +545,13 @@ class StorageManager:
                 if num_accepted > 0:
                     accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
                     del fallen_pages[pg_idx][-num_accepted:]
-            next_level_prepared = False
-            try:
-                self._prepare_free_slots(
-                    goals,
-                    CacheLevel(lvl_id + 1),
-                    fallen_pages,
-                    migration_recorder,
-                    drop_recorder,
-                )
-                next_level_prepared = True
-            finally:
-                if not next_level_prepared:
-                    # Restore pages removed from this level's eviction
-                    # controller that have not already migrated before
-                    # propagating the allocation failure.
-                    for pages in evicted_at_this_level:
-                        for page in reversed(pages):
-                            if page.cache_level == lvl_id and not page.scheduled_for_eviction:
-                                assert self.is_evictable(page)
-                                ctrl.schedule_for_eviction(page, evict_first=True)
+            self._prepare_free_slots(
+                goals,
+                CacheLevel(lvl_id + 1),
+                fallen_pages,
+                migration_recorder,
+                drop_recorder,
+            )
         assert all(len(f) == 0 for f in fallen_pages)
         # migrate pages
         for pg_idx in typed_range(self.num_pool_groups):
@@ -966,13 +945,7 @@ class StorageManager:
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for life_cycle in typed_range(self.num_life_cycles):
-                pool_group = self.get_pool_group_index(life_cycle)
-                utilization_limit = (
-                    max_util_for_resume
-                    if self.pool_group_needs_resume_headroom(pool_group)
-                    else 1.0
-                )
-                scaled_slots = math.ceil(slots[life_cycle] / utilization_limit)
+                scaled_slots = math.ceil(slots[life_cycle] / max_util_for_resume)
                 max_slots[life_cycle] = max(max_slots[life_cycle], scaled_slots)
         return max_slots
 
@@ -986,8 +959,7 @@ class StorageManager:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
         All returned elements are positive. Constraint-derived floors include
-        headroom only for pool groups whose utilization is limited by
-        ``_KVCache.resume``.
+        headroom for the utilization gate checked by ``_KVCache.resume``.
         """
         if not 0 < max_util_for_resume <= 1:
             raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
@@ -1003,10 +975,7 @@ class StorageManager:
                 batch, tokens_per_block, swa_scratch_reuse
             )
             for pg_idx in typed_range(self.num_pool_groups):
-                utilization_limit = (
-                    max_util_for_resume if self.pool_group_needs_resume_headroom(pg_idx) else 1.0
-                )
-                scaled_slots = math.ceil(slots[pg_idx] / utilization_limit)
+                scaled_slots = math.ceil(slots[pg_idx] / max_util_for_resume)
                 max_slots[pg_idx] = max(max_slots[pg_idx], scaled_slots)
         return max_slots
 
