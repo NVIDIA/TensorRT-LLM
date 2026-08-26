@@ -1321,7 +1321,7 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     ]
 
 
-def test_pp_loop_finalizes_pending_adp_dummy_after_queue_decision(monkeypatch):
+def test_pp_loop_finalizes_pending_adp_dummy_after_queue_decision(monkeypatch) -> None:
     class StopAfterFinalize(RuntimeError):
         pass
 
@@ -1337,7 +1337,7 @@ def test_pp_loop_finalizes_pending_adp_dummy_after_queue_decision(monkeypatch):
     executor._pp_rebalance_drain_iters = None
     executor._handle_disagg_cache_errors_synced = Mock()
     executor._fetch_and_activate_new_requests = Mock(return_value=[])
-    executor.should_stop_processing = False
+    executor.is_shutdown = False
     executor._handle_control_request = Mock()
     executor.kv_cache_transceiver = None
     executor._pad_attention_dp_dummy_request = Mock()
@@ -1864,6 +1864,28 @@ def _set_adp_resource_managers(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_kv_cache_manager,
     }
     stub.resource_manager.get_resource_manager.side_effect = managers.get
+
+
+def test_adp_dummy_kv_cleanup_attempts_draft_after_target_failure() -> None:
+    stub = _StubADPExecutor()
+    dummy_request = _make_adp_request(
+        _STATE_GENERATION_IN_PROGRESS,
+        request_id=ATTENTION_DP_DUMMY_REQUEST_ID,
+        is_dummy_request=True,
+    )
+    draft_kv_cache_manager = Mock()
+    _set_adp_resource_managers(
+        stub,
+        draft_kv_cache_manager=draft_kv_cache_manager,
+    )
+    target_error = RuntimeError("target KV cleanup failed")
+    stub.kv_cache_manager.free_resources.side_effect = target_error
+
+    with pytest.raises(RuntimeError, match="target KV cleanup failed"):
+        stub._free_adp_dummy_kv_resources(dummy_request)
+
+    stub.kv_cache_manager.free_resources.assert_called_once_with(dummy_request)
+    draft_kv_cache_manager.free_resources.assert_called_once_with(dummy_request)
 
 
 def test_adp_dummy_role_set_to_ctx_on_context_only_request():

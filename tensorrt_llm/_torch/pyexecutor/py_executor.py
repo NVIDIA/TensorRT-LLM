@@ -3411,11 +3411,13 @@ class PyExecutor:
 
     def _free_adp_dummy_kv_resources(self, dummy_request: LlmRequest) -> None:
         """Release target and independent draft KV allocated for an ADP dummy."""
-        self.kv_cache_manager.free_resources(dummy_request)
         draft_kv_cache_manager = self.resource_manager.get_resource_manager(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        if draft_kv_cache_manager is not None:
-            draft_kv_cache_manager.free_resources(dummy_request)
+        try:
+            self.kv_cache_manager.free_resources(dummy_request)
+        finally:
+            if draft_kv_cache_manager is not None:
+                draft_kv_cache_manager.free_resources(dummy_request)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.

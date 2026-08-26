@@ -277,3 +277,35 @@ def test_minimax_m3_horizontal_producer_ignores_out_of_range_cache_slot():
     assert index_q.shape == (1, num_kv_heads, 128)
     assert torch.equal(main_cache.view(torch.uint8), main_before.view(torch.uint8))
     assert torch.equal(index_cache.view(torch.uint8), index_before.view(torch.uint8))
+
+
+@pytest.mark.parametrize("invalid_weight_index", range(4))
+def test_minimax_m3_horizontal_producer_rejects_non_vector_norm_weight(
+    invalid_weight_index: int,
+) -> None:
+    num_heads_q = 8
+    num_kv_heads = 2
+    num_index_heads = num_kv_heads
+    total_heads = num_heads_q + 2 * num_kv_heads + num_index_heads + 1
+    packed = torch.randn(1, total_heads * 128, dtype=torch.bfloat16, device="cuda")
+    weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
+    weights[invalid_weight_index] = weights[invalid_weight_index].reshape(1, 128)
+    positions = torch.zeros(1, dtype=torch.int32, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    with pytest.raises(RuntimeError, match="norm weights must be one-dimensional"):
+        torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+            packed,
+            _main_cache(1, num_kv_heads),
+            _index_cache(1),
+            slots,
+            num_heads_q,
+            num_kv_heads,
+            num_index_heads,
+            128,
+            64,
+            1e-5,
+            *weights,
+            _rope_cache(1),
+            positions,
+        )

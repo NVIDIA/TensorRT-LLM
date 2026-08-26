@@ -8524,7 +8524,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
             questions = [
                 row["question"]
-                for row in load_dataset("gsm8k", "main", split="test")
+                for row in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
             ][:200]
             chat_prompts = [
                 llm.tokenizer.apply_chat_template([{

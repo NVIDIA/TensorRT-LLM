@@ -69,9 +69,9 @@ from .mamba_cache_manager import (BaseMambaCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
-from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+from .resource_manager import (BaseResourceManager, KVCacheCompressionManager,
+                               KVCacheManager, PeftCacheManager,
+                               ResourceManager, ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -1480,9 +1480,9 @@ class KvCacheCreator:
             return self._draft_config.pretrained_config.num_hidden_layers
         return get_num_spec_layers(self._speculative_config)
 
-    def _get_draft_kv_cache_manager_cls(self,
-                                        effective_draft_config: ModelConfig,
-                                        draft_kv_config: KvCacheConfig):
+    def _get_draft_kv_cache_manager_cls(
+            self, effective_draft_config: ModelConfig,
+            draft_kv_config: KvCacheConfig) -> type[BaseResourceManager]:
         """Resolve the draft manager, preserving a target V2 lifecycle."""
         draft_cls = get_kv_cache_manager_cls(
             effective_draft_config,
