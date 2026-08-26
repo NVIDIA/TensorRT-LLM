@@ -769,36 +769,13 @@ def _prepare_transfer_extra_body(
     *,
     extra_body: Optional[dict[str, Any]],
     input_reference: Optional[str],
-    transfer_hint: Optional[str],
-    control_reference: Optional[str],
-    transfer_controls: Optional[dict[str, Optional[str]]] = None,
+    transfer_controls: Optional[dict[str, Optional[str]]],
 ) -> Optional[dict[str, Any]]:
     """Add one or more Transfer hints without carrying control media in the CLI argv."""
-    if transfer_controls is not None and (
-        transfer_hint is not None or control_reference is not None
-    ):
-        raise ValueError(
-            "--transfer-controls cannot be combined with --transfer-hint or --control-reference"
-        )
-    if transfer_hint is None:
-        if control_reference is not None:
-            raise ValueError("--control-reference requires --transfer-hint")
-        if transfer_controls is None:
-            return extra_body
-        controls = transfer_controls
-    else:
-        if transfer_hint not in TRANSFER_HINTS:
-            raise ValueError(
-                f"--transfer-hint must be one of {sorted(TRANSFER_HINTS)}, got {transfer_hint!r}"
-            )
-        if control_reference is None and transfer_hint not in AUTO_TRANSFER_HINTS:
-            raise ValueError(
-                f"--transfer-hint={transfer_hint} requires --control-reference; only "
-                "edge and blur can derive a control from --input-reference"
-            )
-        controls = {transfer_hint: control_reference}
+    if transfer_controls is None:
+        return extra_body
 
-    derived_hints = [hint for hint, path in controls.items() if path is None]
+    derived_hints = [hint for hint, path in transfer_controls.items() if path is None]
     if derived_hints and input_reference is None:
         formatted_hints = ", ".join(sorted(derived_hints))
         raise ValueError(
@@ -807,7 +784,7 @@ def _prepare_transfer_extra_body(
 
     body = dict(extra_body or {})
     extra_params = dict(body.get("extra_params") or {})
-    for hint, path in controls.items():
+    for hint, path in transfer_controls.items():
         if hint in extra_params:
             raise ValueError(
                 f"Transfer hint {hint!r} conflicts with --extra-body.extra_params.{hint}"
@@ -828,7 +805,6 @@ def _validate_request_configuration(
     input_reference: Optional[str],
     extra_body: Optional[dict[str, Any]],
     require_audio: bool,
-    transfer_hint: Optional[str] = None,
     transfer_controls: Optional[dict[str, Optional[str]]] = None,
 ) -> None:
     """Reject incompatible client request combinations before benchmarking."""
@@ -839,7 +815,7 @@ def _validate_request_configuration(
             "Specify conditioning media with --input-reference, not both "
             "--input-reference and --extra-body.input_reference"
         )
-    if transfer_hint is not None or transfer_controls is not None:
+    if transfer_controls is not None:
         if backend != "openai-videos":
             raise ValueError("Transfer controls are supported only by the openai-videos backend")
         if "cosmos3-edge" in model_id.lower():
@@ -927,13 +903,10 @@ def main(args: argparse.Namespace):
 
     extra_body = _parse_extra_body(args.extra_body)
     input_reference = _validate_input_reference(args.input_reference)
-    control_reference = _validate_input_reference(args.control_reference)
     transfer_controls = _parse_transfer_controls(args.transfer_controls)
     extra_body = _prepare_transfer_extra_body(
         extra_body=extra_body,
         input_reference=input_reference,
-        transfer_hint=args.transfer_hint,
-        control_reference=control_reference,
         transfer_controls=transfer_controls,
     )
     _validate_request_configuration(
@@ -942,7 +915,6 @@ def main(args: argparse.Namespace):
         input_reference=input_reference,
         extra_body=extra_body,
         require_audio=args.require_audio,
-        transfer_hint=args.transfer_hint,
         transfer_controls=transfer_controls,
     )
 
@@ -986,10 +958,6 @@ def main(args: argparse.Namespace):
         result_json["num_prompts"] = args.num_prompts
         if input_reference is not None:
             result_json["input_reference"] = Path(input_reference).name
-        if args.transfer_hint is not None:
-            result_json["transfer_hint"] = args.transfer_hint
-        if control_reference is not None:
-            result_json["control_reference"] = Path(control_reference).name
         if transfer_controls is not None:
             result_json["transfer_controls"] = {
                 hint: "input_reference" if path is None else Path(path).name
@@ -1151,29 +1119,12 @@ if __name__ == "__main__":
         help="Image or video conditioning file for multipart video requests.",
     )
     gen_group.add_argument(
-        "--transfer-hint",
-        type=str,
-        choices=sorted(TRANSFER_HINTS),
-        default=None,
-        help=(
-            "Cosmos3 Transfer control hint. Edge/blur can derive control from "
-            "--input-reference; all hints accept --control-reference."
-        ),
-    )
-    gen_group.add_argument(
-        "--control-reference",
-        type=str,
-        default=None,
-        help="Precomputed MP4/AVI Transfer control clip, encoded into extra_params client-side.",
-    )
-    gen_group.add_argument(
         "--transfer-controls",
         type=str,
         default=None,
         help=(
-            "JSON hint-to-control mapping for multi-control Transfer. Values are true for "
-            "edge/blur derived from --input-reference, or client-local MP4/AVI paths. Cannot "
-            "be combined with --transfer-hint or --control-reference."
+            "JSON hint-to-control mapping for one or more Transfer controls. Values are true for "
+            "edge/blur derived from --input-reference, or client-local MP4/AVI paths."
         ),
     )
     gen_group.add_argument(
