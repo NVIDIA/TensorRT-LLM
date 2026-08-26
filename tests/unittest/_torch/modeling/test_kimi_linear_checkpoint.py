@@ -11,6 +11,7 @@ pytest.importorskip("fla")
 
 from tensorrt_llm._torch.models.modeling_kimi_linear import (  # noqa: E402
     KimiLinearForCausalLM,
+    _helix_cp_v_b_shard,
     _shard_head_major_param,
 )
 
@@ -159,3 +160,25 @@ def test_shard_down_proj_non_divisible_raises():
             kda_tp_rank=0,
             model_tp_rank=0,
         )
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1, 3])
+def test_helix_cp_v_b_shard_slices_this_rank(cp_rank):
+    # Helix cp_size=4: v_b_proj keeps only this rank's 1/cp head chunk, while
+    # kv_b_proj / k_b_proj_trans (built from the un-sliced v_weight) keep every
+    # tp-local head. This slice only fires when cp_size > 1, so no cp_size=1
+    # smoke test exercises it.
+    num_heads_tp, num_heads_tp_cp = 8, 2  # cp_size == 8 / 2 == 4
+    v_weight = _distinct(num_heads_tp, 3, 5)  # [heads, v_head_dim, kv_lora_rank]
+    out = _helix_cp_v_b_shard(v_weight, num_heads_tp_cp=num_heads_tp_cp, cp_rank=cp_rank)
+    expected = v_weight[cp_rank * num_heads_tp_cp : (cp_rank + 1) * num_heads_tp_cp]
+    assert out.shape[0] == num_heads_tp_cp
+    torch.testing.assert_close(out, expected)
+
+
+def test_helix_cp_v_b_shard_noop_without_cp():
+    # cp_size == 1: num_heads_tp_cp equals the full tp-local head count, so the
+    # tensor is returned untouched (no accidental slicing).
+    v_weight = _distinct(8, 3, 5)
+    out = _helix_cp_v_b_shard(v_weight, num_heads_tp_cp=8, cp_rank=0)
+    assert out is v_weight

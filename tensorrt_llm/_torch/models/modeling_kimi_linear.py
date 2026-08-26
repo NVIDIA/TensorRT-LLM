@@ -488,6 +488,27 @@ def _shard_head_major_param(
     return src
 
 
+def _helix_cp_v_b_shard(
+    v_weight: torch.Tensor,
+    *,
+    num_heads_tp_cp: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Select this CP rank's ``v_b_proj`` head chunk from a tp-local KV-B split.
+
+    Under Helix context-parallel (cp_size > 1) ``v_b_proj`` holds only this
+    rank's 1/cp post-all-to-all head chunk, while ``kv_b_proj`` and
+    ``k_b_proj_trans`` keep every tp-local head. When cp_size == 1
+    (``num_heads_tp_cp`` equals the full tp-local head count) the tensor is
+    returned unchanged. ``v_weight`` is ``[num_heads_tp, v_head_dim,
+    kv_lora_rank]``; only its leading head axis is sliced.
+    """
+    if num_heads_tp_cp != v_weight.shape[0]:
+        lo = cp_rank * num_heads_tp_cp
+        v_weight = v_weight[lo : lo + num_heads_tp_cp]
+    return v_weight
+
+
 # ---------------------------------------------------------------------------
 # FP8 block-scale weight read for the replicated MoE-layer MLP projections.
 # ---------------------------------------------------------------------------
@@ -2317,12 +2338,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     ).to(param.dtype)
                 )
                 mla_mixer.k_b_proj_trans.data.copy_(k_weight.transpose(1, 2))
-                # Helix: v_b_proj holds this rank's 1/cp post-all-to-all
-                # head chunk; kv_b/k_b_proj_trans keep every tp-local head.
-                h_cp = mla_mixer.num_heads_tp_cp
-                if h_cp != h:
-                    lo = mla_mixer.mapping.cp_rank * h_cp
-                    v_weight = v_weight[lo : lo + h_cp]
+                v_weight = _helix_cp_v_b_shard(
+                    v_weight,
+                    num_heads_tp_cp=mla_mixer.num_heads_tp_cp,
+                    cp_rank=mla_mixer.mapping.cp_rank,
+                )
                 mla_mixer.v_b_proj.data.copy_(v_weight)
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
