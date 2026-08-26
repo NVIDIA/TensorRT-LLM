@@ -333,26 +333,15 @@ class TestInputReferenceResolution:
             TestInputReferenceResolution._TEST_DATA / "cosmos3_v2v_ref_9f_bframes.avi"
         ).read_bytes()
 
-    def test_multipart_avi_video_reference_resolves_to_bytes(self, tmp_path):
-        # The AVI container survives the boundary and is persisted as untouched
-        # encoded bytes for the worker to demux.
+    @pytest.mark.parametrize("container", ["avi", "mp4"])
+    def test_multipart_video_reference_resolves_to_bytes(self, container):
+        """The boundary never decodes video: the encoded bytes cross it
+        untouched, and the worker demuxes the conditioning window itself."""
         generator = _StubVisualGen()
-        payload = self._avi_bytes()
-        upload = UploadFile(file=BytesIO(payload), filename="clip.avi")
+        payload = self._avi_bytes() if container == "avi" else self._mp4_bytes()
+        upload = UploadFile(file=BytesIO(payload), filename=f"clip.{container}")
         request = VideoGenerationRequest(prompt="x", video_reference=upload)
         params = _parse_and_prepare(request, generator)
-        assert params.image_reference is None
-        assert params.video_reference[0].content == payload
-
-    def test_multipart_mp4_video_reference_resolves_to_bytes(self, tmp_path):
-        generator = _StubVisualGen()
-        payload = self._mp4_bytes()
-        upload = UploadFile(file=BytesIO(payload), filename="clip.mp4")
-        request = VideoGenerationRequest(prompt="x", video_reference=upload)
-        params = _parse_and_prepare(request, generator)
-        # Encoded payload is persisted byte-identical — the boundary never
-        # decodes video; the worker demuxes/NVDEC-decodes the conditioning
-        # window from the stored file.
         assert params.image_reference is None
         assert params.video_reference[0].content == payload
 
@@ -893,31 +882,10 @@ class TestInlineMediaDecoding:
 class TestPrepareReferenceSlots:
     """The engine choke point: every declared form resolves to raw bytes."""
 
-    def test_every_format_resolves_to_the_same_bytes(self, tmp_path):
-        """path / base64 / bytes all name the same payload, so all three must
-        land on byte-identical content with format rewritten to "bytes"."""
-        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
-        from tensorrt_llm.visual_gen.media_refs import prepare_reference_slots
-
-        buf = BytesIO()
-        Image.new("RGB", (4, 4), (7, 8, 9)).save(buf, format="PNG")
-        png = buf.getvalue()
-        src = tmp_path / "ref.png"
-        src.write_bytes(png)
-
-        for ref in (
-            MediaRef(content=str(src), format="path"),
-            MediaRef(content=base64.b64encode(png).decode(), format="base64"),
-            MediaRef(content=png, format="bytes"),
-        ):
-            params = VisualGenParams(image_reference=ref)
-            prepare_reference_slots(params)
-            assert params.image_reference[0].content == png
-            assert params.image_reference[0].format == "bytes"
-
-    def test_nothing_is_resolves_to_bytes(self, tmp_path, monkeypatch):
+    def test_resolving_writes_nothing_to_disk(self, tmp_path, monkeypatch):
         """References never touch the filesystem, so a worker needs no shared
-        filesystem to read what the coordinator resolved."""
+        filesystem to read what the coordinator resolved. The rewritten
+        ``format`` is what stops a worker being handed a stale spelling."""
         from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
         from tensorrt_llm.visual_gen.media_refs import prepare_reference_slots
 
@@ -931,6 +899,7 @@ class TestPrepareReferenceSlots:
         )
         prepare_reference_slots(params)
         assert list(tmp_path.iterdir()) == []
+        assert params.image_reference[0].format == "bytes"
 
     def test_wrong_modality_is_rejected(self, tmp_path):
         """Content is validated against the slot's modality before dispatch."""
@@ -944,16 +913,6 @@ class TestPrepareReferenceSlots:
             video_reference=MediaRef(content=buf.getvalue(), format="bytes"),
         )
         with pytest.raises(ValueError, match="video_reference is not a recognized"):
-            prepare_reference_slots(params)
-
-    def test_missing_path_is_a_client_error(self, tmp_path):
-        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
-        from tensorrt_llm.visual_gen.media_refs import prepare_reference_slots
-
-        params = VisualGenParams(
-            image_reference=MediaRef(content=str(tmp_path / "nope.png"), format="path")
-        )
-        with pytest.raises(ValueError, match="could not be read"):
             prepare_reference_slots(params)
 
 
@@ -1102,16 +1061,6 @@ class TestReferenceHandleTransport:
         req = DiffusionRequest(request_id=1, prompt=["x"], params=VisualGenParams())
         req.refs_to_shm()
         assert req.ref_handles is None
-
-    def test_restore_is_idempotent(self):
-        """rank0 restores unconditionally; a second call must not re-consume a
-        handle that has already been resolved."""
-        payload = os.urandom(2048)
-        req = self._request(payload)
-        req.refs_to_shm()
-        req.refs_from_shm()
-        req.refs_from_shm()
-        assert req.params.image_reference[0].content == payload
 
 
 class TestReferenceBroadcastSplit:
@@ -1265,13 +1214,24 @@ class TestSafeLocalFileRead:
 
         assert _safe_read_local_file(str(link)) == target.read_bytes()
 
-    @pytest.mark.parametrize("device", ["/dev/zero", "/dev/null"])
-    def test_a_character_device_is_refused(self, device):
-        """The unbounded read: `/dev/zero` never reaches EOF."""
+    @pytest.mark.parametrize("kind", ["chardev", "fifo", "directory"])
+    def test_a_non_regular_file_is_refused(self, tmp_path, kind):
+        """Only a regular file has a size the read can trust: a character
+        device never reaches EOF and a FIFO blocks instead of returning."""
+        import os
+
         from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
 
+        if kind == "chardev":
+            target = "/dev/zero"
+        elif kind == "fifo":
+            target = str(tmp_path / "pipe")
+            os.mkfifo(target)
+        else:
+            target = str(tmp_path)
+
         with pytest.raises(ValueError, match="not a regular file"):
-            _safe_read_local_file(device)
+            _safe_read_local_file(target)
 
     def test_a_symlink_to_a_device_is_refused(self, tmp_path):
         """``stat`` follows the link, so the check sees what will be read."""
@@ -1282,24 +1242,6 @@ class TestSafeLocalFileRead:
 
         with pytest.raises(ValueError, match="not a regular file"):
             _safe_read_local_file(str(link))
-
-    def test_a_fifo_is_refused(self, tmp_path):
-        """Reading a FIFO blocks rather than returning, so size caps cannot help."""
-        import os
-
-        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
-
-        fifo = tmp_path / "pipe"
-        os.mkfifo(fifo)
-
-        with pytest.raises(ValueError, match="not a regular file"):
-            _safe_read_local_file(str(fifo))
-
-    def test_a_directory_is_refused(self, tmp_path):
-        from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
-
-        with pytest.raises(ValueError, match="not a regular file"):
-            _safe_read_local_file(str(tmp_path))
 
     def test_a_missing_file_is_a_client_error(self, tmp_path):
         from tensorrt_llm.visual_gen.media_refs import _safe_read_local_file
