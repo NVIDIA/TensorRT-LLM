@@ -31,3 +31,6 @@ TestLlama3_1_8BInstruct::test_suffix_automaton:
 TestLlama3_1_8BInstruct::test_draft_target_dynamic_draft_len:
   ref_al: 3.243380267550134
   min_al: 3.0812112541726275
+TestQwen3_5_4B::test_dflash:
+  ref_al: 3.96417002949639
+  min_al: 3.7659615280215704
