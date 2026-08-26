@@ -380,6 +380,7 @@ unittest/auto_deploy/singlegpu/models/test_glm4_moe_modeling.py::test_glm4_moe_d
 unittest/auto_deploy/singlegpu/models/test_glm4_moe_modeling.py::test_glm4_moe_moe_equivalence[dtype0-1-8] SKIP (https://nvbugs/6566730)
 unittest/auto_deploy/singlegpu/shim/test_ad_executor_swa_eviction.py SKIP (https://nvbugs/6606123)
 unittest/auto_deploy/singlegpu/shim/test_cached_sequence_interface.py::test_initialize_resources_mixed_creates_mamba_hybrid_cache_manager SKIP (https://nvbugs/6606123)
+unittest/auto_deploy/standalone/test_standalone_package.py::TestStandalonePackage::test_run_unit_tests SKIP (https://nvbugs/6670106)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_gpu_tensor SKIP (https://nvbugs/6517836)
 unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_write_transfer_multiple_chunks SKIP (https://nvbugs/6517836)
