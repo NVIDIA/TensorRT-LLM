@@ -86,7 +86,7 @@ CLASSIFY_RC=$?
 if [ "${CLASSIFY_RC}" -ne 0 ]; then
     echo "WARNING: run_pytest_with_log.sh: classify_timeout.py exited with code" \
          "${CLASSIFY_RC}; timed-out tests in this invocation may be reported as" \
-         "'unknown' instead of 'pytest_timeout'. Log: ${LOG}" >&2
+         "'terminated_unexpectedly' instead of 'pytest_timeout'. Log: ${LOG}" >&2
 fi
 
 cleanup_log

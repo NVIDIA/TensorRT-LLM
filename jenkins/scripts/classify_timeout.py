@@ -42,7 +42,6 @@ import json
 import os
 import re
 import sys
-import time
 
 # Regex patterns for banner line detection.
 # The first banner contains the nodeid; the second is a plain separator.
@@ -166,17 +165,6 @@ def _append_records(out_path, records):
         print(f"classify_timeout: WARNING: could not write {out_path}: {exc}", file=sys.stderr)
 
 
-def _append_unfinished_end_times(out_path, unfinished):
-    """Record the wall-clock end time for tests left unfinished by pytest."""
-    if not out_path:
-        return
-    end_time = time.time()
-    _append_records(
-        out_path,
-        [{"type": "end", "nodeid": nodeid, "end_time": end_time} for nodeid in sorted(unfinished)],
-    )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Classify pytest-timeout kills from a captured pytest output log."
@@ -197,7 +185,6 @@ def main() -> None:
         # Nothing to match against; exit cleanly without touching --out.
         return
 
-    _append_unfinished_end_times(args.out, unfinished)
     records = _scan_log(args.log, unfinished)
     if not records:
         return

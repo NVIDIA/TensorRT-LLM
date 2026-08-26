@@ -101,7 +101,11 @@ def load_timeout_map(paths, expected_nodeids=None):
                         continue
                     try:
                         rec = json.loads(raw)
-                        if isinstance(rec, dict) and rec.get("type") in {"start", "end"}:
+                        if isinstance(rec, dict) and rec.get("type") in {
+                            "start",
+                            "end",
+                            "timeout_config",
+                        }:
                             continue
                         if (
                             not isinstance(rec, dict)
@@ -134,20 +138,14 @@ def load_timeout_map(paths, expected_nodeids=None):
     return timeout_map
 
 
-def load_unfinished_test_data(paths, expected_nodeids=None):
-    """Load ``{nodeid: {start_time, end_time, timeout}}`` records.
-
-    The first start/end pair wins, preserving the invocation in which a test
-    actually terminated when a later invocation is run in the same stage.
-    Invalid records are skipped rather than making timeout-report generation
-    fail.
-    """
+def load_test_timeouts(paths, expected_nodeids=None):
+    """Load the effective pytest timeout recorded for each test nodeid."""
     if not paths:
         return {}
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
 
-    test_data = {}
+    test_timeouts = {}
     for path in sorted(map(os.fspath, paths)):
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
@@ -162,27 +160,15 @@ def load_unfinished_test_data(paths, expected_nodeids=None):
                         ):
                             continue
                         nodeid = record.get("nodeid") if isinstance(record, dict) else None
-                        start_time = record.get("start_time") if isinstance(record, dict) else None
-                        end_time = record.get("end_time") if isinstance(record, dict) else None
                         timeout = record.get("timeout") if isinstance(record, dict) else None
                         if not isinstance(nodeid, str):
                             raise ValueError("expected nodeid string")
-                        if start_time is not None and not isinstance(start_time, (int, float)):
-                            raise ValueError("expected start_time to be numeric or null")
-                        if end_time is not None and not isinstance(end_time, (int, float)):
-                            raise ValueError("expected end_time to be numeric or null")
                         if timeout is not None and not isinstance(timeout, (int, float)):
                             raise ValueError("expected timeout to be numeric or null")
-                        if start_time is None and end_time is None:
-                            raise ValueError("expected numeric start_time or end_time")
-                        if expected_nodeids is None or nodeid in expected_nodeids:
-                            data = test_data.setdefault(nodeid, {})
-                            if start_time is not None:
-                                data.setdefault("start_time", float(start_time))
-                            if end_time is not None:
-                                data.setdefault("end_time", float(end_time))
-                            if timeout is not None:
-                                data.setdefault("timeout", float(timeout))
+                        if timeout is not None and (
+                            expected_nodeids is None or nodeid in expected_nodeids
+                        ):
+                            test_timeouts.setdefault(nodeid, float(timeout))
                     except (json.JSONDecodeError, ValueError) as exc:
                         print(
                             f"WARNING: generate_timeout_xml: skipping corrupt line "
@@ -194,22 +180,15 @@ def load_unfinished_test_data(paths, expected_nodeids=None):
                 f"WARNING: generate_timeout_xml: cannot read {path}: {exc}",
                 file=sys.stderr,
             )
-    return test_data
+    return test_timeouts
 
 
-def test_duration(test, timeout_map, unfinished_test_data):
+def test_duration(test, timeout_map, test_timeouts):
     """Return the best available JUnit duration for an interrupted test."""
-    data = unfinished_test_data.get(test, {})
     if test in timeout_map:
-        timeout = data.get("timeout")
+        timeout = test_timeouts.get(test)
         if timeout is not None and timeout > 0:
             return timeout
-        return _FALLBACK_TEST_TIME_SECONDS
-
-    start_time = data.get("start_time")
-    end_time = data.get("end_time")
-    if start_time is not None and end_time is not None:
-        return max(0.0, end_time - start_time)
     return _FALLBACK_TEST_TIME_SECONDS
 
 
@@ -272,8 +251,7 @@ def generate_timeout_xml(
     testList,
     outputFilePath,
     timeout_map=None,
-    unfinished_test_data=None,
-    now=None,
+    test_timeouts=None,
 ):
     """Generate JUnit XML report for timed-out tests.
 
@@ -285,28 +263,28 @@ def generate_timeout_xml(
         timeout_map: Optional mapping of ``{nodeid: snippet}`` produced by
             ``load_timeout_map()``.  A nodeid present in this map is classified
             as ``pytest_timeout`` and its snippet is embedded in
-            ``<system-out>``.  All other nodeids are classified as ``unknown``.
-            When *None* or empty every test falls back to ``unknown``.
-        unfinished_test_data: Optional mapping containing the test start time,
-            end time, and effective pytest timeout recorded during execution.
-        now: Retained for backward compatibility with callers that inject a
-            deterministic clock; timings come from the recorded metadata.
+            ``<system-out>``. All other nodeids are classified as
+            ``terminated_unexpectedly``. When *None* or empty every test falls
+            back to ``terminated_unexpectedly``.
+        test_timeouts: Optional mapping containing the effective pytest timeout
+            recorded for each nodeid.
     """
     if timeout_map is None:
         timeout_map = {}
-    if unfinished_test_data is None:
-        unfinished_test_data = {}
+    if test_timeouts is None:
+        test_timeouts = {}
     num_tests = len(testList)
-    durations = {test: test_duration(test, timeout_map, unfinished_test_data) for test in testList}
+    durations = {test: test_duration(test, timeout_map, test_timeouts) for test in testList}
     timeout_count = sum(test in timeout_map for test in testList)
-    unknown_count = num_tests - timeout_count
+    terminated_unexpectedly_count = num_tests - timeout_count
     # Escape stage_name for XML safety
     stage_name_escaped = escape(stage_name, quote=True)
     xmlContent = (
         f'<?xml version="1.0" encoding="UTF-8"?><testsuites>\n'
         f'        <testsuite name="{stage_name_escaped}" errors="{num_tests}" '
         f'tests="{num_tests}" '
-        f'unfinished_test="{num_tests}" timeout="{timeout_count}" unknown="{unknown_count}" '
+        f'unfinished_test="{num_tests}" timeout="{timeout_count}" '
+        f'terminated_unexpectedly="{terminated_unexpectedly_count}" '
         f'time="{sum(durations.values()):.2f}">\n'
     )
 
@@ -326,8 +304,11 @@ def generate_timeout_xml(
                 f"        <system-out>{snippet_escaped}</system-out>\n"
             )
         else:
-            # Unexpected termination (OOM, node crash, etc.) or unknown cause.
-            error_block = '        <error message="unknown">Test terminated unexpectedly.</error>'
+            # Unexpected termination without a confirmed pytest-timeout banner.
+            error_block = (
+                '        <error message="terminated_unexpectedly">'
+                "Test terminated unexpectedly.</error>"
+            )
 
         xmlContent += (
             f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
@@ -389,18 +370,19 @@ def main():
         return
 
     timeout_map = load_timeout_map(args.timeout_data_file, set(timeoutTests))
-    unfinished_test_data = load_unfinished_test_data(args.timeout_data_file, set(timeoutTests))
+    test_timeouts = load_test_timeouts(args.timeout_data_file, set(timeoutTests))
     classified_count = sum(test in timeout_map for test in timeoutTests)
     print(
         f"Timeout classification summary for {stageName}: {len(timeoutTests)} unfinished, "
-        f"{classified_count} pytest_timeout, {len(timeoutTests) - classified_count} unknown"
+        f"{classified_count} pytest_timeout, "
+        f"{len(timeoutTests) - classified_count} terminated_unexpectedly"
     )
     generate_timeout_xml(
         stageName,
         timeoutTests,
         outputFilePath,
         timeout_map,
-        unfinished_test_data,
+        test_timeouts,
     )
 
 

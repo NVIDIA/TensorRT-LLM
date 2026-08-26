@@ -4326,10 +4326,6 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             "--periodic-junit-xmlpath ${xmlFile}",
             "--reruns ${times - 1}"
         ]
-        // periodic_junit.py stores unfinished_test.txt next to the XML path.
-        // Start each attempt with a fresh file so a successful later rerun
-        // clears any stale interruption record from an earlier attempt.
-        sh "rm -f '${rerunDir}/unfinished_test.txt' || true"
         try {
             runPytestWithLog(stageName, newTestCmdLine, times,
                 "${rerunDir}/unfinished_test.txt",

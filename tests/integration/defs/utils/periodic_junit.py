@@ -471,9 +471,8 @@ class PeriodicJUnitXML:
                     with open(timeout_data_path, "a", encoding="utf-8") as f:
                         f.write(
                             json.dumps({
-                                "type": "start",
+                                "type": "timeout_config",
                                 "nodeid": item.nodeid,
-                                "start_time": time.time(),
                                 "timeout": self._effective_timeout(item),
                             }) + "\n")
             except (AttributeError, OSError, TypeError, ValueError) as exc:
