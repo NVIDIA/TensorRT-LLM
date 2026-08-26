@@ -196,16 +196,16 @@ def test_qwen3_same_delta_preamble_dropped() -> None:
 
 
 def test_qwen3_multi_delta_preamble_already_emitted() -> None:
-    """Content emitted before a later first <think> is not retracted.
+    """Content emitted before a later first <think> is preserved.
 
     Live streaming cannot unsend tokens; parse() would still drop that
-    preamble. Documented intentional stream/non-stream difference.
+    preamble. Keep the remainder before the tag to avoid losing visible text.
     """
     parser = ReasoningParserFactory.create_reasoning_parser("qwen3")
     r1 = parser.parse_delta("Sure.")
     assert r1.content == "Sure."
-    r2 = parser.parse_delta(f"{R1_START}math{R1_END}4")
-    assert r2.content == "4"
+    r2 = parser.parse_delta(f" More{R1_START}math{R1_END}4")
+    assert r2.content == " More4"
     assert r2.reasoning_content == "math"
 
 

@@ -224,10 +224,10 @@ class DeepSeekR1Parser(BaseReasoningParser):
     * Only a trailing suffix that is still a proper prefix of ``<think>`` or
       ``</think>`` is buffered (bounded by tag length). Tag-free model output
       streams token-by-token; the buffer cannot grow without bound.
-    * Already-emitted text cannot be retracted. A multi-delta preamble before
-      the first ``<think>`` may appear as ``content`` even though ``parse()``
-      would drop it. Unreleased (still-buffered) text before the first open
-      is dropped so same-delta cases match ``parse()`` when possible.
+    * Already-emitted text cannot be retracted. Before any content is emitted,
+      text before the first ``<think>`` is dropped so same-delta cases match
+      ``parse()`` when possible. Once content has been emitted, a later prefix
+      before the first open is kept to avoid losing visible text mid-stream.
     * After the first block, further ``<think>`` / ``</think>`` pairs stream as
       interleaved reasoning; text before a later open is kept as content.
       ``parse()`` only partitions once, so multi-block stream totals can
@@ -247,6 +247,8 @@ class DeepSeekR1Parser(BaseReasoningParser):
         # reasoning_at_start). Used to drop only the first still-buffered
         # preamble; later opens keep their content prefix (interleaved).
         self._entered_reasoning = self.reasoning_at_start
+        # Once content is visible to the client, later text cannot be dropped.
+        self._emitted_content = False
         self._buffer = ""
 
     @staticmethod
@@ -328,9 +330,10 @@ class DeepSeekR1Parser(BaseReasoningParser):
                         out_content += text
                     break
 
-                # Start tag found. First open: drop still-buffered preamble.
+                # First open: drop the prefix only if no content was emitted.
                 # Later opens (interleaved): keep the prefix as content.
-                if begin_idx > 0 and self._entered_reasoning:
+                if begin_idx > 0 and (self._entered_reasoning
+                                      or self._emitted_content):
                     out_content += text[:begin_idx]
                 self.in_reasoning = True
                 self._entered_reasoning = True
@@ -352,6 +355,8 @@ class DeepSeekR1Parser(BaseReasoningParser):
             text = text[end_idx + len(self.reasoning_end):]
             # Remainder may be content or another <think> block; loop again.
 
+        if out_content:
+            self._emitted_content = True
         return ReasoningParserResult(content=out_content,
                                      reasoning_content=out_reasoning)
 
