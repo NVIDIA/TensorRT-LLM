@@ -111,7 +111,13 @@ def is_power():
 # TODO(#17993): cherry-picked from PR #17993 to unblock this PR's CI (distro->'na'
 # empty-render bug). Drop this and take main's version when resolving the rebase
 # conflict after #17993 lands.
-def get_linux_distribution():
+def get_linux_distribution() -> tuple[str, str, str]:
+    """Return Linux distribution ID, version, and codename.
+
+    Returns:
+        A tuple containing the distribution ID, version, and codename.
+        Returns ``("na", "na", "na")`` when metadata is unavailable.
+    """
     try:
         import distro
         return (distro.id(), distro.version(), distro.codename())
@@ -134,7 +140,7 @@ def get_linux_distribution():
     except OSError:
         logger.error(
             f"Cannot determine the Linux distribution ({distro_reason}; "
-            "/etc/os-release also unreadable); reporting ('na', 'na', 'na'). "
+            "os-release metadata unavailable); reporting ('na', 'na', 'na'). "
             "Test-db conditions matching linux_distribution_name (e.g. ubuntu*) "
             "will select ZERO tests and the rendered test list will be empty.")
         return ("na", "na", "na")

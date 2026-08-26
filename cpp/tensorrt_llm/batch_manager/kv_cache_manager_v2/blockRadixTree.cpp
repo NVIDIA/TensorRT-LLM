@@ -498,44 +498,52 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     return detachedBlocks;
 }
 
-// ---------------------------------------------------------------------------
-// addOrGetExistingBlock
-// ---------------------------------------------------------------------------
-
-SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> tokens, bool knownNoDigest, bool* isNew)
+SharedPtr<Block> getExistingBlock(NodeBase* prev, BlockKey const& key, TokenIdExt const* tokens, size_t numTokens)
 {
     TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
 
-    // Prev must be a full block if it is a Block (mirrors Python: "prev must be a full block").
-    if (prev->type() == NodeBase::Type::kBLOCK)
-    {
-        TLLM_CHECK_DEBUG_WITH_INFO(static_cast<Block*>(prev)->isFull(), "prev must be a full block");
-    }
+    // Only a full block may be a parent; that is also why returning a covering sibling
+    // below is safe, since only partial blocks can be covered and never become parents.
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        prev->type() != NodeBase::Type::kBLOCK || static_cast<Block*>(prev)->isFull(), "prev must be a full block");
 
     auto& prevNext = prev->next;
-    int const tpb = prev->tokensPerBlock();
-    BlockKey newKey = Block::makeKey(prev->key, tokens.data(), tokens.size(), knownNoDigest);
 
-    // Exact match: return existing block (not new — mirrors Python's UselessBlockError path).
-    auto it = prevNext.find(newKey);
+    // Exact match. On the re-attach path this is another request having re-committed the
+    // same prefix while we were detached; its key is identical, so the chain stays valid.
+    auto it = prevNext.find(key);
     if (it != prevNext.end())
     {
-        if (isNew)
-            *isNew = false;
         return it->second;
     }
 
-    // Useless check: is this block's token prefix covered by a sibling?
-    // Mirrors Python's UselessBlockError — throw with the sibling block.
-    if (static_cast<int>(tokens.size()) < tpb)
+    // Covered by a longer sibling: reuse it rather than insert a redundant shorter node.
+    // A short page on a longer block is well defined -- CommittedPage::numTokensInBlock
+    // records the span and canReplacePage() will not supersede a wider page.
+    if (static_cast<int>(numTokens) < prev->tokensPerBlock())
     {
         for (auto const& [k, sibling] : prevNext)
         {
-            if (sibling->tokens.size() >= tokens.size()
-                && isPrefix(tokens.data(), tokens.size(), sibling->tokens.data(), sibling->tokens.size()))
-                throw UselessBlockError(sibling);
+            if (sibling->tokens.size() >= numTokens
+                && isPrefix(tokens, numTokens, sibling->tokens.data(), sibling->tokens.size()))
+            {
+                return sibling;
+            }
         }
     }
+
+    return nullptr;
+}
+
+void attachBlock(NodeBase* prev, SharedPtr<Block> const& block)
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
+    TLLM_CHECK_DEBUG(block);
+    // Precondition: nothing in the tree supersedes this block, so we cannot shadow a sibling.
+    TLLM_CHECK_DEBUG(getExistingBlock(prev, block->key, block->tokens.data(), block->tokens.size()) == nullptr);
+
+    auto& prevNext = prev->next;
+    auto const& tokens = block->tokens;
 
     // A later turn may extend a partial endpoint to this longer block, replacing the
     // partial sibling. That turn may not have a committable SWA page for this block:
@@ -557,13 +565,12 @@ SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> t
     // would already have replaced the shorter one.
     TLLM_CHECK_DEBUG(toRemove.size() <= 1);
 
-    // Create the new block. ordinal, tokensPerBlock, and numLifeCycles are all
-    // derived from prev. Block stores the tokens as a plain vector (moved in).
-    auto block = makeShared<Block>(newKey, std::move(tokens), prev);
-
+    // Redundant for a freshly constructed block; the re-attach path needs it to restore
+    // the link the prune walk cleared.
+    block->prev = prev;
     // Keep the parent attached while covered children are replaced. Adding the replacement
     // first prevents detachNext() from pruning an emptied RootBlock out of the tree.
-    prevNext[newKey] = block;
+    prevNext[block->key] = block;
 
     for (auto const& k : toRemove)
     {
@@ -572,9 +579,53 @@ SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> t
         block->adoptPagesFrom(*erasedBlock);
         TLLM_CHECK_DEBUG_WITH_INFO(erasedBlock->isOrphan(), "erased sibling must be orphan after removal");
     }
+}
 
+SharedPtr<Block> addOrGetExistingBlock(NodeBase* prev, std::vector<TokenIdExt> tokens, bool knownNoDigest, bool* isNew)
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(prev, "prev must not be null");
+
+    BlockKey const newKey = Block::makeKey(prev->key, tokens.data(), tokens.size(), knownNoDigest);
+
+    // Query first so a block we would discard is never built. Must precede the move below.
+    if (auto existing = getExistingBlock(prev, newKey, tokens.data(), tokens.size()))
+    {
+        if (isNew)
+            *isNew = false;
+        return existing;
+    }
+
+    // ordinal, tokensPerBlock, and numLifeCycles are all derived from prev.
+    // Block stores the tokens as a plain vector (moved in).
+    auto block = makeShared<Block>(newKey, std::move(tokens), prev);
+    attachBlock(prev, block);
     if (isNew)
         *isNew = true;
+    return block;
+}
+
+SharedPtr<Block> attachOrGetExistingBlock(NodeBase* prev, SharedPtr<Block> block, bool* attached)
+{
+    TLLM_CHECK_DEBUG(block);
+
+    if (auto existing = getExistingBlock(prev, block->key, block->tokens.data(), block->tokens.size()))
+    {
+        // Someone else installed an equivalent block while we held ours (on the re-attach
+        // path, another request re-committed this prefix during our orphan window). Hand
+        // over any pages the winner lacks rather than dropping them: ours are still valid
+        // for the same tokens, and adoptPagesFrom() keeps whichever page covers more.
+        if (existing != block && existing->ordinal() == block->ordinal())
+        {
+            existing->adoptPagesFrom(*block);
+        }
+        if (attached)
+            *attached = false;
+        return existing;
+    }
+
+    attachBlock(prev, block);
+    if (attached)
+        *attached = true;
     return block;
 }
 

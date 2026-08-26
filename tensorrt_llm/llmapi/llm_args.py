@@ -714,12 +714,13 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
-    sparse_num_index_heads: int = Field(
+    sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description="Number of index-attention heads (per TP rank's view).",
     )
     sparse_index_dim: int = Field(
         default=128,
+        gt=0,
         description="Per-head index Q/K dimension.",
     )
     sparse_block_size: int = Field(
@@ -747,6 +748,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    indexer_kv_dtype: Literal["bf16", "fp8"] = Field(
+        default="bf16",
+        description=
+        "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses "
+        "unscaled E4M3 values with FP32 score accumulation and is supported only "
+        "by the MSA implementation.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -769,11 +778,18 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     )
 
     @model_validator(mode="after")
-    def _validate_msa_block_size(self):
+    def _validate_msa_configuration(self):
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "
                 f"128, got {self.sparse_block_size}.")
+        if self.indexer_kv_dtype == "fp8" and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 indexer_kv_dtype='fp8' currently requires the "
+                "'msa' implementation.")
+        if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
+            raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
+                             "sparse_disable_index_value=True.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -796,6 +812,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
+            indexer_kv_dtype=self.indexer_kv_dtype,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1613,10 +1630,6 @@ class CpConfig(StrictBaseModel):
         description=
         "FIFO version for alltoall communication. Used in HELIX parallelism. Defaults to 2."
     )
-    cp_anchor_size: Optional[int] = Field(
-        default=None, description="Anchor size for STAR attention.")
-    block_size: Optional[int] = Field(
-        default=None, description="Block size for STAR attention.")
 
     @field_validator("cp_type", mode="before")
     @classmethod
@@ -1860,8 +1873,6 @@ class DecodingBaseConfig(StrictBaseModel):
         "any of these penalties is rejected at admission rather than silently decoded "
         "without them.")
 
-    # If set, drafting is allowed to use chain drafter.
-    _allow_chain_drafter: bool = PrivateAttr(True)
     # If set, drafting uses greedy sampling, irrespective of sampling parameters.
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
@@ -3955,11 +3966,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
-        "is inherited as-is); 'fp8' or 'nvfp4' override it explicitly. Resolved at "
+        "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
+        "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM120/SM121. Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
-                                             "float32", "fp8", "nvfp4"))
+                                             "float32", "fp8", "fp8_ds_mla",
+                                             "nvfp4"))
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -4047,7 +4060,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "When False (default) the rebalance hook is skipped entirely and "
         "pool ratios remain at their warmup-derived values. Beta: enable at "
         "your own risk. Only used when using KV cache manager v2 "
-        "(experimental).")
+        "(experimental). This option is incompatible with dtype='fp8_ds_mla'.")
 
     disk_prefetch_num_reqs: int = Field(
         default=0,
@@ -4142,13 +4155,24 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @classmethod
     def validate_dtype(cls, v: str):
         v = v.lower()
-        if v in ("auto", "fp8",
+        if v in ("auto", "fp8", "fp8_ds_mla",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
 
         raise ValueError(
-            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
-        )
+            'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
+            '"nvfp4", or valid torch.dtype string')
+
+    @model_validator(mode='after')
+    def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
+        """Reject resizing while packed sparse-MLA pool views are fixed."""
+        if self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance:
+            raise ValueError(
+                "kv_cache_config.dtype='fp8_ds_mla' is incompatible with "
+                "kv_cache_config.enable_kv_pool_rebalance=True because packed "
+                "sparse-MLA pool views are fixed at cache-manager construction time."
+            )
+        return self
 
     @field_validator('max_gpu_total_bytes')
     @classmethod
@@ -4960,6 +4984,13 @@ class BaseLlmArgs(StrictBaseModel):
                 )
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
+
+        if self.lora_config is not None and self.backend == 'pytorch':
+            if self.lora_config.cuda_graph_specialize_lora and self.enable_attention_dp:
+                raise ValueError(
+                    "LoRA CUDA graph specialization cannot be used when attention DP is enabled."
+                )
+
         return self
 
     @model_validator(mode="after")
@@ -5317,8 +5348,7 @@ class TorchLlmArgs(BaseLlmArgs):
         status="beta",
         # Recognized values mirror get_attention_backend dispatch in
         # tensorrt_llm/_torch/attention_backend/utils.py.
-        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER",
-                                             "FLASHINFER_STAR_ATTENTION"))
+        telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
 
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
@@ -6230,7 +6260,7 @@ class TorchLlmArgs(BaseLlmArgs):
         assert self.quant_config is not None
         if self.kv_cache_config.dtype == "auto":
             return self
-        elif self.kv_cache_config.dtype == 'fp8':
+        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4

@@ -16,6 +16,7 @@ l0_b200:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
+  - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]
@@ -79,6 +80,7 @@ l0_b200:
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
+  - unittest/_torch/peft/test_fp8_lora_grouped_gemm_regressions.py
   - unittest/_torch/kv_cache_compression
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
   - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
@@ -95,8 +97,8 @@ l0_b200:
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
-  - unittest/_torch/modeling/test_kimi_kda_fused_verify_parity.py
-  - unittest/_torch/modeling/test_kimi_kda_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
@@ -144,6 +146,9 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config
   - unittest/_torch/modules/moe/test_moe_backend.py::test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config
   - unittest/_torch/modules/moe/test_moe_backend.py::test_create_moe_forwards_megamoe_activation_options
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
@@ -171,9 +176,9 @@ l0_b200:
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
   - unittest/_torch/modeling -k "modeling_llama"
-  - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
@@ -226,9 +231,11 @@ l0_b200:
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_media_decode.py
+  - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
+  - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
@@ -433,66 +440,3 @@ l0_b200:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "MEGAMOE_DEEPGEMM"
   # ---- non-quantized (quant=None) moved to post-merge ----
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
-# ------------- AutoDeploy Backend Stages ---------------
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*b100*'
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-      backend: autodeploy
-  tests:
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[bf16]
-  # ------------- AutoDeploy unit tests ---------------
-  # B-tier keeps only Blackwell-meaningful tests (NVFP4 / FP4 / TRTLLM-Gen /
-  # SM100+-gated). HW-agnostic tests (compile, models, shim, utils, plus most
-  # custom_ops, smoke, transformations files) and pure-FP8 tests are covered
-  # on Hopper (l0_h100.yml) and not duplicated here.
-  - unittest/auto_deploy/singlegpu/custom_ops/attention/test_triton_attention.py::TestSDPADispatch
-  - unittest/auto_deploy/singlegpu/custom_ops/mamba/test_flashinfer_mamba_cached_op.py
-  - unittest/auto_deploy/singlegpu/custom_ops/moe/test_ad_moe_op.py
-  - unittest/auto_deploy/singlegpu/custom_ops/moe/test_trtllm_moe.py
-  - unittest/auto_deploy/singlegpu/custom_ops/quantization/test_quant.py
-  - unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py -k "Nemotron-3-Nano-30B-A3B-FP8 or Nemotron-Nano-3-30B-A3.5B-dev or Llama-4-Scout"
-  - unittest/auto_deploy/singlegpu/smoke/test_ad_speculative_decoding.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_fuse_relu2_quant_nvfp4.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_moe_fusion.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_nvfp4_swiglu.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_quant_fusion.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_quant_moe.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_quantization.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_trtllm_gen_diag.py
-
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*b100*'
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
-      backend: autodeploy
-  tests:
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton-False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[torch-True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_nvfp4[True]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[fp8]
-  # ------------- AutoDeploy Perf Sanity ---------------
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)

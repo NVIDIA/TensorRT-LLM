@@ -27,7 +27,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 PILOT_PATH = REPO_ROOT / "jenkins" / "scripts" / "cbts" / "coverage_pilot.py"
 PR_API_URL = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/pulls/123"
-TEST_PILOT_USERS = frozenset({"pilot-user"})
 JSONValue: TypeAlias = Union[
     None,
     bool,
@@ -71,25 +70,21 @@ class _Response:
 @pytest.mark.parametrize(
     ("pr_info", "expected"),
     (
-        ({"user": {"login": " Pilot-User "}}, (True, "Pilot-User", "author is allowlisted")),
-        (
-            {"user": {"login": "someone-else"}},
-            (False, "someone-else", "author is not allowlisted"),
-        ),
-        ({"user": {}}, (False, "", "PR API response has no author login")),
-        ({}, (False, "", "PR API response has no user")),
-        ([], (False, "", "PR API response is not an object")),
+        ({"user": {"login": " Pilot-User "}}, ("Pilot-User", "author resolved")),
+        ({"user": {}}, ("", "PR API response has no author login")),
+        ({}, ("", "PR API response has no user")),
+        ([], ("", "PR API response is not an object")),
     ),
 )
-def test_evaluate_pr_info(
+def test_extract_pr_author(
     pilot_module: ModuleType,
     pr_info: JSONValue,
-    expected: tuple[bool, str, str],
+    expected: tuple[str, str],
 ) -> None:
-    assert pilot_module.evaluate_pr_info(pr_info, pilot_users=TEST_PILOT_USERS) == expected
+    assert pilot_module.extract_pr_author(pr_info) == expected
 
 
-def test_check_pilot_eligibility_uses_token(
+def test_fetch_pr_author_uses_token(
     pilot_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def urlopen(request: urllib.request.Request, timeout: int) -> _Response:
@@ -100,16 +95,13 @@ def test_check_pilot_eligibility_uses_token(
 
     monkeypatch.setattr(pilot_module.urllib.request, "urlopen", urlopen)
 
-    assert pilot_module.check_pilot_eligibility(
-        PR_API_URL, token="token", pilot_users=TEST_PILOT_USERS
-    ) == (
-        True,
+    assert pilot_module.fetch_pr_author(PR_API_URL, token="token") == (
         "pilot-user",
-        "author is allowlisted",
+        "author resolved",
     )
 
 
-def test_check_pilot_eligibility_rejects_untrusted_url(
+def test_fetch_pr_author_rejects_untrusted_url(
     pilot_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def unexpected_urlopen(
@@ -120,15 +112,12 @@ def test_check_pilot_eligibility_rejects_untrusted_url(
 
     monkeypatch.setattr(pilot_module.urllib.request, "urlopen", unexpected_urlopen)
 
-    eligible, login, reason = pilot_module.check_pilot_eligibility(
-        "https://example.com/pulls/123", token="token"
-    )
-    assert not eligible
+    login, reason = pilot_module.fetch_pr_author("https://example.com/pulls/123", token="token")
     assert not login
     assert reason == "missing or unexpected GitHub PR API URL"
 
 
-def test_check_pilot_eligibility_fails_closed_on_api_error(
+def test_fetch_pr_author_fails_closed_on_api_error(
     pilot_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def urlopen(_request: urllib.request.Request, *, timeout: int) -> NoReturn:
@@ -137,8 +126,7 @@ def test_check_pilot_eligibility_fails_closed_on_api_error(
 
     monkeypatch.setattr(pilot_module.urllib.request, "urlopen", urlopen)
 
-    eligible, login, reason = pilot_module.check_pilot_eligibility(PR_API_URL, token="token")
-    assert not eligible
+    login, reason = pilot_module.fetch_pr_author(PR_API_URL, token="token")
     assert not login
     assert reason.startswith("PR author lookup failed:")
 
@@ -152,18 +140,18 @@ def test_main_reads_bot_trigger_payload(
     monkeypatch.setenv("gitlabTriggerPhrase", trigger_phrase)
     monkeypatch.setenv("GITHUB_API_TOKEN", "token")
 
-    def check_pilot_eligibility(
+    def fetch_pr_author(
         pr_api_url: str,
         *,
         token: str,
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[str, str]:
         assert pr_api_url == PR_API_URL
         assert token == "token"
-        return True, "pilot-user", "author is allowlisted"
+        return "pilot-user", "author resolved"
 
-    monkeypatch.setattr(pilot_module, "check_pilot_eligibility", check_pilot_eligibility)
+    monkeypatch.setattr(pilot_module, "fetch_pr_author", fetch_pr_author)
 
     assert pilot_module.main([]) == 0
     captured = capfd.readouterr()
-    assert captured.out == "true\n"
-    assert "pr_author=pilot-user, eligible=true" in captured.err
+    assert captured.out == "pilot-user\n"
+    assert "pr_author=pilot-user, reason=author resolved" in captured.err
