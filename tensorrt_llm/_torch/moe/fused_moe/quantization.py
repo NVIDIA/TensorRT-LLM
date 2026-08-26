@@ -5756,6 +5756,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                            module.w3_w1_bias.data[expert_idx])
                 self._shuffle_w2_weight(module.w2_bias.data[expert_idx])
 
+
 class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
