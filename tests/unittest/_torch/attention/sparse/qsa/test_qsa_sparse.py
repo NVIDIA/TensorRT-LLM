@@ -146,10 +146,72 @@ def test_qsa_decode_selection_supports_multiple_rows_per_request() -> None:
         params,
     )
 
+    from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+
+    top_k = TopK(
+        params.block_topk,
+        prefill_implementation=TopKImplementation.CUDA_RADIX,
+        decode_implementation=TopKImplementation.CUDA_RADIX,
+        compress_ratio=params.compress_ratio,
+    )
+    top_k_output = torch.empty(
+        (q.shape[0], params.block_topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    top_k_row_starts = torch.zeros(q.shape[0], dtype=torch.int32, device="cuda")
+    actual_radix = select_qsa_decode_tokens(
+        q,
+        index_cache,
+        query_positions,
+        sequence_lengths,
+        request_indices,
+        metadata,
+        params,
+        top_k=top_k,
+        top_k_output=top_k_output,
+        top_k_row_starts=top_k_row_starts,
+    ).clone()
+
     assert actual[0].tolist() == [0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]
     assert actual[1].tolist() == [4, 5, 6, 7, 0, 1, 2, 3, 8, 9, -1]
     assert actual[2].tolist() == [0, 1, 2, 3, 4, 5, 6, -1, -1, -1, -1]
     assert actual[3].tolist() == [8, 9, 10, 11, 4, 5, 6, 7, 12, 13, -1]
+    # The CUDA radix kernel returns the exact Top-K set but does not promise
+    # score order. Sparse attention is invariant to a permutation of the
+    # selected token axis.
+    assert torch.equal(
+        actual_radix.sort(dim=1).values,
+        actual.sort(dim=1).values,
+    )
+
+    compressed_keys = torch.arange(
+        1,
+        1 + 4 * params.index_head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).reshape(4, params.index_head_dim)
+    prefill_torch = select_qsa_tokens(
+        q,
+        compressed_keys,
+        query_positions,
+        16,
+        params,
+    )
+    prefill_radix = select_qsa_tokens(
+        q,
+        compressed_keys,
+        query_positions,
+        16,
+        params,
+        top_k=top_k,
+        top_k_output=top_k_output,
+        top_k_row_starts=top_k_row_starts,
+    )
+    assert torch.equal(
+        prefill_radix.sort(dim=1).values,
+        prefill_torch.sort(dim=1).values,
+    )
 
 
 def test_qsa_sparse_gqa_reads_hnd_paged_cache() -> None:
