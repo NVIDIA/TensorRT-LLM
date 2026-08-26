@@ -1776,6 +1776,9 @@ class _StubADPExecutor:
 
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
+        self._free_adp_dummy_kv_resources = types.MethodType(
+            PyExecutor._free_adp_dummy_kv_resources, self
+        )
 
 
 def _run_pad(stub):
@@ -1791,6 +1794,19 @@ def _run_pad(stub):
 
 def _run_update_role(stub, candidates):
     PyExecutor._update_adp_dummy_role(stub, candidates)
+
+
+def _set_adp_resource_managers(
+    stub: _StubADPExecutor,
+    *,
+    spec_resource_manager: Mock | None = None,
+    draft_kv_cache_manager: Mock | None = None,
+) -> None:
+    managers = {
+        ResourceManagerType.SPEC_RESOURCE_MANAGER: spec_resource_manager,
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_kv_cache_manager,
+    }
+    stub.resource_manager.get_resource_manager.side_effect = managers.get
 
 
 def test_adp_dummy_role_set_to_ctx_on_context_only_request():
@@ -2142,20 +2158,31 @@ def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate():
     stub.active_requests = [terminal_request]
     stub.expected_num_active_requests = 2
     spec_resource_manager = Mock()
+    draft_kv_cache_manager = Mock()
     spec_resource_manager.add_dummy_requests.side_effect = NoFreeSlotsError("No free slots")
-    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+    _set_adp_resource_managers(
+        stub,
+        spec_resource_manager=spec_resource_manager,
+        draft_kv_cache_manager=draft_kv_cache_manager,
+    )
 
     _run_pad(stub)
 
     assert stub.active_requests == [terminal_request]
     assert stub._pending_adp_dummy_request is None
     stub.kv_cache_manager.free_resources.assert_called_once()
+    draft_kv_cache_manager.free_resources.assert_called_once()
 
 
 def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     stub = _StubADPExecutor()
     spec_resource_manager = Mock()
-    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+    draft_kv_cache_manager = Mock()
+    _set_adp_resource_managers(
+        stub,
+        spec_resource_manager=spec_resource_manager,
+        draft_kv_cache_manager=draft_kv_cache_manager,
+    )
     terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
     stub.active_requests = [terminal_request]
     stub.expected_num_active_requests = 2
@@ -2173,6 +2200,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     assert stub.active_requests == [terminal_request]
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
+    draft_kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
     stub.dist.tp_allgather.return_value = [1, 1]
     _run_pad(stub)
@@ -2189,6 +2217,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     assert spec_resource_manager.add_dummy_requests.call_count == 2
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
+    draft_kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
 
 def test_adp_dummy_rollback_only_frees_pending_candidate():
@@ -2455,6 +2484,25 @@ def test_pad_empty_batch_degrades_on_allocation_error(error):
     assert len(stub.active_requests) == 1
 
 
+def test_pad_empty_batch_spec_failure_rolls_back_target_and_draft_kv():
+    stub, scheduled_batch = _unfittable_rank()
+    spec_resource_manager = Mock()
+    draft_kv_cache_manager = Mock()
+    spec_resource_manager.add_dummy_requests.side_effect = NoFreeSlotsError("No free slots")
+    _set_adp_resource_managers(
+        stub,
+        spec_resource_manager=spec_resource_manager,
+        draft_kv_cache_manager=draft_kv_cache_manager,
+    )
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 0
+    assert len(stub.active_requests) == 1
+    stub.kv_cache_manager.free_resources.assert_called_once()
+    draft_kv_cache_manager.free_resources.assert_called_once()
+
+
 @pytest.mark.parametrize("enable_adp_dummy_fixes", [False, True])
 def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
     enable_adp_dummy_fixes,
@@ -2465,7 +2513,12 @@ def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
     stub, scheduled_batch = _unfittable_rank(enable_adp_dummy_fixes=enable_adp_dummy_fixes)
     active_request = stub.active_requests[0]
     spec_resource_manager = Mock()
-    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+    draft_kv_cache_manager = Mock()
+    _set_adp_resource_managers(
+        stub,
+        spec_resource_manager=spec_resource_manager,
+        draft_kv_cache_manager=draft_kv_cache_manager,
+    )
 
     _run_pad_empty(stub, scheduled_batch)
     dummy = stub._pending_adp_dummy_request
@@ -2477,6 +2530,7 @@ def test_pad_empty_batch_dummy_rolled_back_when_fleet_still_cannot_queue(
     assert stub._pending_adp_dummy_request is None
     spec_resource_manager.free_resources.assert_called_once_with(dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(dummy)
+    draft_kv_cache_manager.free_resources.assert_called_once_with(dummy)
 
 
 def test_pad_empty_batch_dummy_kept_when_fleet_can_queue():

@@ -3416,6 +3416,14 @@ class PyExecutor:
                     continue
                 self.kv_cache_manager.revert_allocate_generation(req)
 
+    def _free_adp_dummy_kv_resources(self, dummy_request: LlmRequest) -> None:
+        """Release target and independent draft KV allocated for an ADP dummy."""
+        self.kv_cache_manager.free_resources(dummy_request)
+        draft_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        if draft_kv_cache_manager is not None:
+            draft_kv_cache_manager.free_resources(dummy_request)
+
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
 
@@ -3447,7 +3455,7 @@ class PyExecutor:
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
-        self.kv_cache_manager.free_resources(dummy_request)
+        self._free_adp_dummy_kv_resources(dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
@@ -7098,7 +7106,7 @@ class PyExecutor:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
-                self.kv_cache_manager.free_resources(dummy_request)
+                self._free_adp_dummy_kv_resources(dummy_request)
                 return
 
         assert dummy_request is not None
@@ -7186,7 +7194,7 @@ class PyExecutor:
             try:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
-                self.kv_cache_manager.free_resources(dummy_request)
+                self._free_adp_dummy_kv_resources(dummy_request)
                 return
 
         dummy_request.is_attention_dp_dummy = True
