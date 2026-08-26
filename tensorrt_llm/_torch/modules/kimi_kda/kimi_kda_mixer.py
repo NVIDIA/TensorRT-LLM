@@ -87,6 +87,7 @@ class KimiKDALinearAttention(nn.Module):
         mapping=None,
         allreduce_strategy=AllReduceStrategy.AUTO,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        enable_pdl: Optional[bool] = None,
     ) -> None:
         super().__init__()
         lin = cfg.linear_attn_config
@@ -179,6 +180,7 @@ class KimiKDALinearAttention(nn.Module):
         self._dispatch = KDAKernelDispatch(
             use_optimized_decode=kernel_shape_ok,
             use_optimized_verify=kernel_shape_ok,
+            enable_pdl=enable_pdl,
         )
 
         # Fused prefill/decode/verify projection weights, built after checkpoint

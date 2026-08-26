@@ -195,10 +195,9 @@ void launch_selected_kernel(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::
     int const B = static_cast<int>(x_q.size(1));
     int const H = static_cast<int>(x_q.size(2));
     int const HV = static_cast<int>(x_v.size(2));
-    tensorrt_llm::kernels::kdaDecode::KdaDecodeIoLayout const layout{static_cast<int>(token_row_stride(x_q, "x_q")),
-        static_cast<int>(token_row_stride(x_k, "x_k")), static_cast<int>(token_row_stride(x_v, "x_v")),
-        static_cast<int>(token_row_stride(g, "g")), static_cast<int>(beta.stride(1)),
-        static_cast<int>(token_row_stride(onorm_g, "onorm_g"))};
+    tensorrt_llm::kernels::kdaDecode::KdaDecodeIoLayout const layout{token_row_stride(x_q, "x_q"),
+        token_row_stride(x_k, "x_k"), token_row_stride(x_v, "x_v"), token_row_stride(g, "g"), beta.stride(1),
+        apply_onorm ? token_row_stride(onorm_g, "onorm_g") : 0};
 
     tensorrt_llm::kernels::kdaDecode::KdaDecodeParams const params{x_q.data_ptr(), x_k.data_ptr(), x_v.data_ptr(),
         w_q_t.data_ptr(), w_k_t.data_ptr(), w_v_t.data_ptr(), bias_q.data_ptr(), bias_k.data_ptr(), bias_v.data_ptr(),

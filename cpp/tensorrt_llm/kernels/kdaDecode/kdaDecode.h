@@ -49,12 +49,12 @@ constexpr bool shouldUseCompactHeads(int batchSize, int numHeads, int numValueHe
 //! materializing each view as a contiguous tensor.
 struct KdaDecodeIoLayout
 {
-    int xQRowStride;
-    int xKRowStride;
-    int xVRowStride;
-    int gateRowStride;
-    int betaRowStride;
-    int outputNormGateRowStride;
+    int64_t xQRowStride;
+    int64_t xKRowStride;
+    int64_t xVRowStride;
+    int64_t gateRowStride;
+    int64_t betaRowStride;
+    int64_t outputNormGateRowStride;
 };
 
 //! Parameters for the fused, single-token KDA decode kernel.

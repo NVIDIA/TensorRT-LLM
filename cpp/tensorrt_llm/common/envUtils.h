@@ -69,7 +69,7 @@ template <typename KernelFn, typename... Args>
 inline void launchWithPdl(char const* name, bool enablePdl, KernelFn kernelFn, dim3 grid, dim3 block,
     size_t dynamicShmSize, cudaStream_t stream, Args&&... args)
 {
-    TLLM_LOG_DEBUG("Enable PDL in %s", name);
+    TLLM_LOG_DEBUG("PDL in %s: %s", name, enablePdl ? "enabled" : "disabled");
     cudaLaunchConfig_t kernelConfig;
     kernelConfig.gridDim = grid;
     kernelConfig.blockDim = block;

@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import torch
 
-from ...flashinfer_utils import get_env_enable_pdl
-
 _DUMMY_CACHE: dict = {}
 
 
@@ -94,6 +92,7 @@ def run_kda_decode_fusion_cuda(
     use_beta_sigmoid_in_kernel: bool = True,
     verbose: bool = False,
     update_conv_cache: bool = False,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """Run CUDA KDA decode fusion for the tuned decode shapes.
 
@@ -168,16 +167,20 @@ def run_kda_decode_fusion_cuda(
         _require_cuda_fp32(name, tensor)
 
     if update_conv_cache:
+        if any(tensor.ndim != 3 for tensor in (cs_q, cs_k, cs_v)):
+            raise ValueError("update_conv_cache expects rank-3 conv-state pools")
         projection_size = H * 128
-        min_slot_stride = 3 * projection_size * 3
+        conv_state_width = cs_q.shape[2]
+        min_slot_stride = 3 * projection_size * conv_state_width
         if not (
             cs_q.stride(0) == cs_k.stride(0) == cs_v.stride(0)
             and cs_q.stride(0) >= min_slot_stride
-            and cs_q.stride(1) == cs_k.stride(1) == cs_v.stride(1) == 3
+            and cs_q.stride(1) == cs_k.stride(1) == cs_v.stride(1) == conv_state_width
             and cs_q.stride(2) == cs_k.stride(2) == cs_v.stride(2) == 1
         ):
             raise ValueError(
-                "update_conv_cache expects section views of packed [slots, 3 * dim, 3] conv states"
+                "update_conv_cache expects section views of packed "
+                "[slots, 3 * dim, width] conv states"
             )
 
     if cu_seqlens is None:
@@ -223,6 +226,6 @@ def run_kda_decode_fusion_cuda(
         lower_bound_value,
         float(scale),
         float(onorm_eps),
-        get_env_enable_pdl(),
+        enable_pdl,
     )
     return torch.ops.trtllm.kda_decode(*args, *launch_args, output=out)
