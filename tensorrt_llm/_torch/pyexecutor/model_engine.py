@@ -3955,8 +3955,9 @@ class PyTorchModelEngine(ModelEngine):
             # first apply the same accepted-count correction position_ids
             # got above; without overlap the host values are already exact.
             md = inputs.get('attn_metadata')
-            if (md is not None and md.kv_cache_manager is not None
-                    and getattr(md, '_helix_spec_tokens_valid', False)):
+            if (isinstance(md, TrtllmAttentionMetadata)
+                    and md.kv_cache_manager is not None
+                    and md._helix_spec_tokens_valid):
                 helix_gen_tokens = (inputs['input_ids'].shape[0] -
                                     md.num_ctx_tokens)
                 if not self._disable_overlap_scheduler:
@@ -4030,14 +4031,13 @@ class PyTorchModelEngine(ModelEngine):
                         restore=True,
                     )
 
-                if (self.mapping.has_cp_helix() and getattr(
-                        inputs['attn_metadata'], '_helix_spec_tokens_valid',
-                        False)):
-                    # Mirror of the helix position correction in
-                    # _preprocess_inputs (capture symmetry, like position_ids
-                    # above). The recompute's OVERWRITES (slots/bounds/
-                    # kv_lens) need no reversal: every consumer buffer is
-                    # rewritten from host state at the next step's prepare.
+                if (self.mapping.has_cp_helix()
+                        and isinstance(inputs['attn_metadata'],
+                                       TrtllmAttentionMetadata)
+                        and inputs['attn_metadata']._helix_spec_tokens_valid):
+                    # Mirrors the correction in _preprocess_inputs. Only
+                    # the offsets need reversing: the recompute's other
+                    # outputs are rewritten from host state next prepare.
                     inputs['attn_metadata'].helix_position_offsets[:previous_batch_tokens] -= (
                         self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
 

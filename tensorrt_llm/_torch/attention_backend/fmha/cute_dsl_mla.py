@@ -309,8 +309,7 @@ class CuteDslMlaFmha(PhasedFmha):
         seq_len_q = q.shape[0] // meta.num_generations
         batch_size = meta.num_generations
         if meta.helix_position_offsets is not None:
-            if seq_len_q != 1 and not getattr(meta, "_helix_spec_tokens_valid",
-                                              False):
+            if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
                 # Multi-token decode under helix needs the per-token bound /
                 # write-slot buffers of the speculative verify-group path.
                 return False, "CuTe DSL MLA FMHA only supports single-token decode with Helix."
@@ -526,7 +525,7 @@ class CuteDslMlaFmha(PhasedFmha):
             # single-token helix path and outside helix.
             (meta.helix_kv_bounds[:num_tokens] if
              (meta.helix_position_offsets is not None
-              and getattr(meta, "_helix_spec_tokens_valid", False)
+              and meta._helix_spec_tokens_valid
               and kernel_dtype != torch.float8_e4m3fn) else None),
         )
 

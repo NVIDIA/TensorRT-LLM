@@ -769,9 +769,8 @@ class MLA(nn.Module):
                 seq_start=attn_metadata.num_contexts,
                 num_seqs=attn_metadata.num_generations,
             )
-            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
-            if helix_kv_bounds is not None and getattr(
-                    attn_metadata, "_helix_spec_tokens_valid", False):
+            if (isinstance(attn_metadata, TrtllmAttentionMetadata)
+                    and attn_metadata._helix_spec_tokens_valid):
                 # Speculative verify groups: KV ownership is per-TOKEN. A rank
                 # owning only the tail page of a group has zero visible KV for
                 # the group's leading tokens while its per-sequence kv_len is
@@ -781,7 +780,8 @@ class MLA(nn.Module):
                 # pool values; the combine multiplies by corr = 0 and
                 # 0 * NaN would poison the token on every CP rank — sanitize
                 # by the per-token bound instead.
-                zero_kv_mask = helix_kv_bounds[:partial_o.shape[0]] == 0
+                zero_kv_mask = (
+                    attn_metadata.helix_kv_bounds[:partial_o.shape[0]] == 0)
             return _helix_post_process(
                 partial_o,
                 softmax_stats,

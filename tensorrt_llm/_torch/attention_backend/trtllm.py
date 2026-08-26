@@ -832,7 +832,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_helix:
             # If helix is inactive, attend to the previously cached tokens only.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
-            if getattr(self, '_helix_spec_tokens_valid', False):
+            if self._helix_spec_tokens_valid:
                 # Speculative verify groups: a group may straddle a page
                 # boundary, so ownership of this step's new tokens is a
                 # per-sequence COUNT, not a boolean. Provisional host values;
@@ -2563,7 +2563,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
-        if getattr(metadata, '_helix_spec_tokens_valid', False):
+        if metadata._helix_spec_tokens_valid:
             # Speculative verify groups: per-token KV write slots (-1 = this
             # rank does not own the token's position). The append kernel then
             # gates and addresses per token instead of per sequence.
