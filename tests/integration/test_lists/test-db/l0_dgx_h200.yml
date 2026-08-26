@@ -48,6 +48,24 @@ l0_dgx_h200:
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed_stress_test[req120-conc64-qwen3_32b_fp8_mixed_stress]
   - unittest/llmapi/test_llm_pytorch.py::test_nemotron_nas_lora
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_spec_dec
+  # ---- Gemma 4 26B-A4B BF16 on a single H200 (SM90) ----
+  # Single-GPU nodes; they live in this condition because it is the only H200
+  # PyTorch test-list condition (like test_nemotron_nas_lora above).
+  # Fast dummy-weight regression for the two SM90 CUDA-graph defects fixed by
+  # the Hopper bring-up: FlashInfer dereferencing KVCacheManagerV2's
+  # BAD_PAGE_INDEX placeholders, and graph replay running against a deferred
+  # (never refreshed) FlashInfer plan.
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy_cuda_graph_past_sliding_window[ovl0] TIMEOUT (20)
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy_cuda_graph_past_sliding_window[ovl1] TIMEOUT (20)
+  # SM90 coverage of the Gemma 4 modeling unit tests (FA2 dispatch, chunked
+  # context masks, CUDA-graph decode, input-processor pixel precision); the
+  # trtllm-gen-only nodes self-skip on Hopper. Same modules run on l0_b200.
+  - unittest/_torch/modeling/test_modeling_gemma4.py
+  - unittest/_torch/modeling/test_gemma4_multimodal.py
+  # Real-checkpoint accuracy in the production SM90 configuration (FlashInfer
+  # FA2, CUDA graphs + overlap scheduler, chunked prefill, deterministic MoE).
+  - accuracy/test_llm_api_pytorch.py::TestGemma4_26B_A4B::test_auto_dtype TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B_BF16::test_auto_dtype TIMEOUT (60)
 - condition:
     ranges:
       system_gpu_count:

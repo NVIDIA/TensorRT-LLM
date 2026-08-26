@@ -338,6 +338,55 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
             )
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(100000)
+class TestGemma4_26B_A4B_BF16(LlmapiAccuracyTestHarness):
+    """BF16 baseline of TestGemma4_26B_A4B above, runnable on Hopper (H200).
+
+    Deliberately the production SM90 configuration: FlashInfer FA2 dispatch
+    and deterministic MoE finalize via the Gemma4 model defaults, decode CUDA
+    graphs and the overlap scheduler on (llm-args defaults), and chunked
+    prefill on — the paths the Hopper sliding-window/CUDA-graph fixes cover.
+    """
+
+    MODEL_NAME = "google/gemma-4-26B-A4B-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-26B-A4B-it"
+    EXTRA_EVALUATOR_KWARGS = {
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    # Bidirectional multimodal attention needs custom masks, so block reuse
+    # stays off (same constraint as Gemma3).
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        free_gpu_memory_fraction=0.6,
+    )
+
+    def test_auto_dtype(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            max_num_tokens=16384,
+            max_seq_len=10240,
+            kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
 class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-VL-30B-A3B-Instruct"

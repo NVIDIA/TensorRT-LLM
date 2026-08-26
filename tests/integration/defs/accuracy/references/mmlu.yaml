@@ -107,6 +107,12 @@ google/gemma-3-27b-it:
     accuracy: 76.80
 google/gemma-4-26B-A4B-it:
   - accuracy: 71.296
+  # H200 BF16 PyTorch-backend baseline under the chat template (thinking
+  # disabled). The raw-rendering row above is not reproducible on this
+  # instruction-tuned checkpoint by native HF Transformers either (~62 raw);
+  # under this protocol native scores ~78 and TensorRT-LLM tracks it.
+  - extra_acc_spec: apply_chat_template=True,enable_thinking=False
+    accuracy: 76.852
 google/gemma-3n-E2B-it:
   - accuracy: 59.527
 google/gemma-4-E2B-it:

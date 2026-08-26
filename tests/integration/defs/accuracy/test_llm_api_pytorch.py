@@ -1333,6 +1333,51 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
 
 
 @skip_pre_hopper
+@pytest.mark.skip_less_device_memory(100000)
+class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-4-26B-A4B-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-26B-A4B-it"
+
+    # This is an instruction-tuned checkpoint: under the harness's default
+    # raw 5-shot rendering, native HF Transformers itself scores ~62 MMLU
+    # (below the untagged reference row), so the gate uses the chat template
+    # with thinking disabled, where native scores ~78 and TensorRT-LLM tracks
+    # it. The reference row is tagged with this protocol in
+    # references/mmlu.yaml.
+    MMLU_EXTRA_ACC_SPEC = "apply_chat_template=True,enable_thinking=False"
+    MMLU_EVALUATOR_KWARGS = {
+        "apply_chat_template": True,
+        "chat_template_kwargs": {
+            "enable_thinking": False
+        },
+    }
+
+    def test_auto_dtype(self):
+        # Bidirectional multimodal attention needs custom masks, so block
+        # reuse stays off (same constraint as Gemma3).
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            free_gpu_memory_fraction=0.6,
+        )
+        # Deliberately the production SM90 configuration: FlashInfer FA2
+        # dispatch and deterministic MoE finalize via the Gemma4 model
+        # defaults, decode CUDA graphs and the overlap scheduler on (llm-args
+        # defaults), and chunked prefill on — the paths the Hopper
+        # sliding-window/CUDA-graph fixes cover.
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=16,
+                 max_num_tokens=16384,
+                 max_seq_len=10240,
+                 enable_chunked_prefill=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_acc_spec=self.MMLU_EXTRA_ACC_SPEC,
+                          extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
+
+
+@skip_pre_hopper
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"

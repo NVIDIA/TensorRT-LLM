@@ -1062,7 +1062,19 @@ class TestGemma4HFComparison(unittest.TestCase):
 
     @torch.no_grad()
     def test_rms_norm_matches_hf(self):
-        """RMSNorm with Gemma +1 offset convention."""
+        """RMSNorm scale convention: Gemma 4 uses plain ``w``, not ``1 + w``.
+
+        The docstring used to say "Gemma +1 offset convention", which is the
+        Gemma 1-3 rule and the opposite of what this test asserts. HF's
+        ``Gemma4RMSNorm.forward`` multiplies by ``self.weight`` directly, and
+        TensorRT-LLM's Gemma 4 builds every ``RMSNorm`` with the default
+        ``use_gemma=False`` to match. The assertion below is what actually
+        pins it: HF initializes these weights to ones, so ``1 + w`` would
+        scale by 2 and miss ``atol=1e-2`` by a mile. Getting this backwards is
+        not hypothetical -- see ``TestGemma4MMTowerRMSNormConvention``, where
+        the same mistake in the audio tower dropped CoVoST BLEU from 24.54 to
+        1.90 with no crash and no NaN.
+        """
         hf, trt, config = self._make_hf_and_trt_models()
         x = torch.randn(4, config.hidden_size, device="cuda", dtype=config.torch_dtype)
 
@@ -2336,6 +2348,78 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertFalse(mask_26b[0, 1].item(), "Text token 0 should NOT attend to 1")
 
     @torch.no_grad()
+    def test_chunked_context_mask_matches_the_full_sequence_mask(self):
+        """A chunk's mask must equal the full-sequence mask, window included.
+
+        ``get_context_mask`` builds a ``[extend_len, prefix_len + extend_len]``
+        mask for a chunked prefill.  Its prefix columns used to be
+        unconditionally ``True``, on the documented assumption that sliding-window
+        enforcement was "delegated to the kernel's window_left clip".  It is not:
+        FlashInfer's prefill plan sets ``window_left = -1`` whenever a
+        ``custom_mask`` is supplied ("Else, FlashInfer proceeds to use SWA
+        regardless of attention_mask_data" -- ``flashinfer.py``), so nothing
+        downstream re-applies the window and a sliding layer could read
+        arbitrarily far back once a chunked multimodal prefill grew past it.
+
+        The invariant asserted here is the one that actually matters and is
+        cheap to check: chunking is a scheduling decision, so a chunk's mask
+        must be bitwise identical to the corresponding rows of the mask the same
+        sequence would get in a single chunk -- at sequence lengths both inside
+        and well outside the sliding window.
+        """
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        window = 1024
+        # (total, image-block start, image-block end, chunk boundary)
+        geometries = [
+            (439, 163, 429, 160),  # inside the window (the H200 canary's shape)
+            (2048, 1200, 1466, 1152),  # past the window: the case that regressed
+            (3000, 2600, 2866, 2592),  # past the window, block near the end
+        ]
+        for total, block_start, block_end, cut in geometries:
+            with self.subTest(total=total, cut=cut):
+                token_type_ids = torch.zeros(total, dtype=torch.long, device="cuda")
+                token_type_ids[block_start:block_end] = 1
+
+                full = model.get_context_mask(
+                    mm_token_type_ids=token_type_ids,
+                    effective_sliding_window=window,
+                )
+                first = model.get_context_mask(
+                    mm_token_type_ids=token_type_ids[:cut],
+                    effective_sliding_window=window,
+                )
+                second = model.get_context_mask(
+                    mm_token_type_ids=token_type_ids[cut:],
+                    effective_sliding_window=window,
+                    prefix_len=cut,
+                )
+
+                self.assertTrue(
+                    torch.equal(first, full[:cut, :cut]),
+                    f"chunk 1 mask differs from the full-sequence mask (total={total})",
+                )
+                self.assertTrue(
+                    torch.equal(second, full[cut:, :]),
+                    f"chunk 2 mask differs from the full-sequence mask (total={total}); "
+                    f"{int((second & ~full[cut:, :]).sum())} cells are allowed by the chunked "
+                    "mask that the full-sequence mask forbids",
+                )
+                # And the window is genuinely exercised by the long geometries:
+                # a mask that allowed everything would pass the equality above
+                # only if the full mask allowed everything too.
+                if total > window:
+                    self.assertFalse(
+                        bool(full[-1, 0].item()),
+                        f"total={total} exceeds the {window}-token window, so the last query "
+                        "must not attend to position 0; this geometry is not testing the window",
+                    )
+
+    @torch.no_grad()
     def test_bidirectional_mask_only_applies_to_sliding_layers(self):
         """Full-attention layers retain the standard causal mask."""
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2413,6 +2497,29 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         defaults = Gemma4ForCausalLM.get_model_defaults(None)
         self.assertNotIn("cuda_graph_config", defaults)
 
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_gemma4.get_sm_version", return_value=90
+    )
+    def test_sm90_defaults_to_deterministic_moe_finalize(self, _mock_sm):
+        """On Hopper the CUTLASS MoE finalize fusion must default off.
+
+        With top-k > 2 (Gemma 4 routes top-k 8) the fused FC2 + finalize
+        epilogue is nondeterministic: repeated greedy requests through one
+        engine return different tokens. Measured on H200, disabling it costs
+        no throughput at the validated operating point, so determinism is the
+        production default there.
+        """
+        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        self.assertEqual(defaults.get("moe_config"), {"disable_finalize_fusion": True})
+
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_gemma4.get_sm_version", return_value=100
+    )
+    def test_non_sm90_keeps_stock_moe_finalize_default(self, _mock_sm):
+        """Blackwell keeps the stock finalize-fusion default (validated as-is)."""
+        defaults = Gemma4ForCausalLM.get_model_defaults(None)
+        self.assertNotIn("moe_config", defaults)
+
     def test_conditional_gen_requires_flashinfer_backend(self):
         """Gemma4ForConditionalGeneration must also default to FLASHINFER."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
@@ -2489,6 +2596,23 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                 is_sliding=config.layer_types[layer_idx] == "sliding_attention",
             )
             self.assertEqual(attn.attn.flashinfer_backend, "fa2")
+
+
+# Nodes below that construct ``FlashInferAttention(..., flashinfer_backend=
+# "trtllm-gen")`` pin a Blackwell-only kernel family: on SM90 they raise
+# ``RuntimeError: Error in function 'TllmGenFmhaRunner' ... Unsupported
+# architecture`` before asserting anything, so they failed rather than reporting
+# "not applicable here".  The gate uses the same predicate the Gemma 4 dispatch
+# itself uses to choose trtllm-gen (``is_sm_100f``), so these run exactly where
+# production takes that path -- B200 coverage is unchanged -- and are correctly
+# reported as not-applicable on Hopper.  The sibling nodes that exercise the SM90
+# FA2 path (``test_cuda_graph_decode_26b_like``, ``_31b_like``,
+# ``_hybrid_headdim``, ``_real_headdim``, ``test_cuda_graph_multi_step_decode``)
+# are deliberately *not* gated and must keep running on H200.
+requires_trtllm_gen_arch = unittest.skipUnless(
+    is_sm_100f(),
+    "pins flashinfer_backend='trtllm-gen', a Blackwell-only kernel family",
+)
 
 
 class TestGemma4CUDAGraph(unittest.TestCase):
@@ -2660,6 +2784,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             source_offset += page_count
         return expected
 
+    @requires_trtllm_gen_arch
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -2701,6 +2826,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 rtol=0,
             )
 
+    @requires_trtllm_gen_arch
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -2738,6 +2864,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 self.assertEqual(wrappers.decode_block_table_active_rows, len(new_page_counts))
                 self.assertEqual(wrappers.decode_block_table_active_width, max(new_page_counts))
 
+    @requires_trtllm_gen_arch
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -2788,6 +2915,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                     rtol=0,
                 )
 
+    @requires_trtllm_gen_arch
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -3213,6 +3341,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    @requires_trtllm_gen_arch
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
@@ -3559,6 +3688,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         """26B-like: GQA=2, K=V, hd=256/512."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG), "26B")
 
+    @requires_trtllm_gen_arch
     @torch.no_grad()
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
