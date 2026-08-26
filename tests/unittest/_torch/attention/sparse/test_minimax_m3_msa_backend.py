@@ -203,6 +203,58 @@ def test_overlap_kv_correction_derives_slots_from_compact_page_table(monkeypatch
     )
 
 
+def test_overlap_kv_correction_rebuilds_eager_plans(monkeypatch) -> None:
+    """Mixed/eager overlap correction rebuilds plans from corrected lengths."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    monkeypatch.setattr(TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    metadata._msa_fields_ready = True
+    metadata._msa_live_batch = 2
+    metadata._msa_live_total_q = 3
+    metadata._msa_proxy_plan = None
+    metadata.kv_lens_cuda = torch.tensor([129, 257], dtype=torch.int32)
+    rebuild_fields = Mock()
+    rebuild_plans = Mock()
+    monkeypatch.setattr(metadata, "_build_msa_fields", rebuild_fields)
+    monkeypatch.setattr(metadata, "_build_step_plans", rebuild_plans)
+
+    metadata.on_update_kv_lens()
+
+    torch.testing.assert_close(
+        metadata._msa_corrected_kv_lens_cpu,
+        torch.tensor([129, 257], dtype=torch.int32),
+    )
+    rebuild_fields.assert_called_once_with()
+    rebuild_plans.assert_called_once_with()
+
+
+def test_overlap_kv_correction_does_not_rebuild_during_capture(monkeypatch) -> None:
+    """A missing decode plan cannot introduce host work during graph capture."""
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    monkeypatch.setattr(TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    metadata._msa_fields_ready = True
+    metadata._msa_live_batch = 1
+    metadata._msa_live_total_q = 1
+    metadata._msa_proxy_plan = None
+    metadata._msa_corrected_kv_lens_cpu = None
+    metadata.kv_lens_cuda = torch.tensor([129], dtype=torch.int32)
+    rebuild_fields = Mock()
+    rebuild_plans = Mock()
+    monkeypatch.setattr(metadata, "_build_msa_fields", rebuild_fields)
+    monkeypatch.setattr(metadata, "_build_step_plans", rebuild_plans)
+
+    metadata.on_update_kv_lens()
+
+    assert metadata._msa_corrected_kv_lens_cpu is None
+    rebuild_fields.assert_not_called()
+    rebuild_plans.assert_not_called()
+
+
 @pytest.mark.parametrize(
     (
         "configured_sparse_index_dim",
@@ -702,6 +754,17 @@ def test_forward_prepopulated_kv_dispatches_compact_q_without_cache_rewrite(
     plan_kind = "sparse" if is_sparse else "dense"
     plan_phase = "decode" if use_decode_plan else "eager"
     assert captured["kwargs"]["plan"] == (f"{plan_phase}_{plan_kind}",)
+
+
+def test_forward_prepopulated_kv_requires_output_buffer() -> None:
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+
+    with pytest.raises(RuntimeError, match="requires an output buffer"):
+        attention.forward_prepopulated_kv(
+            torch.empty(1, 8),
+            SimpleNamespace(),
+            AttentionForwardArgs(output=None),
+        )
 
 
 @pytest.mark.parametrize(

@@ -8481,9 +8481,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3",
         )
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        dtype="fp8")
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa",
+            indexer_kv_dtype="fp8",
             fuse_qkv_index_projection=True,
         )
 

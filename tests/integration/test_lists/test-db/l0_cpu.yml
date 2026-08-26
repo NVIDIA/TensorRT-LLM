@@ -30,7 +30,17 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
+  - unittest/_torch/models/test_minimax_m3.py::test_eagle_capture_precedes_next_layer_norm
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_uses_one_engine_speculative_base
+  - unittest/_torch/models/test_minimax_m3.py::test_msa_attention_core_routes_compact_q_to_prewritten_kv_entrypoint
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_runs_horizontal_producer
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_fused_projection_preserves_input_token_dimension
+  - unittest/_torch/models/test_minimax_m3.py::test_piecewise_projection_fake_preserves_padded_hidden_rows
+  - unittest/_torch/models/test_minimax_m3.py::test_setup_aliases_preserves_one_engine_draft_weight_loading
+  - unittest/_torch/models/test_minimax_m3.py::test_validate_fused_projection_requires_fp8_main_kv_cache
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/multimodal
