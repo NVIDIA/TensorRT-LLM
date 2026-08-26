@@ -13,38 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal
-
 import pytest
 
-from tensorrt_llm.llmapi.llm_args import TorchCompileConfig, TorchLlmArgs
-
-
-class _NonPytorchLlmArgs(TorchLlmArgs):
-    backend: Literal["test"] = "test"
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 @pytest.mark.cpu_only
-def test_nanojet_configures_prefill_only_compilation() -> None:
-    args = TorchLlmArgs(model="/tmp/dummy_model", use_nanojet=True)
+def test_nanojet_environment_does_not_enable_torch_compile(monkeypatch) -> None:
+    monkeypatch.setenv("TLLM_ENABLE_NANOJET", "1")
 
-    assert args.encode_only is True
-    assert args.attn_backend == "TRTLLM"
-    assert args.use_nanojet is True
-    assert isinstance(args.torch_compile_config, TorchCompileConfig)
+    args = TorchLlmArgs(model="/tmp/dummy_model")
 
-
-@pytest.mark.cpu_only
-def test_nanojet_rejects_multi_gpu() -> None:
-    with pytest.raises(ValueError, match="NanoJet currently supports a single GPU only"):
-        TorchLlmArgs(
-            model="/tmp/dummy_model",
-            use_nanojet=True,
-            tensor_parallel_size=2,
-        )
-
-
-@pytest.mark.cpu_only
-def test_nanojet_rejects_non_pytorch_backend() -> None:
-    with pytest.raises(ValueError, match="NanoJet requires backend='pytorch'"):
-        _NonPytorchLlmArgs(model="/tmp/dummy_model", use_nanojet=True)
+    assert args.torch_compile_config is None

@@ -5352,11 +5352,6 @@ class TorchLlmArgs(BaseLlmArgs):
         # tensorrt_llm/_torch/attention_backend/utils.py.
         telemetry=TelemetryField.categorical("VANILLA", "TRTLLM", "FLASHINFER"))
 
-    use_nanojet: bool = Field(
-        default=False,
-        description="Enable NanoJet kernels through torch.compile fusion passes.",
-        status="prototype")
-
     sampler_type: Union[str, SamplerType] = Field(
         default=SamplerType.auto,
         description=
@@ -5728,23 +5723,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
-        return self
-
-    @model_validator(mode="after")
-    def configure_nanojet(self) -> 'TorchLlmArgs':
-        if not self.use_nanojet:
-            return self
-        if self.backend != "pytorch":
-            raise ValueError("NanoJet requires backend='pytorch'")
-        if self.mm_encoder_only:
-            raise ValueError("NanoJet does not support mm_encoder_only")
-        if self.parallel_config.world_size != 1:
-            raise ValueError("NanoJet currently supports a single GPU only")
-        self.encode_only = True
-        if self.torch_compile_config is None:
-            self.torch_compile_config = TorchCompileConfig(enable_inductor=True)
-        else:
-            self.torch_compile_config.enable_inductor = True
         return self
 
     @model_validator(mode="after")
