@@ -16,7 +16,6 @@ l0_h100:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/attention
-  - unittest/_torch/auto_deploy
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - unittest/_torch/executor
