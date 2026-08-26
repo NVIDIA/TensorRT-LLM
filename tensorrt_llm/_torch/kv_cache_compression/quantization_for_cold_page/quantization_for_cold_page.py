@@ -2,7 +2,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Common construction pipeline for cold-page quantization."""
 
-from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, Sequence
 
 from tensorrt_llm._utils import is_sm_100f
@@ -93,7 +92,7 @@ def create_cold_page_quantization_manager(
     return Nvfp4ColdPageQuantizationCompression(config)
 
 
-class ColdPageQuantizationCompression(KVCacheCompressionManager, ABC):
+class ColdPageQuantizationCompression(KVCacheCompressionManager):
     """Base pipeline shared by storage-bound cold-page quantizers."""
 
     uses_iteration_lifecycle = False
@@ -123,7 +122,6 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager, ABC):
         )
         return native.create_python_cold_page_codec(policy)
 
-    @abstractmethod
     def _create_cold_page_policy(
         self,
         cache_config: object,
@@ -135,3 +133,4 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager, ABC):
         is_draft: bool = False,
     ) -> object:
         """Build the format-specific layout and callback policy."""
+        raise NotImplementedError
