@@ -566,20 +566,36 @@ def chat_response_post_processor(
             if text is None:
                 text = ""
             arguments_end = forced_tool_arguments_end(text)
-            arguments = text if arguments_end is None else text[:arguments_end]
-            args.has_tool_call[output.index] = True
-            message = ChatMessage(
-                role=role,
-                content="",
-                tool_calls=[
-                    ToolCall(id=make_tool_call_id(
-                        id_type=args.tool_call_id_type,
-                        func_name=forced_tool.function.name,
-                        idx=0),
-                             function=FunctionCall(
-                                 name=forced_tool.function.name,
-                                 arguments=arguments))
-                ])
+            if arguments_end is None:
+                # No complete JSON value: the generation was truncated (token
+                # budget, abort) or empty. Reporting the partial text as
+                # ``arguments`` would hand the caller something json.loads()
+                # rejects, and claiming finish_reason="tool_calls" would assert
+                # a call that was never completed. Return the text as content
+                # instead, mirroring the no-markup fallback on the extraction
+                # path below and the streaming path, which only flips
+                # finish_reason once a call has actually been streamed.
+                logger.warning(
+                    f"Forced tool_choice '{forced_tool.function.name}' but the "
+                    "model did not produce a complete JSON arguments value; "
+                    "returning the text as content.")
+                message = ChatMessage(role=role,
+                                      content=text,
+                                      reasoning_content=reasoning_text)
+            else:
+                args.has_tool_call[output.index] = True
+                message = ChatMessage(
+                    role=role,
+                    content="",
+                    tool_calls=[
+                        ToolCall(id=make_tool_call_id(
+                            id_type=args.tool_call_id_type,
+                            func_name=forced_tool.function.name,
+                            idx=0),
+                                 function=FunctionCall(
+                                     name=forced_tool.function.name,
+                                     arguments=text[:arguments_end]))
+                    ])
         elif forced_tool:
             # The parser extracts the forced call from the model's native
             # markup; any free-text preamble becomes content per OpenAI

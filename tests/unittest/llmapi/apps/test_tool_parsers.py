@@ -5110,6 +5110,45 @@ class TestForcedToolChoicePostprocessing:
         assert json.loads(function.arguments) == {"location": "NYC"}
         assert choice.finish_reason == "tool_calls"
 
+    def test_forced_choice_incomplete_arguments_returns_content(
+            self, sample_tools):
+        """A truncated arguments value must not be reported as a tool call.
+
+        Guided decoding constrains the shape but not the length: hitting the
+        token budget leaves a partial JSON value. Reporting it as `arguments`
+        would hand the caller something json.loads() rejects, and claiming
+        finish_reason="tool_calls" would assert a call that never completed.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response('{"location": "San Fra')
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert not choice.message.tool_calls
+        assert choice.message.content == '{"location": "San Fra'
+        assert choice.finish_reason != "tool_calls"
+
+    def test_forced_choice_empty_generation_returns_no_tool_call(
+            self, sample_tools):
+        """An empty generation must not become a tool call with empty args."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response("")
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert not choice.message.tool_calls
+        assert choice.finish_reason != "tool_calls"
+
     def test_forced_choice_streaming_stops_at_end_of_arguments(
             self, sample_tools):
         """The stream stops emitting once the arguments value completes."""
