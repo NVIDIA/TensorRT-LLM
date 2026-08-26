@@ -27,6 +27,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+try:
+    from cutlass import memory as cutlass_memory
+except ImportError:
+    cutlass_memory = utils
+
 from . import dynamic_mainloop
 from .custom_ext import SwapABSwigluFp4Fc12SchedExtension
 from .custom_mix_cga_helpers import (PipelineTmaUmmaMixedCga, TmaAtomOrPair,
@@ -250,8 +255,6 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.task_reg_cnt = 72
 
         if self.arch == "sm_107":
-            import cutlass.memory as cutlass_memory
-
             self.smem_capacity = cutlass_memory.get_smem_capacity_in_bytes(
                 self.arch)
         else:

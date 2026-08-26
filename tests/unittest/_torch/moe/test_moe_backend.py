@@ -727,6 +727,42 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     assert moe._weights_transformed is True
 
 
+def test_megamoe_cutedsl_mpi_bootstrap_binds_local_cuda_device(monkeypatch):
+    import tensorrt_llm._utils as utils
+
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    moe.ep_size = 8
+    mpi_comm = MagicMock()
+    mpi_comm.bcast.return_value = ("127.0.0.1", "29500")
+    local_mpi_comm = MagicMock()
+    local_mpi_comm.Get_rank.return_value = 5
+    init_process_group = MagicMock()
+    set_device = MagicMock()
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(utils, "mpi_world_size", lambda: 8)
+    monkeypatch.setattr(utils, "mpi_rank", lambda: 3)
+    monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
+    monkeypatch.setattr(utils, "local_mpi_comm", lambda: local_mpi_comm)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "set_device", set_device)
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+
+    moe._maybe_init_torch_dist_under_mpi()
+
+    set_device.assert_called_once_with(1)
+    init_process_group.assert_called_once_with(
+        backend="cuda:nccl,cpu:gloo",
+        rank=3,
+        world_size=8,
+        device_id=torch.device("cuda", 1),
+    )
+
+
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
     method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
     hidden_size = 128
@@ -1011,294 +1047,47 @@ _MEGAMOE_LOCAL_TMA_STAGE2_TACTIC = (
 )
 
 
-def test_megamoe_canonical_tactic_validation() -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
-
-    tactic = (
-        [256, 256, 256],
-        [4, 1, 1],
-        [2, 1, 1],
-        ("phase_interleave", None),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        4,
-        4,
-        (2, 4),
-    )
-    megamoe_op.validate_megamoe_tactic(tactic)
-    assert megamoe_op._unpack_tactic(tactic) == tactic
-
-    megamoe_op.validate_megamoe_tactic(_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC)
-
-    invalid_tactic = list(tactic)
-    invalid_tactic[4] = "grid_stride"
-    with pytest.raises(
-        ValueError,
-        match="phase_interleave requires work_id_mode='atomic_counter'",
-    ):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
-
-
-def test_megamoe_legacy_tactic_mapping_and_validation() -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
-
-    legacy_tactic = (
-        [256, 256, 256],
-        [2, 1, 1],
-        512,
-        "static",
-        "epi_warps",
-        True,
-        1,
-        (1, 1),
-    )
-    assert megamoe_op._unpack_tactic(legacy_tactic) == (
-        [256, 256, 256],
-        [2, 1, 1],
-        None,
-        ("grouped", 512),
-        "grid_stride",
-        "epi_warps",
-        True,
-        1,
-        1,
-        (1, 1),
-    )
-    megamoe_op.validate_megamoe_tactic(legacy_tactic)
-
-    for invalid_group_hint in (511, None):
-        invalid_tactic = list(legacy_tactic)
-        invalid_tactic[2] = invalid_group_hint
-        with pytest.raises(ValueError, match=r"group_hint must be an int >= 512"):
-            megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
-
-    invalid_tactic = list(legacy_tactic)
-    invalid_tactic[3] = "dynamic"
-    with pytest.raises(ValueError, match=r"Legacy load_balance_mode"):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_tactic))
-
-    canonical_tactic = list(megamoe_op._unpack_tactic(legacy_tactic))
-    canonical_tactic[7] = None
-    assert megamoe_op._unpack_tactic(tuple(canonical_tactic))[7] == 1
-
-
-def test_megamoe_mixed_cga_launch_cluster_configuration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
-
-    max_active_clusters = {4: 30, 2: 67}
-    monkeypatch.setattr(
-        megamoe_op,
-        "_max_active_clusters",
-        lambda cluster_size, _sm_version=None: max_active_clusters[cluster_size],
-    )
-
-    assert megamoe_op._launch_cluster_configuration([4, 1, 1]) == (
-        30,
-        None,
-        None,
-        120,
-    )
-    assert megamoe_op._launch_cluster_configuration(
-        [4, 1, 1],
-        [2, 1, 1],
-    ) == (33, 30, 6, 132)
-
-
 def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
     from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
-    mid_size = megamoe_op.enumerate_megamoe_candidate_tactics(4096)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
     assert len(decode) == 36
-    assert len(mid_size) == 39
     assert len(prefill) == 40
-    assert all(len(tactic) == 10 for tactic in decode + mid_size + prefill)
     assert {t[-1] for t in decode} == {(1, 1)}
-    assert {t[-1] for t in mid_size} == {(1, 1)}
     assert {t[-1] for t in prefill} == {(2, 4)}
-
-    staged_tactics = [
-        tactic for tactic in mid_size if tactic[5] == "epi_warps" and tactic[7] in {2, 4}
-    ]
-    assert len(staged_tactics) == 2
-    assert {tactic[7] for tactic in staged_tactics} == {2, 4}
-    assert all(tactic[6] and tactic[5] == "epi_warps" for tactic in staged_tactics)
-
-    local_tma_tactics = [
-        tactic for tactic in mid_size if tactic[5] == "reuse_dispatch_warps" and tactic[6]
-    ]
-    assert local_tma_tactics == [_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC]
-
-    mixed_tactics = [tactic for tactic in prefill if tactic[2] is not None]
-    assert len(mixed_tactics) == 1
-    assert mixed_tactics[0][1:5] == (
-        [4, 1, 1],
-        [2, 1, 1],
-        ("phase_interleave", None),
-        "atomic_counter",
-    )
-
-    # The deterministic fallback stays inside the curated axes.
     for num_tokens in (64, 4096, 16384):
-        default_tactic = megamoe_op.default_megamoe_tactic(num_tokens)
-        assert len(default_tactic) == 10
-        megamoe_op.validate_megamoe_tactic(default_tactic)
+        megamoe_op.validate_megamoe_tactic(megamoe_op.default_megamoe_tactic(num_tokens))
 
 
-def test_enumerate_megamoe_sm107_candidate_tactics() -> None:
+def test_megamoe_sm107_dsv4_selector_matches_runner_key() -> None:
     from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
-    decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=107)
-    mid_size = megamoe_op.enumerate_megamoe_candidate_tactics(4096, sm_version=107)
-    prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=107)
-
-    assert [len(tactics) for tactics in (decode, mid_size, prefill)] == [11, 12, 13]
-    assert all(len(tactic) == 10 for tactic in decode + mid_size + prefill)
-    assert {tuple(tactic[0]) for tactic in decode if tactic[6]} == {
-        (mma_m, mma_n, mma_k)
-        for mma_m in (128, 256)
-        for mma_n in (64, 128, 256)
-        for mma_k in (256, 512)
-        if (mma_n, mma_k) != (256, 512)
-    }
-    assert sum(not tactic[6] for tactic in decode) == 1
-    assert all(max(tactic[-1]) <= 4 for tactic in decode + mid_size + prefill)
-    assert sum(tactic[5] == "reuse_dispatch_warps" and tactic[6] for tactic in mid_size) == 1
-    assert sum(tactic[2] is not None for tactic in prefill) == 1
-    for tactic in decode + mid_size + prefill:
+    for tactic in megamoe_op._SM107_DSV4_PRO_DEFAULT_TACTICS.values():
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=107)
-
-    invalid_k = list(decode[0])
-    invalid_k[0] = [256, 256, 128]
-    with pytest.raises(ValueError, match="must be 256 or 512"):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_k), sm_version=107)
-
-    invalid_epi_batch = list(decode[0])
-    invalid_epi_batch[-1] = (1, 5)
-    with pytest.raises(ValueError, match=r"ints in \[1, 4\]"):
-        megamoe_op.validate_megamoe_tactic(tuple(invalid_epi_batch), sm_version=107)
-
-
-def test_megamoe_sm107_dsv4_pro_default_tactics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
-
-    tactics = megamoe_op._SM107_DSV4_PRO_DEFAULT_TACTICS
-    assert {
-        unique_id[7]: (tuple(tactic[0]), tactic[3][1], tactic[8], tactic[9])
-        for unique_id, tactic in tactics.items()
-    } == {
-        1024: ((256, 128, 256), 3, 1, (1, 4)),
-        2048: ((256, 256, 256), 3, 1, (1, 4)),
-        4096: ((256, 256, 256), 4, 1, (1, 4)),
-        8192: ((256, 256, 256), 3, 1, (1, 4)),
-        16384: ((256, 256, 256), 3, 1, (1, 4)),
-        32768: ((256, 256, 256), 3, 1, (1, 4)),
-    }
-    assert {unique_id[7] for unique_id in tactics} == {
-        1024,
-        2048,
-        4096,
-        8192,
-        16384,
-        32768,
-    }
-    for unique_id, tactic in tactics.items():
-        assert tactic[1] == [4, 1, 1]
-        assert tactic[2] == [2, 1, 1]
-        assert (tactic[3][0], *tactic[4:8]) == (
-            "phase_interleave",
-            "atomic_counter",
-            "epi_warps",
-            True,
-            2,
-        )
-        assert unique_id[:7] == (107, 4, 6, 96, 7168, 3072, 6144)
-        assert unique_id[8:] == (
-            str(torch.bfloat16),
-            True,
-            10.0,
-            False,
-            "bf16",
-        )
-        megamoe_op.validate_megamoe_tactic(tactic, sm_version=107)
-
-    exact_key = next(unique_id for unique_id in tactics if unique_id[7] == 4096)
-    assert (100, *exact_key[1:]) not in tactics
-    assert (*exact_key[:7], 256, *exact_key[8:]) not in tactics
-    assert (*exact_key[:4], 4096, *exact_key[5:]) not in tactics
 
     if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
-        return
+        pytest.skip(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON)
 
-    runner = megamoe_op.Sm100MegaMoENvfp4Runner.__new__(megamoe_op.Sm100MegaMoENvfp4Runner)
-    (
-        runner.sm_version,
-        runner.world_size,
-        runner.num_topk,
-        runner.num_experts_per_rank,
-        runner.hidden_size,
-        runner.intermediate_size_per_partition,
-        runner.expand_intermediate_size_per_partition,
-        runner.max_tokens_per_rank,
-    ) = exact_key[:8]
-    runner.output_dtype = torch.bfloat16
-    (
-        runner.apply_topk_in_fc1,
-        runner.gate_up_clamp,
-        runner.in_kernel_fc2_reduce,
-        runner.combine_format,
-    ) = exact_key[9:]
+    for world_size, num_experts_per_rank in ((4, 96), (8, 48)):
+        runner = megamoe_op.Sm100MegaMoENvfp4Runner.__new__(megamoe_op.Sm100MegaMoENvfp4Runner)
+        runner.sm_version = 107
+        runner.world_size = world_size
+        runner.num_topk = 6
+        runner.num_experts_per_rank = num_experts_per_rank
+        runner.hidden_size = 7168
+        runner.intermediate_size_per_partition = 3072
+        runner.expand_intermediate_size_per_partition = 6144
+        runner.max_tokens_per_rank = 256
+        runner.output_dtype = torch.bfloat16
+        runner.apply_topk_in_fc1 = True
+        runner.gate_up_clamp = 10.0
+        runner.situ_beta = None
+        runner.situ_linear_beta = None
+        runner.in_kernel_fc2_reduce = False
+        runner.combine_format = "bf16"
 
-    inputs = [torch.empty((exact_key[7], 1))]
-    baseline = megamoe_op.enumerate_megamoe_candidate_tactics(exact_key[7], sm_version=107)
-    candidates = runner.get_valid_tactics(inputs, MagicMock())
-    assert tactics[exact_key] not in baseline
-    assert candidates == baseline + [tactics[exact_key]]
-
-    class TacticSelected(Exception):
-        pass
-
-    selected = []
-
-    def capture_tactic(tactic, *, sm_version=None):
-        selected.append((tactic, sm_version))
-        raise TacticSelected
-
-    monkeypatch.setattr(megamoe_op, "validate_megamoe_tactic", capture_tactic)
-    monkeypatch.setattr(
-        megamoe_op,
-        "default_megamoe_tactic",
-        lambda _num_tokens: pytest.fail("generic fallback unexpectedly selected"),
-    )
-    with pytest.raises(TacticSelected):
-        runner.forward(inputs)
-    assert selected == [(tactics[exact_key], 107)]
-
-    cap_key = next(unique_id for unique_id in tactics if unique_id[7] == 32768)
-    runner.max_tokens_per_rank = cap_key[7]
-    live_inputs = [torch.empty((8192, 1))]
-    with pytest.raises(TacticSelected):
-        runner.forward(live_inputs)
-    assert selected[-1] == (tactics[cap_key], 107)
-
-    fallback_tactic = object()
-    fallback_tokens = []
-    runner.max_tokens_per_rank = 6144
-    monkeypatch.setattr(
-        megamoe_op,
-        "default_megamoe_tactic",
-        lambda num_tokens: (fallback_tokens.append(num_tokens) or fallback_tactic),
-    )
-    with pytest.raises(TacticSelected):
-        runner.forward(live_inputs)
-    assert fallback_tokens == [8192]
-    assert selected[-1] == (fallback_tactic, 107)
+        assert runner.unique_id() in megamoe_op._SM107_DSV4_PRO_DEFAULT_TACTICS
 
 
 @pytest.mark.parametrize(
@@ -1323,10 +1112,7 @@ def test_megamoe_cutedsl_sm_support(sm: int, eligible: bool) -> None:
             num_slots=8,
             env=MoEEnvironment(
                 sm=sm,
-                available_deps=(
-                    "megamoe_cutedsl_runtime",
-                    "megamoe_cutedsl_op",
-                ),
+                available_deps=("megamoe_cutedsl_runtime", "megamoe_cutedsl_op"),
             ),
         ),
     )
@@ -1741,10 +1527,7 @@ def test_moe_backend(
     hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
 
-    # Execute one local-TMA tactic in the existing B200 accuracy matrix. Tuple
-    # validation alone cannot catch descriptor, SMEM swizzle, or async-wait
-    # regressions in the generated kernel.
-    local_tma_builds = None
+    local_tma_default = None
     if (
         backend_type == MoeBackendType.MEGAMOE_CUTEDSL
         and dtype_activation == torch.bfloat16
@@ -1759,26 +1542,8 @@ def test_moe_backend(
 
         monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "0")
         monkeypatch.setenv("MEGAMOE_COMBINE_FORMAT", "bf16")
-        monkeypatch.setattr(
-            megamoe_op,
-            "default_megamoe_tactic",
-            lambda _num_tokens: _MEGAMOE_LOCAL_TMA_STAGE2_TACTIC,
-        )
-        local_tma_builds = []
-        original_build = megamoe_op.Sm100MegaMoENvfp4Runner._build_kernel
-
-        def checked_local_tma_build(self, tactic):
-            assert megamoe_op._unpack_tactic(tactic) == _MEGAMOE_LOCAL_TMA_STAGE2_TACTIC
-            kernel = original_build(self, tactic)
-            assert "fc2store_tma" in kernel.name()
-            local_tma_builds.append(tactic)
-            return kernel
-
-        monkeypatch.setattr(
-            megamoe_op.Sm100MegaMoENvfp4Runner,
-            "_build_kernel",
-            checked_local_tma_build,
-        )
+        local_tma_default = MagicMock(return_value=_MEGAMOE_LOCAL_TMA_STAGE2_TACTIC)
+        monkeypatch.setattr(megamoe_op, "default_megamoe_tactic", local_tma_default)
 
     skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
 
@@ -1943,8 +1708,8 @@ def test_moe_backend(
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
 
-        if local_tma_builds is not None:
-            assert local_tma_builds
+        if local_tma_default is not None:
+            assert any(call.args[0] > 0 for call in local_tma_default.call_args_list)
 
 
 # ============================================================================

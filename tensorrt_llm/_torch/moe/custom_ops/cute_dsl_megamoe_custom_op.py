@@ -279,15 +279,15 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
 
 
 # Static defaults selected from MR38's balanced and power-law winner sets for
-# the SM107 DSv4 Pro EP4 shape. Routing distribution is not a rank-identical
-# runtime input, so each bucket uses one static tactic. The full runner key
-# prevents applying the table beyond the measured shape and codegen modes.
+# the SM107 DSv4 Pro DEP4 and DEP8 shapes. Routing distribution is not a
+# rank-identical runtime input, so each bucket uses one static tactic. The full
+# runner key prevents applying the table beyond the measured shape and codegen modes.
 _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
     (
         107,
-        4,
+        world_size,
         6,
-        96,
+        num_experts_per_rank,
         7168,
         3072,
         6144,
@@ -295,6 +295,8 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
         str(torch.bfloat16),
         True,
         10.0,
+        None,
+        None,
         False,
         "bf16",
     ): (
@@ -309,14 +311,24 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
         flag_batch,
         (1, 4),
     )
-    for max_tokens_per_rank, (mma_tiler, phase_hint, flag_batch) in {
-        1024: ((256, 128, 256), 3, 1),
-        2048: ((256, 256, 256), 3, 1),
-        4096: ((256, 256, 256), 4, 1),
-        8192: ((256, 256, 256), 3, 1),
-        16384: ((256, 256, 256), 3, 1),
-        32768: ((256, 256, 256), 3, 1),
+    for (world_size, num_experts_per_rank), bucket_tactics in {
+        (4, 96): {
+            256: ((256, 128, 256), 4, 1),
+            1024: ((256, 128, 256), 3, 1),
+            2048: ((256, 256, 256), 3, 1),
+            4096: ((256, 256, 256), 4, 1),
+            8192: ((256, 256, 256), 3, 1),
+            16384: ((256, 256, 256), 3, 1),
+            32768: ((256, 256, 256), 3, 1),
+        },
+        (8, 48): {
+            256: ((256, 128, 256), 4, 1),
+            1024: ((256, 128, 256), 3, 1),
+            4096: ((256, 256, 256), 3, 1),
+            16384: ((256, 128, 256), 4, 1),
+        },
     }.items()
+    for max_tokens_per_rank, (mma_tiler, phase_hint, flag_batch) in bucket_tactics.items()
 }
 
 
@@ -1363,29 +1375,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
             _MEGAMOE_TUNING_WORKSPACE_KEYS.clear()
         else:
             _evict_latched_tuning_workspaces()
-
-    def reset_megamoe_workspace_state() -> None:
-        """TEST/BENCH ONLY: drop ALL process-global MegaMoE workspace state.
-
-        PRECONDITION: every CUDA graph that replayed a MegaMoE launch is
-        destroyed and nothing will launch on the dropped workspaces. Fence /
-        captured-ptr sets are cleared TOGETHER with the buffer caches (stale
-        entries on recycled addresses would ABA-skip the fence or false-positive
-        the capture guard). Must run in lockstep on ALL EP ranks.
-        """
-        global _ACTIVE_MEGAMOE_PROFILING_SCRATCH
-        global _ACTIVE_MEGAMOE_PROFILING_SCRATCH_FACTORY
-        global _MEGAMOE_GRAPH_CAPTURE_SEEN
-        _ACTIVE_MEGAMOE_PROFILING_SCRATCH = None
-        _ACTIVE_MEGAMOE_PROFILING_SCRATCH_FACTORY = None
-        _MEGAMOE_PROFILING_SCRATCH_CACHE.clear()
-        _MEGAMOE_SYMM_PROVIDER_CACHE.clear()
-        _MEGAMOE_LOCAL_WORKSPACE_CACHE.clear()
-        _MEGAMOE_TUNING_WORKSPACE_KEYS.clear()
-        _MEGAMOE_FENCED_KEYS.clear()
-        _MEGAMOE_FENCED_KEY_WS_REFS.clear()
-        _MEGAMOE_CAPTURED_SHARED_PTRS.clear()
-        _MEGAMOE_GRAPH_CAPTURE_SEEN = False
 
     def query_megamoe_shared_workspace_bytes(
         *,

@@ -136,14 +136,9 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
 
     Stricter than ``IS_CUTLASS_DSL_AVAILABLE``, which only confirms that
     ``cutlass`` / ``cutlass.cute`` import cleanly. The MegaMoE kernel
-    ABI also requires ``cutlass.torch.from_dlpack``, ``cutlass._mlir``
-    APIs used by ``sym_buffer.py``, the ``cute_nvgpu`` MMA atoms used
-    by ``kernel_fc12.py``, and the async-copy helpers used by
-    ``dispatch_kernel.py``. PR
-    https://github.com/NVIDIA/TensorRT-LLM/pull/14354 pins
-    ``nvidia-cutlass-dsl[cu13]==4.6.1``; version 4.5.0 was the first release
-    that shipped all SM100 dependencies. SM107 additionally requires the Rubin
-    helpers shipped by a Rubin-capable build. Older wheels return
+    ABI also requires ``cutlass.torch.from_dlpack``, ``cutlass._mlir``,
+    ``cute_nvgpu`` MMA atoms, and async-copy helpers. SM107 additionally
+    requires ``cutlass.utils.rubin_helpers``. Older builds return
     ``(False, reason)``.
 
     Returns ``(True, None)`` on success or ``(False, reason)`` with an
@@ -200,7 +195,10 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
 
     if sm_version == 107:
         try:
-            import cutlass.memory as cutlass_memory
+            try:
+                import cutlass.memory as cutlass_memory
+            except ImportError:
+                import cutlass.utils as cutlass_memory
             import cutlass.utils.rubin_helpers as rubin_helpers
 
             if not hasattr(rubin_helpers, "make_blockscaled_trivial_tiled_mma"):
@@ -208,7 +206,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
                     "cutlass.utils.rubin_helpers lacks make_blockscaled_trivial_tiled_mma"
                 )
             if not hasattr(cutlass_memory, "get_smem_capacity_in_bytes"):
-                raise ImportError("cutlass.memory lacks get_smem_capacity_in_bytes")
+                raise ImportError("Cutlass DSL lacks get_smem_capacity_in_bytes")
             if cutlass_memory.get_smem_capacity_in_bytes("sm_107") <= 0:
                 raise ValueError("invalid SM107 shared-memory capacity")
             if cute.arch.get_max_tmem_alloc_cols("sm_107") <= 0:
@@ -866,11 +864,12 @@ class MegaMoECuteDsl(MoEImplBase):
         """
         if not dist.is_available() or dist.is_initialized():
             return
-        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+        from tensorrt_llm._utils import local_mpi_comm, mpi_comm, mpi_rank, mpi_world_size
 
         try:
             world = mpi_world_size()
             rank = mpi_rank()
+            local_rank = local_mpi_comm().Get_rank()
         except Exception as e:  # not under MPI either -> leave uninitialized
             logger.debug(
                 f"[MegaMoECuteDsl] MPI rank query failed ({e!r}); "
@@ -915,13 +914,24 @@ class MegaMoECuteDsl(MoEImplBase):
         host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
         os.environ["MASTER_ADDR"] = str(host)
         os.environ["MASTER_PORT"] = str(port)
+        device_id = None
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            device_index = local_rank % torch.cuda.device_count()
+            torch.cuda.set_device(device_index)
+            device_id = torch.device("cuda", device_index)
         logger.info(
             f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
             f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
+            f"local_rank={local_rank}, device={device_id}, "
             f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
             f"EP rendezvous."
         )
-        dist.init_process_group(backend="cuda:nccl,cpu:gloo", rank=rank, world_size=world)
+        dist.init_process_group(
+            backend="cuda:nccl,cpu:gloo",
+            rank=rank,
+            world_size=world,
+            device_id=device_id,
+        )
 
     def _resolve_ep_pg(self):
         """Return the torch.distributed ProcessGroup for the EP sub-world.
