@@ -224,6 +224,7 @@ def _make_forward_only_engine(
     engine.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = {}
     engine.forward_pass_callable = None
+    engine.moe_load_balancer = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
     engine.cuda_graph_lora_manager = None
