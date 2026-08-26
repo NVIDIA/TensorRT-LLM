@@ -94,7 +94,7 @@ class TEAttention(AttentionBackend):
     def _get_attn_op(self, num_gqa_groups: Optional[int], attn_mask_type: str) -> Any:
         traits = (self.num_heads, self.head_dim, num_gqa_groups, attn_mask_type)
         if traits not in self._attn_ops:
-            self._attn_ops[traits] = DotProductAttention(
+            op = DotProductAttention(
                 self.num_heads,
                 self.head_dim,
                 num_gqa_groups=num_gqa_groups,
@@ -102,6 +102,8 @@ class TEAttention(AttentionBackend):
                 softmax_scale=self.scale,
                 qkv_format="bshd",
             )
+            # eval(): cuDNN's FP8 gate demands head_dim == 128 on sm < 100 while is_training.
+            self._attn_ops[traits] = op.eval()
         return self._attn_ops[traits]
 
     def _parse_inputs(
