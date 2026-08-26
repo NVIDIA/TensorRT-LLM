@@ -183,9 +183,11 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
     gemmData.mProblemDimensions.mRank = 0;
     gemmData.mProblemDimensions.mWorldSize = 1;
 
+    int const gpuSM = tensorrt_llm::common::getSMVersion();
+
     std::vector<int32_t> sortedIndices = mPassingConfigIndices;
     std::sort(sortedIndices.begin(), sortedIndices.end(),
-        [&configs, &gemmData](int32_t idx0, int32_t idx1)
+        [&configs, &gemmData, gpuSM](int32_t idx0, int32_t idx1)
         {
             auto const& optionsA = configs[idx0].mOptions;
             auto const& optionsB = configs[idx1].mOptions;
@@ -231,6 +233,13 @@ void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
             if (optionsA.mNumSlicesForSplitK != optionsB.mNumSlicesForSplitK)
             {
                 return optionsA.mNumSlicesForSplitK > optionsB.mNumSlicesForSplitK;
+            }
+
+            // On SM107, prefer Sm107a variants (2x mmaK) over Sm100f fallbacks; the generated
+            // table lists Sm100f first, so they would otherwise never be selected.
+            if (gpuSM == 107 && configs[idx0].mSm != configs[idx1].mSm)
+            {
+                return configs[idx0].mSm == SmVersion::Sm107a;
             }
 
             // Elements are equivalent - must return false for strict weak ordering
