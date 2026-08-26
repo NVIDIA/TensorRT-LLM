@@ -771,15 +771,13 @@ class MLA(nn.Module):
             )
             if (isinstance(attn_metadata, TrtllmAttentionMetadata)
                     and attn_metadata._helix_spec_tokens_valid):
-                # Speculative verify groups: KV ownership is per-TOKEN. A rank
-                # owning only the tail page of a group has zero visible KV for
-                # the group's leading tokens while its per-sequence kv_len is
-                # nonzero, so the per-sequence mask above misses those rows.
-                # Their decode rows are fully masked with a finite sentinel,
-                # making partial_o an average over (possibly uninitialized)
-                # pool values; the combine multiplies by corr = 0 and
-                # 0 * NaN would poison the token on every CP rank — sanitize
-                # by the per-token bound instead.
+                # A rank owning only a group's tail page has zero visible KV
+                # for its leading tokens while the per-sequence kv_len is
+                # nonzero, so the mask above misses those rows. Their scores
+                # are fully masked with a finite sentinel, leaving partial_o
+                # an average over uninitialized pool values; the combine
+                # scales it by corr = 0, and 0 * NaN would poison the token
+                # on every CP rank.
                 zero_kv_mask = (
                     attn_metadata.helix_kv_bounds[:partial_o.shape[0]] == 0)
             return _helix_post_process(

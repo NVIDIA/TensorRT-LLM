@@ -2809,13 +2809,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     else:
                         q_tok = common_params.blk_coord[1]
                     if cutlass.const_expr(common_params.kv_bounds is not None):
-                        # Helix verify groups: per-token rank-local bound
-                        # (committed prefix + owned group tokens <= q_tok);
-                        # subsumes the causal offset and non-owner ranks.
-                        # Clamp for fold_sq M-tile padding rows (row beyond
-                        # num_heads * fold_sq_ratio derives q_tok >= S_q);
-                        # their results are discarded, but the gmem read must
-                        # stay in bounds.
+                        # Per-token rank-local bound; subsumes the causal
+                        # offset and non-owner ranks.
+                        # fold_sq M-tile padding rows derive q_tok >= S_q;
+                        # their results are discarded but the read must stay
+                        # in bounds.
                         q_tok_c = (q_tok if cute.elem_less(
                             q_tok, self.seq_len_q) else self.seq_len_q - 1)
                         k_bound = common_params.kv_bounds[
@@ -2864,12 +2862,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     else:
                         q_tok = common_params.blk_coord[1]
                     if cutlass.const_expr(common_params.kv_bounds is not None):
-                        # Helix verify groups: per-token rank-local bound
-                        # (see the sm_100 branch above).
-                        # Clamp for fold_sq M-tile padding rows (row beyond
-                        # num_heads * fold_sq_ratio derives q_tok >= S_q);
-                        # their results are discarded, but the gmem read must
-                        # stay in bounds.
+                        # Per-token rank-local bound (see the sm_100 branch).
+                        # fold_sq M-tile padding rows derive q_tok >= S_q;
+                        # their results are discarded but the read must stay
+                        # in bounds.
                         q_tok_c = (q_tok if cute.elem_less(
                             q_tok, self.seq_len_q) else self.seq_len_q - 1)
                         k_bound = common_params.kv_bounds[

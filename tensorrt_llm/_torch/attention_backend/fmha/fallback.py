@@ -77,13 +77,12 @@ class FallbackFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del k, v, phase
-        # Helix speculative verify groups carry per-token KV ownership (a
-        # group may straddle a page boundary onto two CP ranks) that the
-        # fused thop attention path cannot express: its spec-dec mask and the
-        # per-sequence helix_is_inactive_rank gate both assume the group's
-        # new KV entries are the trailing slots of one rank's kv_len. Running
-        # it would be silently wrong, so reject — with no remaining FMHA
-        # library, dispatch raises loudly instead.
+        # A verify group may straddle a page boundary onto two CP ranks, so
+        # its KV ownership is per-token. The fused thop path cannot express
+        # that: its spec-dec mask and the per-sequence helix_is_inactive_rank
+        # gate both assume the new KV entries are the trailing slots of one
+        # rank's kv_len. Reject rather than run it silently wrong; being last
+        # in the library list, this makes dispatch raise.
         if (metadata.helix_position_offsets is not None
                 and metadata._helix_spec_tokens_valid
                 and metadata.num_generations > 0

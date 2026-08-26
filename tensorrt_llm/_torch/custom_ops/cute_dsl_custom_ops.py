@@ -9771,10 +9771,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                               split_kv_size]
 
             if kv_bounds is not None and AutoTuner.get().is_tuning_mode:
-                # Profiling rebuilds bucketed cache_seqs but carries
-                # kv_bounds through unchanged (input 9 has no dynamic-dim
-                # spec); re-derive a size-consistent dummy — bound values
-                # only affect masking depth, not the tactic space.
+                # Profiling rebuilds cache_seqs at bucketed sizes but input 9
+                # has no dynamic-dim spec, so kv_bounds arrives at the old
+                # size. Bound values only affect masking depth, not the
+                # tactic space, so any size-consistent dummy will do.
                 if kv_bounds.numel() != batch_size * seq_len_q:
                     kv_bounds = cache_seqs.repeat_interleave(
                         seq_len_q).contiguous()

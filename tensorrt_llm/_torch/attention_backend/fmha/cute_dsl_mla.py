@@ -520,9 +520,8 @@ class CuteDslMlaFmha(PhasedFmha):
             # Max batch size for the AutoTuner to profile.
             int(meta.max_num_requests),
             params.fwd.softmax_stats_tensor,
-            # Helix speculative verify groups: per-token rank-local bounds
-            # (filled by recompute_helix_spec_buffers). None on the
-            # single-token helix path and outside helix.
+            # Per-token rank-local bounds, filled by
+            # recompute_helix_spec_buffers. None everywhere else.
             (meta.helix_kv_bounds[:num_tokens] if
              (meta.helix_position_offsets is not None
               and meta._helix_spec_tokens_valid
