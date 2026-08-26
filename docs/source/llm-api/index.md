@@ -59,27 +59,56 @@ llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 print(llm.startup_metrics)
 ```
 
-A typical result has the following structure:
+A TP1 PyTorch-backend run of `TinyLlama/TinyLlama-1.1B-Chat-v1.0` produced the
+following result:
 
 ```json
 {
-  "py_executor": {
-    "total_executor_creation_seconds": 41.747,
-    "model_engine_creation_seconds": 1.802,
-    "final_kv_cache_creation_seconds": 0.068,
-    "final_py_executor_creation_seconds": 18.203
+  "initial_model_engine": {
+    "attention_warmup_seconds": 2.911,
+    "general_warmup_seconds": 0.387,
+    "autotuner_warmup_seconds": 0.041,
+    "mamba_hybrid_warmup_seconds": 0.000,
+    "cuda_graph_warmup_seconds": 0.566,
+    "cuda_graph_capture_seconds": 0.950,
+    "dg_paged_mqa_warmup_seconds": 0.000,
+    "cute_dsl_radix_topk_warmup_seconds": 0.000,
+    "memory_pool_prepopulation_seconds": 0.094,
+    "kv_cache_cleanup_seconds": 0.194,
+    "total_warmup_seconds": 5.485
   },
   "final_model_engine": {
-    "total_warmup_seconds": 16.885,
-    "attention_warmup_seconds": 0.884,
-    "autotuner_warmup_seconds": 0.030,
-    "cuda_graph_capture_seconds": 8.143
+    "attention_warmup_seconds": 0.057,
+    "general_warmup_seconds": 0.492,
+    "autotuner_warmup_seconds": 0.046,
+    "mamba_hybrid_warmup_seconds": 0.000,
+    "cuda_graph_warmup_seconds": 0.599,
+    "cuda_graph_capture_seconds": 0.991,
+    "dg_paged_mqa_warmup_seconds": 0.000,
+    "cute_dsl_radix_topk_warmup_seconds": 0.000,
+    "memory_pool_prepopulation_seconds": 0.097,
+    "kv_cache_cleanup_seconds": 1.657,
+    "total_warmup_seconds": 4.230
+  },
+  "py_executor": {
+    "config_and_checkpoint_loader_initialization_seconds": 0.004,
+    "model_engine_creation_seconds": 1.554,
+    "sampler_creation_seconds": 1.195,
+    "initial_kv_cache_creation_seconds": 0.025,
+    "speculative_decoding_resource_manager_creation_seconds": 0.000,
+    "speculative_drafter_creation_seconds": 0.000,
+    "initial_py_executor_creation_seconds_for_kv_cache_estimation": 5.766,
+    "kv_cache_capacity_configuration_seconds": 0.075,
+    "final_kv_cache_creation_seconds": 0.057,
+    "final_py_executor_creation_seconds": 4.459,
+    "worker_start_seconds": 0.000,
+    "total_executor_creation_seconds": 13.373
   },
   "model_loader": {
-    "total_model_loading_seconds": 1.765,
-    "checkpoint_preparation_seconds": 1.001,
-    "weight_population_seconds": 0.495,
-    "post_load_processing_seconds": 0.005
+    "checkpoint_preparation_seconds": 0.719,
+    "weight_population_seconds": 0.272,
+    "post_load_processing_seconds": 0.004,
+    "total_model_loading_seconds": 1.545
   }
 }
 ```
@@ -152,7 +181,7 @@ curl http://localhost:8000/server_info
 {
   "startup_metrics": {
     "model_loader": {
-      "total_model_loading_seconds": 1.765,
+      "total_model_loading_seconds": 1.545,
       ...
     }
   }
