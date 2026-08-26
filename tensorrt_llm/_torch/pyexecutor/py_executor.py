@@ -7387,12 +7387,29 @@ class PyExecutor:
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
 
+    @staticmethod
+    def _is_transfer_only_request(request: LlmRequest) -> bool:
+        params = getattr(request, "py_disaggregated_params", None)
+        return bool(params is not None and getattr(params, "transfer_only", False))
+
+    def _finish_transfer_only_requests(self, requests):
+        for request in requests:
+            request.finish_by_reason(FinishReason.LENGTH)
+            request.decoding_iter = request.py_decoding_iter
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
         cache_trans_complete_requests = []
+        transfer_only_requests = []
         for req in scheduled_batch.generation_requests:
-            if req.is_disagg_generation_transmission_complete:
+            if not req.is_disagg_generation_transmission_complete:
+                continue
+            if self._is_transfer_only_request(req):
+                transfer_only_requests.append(req)
+            else:
                 cache_trans_complete_requests.append(req)
+        if len(transfer_only_requests) > 0:
+            self._finish_transfer_only_requests(transfer_only_requests)
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
             requests.context_requests_last_chunk = cache_trans_complete_requests

@@ -44,9 +44,6 @@ from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareR
 # the CTX request already completed and the disagg KV-cache handoff was never set up.
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
 
-# Grace for the generation worker to publish its blocks after generation finished to avoid race condition.
-_WARM_SETTLE_SECONDS = 0.2
-
 
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
@@ -208,8 +205,6 @@ class OpenAIDisaggregatedService(OpenAIService):
             if state is None:
                 return
 
-            await asyncio.sleep(_WARM_SETTLE_SECONDS)
-
             warm_req = CompletionRequest(
                 model=gen_req.model,
                 prompt=full_token_ids,
@@ -220,13 +215,14 @@ class OpenAIDisaggregatedService(OpenAIService):
                     encoded_opaque_state=state,
                     disagg_request_id=disagg_request_id,
                     first_gen_tokens=[0],
+                    transfer_only=True,
                 ),
             )
             await self._ctx_client.send_request(warm_req, server=ctx_server)
-            logger.info(f"Warmed ctx {ctx_server} from gen {gen_server}: "
-                        f"{len(full_token_ids)} of "
-                        f"{len(prompt_token_ids)}+{len(gen_token_ids)} tokens "
-                        f"(block={block_size})")
+            logger.debug(f"Warmed ctx {ctx_server} from gen {gen_server}: "
+                         f"{len(full_token_ids)} of "
+                         f"{len(prompt_token_ids)}+{len(gen_token_ids)} tokens "
+                         f"(block={block_size})")
         except Exception:
             self._gen_client.forget_data_transceiver_state(gen_server)
             logger.error(f"Failed to warm ctx: {traceback.format_exc()}")

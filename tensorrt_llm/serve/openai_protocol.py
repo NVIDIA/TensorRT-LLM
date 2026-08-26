@@ -248,6 +248,8 @@ class DisaggregatedParams(OpenAIBaseModel):
     # Orchestrator -> generation-worker instruction to also emit the generated token
     # ids on each streaming chunk. Required for warm_ctx.
     return_gen_token_ids: bool = False
+    # Orchestrator -> context-worker instruction to pull the KV and finish without decode
+    transfer_only: bool = False
     # Context worker -> generation worker: the reasoning mode the context
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
@@ -1832,6 +1834,7 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
+        transfer_only=disaggregated_params.transfer_only,
     )
 
 
