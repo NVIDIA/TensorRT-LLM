@@ -17,14 +17,13 @@ and each block wraps its compute in a Hyper-Connection:
   norm before ``lm_head`` (there is **no** separate final RMSNorm) and is built
   with ``use_combine=False``.
 
-This is a native-torch reimplementation of the sglang reference
+This is a TRT-LLM reimplementation of the sglang reference
 ``GatedResidualSimple`` / ``GroupedGemmaRMSNorm`` (source of truth:
 ``sglang/srt/layers/hyperconnection.py``), matching the reference **non-fused
-fallback** math exactly — the fused Triton/JIT kernels in the reference are a
-numerically-equivalent optimization and are intentionally not ported here
-(bring-up is parity-first; see plan AD-1 / AD-5). The checkpoint stores the
-Qwen4-Exp variant with ``hc_per_branch_norm=True`` (a per-element ``[10240]``
-grouped-RMSNorm weight, grouped by ``hidden_size``).
+fallback** math exactly. Its grouped Gemma RMSNorm reuses TRT-LLM's existing
+Mamba Triton kernel with FP32 ``1 + delta_weight`` semantics. The checkpoint
+stores the Qwen4-Exp variant with ``hc_per_branch_norm=True`` (a per-element
+``[10240]`` grouped-RMSNorm weight, grouped by ``hidden_size``).
 
 Parameter names (``hc_norm.weight``, ``input_mix_weight_down.weight``,
 ``input_mix_weight_up.weight``, ``block_inject_weight.weight``) mirror the
@@ -41,12 +40,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
+
 __all__ = ["GroupedRMSNorm", "Qwen4ExpHyperConnection"]
 
 
-class GroupedRMSNorm(nn.Module):
-    """Gemma-style grouped RMS norm (native fallback of the sglang
-    ``GroupedGemmaRMSNorm``).
+class GroupedRMSNorm(TritonRMSNorm):
+    """Gemma-style grouped RMS norm using TRT-LLM's grouped Triton kernel.
+
+    A native implementation remains available for CPU/model-construction tests.
+    This matches sglang's ``GroupedGemmaRMSNorm``.
 
     Normalizes over ``group_size`` slices of the last dim independently (RMS,
     fp32 accumulation) and scales by ``(1.0 + weight)`` (Gemma convention: the
@@ -66,22 +69,31 @@ class GroupedRMSNorm(nn.Module):
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ):
-        super().__init__()
         if group_size is not None and normalized_shape % group_size != 0:
             raise ValueError(
                 f"normalized_shape ({normalized_shape}) must be divisible by "
                 f"group_size ({group_size})"
             )
+        super().__init__(
+            normalized_shape,
+            eps=eps,
+            group_size=group_size,
+            dtype=dtype,
+            device=device,
+            weight_is_delta=True,
+        )
         # Gemma init: the weight is a delta around 1, so a fresh (unloaded)
-        # module is the identity scale.
+        # module is the identity scale. Constructing a new tensor is required
+        # here because TRT-LLM meta initialization rejects in-place ``zero_``.
         self.weight = nn.Parameter(torch.zeros(normalized_shape, dtype=dtype, device=device))
         self.variance_epsilon = eps
-        self.group_size = group_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            return super().forward(x)
         input_dtype = x.dtype
         x_float = x.float()
-        if self.group_size is None:
+        if self.group_size == self.hidden_size:
             variance = x_float.pow(2).mean(dim=-1, keepdim=True)
             x_norm = x_float * torch.rsqrt(variance + self.variance_epsilon)
         else:

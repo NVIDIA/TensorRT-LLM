@@ -150,6 +150,9 @@ class QSASparseHooks(AttentionSparseHooks):
                 req_idx,
                 attn_metadata,
                 params,
+                top_k=attention.indexer.top_k,
+                top_k_output=attn_metadata.qsa_topk_indices,
+                top_k_row_starts=attn_metadata.qsa_topk_row_starts,
             )
             output = qsa_sparse_gqa(
                 q=q,
@@ -189,6 +192,9 @@ class QSASparseHooks(AttentionSparseHooks):
                     chunk_positions,
                     sequence_len,
                     params,
+                    top_k=attention.indexer.top_k,
+                    top_k_output=attn_metadata.qsa_topk_indices,
+                    top_k_row_starts=attn_metadata.qsa_topk_row_starts,
                 )
                 output[packed_slice] = qsa_sparse_gqa(
                     q=q[packed_slice],
