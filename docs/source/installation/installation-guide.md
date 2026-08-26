@@ -32,6 +32,7 @@ python3 -c "import tensorrt_llm"
 
 Tested on Ubuntu 24.04.
 
+(install-prerequisites)=
 ### Install prerequisites
 
 Before the pre-built Python wheel can be installed via `pip`, a few
@@ -76,14 +77,15 @@ pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
 ```
 
-> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
+> **Nightly releases:** Nightly wheels and containers provide early access to development builds.
+> Install a nightly wheel from the dedicated package index:
 >
 > ```bash
-> # Example: install TensorRT LLM 1.3.0rc16 inside the pytorch:26.02 NGC container
-> pip3 install tensorrt_llm==1.3.0rc16+ngcpytorch2602
+> pip3 install --pre tensorrt_llm --extra-index-url https://pypi.nvidia.com/trtllm_nightly/
 > ```
 >
-> If the NGC PyTorch container-specific wheel is not available, you can instead install the pre-built wheel located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container.
+> Follow the [nightly release installation guide](nightly-releases.md) for optional version pinning, NGC container
+> installation, compatibility checks, and verification.
 
 ### Sanity check
 
@@ -92,6 +94,7 @@ pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_ll
     :linenos:
 ```
 
+(known-limitations)=
 ### Known limitations
 
 There are some known limitations when you pip install the pre-built TensorRT LLM wheel package.

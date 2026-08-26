@@ -19,5 +19,6 @@ Note: **This project will download and install additional third-party open sourc
    :hidden:
 
    installation-guide
+   nightly-releases
    build-from-source
    containers
