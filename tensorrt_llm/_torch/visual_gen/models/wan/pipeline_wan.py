@@ -427,12 +427,10 @@ class WanPipeline(BasePipeline):
 
     @property
     def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
-        # Only Wan 2.2 TI2V-5B conditions on a first frame; the T2V variants
-        # accept no reference (forward() rejects an image otherwise), so they
-        # declare no slot and unsupported image requests fail at preflight.
+        # Only TI2V-5B takes a reference; the T2V variants declare no slot, so
+        # an image request fails at preflight instead of inside forward().
         if not self.is_wan22_5b:
             return {}
-        # Optional single conditioning image (first frame); T2V when absent.
         return {
             "image_reference": RefSlotSpec(
                 modality="image",

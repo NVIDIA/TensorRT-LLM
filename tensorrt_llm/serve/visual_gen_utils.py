@@ -391,9 +391,7 @@ def _apply_deprecated_input_reference(
                 "files and is only meaningful for co-located clients. Send the "
                 "file as base64 or upload it via multipart/form-data."
             )
-        # Imported here, not at module scope: the resolver reaches into
-        # VisualGen, and a plain LLM deployment must not pull a vertical in
-        # behind its request schema.
+        # Local import, for the reason given at the first one.
         from tensorrt_llm.visual_gen.media_refs import _resolve_reference
 
         payload = _resolve_reference(input_reference, input_reference_format)

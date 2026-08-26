@@ -503,12 +503,8 @@ class DiffusionExecutor:
                     req.refs_from_shm()
                 logger.info(f"Worker {self.device_id}: Request available")
 
-            # Broadcast to all ranks. ``req.params.seed`` is already a
-            # concrete int — resolved once on the coordinator process at
-            # :meth:`VisualGen.generate_async` entry — so the broadcast
-            # propagates the same value to every rank. Single-rank runs skip
-            # it: there is no peer, and the object broadcast would still
-            # serialize the whole request to a tensor before discovering that.
+            # Skipped at world_size 1: with no peer, the object broadcast would
+            # still serialize the whole request to a tensor before finding out.
             if self.world_size > 1:
                 req = self._broadcast_request(req)
 

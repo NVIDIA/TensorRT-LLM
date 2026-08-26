@@ -407,7 +407,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
     @property
     def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
-        # I2V first frame (required) + optional last frame for interpolation.
+        # The last frame is what interpolation conditions on.
         return {
             "image_reference": RefSlotSpec(
                 modality="image",

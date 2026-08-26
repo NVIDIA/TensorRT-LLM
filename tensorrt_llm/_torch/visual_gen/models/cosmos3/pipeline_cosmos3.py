@@ -46,6 +46,7 @@ from tensorrt_llm._torch.visual_gen.utils import (
     synchronize_media_prepare_status,
 )
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.media_io import convert_image_mode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
@@ -246,7 +247,9 @@ def _load_reference_image(data: bytes):
     upload would be reported as a server fault.
     """
     try:
-        return PIL.Image.open(BytesIO(data)).convert("RGB")
+        # convert_image_mode, not convert("RGB"): it composites RGBA onto white,
+        # which is what this pipeline's references went through before.
+        return convert_image_mode(PIL.Image.open(BytesIO(data)), "RGB")
     except OSError as exc:
         raise ValueError(
             f"Image reference could not be decoded; it may be truncated, "
@@ -605,8 +608,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     @property
     def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
         return {
-            # image (I2V) and video (V2V) are both optional; Cosmos3 also runs
-            # T2V with neither.
+            # Both optional: Cosmos3 also runs T2V with neither.
             "image_reference": RefSlotSpec(
                 modality="image",
                 roles=[RoleSpec(role="first_frame", min=0, max=1)],

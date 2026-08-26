@@ -148,15 +148,11 @@ class _VideoRoutesMixin:
         - Multipart: Send form fields + optional image_reference / video_reference file
         """
         request_received = raw_request.state.server_arrival_time
-        # Names this request's output files (``{video_id}_{i}``) and the b64
-        # response id; references are keyed and reclaimed by the engine instead.
+        # Prefixes this request's output files (``{video_id}_{i}``).
         video_id = f"video_{uuid.uuid4().hex}"
         try:
-            # Client-side ValueErrors from content-type parsing, request
-            # translation, encoder-format preflight, parameter validation,
-            # and the engine call return 400. Serialization / encoder failures
-            # further down (server-side) fall through to the outer
-            # ``except Exception`` → 500.
+            # ValueError here is the client's fault and returns 400; anything
+            # further down falls through to the outer handler as a 500.
             try:
                 # Parse request based on content-type
                 request = await self._parse_video_generation_request(raw_request)
@@ -172,9 +168,8 @@ class _VideoRoutesMixin:
                     f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
                 )
                 sync_video_start = time.perf_counter()
-                # Offload the blocking resolve/enqueue off the event loop but
-                # await it, so bad media / bad params still surface as 400
-                # here; then await generation on the executor's loop.
+                # Awaited, not fire-and-forget: bad media / bad params must
+                # surface as a 400 rather than a failed job.
                 handle = await asyncio.to_thread(
                     self.generator.generate_async, request.prompt, params
                 )
@@ -396,8 +391,7 @@ class _VideoRoutesMixin:
         - Multipart: Send form fields + optional image_reference / video_reference file
         """
         request_received = raw_request.state.server_arrival_time
-        # Names this request's output files and VIDEO_STORE entry; references
-        # are keyed and reclaimed by the engine when the task awaits the handle.
+        # Prefixes this request's output files and keys its VIDEO_STORE entry.
         video_id = f"video_{uuid.uuid4().hex}"
         try:
             # Parse request based on content-type
@@ -428,10 +422,8 @@ class _VideoRoutesMixin:
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            # Resolve references, validate params, and enqueue in the
-            # foreground (offloaded but awaited) so bad media / unknown
-            # extra_params surface as 400 here, before the 202 — not as a queued
-            # job that later fails.
+            # Awaited before the 202, so bad media / unknown extra_params are a
+            # 400 rather than a queued job that later fails.
             handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
 
             # Persist the queued job before scheduling the background task so

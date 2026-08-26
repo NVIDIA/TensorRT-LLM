@@ -335,9 +335,13 @@ class TestQwenImageEditReferenceLoading:
         with pytest.raises(ValueError, match="PIL images or encoded bytes"):
             QwenImageEditPlusPipeline._load_edit_images(["/tmp/ref.png"])
 
-    def test_alpha_is_composited_onto_white(self):
-        """This pipeline went through ``load_image``, which flattens onto white
-        rather than dropping the channel the way diffusers does."""
+    def test_alpha_is_dropped_not_composited(self):
+        """A transparent pixel keeps its stored RGB.
+
+        ``convert("RGB")`` discards the channel; compositing onto white instead
+        rewrites every pixel with ``alpha < 255``, silently, so a reference with
+        transparency would reach the model as a different image.
+        """
         import PIL.Image
 
         from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
@@ -345,8 +349,10 @@ class TestQwenImageEditReferenceLoading:
         )
 
         transparent = PIL.Image.new("RGBA", (4, 4), (10, 20, 30, 0))
+        encoded = self._png(mode="RGBA", color=(10, 20, 30, 0))
 
-        (image,) = QwenImageEditPlusPipeline._load_edit_images([transparent])
+        from_pil, from_bytes = QwenImageEditPlusPipeline._load_edit_images([transparent, encoded])
 
-        assert image.mode == "RGB"
-        assert image.getpixel((0, 0)) == (255, 255, 255)
+        assert from_pil.mode == "RGB" and from_bytes.mode == "RGB"
+        assert from_pil.getpixel((0, 0)) == (10, 20, 30)
+        assert from_bytes.getpixel((0, 0)) == (10, 20, 30)

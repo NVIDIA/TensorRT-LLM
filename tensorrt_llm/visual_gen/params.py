@@ -19,10 +19,8 @@ from pydantic import Field, field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 
-# The reference wire types live in a dependency-neutral leaf so the common
-# serving protocol can name them without pulling VisualGen in, but
-# ``tensorrt_llm.visual_gen`` stays their public home. The redundant aliases
-# mark these as intentional re-exports rather than unused imports.
+# Defined in a dependency-neutral leaf so the serving protocol can name them
+# without importing VisualGen; re-exported here as their public home.
 from tensorrt_llm.media.reference import MediaContentFormat as MediaContentFormat
 from tensorrt_llm.media.reference import MediaRef as MediaRef
 from tensorrt_llm.media.reference import MediaRole as MediaRole
@@ -194,6 +192,10 @@ def validate_visual_gen_params(
       field set can still validate ``extra_params``.
     - Type mismatches for ``extra_params`` values.
     - Out-of-range ``extra_params`` values.
+    - References in a slot the pipeline does not declare, in an unsupported
+      role, or in counts outside the role's ``min``/``max``. Skipped when
+      ``ref_slot_specs`` is ``None``; an empty mapping declares no slots and
+      so rejects every reference.
     """
     messages: List[str] = []
     specs = extra_param_specs
@@ -267,31 +269,19 @@ def validate_visual_gen_params(
                         f"extra_params['{key}'] value {value} is out of range [{lo}, {hi}]"
                     )
 
-    # --- reference role / arity checks (duck-typed RefSlotSpec) ---
-    # ``ref_slot_specs`` maps a reference field name to a spec exposing
-    # ``.roles`` (a list of role specs with ``.role`` / ``.min`` / ``.max``).
-    # role must be explicit only when the assignment is ambiguous (a multi-role
-    # slot with more than one required role); a single-role slot or a single
-    # required role is inferred. Reference fields are
-    # already normalized to ``list[*Ref]`` by the field validators. An empty
-    # (but non-None) mapping means the pipeline declares no slots, so any
-    # reference the client sent is rejected; only ``None`` skips validation.
+    # The field validators have already normalized each slot to ``list[MediaRef]``.
     if ref_slot_specs is not None:
         for field in ("image_reference", "video_reference", "audio_reference"):
             refs = getattr(params, field, None) or []
             spec = ref_slot_specs.get(field)
             if spec is None:
-                # An undeclared slot is only an error if the client actually
-                # sent one; an absent undeclared slot is fine.
                 if refs:
                     messages.append(f"'{field}' is not accepted by the loaded pipeline.")
                 continue
             role_specs = list(spec.roles)
             allowed = {rs.role for rs in role_specs}
-            # A role-less ref is inferred when unambiguous: a single-role slot,
-            # or a multi-role slot with exactly one required role (min >= 1) —
-            # e.g. i2v's first_frame — matching the pipeline's own default. Only
-            # a genuinely ambiguous slot (multiple required roles) demands one.
+            # A missing role is inferred while it is unambiguous, so only a slot
+            # with more than one required role forces the caller to name one.
             required_roles = [rs.role for rs in role_specs if rs.min >= 1]
             counts: Dict[str, int] = {}
             for r in refs:
@@ -313,9 +303,8 @@ def validate_visual_gen_params(
                     )
                     continue
                 counts[role] = counts.get(role, 0) + 1
-            # Arity runs even for an absent slot: a role with ``min >= 1`` is a
-            # required reference, enforced here as a clean 400 instead of a deep
-            # worker crash. ``min == 0`` leaves the slot optional.
+            # Runs for an absent slot too, which is what catches a missing
+            # required reference before the worker sees the request.
             for rs in role_specs:
                 n = counts.get(rs.role, 0)
                 if n < rs.min or (rs.max is not None and n > rs.max):
