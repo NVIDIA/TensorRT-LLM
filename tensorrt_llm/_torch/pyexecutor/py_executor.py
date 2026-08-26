@@ -3610,7 +3610,7 @@ class PyExecutor:
             # A single-rank CTX worker cannot diverge on a collective. Reap
             # completed sends while it is idle so their pinned KV blocks can
             # be reused by the next context requests.
-            if (is_idle and self._dist_size(self.dist, "world_size") == 1 and
+            if (self._dist_size(self.dist, "world_size") == 1 and
                     self.async_transfer_manager.has_any_inflight_requests()):
                 self._check_disagg_ctx_cache_transfer_status(0)
             return
