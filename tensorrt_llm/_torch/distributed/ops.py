@@ -1216,12 +1216,12 @@ class MNNVLAllReduce(nn.Module):
             return self._moe_fold_call(input, all_reduce_params)
 
         if input.dtype != self.dtype:
-            self._log_fallback(
+            logger.debug(
                 f"[MNNVL AllReduce] Input dtype {input.dtype} does not match configured dtype {self.dtype}."
             )
             return None
         if input.ndim < 2 or input.shape[-1] <= 0:
-            self._log_fallback(
+            logger.debug(
                 f"[MNNVL AllReduce] Input must have at least two dimensions and a positive hidden dimension, "
                 f"got shape {tuple(input.shape)}.")
             return None
@@ -1229,7 +1229,7 @@ class MNNVLAllReduce(nn.Module):
         fusion_op = all_reduce_params.fusion_op
         is_fusion = fusion_op != AllReduceFusionOp.NONE
         if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
-            self._log_fallback(
+            logger.debug(
                 f"[MNNVL AllReduce] Fusion operation {fusion_op} is not supported."
             )
             return None
@@ -1249,7 +1249,7 @@ class MNNVLAllReduce(nn.Module):
                 f"[MNNVL AllReduce] Required buffer {required_buffer_size_bytes} bytes exceeds the largest "
                 f"supported capacity {_MNNVL_MAX_BUFFER_SIZE_BYTES} for shard ({num_tokens}, {hidden_dim}), "
                 f"TP {self.mapping.tp_size}.")
-            self._log_fallback(message)
+            logger.debug(message)
             return None
 
         try:
@@ -1260,7 +1260,7 @@ class MNNVLAllReduce(nn.Module):
                 transport=self.transport,
             )
         except _MnnvlUnavailableError as error:
-            self._log_fallback(
+            logger.debug(
                 f"MNNVL AllReduce workspace growth is unavailable: {error}")
             return None
 
@@ -1533,11 +1533,13 @@ class AllReduce(nn.Module):
                         dispatch_plan=dispatch_plan,
                         max_num_tokens=fused_norm_max_num_tokens,
                         hidden_size=fused_norm_hidden_size,
-                        warn_on_fallback=is_explicit_mnnvl,
                     )
-                except _MnnvlUnavailableError as error:
+                except Exception as error:
+                    kind = "unavailable" if isinstance(
+                        error,
+                        _MnnvlUnavailableError) else "initialization failed"
                     log_fallback(
-                        f"MNNVL AllReduce is unavailable: {error}. Falling back to AUTO."
+                        f"MNNVL AllReduce {kind}: {error}. Falling back to AUTO."
                     )
 
     def supports_moe_fold(self, num_tokens: int, hidden_size: int) -> bool:
