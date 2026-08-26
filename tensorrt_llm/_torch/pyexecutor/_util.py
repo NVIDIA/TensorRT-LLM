@@ -1996,19 +1996,19 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
-        # One-model spec with shared draft layers appends the drafter's
-        # layers to this manager; tell the manager how many. Anchor on the
-        # pretrained TARGET layer count — local num_hidden_layers may already
-        # include the draft tail. Consumed by managers with a draft KV-cache
-        # view (MiniMax-M3); others ignore it. Masked/cross flows yield a
-        # non-positive delta and correctly report 0.
-        target_num_layers = getattr(config, "num_hidden_layers", None)
-        num_appended_draft_layers = (len(per_layer_num_kv_heads) -
-                                     target_num_layers
-                                     if isinstance(per_layer_num_kv_heads, list)
-                                     and target_num_layers is not None else 0)
-        manager_extra_kwargs["num_one_model_draft_layers"] = max(
-            0, num_appended_draft_layers)
+        if hasattr(kv_cache_manager_cls, "get_draft_kv_cache_view"):
+            # One-model spec with shared draft layers appends the drafter's
+            # layers to managers that expose a draft KV-cache view. Anchor on
+            # the pretrained TARGET layer count because local num_hidden_layers
+            # may already include the draft tail. Masked/cross flows yield a
+            # non-positive delta and correctly report 0.
+            target_num_layers = getattr(config, "num_hidden_layers", None)
+            num_appended_draft_layers = (
+                len(per_layer_num_kv_heads) -
+                target_num_layers if isinstance(per_layer_num_kv_heads, list)
+                and target_num_layers is not None else 0)
+            manager_extra_kwargs["num_one_model_draft_layers"] = max(
+                0, num_appended_draft_layers)
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

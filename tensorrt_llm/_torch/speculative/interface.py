@@ -122,9 +122,10 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
 def prepare_attn_metadata_for_draft_replay(attn_metadata,
                                            draft_kv_cache_manager):
     """
-    Prepare attention metadata for CUDA graph replay when using separate draft KV cache.
-    Swaps to draft manager and (for DSA) re-prepares indexer slot mappings for the current
-    batch. Call restore_attn_metadata_after_draft_replay after replay in a finally block.
+    Prepare attention metadata for CUDA graph replay with a distinct
+    draft-side KV layout. Swaps to the resolved draft manager or view and (for
+    DSA) re-prepares indexer slot mappings for the current batch. Call
+    restore_attn_metadata_after_draft_replay after replay in a finally block.
     Returns saved state or None if no-op.
     """
     if draft_kv_cache_manager is None:
@@ -2119,18 +2120,20 @@ class SpecWorkerBase(nn.Module, ABC):
     @contextmanager
     def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
         """
-        Context manager to temporarily switch to draft KV cache manager in one-engine speculative decoding.
+        Temporarily switch to a distinct draft-side KV layout in one-engine
+        speculative decoding.
 
         This swaps both the kv_cache_manager reference AND the block offset tensors,
         since the target and draft KV caches have different block layouts.
         """
 
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
+        # None means two-engine decoding or a unified draft layout that needs
+        # no adapter.
         if draft_kv_cache_manager is None:
             yield
             return
 
-        # Only TrtllmAttentionMetadata supports separate draft KV cache layouts
+        # Only TrtllmAttentionMetadata supports a distinct draft KV layout.
         if not isinstance(attn_metadata, TrtllmAttentionMetadata):
             yield
             return
@@ -2148,7 +2151,7 @@ class SpecWorkerBase(nn.Module, ABC):
         target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
         target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
 
-        # Switch to draft KV cache manager and its block offsets
+        # Switch to the draft-side manager or view and its block offsets.
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
         attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
         attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
