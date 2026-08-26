@@ -308,8 +308,14 @@ void McastDeviceMemory::initializePointerArrays()
     TLLM_CUDA_CHECK(cudaMemcpy(mUcPtrsDev, mUcPtrs.data(), pointerArraySize, cudaMemcpyHostToDevice));
 }
 
+// Invoked from the destructor and from constructor rollback. Must not throw: a throw
+// during destruction calls std::terminate. Use warn-only CUDA checks and swallow errors.
 void McastDeviceMemory::cleanup() noexcept
 {
+    int previousDevice{-1};
+    bool const restoreDevice = cudaGetDevice(&previousDevice) == cudaSuccess;
+    TLLM_CUDA_CHECK_WARN(cudaSetDevice(mDeviceIdx));
+
     try
     {
         tensorrt_llm::common::unregisterMcastDevMemBuffer(this);
@@ -405,6 +411,11 @@ void McastDeviceMemory::cleanup() noexcept
             TLLM_LOG_WARNING("[McastDeviceMemory] ipcNvlsFree failed during cleanup");
         }
         mNvlsHandle = nullptr;
+    }
+
+    if (restoreDevice)
+    {
+        TLLM_CUDA_CHECK_WARN(cudaSetDevice(previousDevice));
     }
 }
 
