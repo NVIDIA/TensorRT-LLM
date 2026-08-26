@@ -57,7 +57,6 @@ intended model-specific runtime path executed.
 | Hyper-Connections | **Validated** | **Validated** | Multi-stream residual mixing and topology-specific reductions are part of the accepted end-to-end paths. CUDA execution fuses gated stream reduction, residual injection, and the combine-to-grouped-RMSNorm boundary. |
 | PLE | **Validated** | **Validated** | Token and short-convolution state are managed per request and participate in reuse, offload, MTP promotion, and text disaggregation where applicable. The n-gram table is row-sharded across TP ranks; ADP preserves rank-local token ownership with gather and reduce-scatter collectives. |
 | QSA/GDN/PLE state with KV cache manager V2 | **Validated** | **Validated** | KV cache manager V2 is the required lifecycle owner for the model-specific auxiliary state. |
-| General DSA backend | **Not applicable** | **Not applicable** | Qwen3.8-Flash-Next uses QSA. General DSA is not a replacement for the model-defined QSA semantics. |
 
 ### Parallelism, communication, and speculative decoding
 
@@ -129,27 +128,30 @@ between serving or parallelism strategies.
 
 ### BF16 MTP3 acceptance
 
-The retained BF16 MTP3 semantic smoke accepted **799 of 945 drafted tokens
-(84.55%)**. The rate is the strict aggregate ratio
-`accepted_draft_tokens / draft_tokens`; forced acceptance was not enabled. The
-same run answered all eight GSM8K questions correctly.
+The table reports unforced BF16 MTP3 acceptance on complete semantic datasets.
+Acceptance is the exact aggregate ratio
+`accepted_draft_tokens / drafted_tokens` across all request records; it is not
+the mean of per-request percentages. Every request record proved a maximum
+draft length of three, and forced acceptance was not enabled.
 
-| Setting | Value |
-|---|---|
-| Checkpoint precision | BF16 |
-| Parallelism | TP2 with MoE-TP2 |
-| Speculative decoding | MTP, maximum draft length 3 |
-| Acceptance method | Strict greedy token match |
-| Workload | First 8 GSM8K questions, 5-shot manual no-thinking template |
-| Sampling | Greedy, temperature 0 |
-| Maximum generated tokens | 512 |
-| Seed | 42 |
-| Maximum concurrency | 1 |
-| Semantic result | 8 / 8 exact |
+All full-dataset runs used thinking mode, temperature 1.0, top-p 0.95, seed 42,
+rejection sampling, and `advanced_sampling_mode: full`. The maximum generation
+length was 65,536 tokens for GSM8K and 65,535 tokens for GPQA Diamond. Complete
+dataset coverage, request errors, empty responses, and responses reaching the
+generation limit were retained in the result denominator.
 
-MTP acceptance depends on the checkpoint, prompts, sampling, batch shape, and
-server configuration. This short greedy result must not be treated as a model
-constant or compared directly with a long thinking-enabled workload.
+| Dataset | Serving topology | Requests | Accepted / drafted tokens | Acceptance | Accuracy |
+|---|---|---:|---:|---:|---:|
+| GSM8K | Aggregate TEP4 | 1,319 | 412,482 / 696,480 | **59.22%** | 1,289 / 1,319 (97.73%) |
+| GSM8K | Aggregate ADP4 | 1,319 | 428,171 / 701,925 | **61.00%** | 1,292 / 1,319 (97.95%) |
+| GPQA Diamond | Aggregate TEP4 | 198 | 1,731,001 / 3,480,723 | **49.73%** | 179 / 198 (90.40%) |
+| GPQA Diamond | Aggregate ADP4 | 198 | 1,763,395 / 3,582,222 | **49.23%** | 179 / 198 (90.40%) |
+
+Acceptance is workload- and configuration-dependent. The measured rates mean
+that target verification remains a substantial part of these long,
+thinking-enabled sampled workloads; they do not by themselves indicate an
+output-correctness failure. Results from different datasets or serving
+topologies must not be treated as estimates of a single model constant.
 
 ### Block-FP8 prefix caching
 
