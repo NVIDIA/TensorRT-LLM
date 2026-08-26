@@ -10,7 +10,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4 import (
+from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
+    Nvfp4ColdPageQuantizationCompression,
     _load_modelopt_nvfp4_scales,
 )
 from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.quantization_for_cold_page import (
@@ -39,7 +40,7 @@ def _manager(scale_checkpoint_path=None):
             str(scale_checkpoint_path) if scale_checkpoint_path is not None else None
         )
     )
-    return ColdPageQuantizationCompression(config)
+    return Nvfp4ColdPageQuantizationCompression(config)
 
 
 def _cache_config(*layers):
@@ -62,6 +63,8 @@ def _native() -> tuple[SimpleNamespace, MagicMock]:
         ColdPageLifecycleProperties=lambda: SimpleNamespace(),
         ColdPageIndexLocation=SimpleNamespace(HOST="host"),
         create_python_cold_page_codec=MagicMock(return_value=codec),
+        invoke_nvfp4_cold_page_encode=MagicMock(),
+        invoke_nvfp4_cold_page_decode=MagicMock(),
     )
     return module, codec
 
@@ -240,7 +243,6 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
         1.0,
     ]
     metadata = _configure_policy(native, raw_bytes=5120)
-    assert metadata.runtime_type == 0
     assert metadata.cold_page_bytes == 2880
     assert metadata.wide[:2, 3].tolist() == [0, 1280]
     assert metadata.wide[:2, 4].tolist() == [2560, 2720]
@@ -301,22 +303,8 @@ def test_provider_creates_one_native_codec_per_kv_cache_manager():
     assert native.create_python_cold_page_codec.call_count == 2
 
 
-def test_policy_forwards_a_4096_page_batch_through_one_custom_op(monkeypatch) -> None:
+def test_policy_forwards_a_4096_page_batch_through_one_native_launch() -> None:
     native, _ = _native()
-    encode = MagicMock()
-    decode = MagicMock()
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "nvfp4_cold_page_encode",
-        encode,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "nvfp4_cold_page_decode",
-        decode,
-        raising=False,
-    )
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
         _manager().create_cold_page_codec(
@@ -336,20 +324,31 @@ def test_policy_forwards_a_4096_page_batch_through_one_custom_op(monkeypatch) ->
             for index, role in enumerate(("key", "value"))
         }
         properties = policy.configure([SimpleNamespace(layers={0: hot})])
+        policy.encode(0, 0x3000, 0x4000, 4096, 0x5000)
+        policy.decode(0, 0x3000, 0x4000, 4096, 0x5000)
 
     assert properties[0].cold_page_bytes == 1152
     assert properties[0].page_index_location == "host"
-
-    policy.encode(0, 0x3000, 0x4000, 4096, 0x5000)
-    policy.decode(0, 0x3000, 0x4000, 4096, 0x5000)
     metadata = policy._lifecycle_metadata[0]
-    for operation in (encode, decode):
+    for operation in (
+        native.invoke_nvfp4_cold_page_encode,
+        native.invoke_nvfp4_cold_page_decode,
+    ):
         operation.assert_called_once()
         arguments = operation.call_args.args
-        assert arguments[0] is metadata.wide
-        assert arguments[1] is metadata.integers
-        assert arguments[2] is metadata.scales
-        assert arguments[3:] == (2, 128, 1152, 1, 0x3000, 0x4000, 4096, 0x5000)
+        assert arguments == (
+            0x4000,
+            4096,
+            metadata.wide.data_ptr(),
+            metadata.integers.data_ptr(),
+            metadata.scales.data_ptr(),
+            2,
+            128,
+            1152,
+            1,
+            0x3000,
+            0x5000,
+        )
 
 
 def test_policy_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
@@ -365,9 +364,15 @@ def test_policy_metadata_stays_on_cpu_with_non_cpu_default_device() -> None:
 
     with torch.device("meta"):
         metadata = _configure_policy(native, raw_bytes=2048)
-    assert metadata.wide.device.type == "cpu"
-    assert metadata.integers.device.type == "cpu"
-    assert metadata.scales.device.type == "cpu"
+    for tensor, dtype, shape in (
+        (metadata.wide, torch.int64, (256, 6)),
+        (metadata.integers, torch.int32, (256, 5)),
+        (metadata.scales, torch.float32, (256, 4)),
+    ):
+        assert tensor.device.type == "cpu"
+        assert tensor.dtype == dtype
+        assert tensor.shape == shape
+        assert tensor.is_contiguous()
 
 
 def test_policy_rejects_invalid_resolved_hot_buffers() -> None:
@@ -431,18 +436,14 @@ def test_policy_rejects_more_than_256_lifecycle_buffers() -> None:
         )
 
 
-def test_unsupported_quant_does_not_construct_nvfp4_policy() -> None:
+def test_unsupported_quant_is_rejected_before_manager_construction() -> None:
     config = SimpleNamespace(
+        algorithm="quantization_for_cold_page",
         quant="future-format",
         scale_checkpoint_path="/not/a/checkpoint",
     )
-    with patch(
-        "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-        "nvfp4.Nvfp4ColdPageQuantization"
-    ) as policy:
-        with pytest.raises(NotImplementedError, match="future-format"):
-            ColdPageQuantizationCompression(config)
-    policy.assert_not_called()
+    with pytest.raises(NotImplementedError, match="future-format"):
+        util_mod.create_kv_cache_compression_manager(config)
 
 
 def test_scale_loader_matches_hf_shard_and_consolidated_policy(tmp_path):
@@ -833,6 +834,7 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4():
 
     resources = build()
     manager = resources[util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER]
+    assert isinstance(manager, Nvfp4ColdPageQuantizationCompression)
     assert isinstance(manager, ColdPageQuantizationCompression)
     assert manager.provides_cold_page_codec
     assert not manager.uses_iteration_lifecycle

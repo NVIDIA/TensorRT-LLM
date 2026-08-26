@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""NVFP4 policy and cold-page layout construction."""
+"""NVFP4 quantization policy and cold-page layout construction."""
 
 import json
 import math
@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -18,12 +18,14 @@ from tensorrt_llm.quantization.modelopt_config import (
 )
 
 from ...pyexecutor.resource_manager import DataType
-from .quantization_for_cold_page import ColdPageCodecPolicy, ColdPageQuantizationMethod
+from .quantization_for_cold_page import ColdPageQuantizationCompression
 
-ScalePair = tuple[float, float]
-LayerScales = tuple[ScalePair, ScalePair]
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
 
-_IDENTITY_NVFP4_SCALES: LayerScales = ((1.0, 1.0), (1.0, 1.0))
+_LayerScales = tuple[tuple[float, float], tuple[float, float]]
+
+_IDENTITY_NVFP4_SCALES: _LayerScales = ((1.0, 1.0), (1.0, 1.0))
 _MODEL_OPT_LANGUAGE_KV_SCALE_KEY = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer_id>\d+)\.self_attn\."
     r"(?P<kind>[kv])_proj\.(?P=kind)_scale$"
@@ -74,12 +76,11 @@ class _Nvfp4ColdPageMetadata:
     num_buffers: int
     max_half_groups_per_tile: int
     cold_page_bytes: int
-    runtime_type: int
 
 
 def _load_modelopt_nvfp4_scales(
     checkpoint_path: str | None,
-) -> dict[int, LayerScales]:
+) -> dict[int, _LayerScales]:
     """Load optional ModelOpt NVFP4 K/V global scales by model layer."""
 
     if checkpoint_path is None or os.environ.get("TRTLLM_LOAD_KV_SCALES", "1") != "1":
@@ -126,7 +127,7 @@ def _load_modelopt_nvfp4_scales(
                 layer_values = values.setdefault(int(match.group("layer_id")), {"k": [], "v": []})
                 layer_values[match.group("kind")].append(value)
 
-    result: dict[int, LayerScales] = {}
+    result: dict[int, _LayerScales] = {}
     for layer_id, layer_values in values.items():
         k_values, v_values = layer_values["k"], layer_values["v"]
         if not k_values or not v_values:
@@ -147,21 +148,14 @@ def _load_modelopt_nvfp4_scales(
     return result
 
 
-def _align_up(value: int, alignment: int = _COLD_PAGE_ALIGNMENT) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
-class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
-    """Resolve NVFP4 metadata and submit one CUDA op per codec batch."""
+class _Nvfp4ColdPagePolicy:
+    """Resolve NVFP4 metadata and submit one native launch per codec batch."""
 
     def __init__(self, layer_layouts: Sequence[_Nvfp4LayerLayout], runtime_type: int) -> None:
         self._layer_layouts = {layout.layer_id: layout for layout in layer_layouts}
+        self.layer_ids = tuple(sorted(self._layer_layouts))
         self._runtime_type = runtime_type
         self._lifecycle_metadata: list[_Nvfp4ColdPageMetadata] = []
-
-    @property
-    def layer_ids(self) -> tuple[int, ...]:
-        return tuple(sorted(self._layer_layouts))
 
     def configure(self, lifecycles: Sequence[object]) -> Sequence[object]:
         """Resolve hot buffers into immutable Python-owned launch metadata."""
@@ -184,19 +178,20 @@ class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
                     raise ValueError(
                         f"Cold-page layer {layer_id} roles do not match its KVCM layout"
                     )
-                compressed = [buffer for buffer in layout.buffers if buffer.scales]
-                packed_bytes = (
-                    layout.num_kv_heads * layout.tokens_per_page * layout.head_dim
-                ) // _ELEMENTS_PER_BYTE
-                scale_bytes = (
-                    layout.num_kv_heads * layout.tokens_per_page * layout.head_dim
-                ) // _ELEMENTS_PER_SCALE
+                elements = layout.num_kv_heads * layout.tokens_per_page * layout.head_dim
+                element_bytes = 1 if self._runtime_type == 2 else 2
+                expected_raw_bytes = elements * element_bytes
+                half_groups = elements // _ELEMENTS_PER_HALF_GROUP
+                compressed_count = sum(buffer.scales is not None for buffer in layout.buffers)
+                packed_bytes = elements // _ELEMENTS_PER_BYTE
+                scale_bytes = elements // _ELEMENTS_PER_SCALE
                 layer_start = cold_page_bytes
-                scale_start = layer_start + len(compressed) * packed_bytes
-                cursor = scale_start + len(compressed) * scale_bytes
+                scale_start = layer_start + compressed_count * packed_bytes
+                cursor = scale_start + compressed_count * scale_bytes
 
                 compressed_index = 0
                 for buffer in layout.buffers:
+                    is_compressed = buffer.scales is not None
                     hot = hot_buffers[buffer.role]
                     raw_base = int(hot.raw_base)
                     raw_slot_bytes = int(hot.raw_slot_bytes)
@@ -204,27 +199,16 @@ class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
                     if raw_base <= 0 or raw_bytes <= 0 or raw_bytes > raw_slot_bytes:
                         raise ValueError("Cold-page hot buffer has invalid address or size")
 
-                    if buffer.scales:
+                    if is_compressed:
                         data_offset = layer_start + compressed_index * packed_bytes
                         scale_offset = scale_start + compressed_index * scale_bytes
                         compressed_index += 1
-                        expected_raw_bytes = (
-                            layout.num_kv_heads
-                            * layout.tokens_per_page
-                            * layout.head_dim
-                            * (1 if self._runtime_type == 2 else 2)
-                        )
                         if raw_bytes != expected_raw_bytes:
                             raise ValueError("Hot buffer size does not match NVFP4 geometry")
                         if raw_base % 16 or raw_slot_bytes % 16:
                             raise ValueError(
                                 "NVFP4 hot address and Slot stride must be 16-byte aligned"
                             )
-                        half_groups = (
-                            expected_raw_bytes
-                            // (1 if self._runtime_type == 2 else 2)
-                            // _ELEMENTS_PER_HALF_GROUP
-                        )
                         max_half_groups_per_tile = max(
                             max_half_groups_per_tile,
                             min(half_groups, _MAX_HALF_GROUPS_PER_TILE),
@@ -247,13 +231,13 @@ class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
                     integer_rows.append(
                         [
                             0,
-                            _NVFP4_TRANSFORM if buffer.scales else _LOSSLESS_TRANSFORM,
-                            layout.num_kv_heads if buffer.scales else 0,
-                            layout.tokens_per_page if buffer.scales else 0,
-                            layout.head_dim if buffer.scales else 0,
+                            _NVFP4_TRANSFORM if is_compressed else _LOSSLESS_TRANSFORM,
+                            layout.num_kv_heads if is_compressed else 0,
+                            layout.tokens_per_page if is_compressed else 0,
+                            layout.head_dim if is_compressed else 0,
                         ]
                     )
-                    buffer_scales = buffer.scales or _Nvfp4Scales(1.0, 1.0)
+                    buffer_scales = buffer.scales if is_compressed else _Nvfp4Scales(1.0, 1.0)
                     scale_rows.append(
                         [
                             buffer_scales.nvfp4_orig_quant,
@@ -262,7 +246,11 @@ class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
                             buffer_scales.fp8_quant_orig,
                         ]
                     )
-                layer_end = _align_up(cursor)
+                layer_end = (
+                    (cursor + _COLD_PAGE_ALIGNMENT - 1)
+                    // _COLD_PAGE_ALIGNMENT
+                    * _COLD_PAGE_ALIGNMENT
+                )
                 wide_rows[-1][5] = cursor
                 integer_rows[-1][0] = layer_end - cursor
                 cold_page_bytes = layer_end
@@ -294,7 +282,6 @@ class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
                     num_buffers=num_buffers,
                     max_half_groups_per_tile=max_half_groups_per_tile,
                     cold_page_bytes=cold_page_bytes,
-                    runtime_type=self._runtime_type,
                 )
             )
             lifecycle_properties = native.ColdPageLifecycleProperties()
@@ -313,18 +300,20 @@ class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
         num_pages: int,
         stream: int,
     ) -> None:
+        from tensorrt_llm.bindings.internal import kv_cache_compression as native
+
         metadata = self._lifecycle_metadata[lifecycle_index]
-        torch.ops.trtllm.nvfp4_cold_page_encode(
-            metadata.wide,
-            metadata.integers,
-            metadata.scales,
+        native.invoke_nvfp4_cold_page_encode(
+            page_indices,
+            num_pages,
+            metadata.wide.data_ptr(),
+            metadata.integers.data_ptr(),
+            metadata.scales.data_ptr(),
             metadata.num_buffers,
             metadata.max_half_groups_per_tile,
             metadata.cold_page_bytes,
-            metadata.runtime_type,
+            self._runtime_type,
             cold_base,
-            page_indices,
-            num_pages,
             stream,
         )
 
@@ -336,27 +325,30 @@ class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
         num_pages: int,
         stream: int,
     ) -> None:
+        from tensorrt_llm.bindings.internal import kv_cache_compression as native
+
         metadata = self._lifecycle_metadata[lifecycle_index]
-        torch.ops.trtllm.nvfp4_cold_page_decode(
-            metadata.wide,
-            metadata.integers,
-            metadata.scales,
+        native.invoke_nvfp4_cold_page_decode(
+            page_indices,
+            num_pages,
+            metadata.wide.data_ptr(),
+            metadata.integers.data_ptr(),
+            metadata.scales.data_ptr(),
             metadata.num_buffers,
             metadata.max_half_groups_per_tile,
             metadata.cold_page_bytes,
-            metadata.runtime_type,
+            self._runtime_type,
             cold_base,
-            page_indices,
-            num_pages,
             stream,
         )
 
 
-class Nvfp4ColdPageQuantization(ColdPageQuantizationMethod):
-    """Build one fresh NVFP4 callback policy for each KVCM construction."""
+class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
+    """NVFP4 cold-page quantization and per-KVCM codec construction."""
 
-    def __init__(self, checkpoint_path: str | None) -> None:
-        self._model_scales = _load_modelopt_nvfp4_scales(checkpoint_path)
+    def __init__(self, config: "ColdPageQuantizationCompressionConfig") -> None:
+        super().__init__(config)
+        self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
 
     def create_cold_page_codec(
         self,
@@ -388,13 +380,13 @@ class Nvfp4ColdPageQuantization(ColdPageQuantizationMethod):
         layer_layouts = []
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
-            buffers_by_role = {str(buffer.role): buffer for buffer in layer.buffers}
-            if "key" not in buffers_by_role:
+            buffer_roles = {str(buffer.role) for buffer in layer.buffers}
+            if "key" not in buffer_roles:
                 raise NotImplementedError(
                     "NVFP4 cold-page compression requires an Attention key buffer"
                 )
 
-            compressed_roles = ("key", "value") if "value" in buffers_by_role else ("key",)
+            compressed_roles = ("key", "value") if "value" in buffer_roles else ("key",)
             if len(compressed_roles) == 2 and not is_draft:
                 orig_quant, quant_orig = self._model_scales.get(
                     int(pp_layers[layer_id]), _IDENTITY_NVFP4_SCALES
@@ -431,5 +423,7 @@ class Nvfp4ColdPageQuantization(ColdPageQuantizationMethod):
                 )
             )
 
-        policy = Nvfp4ColdPagePolicy(layer_layouts, runtime_type or 0)
+        policy = _Nvfp4ColdPagePolicy(
+            layer_layouts, runtime_type if runtime_type is not None else 0
+        )
         return native.create_python_cold_page_codec(policy)

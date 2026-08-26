@@ -2847,10 +2847,13 @@ def create_kv_cache_compression_manager(
 ) -> Optional[KVCacheCompressionManager]:
     """Construct the configured compression manager before KVCM."""
     if config.algorithm == "quantization_for_cold_page":
-        from ..kv_cache_compression.quantization_for_cold_page.quantization_for_cold_page import \
-            ColdPageQuantizationCompression  # noqa: E501
+        if config.quant == "nvfp4":
+            from ..kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import \
+                Nvfp4ColdPageQuantizationCompression  # noqa: E501
 
-        return ColdPageQuantizationCompression(config)
+            return Nvfp4ColdPageQuantizationCompression(config)
+        raise NotImplementedError(
+            f"Unsupported cold-page quantization format {config.quant!r}")
 
     if config.algorithm == "triattention":
         # TriAttention imports CuTe/CUTLASS; keep normal executor startup lazy.
