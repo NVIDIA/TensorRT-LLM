@@ -234,6 +234,103 @@ class QSAIndexer(nn.Module):
             coordinates,
         )
 
+    def project_and_update_cache(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        layer_idx: int,
+        metadata: "QSAAttentionMetadata",
+    ) -> torch.Tensor:
+        """Project the index Q/K and update its paged side cache.
+
+        Ordinary CUDA-graph decode uses a single Triton launch for Q
+        normalization/RoPE plus raw/compressed K cache updates. Prefill,
+        speculative verification, CPU execution, and unsupported RoPE layouts
+        retain the reference path below.
+        """
+        num_tokens = hidden_states.shape[0]
+        qk = self.index_qk_proj(hidden_states)
+        q_width = self.params.index_n_heads * self.params.index_head_dim
+        q_raw, k_raw = qk.split(
+            (q_width, self.params.index_kv_heads * self.params.index_head_dim),
+            dim=-1,
+        )
+        q_raw = q_raw.reshape(
+            num_tokens,
+            self.params.index_n_heads,
+            self.params.index_head_dim,
+        )
+        token_k = k_raw.reshape(
+            num_tokens,
+            self.params.index_kv_heads,
+            self.params.index_head_dim,
+        )
+        coordinates = _position_coordinates(position_ids, num_tokens)
+
+        index_cache = metadata.kv_cache_manager.get_index_k_buffer(layer_idx)
+        position_cache = metadata.kv_cache_manager.get_qsa_position_buffer()
+        if index_cache is None or position_cache is None:
+            raise RuntimeError("QSA sparse side-cache buffers are unavailable")
+        rotary_cache = self.rotary_emb.rotary_cos_sin
+        mrope_section = None
+        supported_mrope = True
+        if isinstance(self.rotary_emb, MRotaryEmbedding):
+            supported_mrope = self.rotary_emb.mrope_interleaved
+            if supported_mrope:
+                mrope_section = tuple(self.rotary_emb.mrope_section)
+        fused_decode = (
+            os.environ.get("TRTLLM_QSA_FUSED_DECODE_PRE_INDEXER", "1") != "0"
+            and metadata.is_cuda_graph
+            and metadata.num_contexts == 0
+            and num_tokens == metadata.num_seqs
+            and q_raw.is_cuda
+            and q_raw.dtype == torch.bfloat16
+            and token_k.dtype == torch.bfloat16
+            and index_cache.dtype == torch.bfloat16
+            and position_cache.is_cuda
+            and supported_mrope
+            and rotary_cache.ndim == 3
+            and rotary_cache.shape[1] == 2
+            and rotary_cache.shape[2] * 4 == self.params.index_head_dim
+            and self.params.index_head_dim > 0
+            and (self.params.index_head_dim & (self.params.index_head_dim - 1)) == 0
+            and (self.params.compress_ratio & (self.params.compress_ratio - 1)) == 0
+        )
+        if fused_decode:
+            from .kernels import triton_qsa_decode_pre_indexer
+
+            logger.info_once(
+                "QSA fused decode pre-indexer Triton kernel is active",
+                key="qsa_fused_decode_pre_indexer_active",
+            )
+            return triton_qsa_decode_pre_indexer(
+                q=q_raw,
+                token_k=token_k,
+                position_coordinates=coordinates,
+                request_indices=metadata.qsa_req_idx_per_token[:num_tokens],
+                logical_positions=metadata.qsa_logical_positions[:num_tokens],
+                block_table=metadata.qsa_block_table,
+                index_cache=index_cache,
+                position_cache=position_cache,
+                q_norm_weight=self.q_layernorm.weight,
+                k_norm_weight=self.k_layernorm.weight,
+                cos_sin=rotary_cache.view(rotary_cache.shape[0], -1),
+                eps=self.q_layernorm.variance_epsilon,
+                tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+                compress_ratio=self.params.compress_ratio,
+                mrope_section=mrope_section,
+            )
+
+        q = self.q_layernorm(q_raw.reshape(-1, self.params.index_head_dim)).reshape_as(q_raw)
+        q = self._apply_rope(q, coordinates)
+        self.update_cache_and_compress(
+            layer_idx,
+            token_k,
+            coordinates,
+            metadata,
+        )
+        return q
+
     def update_cache_and_compress(
         self,
         layer_idx: int,

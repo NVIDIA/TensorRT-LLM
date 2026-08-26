@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
     select_qsa_paged_tokens,
     select_qsa_tokens,
 )
+from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import triton_qsa_decode_pre_indexer
 from tensorrt_llm._torch.attention_backend.sparse.qsa.module import _query_chunk_size
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2, MambaRole
 from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
@@ -225,6 +226,164 @@ def test_qsa_paged_selection_supports_multiple_rows_per_request() -> None:
         prefill_radix.sort(dim=1).values,
         prefill_torch.sort(dim=1).values,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_fused_decode_pre_indexer_matches_reference() -> None:
+    torch.manual_seed(42)
+    rows = 4
+    num_heads = 4
+    head_dim = 128
+    rotary_pairs = head_dim // 4
+    tokens_per_block = 8
+    compress_ratio = 4
+    max_positions = 32
+    q = torch.randn(
+        rows,
+        num_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    token_k = torch.randn(
+        rows,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q_reference_input = q.clone()
+    token_k_reference = token_k.clone()
+    request_indices = torch.arange(rows, dtype=torch.int32, device="cuda")
+    logical_positions = torch.tensor([3, 4, 7, 8], dtype=torch.int64, device="cuda")
+    block_table = torch.arange(rows * 2, dtype=torch.int32, device="cuda").reshape(rows, 2)
+    index_cache = torch.randn(
+        rows * 2,
+        tokens_per_block,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    position_cache = torch.empty(
+        rows * 2,
+        tokens_per_block,
+        3,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    for request in range(rows):
+        for logical in range(2 * tokens_per_block):
+            page_column, within = divmod(logical, tokens_per_block)
+            page = int(block_table[request, page_column])
+            position_cache[page, within] = torch.tensor(
+                [logical, logical + 1, logical + 2],
+                dtype=torch.int32,
+                device="cuda",
+            )
+    initial_index_cache = index_cache.clone()
+    initial_position_cache = position_cache.clone()
+    position_coordinates = torch.stack(
+        (
+            logical_positions,
+            logical_positions + 2,
+            logical_positions + 4,
+        ),
+        dim=1,
+    ).to(torch.int32)
+    q_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda") * 0.05
+    k_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda") * 0.05
+    angles = (
+        torch.arange(max_positions, device="cuda", dtype=torch.float32)[:, None]
+        * (torch.arange(rotary_pairs, device="cuda", dtype=torch.float32)[None, :] + 1)
+        / 97.0
+    )
+    cos_sin = torch.stack((angles.cos(), angles.sin()), dim=1)
+    mrope_section = (11, 11, 10)
+
+    def reference_norm_rope(
+        values: torch.Tensor,
+        positions: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        normalized = values.float()
+        normalized = normalized * torch.rsqrt(normalized.square().mean(dim=-1, keepdim=True) + 1e-6)
+        normalized = (normalized * (1.0 + weight.float())).to(torch.bfloat16)
+        pairs = torch.arange(rotary_pairs, device="cuda")
+        height_pair = (pairs % 3 == 1) & (pairs < 3 * mrope_section[1])
+        width_pair = (pairs % 3 == 2) & (pairs < 3 * mrope_section[2])
+        selected_positions = torch.where(
+            height_pair[None, :],
+            positions[:, 1, None],
+            torch.where(
+                width_pair[None, :],
+                positions[:, 2, None],
+                positions[:, 0, None],
+            ),
+        )
+        cosine = cos_sin[selected_positions, 0, pairs[None, :]]
+        sine = cos_sin[selected_positions, 1, pairs[None, :]]
+        first = normalized[..., :rotary_pairs]
+        second = normalized[..., rotary_pairs : 2 * rotary_pairs]
+        output = normalized.clone()
+        output[..., :rotary_pairs] = first * cosine[:, None, :] - second * sine[:, None, :]
+        output[..., rotary_pairs : 2 * rotary_pairs] = (
+            second * cosine[:, None, :] + first * sine[:, None, :]
+        )
+        return output
+
+    expected_q = reference_norm_rope(q_reference_input, position_coordinates, q_weight)
+    expected_index_cache = initial_index_cache.clone()
+    expected_position_cache = initial_position_cache.clone()
+    for row in range(rows):
+        request = int(request_indices[row])
+        logical = int(logical_positions[row])
+        page_column, within = divmod(logical, tokens_per_block)
+        page = int(block_table[request, page_column])
+        expected_position_cache[page, within] = position_coordinates[row]
+        stored = token_k_reference[row, 0]
+        if (logical + 1) % compress_ratio == 0:
+            group = []
+            for group_position in range(logical - compress_ratio + 1, logical + 1):
+                if group_position == logical:
+                    group.append(token_k_reference[row, 0])
+                    continue
+                group_page_column, group_within = divmod(group_position, tokens_per_block)
+                group_page = int(block_table[request, group_page_column])
+                group.append(initial_index_cache[group_page, group_within, 0])
+            pooled = torch.stack(group).float().mean(dim=0).to(torch.bfloat16)
+            first_logical = logical - compress_ratio + 1
+            first_page_column, first_within = divmod(first_logical, tokens_per_block)
+            first_page = int(block_table[request, first_page_column])
+            first_position = initial_position_cache[first_page, first_within].reshape(1, 3)
+            stored = reference_norm_rope(
+                pooled.reshape(1, 1, head_dim),
+                first_position,
+                k_weight,
+            )[0, 0]
+        expected_index_cache[page, within, 0] = stored
+
+    triton_qsa_decode_pre_indexer(
+        q=q,
+        token_k=token_k,
+        position_coordinates=position_coordinates,
+        request_indices=request_indices,
+        logical_positions=logical_positions,
+        block_table=block_table,
+        index_cache=index_cache,
+        position_cache=position_cache,
+        q_norm_weight=q_weight,
+        k_norm_weight=k_weight,
+        cos_sin=cos_sin.view(max_positions, -1),
+        eps=1e-6,
+        tokens_per_block=tokens_per_block,
+        compress_ratio=compress_ratio,
+        mrope_section=mrope_section,
+    )
+
+    torch.testing.assert_close(q, expected_q, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(index_cache, expected_index_cache, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(position_cache, expected_position_cache)
 
 
 def test_qsa_sparse_gqa_reads_hnd_paged_cache() -> None:

@@ -85,14 +85,10 @@ class QSASparseHooks(AttentionSparseHooks):
 
         num_tokens = attn_metadata.num_tokens
         hidden_states = hidden_states[:num_tokens]
-        q_index, token_k, coordinates = attention.indexer.project(
+        q_index = attention.indexer.project_and_update_cache(
             hidden_states,
             position_ids,
-        )
-        attention.indexer.update_cache_and_compress(
             attention.layer_idx,
-            token_k,
-            coordinates,
             attn_metadata,
         )
 
