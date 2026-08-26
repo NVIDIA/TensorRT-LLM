@@ -464,8 +464,8 @@ def test_histogram_selector_matches_reference_ties_and_forcing(num_blocks):
 def test_histogram_selector_matches_reference_mixed_length_batch():
     """Per-row valid-block bounds, from a single block up to the full row.
 
-    The histogram select reads each row through its own ``n_valid_blocks``
-    bound rather than a batch-wide one, so a batch whose rows span the trivial
+    The histogram select reads each row through its own n_valid_blocks bound
+    rather than a batch-wide one, so a batch whose rows span the trivial
     path, the boundary-sort path, and everything between must still agree.
     """
     num_kv_heads, num_blocks = 3, 2048
@@ -576,6 +576,55 @@ def test_histogram_selector_matches_reference_nonfinite():
 
     assert (expected[1] == -1).any(), "query 1 should exercise the -inf -> -1 rule"
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("num_nan", [16, 48])
+def test_histogram_selector_matches_reference_repeated_nan(num_nan):
+    """A row whose threshold bin holds more than one NaN.
+
+    NaN outranks every finite score and +inf, so a row with at least topk NaNs
+    makes the NaN bin the threshold bin and sends every NaN through the
+    boundary sort. That sort therefore has to rank NaN against NaN, which
+    comparing the scores as floats cannot do.
+    """
+    num_kv_heads, num_blocks, total_q = 2, 300, 3
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    scores = torch.randn(num_kv_heads, num_blocks, total_q, generator=generator, device="cuda")
+    nan_blocks = torch.arange(20, 20 + 2 * num_nan, 2, device="cuda")
+    scores[:, nan_blocks, :] = float("nan")
+    n_valid_blocks = torch.full((total_q,), num_blocks, device="cuda", dtype=torch.int32)
+
+    kwargs = dict(topk=16, n_valid_blocks=n_valid_blocks, init_blocks=0, local_blocks=0)
+    actual = select_blocks_from_maxscore(scores, **kwargs)
+
+    # The NaNs are bit-identical, so the smaller-block-index tie-break decides.
+    expected = nan_blocks[:16].to(torch.int32).view(1, 1, 16).expand(total_q, num_kv_heads, 16)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual, _reference_select_blocks(scores, **kwargs))
+
+
+@pytest.mark.parametrize("num_blocks", [HISTOGRAM_MIN_BLOCKS, 1023])
+def test_histogram_selector_matches_reference_contiguous_single_query(num_blocks):
+    """The float4 read path, which needs a unit block stride.
+
+    A [num_kv_heads, n_blocks, total_q] score tensor has block stride total_q,
+    so only a single-query batch reads through float4. An odd n_blocks with
+    several KV heads misaligns the row base for some heads and leaves a
+    remainder, so the scalar lead-in and the scalar tail run alongside the
+    vector body.
+    """
+    num_kv_heads = 3
+    generator = torch.Generator(device="cuda").manual_seed(23)
+    scores = torch.randn(num_kv_heads, num_blocks, 1, generator=generator, device="cuda")
+    assert scores.stride(1) == 1
+    assert num_blocks % 4 != 0
+    n_valid_blocks = torch.tensor([num_blocks], device="cuda", dtype=torch.int32)
+
+    kwargs = dict(topk=16, n_valid_blocks=n_valid_blocks, init_blocks=2, local_blocks=3)
+    assert torch.equal(
+        select_blocks_from_maxscore(scores, **kwargs),
+        _reference_select_blocks(scores, **kwargs),
+    )
 
 
 def test_histogram_selector_supports_strided_scores():

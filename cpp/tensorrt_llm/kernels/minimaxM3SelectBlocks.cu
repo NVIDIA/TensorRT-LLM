@@ -457,7 +457,7 @@ __global__ void minimaxM3SelectBlocks128Kernel(float const* __restrict__ scores,
 }
 
 // =============================================================================
-// Histogram (radix) select — for rows too long for the bitonic paths
+// Histogram (radix) select, for rows too long for the bitonic paths
 // =============================================================================
 //
 // The bitonic paths above stop at 128 blocks because that is the widest row
@@ -500,11 +500,20 @@ __global__ void minimaxM3SelectBlocks128Kernel(float const* __restrict__ scores,
 // A threshold bin wider than this forces another refinement step.
 constexpr int kNumFinalItems = 2048;
 
+// Maps float bits to an unsigned key that orders descending, so a smaller key
+// is a larger score and NaN sorts above +inf. This is the descending form of
+// the key torch.topk uses on CUDA, so the two agree on every bit pattern,
+// including NaN payloads and signed zeros. The radix bins are slices of this
+// key and the boundary sort compares it whole.
+__forceinline__ __device__ uint32_t orderedScoreKey(float x)
+{
+    uint32_t const bits = __float_as_uint(x);
+    return (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+}
+
 // Radix bin extraction. kNumBins picks the bin width: 2048 gives 11-bit bins
 // (indexerTopK's canonical config, and the only width whose step 3 is exact),
-// 1024 gives 10-bit bins. The transform maps float bits to an unsigned key that
-// orders descending, so bin 0 holds the largest values and NaN sorts above
-// +inf, matching torch.topk on CUDA.
+// 1024 gives 10-bit bins. Bin 0 holds the largest values.
 template <int step, int kNumBins>
 __forceinline__ __device__ uint32_t extractBinIdx(float x)
 {
@@ -512,14 +521,14 @@ __forceinline__ __device__ uint32_t extractBinIdx(float x)
     constexpr int kBinBits = kNumBins == 2048 ? 11 : 10;
     if constexpr (step == 0)
     {
+        // Step 0 bins an fp16 cast, so it needs the same transform at fp16 width.
         uint16_t bits = __half_as_ushort(__float2half(x));
         bits = (bits & 0x8000) ? bits : ~bits & 0x7fff;
         return bits >> (16 - kBinBits);
     }
     else
     {
-        uint32_t bits = __float_as_uint(x);
-        bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+        uint32_t const bits = orderedScoreKey(x);
         if constexpr (step == 1)
         {
             return bits >> (32 - kBinBits);
@@ -542,9 +551,7 @@ __forceinline__ __device__ bool isPartialMatch(float x, uint32_t pattern)
     {
         return true;
     }
-    uint32_t bits = __float_as_uint(x);
-    bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
-    return (bits ^ pattern) >> shift == 0;
+    return (orderedScoreKey(x) ^ pattern) >> shift == 0;
 }
 
 // Reads one row of scores, applying the init / local forcing, and hands each
@@ -627,20 +634,20 @@ __device__ bool processHistogramStep(float const* __restrict__ rowBase, int64_t 
     __syncthreads();
 
     constexpr int kBinBits = kNumBins == 2048 ? 11 : 10;
-    constexpr int patternShift = step < 2 ? 0 : step == 2 ? 32 - kBinBits : 32 - 2 * kBinBits;
+    constexpr int kPatternShift = step < 2 ? 0 : step == 2 ? 32 - kBinBits : 32 - 2 * kBinBits;
     if constexpr (step == 2)
     {
-        logitPattern = static_cast<uint32_t>(thresholdBinIdx & (kNumBins - 1)) << patternShift;
+        logitPattern = static_cast<uint32_t>(thresholdBinIdx & (kNumBins - 1)) << kPatternShift;
     }
     else if constexpr (step == 3)
     {
-        logitPattern |= static_cast<uint32_t>(thresholdBinIdx & (kNumBins - 1)) << patternShift;
+        logitPattern |= static_cast<uint32_t>(thresholdBinIdx & (kNumBins - 1)) << kPatternShift;
     }
 
     forEachScore(rowBase, blockStride, rowEnd, initBlocks, localStart, kNumThreadsPerBlock,
         [&](float score, int32_t /* block */)
         {
-            if (isPartialMatch<patternShift>(score, logitPattern))
+            if (isPartialMatch<kPatternShift>(score, logitPattern))
             {
                 atomicAdd(&smemFinal.histo.data[extractBinIdx<step, kNumBins>(score)], 1);
             }
@@ -690,7 +697,7 @@ __device__ bool processHistogramStep(float const* __restrict__ rowBase, int64_t 
     forEachScore(rowBase, blockStride, rowEnd, initBlocks, localStart, kNumThreadsPerBlock,
         [&](float score, int32_t block)
         {
-            if (!isPartialMatch<patternShift>(score, logitPattern))
+            if (!isPartialMatch<kPatternShift>(score, logitPattern))
             {
                 return;
             }
@@ -845,19 +852,23 @@ __global__ __launch_bounds__(kNumThreadsPerBlock) void minimaxM3SelectBlocksHist
         if (!continueToNextStep)
         {
             // The threshold bin fit the staging buffer: rank the staged
-            // boundary candidates by score, breaking ties towards the smaller
-            // block index, and emit the slots the steps above did not fill.
+            // boundary candidates and emit the slots the steps above did not
+            // fill. Ranking on the ordered key keeps this consistent with the
+            // bins that got the candidates here, and gives NaN a rank at all.
+            // Every float comparison against NaN is false, so ranking on the
+            // float would send a whole NaN threshold bin to one output slot
+            // and leave the other slots unwritten.
             int const baseIdx = smemFoundTopKValues[0];
             int const finalCount = smemFinalDstIdx[0];
             for (int i = threadIdx.x; i < finalCount; i += kNumThreadsPerBlock)
             {
-                float const logit = smemFinal.items.logits[i];
+                uint32_t const key = orderedScoreKey(smemFinal.items.logits[i]);
                 int const block = smemFinal.items.indices[i];
                 int outIndex = 0;
                 for (int j = 0; j < finalCount; ++j)
                 {
-                    float const otherLogit = smemFinal.items.logits[j];
-                    if (logit < otherLogit || (logit == otherLogit && block > smemFinal.items.indices[j]))
+                    uint32_t const otherKey = orderedScoreKey(smemFinal.items.logits[j]);
+                    if (key > otherKey || (key == otherKey && block > smemFinal.items.indices[j]))
                     {
                         ++outIndex;
                     }
