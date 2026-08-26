@@ -1977,6 +1977,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 text_ids=text_ids,
                 text_mask=text_mask,
                 control_latents=branch_control_latents,
+                offload_context=self.offloader.context_if_requested,
                 **shared_kwargs,
             )
             branch_caches[cache_key] = (
@@ -2414,7 +2415,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # input tensor's device.
         video = host_output
         if self.rank == 0 and use_guardrails and self.safety_checker is not None:
-            video = check_video_safety(video, self.safety_checker)
+            with self.offloader.context_if_requested(COSMOS3_VIDEO_GUARDRAIL_OFFLOAD_COMPONENT):
+                video = check_video_safety(video, self.safety_checker)
         # Back to the device the other pipelines hand back, now that denoising
         # has released its working set.
         if video is not None:

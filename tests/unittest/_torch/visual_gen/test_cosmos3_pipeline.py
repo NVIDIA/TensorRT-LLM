@@ -59,6 +59,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3Sampli
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
+from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
@@ -1239,8 +1240,10 @@ class TestCosmos3TextGuardrailBlocked:
     @staticmethod
     def _blocked_pipeline():
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
-        # __new__ skips BasePipeline.__init__, which is where ``_device`` is set.
+        # __new__ skips BasePipeline.__init__, which sets the device and offloader.
         pipeline._device = torch.device("cpu")
+        pipeline.pipeline_config = SimpleNamespace(cpu_offload_config=None)
+        pipeline.offloader = PipelineOffloader(pipeline)
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
         pipeline.audio_gen = False
         pipeline.audio_scheduler = None
