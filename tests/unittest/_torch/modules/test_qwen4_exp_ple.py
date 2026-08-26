@@ -32,7 +32,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modules.qwen4_exp_ple import PLEMetadata, Qwen4ExpPLE, _splitmix64
+from tensorrt_llm._torch.modules.qwen4_exp_ple import (
+    PLEMetadata,
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLE,
+    _splitmix64,
+)
 
 # Parity is measured against an independent per-token reference whose GEMMs /
 # conv have a different reduction shape than the batched module. TF32 (default-on
@@ -499,3 +504,66 @@ def test_ple_speculative_commit_selects_accepted_prefix_state() -> None:
     torch.testing.assert_close(context_pool[slots], torch.tensor([[100], [202]]))
     assert module._pending_conv_states is None
     assert module._pending_ngram_contexts is None
+
+
+def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> None:
+    from tensorrt_llm._torch.modules import qwen4_exp_ple
+
+    config = _make_config()
+    mapping = SimpleNamespace(tp_size=2, tp_rank=0, enable_attention_dp=True)
+    module = Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim=32,
+        dtype=torch.float32,
+        mapping=mapping,
+    )
+    full_weight = torch.arange(
+        module.padded_vocab_size * module.head_dim_per_ngram,
+        dtype=torch.float32,
+    ).reshape(module.padded_vocab_size, module.head_dim_per_ngram)
+    with torch.no_grad():
+        module.ngram_embedding.weight.copy_(
+            full_weight[module.vocab_start_index : module.vocab_end_index]
+        )
+
+    local_ids = torch.tensor(
+        [
+            [1, module.vocab_end_index + 1] * (NGRAM_HEADS // 2),
+            [module.vocab_end_index - 1, module.padded_vocab_size - 1] * (NGRAM_HEADS // 2),
+        ],
+        dtype=torch.long,
+    )
+    remote_ids = torch.tensor(
+        [[module.vocab_end_index + 3, 7] * (NGRAM_HEADS // 2)],
+        dtype=torch.long,
+    )
+    gathered_ids = torch.cat((local_ids, torch.zeros_like(local_ids[:1]), remote_ids))
+
+    def fake_allgather(input_ids, actual_mapping, dim, sizes):
+        assert actual_mapping is mapping
+        assert dim == 0
+        assert sizes == [3, 1]
+        torch.testing.assert_close(input_ids[:2], local_ids)
+        torch.testing.assert_close(input_ids[2], torch.zeros_like(input_ids[2]))
+        return gathered_ids
+
+    def fake_reducescatter(partial, actual_mapping, dim, sizes):
+        assert actual_mapping is mapping
+        assert dim == 0
+        assert sizes == [3, 1]
+        owned = gathered_ids < module.vocab_end_index
+        expected_partial = torch.zeros_like(partial)
+        expected_partial[owned] = full_weight[gathered_ids[owned]]
+        torch.testing.assert_close(partial, expected_partial)
+        return full_weight[gathered_ids[:3]]
+
+    monkeypatch.setattr(qwen4_exp_ple, "allgather", fake_allgather)
+    monkeypatch.setattr(qwen4_exp_ple, "reducescatter", fake_reducescatter)
+
+    output = module.embed(
+        local_ids,
+        physical_tokens=3,
+        all_rank_num_tokens=[3, 1],
+    )
+
+    torch.testing.assert_close(output, full_weight[local_ids])
