@@ -543,11 +543,20 @@ def _build_spec_metadata(spec_config,
 
 def get_mtp_hidden_size(model_config) -> int:
     pretrained_config = getattr(model_config, "pretrained_config", model_config)
+    if getattr(pretrained_config, "model_type", None) == "qwen4_exp":
+        pretrained_config = pretrained_config.text_config
     hidden_size = getattr(pretrained_config, "hidden_size", None)
     if hidden_size is None:
         hidden_size = getattr(model_config, "hidden_size")
-    if getattr(pretrained_config, "model_type", None) == "deepseek_v4":
-        return hidden_size * getattr(pretrained_config, "hc_mult", 1)
+    if getattr(pretrained_config, "model_type", None) in {
+            "deepseek_v4",
+            "qwen4_exp_text",
+    }:
+        return hidden_size * getattr(
+            pretrained_config,
+            "hc_mult",
+            getattr(pretrained_config, "hc_count", 1),
+        )
     return hidden_size
 
 
@@ -571,7 +580,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             return MTPEagleDynamicTreeResourceManager(
                 spec_config,
                 model_config.torch_dtype,
-                model_config.hidden_size,
+                get_mtp_hidden_size(model_config),
                 max_num_requests,
                 sa_manager=sa_manager,
             )

@@ -276,6 +276,27 @@ class AttentionLayerGroup(LayerGroup):
 
 
 @dataclass
+class MambaSideState:
+    """One replicated recurrent side-state role and its layer mapping."""
+
+    pool: PhysicalPool
+    layer_offsets: Dict[int, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "layer_offsets": {int(k): int(v) for k, v in self.layer_offsets.items()},
+            "pool": self.pool.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MambaSideState":
+        return cls(
+            layer_offsets={int(k): int(v) for k, v in data["layer_offsets"].items()},
+            pool=PhysicalPool.from_dict(data["pool"]),
+        )
+
+
+@dataclass
 class MambaLayerGroup(LayerGroup):
     """Layer group for Mamba SSM states."""
 
@@ -284,6 +305,7 @@ class MambaLayerGroup(LayerGroup):
     ssm_states: Optional[PhysicalPool] = None
     conv_section_bytes: Optional[List[int]] = None
     ssm_bytes_per_head: Optional[int] = None
+    side_states: Dict[str, MambaSideState] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -293,6 +315,9 @@ class MambaLayerGroup(LayerGroup):
             "ssm_states": self.ssm_states.to_dict(),
             "conv_section_bytes": self.conv_section_bytes,
             "ssm_bytes_per_head": self.ssm_bytes_per_head,
+            "side_states": {
+                role: state.to_dict() for role, state in sorted(self.side_states.items())
+            },
         }
 
     @classmethod
@@ -308,6 +333,10 @@ class MambaLayerGroup(LayerGroup):
             if conv_section_bytes is not None
             else None,
             ssm_bytes_per_head=int(ssm_bytes_per_head) if ssm_bytes_per_head is not None else None,
+            side_states={
+                str(role): MambaSideState.from_dict(state)
+                for role, state in data.get("side_states", {}).items()
+            },
         )
 
 

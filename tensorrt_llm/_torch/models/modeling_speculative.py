@@ -2206,6 +2206,9 @@ class MTPForCausalLM(nn.Module):
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+            case "qwen4_exp_text":
+                from .modeling_qwen4_exp import Qwen4ExpMTP
+                mtp_layer = Qwen4ExpMTP
             case "step3p7" | "step3p5":
                 from .modeling_step3p7 import Step3p7MTP
                 mtp_layer = Step3p7MTP

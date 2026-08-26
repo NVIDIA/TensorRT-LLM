@@ -438,6 +438,29 @@ class MambaPolicy:
             ):
                 _check_global(f"conv_section_bytes[{i}]", s, p)
 
+        overlapping_layers = set(self_mlg.mamba_layer_offsets) & set(peer_mlg.mamba_layer_offsets)
+        for role in sorted(set(self_mlg.side_states) | set(peer_mlg.side_states)):
+            self_state = self_mlg.side_states.get(role)
+            peer_state = peer_mlg.side_states.get(role)
+            self_layers = set(self_state.layer_offsets) if self_state is not None else set()
+            peer_layers = set(peer_state.layer_offsets) if peer_state is not None else set()
+            missing_layers = overlapping_layers & (self_layers ^ peer_layers)
+            if missing_layers:
+                raise ValueError(
+                    "MambaPolicy.validate_peer_compatible: recurrent "
+                    f"side-state role {role!r} differs for overlapping layers "
+                    f"{sorted(missing_layers)}"
+                )
+            if not (overlapping_layers & self_layers & peer_layers):
+                continue
+            if self_state.pool.slot_bytes != peer_state.pool.slot_bytes:
+                raise ValueError(
+                    "MambaPolicy.validate_peer_compatible: replicated recurrent "
+                    f"side-state role {role!r} slot_bytes differs "
+                    f"(local={self_state.pool.slot_bytes}, "
+                    f"peer={peer_state.pool.slot_bytes})"
+                )
+
     @staticmethod
     def _mamba_tp(ri: RankInfo) -> Tuple[int, int]:
         """Return (mamba_effective_tp_size, mamba_effective_tp_rank).
@@ -610,6 +633,34 @@ class MambaPolicy:
                 frag_size = rp.src.memory.bytes_per_region
                 kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
 
+        for role in sorted(set(self_mlg.side_states) & set(peer_mlg.side_states)):
+            self_state = self_mlg.side_states[role]
+            peer_state = peer_mlg.side_states[role]
+            side_layers = sorted(set(self_state.layer_offsets) & set(peer_state.layer_offsets))
+            if not side_layers:
+                continue
+            if self_state.pool.slot_bytes != peer_state.pool.slot_bytes:
+                raise ValueError(
+                    f"Recurrent side-state role {role!r} slot_bytes differs: "
+                    f"local={self_state.pool.slot_bytes}, "
+                    f"peer={peer_state.pool.slot_bytes}"
+                )
+            src_ptrs = MambaPolicy._build_layer_ptrs(
+                self_state.pool,
+                self_state.layer_offsets,
+                side_layers,
+                src_slot,
+            )
+            dst_ptrs = MambaPolicy._build_layer_ptrs(
+                peer_state.pool,
+                peer_state.layer_offsets,
+                side_layers,
+                dst_slot,
+            )
+            src_frags.extend(src_ptrs)
+            dst_frags.extend(dst_ptrs)
+            kv_sizes.extend([self_state.pool.slot_bytes] * len(side_layers))
+
         return src_frags, dst_frags, kv_sizes
 
     @staticmethod
@@ -637,7 +688,16 @@ class MambaPolicy:
             peer_mlg.mamba_layer_offsets.keys()
         )
         per_layer = peer_mlg.conv_states.slot_bytes + peer_mlg.ssm_states.slot_bytes
-        return len(overlap) * int(per_layer)
+        total = len(overlap) * int(per_layer)
+        for role in set(self_mlg.side_states) & set(peer_mlg.side_states):
+            peer_state = peer_mlg.side_states[role]
+            side_overlap = (
+                overlap
+                & set(self_mlg.side_states[role].layer_offsets)
+                & set(peer_state.layer_offsets)
+            )
+            total += len(side_overlap) * int(peer_state.pool.slot_bytes)
+        return total
 
     @staticmethod
     def payload_bytes(

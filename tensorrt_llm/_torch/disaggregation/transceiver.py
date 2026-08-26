@@ -397,6 +397,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     total += len(lg.mamba_layer_offsets) * (
                         lg.conv_states.slot_bytes + lg.ssm_states.slot_bytes
                     )
+                    total += sum(
+                        len(state.layer_offsets) * state.pool.slot_bytes
+                        for state in lg.side_states.values()
+                    )
                 continue
             if block_ids is None or block_ids.size == 0:
                 continue

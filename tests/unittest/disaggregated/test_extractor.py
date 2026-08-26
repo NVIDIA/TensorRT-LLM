@@ -20,6 +20,7 @@ import torch
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
+    _build_layer_group_for_v2_mamba,
     _build_v2_mamba_state_pool,
     build_page_table,
     build_page_table_from_manager,
@@ -36,6 +37,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_unique_layers,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2, MambaRole
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -661,7 +663,11 @@ def test_v2_builder_validates_role_mapper_declaration():
 
 @pytest.mark.cpu_only
 def test_mamba_layer_group_serialization():
-    from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup, PhysicalPool
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        MambaLayerGroup,
+        MambaSideState,
+        PhysicalPool,
+    )
 
     conv_pool = PhysicalPool(
         base_address=1000,
@@ -684,6 +690,18 @@ def test_mamba_layer_group_serialization():
         ssm_states=ssm_pool,
         conv_section_bytes=[512, 256, 256],
         ssm_bytes_per_head=128,
+        side_states={
+            "recurrent_side": MambaSideState(
+                pool=PhysicalPool(
+                    base_address=16000,
+                    slot_bytes=64,
+                    num_slots=10,
+                    slot_stride_bytes=640,
+                    layer_stride_bytes=128,
+                ),
+                layer_offsets={10: 0, 12: 1},
+            )
+        },
     )
 
     d = mlg.to_dict()
@@ -702,6 +720,9 @@ def test_mamba_layer_group_serialization():
     assert restored.ssm_states.slot_stride_bytes == 1024
     assert restored.conv_section_bytes == [512, 256, 256]
     assert restored.ssm_bytes_per_head == 128
+    assert restored.side_states["recurrent_side"].layer_offsets == {10: 0, 12: 1}
+    assert restored.side_states["recurrent_side"].pool.base_address == 16000
+    assert restored.side_states["recurrent_side"].pool.slot_stride_bytes == 640
 
     legacy_pool = PhysicalPool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
     assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
@@ -721,6 +742,41 @@ def test_v2_mamba_state_pool_uses_affine_layer_and_slot_strides():
     assert pool.num_slots == num_slots
     assert pool.slot_stride_bytes == 4 * state_bytes
     assert pool.layer_stride_bytes == 2 * state_bytes
+
+
+def test_v2_mamba_side_state_pool_allows_unrelated_coalesced_roles():
+    state_bytes = 64
+    storage = torch.empty((3, 7, state_bytes), dtype=torch.uint8)
+    states = [storage[:, 0, :], storage[:, 3, :]]
+
+    pool = _build_v2_mamba_state_pool(states)
+
+    assert pool.slot_stride_bytes == 7 * state_bytes
+    assert pool.layer_stride_bytes == 3 * state_bytes
+
+
+def test_v2_mamba_layer_group_includes_recurrent_side_states():
+    num_slots = 3
+    conv_storage = torch.empty((num_slots, 2, 4, 3), dtype=torch.float32)
+    ssm_storage = torch.empty((num_slots, 2, 2, 4, 5), dtype=torch.float32)
+    side_storage = torch.empty((num_slots, 3, 8), dtype=torch.int64)
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.mamba_layer_offsets = {10: 0, 11: 1}
+    manager.all_conv_states = [conv_storage[:, 0], conv_storage[:, 1]]
+    manager.all_ssm_states = [ssm_storage[:, 0], ssm_storage[:, 1]]
+    manager.conv_state_shape = [4, 3]
+    manager.conv_section_dims = [1, 1, 2]
+    manager.ssm_state_shape = [2, 4, 5]
+    manager._ple_ngram_contexts = {11: side_storage[:, 1]}
+    manager._ple_conv_states = {}
+
+    layer_group = _build_layer_group_for_v2_mamba(manager, pool_group_idx=2)
+
+    side_state = layer_group.side_states[str(MambaRole.PLE_NGRAM_CONTEXT)]
+    assert side_state.layer_offsets == {11: 0}
+    assert side_state.pool.base_address == side_storage[:, 1].data_ptr()
+    assert side_state.pool.num_slots == num_slots
+    assert side_state.pool.slot_bytes == 8 * side_storage.element_size()
 
 
 def test_v2_mamba_single_layer_pool_preserves_shared_role_footprint():

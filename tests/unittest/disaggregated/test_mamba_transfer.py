@@ -34,6 +34,7 @@ import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource import page
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -319,6 +320,111 @@ def test_mamba_policy_slot_major_interleaved_role_ptrs():
             1000 + 3 * state_bytes + 3 * physical_slot_bytes,
         ],
     )
+
+
+def _make_rank_info() -> RankInfo:
+    return RankInfo(
+        instance_name="test",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[2],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+
+
+def _make_mamba_group(*, base_address: int, side_bytes: int = 8):
+    return page.MambaLayerGroup(
+        pool_group_idx=0,
+        mamba_layer_offsets={1: 0, 2: 1},
+        conv_states=page.PhysicalPool(
+            base_address=base_address,
+            slot_bytes=16,
+            num_slots=4,
+            slot_stride_bytes=64,
+            layer_stride_bytes=16,
+        ),
+        ssm_states=page.PhysicalPool(
+            base_address=base_address + 256,
+            slot_bytes=16,
+            num_slots=4,
+            slot_stride_bytes=64,
+            layer_stride_bytes=16,
+        ),
+        conv_section_bytes=[4, 4, 8],
+        ssm_bytes_per_head=16,
+        side_states={
+            "recurrent_side": page.MambaSideState(
+                pool=page.PhysicalPool(
+                    base_address=base_address + 512,
+                    slot_bytes=side_bytes,
+                    num_slots=4,
+                    slot_stride_bytes=32,
+                    layer_stride_bytes=side_bytes,
+                ),
+                layer_offsets={2: 0},
+            )
+        },
+    )
+
+
+def test_mamba_policy_transfers_replicated_recurrent_side_state():
+    self_group = _make_mamba_group(base_address=1000)
+    peer_group = _make_mamba_group(base_address=10000)
+    rank_info = _make_rank_info()
+    self_page_table = page.KVCachePageTable(1, [self_group], [])
+    peer_page_table = page.KVCachePageTable(1, [peer_group], [])
+
+    peer.MambaPolicy.validate_peer_compatible(
+        rank_info,
+        rank_info,
+        self_page_table,
+        peer_page_table,
+    )
+    src, dst, sizes = peer.MambaPolicy.build_mamba_frags(
+        self_group,
+        peer_group,
+        src_slot=1,
+        dst_slot=2,
+        self_ri=rank_info,
+        peer_ri=rank_info,
+    )
+
+    assert src[-1] == 1000 + 512 + 32
+    assert dst[-1] == 10000 + 512 + 2 * 32
+    assert sizes[-1] == 8
+    assert len(src) == len(dst) == len(sizes) == 5
+    assert (
+        peer.MambaPolicy.receiver_payload_bytes(self_page_table, peer_page_table, dst_slot=2) == 72
+    )
+    assert (
+        peer.MambaPolicy.payload_bytes(
+            self_page_table,
+            peer_page_table,
+            dst_slot=2,
+            sender_ri=rank_info,
+            receiver_ri=rank_info,
+        )
+        == 72
+    )
+
+
+def test_mamba_policy_rejects_incompatible_recurrent_side_state():
+    self_group = _make_mamba_group(base_address=1000)
+    peer_group = _make_mamba_group(base_address=10000, side_bytes=16)
+    rank_info = _make_rank_info()
+
+    with pytest.raises(ValueError, match="side-state role.*slot_bytes differs"):
+        peer.MambaPolicy.validate_peer_compatible(
+            rank_info,
+            rank_info,
+            page.KVCachePageTable(1, [self_group], []),
+            page.KVCachePageTable(1, [peer_group], []),
+        )
 
 
 # ---------------------------------------------------------------------------

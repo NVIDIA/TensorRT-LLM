@@ -26,6 +26,7 @@ import triton.language as tl
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+    from tensorrt_llm._torch.pyexecutor.config_utils import Qwen4ExpPLECacheParams
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
@@ -124,6 +125,8 @@ class MambaRole:
 
     SSM_STATE = DataRole("ssm_state")
     CONV_STATE = DataRole("conv_state")
+    PLE_NGRAM_CONTEXT = DataRole("ple_token_state")
+    PLE_CONV_STATE = DataRole("ple_conv_state")
 
 
 def _mamba_effective_tp_size(mapping: Mapping) -> int:
@@ -2041,6 +2044,35 @@ def _estimate_mamba_hybrid_cache_cost(
     ) if local_attention_layers > 0 else 0)
     state_bytes_per_rank = (local_mamba_layers *
                             params.get_states_bytes_per_layer(mapping))
+    if not is_draft:
+        from tensorrt_llm._torch.pyexecutor.config_utils import (
+            extract_qwen4_exp_ple_cache_params, is_qwen4_exp)
+
+        pretrained_config = model_config.pretrained_config
+        if is_qwen4_exp(pretrained_config):
+            ple_params = extract_qwen4_exp_ple_cache_params(pretrained_config)
+            mamba_layer_mask, full_attention_layer_mask = params.get_layer_masks(
+                is_draft=False,
+                use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            )
+            combined_layer_mask = [
+                is_mamba or is_attention for is_mamba, is_attention in zip(
+                    mamba_layer_mask, full_attention_layer_mask)
+            ]
+            local_layer_indices, _ = get_pp_layers(
+                sum(combined_layer_mask),
+                mapping,
+                spec_config=spec_config,
+                layer_mask=combined_layer_mask,
+            )
+            local_ple_layers = sum(layer_id < len(ple_params.ple_layer_mask)
+                                   and ple_params.ple_layer_mask[layer_id]
+                                   for layer_id in local_layer_indices)
+            ple_bytes_per_layer = (
+                ple_params.short_conv_channels * ple_params.short_conv_state_len
+                * ple_params.conv_state_dtype.itemsize +
+                ple_params.ngram_context_len * torch.int64.itemsize)
+            state_bytes_per_rank += local_ple_layers * ple_bytes_per_layer
     max_resident_sequences = max_batch_size * mapping.pp_size
 
     if include_explicit_snapshots:
@@ -2879,6 +2911,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
+        qwen4_exp_ple_cache_params: Optional["Qwen4ExpPLECacheParams"] = None,
         **kwargs,
     ) -> None:
         if conv_state_layout not in ("x_b_c", "q_k_v"):
@@ -2929,6 +2962,47 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                                     max_batch_size))
         self._num_reserved_dummy_slots = (num_cuda_graph_padding_dummy_slots +
                                           int(mapping.enable_attention_dp))
+        # PLE n-gram and short-convolution states share the same V2 lifecycle
+        # and state indices as the GDN recurrent state.
+        self._qwen4_exp_ple_cache_params = qwen4_exp_ple_cache_params
+        self._ple_layer_ids: List[int] = []
+        self._ple_conv_state_shape: List[int] = []
+        self._ple_ngram_context_shape: List[int] = []
+        self._ple_conv_state_dtype = mamba_cache_dtype
+        if qwen4_exp_ple_cache_params is not None:
+            params = qwen4_exp_ple_cache_params
+            if len(params.ple_layer_mask) != total_layers:
+                raise ValueError(
+                    "PLE layer mask length must match the hybrid layer mask: "
+                    f"got {len(params.ple_layer_mask)}, expected {total_layers}"
+                )
+            self._ple_layer_ids = [
+                layer_id
+                for layer_id, active in enumerate(params.ple_layer_mask)
+                if active
+            ]
+            if len(self._ple_layer_ids) != params.num_ple_layers:
+                raise ValueError(
+                    "PLE layer mask count does not match num_ple_layers: "
+                    f"got {len(self._ple_layer_ids)}, expected "
+                    f"{params.num_ple_layers}")
+            if any(not self._mamba_layer_mask[layer_id]
+                   for layer_id in self._ple_layer_ids):
+                raise ValueError(
+                    "PLE lifecycle state must belong to Mamba layers")
+            if (params.short_conv_channels <= 0
+                    or params.short_conv_state_len <= 0
+                    or params.ngram_context_len <= 0):
+                raise ValueError(
+                    "PLE recurrent-state dimensions must be positive")
+            self._ple_conv_state_shape = [
+                params.short_conv_channels,
+                params.short_conv_state_len,
+            ]
+            self._ple_ngram_context_shape = [params.ngram_context_len]
+            self._ple_conv_state_dtype = params.conv_state_dtype
+        self._ple_conv_states: Dict[int, torch.Tensor] = {}
+        self._ple_ngram_contexts: Dict[int, torch.Tensor] = {}
         self.ssm_state_dtype = (mamba_ssm_cache_dtype if mamba_ssm_cache_dtype
                                 is not None else mamba_cache_dtype)
         self.conv_state_dtype = mamba_cache_dtype
@@ -3082,6 +3156,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     f"{required_live_slots} live/dummy slots. Increase the "
                     "KV cache budget or allocate a larger Mamba pool_ratio.")
             self._setup_states()
+            # PLE side-path pools share the mamba slot lifecycle: size them to
+            # the mamba state pool's slot count so any valid GDN ``state_index``
+            # (real request or CUDA-graph padding slot) is a valid PLE slot.
+            self._setup_ple_states(num_ssm_slots)
             self._setup_replay_buffers(spec_config)
             if self._use_gdn_cached_replay_all_layer_commit:
                 state_layout = ("affine"
@@ -3099,6 +3177,62 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.all_ssm_states = []
             self.all_conv_states = []
             self._setup_replay_buffers(spec_config)
+
+    def _setup_ple_states(self, num_state_slots: int) -> None:
+        """Bind PLE short-convolution and n-gram state to V2 buffers.
+
+        Each local PLE layer registers one replicated short-convolution view and
+        one int64 n-gram-context view. The views share the GDN slot lifecycle,
+        so block reuse, host offload, and model forward address the same state.
+        """
+        if not self._ple_layer_ids:
+            return
+        for layer_id in self._ple_layer_ids:
+            local_layer_idx = self.layer_offsets.get(layer_id)
+            if local_layer_idx is None:
+                continue
+            conv_state = self._get_state_buffer(
+                local_layer_idx,
+                MambaRole.PLE_CONV_STATE,
+                self._ple_conv_state_dtype,
+                self._ple_conv_state_shape,
+            )
+            ngram_context = self._get_state_buffer(
+                local_layer_idx,
+                MambaRole.PLE_NGRAM_CONTEXT,
+                dtype=torch.long,
+                state_shape=self._ple_ngram_context_shape,
+            )
+            if (conv_state.shape[0] != num_state_slots
+                    or ngram_context.shape[0] != num_state_slots):
+                raise RuntimeError(
+                    "PLE and GDN lifecycle buffers must have the same number "
+                    f"of slots: layer={layer_id}, GDN={num_state_slots}, "
+                    f"conv={conv_state.shape[0]}, "
+                    f"ngram={ngram_context.shape[0]}")
+            self._ple_conv_states[layer_id] = conv_state
+            self._ple_ngram_contexts[layer_id] = ngram_context
+        logger.info(
+            "PLE state views bound to V2 lifecycle buffers for local layers "
+            f"{sorted(self._ple_conv_states)}: conv "
+            f"[{num_state_slots}, {', '.join(map(str, self._ple_conv_state_shape))}] "
+            f"({self._ple_conv_state_dtype}), n-gram context "
+            f"[{num_state_slots}, {self._ple_ngram_context_shape[0]}] (int64)")
+
+    def ple_layer_cache(
+            self,
+            layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return the ``(short_conv_state, ngram_context)`` PLE pools for a layer.
+
+        Returns ``None`` when this layer has no PLE side path (or the model is
+        not Qwen4-Exp), so callers fall back cleanly. The tensors are the
+        persistent per-slot pools; the caller indexes them by ``state_indices``.
+        """
+        conv = self._ple_conv_states.get(layer_idx)
+        ngram = self._ple_ngram_contexts.get(layer_idx)
+        if conv is None or ngram is None:
+            return None
+        return conv, ngram
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
@@ -3190,7 +3324,33 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return self.max_batch_size * self.mapping.pp_size
 
     def _mamba_state_bytes_per_slot(self) -> int:
-        return self.local_num_mamba_layers * (self.ssm_bytes + self.conv_bytes)
+        base_bytes = self.local_num_mamba_layers * (self.ssm_bytes +
+                                                    self.conv_bytes)
+        local_ple_layers = sum(layer_id in self.pp_layers
+                               for layer_id in self._ple_layer_ids)
+        if local_ple_layers == 0:
+            return base_bytes
+        ple_bytes = (
+            math.prod(self._ple_conv_state_shape) *
+            self._ple_conv_state_dtype.itemsize +
+            math.prod(self._ple_ngram_context_shape) * torch.int64.itemsize)
+        return base_bytes + local_ple_layers * ple_bytes
+
+    def _ple_buffer_configs(self) -> List[BufferConfig]:
+        if not self._ple_layer_ids:
+            return []
+        return [
+            BufferConfig(
+                role=MambaRole.PLE_NGRAM_CONTEXT,
+                size=(math.prod(self._ple_ngram_context_shape) *
+                      torch.int64.itemsize),
+            ),
+            BufferConfig(
+                role=MambaRole.PLE_CONV_STATE,
+                size=(math.prod(self._ple_conv_state_shape) *
+                      self._ple_conv_state_dtype.itemsize),
+            ),
+        ]
 
     def _num_ssm_snapshots_for_capacity(
         self,
@@ -3328,14 +3488,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
             if self._mamba_layer_mask[global_layer_idx]:
                 layer_id = LayerId(local_layer_idx)
+                buffers = [
+                    BufferConfig(role=MambaRole.SSM_STATE, size=self.ssm_bytes),
+                    BufferConfig(role=MambaRole.CONV_STATE,
+                                 size=self.conv_bytes),
+                ]
+                if global_layer_idx in self._ple_layer_ids:
+                    buffers.extend(self._ple_buffer_configs())
                 layers[local_layer_idx] = SsmLayerConfig(
                     layer_id=layer_id,
-                    buffers=[
-                        BufferConfig(role=MambaRole.SSM_STATE,
-                                     size=self.ssm_bytes),
-                        BufferConfig(role=MambaRole.CONV_STATE,
-                                     size=self.conv_bytes),
-                    ],
+                    buffers=buffers,
                 )
 
         dummy_requests = [
@@ -3465,6 +3627,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     device=reference.device,
                 )
 
+    def get_disagg_recurrent_side_states(
+        self, ) -> Dict[str, Dict[int, torch.Tensor]]:
+        """Return replicated per-layer state roles transferred with SSM state.
+
+        Keys are stable native role names. Each value maps global layer IDs to
+        lifecycle-owned state views whose first dimension is the state slot.
+        PLE state is replicated rather than tensor-parallel sharded and is
+        transferred as two native side-state roles.
+        """
+        return {
+            str(MambaRole.PLE_NGRAM_CONTEXT): dict(self._ple_ngram_contexts),
+            str(MambaRole.PLE_CONV_STATE): dict(self._ple_conv_states),
+        }
+
     def _setup_replay_buffers(self, spec_config) -> None:
         cache_size = 0
         device = None
@@ -3552,6 +3728,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         yield from self.all_ssm_states
         yield from self.all_conv_states
+        yield from self._ple_ngram_contexts.values()
+        yield from self._ple_conv_states.values()
 
     def add_dummy_requests(
         self,
@@ -3799,6 +3977,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._gdn_cached_replay_state_strides = None
         self.all_ssm_states = []
         self.all_conv_states = []
+        self._ple_ngram_contexts = {}
+        self._ple_conv_states = {}
         self.intermediate_ssm_states = None
         self.intermediate_conv_states = None
         self.intermediate_state_indices = None

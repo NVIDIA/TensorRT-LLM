@@ -32,6 +32,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     LayerGroup,
     LocalLayer,
     MambaLayerGroup,
+    MambaSideState,
     MapperKind,
     PhysicalPool,
     PhysicalPoolGroup,
@@ -49,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.logger import logger
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -190,12 +192,16 @@ def _build_v2_mamba_state_pool(states: Sequence[torch.Tensor]) -> PhysicalPool:
     slot_stride_bytes = _slot_stride_bytes(first_state)
 
     num_layers = len(states)
-    if slot_stride_bytes % num_layers != 0:
-        raise ValueError("V2 Mamba physical slot must divide evenly across layers")
-    # Each role appears once per layer in its size-class pool. Equal-size SSM
-    # and convolution states share that pool and are interleaved, so their
-    # layer stride includes both role payloads.
-    layer_stride_bytes = slot_stride_bytes // num_layers
+    # Derive this role's layer stride from its views instead of assuming the
+    # physical slot contains only this role. V2 may coalesce unrelated,
+    # equal-size side-state roles into one size-class pool.
+    layer_stride_bytes = (
+        int(states[1].data_ptr()) - base_address if num_layers > 1 else slot_stride_bytes
+    )
+    if layer_stride_bytes < slot_bytes:
+        raise ValueError("V2 Mamba state tensors must have a valid layer stride")
+    if (num_layers - 1) * layer_stride_bytes + slot_bytes > slot_stride_bytes:
+        raise ValueError("V2 Mamba state tensors must fit inside one physical slot")
 
     for layer_offset, state in enumerate(states):
         state_slot_bytes = int(state[0].numel() * state.element_size())
@@ -249,6 +255,31 @@ def _build_layer_group_for_v2_mamba(
     ssm_elem_size = first_ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
+    side_states = {}
+    for role, states_by_layer in manager.get_disagg_recurrent_side_states().items():
+        if not role:
+            raise ValueError("V2 recurrent side-state role names must be non-empty")
+        if not states_by_layer:
+            continue
+        layer_ids = sorted(int(layer_id) for layer_id in states_by_layer)
+        states = [states_by_layer[layer_id] for layer_id in layer_ids]
+        pool = _build_v2_mamba_state_pool(states)
+        if pool.num_slots != conv_pool.num_slots:
+            raise ValueError(
+                f"V2 recurrent side state {role!r} must have the same number "
+                "of slots as the standard recurrent state"
+            )
+        side_states[str(role)] = MambaSideState(
+            pool=pool,
+            layer_offsets={layer_id: offset for offset, layer_id in enumerate(layer_ids)},
+        )
+    if side_states:
+        role_summary = ", ".join(
+            f"{role}:layers={sorted(state.layer_offsets)}:slot_bytes={state.pool.slot_bytes}"
+            for role, state in sorted(side_states.items())
+        )
+        logger.info(f"V2 recurrent side-state transfer roles registered: {role_summary}")
+
     return MambaLayerGroup(
         pool_group_idx=pool_group_idx,
         mamba_layer_offsets=mamba_layer_offsets,
@@ -256,6 +287,7 @@ def _build_layer_group_for_v2_mamba(
         ssm_states=ssm_pool,
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
+        side_states=side_states,
     )
 
 
