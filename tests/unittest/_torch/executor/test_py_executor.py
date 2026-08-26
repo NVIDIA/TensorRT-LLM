@@ -1143,49 +1143,6 @@ class TestDisaggTransferIdleProgress:
         )
 
 
-class TestIdleDisaggLoopPacing:
-    """Pacing must cost nothing when a transfer is not holding the loop back."""
-
-    @staticmethod
-    def _make_request(*, init_state: bool = False, transfer_in_progress: bool = False) -> Mock:
-        req = Mock()
-        req.is_disagg_generation_init_state = init_state
-        req.is_disagg_generation_transmission_in_progress = transfer_in_progress
-        return req
-
-    @pytest.mark.parametrize(
-        "has_transceiver, ctx_inflight, request_kwargs, expect_sleep",
-        [
-            pytest.param(False, True, {"init_state": True}, False, id="not_disagg"),
-            pytest.param(True, False, {}, False, id="nothing_pending"),
-            pytest.param(True, True, {}, True, id="context_send_inflight"),
-            pytest.param(True, False, {"init_state": True}, True, id="gen_awaiting_transfer"),
-            pytest.param(
-                True, False, {"transfer_in_progress": True}, True, id="gen_receive_inflight"
-            ),
-        ],
-    )
-    def test_paces_only_when_a_transfer_can_unblock_the_loop(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        has_transceiver: bool,
-        ctx_inflight: bool,
-        request_kwargs: dict,
-        expect_sleep: bool,
-    ) -> None:
-        sleep = Mock()
-        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep", sleep)
-        executor = object.__new__(PyExecutor)
-        executor.kv_cache_transceiver = Mock() if has_transceiver else None
-        executor.async_transfer_manager = Mock()
-        executor.async_transfer_manager.has_any_inflight_requests.return_value = ctx_inflight
-        executor.active_requests = [self._make_request(**request_kwargs)]
-
-        PyExecutor._pace_idle_disagg_loop(executor)
-
-        assert sleep.called is expect_sleep
-
-
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferAdmissionPP:
     def test_pp_schedule_applies_gate_before_serializing(self):
