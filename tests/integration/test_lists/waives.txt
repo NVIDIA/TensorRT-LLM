@@ -111,7 +111,6 @@ examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_agai
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_v2v_lpips_against_golden SKIP (https://nvbugs/6655359)
 examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4] SKIP (https://nvbugs/6572800)
 examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-nvfp4] SKIP (https://nvbugs/6572800)
-examples/visual_gen/test_visual_gen_glm.py::test_glm_image_feature_accuracy_against_golden[nvfp4] SKIP (https://nvbugs/6644450)
 examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend SKIP (https://nvbugs/6668775)
 examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example SKIP (https://nvbugs/6641122)
 examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[cuda-graph] SKIP (https://nvbugs/6655986)
