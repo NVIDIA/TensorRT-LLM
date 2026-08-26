@@ -110,11 +110,15 @@ def is_power():
 
 def get_linux_distribution():
     try:
-        import distro
-        return (distro.id(), distro.version(), distro.codename())
-    except:
+        release = platform.freedesktop_os_release()
+        return (
+            release.get("ID", "na"),
+            release.get("VERSION_ID", "na"),
+            release.get("VERSION_CODENAME", "na"),
+        )
+    except OSError:
         logger.warning(
-            "Unable to use distro module, defaulting operating system to ('na', 'na', 'na')"
+            "Unable to read the operating system release, defaulting to ('na', 'na', 'na')"
         )
         return ("na", "na", "na")
 
