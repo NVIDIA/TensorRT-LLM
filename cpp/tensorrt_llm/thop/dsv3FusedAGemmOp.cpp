@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,8 +37,11 @@ th::Tensor dsv3_fused_a_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b
     // auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     auto const data_type = mat_a.scalar_type();
-    constexpr int kHdIn = 7168;
-    constexpr int kHdOut = 2112;
+    // Supported fused-A shapes (hd_in -> hd_out), one instantiation set per model:
+    //   DeepSeek-V3/V3.2: 7168 -> 2112 (fused q_a + kv_a down-proj)
+    //   GLM MoE DSA:      6144 -> 2624 (kv_a_proj_with_mqa, GlmMoeDsaForCausalLM)
+    bool const is_dsv3_shape = (hd_in == 7168 && hd_out == 2112);
+    bool const is_glm_shape = (hd_in == 6144 && hd_out == 2624);
     std::vector<int64_t> output_size = {num_tokens, hd_out};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
 
@@ -50,7 +53,7 @@ th::Tensor dsv3_fused_a_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b
     if (sm >= 90)
     {
         bool use_custom_kernel = false;
-        if (num_tokens >= 1 && num_tokens <= 16 && hd_in == kHdIn && hd_out == kHdOut && data_type == torch::kBFloat16
+        if (num_tokens >= 1 && num_tokens <= 16 && (is_dsv3_shape || is_glm_shape) && data_type == torch::kBFloat16
             && out_dtype_ == torch::kBFloat16)
         {
             use_custom_kernel = true;
@@ -58,19 +61,43 @@ th::Tensor dsv3_fused_a_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b
         if (use_custom_kernel)
         {
             auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-            if (num_tokens <= 8)
+            auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr());
+            auto const* a_ptr = reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr());
+            auto const* b_ptr = reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr());
+            // tile_n = 8 for num_tokens <= 8, else 16. Instantiations exist per supported shape.
+            // tile_m: 16 for DSV3 (132 CTAs); 32 for GLM (82 CTAs, halved from 164 to reduce waves).
+            if (is_dsv3_shape)
             {
-                tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 8>(
-                    reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
-                    reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-                    reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens, stream);
+                if (num_tokens <= 8)
+                {
+                    tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8, 16>(
+                        out_ptr, a_ptr, b_ptr, num_tokens, stream);
+                }
+                else
+                {
+                    tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16, 16>(
+                        out_ptr, a_ptr, b_ptr, num_tokens, stream);
+                }
+            }
+            else if (is_glm_shape)
+            {
+                if (num_tokens <= 8)
+                {
+                    tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, 6144, 2624, 8, 32>(
+                        out_ptr, a_ptr, b_ptr, num_tokens, stream);
+                }
+                else
+                {
+                    tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, 6144, 2624, 16, 32>(
+                        out_ptr, a_ptr, b_ptr, num_tokens, stream);
+                }
             }
             else
             {
-                tk::dsv3MinLatencyKernels::invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 16>(
-                    reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
-                    reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-                    reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), num_tokens, stream);
+                // Unreachable: use_custom_kernel is only set for is_dsv3_shape || is_glm_shape,
+                // both handled above. Internal-invariant guard so that adding a shape to the gate
+                // without a matching dispatch branch fails loudly instead of silently.
+                TORCH_INTERNAL_ASSERT(false, "dsv3_fused_a_gemm_op: gated shape has no dispatch branch");
             }
         }
         else

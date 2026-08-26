@@ -7,9 +7,13 @@ def fused_a_gemm_ref(input, weight, bias, dtype):
     return logits_ref
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5])
-@pytest.mark.parametrize("hd_out", [2112])
-@pytest.mark.parametrize("hd_in", [7168])
+# (hd_in, hd_out) of the fused A-projection weight, one pair per supported model shape:
+#   DeepSeek-V3/V3.2:   7168 -> 2112 (fused q_a + kv_a down-proj),  dispatched at tile_m=16.
+#   GlmMoeDsaForCausalLM: 6144 -> 2624 (kv_a_proj_with_mqa),        dispatched at tile_m=32.
+@pytest.mark.parametrize("hd_in, hd_out", [(7168, 2112), (6144, 2624)])
+# num_tokens spans the tile_n dispatch boundary (<=8 uses tile_n=8, >8 uses tile_n=16)
+# and the full fused range [1, 16].
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 8, 9, 16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_a_gemm_run(num_tokens, hd_out, hd_in, dtype):
     torch.manual_seed(24)
