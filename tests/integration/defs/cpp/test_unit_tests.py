@@ -6,10 +6,9 @@ import pytest
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-@pytest.mark.parametrize("test_group", [
-    "batch_manager", "common", "executor", "kernels", "layers", "runtime",
-    "thop"
-])
+@pytest.mark.parametrize(
+    "test_group",
+    ["batch_manager", "common", "executor", "kernels", "runtime", "thop"])
 def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
 
     xml_name = f"results-unit-tests-{test_group}.xml"

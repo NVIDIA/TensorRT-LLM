@@ -589,8 +589,6 @@
    "cpp/test_unit_tests.py::test_unit_tests[executor-80]": 152.0915,
    "cpp/test_unit_tests.py::test_unit_tests[kernels-80]": 901.1726,
    "cpp/test_unit_tests.py::test_unit_tests[kernels-90]": 744.9493938618926,
-   "cpp/test_unit_tests.py::test_unit_tests[layers-80]": 916.0591999999999,
-   "cpp/test_unit_tests.py::test_unit_tests[layers-90]": 800.9129719387755,
    "cpp/test_unit_tests.py::test_unit_tests[runtime-80]": 660.1636,
    "cpp/test_unit_tests.py::test_unit_tests[thop-80]": 3.2278000000000002,
    "cpp/test_unit_tests.py::test_unit_tests[thop-90]": 3.546890306122449,
