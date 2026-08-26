@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import time
 from dataclasses import dataclass, field
@@ -461,16 +475,19 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                             arguments=call_item.parameters,
                         ),
                     ))
-        # Keep token-bearing chunks visible even when detokenization has no
-        # text to flush yet.
-        if (tool_calls or delta_text or reasoning_delta_text
-                or output.finish_reason or has_token_delta):
-            delta_message = DeltaMessage(
-                content=delta_text,
-                reasoning_content=reasoning_delta_text,
-                tool_calls=tool_calls if tool_calls else None)
-        else:
-            continue
+            # Keep token-bearing chunks visible even when detokenization has
+            # no text to flush yet. Only this branch builds ``delta_message``
+            # here; the forced branch above builds its own and must not have
+            # it rebuilt with ``content``, since a forced call produces no
+            # assistant text.
+            if (tool_calls or delta_text or reasoning_delta_text
+                    or output.finish_reason or has_token_delta):
+                delta_message = DeltaMessage(
+                    content=delta_text,
+                    reasoning_content=reasoning_delta_text,
+                    tool_calls=tool_calls if tool_calls else None)
+            else:
+                continue
 
         choice = ChatCompletionResponseStreamChoice(
             index=i,

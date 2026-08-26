@@ -5135,6 +5135,11 @@ class TestForcedToolChoicePostprocessing:
         assert named[0]["tool_calls"][0]["function"]["name"] == "get_weather"
         assert len([d for d in tool_deltas
                     if d["tool_calls"][0].get("id")]) == 1
+        # A forced call produces no assistant text. Content here means the raw
+        # generation -- including the overrun tail -- leaked into the message.
+        assert not any(d.get("content") for d in deltas), (
+            "forced call leaked content: "
+            f"{[d.get('content') for d in deltas if d.get('content')]}")
 
     def test_forced_choice_k3_streaming_extracts(self, sample_tools):
         """Extract the forced call from a streamed K3 response.

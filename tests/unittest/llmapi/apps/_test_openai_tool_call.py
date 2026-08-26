@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import os
 import sys
@@ -52,7 +66,7 @@ def model_name() -> str:
 
 
 @pytest.fixture(scope="module")
-def extra_llm_api_options_file():
+def extra_llm_api_options_file() -> str:
     # A named ``tool_choice`` constrains the forced call's arguments with
     # JSON-schema guided decoding. Without a backend configured the constraint
     # is silently dropped, so the server rejects the request outright -- these
@@ -69,7 +83,8 @@ def extra_llm_api_options_file():
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, extra_llm_api_options_file: str):
+def server(model_name: str,
+           extra_llm_api_options_file: str) -> RemoteOpenAIServer:
     model_path = get_model_path(model_name)
     args = [
         "--tool_parser", "qwen3", "--extra_llm_api_options",
@@ -80,7 +95,7 @@ def server(model_name: str, extra_llm_api_options_file: str):
 
 
 @pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer):
+def client(server: RemoteOpenAIServer) -> openai.AsyncOpenAI:
     return server.get_async_client()
 
 
