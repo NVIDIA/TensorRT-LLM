@@ -50,3 +50,11 @@ cd ../..
 rm -rf Mooncake
 
 echo "export LD_LIBRARY_PATH=${MOONCAKE_INSTALL_PATH}/lib:\$LD_LIBRARY_PATH" >> "${ENV}"
+
+# The source build above only produces the C++ transfer engine, which is what
+# the cache transceiver links against. MooncakeDistributedStore -- the shared
+# CPU pool behind the mooncake-store KV cache connector -- is only reachable
+# through the Python bindings, and those are not part of the CMake install. Take
+# them from the wheel at the same upstream version so the store client and the
+# transfer engine cannot drift apart.
+pip3 install --no-cache-dir "mooncake-transfer-engine==${MOONCAKE_VERSION#v}"
