@@ -17,6 +17,7 @@ import os
 import platform
 import threading
 import typing
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 
 import torch
@@ -31,7 +32,7 @@ from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_pybind11_abi
 from tensorrt_llm.bindings import internal as _tllm_internal
-from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+from tensorrt_llm.bindings.internal.runtime import (McastGPUBuffer, MnnvlTransport, MnnvlWorkspace)
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
@@ -46,10 +47,62 @@ from tensorrt_llm.mapping import Mapping
 _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
     "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1") == "1")
 
+_MNNVL_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_MNNVL_SUPPORTED_GROUP_SIZES = frozenset((2, 4, 8, 16, 32, 64))
 _MNNVL_ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 _MNNVL_NUM_LAMPORT_BUFFERS = 3
 _MNNVL_BUFFER_ALIGNMENT_BYTES = 32
 _MNNVL_MAX_BUFFER_SIZE_BYTES = ((2**32 - 1) // _MNNVL_BUFFER_ALIGNMENT_BYTES) * _MNNVL_BUFFER_ALIGNMENT_BYTES
+
+@dataclass(frozen=True)
+class _MnnvlDispatchPlan:
+    transport: Optional[MnnvlTransport] = None
+    unsupported_reason: Optional[str] = None
+
+    @property
+    def is_supported(self) -> bool:
+        return self.transport is not None
+
+
+class _MnnvlUnavailableError(RuntimeError):
+    """Expected, collectively reported MNNVL preflight unavailability."""
+
+
+def _get_mnnvl_dispatch_plan(
+    mapping: Mapping,
+    dtype: Optional[torch.dtype],
+) -> _MnnvlDispatchPlan:
+    """Resolve mapping policy only; runtime qualification belongs to C++."""
+    if dtype not in _MNNVL_SUPPORTED_DTYPES:
+        return _MnnvlDispatchPlan(
+            unsupported_reason=f"dtype must be one of {_MNNVL_SUPPORTED_DTYPES}, got {dtype}"
+        )
+    if mapping.has_cp():
+        return _MnnvlDispatchPlan(
+            unsupported_reason="context parallelism is not supported")
+    if mapping.enable_attention_dp:
+        return _MnnvlDispatchPlan(
+            unsupported_reason="attention data parallelism is not supported")
+    if mapping.tp_size not in _MNNVL_SUPPORTED_GROUP_SIZES:
+        return _MnnvlDispatchPlan(
+            unsupported_reason=
+            f"TP size must be one of {sorted(_MNNVL_SUPPORTED_GROUP_SIZES)}, got {mapping.tp_size}"
+        )
+
+    tp_group = list(mapping.tp_group)
+    if (len(tp_group) != mapping.tp_size
+            or len(set(tp_group)) != mapping.tp_size
+            or mapping.rank not in tp_group):
+        return _MnnvlDispatchPlan(
+            unsupported_reason=
+            f"TP group {tp_group} is inconsistent with TP size {mapping.tp_size} and rank {mapping.rank}"
+        )
+
+    group_node_ranks = {mapping.get_node_rank(rank) for rank in tp_group}
+    force_fabric = (os.environ.get("TRTLLM_FORCE_MNNVL_AR_FABRIC", "0") == "1" or os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1")
+    transport = (MnnvlTransport.FABRIC if force_fabric
+                 or len(group_node_ranks) > 1 else MnnvlTransport.POSIX_FD)
+    return _MnnvlDispatchPlan(transport=transport)
 
 _thread_local = threading.local()
 
@@ -96,7 +149,7 @@ class _MpiCommProtocol(Protocol):
 
 
 class _MnnvlWorkspace(TypedDict):
-    handle: McastGPUBuffer
+    handle: MnnvlWorkspace
     uc_buffer: torch.Tensor
     buffer_flags: torch.Tensor
     buffer_size_bytes: int
@@ -224,6 +277,14 @@ def _make_mnnvl_mcast_buffer(comm, workspace_size_bytes: int, mapping: Mapping,
     )
 
 
+def _make_mnnvl_workspace(comm, workspace_size_bytes: int, mapping: Mapping,
+                           transport: MnnvlTransport) -> MnnvlWorkspace:
+    if mpi_disabled():
+        return MnnvlWorkspace(workspace_size_bytes, transport, _mnnvl_device_index(mapping),
+                              process_group=comm, pybind11_abi=torch_pybind11_abi())
+    return MnnvlWorkspace(workspace_size_bytes, transport, _mnnvl_device_index(mapping), comm.py2f())
+
+
 def _mnnvl_workspace_size(comm) -> int:
     """Number of ranks in the communicator returned by _get_mnnvl_workspace_comm."""
     return comm.size() if mpi_disabled() else comm.Get_size()
@@ -251,7 +312,8 @@ def _mnnvl_workspace_all_succeeded(comm, local_success: bool) -> bool:
 def get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,
-        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
+        buffer_size_bytes: Optional[int] = None, *,
+        transport: Optional[MnnvlTransport] = None) -> _MnnvlWorkspace:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
@@ -271,7 +333,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
     with workspace_lock:
         return _mark_if_capturing(
             _get_or_scale_allreduce_mnnvl_workspace(mapping, dtype,
-                                                    buffer_size_bytes))
+                                                    buffer_size_bytes, transport=transport))
 
 
 def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
@@ -284,7 +346,8 @@ def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
 def _get_or_scale_allreduce_mnnvl_workspace(
         mapping: Mapping,
         dtype: torch.dtype,
-        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
+        buffer_size_bytes: Optional[int] = None, *,
+        transport: Optional[MnnvlTransport] = None) -> _MnnvlWorkspace:
 
     NUM_LAMPORT_BUFFERS = 3
 
@@ -300,7 +363,8 @@ def _get_or_scale_allreduce_mnnvl_workspace(
     # A safe method to get the element size of the dtype
     elem_size = torch.tensor([], dtype=dtype).element_size()
     force_mn = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
-    use_fabric_handle = force_mn or mapping.is_multi_node()
+    if transport is None:
+        transport = MnnvlTransport.FABRIC if force_mn or mapping.is_multi_node() else MnnvlTransport.POSIX_FD
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
             mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
@@ -342,23 +406,20 @@ def _get_or_scale_allreduce_mnnvl_workspace(
             buffer_size_bytes = ((buffer_size_bytes + _MNNVL_BUFFER_ALIGNMENT_BYTES - 1) // _MNNVL_BUFFER_ALIGNMENT_BYTES) * _MNNVL_BUFFER_ALIGNMENT_BYTES
             # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
             workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
-            mcast_buf_handle = _make_mnnvl_mcast_buffer(comm,
+            mcast_buf_handle = _make_mnnvl_workspace(comm,
                                                         workspace_size_bytes,
                                                         mapping,
-                                                        use_fabric_handle)
-            usable_size = mcast_buf_handle.get_buffer_size()
+                                                        transport)
+            if not mcast_buf_handle.is_available:
+                raise _MnnvlUnavailableError(mcast_buf_handle.reason)
+            usable_size = mcast_buf_handle.get_workspace_size()
             buffer_size_bytes = min(usable_size // NUM_LAMPORT_BUFFERS, _MNNVL_MAX_BUFFER_SIZE_BYTES)
             buffer_size_bytes -= buffer_size_bytes % _MNNVL_BUFFER_ALIGNMENT_BYTES
             if buffer_size_bytes < workspace_size_bytes // NUM_LAMPORT_BUFFERS:
                 raise RuntimeError("[MNNVL] Allocator returned insufficient usable capacity")
             workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
             # We use per FP32 element in the buffer for lamport sync
-            buffer = mcast_buf_handle.get_uc_buffer(
-                mapping.tp_rank,
-                (workspace_size_bytes // torch.float32.itemsize, ),
-                torch.float32,
-                0,
-            )
+            buffer = mcast_buf_handle.get_local_buffer()[:workspace_size_bytes // torch.float32.itemsize]
             # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages,
             # numBytesToClear[4], access count ptr]. Filled in by
             # _initialize_allreduce_mnnvl_protocol once every rank has its buffers.
@@ -378,6 +439,8 @@ def _get_or_scale_allreduce_mnnvl_workspace(
         except Exception as error:
             candidate_error = error
 
+        if not _mnnvl_workspace_all_succeeded(comm, not isinstance(candidate_error, _MnnvlUnavailableError)):
+            raise _MnnvlUnavailableError("MNNVL runtime preflight is unavailable on one or more ranks") from candidate_error
         if not _mnnvl_workspace_all_succeeded(comm, candidate_error is None):
             raise RuntimeError(
                 "MNNVL workspace construction failed on at least one rank"
@@ -822,19 +885,17 @@ class MNNVLAllReduce(nn.Module):
             return cls._allreduce_mnnvl_workspace_locks.setdefault(
                 mapping, threading.Lock())
 
-    def __init__(self, mapping: Mapping, dtype: torch.dtype):
+    def __init__(self, mapping: Mapping, dtype: torch.dtype,
+                 dispatch_plan: Optional[_MnnvlDispatchPlan] = None):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
-        if dtype not in MNNVLAllReduce.get_supported_dtypes() or (
-                mapping.has_cp()):
-            # This is safe as we always capture the exception when create this object
-            raise ValueError(
-                f"MNNVL all reduce only supports dtype {MNNVLAllReduce.get_supported_dtypes()} and without cp."
-            )
-
-        # Initialize the workspace
-        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype)
+        dispatch_plan = dispatch_plan or _get_mnnvl_dispatch_plan(mapping, dtype)
+        if not dispatch_plan.is_supported:
+            raise ValueError(f"[MNNVL] Unsupported dispatch: {dispatch_plan.unsupported_reason}")
+        assert dispatch_plan.transport is not None
+        self.transport = dispatch_plan.transport
+        get_or_scale_allreduce_mnnvl_workspace(self.mapping, self.dtype, transport=self.transport)
 
     @staticmethod
     def get_supported_dtypes():
@@ -869,6 +930,10 @@ class MNNVLAllReduce(nn.Module):
     @staticmethod
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
                                     group_size: int, dtype: torch.dtype) -> int:
+        if dtype not in _MNNVL_SUPPORTED_DTYPES or group_size not in _MNNVL_SUPPORTED_GROUP_SIZES:
+            raise ValueError("[MNNVL] Unsupported dtype or group size")
+        if num_tokens <= 0 or hidden_dim <= 0:
+            raise ValueError("[MNNVL] Token count and hidden dimension must be positive")
         elem_size = torch.tensor([], dtype=dtype).element_size()
         # This should match the heuristic in allreduceOp.cpp.
         is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
@@ -879,8 +944,7 @@ class MNNVLAllReduce(nn.Module):
         else:
             # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest group_size.
             # 2 Stage is required for the two-shot allreduce.
-            workspace_size = 2 * math.ceil(
-                num_tokens / group_size) * group_size * hidden_dim * elem_size
+            workspace_size = 2 * ((num_tokens + group_size - 1) // group_size) * group_size * hidden_dim * elem_size
         return workspace_size
 
     def checkpoint_prepare(self) -> None:
@@ -953,7 +1017,7 @@ class MNNVLAllReduce(nn.Module):
         self,
         input: torch.Tensor,
         all_reduce_params: AllReduceParams,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+    ) -> Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]]:
         """Forward pass for MNNVL AllReduce.
 
         Args:
@@ -961,40 +1025,61 @@ class MNNVLAllReduce(nn.Module):
             all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations.
 
         Returns:
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s). Output tensors
-            preserve the input's N-D shape (NVFP4 quant output has its last dim halved; the
-            NVFP4 scale-factor output is 1-D).
+            Reduced tensor(s), or None when the caller should use its fallback.
+            Output tensors preserve the input's N-D shape (NVFP4 quant output has
+            its last dim halved; the NVFP4 scale-factor output is 1-D).
         """
 
+        if input.dtype != self.dtype:
+            self._log_fallback(
+                f"[MNNVL AllReduce] Input dtype {input.dtype} does not match configured dtype {self.dtype}."
+            )
+            return None
+        if input.ndim < 2 or input.shape[-1] <= 0:
+            self._log_fallback(
+                f"[MNNVL AllReduce] Input must have at least two dimensions and a positive hidden dimension, "
+                f"got shape {tuple(input.shape)}.")
+            return None
+
         fusion_op = all_reduce_params.fusion_op
+        is_fusion = fusion_op != AllReduceFusionOp.NONE
+        if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
+            self._log_fallback(
+                f"[MNNVL AllReduce] Fusion operation {fusion_op} is not supported."
+            )
+            return None
+
         hidden_dim = input.shape[-1]
         num_tokens = input.numel() // hidden_dim
 
-        workspace_size_bytes = self.get_required_workspace_size(
+        required_buffer_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
 
-        # We use uint32_t to store workspace size related info. Safeguard against overflow.
-        if workspace_size_bytes > _MNNVL_MAX_BUFFER_SIZE_BYTES:
-            # Raise an error so we can fallback to other allreduce strategies
-            raise ValueError(
-                f"[MNNVL AllReduce] Required workspace {workspace_size_bytes} bytes exceeds uint32 limits "
-                f"for shard ({num_tokens}, {hidden_dim}), TP {self.mapping.tp_size}."
-            )
+        # The final aligned capacity is stored in a uint32 flag.
+        if required_buffer_size_bytes > _MNNVL_MAX_BUFFER_SIZE_BYTES:
+            message = (
+                f"[MNNVL AllReduce] Required buffer {required_buffer_size_bytes} bytes exceeds the largest "
+                f"supported capacity {_MNNVL_MAX_BUFFER_SIZE_BYTES} for shard ({num_tokens}, {hidden_dim}), "
+                f"TP {self.mapping.tp_size}.")
+            self._log_fallback(message)
+            return None
 
-        workspace = get_or_scale_allreduce_mnnvl_workspace(
-            self.mapping,
-            self.dtype,
-            buffer_size_bytes=workspace_size_bytes,
-        )
+        try:
+            workspace = get_or_scale_allreduce_mnnvl_workspace(
+                self.mapping,
+                self.dtype,
+                buffer_size_bytes=required_buffer_size_bytes,
+                transport=self.transport,
+            )
+        except _MnnvlUnavailableError as error:
+            self._log_fallback(
+                f"MNNVL AllReduce workspace growth is unavailable: {error}")
+            return None
 
         # We don't expect the buffer to be directly used in this level. The tensor is only used for passing the pointer to the kernel
         buffer_base = workspace["uc_buffer"].view(self.dtype).view(3, -1)
         # The buffer flags is tied to the buffer and used to save the state of the buffer
         buffer_flags = workspace["buffer_flags"]
-
-        is_fusion = fusion_op != AllReduceFusionOp.NONE
-        if is_fusion and fusion_op not in MNNVLAllReduce.SUPPORTED_FUSION_OPS:
-            return None
 
         outputs = torch.ops.trtllm.mnnvl_fusion_allreduce(
             input,
@@ -1131,27 +1216,29 @@ class AllReduce(nn.Module):
                                          AllReduceStrategy.NCCL_SYMMETRIC):
                     self.workspace = get_allreduce_workspace(self.mapping)
 
-            # Initialize MNNVL if using AUTO or MNNVL strategy
-            if self.strategy in (AllReduceStrategy.AUTO,
-                                 AllReduceStrategy.MNNVL):
-                # Try to initialize MNNVL
-                if MNNVLAllReduce.is_mnnvl(self.mapping,
-                                           dtype,
-                                           explicitly_requested=self.strategy ==
-                                           AllReduceStrategy.MNNVL):
-                    # ALWAYS capture the exception when creating this instance
-                    try:
-                        self.mnnvl_allreduce = MNNVLAllReduce(
-                            self.mapping, dtype) if dtype else None
-                    except Exception as e:
-                        logger.debug(
-                            f"MNNVL AllReduce can't be enabled due to {e}.")
-                        self.mnnvl_allreduce = None
-                else:
-                    logger.debug(
-                        "MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
+        # Keep MNNVL dispatch planning and handling together.
+        if self.mapping.tp_size > 1 and self.strategy in (
+                AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
+            is_explicit_mnnvl = self.strategy == AllReduceStrategy.MNNVL
+            log_fallback = logger.warning if is_explicit_mnnvl else logger.debug
+            dispatch_plan = _get_mnnvl_dispatch_plan(self.mapping, dtype)
+            if not dispatch_plan.is_supported:
+                log_fallback(
+                    f"MNNVL AllReduce dispatch is unsupported: {dispatch_plan.unsupported_reason}. "
+                    "Falling back to AUTO.")
+            else:
+                assert dtype is not None
+                try:
+                    self.mnnvl_allreduce = MNNVLAllReduce(
+                        self.mapping,
+                        dtype,
+                        dispatch_plan,
+                        warn_on_fallback=is_explicit_mnnvl,
                     )
-                    self.mnnvl_allreduce = None
+                except _MnnvlUnavailableError as error:
+                    log_fallback(
+                        f"MNNVL AllReduce is unavailable: {error}. Falling back to AUTO."
+                    )
 
     def uses_nccl_symmetric_memory_window(self) -> bool:
         """Return True if this allreduce can use an NCCL window output buffer.
