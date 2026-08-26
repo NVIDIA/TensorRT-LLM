@@ -65,8 +65,8 @@ def _get_mnnvl_dispatch_plan(
     """Resolve mapping policy only; runtime qualification belongs to C++."""
     if dtype not in _MNNVL_SUPPORTED_DTYPES:
         return _MnnvlDispatchPlan(
-            unsupported_reason=f"dtype must be one of {_MNNVL_SUPPORTED_DTYPES}, got {dtype}"
-        )
+            unsupported_reason=
+            f"dtype must be one of {_MNNVL_SUPPORTED_DTYPES}, got {dtype}")
     if mpi_disabled():
         return _MnnvlDispatchPlan(
             unsupported_reason="the MNNVL workspace requires an MPI communicator"
@@ -97,6 +97,7 @@ def _get_mnnvl_dispatch_plan(
     transport = (MnnvlTransport.FABRIC if force_fabric
                  or len(group_node_ranks) > 1 else MnnvlTransport.POSIX_FD)
     return _MnnvlDispatchPlan(transport=transport)
+
 
 _thread_local = threading.local()
 
@@ -156,9 +157,8 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
-def _create_allreduce_mnnvl_workspace(
-        mapping: Mapping, buffer_size_bytes: int, transport: MnnvlTransport,
-        comm) -> Dict:
+def _create_allreduce_mnnvl_workspace(mapping: Mapping, buffer_size_bytes: int,
+                                      transport: MnnvlTransport, comm) -> Dict:
     comm_size = comm.Get_size()
     comm_rank = comm.Get_rank()
     if comm_size != mapping.tp_size or comm_rank != mapping.tp_rank:
@@ -176,8 +176,8 @@ def _create_allreduce_mnnvl_workspace(
     requested_buffer_size_bytes = (
         (buffer_size_bytes + _MNNVL_BUFFER_ALIGNMENT_BYTES - 1) //
         _MNNVL_BUFFER_ALIGNMENT_BYTES) * _MNNVL_BUFFER_ALIGNMENT_BYTES
-    requested_workspace_size_bytes = (
-        _MNNVL_NUM_LAMPORT_BUFFERS * requested_buffer_size_bytes)
+    requested_workspace_size_bytes = (_MNNVL_NUM_LAMPORT_BUFFERS *
+                                      requested_buffer_size_bytes)
     workspace_handle = MnnvlWorkspace(
         requested_workspace_size_bytes,
         transport,
@@ -198,12 +198,10 @@ def _create_allreduce_mnnvl_workspace(
         raise RuntimeError(
             f"[MNNVL] Allocator returned {usable_workspace_size_bytes} usable workspace bytes, which provides "
             f"only {buffer_capacity_bytes} bytes per Lamport buffer for a "
-            f"{requested_buffer_size_bytes}-byte request."
-        )
+            f"{requested_buffer_size_bytes}-byte request.")
 
     # Keep a byte-equivalent FP32 view so one cached workspace can serve every supported model dtype.
-    workspace_size_bytes = (_MNNVL_NUM_LAMPORT_BUFFERS *
-                            buffer_capacity_bytes)
+    workspace_size_bytes = (_MNNVL_NUM_LAMPORT_BUFFERS * buffer_capacity_bytes)
     buffer = workspace_handle.get_local_buffer()
     buffer = buffer[:workspace_size_bytes // torch.float32.itemsize].view(
         _MNNVL_NUM_LAMPORT_BUFFERS, -1)
@@ -687,8 +685,7 @@ class MNNVLAllReduce(nn.Module):
     })
 
     def __init__(self, mapping: Mapping, dtype: torch.dtype,
-                 dispatch_plan: _MnnvlDispatchPlan,
-                 warn_on_fallback: bool):
+                 dispatch_plan: _MnnvlDispatchPlan, warn_on_fallback: bool):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
@@ -738,8 +735,8 @@ class MNNVLAllReduce(nn.Module):
         if is_one_shot:
             return num_tokens * hidden_dim * group_size * element_size
 
-        rounded_tokens = ((num_tokens + group_size - 1) //
-                          group_size) * group_size
+        rounded_tokens = (
+            (num_tokens + group_size - 1) // group_size) * group_size
         return 2 * rounded_tokens * hidden_dim * element_size
 
     def forward(

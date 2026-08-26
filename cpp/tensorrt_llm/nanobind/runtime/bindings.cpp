@@ -167,12 +167,10 @@ void initBindings(nb::module_& m)
 
     nb::class_<tr::MnnvlWorkspace>(m, "MnnvlWorkspace")
         .def(nb::init<size_t, tr::MnnvlTransport, int, int64_t>(), nb::arg("workspace_size"), nb::arg("transport"),
-            nb::arg("device_idx"), nb::arg("mpi_comm_fortran_handle"),
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("device_idx"), nb::arg("mpi_comm_fortran_handle"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("is_available", &tr::MnnvlWorkspace::isAvailable)
         .def_prop_ro("reason", &tr::MnnvlWorkspace::getReason)
-        .def("get_local_buffer", &tr::MnnvlWorkspace::getLocalBuffer,
-            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_buffer", &tr::MnnvlWorkspace::getLocalBuffer, nb::call_guard<nb::gil_scoped_release>())
         .def("get_workspace_size", &tr::MnnvlWorkspace::getWorkspaceSize);
 
     nb::enum_<tensorrt_llm::kernels::AllReduceFusionOp>(m, "AllReduceFusionOp")

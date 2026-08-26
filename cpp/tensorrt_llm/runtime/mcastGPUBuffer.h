@@ -194,8 +194,7 @@ inline PreflightWire makePreflightWire(PreflightResult const& result)
     return wire;
 }
 
-inline PreflightResult getCollectivePreflightResult(
-    mpi::MpiComm const& comm, PreflightResult const& localResult)
+inline PreflightResult getCollectivePreflightResult(mpi::MpiComm const& comm, PreflightResult const& localResult)
 {
     PreflightWire const local = makePreflightWire(localResult);
     std::vector<PreflightWire> results(static_cast<size_t>(comm.getSize()));
@@ -208,8 +207,7 @@ inline PreflightResult getCollectivePreflightResult(
             if (results[rank].status == target)
             {
                 std::ostringstream message;
-                message << "[MNNVL] Runtime preflight failed on rank " << rank << ": "
-                        << results[rank].message.data();
+                message << "[MNNVL] Runtime preflight failed on rank " << rank << ": " << results[rank].message.data();
                 return {target, message.str()};
             }
         }
@@ -251,8 +249,7 @@ inline PreflightResult probeFabricHandleSupport(int deviceIdx)
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
 
     size_t granularity{0};
-    TLLM_CU_CHECK(
-        cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
 
     CUmemGenericAllocationHandle allocation{0};
     CUmemGenericAllocationHandle importedAllocation{0};
@@ -284,8 +281,7 @@ inline PreflightResult probeFabricHandleSupport(int deviceIdx)
     if (result != CUDA_SUCCESS)
     {
         // These errors are expected when the fabric/IMEX plane is not provisioned.
-        bool const isExpectedUnavailable
-            = result == CUDA_ERROR_NOT_PERMITTED || result == CUDA_ERROR_NOT_SUPPORTED;
+        bool const isExpectedUnavailable = result == CUDA_ERROR_NOT_PERMITTED || result == CUDA_ERROR_NOT_SUPPORTED;
         return {isExpectedUnavailable ? PreflightStatus::kUnavailable : PreflightStatus::kError,
             formatFabricProbeError(result, "cuMemCreate(fabric probe)")};
     }
@@ -323,8 +319,7 @@ inline PreflightResult runPosixFdPreflight(mpi::MpiComm const& groupComm)
     }
     if (!ipcNvlsSupported())
     {
-        return {PreflightStatus::kUnavailable,
-            "the IPC NVLS allocator reports that multicast memory is unavailable"};
+        return {PreflightStatus::kUnavailable, "the IPC NVLS allocator reports that multicast memory is unavailable"};
     }
     return {};
 }
@@ -342,17 +337,15 @@ inline PreflightResult runFabricPreflight(int deviceIdx, CUdevice device)
     TLLM_CU_CHECK(cuDeviceGetAttribute(&multicastSupported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, device));
     if (multicastSupported == 0)
     {
-        return {PreflightStatus::kUnavailable,
-            "CUDA multicast memory is not supported by the selected device"};
+        return {PreflightStatus::kUnavailable, "CUDA multicast memory is not supported by the selected device"};
     }
 
     int fabricHandleSupported{0};
-    TLLM_CU_CHECK(cuDeviceGetAttribute(
-        &fabricHandleSupported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device));
+    TLLM_CU_CHECK(
+        cuDeviceGetAttribute(&fabricHandleSupported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device));
     if (fabricHandleSupported == 0)
     {
-        return {PreflightStatus::kUnavailable,
-            "CUDA fabric handles are not supported by the selected device"};
+        return {PreflightStatus::kUnavailable, "CUDA fabric handles are not supported by the selected device"};
     }
 
     return probeFabricHandleSupport(deviceIdx);
@@ -370,12 +363,12 @@ inline PreflightResult runLocalPreflight(
         TLLM_CU_CHECK(cuDeviceGetUuid(&deviceUuid, device));
 
         int computeCapabilityMajor{0};
-        TLLM_CU_CHECK(cuDeviceGetAttribute(
-            &computeCapabilityMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+        TLLM_CU_CHECK(
+            cuDeviceGetAttribute(&computeCapabilityMajor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
         if (computeCapabilityMajor < 9)
         {
-            return {PreflightStatus::kUnavailable,
-                "the MNNVL all-reduce kernel requires compute capability 9.0 or newer"};
+            return {
+                PreflightStatus::kUnavailable, "the MNNVL all-reduce kernel requires compute capability 9.0 or newer"};
         }
 
         if (transport == MnnvlTransport::kPosixFd)
@@ -437,8 +430,7 @@ public:
         {
             for (size_t rhs = lhs + 1; rhs < deviceUuids.size(); ++rhs)
             {
-                if (std::memcmp(
-                        deviceUuids[lhs].bytes, deviceUuids[rhs].bytes, sizeof(deviceUuids[lhs].bytes)) == 0)
+                if (std::memcmp(deviceUuids[lhs].bytes, deviceUuids[rhs].bytes, sizeof(deviceUuids[lhs].bytes)) == 0)
                 {
                     throw std::invalid_argument("[MNNVL] Communicator ranks " + std::to_string(lhs) + " and "
                         + std::to_string(rhs) + " selected the same physical CUDA device");
@@ -447,8 +439,8 @@ public:
         }
 
         mBuffer = std::make_shared<McastGPUBuffer>(workspaceSize, static_cast<uint32_t>(groupSize),
-            static_cast<uint32_t>(groupRank), static_cast<uint32_t>(deviceIdx),
-            transport == MnnvlTransport::kFabric, mpiCommFortranHandle);
+            static_cast<uint32_t>(groupRank), static_cast<uint32_t>(deviceIdx), transport == MnnvlTransport::kFabric,
+            mpiCommFortranHandle);
 
         mGroupRank = static_cast<uint32_t>(groupRank);
     }
@@ -475,8 +467,7 @@ public:
     //! Return a flat FP32 view of the allocator's total usable local workspace.
     [[nodiscard]] at::Tensor getLocalBuffer()
     {
-        TORCH_CHECK(mBuffer != nullptr,
-            "MnnvlWorkspace::getLocalBuffer: workspace is unavailable: ", mReason);
+        TORCH_CHECK(mBuffer != nullptr, "MnnvlWorkspace::getLocalBuffer: workspace is unavailable: ", mReason);
         return mBuffer->getUCBuffer(
             mGroupRank, {static_cast<long int>(mBuffer->getBufferSize() / sizeof(float))}, at::kFloat, 0);
     }
