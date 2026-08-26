@@ -356,6 +356,26 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
+def uploadBuildInfo(pipeline, globalVars)
+{
+    try {
+        def branch = globalVars[BUILD_BRANCH]
+        def buildInfo = "commit=${env.gitlabCommit}\n" +
+            "branch=${branch}\n" +
+            "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+            "jenkins_url=${env.BUILD_URL}"
+        writeFile file: 'build_info.txt', text: buildInfo
+        trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
+        pipeline.echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
+        return true
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo "Upload Build Info failed: ${e.toString()}"
+        return false
+    }
+}
+
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
     sh "env | sort"
@@ -389,6 +409,11 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        stage("Upload Build Info") {
+            env.BUILD_INFO_UPLOADED = uploadBuildInfo(pipeline, globalVars).toString()
+        }
+    }
     if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
     }
@@ -2346,6 +2371,7 @@ pipeline {
         timeout(time: 24, unit: 'HOURS')
     }
     environment {
+        BUILD_INFO_UPLOADED="false"
         // CBTS decision telemetry; auto-exposes _USR/_PSW that open_search_db.py reads.
         OPEN_SEARCH_DB_BASE_URL=credentials("open_search_db_base_url")
         OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
@@ -2379,18 +2405,9 @@ pipeline {
         }
         always {
             script {
-                stage("Upload Build Info") {
-                    try {
-                        def branch = globalVars[BUILD_BRANCH]
-                        def buildInfo = "commit=${env.gitlabCommit}\n" +
-                            "branch=${branch}\n" +
-                            "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
-                            "jenkins_url=${env.BUILD_URL}"
-                        writeFile file: 'build_info.txt', text: buildInfo
-                        trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
-                        echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
-                    } catch (Exception e) {
-                        echo "Upload Build Info failed: ${e.toString()}"
+                if (env.BUILD_INFO_UPLOADED != "true") {
+                    stage("Upload Build Info") {
+                        uploadBuildInfo(this, globalVars)
                     }
                 }
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
