@@ -1552,6 +1552,11 @@ skip_arm = pytest.mark.skipif(
     reason="This test is not supported on ARM architecture",
 )
 
+skip_x86 = pytest.mark.skipif(
+    "x86_64" in platform.machine(),
+    reason="This test is not supported on x86 architecture",
+)
+
 
 def skip_fp8_pre_ada(use_fp8):
     "skip fp8 tests if sm version less than 8.9"
