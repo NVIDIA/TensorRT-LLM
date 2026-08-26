@@ -13,12 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU LTX-2.3 HQ text-to-video with audio. Request-level HQ defaults
-# are set by examples/visual_gen/models/ltx2_3.py or the serving request.
+# 1-GPU LTX-2.3 HQ text-to-video with audio. Request shape is set by
+# examples/visual_gen/models/ltx2_3.py or the serving request; HQ sampler
+# defaults are supplied as pipeline default extra params below.
 pipeline_config:
   text_encoder_path: google/gemma-3-12b-it
   distilled_lora_strength_stage_1: 0.25
   distilled_lora_strength_stage_2: 0.5
+  default_extra_params:
+    sampler: res2s
+    res2s_eta: 0.5
+    stg_scale: 0.0
+    stg_blocks: []
+    modality_scale: 3.0
+    rescale_scale: 0.45
+    audio_rescale_scale: 1.0
 attention_config:
   backend: VANILLA
 parallel_config:

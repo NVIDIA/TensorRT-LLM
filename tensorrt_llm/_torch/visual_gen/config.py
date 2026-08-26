@@ -481,17 +481,23 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        # LTX-2 stage-2 paths (spatial_upsampler_path, distilled_lora_path)
-        # are surfaced to the LTX2 pipeline consumer via extra_attrs. The
-        # resolved pipeline_config kwarg comes from PipelineLoader after
-        # registry validation; when from_pretrained is called directly
-        # (mostly in unit tests), fall back to the raw VisualGenArgs dict.
+        # LTX-2 pipeline_config knobs consumed directly by the pipeline are
+        # surfaced via extra_attrs. The resolved pipeline_config kwarg comes
+        # from PipelineLoader after registry validation; when from_pretrained
+        # is called directly (mostly in unit tests), fall back to the raw
+        # VisualGenArgs dict.
         resolved_pipeline_config = kwargs.pop("pipeline_config", None)
         if resolved_pipeline_config is None:
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
-        for key in ("spatial_upsampler_path", "distilled_lora_path"):
+        for key in (
+            "spatial_upsampler_path",
+            "distilled_lora_path",
+            "distilled_lora_strength_stage_1",
+            "distilled_lora_strength_stage_2",
+            "default_extra_params",
+        ):
             value = resolved_pipeline_config.get(key)
-            if value:
+            if value is not None and value != "":
                 extra_attrs[key] = value
 
         # Discover pipeline components (diffusers layout)

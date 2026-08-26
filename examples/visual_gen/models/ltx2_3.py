@@ -17,7 +17,7 @@
 
 Usage:
     python ltx2_3.py
-    python ltx2_3.py --model /path/to/LTX-2.3-checkpoint         --visual_gen_args ../configs/ltx2-3-hq-1gpu.yaml
+    python ltx2_3.py --visual_gen_args ../configs/ltx2-3-hq-1gpu.yaml
 """
 
 import argparse
@@ -29,7 +29,6 @@ DEFAULT_PROMPT = (
     "A cinematic close-up of a glass greenhouse at sunrise, dew on the leaves, "
     "soft warm light, slow camera push-in, realistic ambience."
 )
-DEFAULT_NEGATIVE_PROMPT = "worst quality, blurry, jittery, distorted, inconsistent motion"
 
 
 def main():
@@ -51,32 +50,11 @@ def main():
         "--text_encoder_path",
         type=str,
         default=None,
-        help="Gemma3 text encoder path; overrides pipeline_config.text_encoder_path.",
+        help=(
+            "Gemma3 text encoder path. Overrides pipeline_config.text_encoder_path "
+            "from --visual_gen_args when set."
+        ),
     )
-    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT, help="Text prompt")
-    parser.add_argument(
-        "--negative_prompt",
-        type=str,
-        default=DEFAULT_NEGATIVE_PROMPT,
-        help="Negative prompt used for classifier-free guidance",
-    )
-    parser.add_argument("--height", type=int, default=1088, help="Output video height")
-    parser.add_argument("--width", type=int, default=1920, help="Output video width")
-    parser.add_argument("--num_frames", type=int, default=121, help="Number of video frames")
-    parser.add_argument("--frame_rate", type=float, default=24.0, help="Output frame rate")
-    parser.add_argument(
-        "--num_inference_steps",
-        type=int,
-        default=15,
-        help="Number of Res2S denoising steps",
-    )
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=3.0,
-        help="Video classifier-free guidance scale",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--output_path",
         type=str,
@@ -98,27 +76,21 @@ def main():
         }
 
     visual_gen = VisualGen(model=args.model, args=extra_args)
-    params = visual_gen.default_params
-    params.height = args.height
-    params.width = args.width
-    params.num_frames = args.num_frames
-    params.frame_rate = args.frame_rate
-    params.num_inference_steps = args.num_inference_steps
-    params.guidance_scale = args.guidance_scale
-    params.negative_prompt = args.negative_prompt
-    params.seed = args.seed
-    params.extra_params = {
-        **(params.extra_params or {}),
-        "sampler": "res2s",
-        "res2s_eta": 0.5,
-        "stg_scale": 0.0,
-        "stg_blocks": [],
-        "modality_scale": 3.0,
-        "rescale_scale": 0.45,
-        "audio_rescale_scale": 1.0,
-    }
 
-    output = visual_gen.generate(inputs=args.prompt, params=params)
+    # --- Model-specific: T2V request construction ---
+    # LTX-2.3-specific sampler defaults are provided by --visual_gen_args.
+    params = visual_gen.default_params
+    params.height = 1088
+    params.width = 1920
+    params.num_frames = 121
+    params.frame_rate = 24.0
+    params.num_inference_steps = 15
+    params.guidance_scale = 3.0
+
+    output = visual_gen.generate(
+        inputs=DEFAULT_PROMPT,
+        params=params,
+    )
     output.save(args.output_path)
     print(f"Saved: {args.output_path}")
 

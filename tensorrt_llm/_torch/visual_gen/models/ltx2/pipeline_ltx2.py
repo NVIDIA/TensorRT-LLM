@@ -699,6 +699,7 @@ def _load_component_weights(
         "distilled_lora_path": None,
         "distilled_lora_strength_stage_1": None,
         "distilled_lora_strength_stage_2": None,
+        "default_extra_params": {},
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
@@ -1656,7 +1657,7 @@ class LTX2Pipeline(BasePipeline):
 
     @property
     def extra_param_specs(self):
-        return {
+        specs = {
             "output_type": ExtraParamSchema(
                 type="str",
                 default="pt",
@@ -1728,6 +1729,21 @@ class LTX2Pipeline(BasePipeline):
                 default=None,
                 description="Substep SDE noise seed for the LTX-2.3 res2s sampler.",
             ),
+        }
+        default_extra_params = self.pipeline_config.extra_attrs.get("default_extra_params") or {}
+        if not isinstance(default_extra_params, dict):
+            raise ValueError("pipeline_config.default_extra_params must be a mapping.")
+        unknown = set(default_extra_params) - set(specs)
+        if unknown:
+            raise ValueError(
+                "Unknown LTX-2 default_extra_params keys: "
+                f"{sorted(unknown)}. Valid keys: {sorted(specs)}"
+            )
+        return {
+            key: spec.model_copy(update={"default": default_extra_params[key]})
+            if key in default_extra_params
+            else spec
+            for key, spec in specs.items()
         }
 
     def infer(self, req):
