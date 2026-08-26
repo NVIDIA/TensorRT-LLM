@@ -694,6 +694,115 @@ class SeqLenAwareSparseAttentionConfig(BaseSparseAttentionConfig):
         return False
 
 
+class QSASparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
+    """Configuration for QSA compressed query-selected attention."""
+
+    algorithm: Literal["qsa"] = "qsa"
+    index_n_heads: Optional[int] = Field(
+        default=None,
+        description="Number of replicated QSA index-query heads.",
+    )
+    index_kv_heads: Optional[int] = Field(
+        default=None,
+        description="Number of QSA index key heads.",
+    )
+    index_head_dim: Optional[int] = Field(
+        default=None,
+        description="Dimension of each QSA index head.",
+    )
+    token_topk: Optional[int] = Field(
+        default=None,
+        description=
+        "Maximum number of complete-group tokens selected per query.",
+    )
+    compress_ratio: Optional[int] = Field(
+        default=None,
+        description="Number of raw index keys averaged into one complete group.",
+    )
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def get_indices_block_size(self) -> int:
+        return 1
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        """Capture distinct dense and sparse decode graph families."""
+        if self.seq_len_threshold is None:
+            self.seq_len_threshold = self.token_topk or 2048
+        return True
+
+    @staticmethod
+    def _value(config_value,
+               pretrained_config,
+               checkpoint_name: str,
+               default=None):
+        if config_value is not None:
+            return config_value
+        if pretrained_config is not None:
+            return getattr(pretrained_config, checkpoint_name, default)
+        return default
+
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.qsa import \
+            QSASparseParams
+
+        pretrained_config = kwargs.get("pretrained_config")
+        token_topk = int(
+            self._value(
+                self.token_topk,
+                pretrained_config,
+                "indexer_budget",
+                2048,
+            ))
+        seq_len_threshold = (token_topk if self.seq_len_threshold is None else
+                             int(self.seq_len_threshold))
+        params = QSASparseParams(
+            index_n_heads=int(
+                self._value(
+                    self.index_n_heads,
+                    pretrained_config,
+                    "indexer_n_heads",
+                    4,
+                )),
+            index_kv_heads=int(
+                self._value(
+                    self.index_kv_heads,
+                    pretrained_config,
+                    "indexer_kv_heads",
+                    1,
+                )),
+            index_head_dim=int(
+                self._value(
+                    self.index_head_dim,
+                    pretrained_config,
+                    "indexer_head_dim",
+                    128,
+                )),
+            token_topk=token_topk,
+            compress_ratio=int(
+                self._value(
+                    self.compress_ratio,
+                    pretrained_config,
+                    "indexer_compress_ratio",
+                    4,
+                )),
+            seq_len_threshold=seq_len_threshold,
+        )
+        self.seq_len_threshold = params.seq_len_threshold
+        return params
+
+    def to_sparse_metadata_params(self, **kwargs):
+        from tensorrt_llm._torch.attention_backend.sparse.qsa import \
+            QSASparseMetadataParams
+
+        params = self.to_sparse_params(**kwargs)
+        return QSASparseMetadataParams(
+            token_topk=params.token_topk,
+            compress_ratio=params.compress_ratio,
+        )
+
+
 class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for MiniMax-M3 block-sparse attention.
 
@@ -3732,6 +3841,7 @@ SpeculativeConfig: TypeAlias = Annotated[
 
 SparseAttentionConfig: TypeAlias = Annotated[
     Union[
+        QSASparseAttentionConfig,
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,

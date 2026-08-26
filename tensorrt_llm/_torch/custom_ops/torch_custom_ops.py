@@ -2199,12 +2199,13 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
-            AllReduceStrategy.NCCL.value,
-        ]
-        # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
-        # So we need to check if the workspace size is too large to avoid hanging.
+        from tensorrt_llm._torch.distributed.ops import \
+            _nccl_symmetric_auto_tactic_supported
+
+        valid_strategies = [AllReduceStrategy.NCCL.value]
+        if _nccl_symmetric_auto_tactic_supported():
+            valid_strategies.insert(0, AllReduceStrategy.NCCL_SYMMETRIC.value)
+        # When the symmetric tactic is eligible, retain its workspace guard.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
         max_workspace_size = CustomAllReduceHelper.max_workspace_size_auto(
             self.tp_size,
@@ -2220,6 +2221,15 @@ class AllReduceRunner(TunableRunner):
             valid_strategies.append(AllReduceStrategy.TWOSHOT.value)
 
         return valid_strategies
+
+    @staticmethod
+    def _cache_miss_fallback_tactic() -> int:
+        from tensorrt_llm._torch.distributed.ops import \
+            _nccl_symmetric_auto_tactic_supported
+
+        if _nccl_symmetric_auto_tactic_supported():
+            return AllReduceStrategy.NCCL_SYMMETRIC.value
+        return AllReduceStrategy.NCCL.value
 
     def _register_native_tactics(self, inputs: List[torch.Tensor]) -> None:
         input, residual, norm_weight, scale, bias, workspace = inputs
@@ -2290,10 +2300,9 @@ class AllReduceRunner(TunableRunner):
             return input
         if tactic == -1:
             # tactic == -1 means the autotuner cache missed for this shape.
-            # Fall back to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
-            # by a cross-rank barrier in NCCLWindowAllocator which falls back
-            # to plain NCCL.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # Follow the same platform policy as the tactics benchmarked by
+            # AUTO instead of selecting an intentionally excluded tactic.
+            tactic = self._cache_miss_fallback_tactic()
 
         return torch.ops.trtllm.allreduce(
             input,
