@@ -26,7 +26,6 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
-#include <cstdlib>
 #include <cuda.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -145,18 +144,6 @@ void NixlTransferAgent::maybeInitBounce(
     // agent_bounce_buffer_enable is set, 0 otherwise): 0 keeps
     // bounce disabled, >0 enables it at that arena capacity. The expert knobs resolve as
     // agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_* env var > built-in default.
-    // The retired on/off & arena-size env vars no longer do anything — call that out instead of
-    // silently ignoring a deployment that still sets them.
-    for (char const* legacyEnv : {"TRTLLM_NIXL_BOUNCE_ENABLE", "TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES"})
-    {
-        if (std::getenv(legacyEnv) != nullptr)
-        {
-            TLLM_LOG_WARNING(
-                "NixlTransferAgent(%s): %s is deprecated and has NO effect; configure bounce via "
-                "CacheTransceiverConfig.agent_bounce_buffer_enable + kv_cache_bounce_size_mb instead",
-                mName.c_str(), legacyEnv);
-        }
-    }
     if (agentBufferSizeMb == 0)
     {
         if (!bounceParams.empty())
