@@ -2972,24 +2972,31 @@ class PyTorchModelEngine(ModelEngine):
         # Use max_draft_loop_tokens for capacity estimation to account
         # for the actual KV reservation per request.
         _kv_draft = self.max_draft_loop_tokens
+        # add_dummy_requests() extends every generation dummy to
+        # `kv_cache.capacity + _kv_draft + 1`, so the dummy has to be sized
+        # leaving room for that trailing token too. Reserving only
+        # `_kv_draft` here leaves the request exactly one token short, and
+        # the extension then fails whenever the pool -- not max_seq_len --
+        # is what bounds token_num.
+        _kv_reserve = _kv_draft + 1
         available_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=max_seq_len,
             batch_size=batch_size,
-            max_num_draft_tokens=_kv_draft)
+            max_num_draft_tokens=_kv_reserve)
 
         # Also consider draft KV cache capacity when it exists
         if draft_kv_cache_manager is not None:
             draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
                 batch_size=batch_size,
                 token_num_upper_bound=max_seq_len,
-                max_num_draft_tokens=_kv_draft)
+                max_num_draft_tokens=_kv_reserve)
             available_tokens = min(available_tokens, draft_available_tokens)
 
         token_num = max(
             ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM if is_enc_dec else 1,
             min(
                 available_tokens, max_seq_len - 1 -
-                get_num_extra_kv_tokens(self.spec_config) - _kv_draft))
+                get_num_extra_kv_tokens(self.spec_config) - _kv_reserve))
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
