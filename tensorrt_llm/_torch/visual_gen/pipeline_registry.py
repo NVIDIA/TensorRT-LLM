@@ -7,7 +7,7 @@ Follows: VisualGenArgs → PipelineLoader → DiffusionPipelineConfig → AutoPi
 All pipelines (Wan, Flux, Flux2, LTX2, QwenImage) register via @register_pipeline decorator.
 
 The registry value is a private ``_PipelineEntry`` dataclass that carries
-the pipeline class plus three pieces of per-family metadata:
+the pipeline class plus four pieces of per-family metadata:
 
   * ``hf_ids``  — canonical HuggingFace model IDs that dispatch to this
                   pipeline. Powers ``VisualGen.supported_models()`` and
@@ -17,6 +17,7 @@ the pipeline class plus three pieces of per-family metadata:
   * ``defaults`` — default per-family ``pipeline_config`` knobs
                    (schema-by-example for the strict-validated dict).
   * ``doc``     — short human-readable description for discovery tooling.
+  * ``supports_nvfp4_vae`` — whether this family can execute an NVFP4 VAE.
 
 The dataclass and the registry itself are deliberately private — users go
 through ``VisualGenArgs(model=...)``, ``VisualGen.supported_models()``,
@@ -33,6 +34,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 if TYPE_CHECKING:
     from .config import DiffusionPipelineConfig
@@ -69,6 +71,7 @@ class _PipelineEntry:
     hf_ids: List[str] = field(default_factory=list)
     defaults: Dict[str, Any] = field(default_factory=dict)
     doc: str = ""
+    supports_nvfp4_vae: bool = False
 
 
 # Keyed by Diffusers ``_class_name`` (from model_index.json). ~3-5 entries
@@ -83,6 +86,7 @@ def register_pipeline(
     hf_ids: Optional[List[str]] = None,
     defaults: Optional[Dict[str, Any]] = None,
     doc: str = "",
+    supports_nvfp4_vae: bool = False,
 ):
     """Register a pipeline class with optional per-family metadata.
 
@@ -114,6 +118,7 @@ def register_pipeline(
             hf_ids=list(hf_ids or []),
             defaults=dict(defaults or {}),
             doc=doc,
+            supports_nvfp4_vae=supports_nvfp4_vae,
         )
         logger.debug(f"Registered pipeline: {name} -> {cls.__name__}")
         return cls
@@ -142,7 +147,9 @@ class AutoPipeline:
                 f"Checkpoint: {checkpoint_dir}"
             )
 
-        pipeline_class = PIPELINE_REGISTRY[class_name].pipeline_cls
+        entry = PIPELINE_REGISTRY[class_name]
+        AutoPipeline._validate_vae_quantization(config, class_name, entry)
+        pipeline_class = entry.pipeline_cls
 
         # Let the pipeline class upgrade itself to a specialised variant
         # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
@@ -152,6 +159,45 @@ class AutoPipeline:
 
         # Instantiate pipeline with DiffusionPipelineConfig
         return pipeline_class(config)
+
+    @staticmethod
+    def _validate_vae_quantization(
+        config: "DiffusionPipelineConfig",
+        class_name: str,
+        entry: _PipelineEntry,
+    ) -> None:
+        """Reject NVFP4 VAE execution on pipeline families without support."""
+        vae_model_config = config.model_configs.get(PipelineComponent.VAE.value)
+        checkpoint_quant_config = (
+            getattr(vae_model_config.pretrained_config, "quantization_config", None)
+            if vae_model_config is not None
+            else None
+        )
+        checkpoint_quant_algo = (
+            checkpoint_quant_config.get("quant_algo")
+            if isinstance(checkpoint_quant_config, dict)
+            else None
+        )
+
+        vae_quant_config = config.vae_quant_config
+        if vae_quant_config is not None:
+            quant_algo = vae_quant_config.quant_algo
+            if quant_algo not in (None, QuantAlgo.NVFP4):
+                raise ValueError(
+                    f"VAE quantization supports only NVFP4, got {quant_algo}. "
+                    "Use quant_config for transformer quantization."
+                )
+        else:
+            quant_algo = checkpoint_quant_algo
+
+        nvfp4_values = (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
+        if quant_algo not in nvfp4_values and checkpoint_quant_algo not in nvfp4_values:
+            return
+        if not entry.supports_nvfp4_vae:
+            raise ValueError(
+                f"NVFP4 VAE is not supported by {class_name}. "
+                "Remove vae_quant_config or use a supported Wan pipeline."
+            )
 
     @staticmethod
     def _detect_from_checkpoint(checkpoint_dir: str) -> str:

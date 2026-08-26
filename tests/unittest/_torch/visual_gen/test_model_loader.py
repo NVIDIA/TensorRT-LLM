@@ -6,6 +6,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -263,6 +264,97 @@ def test_vae_quant_config_is_independent_from_transformer(tmp_path):
     )
     assert config.vae_dynamic_weight_quant is False
     assert config.vae_dynamic_activation_quant is True
+
+
+@pytest.mark.parametrize(
+    ("vae_quant_config", "checkpoint_quant_config"),
+    [
+        ({"quant_algo": "NVFP4"}, None),
+        (None, {"quant_algo": "NVFP4"}),
+    ],
+)
+def test_auto_pipeline_rejects_nvfp4_vae_for_unsupported_pipeline(
+    monkeypatch,
+    vae_quant_config,
+    checkpoint_quant_config,
+):
+    """Reject explicit and checkpoint-driven NVFP4 before pipeline construction."""
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(
+        AutoPipeline,
+        "_detect_from_checkpoint",
+        staticmethod(lambda _: "FluxPipeline"),
+    )
+    explicit_config = (
+        QuantConfig(quant_algo=QuantAlgo.NVFP4) if vae_quant_config is not None else None
+    )
+    vae_model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(quantization_config=checkpoint_quant_config)
+    )
+    config = SimpleNamespace(
+        vae_quant_config=explicit_config,
+        model_configs={"vae": vae_model_config},
+    )
+
+    with pytest.raises(ValueError, match="NVFP4 VAE is not supported by FluxPipeline"):
+        AutoPipeline.from_config(config, "/unused")
+
+
+def test_pipeline_vae_quant_validation_allows_supported_or_disabled_nvfp4():
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    checkpoint_config = SimpleNamespace(
+        model_configs={
+            "vae": SimpleNamespace(
+                pretrained_config=SimpleNamespace(quantization_config={"quant_algo": "NVFP4"})
+            )
+        }
+    )
+    checkpoint_config.vae_quant_config = None
+    AutoPipeline._validate_vae_quantization(
+        checkpoint_config,
+        "WanPipeline",
+        PIPELINE_REGISTRY["WanPipeline"],
+    )
+
+    # A supported pipeline can dequantize a packed checkpoint when FP4 is disabled.
+    checkpoint_config.vae_quant_config = QuantConfig()
+    AutoPipeline._validate_vae_quantization(
+        checkpoint_config,
+        "WanPipeline",
+        PIPELINE_REGISTRY["WanPipeline"],
+    )
+
+    # A disabled VAE config is also valid for an unquantized unsupported family.
+    checkpoint_config.model_configs["vae"].pretrained_config.quantization_config = None
+    AutoPipeline._validate_vae_quantization(
+        checkpoint_config,
+        "FluxPipeline",
+        PIPELINE_REGISTRY["FluxPipeline"],
+    )
+
+
+def test_auto_pipeline_rejects_unsupported_explicit_vae_quant_algo(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(
+        AutoPipeline,
+        "_detect_from_checkpoint",
+        staticmethod(lambda _: "WanPipeline"),
+    )
+    config = SimpleNamespace(
+        vae_quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+        model_configs={},
+    )
+
+    with pytest.raises(ValueError, match="VAE quantization supports only NVFP4"):
+        AutoPipeline.from_config(config, "/unused")
 
 
 @pytest.mark.parametrize(

@@ -301,6 +301,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_vsa_pipeline.py
   - unittest/_torch/visual_gen/test_wan_dup_up3d.py
   - unittest/_torch/visual_gen/test_wan_vae.py
+  - unittest/_torch/visual_gen/test_wan_vae_fp4.py
   - unittest/_torch/visual_gen/test_wan_vae_halo.py
   - unittest/_torch/visual_gen/test_fastwan_dmd_math.py
   - unittest/_torch/visual_gen/test_fastwan_pipeline.py

@@ -183,6 +183,42 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 
 Omit `quant_config` for BF16/FP16 baseline.
 
+#### Wan VAE NVFP4
+
+Transformer and VAE quantization are selected independently. Use
+`quant_config` for transformer layers and `vae_quant_config` for the VAE.
+NVFP4 VAE execution currently supports native Wan-family VAEs on SM100-family
+GPUs. Unsupported pipelines and algorithms fail before pipeline construction;
+unsupported devices and checkpoint/config combinations fail during VAE load.
+
+If `vae_quant_config` is omitted, the VAE follows its checkpoint metadata: a
+packed NVFP4 checkpoint uses its stored weights and activation scales, while a
+high-precision checkpoint remains high precision. To quantize a high-precision
+Wan VAE at load time and derive activation scales dynamically, configure:
+
+```yaml
+vae_quant_config:
+  quant_algo: NVFP4
+  config_groups:
+    default:
+      weights:
+        dynamic: true
+      input_activations:
+        dynamic: true
+```
+
+For a packed NVFP4 checkpoint, set `weights.dynamic: false`. Set
+`input_activations.dynamic: false` to use calibrated checkpoint scales, or
+`true` to derive rank-local activation scales at runtime. A top-level
+`dynamic` boolean remains shorthand for setting both values, but the grouped
+form makes the weight and activation sources explicit.
+
+The optional ModelOpt `ignore` list excludes matching VAE modules. With a
+high-precision checkpoint, excluded convolutions remain in BF16. With a packed
+NVFP4 checkpoint, their weights can only be dequantized back to BF16; the
+original high-precision weights cannot be recovered, so TensorRT-LLM emits a
+warning.
+
 ### Runtime LoRA
 
 VisualGen can preload a local LoRA adapter at startup and fuse its deltas into transformer weights before warmup, CUDA graph capture, and cache acceleration setup. Configure this through `VisualGenArgs.runtime_lora_config` in Python or YAML:
