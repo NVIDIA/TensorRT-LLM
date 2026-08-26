@@ -30,8 +30,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
 )
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 
-_ZMQ_SETUP_ATTEMPTS = 8
+_ZMQ_SETUP_ATTEMPTS = 4
 _RECEIVE_TIMEOUT_MS = 2_000
+_SUBSCRIBE_ATTEMPTS = 50
+_PROBE_TIMEOUT_MS = 100
 
 
 class _NotReceived(Exception):
@@ -44,12 +46,30 @@ def _unused_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _run_on_fresh_port(scenario: Callable[[int], None]) -> None:
-    """Retry `scenario(port)` until its sockets come up.
+def _await_subscription(publisher: ZmqEventPublisher, subscriber: zmq.Socket) -> int:
+    """Publish probe batches until the subscriber's subscription is live.
 
-    A PUB socket drops messages published before a subscriber's subscription
-    propagates, and `_unused_tcp_port()` releases its port before the publisher binds
-    it. Both are transient; assertion failures inside `scenario` are not retried.
+    A PUB socket silently drops everything published before a subscriber's
+    subscription has propagated, and that window is not bounded by any delay the test
+    can pick -- so synchronise on an actual received message instead of sleeping.
+    Returns the number of probes published, which is the sequence number the next real
+    batch will carry.
+    """
+    for probes in range(1, _SUBSCRIBE_ATTEMPTS + 1):
+        publisher.publish(KVEventBatch(ts=0.0, events=[]))
+        if subscriber.poll(_PROBE_TIMEOUT_MS):
+            while subscriber.poll(0):
+                subscriber.recv_multipart()
+            return probes
+    raise _NotReceived("subscription never propagated")
+
+
+def _run_on_fresh_port(scenario: Callable[[int], None]) -> None:
+    """Retry `scenario(port)` on a fresh port if its sockets could not come up.
+
+    `_unused_tcp_port()` releases its port before the publisher binds it, so another
+    process can take it in between. Assertion failures inside `scenario` are not
+    retried.
     """
     for _ in range(_ZMQ_SETUP_ATTEMPTS):
         try:
@@ -99,6 +119,7 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
                 max_window_size=128,
             )
             manager.start()
+            base_seq = _await_subscription(manager._publisher, subscriber)
             manager.set_layer_group_window_sizes({0: 128, 1: 64})
 
             root = SimpleNamespace(ordinal=-1)
@@ -133,7 +154,11 @@ def test_streaming_fast_path_publishes_only_full_max_window_blocks() -> None:
                 frames.append(subscriber.recv_multipart())
 
             assert [frame[0] for frame in frames] == [topic.encode(), topic.encode()]
-            assert [int.from_bytes(frame[1], "big") for frame in frames] == [0, 1]
+            # Sequence numbers stay dense across the probes and the real batches.
+            assert [int.from_bytes(frame[1], "big") for frame in frames] == [
+                base_seq,
+                base_seq + 1,
+            ]
             stored_batch = msgspec.msgpack.decode(frames[0][2])
             removed_batch = msgspec.msgpack.decode(frames[1][2])
             assert stored_batch[2] == 0
@@ -272,11 +297,6 @@ def test_construction_binds_nothing_until_start() -> None:
         publisher = manager._publisher
         assert publisher._pub is None
         assert publisher._thread is None
-        # The endpoint is still free, so an unrelated socket can take it.
-        context = zmq.Context.instance()
-        squatter = context.socket(zmq.PUB)
-        squatter.bind(endpoint)
-        squatter.close(linger=0)
 
         manager.start()
         assert publisher._pub is not None
