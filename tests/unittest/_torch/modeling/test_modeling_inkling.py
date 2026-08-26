@@ -699,7 +699,15 @@ class _FakeKvManager:
     kv_factor = 2
     enable_swa_scratch_reuse = False
 
-    def __init__(self, pp_layers=(0, 1), layer_pools=None, index_scale=_FAKE_INDEX_SCALE):
+    def __init__(
+        self,
+        pp_layers=(0, 1),
+        layer_pools=None,
+        index_scale=_FAKE_INDEX_SCALE,
+        layer_scales=None,
+        max_blocks_per_seq=None,
+        batch_cache_indices=None,
+    ):
         self.pp_layers = list(pp_layers)
         self.layer_offsets = {layer: i for i, layer in enumerate(self.pp_layers)}
         # Default: every layer its own pool, so a test that means to exercise
@@ -711,11 +719,24 @@ class _FakeKvManager:
         self.num_pools = len(set(self.layer_to_pool_mapping_dict.values()))
         self._index_scale = index_scale
         self.index_scales = [index_scale] * self.num_pools
+        # Per-layer scale overrides: a layer absent here matches its pool (the
+        # common case). A present, differing scale is a mixed-scale pool -- the
+        # Inkling reality (global vs local geometry) the staging path exists for.
+        self._layer_scales = dict(layer_scales or {})
+        # Only the mixed-scale staging path reads these two.
+        self.max_blocks_per_seq = max_blocks_per_seq
+        self._batch_cache_indices = dict(batch_cache_indices or {})
         self.calls = []
 
     def get_layer_page_index_scale(self, layer_idx):
         self.calls.append(("scale", layer_idx))
-        return self._index_scale
+        return self._layer_scales.get(layer_idx, self._index_scale)
+
+    def get_batch_cache_indices(self, request_ids, layer_idx):
+        # Block indices per request for this layer's *own* scale (already divided
+        # by kv_factor), as the V2 manager returns them for the staging path.
+        self.calls.append(("indices", layer_idx))
+        return [list(self._batch_cache_indices[req_id]) for req_id in request_ids]
 
 
 def _fake_block_offsets(num_pools, num_seqs, max_blocks, index_scale=_FAKE_INDEX_SCALE):
@@ -737,6 +758,16 @@ def _fake_block_offsets(num_pools, num_seqs, max_blocks, index_scale=_FAKE_INDEX
             offs[pool, seq, 0, :n] = base * index_scale
             offs[pool, seq, 1, :n] = base * index_scale + 1
     return offs
+
+
+class _FakeBuffers:
+    """Stand-in for the captured-graph buffer cache. get_empty routes through
+    get_buffer; handing back a fresh CPU tensor keeps the staging test CPU-only."""
+
+    def get_buffer(self, tensor_shape, dtype, cache_name, capture_graph):
+        import torch
+
+        return torch.zeros(tensor_shape, dtype=dtype)
 
 
 def _ptmod():
@@ -863,7 +894,9 @@ def test_metadata_page_div_recovers_the_block_index():
 def test_metadata_stages_no_page_table_of_its_own():
     """Regression on the reason for this refactor: the previous version built a
     pinned host table in a Python loop and issued one H2D per KV geometry, every
-    decode step, on the host-bound path."""
+    decode step, on the host-bound path. This is the scale-matched borrow path
+    every layer takes unless its scale disagrees with its pool (the mixed-scale
+    layers that still stage are covered separately)."""
     md = _ink_metadata(pp_layers=(0, 1), layer_pools={0: 0, 1: 0})
 
     _validate(md)
@@ -976,15 +1009,74 @@ def test_metadata_rejects_a_batch_wider_than_the_borrowed_block_offsets():
 
 
 def test_metadata_rejects_a_layer_whose_scale_disagrees_with_its_pool():
-    """The C++ copy encodes with the pool-level index_scale, while
-    ``get_layer_page_index_scale`` documents that layers in one pool may differ.
-    They agree for Inkling, but a mismatch would be a wrong page address rather
-    than a crash, so it is asserted."""
+    """A scale-mismatched layer must never fall back to the borrowed pool row.
+
+    The C++ copy encodes with the pool-level index_scale, while
+    ``get_layer_page_index_scale`` documents that layers in one pool may differ --
+    and for Inkling they *do* (global 8 kv-head layers share a pool with local
+    16 kv-head ones). ``prepare`` stages such layers a private table; this is the
+    backstop for when validation reaches one that was never staged -- prepare did
+    not run, or did not own the layer. Borrowing the pool row there recovers a
+    wrong page address rather than crashing, so it is rejected loudly."""
     md = _ink_metadata(pp_layers=(0, 1), layer_pools={0: 0, 1: 0})
     md.kv_cache_manager.index_scales = [_FAKE_INDEX_SCALE * 2]
 
     with pytest.raises(RuntimeError, match="page-index scale"):
         _validate(md)
+
+
+def test_metadata_stages_a_private_table_for_a_scale_mismatched_layer():
+    """The Inkling case the borrow cannot serve, and the whole reason the staging
+    helper exists.
+
+    Layer 1's page-index scale differs from its pool's shared row (main's V2
+    manager co-locates global- and local-geometry layers in one pool). prepare()
+    must stage that layer a private table built from its *own* scale via
+    get_batch_cache_indices -- already block indices, so divisor 1 -- while the
+    scale-matched layer 0 keeps the zero-copy pool borrow (divisor kv_factor)."""
+    pt = _ptmod()
+
+    # Layer 0 matches pool 0's scale; layer 1's own scale is doubled, so it does
+    # not, exactly like an Inkling global layer sharing a local-encoded pool.
+    mgr = _FakeKvManager(
+        pp_layers=(0, 1),
+        layer_pools={0: 0, 1: 0},
+        layer_scales={1: _FAKE_INDEX_SCALE * 2},
+        max_blocks_per_seq=4,
+        batch_cache_indices={7: [4, 5], 9: [6, 7, 8]},
+    )
+    md = _ink_metadata(
+        pp_layers=(0, 1),
+        request_ids=(7, 9),
+        num_cached=(3, 130),
+        layer_pools={0: 0, 1: 0},
+        mgr=mgr,
+        max_num_sequences=2,
+    )
+    md.max_num_sequences = 2
+    md.cuda_graph_buffers = _FakeBuffers()
+
+    md._stage_scale_fixed_page_tables()
+
+    # Only the mismatched layer is staged; the matched one still borrows.
+    assert set(md._scale_fixed_page_tables) == {1}
+    assert not pt.uses_pool_row(md, 1) and pt.uses_pool_row(md, 0)
+    # It was built from the layer's own block indices, zero-padded to width.
+    assert md._scale_fixed_page_tables[1].tolist() == [[4, 5, 0, 0], [6, 7, 8, 0]]
+    assert ("indices", 1) in mgr.calls
+
+    # decode_page_table routes each layer correctly.
+    fixed_pt, fixed_div = pt.decode_page_table(md, 1, 2)
+    assert fixed_div == 1
+    assert fixed_pt.tolist() == [[4, 5, 0, 0], [6, 7, 8, 0]]
+
+    borrowed_pt, borrowed_div = pt.decode_page_table(md, 0, 2)
+    assert borrowed_div == mgr.kv_factor
+    # A view of the base offsets, not a private copy.
+    assert (
+        borrowed_pt.untyped_storage().data_ptr()
+        == md.kv_cache_block_offsets.untyped_storage().data_ptr()
+    )
 
 
 def test_metadata_rejects_a_missing_block_offsets_tensor():
@@ -1282,10 +1374,18 @@ def test_conv_pool_dtype_refuses_to_guess():
 
 
 def test_prepare_publishes_the_pool_rows_and_nothing_else():
-    """The metadata subclass exists for exactly one line: the slot write, which is
-    a host->device copy into a buffer the captured decode graph aliases and so has
-    to run every step outside that region. Everything else the decode path needs
-    is a view of the base's buffers, so the subclass must add no fields."""
+    """The metadata subclass overrides ``prepare`` and adds exactly one helper.
+
+    prepare() does host->device writes into buffers the captured decode graph
+    aliases, so they run every step outside that region: the short-conv slot
+    write, and -- via ``_stage_scale_fixed_page_tables`` -- a private page table
+    for any layer whose page-index scale differs from its pool's shared row.
+    Inkling needs the second because main's V2 manager co-locates its 55 local
+    (16 kv-head) and 11 global (8 kv-head) attention layers in one pool, so one
+    geometry cannot borrow the other's scale. Everything else the decode path
+    needs is still a view of the base's buffers, so the subclass adds no further
+    method or field -- bound the surface here so a future addition that should
+    have been a base-buffer view is caught."""
     from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
     from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
@@ -1294,9 +1394,10 @@ def test_prepare_publishes_the_pool_rows_and_nothing_else():
     md.kv_cache_manager = SimpleNamespace(conv_state_cache=pool)
     md.request_ids = [7, 9]
 
-    # Only prepare() is overridden, and it declares no state of its own.
+    # prepare() plus the mixed-scale staging helper, and nothing else.
     assert set(vars(InklingAttentionMetadata)) - set(vars(TrtllmAttentionMetadata)) <= {
         "prepare",
+        "_stage_scale_fixed_page_tables",
         "__doc__",
         "__module__",
         "__qualname__",
