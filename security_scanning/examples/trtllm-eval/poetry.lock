@@ -2732,20 +2732,20 @@ test = ["black", "datasets", "diffusers", "hf-doc-builder", "parameterized", "pr
 
 [[package]]
 name = "portalocker"
-version = "4.2.0"
+version = "4.3.0"
 description = "Cross-platform file locking, with Redis, PID-file and bounded-semaphore locks"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "portalocker-4.2.0-py3-none-any.whl", hash = "sha256:b33a8ce7d9b74922123a6fe64c2d785c015e5e9049ce7f1db5bd44e288731460"},
-    {file = "portalocker-4.2.0.tar.gz", hash = "sha256:f4c5024903126159c4798e6aec6c32e30a0759db39bf795c0dbeb180a2e8c843"},
+    {file = "portalocker-4.3.0-py3-none-any.whl", hash = "sha256:aa91709ccfc322b8225171392d64a2f9fc833f15f5ab741cfba6d3fba285ce31"},
+    {file = "portalocker-4.3.0.tar.gz", hash = "sha256:69bf8e46769d66eb0a23219b9550253d2c3b5f03400202a2333784c1e6395e32"},
 ]
 
 [package.extras]
 docs = ["furo", "sphinx (>=7)"]
 redis = ["redis (>=5.0)"]
-tests = ["coverage-conditional-plugin (>=0.9)", "fakeredis (>=2.31.0)", "portalocker[redis]", "pytest (>=5.4.1)", "pytest-cov (>=2.8.1)", "pytest-rerunfailures (>=15.1)", "pytest-timeout (>=2.1.0)", "types-pywin32 (>=310.0.0.20250429)"]
+tests = ["coverage-conditional-plugin (>=0.9)", "fakeredis (>=2.31.0)", "portalocker[redis]", "pytest (>=5.4.1)", "pytest-cov (>=2.8.1)", "pytest-rerunfailures (>=15.1)", "pytest-timeout (>=2.1.0)", "types-pywin32 (>=310.0.0.20250429)", "typing-extensions (>=4.4)"]
 win32 = ["pywin32 (>=226) ; sys_platform == \"win32\""]
 
 [[package]]
