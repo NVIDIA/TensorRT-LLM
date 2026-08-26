@@ -272,6 +272,7 @@ def encode_multimodal_by_groups(
 
 
 if TYPE_CHECKING:
+    from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
 
@@ -680,6 +681,17 @@ class MultimodalModelMixin:
     def infer_max_seq_len(self) -> int:
         """Return the inner language model's maximum sequence length."""
         return self.language_model.infer_max_seq_len()
+
+    def set_guided_decoder(self, guided_decoder: "CapturableGuidedDecoder") -> bool:
+        """Install a guided decoder on the inner language model.
+
+        Returns False when the inner model does not support guided decoding,
+        matching the contract ModelEngine.set_guided_decoder() expects.
+        """
+        inner = self.language_model
+        if not hasattr(inner, "set_guided_decoder"):
+            return False
+        return inner.set_guided_decoder(guided_decoder)
 
     def get_language_model_extra_forward_kwargs(
         self,

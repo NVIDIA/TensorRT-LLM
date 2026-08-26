@@ -215,6 +215,8 @@ public:
         : mMmaKind{mmaKind}
         , mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma}
         , mUseMaxTmemOverlap{useMaxTmemOverlap}
+        , mUseTmaStore{useTmaStore}
+        , mUsePersistentScheduler{usePersistentScheduler}
         , mUseCustomizedMma3xNvFp4{useCustomizedMma3xNvFp4}
         , mFusedBiasShuffleMode{fusedBiasShuffleMode}
         , mNumEpilogueWarps{numEpilogueWarps}
@@ -609,6 +611,10 @@ tg::MmaKind mMmaKind{};
 bool mFuseUtccpWithUtcmma{};
 // Whether use the max TMEM overlap trick.
 bool mUseMaxTmemOverlap{};
+// Whether the epilogue stages output in SMEM for an asynchronous TMA store.
+bool mUseTmaStore{};
+// Whether work tiles are assigned by a persistent scheduler.
+bool mUsePersistentScheduler{};
 // Whether use customized MMA for 3xNvFp4
 bool mUseCustomizedMma3xNvFp4{};
 // Which BiasType::Mn preprocessing steps are fused into the kernel instead of the host.
