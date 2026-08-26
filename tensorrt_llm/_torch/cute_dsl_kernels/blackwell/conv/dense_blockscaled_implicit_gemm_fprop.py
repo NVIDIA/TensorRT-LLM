@@ -3257,8 +3257,8 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                     #
                     # SFD generation (NVFP4 output only): per sfd_vec_size
                     # abs-max -> pvscale_f32 -> cast to sf_dtype (E4M3) -> STG.
-                    # Then rescale acc by norm_const * rcp(pvscale_f32), with
-                    # NaN/inf clamp via fmin.
+                    # Rescale with the E4M3-quantized SFD value so the FP4 output
+                    # and its stored scale remain self-consistent.
                     #
                     if cutlass.const_expr(self.gen_sfd):
                         # Slice gSFD for this subtile and collapse stride-0 broadcast.
@@ -3289,9 +3289,7 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                         # Reciprocal of the output dtype's full-scale max (M_D).
                         rcp_max = cutlass.Float32(1.0 / self.M_D)
                         fp32_max = cutlass.Float32(3.40282346638528859812e38)
-                        # Single-pass: compute amax, quantize SFD, and rescale acc
-                        # in the same loop using a local f32 pvscale (no rmem
-                        # tensor round-trip).
+                        # Single-pass: compute amax, quantize SFD, and rescale acc.
                         for i_sf in cutlass.range(n_sf, unroll_full=True):
                             sfgen_slice = sfgen_rAcc[(None, i_sf)]
                             red_ssa = sfgen_slice.load()
@@ -3305,7 +3303,8 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                             )
                             pvscale_f32 = amax * rcp_max * norm_const_scalar
                             rSFD[(0, i_sf)] = pvscale_f32.to(self.sfd_dtype)
-                            acc_scale = norm_const_scalar * cute.arch.rcp_approx(pvscale_f32)
+                            qpvscale_f32 = cutlass.Float32(rSFD[(0, i_sf)].to(cutlass.Float32))
+                            acc_scale = norm_const_scalar * cute.arch.rcp_approx(qpvscale_f32)
                             acc_scale = cutlass.Float32(
                                 nvvm.fmin(
                                     acc_scale.ir_value(),
@@ -3637,8 +3636,8 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
             )
         return tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
-    @staticmethod
     def _compute_stages(
+        self,
         tiled_mma: cute.TiledMma,
         mma_tiler_mnk: Tuple[int, int, int],
         a_dtype: Type[cutlass.Numeric],
@@ -3652,107 +3651,130 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
         occupancy: int,
         has_residual: bool = False,
     ) -> Tuple[int, int, int]:
-        """Computes the number of stages for A/B/D operands based on heuristics.
+        """Compute A/B, accumulator, and epilogue stage counts.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
-        :type tiled_mma: cute.TiledMma
         :param mma_tiler_mnk: The shape (M, N, K) of the MMA tiler.
-        :type mma_tiler_mnk: tuple[int, int, int]
         :param a_dtype: Data type of operand A.
-        :type a_dtype: type[cutlass.Numeric]
         :param b_dtype: Data type of operand B.
-        :type b_dtype: type[cutlass.Numeric]
         :param epi_tile: The epilogue tile shape.
-        :type epi_tile: cute.Tile
         :param d_dtype: Data type of operand D (output).
-        :type d_dtype: type[cutlass.Numeric]
         :param d_layout: Layout enum of operand D.
-        :type d_layout: utils.LayoutEnum
         :param sf_dtype: Data type of Scale factor.
-        :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Scale factor vector size.
-        :type sf_vec_size: int
         :param smem_capacity: Total available shared memory capacity in bytes.
-        :type smem_capacity: int
-        :param occupancy: Target number of CTAs per SM (occupancy).
-        :type occupancy: int
+        :param occupancy: CTAs per SM; this persistent kernel uses one.
 
-        :return: A tuple containing the computed number of stages for:
-                 (ACC stages, A/B operand stages, D stages)
+        :return: ACC, A/B, and D stage counts.
         :rtype: tuple[int, int, int]
         """
-        # ACC stages
+        del occupancy
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
-
-        # Default D stages
         num_d_stage = 2
 
-        # Calculate smem layout and size for one stage of A, B, SFA, SFB and D
-        a_smem_layout_stage_one = sm100_utils.make_smem_layout_a(
-            tiled_mma,
-            mma_tiler_mnk,
-            a_dtype,
-            1,  # a tmp 1 stage is provided
-        )
-        b_smem_layout_staged_one = sm100_utils.make_smem_layout_b(
-            tiled_mma,
-            mma_tiler_mnk,
-            b_dtype,
-            1,  # a tmp 1 stage is provided
-        )
-        # Flatten hierarchical K for blockscaled utils
         flat_k = mma_tiler_mnk[2] if isinstance(mma_tiler_mnk[2], int) else mma_tiler_mnk[2][0]
         flat_mma_tiler_mnk = (mma_tiler_mnk[0], mma_tiler_mnk[1], flat_k)
-        sfa_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfa(
-            tiled_mma,
-            flat_mma_tiler_mnk,
-            sf_vec_size,
-            1,  # a tmp 1 stage is provided
-        )
-        sfb_smem_layout_staged_one = blockscaled_utils.make_smem_layout_sfb(
-            tiled_mma,
-            flat_mma_tiler_mnk,
-            sf_vec_size,
-            1,  # a tmp 1 stage is provided
-        )
 
-        d_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
-            d_dtype,
-            d_layout,
-            epi_tile,
+        buffer_align_bytes = 1024
+        num_clc_stage = 1
+        num_clc_response_bytes = 16
+        cta_tile_n = mma_tiler_mnk[1]
+
+        def smem_bytes(ab_stage: int, d_stage: int) -> int:
+            """Return the exact runtime SharedStorage size for the stage counts."""
+            a_smem = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, ab_stage)
+            b_smem = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, b_dtype, ab_stage)
+            sfa_smem = blockscaled_utils.make_smem_layout_sfa(
+                tiled_mma, flat_mma_tiler_mnk, sf_vec_size, ab_stage
+            )
+            sfb_smem = blockscaled_utils.make_smem_layout_sfb(
+                tiled_mma, flat_mma_tiler_mnk, sf_vec_size, ab_stage
+            )
+            d_smem = sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, d_stage)
+
+            @cute.struct
+            class ProbeStorage:
+                ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ab_stage * 2]
+                sfa_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, ab_stage * 2]
+                acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, num_acc_stage * 2]
+                tmem_dealloc_mbar_ptr: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+                clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, num_clc_stage * 2]
+                clc_response: cute.struct.Align[
+                    cute.struct.MemRange[
+                        cutlass.Int32, num_clc_response_bytes // 4 * num_clc_stage
+                    ],
+                    16,
+                ]
+                sD: cute.struct.Align[
+                    cute.struct.MemRange[d_dtype, cute.cosize(d_smem.outer)],
+                    buffer_align_bytes,
+                ]
+                sBias: cute.struct.Align[
+                    cute.struct.MemRange[d_dtype, cta_tile_n if self.has_bias else 0],
+                    buffer_align_bytes,
+                ]
+                sC: cute.struct.Align[
+                    cute.struct.MemRange[
+                        d_dtype,
+                        cute.cosize(d_smem.outer) if has_residual else 0,
+                    ],
+                    buffer_align_bytes,
+                ]
+                c_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, d_stage * 2 if has_residual else 0
+                ]
+                sA: cute.struct.Align[
+                    cute.struct.MemRange[a_dtype, cute.cosize(a_smem.outer)],
+                    buffer_align_bytes,
+                ]
+                sB: cute.struct.Align[
+                    cute.struct.MemRange[b_dtype, cute.cosize(b_smem.outer)],
+                    buffer_align_bytes,
+                ]
+                sSFA: cute.struct.Align[
+                    cute.struct.MemRange[sf_dtype, cute.cosize(sfa_smem)],
+                    buffer_align_bytes,
+                ]
+                sSFB: cute.struct.Align[
+                    cute.struct.MemRange[sf_dtype, cute.cosize(sfb_smem)],
+                    buffer_align_bytes,
+                ]
+
+            return ProbeStorage.size_in_bytes()
+
+        if smem_bytes(1, num_d_stage) > smem_capacity:
+            raise RuntimeError(
+                "tile too large for one A/B stage; can_implement should have rejected it"
+            )
+
+        # Start from a conservative lower bound, then use the exact struct size
+        # to maximize the mainloop and epilogue pipeline depths independently.
+        a_one = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, a_dtype, 1)
+        b_one = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, b_dtype, 1)
+        sfa_one = blockscaled_utils.make_smem_layout_sfa(
+            tiled_mma, flat_mma_tiler_mnk, sf_vec_size, 1
+        )
+        sfb_one = blockscaled_utils.make_smem_layout_sfb(
+            tiled_mma, flat_mma_tiler_mnk, sf_vec_size, 1
+        )
+        stage_slope = (
+            cute.cosize(a_one.outer) * a_dtype.width // 8
+            + cute.cosize(b_one.outer) * b_dtype.width // 8
+            + cute.cosize(sfa_one) * sf_dtype.width // 8
+            + cute.cosize(sfb_one) * sf_dtype.width // 8
+            + 2 * 8
+            + 2 * 8
+        )
+        alignment_bound = 4 * buffer_align_bytes
+        num_ab_stage = max(
             1,
+            1 + (smem_capacity - smem_bytes(1, num_d_stage) - alignment_bound) // stage_slope,
         )
-
-        ab_bytes_per_stage = (
-            cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
-            + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfa_smem_layout_staged_one)
-            + cute.size_in_bytes(sf_dtype, sfb_smem_layout_staged_one)
-        )
-        mbar_helpers_bytes = 1024
-        # The residual reuses the D epilogue smem layout with the same stage
-        # count, so each epilogue stage costs a D tile plus a residual tile.
-        d_bytes_per_stage = cute.size_in_bytes(d_dtype, d_smem_layout_staged_one)
-        if has_residual:
-            d_bytes_per_stage *= 2
-        d_bytes = d_bytes_per_stage * num_d_stage
-
-        # Calculate A/B/SFA/SFB stages:
-        # Start with total smem per CTA (capacity / occupancy)
-        # Subtract reserved bytes and initial D stages bytes
-        # Divide remaining by bytes needed per A/B/SFA/SFB stage
-        num_ab_stage = (
-            smem_capacity // occupancy - (mbar_helpers_bytes + d_bytes)
-        ) // ab_bytes_per_stage
-
-        # Refine epilogue stages:
-        # Calculate remaining smem after allocating for A/B/SFA/SFB stages and reserved bytes
-        # Add remaining unused smem to epilogue
-        num_d_stage += (
-            smem_capacity
-            - occupancy * ab_bytes_per_stage * num_ab_stage
-            - occupancy * (mbar_helpers_bytes + d_bytes)
-        ) // (occupancy * d_bytes_per_stage)
+        while smem_bytes(num_ab_stage + 1, num_d_stage) <= smem_capacity:
+            num_ab_stage += 1
+        while smem_bytes(num_ab_stage, num_d_stage + 1) <= smem_capacity:
+            num_d_stage += 1
 
         return num_acc_stage, num_ab_stage, num_d_stage
 
@@ -3984,6 +4006,20 @@ class Sm100BlockScaledPersistentDenseImplicitGemmKernel(PersistentConvKernel):
                 raise testing.CantImplementError(
                     f"cta_tile_k={self.cta_tile_k} only serves C == {self.cta_tile_k}, "
                     f"got C = {c}. Use cta_tile_k=256 for C that is a 256-multiple."
+                )
+            # A 2CTA narrow-N SFB multicast cannot split an odd count of
+            # scale-factor K atoms between its CTAs.
+            sf_k_atoms = self.cta_tile_k // 64
+            if (
+                self.use_2cta_instrs
+                and sf_k_atoms % 2 == 1
+                and sf_k_atoms > 1
+                and self.mma_tiler_mn[1] < 192
+            ):
+                raise testing.CantImplementError(
+                    f"2CTA cta_tile_k={self.cta_tile_k} with mma_tiler_n="
+                    f"{self.mma_tiler_mn[1]} deadlocks in SFB multicast. "
+                    "Use 1CTA or mma_tiler_n >= 192."
                 )
         except testing.CantImplementError as e:
             print(e)
