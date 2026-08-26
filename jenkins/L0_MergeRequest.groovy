@@ -367,12 +367,10 @@ def uploadBuildInfo(pipeline, globalVars)
         writeFile file: 'build_info.txt', text: buildInfo
         trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
         pipeline.echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
-        return true
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo "Upload Build Info failed: ${e.toString()}"
-        return false
     }
 }
 
@@ -410,7 +408,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
     echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
     stage("Upload Build Info") {
-        env.BUILD_INFO_UPLOADED = uploadBuildInfo(pipeline, globalVars).toString()
+        uploadBuildInfo(pipeline, globalVars)
     }
     if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
         trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
@@ -2369,7 +2367,6 @@ pipeline {
         timeout(time: 24, unit: 'HOURS')
     }
     environment {
-        BUILD_INFO_UPLOADED="false"
         // CBTS decision telemetry; auto-exposes _USR/_PSW that open_search_db.py reads.
         OPEN_SEARCH_DB_BASE_URL=credentials("open_search_db_base_url")
         OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
@@ -2403,11 +2400,6 @@ pipeline {
         }
         always {
             script {
-                if (env.BUILD_INFO_UPLOADED != "true") {
-                    stage("Upload Build Info") {
-                        uploadBuildInfo(this, globalVars)
-                    }
-                }
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
                     collectTestResults(this, testFilter, globalVars)
                 }
