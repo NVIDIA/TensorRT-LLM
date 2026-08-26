@@ -6,8 +6,11 @@ import json
 import math
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+import torch
 
 from tensorrt_llm.quantization.modelopt_config import (
     is_modelopt_quant_config,
@@ -15,6 +18,7 @@ from tensorrt_llm.quantization.modelopt_config import (
 )
 
 from ...pyexecutor.resource_manager import DataType
+from .quantization_for_cold_page import ColdPageCodecPolicy, ColdPageQuantizationMethod
 
 ScalePair = tuple[float, float]
 LayerScales = tuple[ScalePair, ScalePair]
@@ -27,6 +31,36 @@ _MODEL_OPT_LANGUAGE_KV_SCALE_KEY = re.compile(
 _COLD_PAGE_ALIGNMENT = 16
 _ELEMENTS_PER_BYTE = 2
 _ELEMENTS_PER_SCALE = 16
+_NVFP4_TRANSFORM = 0
+_LOSSLESS_TRANSFORM = 1
+
+
+@dataclass(frozen=True)
+class _Nvfp4Scales:
+    nvfp4_orig_quant: float
+    nvfp4_quant_orig: float
+    fp8_orig_quant: float = 1.0
+    fp8_quant_orig: float = 1.0
+
+
+@dataclass(frozen=True)
+class _Nvfp4BufferLayout:
+    role: str
+    data_offset: int
+    scale_offset: int = 0
+    scales: _Nvfp4Scales | None = None
+
+
+@dataclass(frozen=True)
+class _Nvfp4LayerLayout:
+    layer_id: int
+    runtime_type: int
+    num_kv_heads: int
+    tokens_per_page: int
+    head_dim: int
+    cold_page_bytes: int
+    padding_offset: int
+    buffers: tuple[_Nvfp4BufferLayout, ...]
 
 
 def _load_modelopt_nvfp4_scales(
@@ -100,8 +134,111 @@ def _buffer_bytes(buffer: object, tokens_per_page: int) -> int:
     return int(buffer.size) * (tokens_per_page // buffer_tokens)
 
 
-class Nvfp4ColdPagePolicy:
-    """Build native NVFP4 plans without retaining Python in the data path."""
+class Nvfp4ColdPagePolicy(ColdPageCodecPolicy):
+    """Own NVFP4 lifecycle programs and dispatch one operation per codec batch."""
+
+    def __init__(self, layer_layouts: Sequence[_Nvfp4LayerLayout]) -> None:
+        self._layer_layouts = {layout.layer_id: layout for layout in layer_layouts}
+        self._programs: list[object] = []
+
+    @property
+    def layer_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self._layer_layouts))
+
+    def configure(self, lifecycles: Sequence[object]) -> Sequence[object]:
+        """Resolve Python layouts against hot buffers and prepare method programs."""
+
+        from tensorrt_llm.bindings.internal import kv_cache_compression as native
+
+        programs = []
+        properties = []
+        for lifecycle in lifecycles:
+            metadata: list[list[int]] = []
+            scales: list[list[float]] = []
+            cold_page_bytes = 0
+            runtime_type = None
+
+            for layer_id, hot_buffers in lifecycle.layers.items():
+                layout = self._layer_layouts[int(layer_id)]
+                if runtime_type is not None and runtime_type != layout.runtime_type:
+                    raise ValueError("One cold-page lifecycle must use one runtime dtype")
+                runtime_type = layout.runtime_type
+
+                for index, buffer in enumerate(layout.buffers):
+                    hot = hot_buffers[buffer.role]
+                    padding_offset = 0
+                    padding_bytes = 0
+                    if index + 1 == len(layout.buffers):
+                        padding_offset = cold_page_bytes + layout.padding_offset
+                        padding_bytes = layout.cold_page_bytes - layout.padding_offset
+                    metadata.append(
+                        [
+                            int(hot.raw_base),
+                            int(hot.raw_slot_bytes),
+                            int(hot.raw_bytes),
+                            cold_page_bytes + buffer.data_offset,
+                            cold_page_bytes + buffer.scale_offset if buffer.scales else 0,
+                            padding_offset,
+                            padding_bytes,
+                            _NVFP4_TRANSFORM if buffer.scales else _LOSSLESS_TRANSFORM,
+                            layout.num_kv_heads if buffer.scales else 0,
+                            layout.tokens_per_page if buffer.scales else 0,
+                            layout.head_dim if buffer.scales else 0,
+                        ]
+                    )
+                    buffer_scales = buffer.scales or _Nvfp4Scales(1.0, 1.0)
+                    scales.append(
+                        [
+                            buffer_scales.nvfp4_orig_quant,
+                            buffer_scales.nvfp4_quant_orig,
+                            buffer_scales.fp8_orig_quant,
+                            buffer_scales.fp8_quant_orig,
+                        ]
+                    )
+                cold_page_bytes += layout.cold_page_bytes
+
+            if runtime_type is None:
+                raise ValueError("NVFP4 received an empty cold-page lifecycle")
+            programs.append(
+                torch.ops.trtllm.prepare_nvfp4_cold_page_program(
+                    metadata, scales, cold_page_bytes, runtime_type
+                )
+            )
+            lifecycle_properties = native.ColdPageLifecycleProperties()
+            lifecycle_properties.cold_page_bytes = cold_page_bytes
+            lifecycle_properties.page_index_location = native.ColdPageIndexLocation.HOST
+            properties.append(lifecycle_properties)
+
+        self._programs = programs
+        return properties
+
+    def encode(
+        self,
+        program_index: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        torch.ops.trtllm.nvfp4_cold_page_encode(
+            self._programs[program_index], cold_base, page_indices, num_pages, stream
+        )
+
+    def decode(
+        self,
+        program_index: int,
+        cold_base: int,
+        page_indices: int,
+        num_pages: int,
+        stream: int,
+    ) -> None:
+        torch.ops.trtllm.nvfp4_cold_page_decode(
+            self._programs[program_index], cold_base, page_indices, num_pages, stream
+        )
+
+
+class Nvfp4ColdPageQuantization(ColdPageQuantizationMethod):
+    """Build one fresh NVFP4 callback policy for each KVCM construction."""
 
     def __init__(self, checkpoint_path: str | None) -> None:
         self._model_scales = _load_modelopt_nvfp4_scales(checkpoint_path)
@@ -116,23 +253,18 @@ class Nvfp4ColdPagePolicy:
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
     ) -> object:
-        """Create the native generic codec from explicit per-buffer plans."""
-
         from tensorrt_llm.bindings.internal import kv_cache_compression as native
         from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
+        runtime_type = {
+            DataType.HALF: 0,
+            DataType.BF16: 1,
+            DataType.FP8: 2,
+        }.get(runtime_dtype)
         attention_layers = [
             layer for layer in cache_config.layers if isinstance(layer, AttentionLayerConfig)
         ]
-        if not attention_layers:
-            return native.create_nvfp4_cold_page_codec([])
-
-        runtime_type = {
-            DataType.HALF: native.Nvfp4ColdPageRuntimeType.FLOAT16,
-            DataType.BF16: native.Nvfp4ColdPageRuntimeType.BFLOAT16,
-            DataType.FP8: native.Nvfp4ColdPageRuntimeType.FP8_E4M3,
-        }.get(runtime_dtype)
-        if runtime_type is None:
+        if attention_layers and runtime_type is None:
             raise RuntimeError(
                 "NVFP4 cold-page compression supports FP16, BF16, or FP8 "
                 f"Attention KV, not {runtime_dtype}"
@@ -153,8 +285,6 @@ class Nvfp4ColdPagePolicy:
                     int(pp_layers[layer_id]), _IDENTITY_NVFP4_SCALES
                 )
             else:
-                # Target projection scales describe neither MLA latents nor a
-                # separately numbered draft model.
                 orig_quant, quant_orig = _IDENTITY_NVFP4_SCALES
 
             num_kv_heads = int(num_kv_heads_per_layer[layer_id])
@@ -177,41 +307,33 @@ class Nvfp4ColdPagePolicy:
             }
             cursor = scale_base + len(compressed_roles) * scale_bytes
 
-            buffer_layouts = []
-            for scale_index, role in enumerate(compressed_roles):
-                scales = native.Nvfp4ColdPageScales()
-                scales.nvfp4_scale_orig_quant = orig_quant[scale_index]
-                scales.nvfp4_scale_quant_orig = quant_orig[scale_index]
-                scales.fp8_scale_orig_quant = 1.0
-                scales.fp8_scale_quant_orig = 1.0
-
-                buffer_layout = native.Nvfp4ColdPageBufferLayout()
-                buffer_layout.role = role
-                buffer_layout.cold_data_offset = data_offsets[role]
-                buffer_layout.cold_scale_offset = scale_offsets[role]
-                buffer_layout.scales = scales
-                buffer_layouts.append(buffer_layout)
-
+            buffer_layouts = [
+                _Nvfp4BufferLayout(
+                    role=role,
+                    data_offset=data_offsets[role],
+                    scale_offset=scale_offsets[role],
+                    scales=_Nvfp4Scales(orig_quant[index], quant_orig[index]),
+                )
+                for index, role in enumerate(compressed_roles)
+            ]
             for buffer in layer.buffers:
                 role = str(buffer.role)
-                if role in compressed_roles:
-                    continue
-                buffer_layout = native.Nvfp4ColdPageBufferLayout()
-                buffer_layout.role = role
-                buffer_layout.cold_data_offset = cursor
-                buffer_layouts.append(buffer_layout)
-                cursor += _buffer_bytes(buffer, tokens_per_page)
+                if role not in compressed_roles:
+                    buffer_layouts.append(_Nvfp4BufferLayout(role=role, data_offset=cursor))
+                    cursor += _buffer_bytes(buffer, tokens_per_page)
 
-            cold_page_bytes = _align_up(cursor)
-            layer_layout = native.Nvfp4ColdPageLayerLayout()
-            layer_layout.layer_id = layer_id
-            layer_layout.runtime_type = runtime_type
-            layer_layout.num_kv_heads = num_kv_heads
-            layer_layout.tokens_per_page = tokens_per_page
-            layer_layout.head_dim = head_dim
-            layer_layout.cold_page_bytes = cold_page_bytes
-            layer_layout.cold_padding_offset = cursor
-            layer_layout.buffers = buffer_layouts
-            layer_layouts.append(layer_layout)
+            layer_layouts.append(
+                _Nvfp4LayerLayout(
+                    layer_id=layer_id,
+                    runtime_type=runtime_type,
+                    num_kv_heads=num_kv_heads,
+                    tokens_per_page=tokens_per_page,
+                    head_dim=head_dim,
+                    cold_page_bytes=_align_up(cursor),
+                    padding_offset=cursor,
+                    buffers=tuple(buffer_layouts),
+                )
+            )
 
-        return native.create_nvfp4_cold_page_codec(layer_layouts)
+        policy = Nvfp4ColdPagePolicy(layer_layouts)
+        return native.create_python_cold_page_codec(policy.layer_ids, policy)

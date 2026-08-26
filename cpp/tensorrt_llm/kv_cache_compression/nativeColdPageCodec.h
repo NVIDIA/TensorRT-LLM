@@ -70,7 +70,7 @@ private:
         std::vector<ResolvedHotLifecycle> const& lifecycles)
         = 0;
 
-    //! Enqueue only on stream; drain earlier partial submissions before throwing.
+    //! Enqueue only on stream; this codec drains partial submissions after a throw.
     virtual void encodeAlgorithm(std::size_t planIndex, void* coldBase, kv::PageIndexPair const* pageIndices,
         std::size_t numPages, cudaStream_t stream)
         = 0;

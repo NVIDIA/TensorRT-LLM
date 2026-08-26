@@ -111,6 +111,7 @@ add_library(
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
+  nvfp4ColdPageOp.cpp
   fusedCatFp4Op.cpp
   fusedCatFp8Op.cpp
   IndexerKCacheGatherOp.cpp

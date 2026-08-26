@@ -9,6 +9,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
+#include <exception>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -40,6 +41,16 @@ ResolvedHotLifecycle resolveLifecycle(kv::PoolGroupDesc const& gpuDesc, kv::Slot
         }
     }
     return result;
+}
+
+void drainAfterAlgorithmFailure(cudaStream_t stream) noexcept
+{
+    auto const status = cudaStreamSynchronize(stream);
+    if (status != cudaSuccess)
+    {
+        TLLM_LOG_ERROR("Cold-page algorithm rollback drain failed: %s", cudaGetErrorString(status));
+        std::terminate();
+    }
 }
 
 } // namespace
@@ -163,6 +174,7 @@ kv::PageIndexLocation NativeColdPageCodec::queryPageIndexLocation(kv::LayerGroup
 bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr, kv::PageIndexPair const* pageIndices,
     std::size_t numBasePages, cudaStream_t stream) noexcept
 {
+    bool algorithmStarted = false;
     try
     {
         auto const* state = findLayerGroup(layerGroupId);
@@ -178,16 +190,25 @@ bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr
         {
             return mLosslessCodec->encode(layerGroupId, dstBasePtr, pageIndices, numBasePages, stream);
         }
+        algorithmStarted = true;
         encodeAlgorithm(*state->planIndex, dstBasePtr, pageIndices, numBasePages, stream);
         return true;
     }
     catch (std::exception const& error)
     {
+        if (algorithmStarted)
+        {
+            drainAfterAlgorithmFailure(stream);
+        }
         TLLM_LOG_ERROR("NativeColdPageCodec::encode failed before completion fencing: %s", error.what());
         return false;
     }
     catch (...)
     {
+        if (algorithmStarted)
+        {
+            drainAfterAlgorithmFailure(stream);
+        }
         TLLM_LOG_ERROR("NativeColdPageCodec::encode failed before completion fencing: unknown error");
         return false;
     }
@@ -196,6 +217,7 @@ bool NativeColdPageCodec::encode(kv::LayerGroupId layerGroupId, void* dstBasePtr
 bool NativeColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcBasePtr,
     kv::PageIndexPair const* pageIndices, std::size_t numBasePages, cudaStream_t stream) noexcept
 {
+    bool algorithmStarted = false;
     try
     {
         auto const* state = findLayerGroup(layerGroupId);
@@ -211,16 +233,25 @@ bool NativeColdPageCodec::decode(kv::LayerGroupId layerGroupId, void const* srcB
         {
             return mLosslessCodec->decode(layerGroupId, srcBasePtr, pageIndices, numBasePages, stream);
         }
+        algorithmStarted = true;
         decodeAlgorithm(*state->planIndex, srcBasePtr, pageIndices, numBasePages, stream);
         return true;
     }
     catch (std::exception const& error)
     {
+        if (algorithmStarted)
+        {
+            drainAfterAlgorithmFailure(stream);
+        }
         TLLM_LOG_ERROR("NativeColdPageCodec::decode failed before completion fencing: %s", error.what());
         return false;
     }
     catch (...)
     {
+        if (algorithmStarted)
+        {
+            drainAfterAlgorithmFailure(stream);
+        }
         TLLM_LOG_ERROR("NativeColdPageCodec::decode failed before completion fencing: unknown error");
         return false;
     }

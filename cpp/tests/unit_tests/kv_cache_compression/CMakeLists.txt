@@ -7,7 +7,6 @@ set(COLD_PAGE_CODEC_TEST_SRC
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCodec.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/kv_cache_compression/nativeColdPageCodec.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/kv_cache_compression/nvfp4ColdPageCodec.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/assert.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/cudaDriverWrapper.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/envUtils.cpp

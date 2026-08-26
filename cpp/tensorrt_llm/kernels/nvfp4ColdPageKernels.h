@@ -19,6 +19,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kv_cache_compression/coldPageCallbackAbi.h"
 
 #include <array>
 #include <cstddef>
@@ -31,27 +32,15 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-//! Active GPU representation encoded into cold Pages.
+//! Active GPU representation encoded into cold Pages; values are part of the Python custom-op ABI.
 enum class Nvfp4ColdPageRuntimeType : std::uint8_t
 {
-    kFloat16,
-    kBfloat16,
-    kFp8E4m3,
+    kFloat16 = 0,
+    kBfloat16 = 1,
+    kFp8E4m3 = 2,
 };
 
-//! One Base Page selected for GPU-to-Host transformation.
-struct Nvfp4ColdPageOffloadPageTask
-{
-    std::int32_t gpuPageIndex;
-    std::int32_t coldPageIndex;
-};
-
-//! One Base Page selected for Host-to-GPU transformation.
-struct Nvfp4ColdPageOnboardPageTask
-{
-    std::int32_t gpuPageIndex;
-    std::int32_t coldPageIndex;
-};
+using ColdPageIndexPair = ::tensorrt_llm::kv_cache_compression::ColdPageIndexPair;
 
 //! Per-buffer geometry and scales for one NVFP4 record in HND order.
 //! `headDim` is a multiple of 16; `*OrigQuant` encodes and `*QuantOrig` decodes this buffer.
@@ -66,12 +55,12 @@ struct Nvfp4ColdPageKernelParams
     float fp8ScaleQuantOrig;
 };
 
-//! Transformation applied to one independently addressed hot buffer.
+//! Per-buffer transform selected by the Python custom-op metadata ABI.
 enum class Nvfp4ColdPageTransform : std::uint8_t
 {
-    kNvfp4,
+    kNvfp4 = 0,
     //! Byte-exact copy for an Attention side buffer such as DSA index_key.
-    kLosslessCopy,
+    kLosslessCopy = 1,
 };
 
 //! Immutable transform plan for one hot buffer and its fixed-offset cold record.
@@ -104,13 +93,13 @@ struct Nvfp4ColdPagePreparedPlan
 [[nodiscard]] Nvfp4ColdPagePreparedPlan prepareNvfp4ColdPagePlan(std::vector<Nvfp4ColdPageBufferPlan> const& buffers,
     std::size_t coldPageBytes, Nvfp4ColdPageRuntimeType runtimeType);
 
-//! Compress GPU Pages into mapped-Host NVFP4 records.
-void invokeNvfp4ColdPageEncode(std::vector<Nvfp4ColdPageOffloadPageTask> const& pages,
-    Nvfp4ColdPagePreparedPlan const& plan, void* coldBase, cudaStream_t stream);
+//! Compress one whole KVCM Page-index batch; the launcher performs 256-Page chunking internally.
+void invokeNvfp4ColdPageEncode(void const* pages, std::size_t numPages, Nvfp4ColdPagePreparedPlan const& plan,
+    void* coldBase, cudaStream_t stream);
 
-//! Restore mapped-Host NVFP4 records into GPU Pages.
-void invokeNvfp4ColdPageDecode(std::vector<Nvfp4ColdPageOnboardPageTask> const& pages,
-    Nvfp4ColdPagePreparedPlan const& plan, void const* coldBase, cudaStream_t stream);
+//! Restore one whole KVCM Page-index batch; the launcher performs 256-Page chunking internally.
+void invokeNvfp4ColdPageDecode(void const* pages, std::size_t numPages, Nvfp4ColdPagePreparedPlan const& plan,
+    void const* coldBase, cudaStream_t stream);
 
 } // namespace kernels
 

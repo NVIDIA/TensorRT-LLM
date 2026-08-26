@@ -56,26 +56,22 @@ def _cache_config(*layers):
     return SimpleNamespace(tokens_per_block=64, layers=tuple(configs))
 
 
-def _native():
-    def config():
-        return SimpleNamespace()
-
-    def buffer_layout():
-        return SimpleNamespace(scales=None, cold_scale_offset=0)
-
+def _native() -> tuple[SimpleNamespace, MagicMock]:
     codec = MagicMock()
     module = SimpleNamespace(
-        Nvfp4ColdPageRuntimeType=SimpleNamespace(
-            FLOAT16="native-fp16",
-            BFLOAT16="native-bf16",
-            FP8_E4M3="native-fp8",
-        ),
-        Nvfp4ColdPageScales=config,
-        Nvfp4ColdPageBufferLayout=buffer_layout,
-        Nvfp4ColdPageLayerLayout=config,
-        create_nvfp4_cold_page_codec=MagicMock(return_value=codec),
+        ColdPageLifecycleProperties=lambda: SimpleNamespace(),
+        ColdPageIndexLocation=SimpleNamespace(HOST="host"),
+        create_python_cold_page_codec=MagicMock(return_value=codec),
     )
     return module, codec
+
+
+def _policy(native: SimpleNamespace) -> object:
+    return native.create_python_cold_page_codec.call_args.args[1]
+
+
+def _plans(native: SimpleNamespace) -> list[object]:
+    return list(_policy(native)._layer_layouts.values())
 
 
 def _write_quant_metadata(directory, algorithm="NVFP4"):
@@ -129,13 +125,13 @@ def test_optional_modelopt_scales_map_pp_layers_and_default_missing_layers(tmp_p
         )
 
     assert result is codec
-    plans = native.create_nvfp4_cold_page_codec.call_args.args[0]
+    plans = _plans(native)
     assert [plan.layer_id for plan in plans] == [0, 1, 2]
-    assert [plan.runtime_type for plan in plans] == ["native-bf16"] * 3
+    assert [plan.runtime_type for plan in plans] == [1] * 3
     assert [
         (
-            tuple(buffer.scales.nvfp4_scale_orig_quant for buffer in plan.buffers),
-            tuple(buffer.scales.nvfp4_scale_quant_orig for buffer in plan.buffers),
+            tuple(buffer.scales.nvfp4_orig_quant for buffer in plan.buffers),
+            tuple(buffer.scales.nvfp4_quant_orig for buffer in plan.buffers),
         )
         for plan in plans
     ] == [
@@ -158,7 +154,7 @@ def test_draft_codec_does_not_reuse_target_modelopt_scales(tmp_path) -> None:
             num_kv_heads_per_layer=(8,),
             head_dim_per_layer=(128,),
         )
-        target_plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+        target_plan = _plans(native)[0]
         manager.create_cold_page_codec(
             _cache_config((0, "attention")),
             runtime_dtype=DataType.BF16,
@@ -168,16 +164,16 @@ def test_draft_codec_does_not_reuse_target_modelopt_scales(tmp_path) -> None:
             is_draft=True,
         )
 
-    draft_plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
-    assert [buffer.scales.nvfp4_scale_orig_quant for buffer in target_plan.buffers] == [
+    draft_plan = _plans(native)[0]
+    assert [buffer.scales.nvfp4_orig_quant for buffer in target_plan.buffers] == [
         2.0,
         4.0,
     ]
-    assert [buffer.scales.nvfp4_scale_orig_quant for buffer in draft_plan.buffers] == [
+    assert [buffer.scales.nvfp4_orig_quant for buffer in draft_plan.buffers] == [
         1.0,
         1.0,
     ]
-    assert [buffer.scales.nvfp4_scale_quant_orig for buffer in draft_plan.buffers] == [
+    assert [buffer.scales.nvfp4_quant_orig for buffer in draft_plan.buffers] == [
         1.0,
         1.0,
     ]
@@ -197,21 +193,21 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
             head_dim_per_layer=(128,),
         )
 
-    plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+    plan = _plans(native)[0]
     assert [buffer.role for buffer in plan.buffers] == ["key", "value"]
-    assert [buffer.cold_data_offset for buffer in plan.buffers] == [0, 1280]
-    assert [buffer.cold_scale_offset for buffer in plan.buffers] == [2560, 2720]
+    assert [buffer.data_offset for buffer in plan.buffers] == [0, 1280]
+    assert [buffer.scale_offset for buffer in plan.buffers] == [2560, 2720]
     assert plan.cold_page_bytes == 2880
-    assert plan.cold_padding_offset == plan.cold_page_bytes
-    assert plan.runtime_type == "native-fp16"
+    assert plan.padding_offset == plan.cold_page_bytes
+    assert plan.runtime_type == 0
     assert plan.num_kv_heads == 4
     assert plan.tokens_per_page == 5
     assert plan.head_dim == 128
-    assert [buffer.scales.nvfp4_scale_orig_quant for buffer in plan.buffers] == [
+    assert [buffer.scales.nvfp4_orig_quant for buffer in plan.buffers] == [
         1.0,
         1.0,
     ]
-    assert [buffer.scales.nvfp4_scale_quant_orig for buffer in plan.buffers] == [
+    assert [buffer.scales.nvfp4_quant_orig for buffer in plan.buffers] == [
         1.0,
         1.0,
     ]
@@ -241,18 +237,18 @@ def test_mha_layout_is_k_v_then_scales_and_layer_padding() -> None:
             head_dim_per_layer=(32,),
         )
 
-    plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+    plan = _plans(native)[0]
     assert [buffer.role for buffer in plan.buffers] == ["key", "value"]
-    assert [buffer.cold_data_offset for buffer in plan.buffers] == [0, 80]
-    assert [buffer.cold_scale_offset for buffer in plan.buffers] == [160, 170]
-    assert plan.cold_padding_offset == 180
+    assert [buffer.data_offset for buffer in plan.buffers] == [0, 80]
+    assert [buffer.scale_offset for buffer in plan.buffers] == [160, 170]
+    assert plan.padding_offset == 180
     assert plan.cold_page_bytes == 192
 
 
 def test_provider_creates_one_native_codec_per_kv_cache_manager():
     native, _ = _native()
     codecs = (object(), object())
-    native.create_nvfp4_cold_page_codec.side_effect = codecs
+    native.create_python_cold_page_codec.side_effect = codecs
     provider = _manager()
 
     with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
@@ -268,7 +264,61 @@ def test_provider_creates_one_native_codec_per_kv_cache_manager():
         )
 
     assert results == codecs
-    assert native.create_nvfp4_cold_page_codec.call_count == 2
+    assert native.create_python_cold_page_codec.call_count == 2
+
+
+def test_policy_forwards_a_4096_page_batch_through_one_custom_op(monkeypatch) -> None:
+    native, _ = _native()
+    program = object()
+    prepare = MagicMock(return_value=program)
+    encode = MagicMock()
+    decode = MagicMock()
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "prepare_nvfp4_cold_page_program",
+        prepare,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "nvfp4_cold_page_encode",
+        encode,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "nvfp4_cold_page_decode",
+        decode,
+        raising=False,
+    )
+
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager().create_cold_page_codec(
+            _cache_config((0, "attention")),
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(1,),
+            head_dim_per_layer=(16,),
+        )
+        policy = _policy(native)
+        hot = {
+            role: SimpleNamespace(
+                raw_base=0x1000 + index * 0x1000,
+                raw_slot_bytes=4096,
+                raw_bytes=2048,
+            )
+            for index, role in enumerate(("key", "value"))
+        }
+        properties = policy.configure([SimpleNamespace(layers={0: hot})])
+
+    assert prepare.call_count == 1
+    assert properties[0].cold_page_bytes == 1152
+    assert properties[0].page_index_location == "host"
+
+    policy.encode(0, 0x3000, 0x4000, 4096, 0x5000)
+    policy.decode(0, 0x3000, 0x4000, 4096, 0x5000)
+    encode.assert_called_once_with(program, 0x3000, 0x4000, 4096, 0x5000)
+    decode.assert_called_once_with(program, 0x3000, 0x4000, 4096, 0x5000)
 
 
 def test_unsupported_quant_does_not_construct_nvfp4_policy() -> None:
@@ -278,7 +328,7 @@ def test_unsupported_quant_does_not_construct_nvfp4_policy() -> None:
     )
     with patch(
         "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
-        "quantization_for_cold_page.Nvfp4ColdPagePolicy"
+        "nvfp4.Nvfp4ColdPageQuantization"
     ) as policy:
         with pytest.raises(NotImplementedError, match="future-format"):
             ColdPageQuantizationCompression(config)
@@ -385,9 +435,9 @@ def test_hybrid_codec_skips_ssm_layers_and_ssm_only_rank_is_lossless(tmp_path):
             num_kv_heads_per_layer=(0, 8),
             head_dim_per_layer=(128, 128),
         )
-        plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+        plan = _plans(native)[0]
         assert plan.layer_id == 1
-        assert [buffer.scales.nvfp4_scale_orig_quant for buffer in plan.buffers] == [
+        assert [buffer.scales.nvfp4_orig_quant for buffer in plan.buffers] == [
             2.0,
             4.0,
         ]
@@ -401,7 +451,7 @@ def test_hybrid_codec_skips_ssm_layers_and_ssm_only_rank_is_lossless(tmp_path):
         )
 
     assert result is codec
-    native.create_nvfp4_cold_page_codec.assert_called_with([])
+    assert native.create_python_cold_page_codec.call_args.args[0] == ()
 
 
 def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
@@ -429,20 +479,20 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
         )
 
     assert result is codec
-    plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+    plan = _plans(native)[0]
     assert plan.layer_id == 0
     assert plan.cold_page_bytes == 29184
-    assert plan.cold_padding_offset == 29184
+    assert plan.padding_offset == 29184
     assert [buffer.role for buffer in plan.buffers] == ["key", "index_key"]
     assert [buffer.scales is not None for buffer in plan.buffers] == [True, False]
-    assert [buffer.cold_data_offset for buffer in plan.buffers] == [0, 20736]
-    assert [buffer.cold_scale_offset for buffer in plan.buffers] == [18432, 0]
-    assert plan.runtime_type == "native-bf16"
+    assert [buffer.data_offset for buffer in plan.buffers] == [0, 20736]
+    assert [buffer.scale_offset for buffer in plan.buffers] == [18432, 0]
+    assert plan.runtime_type == 1
     assert plan.num_kv_heads == 1
     assert plan.tokens_per_page == 64
     assert plan.head_dim == 576
     scales = plan.buffers[0].scales
-    assert scales.nvfp4_scale_orig_quant == scales.nvfp4_scale_quant_orig == 1.0
+    assert scales.nvfp4_orig_quant == scales.nvfp4_quant_orig == 1.0
     assert plan.buffers[1].scales is None
 
 
@@ -471,15 +521,15 @@ def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
             head_dim_per_layer=(32,),
         )
 
-    plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
+    plan = _plans(native)[0]
     assert [buffer.role for buffer in plan.buffers] == [
         "key",
         "index_key",
         "rope_state",
     ]
     assert [buffer.scales is not None for buffer in plan.buffers] == [True, False, False]
-    assert [buffer.cold_data_offset for buffer in plan.buffers] == [0, 90, 158]
-    assert plan.cold_padding_offset == 165
+    assert [buffer.data_offset for buffer in plan.buffers] == [0, 90, 158]
+    assert plan.padding_offset == 165
     assert plan.cold_page_bytes == 176
 
 
@@ -511,9 +561,9 @@ def test_tokens_per_block_override_expands_lossless_bytes() -> None:
             head_dim_per_layer=(16,),
         )
 
-    plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
-    assert [buffer.cold_data_offset for buffer in plan.buffers] == [0, 36]
-    assert plan.cold_padding_offset == 42
+    plan = _plans(native)[0]
+    assert [buffer.data_offset for buffer in plan.buffers] == [0, 36]
+    assert plan.padding_offset == 42
     assert plan.cold_page_bytes == 48
 
 
@@ -554,7 +604,7 @@ def test_mla_model_layouts_are_built_in_python(
             head_dim_per_layer=(576,) * expected_layers,
         )
 
-    plans = native.create_nvfp4_cold_page_codec.call_args.args[0]
+    plans = _plans(native)
     assert len(plans) == expected_layers
     assert sum(len(plan.buffers) for plan in plans) == expected_buffers
     assert sum(plan.cold_page_bytes for plan in plans) == expected_bytes
@@ -572,18 +622,18 @@ def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
             head_dim_per_layer=(128,),
         )
 
-    plan = native.create_nvfp4_cold_page_codec.call_args.args[0][0]
-    assert plan.runtime_type == "native-fp8"
-    assert [buffer.scales.nvfp4_scale_orig_quant for buffer in plan.buffers] == [
+    plan = _plans(native)[0]
+    assert plan.runtime_type == 2
+    assert [buffer.scales.nvfp4_orig_quant for buffer in plan.buffers] == [
         2.0,
         4.0,
     ]
-    assert [buffer.scales.nvfp4_scale_quant_orig for buffer in plan.buffers] == [
+    assert [buffer.scales.nvfp4_quant_orig for buffer in plan.buffers] == [
         0.5,
         0.25,
     ]
     assert all(
-        buffer.scales.fp8_scale_orig_quant == buffer.scales.fp8_scale_quant_orig == 1.0
+        buffer.scales.fp8_orig_quant == buffer.scales.fp8_quant_orig == 1.0
         for buffer in plan.buffers
     )
 

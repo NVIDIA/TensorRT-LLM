@@ -28,10 +28,10 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
-#include <exception>
 #include <limits>
 #include <type_traits>
 #include <vector>
@@ -73,16 +73,11 @@ static_assert(
 static_assert(std::is_trivially_copyable_v<Nvfp4ColdPageBufferPlan>, "Buffer plans must remain raw-copyable");
 
 // Keep both kernel argument packs within CUDA's modern 32,764-byte limit.
-static_assert(sizeof(std::array<Nvfp4ColdPageOffloadPageTask, kMaxTasksPerLaunch>)
+static_assert(sizeof(std::array<ColdPageIndexPair, kMaxTasksPerLaunch>)
             + sizeof(std::array<Nvfp4ColdPageBufferPlan, kMaxBuffersPerLaunch>) + 2U * sizeof(std::uintptr_t)
             + 3U * sizeof(std::uint32_t)
         <= kKernelParameterLimitBytes,
-    "Offload kernel arguments exceed CUDA's parameter limit");
-static_assert(sizeof(std::array<Nvfp4ColdPageOnboardPageTask, kMaxTasksPerLaunch>)
-            + sizeof(std::array<Nvfp4ColdPageBufferPlan, kMaxBuffersPerLaunch>) + 2U * sizeof(std::uintptr_t)
-            + 3U * sizeof(std::uint32_t)
-        <= kKernelParameterLimitBytes,
-    "Onboard kernel arguments exceed CUDA's parameter limit");
+    "Cold-page kernel arguments exceed CUDA's parameter limit");
 
 // Device data path.
 
@@ -115,20 +110,20 @@ struct OnboardBufferTask
     std::uint8_t* raw;
 };
 
-__device__ OffloadBufferTask resolveTask(Nvfp4ColdPageOffloadPageTask const& page,
-    Nvfp4ColdPageBufferPlan const& buffer, std::uint8_t* coldBase, std::size_t coldPageBytes)
+__device__ OffloadBufferTask resolveOffloadTask(ColdPageIndexPair const& page, Nvfp4ColdPageBufferPlan const& buffer,
+    std::uint8_t* coldBase, std::size_t coldPageBytes)
 {
-    std::size_t const gpuPage = static_cast<std::size_t>(page.gpuPageIndex);
-    auto* coldPage = coldBase + static_cast<std::size_t>(page.coldPageIndex) * coldPageBytes;
+    std::size_t const gpuPage = static_cast<std::size_t>(page.src);
+    auto* coldPage = coldBase + static_cast<std::size_t>(page.dst) * coldPageBytes;
     return {reinterpret_cast<std::uint8_t const*>(buffer.rawBase + gpuPage * buffer.rawSlotBytes),
         coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset, coldPage + buffer.coldPaddingOffset};
 }
 
-__device__ OnboardBufferTask resolveTask(Nvfp4ColdPageOnboardPageTask const& page,
-    Nvfp4ColdPageBufferPlan const& buffer, std::uint8_t const* coldBase, std::size_t coldPageBytes)
+__device__ OnboardBufferTask resolveOnboardTask(ColdPageIndexPair const& page, Nvfp4ColdPageBufferPlan const& buffer,
+    std::uint8_t const* coldBase, std::size_t coldPageBytes)
 {
-    std::size_t const gpuPage = static_cast<std::size_t>(page.gpuPageIndex);
-    auto const* coldPage = coldBase + static_cast<std::size_t>(page.coldPageIndex) * coldPageBytes;
+    std::size_t const gpuPage = static_cast<std::size_t>(page.dst);
+    auto const* coldPage = coldBase + static_cast<std::size_t>(page.src) * coldPageBytes;
     return {coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset,
         reinterpret_cast<std::uint8_t*>(buffer.rawBase + gpuPage * buffer.rawSlotBytes)};
 }
@@ -410,7 +405,7 @@ __device__ void restoreNvfp4Pair(uint2 packedPair, T* output, std::uint32_t firs
 // FP16/BF16 GPU Page -> mapped-Host NVFP4 in bounded tiles.
 template <typename T>
 __global__ void offloadFrom16BitTiledKernel(
-    std::array<Nvfp4ColdPageOffloadPageTask, kMaxTasksPerLaunch> const __grid_constant__ pages,
+    std::array<ColdPageIndexPair, kMaxTasksPerLaunch> const __grid_constant__ pages,
     std::array<Nvfp4ColdPageBufferPlan, kMaxBuffersPerLaunch> const __grid_constant__ buffers, std::uint8_t* coldBase,
     std::size_t coldPageBytes, std::uint32_t numBuffers)
 {
@@ -420,7 +415,7 @@ __global__ void offloadFrom16BitTiledKernel(
     std::uint32_t const bufferIndex = blockIdx.y;
     assert(bufferIndex < numBuffers);
     auto const& buffer = buffers[bufferIndex];
-    auto const task = resolveTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
+    auto const task = resolveOffloadTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
     if (buffer.transform == Nvfp4ColdPageTransform::kLosslessCopy)
@@ -491,7 +486,7 @@ __global__ void offloadFrom16BitTiledKernel(
 
 // FP8 E4M3 GPU Page -> mapped-Host NVFP4 in bounded tiles.
 __global__ void offloadFromFp8TiledKernel(
-    std::array<Nvfp4ColdPageOffloadPageTask, kMaxTasksPerLaunch> const __grid_constant__ pages,
+    std::array<ColdPageIndexPair, kMaxTasksPerLaunch> const __grid_constant__ pages,
     std::array<Nvfp4ColdPageBufferPlan, kMaxBuffersPerLaunch> const __grid_constant__ buffers, std::uint8_t* coldBase,
     std::size_t coldPageBytes, std::uint32_t numBuffers)
 {
@@ -501,7 +496,7 @@ __global__ void offloadFromFp8TiledKernel(
     std::uint32_t const bufferIndex = blockIdx.y;
     assert(bufferIndex < numBuffers);
     auto const& buffer = buffers[bufferIndex];
-    auto const task = resolveTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
+    auto const task = resolveOffloadTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
     if (buffer.transform == Nvfp4ColdPageTransform::kLosslessCopy)
@@ -634,8 +629,7 @@ __device__ void loadCompactRangeFromHost(std::uint8_t* compactStages, OnboardBuf
 
 // Mapped-Host NVFP4 -> runtime GPU Page in bounded tiles.
 template <typename T>
-__global__ void onboardTiledKernel(
-    std::array<Nvfp4ColdPageOnboardPageTask, kMaxTasksPerLaunch> const __grid_constant__ pages,
+__global__ void onboardTiledKernel(std::array<ColdPageIndexPair, kMaxTasksPerLaunch> const __grid_constant__ pages,
     std::array<Nvfp4ColdPageBufferPlan, kMaxBuffersPerLaunch> const __grid_constant__ buffers,
     std::uint8_t const* coldBase, std::size_t coldPageBytes, std::uint32_t numBuffers)
 {
@@ -645,7 +639,7 @@ __global__ void onboardTiledKernel(
     std::uint32_t const bufferIndex = blockIdx.y;
     assert(bufferIndex < numBuffers);
     auto const& buffer = buffers[bufferIndex];
-    auto const task = resolveTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
+    auto const task = resolveOnboardTask(pages[blockIdx.z], buffer, coldBase, coldPageBytes);
 
     asm volatile("griddepcontrol.wait;\n" : : : "memory");
     if (buffer.transform == Nvfp4ColdPageTransform::kLosslessCopy)
@@ -793,29 +787,31 @@ void validateBufferPlan(Nvfp4ColdPageBufferPlan const& buffer, std::size_t coldP
 
 // Host submission path.
 
-// Submit Page tasks through the fixed 256-descriptor kernel ABI.
-template <typename Task, typename Kernel, typename ColdPointer>
-void launchTaskChunks(Kernel kernel, std::vector<Task> const& tasks, Nvfp4ColdPagePreparedPlan const& plan,
+// Submit one whole KVCM Page batch through the fixed 256-descriptor kernel ABI.
+template <typename Kernel, typename ColdPointer>
+void launchPageChunks(Kernel kernel, void const* pages, std::size_t numPages, Nvfp4ColdPagePreparedPlan const& plan,
     ColdPointer coldBase, cudaStream_t stream)
 {
-    static_assert(std::is_trivially_copyable_v<std::array<Task, kMaxTasksPerLaunch>>,
-        "Page tasks must remain raw-copyable kernel arguments");
-    static_assert(sizeof(std::array<Task, kMaxTasksPerLaunch>) == sizeof(Task) * kMaxTasksPerLaunch,
-        "Page task arrays must not add ABI padding");
+    static_assert(std::is_trivially_copyable_v<std::array<ColdPageIndexPair, kMaxTasksPerLaunch>>,
+        "Page-index pairs must remain raw-copyable kernel arguments");
+    static_assert(
+        sizeof(std::array<ColdPageIndexPair, kMaxTasksPerLaunch>) == sizeof(ColdPageIndexPair) * kMaxTasksPerLaunch,
+        "Page-index pair arrays must not add ABI padding");
     dim3 const block(kThreadsPerBlock);
+    auto const* pageBytes = static_cast<std::byte const*>(pages);
     std::size_t offset = 0;
-    while (offset < tasks.size())
+    while (offset < numPages)
     {
-        std::uint32_t const numChunkTasks
-            = static_cast<std::uint32_t>(std::min<std::size_t>(tasks.size() - offset, kMaxTasksPerLaunch));
-        Task const* chunkTasks = tasks.data() + offset;
+        std::uint32_t const numChunkPages
+            = static_cast<std::uint32_t>(std::min<std::size_t>(numPages - offset, kMaxTasksPerLaunch));
+        auto const* chunkPages = pageBytes + offset * sizeof(ColdPageIndexPair);
 
         // CUDA copies the full by-value array, so pad only the final partial chunk.
-        std::array<Task, kMaxTasksPerLaunch> paddedTasks{};
-        if (numChunkTasks < kMaxTasksPerLaunch)
+        std::array<ColdPageIndexPair, kMaxTasksPerLaunch> paddedPages{};
+        if (numChunkPages < kMaxTasksPerLaunch)
         {
-            std::copy_n(chunkTasks, numChunkTasks, paddedTasks.begin());
-            chunkTasks = paddedTasks.data();
+            std::memcpy(paddedPages.data(), chunkPages, numChunkPages * sizeof(ColdPageIndexPair));
+            chunkPages = reinterpret_cast<std::byte const*>(paddedPages.data());
         }
 
         cudaLaunchAttribute attribute{};
@@ -823,7 +819,7 @@ void launchTaskChunks(Kernel kernel, std::vector<Task> const& tasks, Nvfp4ColdPa
         attribute.val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL() ? 1 : 0;
 
         cudaLaunchConfig_t config{};
-        config.gridDim = dim3(kMappedHostGridSplits, plan.numBuffers, numChunkTasks);
+        config.gridDim = dim3(kMappedHostGridSplits, plan.numBuffers, numChunkPages);
         config.blockDim = block;
         config.dynamicSmemBytes = compactStageBytesForHalfGroups(plan.maxHalfGroupsPerTile);
         config.stream = stream;
@@ -832,32 +828,10 @@ void launchTaskChunks(Kernel kernel, std::vector<Task> const& tasks, Nvfp4ColdPa
 
         auto coldPageBytes = plan.coldPageBytes;
         auto numBuffers = plan.numBuffers;
-        void* arguments[] = {const_cast<Task*>(chunkTasks), const_cast<Nvfp4ColdPageBufferPlan*>(plan.buffers.data()),
-            &coldBase, &coldPageBytes, &numBuffers};
+        void* arguments[] = {const_cast<std::byte*>(chunkPages),
+            const_cast<Nvfp4ColdPageBufferPlan*>(plan.buffers.data()), &coldBase, &coldPageBytes, &numBuffers};
         TLLM_CUDA_CHECK(cudaLaunchKernelExC(&config, reinterpret_cast<void const*>(kernel), arguments));
-        offset += numChunkTasks;
-    }
-}
-
-// Drain earlier chunks after a later synchronous launch failure.
-template <typename Task, typename Kernel, typename ColdPointer>
-void submitColdPageTasks(Kernel kernel, std::vector<Task> const& tasks, Nvfp4ColdPagePreparedPlan const& plan,
-    ColdPointer coldBase, cudaStream_t stream)
-{
-    try
-    {
-        launchTaskChunks(kernel, tasks, plan, coldBase, stream);
-    }
-    catch (...)
-    {
-        cudaError_t const drainStatus = cudaStreamSynchronize(stream);
-        if (drainStatus != cudaSuccess)
-        {
-            // An asynchronous drain failure leaves Slot ownership unknown; fail-stop.
-            TLLM_LOG_ERROR("NVFP4 cold-page failure drain failed: %s", cudaGetErrorString(drainStatus));
-            std::terminate();
-        }
-        throw;
+        offset += numChunkPages;
     }
 }
 
@@ -910,51 +884,55 @@ Nvfp4ColdPagePreparedPlan prepareNvfp4ColdPagePlan(std::vector<Nvfp4ColdPageBuff
     return plan;
 }
 
-void invokeNvfp4ColdPageEncode(std::vector<Nvfp4ColdPageOffloadPageTask> const& pages,
-    Nvfp4ColdPagePreparedPlan const& plan, void* coldBase, cudaStream_t stream)
+void invokeNvfp4ColdPageEncode(
+    void const* pages, std::size_t numPages, Nvfp4ColdPagePreparedPlan const& plan, void* coldBase, cudaStream_t stream)
 {
-    if (pages.empty())
+    if (numPages == 0)
     {
         return;
     }
+    TLLM_CHECK_WITH_INFO(pages != nullptr, "pages must not be null");
     TLLM_CHECK_WITH_INFO(coldBase != nullptr, "coldBase must not be null");
     switch (plan.runtimeType)
     {
     case Nvfp4ColdPageRuntimeType::kFloat16:
-        submitColdPageTasks(
-            offloadFrom16BitTiledKernel<half>, pages, plan, static_cast<std::uint8_t*>(coldBase), stream);
+        launchPageChunks(
+            offloadFrom16BitTiledKernel<half>, pages, numPages, plan, static_cast<std::uint8_t*>(coldBase), stream);
         break;
     case Nvfp4ColdPageRuntimeType::kBfloat16:
-        submitColdPageTasks(
-            offloadFrom16BitTiledKernel<__nv_bfloat16>, pages, plan, static_cast<std::uint8_t*>(coldBase), stream);
+        launchPageChunks(offloadFrom16BitTiledKernel<__nv_bfloat16>, pages, numPages, plan,
+            static_cast<std::uint8_t*>(coldBase), stream);
         break;
     case Nvfp4ColdPageRuntimeType::kFp8E4m3:
-        submitColdPageTasks(offloadFromFp8TiledKernel, pages, plan, static_cast<std::uint8_t*>(coldBase), stream);
+        launchPageChunks(
+            offloadFromFp8TiledKernel, pages, numPages, plan, static_cast<std::uint8_t*>(coldBase), stream);
         break;
     default: TLLM_THROW("Unsupported NVFP4 cold-page runtime type");
     }
 }
 
-void invokeNvfp4ColdPageDecode(std::vector<Nvfp4ColdPageOnboardPageTask> const& pages,
-    Nvfp4ColdPagePreparedPlan const& plan, void const* coldBase, cudaStream_t stream)
+void invokeNvfp4ColdPageDecode(void const* pages, std::size_t numPages, Nvfp4ColdPagePreparedPlan const& plan,
+    void const* coldBase, cudaStream_t stream)
 {
-    if (pages.empty())
+    if (numPages == 0)
     {
         return;
     }
+    TLLM_CHECK_WITH_INFO(pages != nullptr, "pages must not be null");
     TLLM_CHECK_WITH_INFO(coldBase != nullptr, "coldBase must not be null");
     switch (plan.runtimeType)
     {
     case Nvfp4ColdPageRuntimeType::kFloat16:
-        submitColdPageTasks(onboardTiledKernel<half>, pages, plan, static_cast<std::uint8_t const*>(coldBase), stream);
+        launchPageChunks(
+            onboardTiledKernel<half>, pages, numPages, plan, static_cast<std::uint8_t const*>(coldBase), stream);
         break;
     case Nvfp4ColdPageRuntimeType::kBfloat16:
-        submitColdPageTasks(
-            onboardTiledKernel<__nv_bfloat16>, pages, plan, static_cast<std::uint8_t const*>(coldBase), stream);
+        launchPageChunks(onboardTiledKernel<__nv_bfloat16>, pages, numPages, plan,
+            static_cast<std::uint8_t const*>(coldBase), stream);
         break;
     case Nvfp4ColdPageRuntimeType::kFp8E4m3:
-        submitColdPageTasks(
-            onboardTiledKernel<__nv_fp8_e4m3>, pages, plan, static_cast<std::uint8_t const*>(coldBase), stream);
+        launchPageChunks(onboardTiledKernel<__nv_fp8_e4m3>, pages, numPages, plan,
+            static_cast<std::uint8_t const*>(coldBase), stream);
         break;
     default: TLLM_THROW("Unsupported NVFP4 cold-page runtime type");
     }
