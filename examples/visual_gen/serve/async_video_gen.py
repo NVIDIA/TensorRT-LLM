@@ -17,6 +17,8 @@ Examples:
 """
 
 import argparse
+import base64
+import json
 import sys
 import time
 from pathlib import Path
@@ -81,17 +83,19 @@ def test_async_video_generation(
             },
         }
 
-        # Add input reference if provided (TI2V mode). Keep the create call
-        # inside the file's context so the handle closes once the request is sent.
+        # Add the conditioning image if provided (TI2V mode). The OpenAI SDK
+        # only knows one file parameter, `input_reference`, so the typed field
+        # travels base64-encoded in extra_body. It has to be a JSON string: a
+        # nested dict would be flattened into `image_reference[content]`.
         if image_reference:
             if not Path(image_reference).exists():
                 print(f"\n❌ Error: Input reference image not found: {image_reference}")
                 return False
-            with open(image_reference, "rb") as ref_file:
-                create_params["image_reference"] = ref_file
-                job = client.videos.create(**create_params)
-        else:
-            job = client.videos.create(**create_params)
+            encoded = base64.b64encode(Path(image_reference).read_bytes()).decode()
+            create_params["extra_body"]["image_reference"] = json.dumps(
+                {"content": encoded, "format": "base64"}
+            )
+        job = client.videos.create(**create_params)
 
         print("Video generation started: \n", job.model_dump_json(indent=2))
 
