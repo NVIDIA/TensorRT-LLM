@@ -930,10 +930,13 @@ inline bool checkAndUpdateGemmOptions(
             options.mValidM, " validN=", options.mValidN, " validK=", options.mValidK);
     }
 
+#ifndef TLLM_GEN_EXPORT_INTERFACE
+    // JIT compilation from public sources does not support E2m1 x E4m3; prebuilt cubins do.
     if (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3)
     {
         TLLM_CHECK_ERROR(false, "E2m1 x E4m3 is not supported for JIT compile. Use cubins instead.");
     }
+#endif // TLLM_GEN_EXPORT_INTERFACE
 
     // Check that the A cast is supported.
     // Currently, we only support {MxFp4, NvFp4, MxInt4} -> Bf16.
