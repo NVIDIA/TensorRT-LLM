@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -364,6 +366,220 @@ def _qsa_paged_sparse_gqa_kernel(
     )
 
 
+@triton.jit
+def _qsa_paged_sparse_gqa_splitk_kernel(
+    q,
+    k_cache,
+    v_cache,
+    block_table,
+    selected_tokens,
+    request_indices,
+    partial_output,
+    partial_lse,
+    output,
+    softmax_scale,
+    num_rows,
+    q_stride_row: tl.constexpr,
+    q_stride_head: tl.constexpr,
+    q_stride_dim: tl.constexpr,
+    k_stride_page: tl.constexpr,
+    k_stride_head: tl.constexpr,
+    k_stride_token: tl.constexpr,
+    k_stride_dim: tl.constexpr,
+    v_stride_page: tl.constexpr,
+    v_stride_head: tl.constexpr,
+    v_stride_token: tl.constexpr,
+    v_stride_dim: tl.constexpr,
+    block_table_stride_request: tl.constexpr,
+    block_table_stride_page: tl.constexpr,
+    selected_stride_row: tl.constexpr,
+    selected_stride_token: tl.constexpr,
+    output_stride_row: tl.constexpr,
+    output_stride_head: tl.constexpr,
+    output_stride_dim: tl.constexpr,
+    NUM_CACHE_PAGES: tl.constexpr,
+    NUM_REQUESTS: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    TOPK: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split = tl.program_id(2)
+    request = tl.load(request_indices + row).to(tl.int64)
+    valid_request = (request >= 0) & (request < NUM_REQUESTS)
+    safe_request = tl.minimum(tl.maximum(request, 0), NUM_REQUESTS - 1)
+
+    head_offsets = tl.arange(0, BLOCK_M)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    token_offsets = tl.arange(0, BLOCK_N)
+    query_heads = kv_head * GROUP_SIZE + head_offsets
+    query_values = tl.load(
+        q
+        + row * q_stride_row
+        + query_heads[:, None] * q_stride_head
+        + dim_offsets[None, :] * q_stride_dim,
+        mask=(head_offsets < GROUP_SIZE)[:, None],
+        other=0.0,
+    )
+
+    running_max = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    running_sum = tl.zeros([BLOCK_M], tl.float32)
+    accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+    split_tile_start = split * NUM_TILES // NUM_SPLITS
+    split_tile_end = (split + 1) * NUM_TILES // NUM_SPLITS
+
+    for tile in range(split_tile_start, split_tile_end):
+        selected_columns = tile * BLOCK_N + token_offsets
+        logical_tokens = tl.load(
+            selected_tokens + row * selected_stride_row + selected_columns * selected_stride_token,
+            mask=selected_columns < TOPK,
+            other=-1,
+        )
+        safe_tokens = tl.maximum(logical_tokens, 0)
+        logical_pages = safe_tokens // TOKENS_PER_BLOCK
+        token_in_page = safe_tokens % TOKENS_PER_BLOCK
+        valid = (
+            valid_request
+            & (selected_columns < TOPK)
+            & (logical_tokens >= 0)
+            & (logical_pages < PAGE_TABLE_WIDTH)
+        )
+        physical_pages = tl.load(
+            block_table
+            + safe_request * block_table_stride_request
+            + tl.minimum(logical_pages, PAGE_TABLE_WIDTH - 1) * block_table_stride_page,
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+        valid &= (physical_pages >= 0) & (physical_pages < NUM_CACHE_PAGES)
+        safe_pages = tl.maximum(physical_pages, 0)
+
+        keys = tl.load(
+            k_cache
+            + safe_pages[None, :] * k_stride_page
+            + kv_head * k_stride_head
+            + token_in_page[None, :] * k_stride_token
+            + dim_offsets[:, None] * k_stride_dim,
+            mask=valid[None, :],
+            other=0.0,
+        ).to(query_values.dtype)
+        values = tl.load(
+            v_cache
+            + safe_pages[:, None] * v_stride_page
+            + kv_head * v_stride_head
+            + token_in_page[:, None] * v_stride_token
+            + dim_offsets[None, :] * v_stride_dim,
+            mask=valid[:, None],
+            other=0.0,
+        ).to(query_values.dtype)
+        scores = tl.dot(query_values, keys)
+        scores *= softmax_scale * 1.4426950408889634
+        scores = tl.where(valid[None, :], scores, -float("inf"))
+        next_max = tl.maximum(running_max, tl.max(scores, axis=1))
+        correction = tl.math.exp2(running_max - next_max)
+        probabilities = tl.where(
+            valid[None, :],
+            tl.math.exp2(scores - next_max[:, None]),
+            0.0,
+        )
+        accumulator = tl.dot(
+            probabilities.to(values.dtype),
+            values,
+            accumulator * correction[:, None],
+        )
+        running_sum = running_sum * correction + tl.sum(probabilities, axis=1)
+        running_max = next_max
+
+    has_values = running_sum > 0
+    normalized = tl.where(
+        has_values[:, None],
+        accumulator / tl.maximum(running_sum[:, None], 1.0e-20),
+        0.0,
+    )
+    output_mask = (head_offsets < GROUP_SIZE)[:, None]
+    if NUM_SPLITS == 1:
+        tl.store(
+            output
+            + row * output_stride_row
+            + query_heads[:, None] * output_stride_head
+            + dim_offsets[None, :] * output_stride_dim,
+            normalized,
+            mask=output_mask,
+        )
+    else:
+        partial_lse_values = tl.where(
+            has_values,
+            running_max + tl.math.log2(tl.maximum(running_sum, 1.0e-20)),
+            -float("inf"),
+        )
+        tl.store(
+            partial_output
+            + ((split * num_rows + row) * NUM_QUERY_HEADS + query_heads[:, None]) * HEAD_DIM
+            + dim_offsets[None, :],
+            normalized,
+            mask=output_mask,
+        )
+        tl.store(
+            partial_lse + (split * num_rows + row) * NUM_QUERY_HEADS + query_heads,
+            partial_lse_values,
+            mask=head_offsets < GROUP_SIZE,
+        )
+
+
+@triton.jit
+def _qsa_merge_splitk_kernel(
+    partial_output,
+    partial_lse,
+    output,
+    num_rows,
+    output_stride_row: tl.constexpr,
+    output_stride_head: tl.constexpr,
+    output_stride_dim: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_SPLITS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    split_offsets = tl.arange(0, BLOCK_SPLITS)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    split_mask = split_offsets < NUM_SPLITS
+    lse = tl.load(
+        partial_lse + (split_offsets * num_rows + row) * NUM_QUERY_HEADS + head,
+        mask=split_mask,
+        other=-float("inf"),
+    )
+    max_lse = tl.max(lse, axis=0)
+    has_values = max_lse > -float("inf")
+    weights = tl.math.exp2(tl.where(split_mask & has_values, lse - max_lse, -float("inf")))
+    denominator = tl.sum(weights, axis=0)
+    partials = tl.load(
+        partial_output
+        + ((split_offsets[:, None] * num_rows + row) * NUM_QUERY_HEADS + head) * HEAD_DIM
+        + dim_offsets[None, :],
+        mask=split_mask[:, None],
+        other=0.0,
+    )
+    merged = tl.sum(partials * weights[:, None], axis=0)
+    merged = tl.where(denominator > 0, merged / denominator, 0.0)
+    tl.store(
+        output
+        + row * output_stride_row
+        + head * output_stride_head
+        + dim_offsets * output_stride_dim,
+        merged,
+    )
+
+
 def triton_qsa_paged_sparse_gqa(
     *,
     q: torch.Tensor,
@@ -380,8 +596,105 @@ def triton_qsa_paged_sparse_gqa(
     num_kv_heads = k_cache.shape[1]
     group_size = num_q_heads // num_kv_heads
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n = 64 if rows <= 64 else 32
     output = torch.empty_like(q)
+    if rows == 0:
+        return output
+
+    if os.environ.get("TRTLLM_QSA_SPARSE_SPLITK", "1") != "0":
+        base_programs = rows * num_kv_heads
+        if base_programs <= 4:
+            block_n, target_splits, num_warps = 16, 64, 4
+        elif base_programs < 32:
+            block_n, target_splits, num_warps = 16, 32, 4
+        elif base_programs <= 256:
+            block_n, target_splits, num_warps = 64, 8, 2
+        elif base_programs <= 512:
+            block_n, target_splits, num_warps = 64, 4, 2
+        else:
+            block_n, target_splits, num_warps = 64, 1, 2
+
+        num_tiles = triton.cdiv(selected_tokens.shape[1], block_n)
+        max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+        num_splits = min(max_useful_splits, target_splits)
+        if num_splits == 1:
+            partial_output = output
+            partial_lse = output
+        else:
+            partial_output = torch.empty(
+                (num_splits, *q.shape),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            partial_lse = torch.empty(
+                (num_splits, rows, num_q_heads),
+                dtype=torch.float32,
+                device=q.device,
+            )
+        _qsa_paged_sparse_gqa_splitk_kernel[(rows, num_kv_heads, num_splits)](
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            selected_tokens,
+            request_indices,
+            partial_output,
+            partial_lse,
+            output,
+            softmax_scale,
+            rows,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            k_cache.stride(3),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            v_cache.stride(3),
+            block_table.stride(0),
+            block_table.stride(1),
+            selected_tokens.stride(0),
+            selected_tokens.stride(1),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            NUM_CACHE_PAGES=k_cache.shape[0],
+            NUM_REQUESTS=block_table.shape[0],
+            PAGE_TABLE_WIDTH=block_table.shape[1],
+            GROUP_SIZE=group_size,
+            NUM_QUERY_HEADS=num_q_heads,
+            TOKENS_PER_BLOCK=tokens_per_block,
+            TOPK=selected_tokens.shape[1],
+            NUM_SPLITS=num_splits,
+            NUM_TILES=num_tiles,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HEAD_DIM=head_dim,
+            num_warps=num_warps,
+            num_stages=2,
+        )
+        if num_splits == 1:
+            return output
+        _qsa_merge_splitk_kernel[(rows, num_q_heads)](
+            partial_output,
+            partial_lse,
+            output,
+            rows,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            NUM_QUERY_HEADS=num_q_heads,
+            NUM_SPLITS=num_splits,
+            BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+            HEAD_DIM=head_dim,
+            num_warps=2,
+            num_stages=1,
+        )
+        return output
+
+    block_n = 64 if rows <= 64 else 32
     _qsa_paged_sparse_gqa_kernel[(rows, num_kv_heads)](
         q,
         k_cache,

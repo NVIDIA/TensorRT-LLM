@@ -12,7 +12,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ..hooks import AttentionSparseHooks, register_attention_sparse_hooks
-from .indexer import QSAIndexer, qsa_sparse_gqa, select_qsa_decode_tokens, select_qsa_tokens
+from .indexer import QSAIndexer, qsa_sparse_gqa, select_qsa_paged_tokens
 from .metadata import QSAAttentionMetadata
 from .params import QSASparseParams
 
@@ -20,18 +20,24 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.modules.attention import Attention
 
 
-_DEFAULT_QUERY_CHUNK = 32
+_DEFAULT_SCORE_WORKSPACE_BYTES = 128 * 1024 * 1024
+_FP32_BYTES = 4
 
 
-def _query_chunk_size() -> int:
+def _query_chunk_size(query_len: int, score_columns: int) -> int:
     raw = os.environ.get("TRTLLM_QSA_SPARSE_QUERY_CHUNK")
-    if raw is None:
-        return _DEFAULT_QUERY_CHUNK
-    try:
-        value = int(raw)
-    except ValueError:
-        return _DEFAULT_QUERY_CHUNK
-    return max(value, 1)
+    if raw is not None:
+        try:
+            return max(int(raw), 1)
+        except ValueError:
+            pass
+
+    # Paged QSA selection materializes one FP32 score per compressed block.
+    # Bound its workspace while keeping all packed rows in one launch whenever
+    # practical.  A small fixed chunk leaves long prefills launch-bound.
+    score_bytes_per_row = max(score_columns * _FP32_BYTES, 1)
+    workspace_rows = max(_DEFAULT_SCORE_WORKSPACE_BYTES // score_bytes_per_row, 1)
+    return max(min(query_len, workspace_rows), 1)
 
 
 class QSASparseHooks(AttentionSparseHooks):
@@ -142,7 +148,7 @@ class QSASparseHooks(AttentionSparseHooks):
             # lengths on device and the host mirror is not updated between its
             # sub-steps.
             sequence_lengths = attn_metadata.kv_lens_cuda_runtime[req_idx.to(torch.long)]
-            selected = select_qsa_decode_tokens(
+            selected = select_qsa_paged_tokens(
                 q_index,
                 index_cache,
                 logical,
@@ -165,50 +171,38 @@ class QSASparseHooks(AttentionSparseHooks):
             )
             return output.reshape(num_tokens, -1)
 
+        index_cache = attn_metadata.kv_cache_manager.get_index_k_buffer(attention.layer_idx)
+        if index_cache is None:
+            raise RuntimeError(f"QSA index cache is unavailable for layer {attention.layer_idx}")
+        sequence_lengths = attn_metadata.kv_lens_cuda_runtime[req_idx.to(torch.long)]
+        score_columns = (
+            attn_metadata.qsa_block_table.shape[1] * tokens_per_block // params.compress_ratio
+        )
+        chunk_size = _query_chunk_size(num_tokens, score_columns)
         output = torch.empty_like(q)
-        seq_lens = attn_metadata.seq_lens[: attn_metadata.num_seqs].tolist()
-        kv_lens = attn_metadata.kv_lens_runtime.tolist()
-        token_offset = 0
-        chunk_size = _query_chunk_size()
-        for request_idx, (query_len, sequence_len) in enumerate(zip(seq_lens, kv_lens)):
-            query_len = int(query_len)
-            sequence_len = int(sequence_len)
-            request_slice = slice(token_offset, token_offset + query_len)
-            request_positions = logical[request_slice]
-            complete_blocks = sequence_len // params.compress_ratio
-            compressed_keys = attention.indexer.gather_compressed_keys(
-                attention.layer_idx,
-                request_idx,
-                complete_blocks,
+        for start in range(0, num_tokens, chunk_size):
+            end = min(start + chunk_size, num_tokens)
+            packed_slice = slice(start, end)
+            selected = select_qsa_paged_tokens(
+                q_index[packed_slice],
+                index_cache,
+                logical[packed_slice],
+                sequence_lengths[packed_slice],
+                req_idx[packed_slice],
                 attn_metadata,
+                params,
+                top_k=attention.indexer.top_k,
+                top_k_output=attn_metadata.qsa_topk_indices[packed_slice],
+                top_k_row_starts=attn_metadata.qsa_topk_row_starts[packed_slice],
             )
-            for start in range(0, query_len, chunk_size):
-                end = min(start + chunk_size, query_len)
-                packed_slice = slice(token_offset + start, token_offset + end)
-                chunk_positions = request_positions[start:end]
-                selected = select_qsa_tokens(
-                    q_index[packed_slice],
-                    compressed_keys,
-                    chunk_positions,
-                    sequence_len,
-                    params,
-                    top_k=attention.indexer.top_k,
-                    top_k_output=attn_metadata.qsa_topk_indices,
-                    top_k_row_starts=attn_metadata.qsa_topk_row_starts,
-                )
-                output[packed_slice] = qsa_sparse_gqa(
-                    q=q[packed_slice],
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    selected_tokens=selected,
-                    request_indices=req_idx[packed_slice],
-                    metadata=attn_metadata,
-                    softmax_scale=1.0 / (attention.q_scaling * attention.head_dim**0.5),
-                )
-            token_offset += query_len
-        if token_offset != num_tokens:
-            raise RuntimeError(
-                f"QSA packed token accounting mismatch: {token_offset} != {num_tokens}"
+            output[packed_slice] = qsa_sparse_gqa(
+                q=q[packed_slice],
+                k_cache=k_cache,
+                v_cache=v_cache,
+                selected_tokens=selected,
+                request_indices=req_idx[packed_slice],
+                metadata=attn_metadata,
+                softmax_scale=1.0 / (attention.q_scaling * attention.head_dim**0.5),
             )
         return output.reshape(num_tokens, -1)
 

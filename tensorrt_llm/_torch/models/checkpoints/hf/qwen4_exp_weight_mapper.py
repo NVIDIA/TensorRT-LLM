@@ -61,10 +61,11 @@ What differs from the stock HF loader (why a bespoke mapper is required):
   / ``v_proj`` fuse to ``qkv_proj`` via the stock fusion; ``o_proj``, per-head
   ``q_norm``/``k_norm``, and the compressed indexer
   (``indexer.index_qk_proj``/``q_layernorm``/``k_layernorm``) map by direct name.
-* **Hyper-Connection (C1)** — the ``attn_hyper_connection`` /
-  ``mlp_hyper_connection`` / final ``hyper_connection_mixer`` low-rank projections
-  and grouped RMS-norm map by direct name (the modules mirror the checkpoint
-  parameter names); they are replicated across TP ranks.
+* **Hyper-Connection (C1)** — attention/MLP mixers pack the checkpoint's
+  ``input_mix_weight_down`` and ``block_inject_weight`` into one 16-row-aligned
+  runtime projection, eliminating a skinny GEMM launch. The final mix-only
+  ``hyper_connection_mixer`` retains its direct checkpoint name. All HC weights
+  are replicated across TP ranks.
 """
 
 from __future__ import annotations
@@ -224,6 +225,9 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         gdn_in_proj: dict = {}
         # layer_prefix -> {shard_i / buffer_name: tensor}
         ngram: dict = {}
+        # HC module prefix -> {down/inject: tensor}. Mix-only final heads only
+        # contain ``down`` and retain the checkpoint's direct parameter name.
+        hc_down_inject: dict = {}
 
         for name, tensor in weights.items():
             if any(name.startswith(p) for p in _SKIP_PREFIXES):
@@ -266,6 +270,14 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                 ple_prefix = key.split(".ple_embedding.", 1)[0]
                 leaf = key.split(".ple_embedding.", 1)[1]
                 ngram.setdefault(ple_prefix, {})[leaf] = tensor
+                continue
+            if key.endswith(".input_mix_weight_down.weight"):
+                prefix = key[: -len(".input_mix_weight_down.weight")]
+                hc_down_inject.setdefault(prefix, {})["down"] = tensor
+                continue
+            if key.endswith(".block_inject_weight.weight"):
+                prefix = key[: -len(".block_inject_weight.weight")]
+                hc_down_inject.setdefault(prefix, {})["inject"] = tensor
                 continue
             renamed[key] = tensor
 
@@ -319,6 +331,32 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
             )
             new_weights[f"{prefix}.in_proj_qkvz.weight"] = qkvz
             new_weights[f"{prefix}.in_proj_ba.weight"] = ba
+
+        # Pack each layer's HC down and injection projections into a single
+        # aligned GEMM. Final mix-only heads have no injection projection and
+        # keep the original ``input_mix_weight_down`` parameter.
+        for prefix, parts in hc_down_inject.items():
+            down = parts.get("down")
+            inject = parts.get("inject")
+            if inject is None:
+                if down is not None:
+                    new_weights[f"{prefix}.input_mix_weight_down.weight"] = down
+                continue
+            if down is None:
+                if allow_partial_loading:
+                    new_weights[f"{prefix}.block_inject_weight.weight"] = inject
+                    continue
+                raise ValueError(
+                    f"Qwen4-Exp Hyper-Connection {prefix} has an injection "
+                    "projection but no input-mix down projection"
+                )
+            padding = (-(down.shape[0] + inject.shape[0])) % 16
+            components = [down, inject]
+            if padding:
+                components.append(down.new_zeros((padding, down.shape[1])))
+            new_weights[f"{prefix}.input_mix_weight_down_block_inject.weight"] = torch.cat(
+                components, dim=0
+            ).contiguous()
 
         # --- pass 3: stream the PLE n-gram table + copy its metadata buffers. ---
         if ngram:

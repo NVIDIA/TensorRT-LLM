@@ -155,6 +155,7 @@ class QSAMambaHybridCacheManagerV2(MambaHybridCacheManagerV2):
         )
         return full_view[:, :2]
 
+    @torch.compiler.disable
     def get_qsa_position_buffer(self) -> Optional[torch.Tensor]:
         """Return ``[slots, tokens_per_block, 3]`` position coordinates."""
         if self.qsa_position_layer_id is None:

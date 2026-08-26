@@ -17,6 +17,58 @@ import triton.language as tl
 
 
 @triton.jit
+def _hc_silu_kernel(
+    input_ptr,
+    output_ptr,
+    stride_input,
+    stride_output,
+    width: tl.constexpr,
+    hc_count: tl.constexpr,
+    block_size: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < width
+    value = tl.load(
+        input_ptr + row * stride_input + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    value /= hc_count
+    tl.store(
+        output_ptr + row * stride_output + offsets,
+        value * tl.sigmoid(value),
+        mask=mask,
+    )
+
+
+@torch.library.custom_op("trtllm::qwen4_exp_hc_silu", mutates_args=())
+def hc_silu(input: torch.Tensor, hc_count: int) -> torch.Tensor:
+    """Fuse the HC scaling and SiLU applied after the down projection."""
+    rows, width = input.shape
+    assert input.is_cuda and input.stride(1) == 1
+    output = torch.empty_like(input)
+    block_size = triton.next_power_of_2(width)
+    with torch.cuda.device(input.device.index):
+        _hc_silu_kernel[(rows,)](
+            input,
+            output,
+            input.stride(0),
+            output.stride(0),
+            width=width,
+            hc_count=hc_count,
+            block_size=block_size,
+        )
+    return output
+
+
+@hc_silu.register_fake
+def _(input: torch.Tensor, hc_count: int) -> torch.Tensor:
+    del hc_count
+    return torch.empty_like(input)
+
+
+@triton.jit
 def _hc_gate_mix_kernel(
     input_ptr,
     gate_ptr,
@@ -195,10 +247,8 @@ def _hc_combine_norm_kernel(
     shared_weight: tl.constexpr,
     eps: tl.constexpr,
     block_size: tl.constexpr,
+    padded_tiles: tl.constexpr,
 ) -> None:
-    num_tiles: tl.constexpr = tl.cdiv(hidden_size, block_size)
-    padded_tiles: tl.constexpr = triton.next_power_of_2(num_tiles)
-
     row = tl.program_id(0)
     stream = tl.program_id(1)
     tile_ids = tl.arange(0, padded_tiles)
@@ -255,6 +305,7 @@ def hc_combine_norm(
     output = torch.empty_like(residual)
     normed = torch.empty_like(residual)
     block_size = 512
+    padded_tiles = triton.next_power_of_2(triton.cdiv(hidden_size, block_size))
     with torch.cuda.device(residual.device.index):
         _hc_combine_norm_kernel[(rows, hc_count)](
             residual,
@@ -273,6 +324,7 @@ def hc_combine_norm(
             shared_weight=norm_weight.numel() == hidden_size,
             eps=eps,
             block_size=block_size,
+            padded_tiles=padded_tiles,
             num_warps=8,
         )
     return output, normed
@@ -291,4 +343,4 @@ def _(
     return torch.empty_like(residual), torch.empty_like(residual)
 
 
-__all__ = ["hc_combine", "hc_combine_norm", "hc_gate_mix"]
+__all__ = ["hc_combine", "hc_combine_norm", "hc_gate_mix", "hc_silu"]

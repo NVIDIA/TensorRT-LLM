@@ -27,25 +27,31 @@ preserving the reference BF16 materialization point. The checkpoint stores the
 Qwen4-Exp variant with ``hc_per_branch_norm=True`` (a per-element ``[10240]``
 grouped-RMSNorm weight, grouped by ``hidden_size``).
 
-Parameter names (``hc_norm.weight``, ``input_mix_weight_down.weight``,
-``input_mix_weight_up.weight``, ``block_inject_weight.weight``) mirror the
-checkpoint exactly so the model weight loader maps them by direct copy. All
-three HC projections operate on the full per-token bundle and are **replicated**
-across tensor-parallel ranks (the reference does not shard them; the block's TP
-all-reduce happens between ``mix`` and ``combine`` on the block output), so plain
-``nn.Linear`` / a native norm are used rather than TP-sharded TRT-LLM ``Linear``.
+The checkpoint keeps ``input_mix_weight_down`` and ``block_inject_weight``
+separate. At load time they are packed into one 16-row-aligned replicated
+projection, matching the runtime layout used by the optimized reference and
+removing one skinny GEMM launch from every attention/MLP HC mix. All HC
+projections operate on the full per-token bundle and are **replicated** across
+tensor-parallel ranks (the reference does not shard them; the block's TP
+all-reduce happens between ``mix`` and ``combine`` on the block output).
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm.mapping import Mapping
+
+from .linear import Linear
 from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
-from .qwen4_exp_hyper_connection_kernels import hc_combine, hc_combine_norm, hc_gate_mix
+from .qwen4_exp_hyper_connection_kernels import hc_combine, hc_combine_norm, hc_gate_mix, hc_silu
 
 __all__ = ["GroupedRMSNorm", "Qwen4ExpHyperConnection"]
+
+_HC_DIRECT_SKINNY_GEMM_ENV = "TRTLLM_QWEN4_EXP_HC_DIRECT_SKINNY_GEMM"
 
 
 class GroupedRMSNorm(TritonRMSNorm):
@@ -145,6 +151,8 @@ class Qwen4ExpHyperConnection(nn.Module):
         use_mix: bool = True,
         use_combine: bool = True,
         device: Optional[torch.device] = None,
+        mapping: Optional[Mapping] = None,
+        use_cute_dsl_bf16_gemm: bool = False,
     ):
         super().__init__()
         if not (use_mix or use_combine):
@@ -165,16 +173,43 @@ class Qwen4ExpHyperConnection(nn.Module):
 
         hc_dim = hc_count * hidden_size
         if use_mix:
-            self.input_mix_weight_down = nn.Linear(
-                hc_dim, hc_lowrank, bias=False, dtype=dtype, device=device
+            self.input_mix_padding = (-(hc_lowrank + hc_count)) % 16 if use_combine else 0
+            if use_combine:
+                packed_rows = hc_lowrank + hc_count + self.input_mix_padding
+                self.input_mix_weight_down_block_inject = Linear(
+                    hc_dim,
+                    packed_rows,
+                    bias=False,
+                    dtype=dtype,
+                    mapping=mapping,
+                    reduce_output=False,
+                    use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+                )
+            else:
+                self.input_mix_weight_down = Linear(
+                    hc_dim,
+                    hc_lowrank,
+                    bias=False,
+                    dtype=dtype,
+                    mapping=mapping,
+                    reduce_output=False,
+                    use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+                )
+            self.input_mix_weight_up = Linear(
+                hc_lowrank,
+                hc_dim,
+                bias=False,
+                dtype=dtype,
+                mapping=mapping,
+                reduce_output=False,
+                use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             )
-            self.input_mix_weight_up = nn.Linear(
-                hc_lowrank, hc_dim, bias=False, dtype=dtype, device=device
-            )
-        if use_combine:
-            self.block_inject_weight = nn.Linear(
-                hc_dim, hc_count, bias=False, dtype=dtype, device=device
-            )
+            if device is not None:
+                self.input_mix_weight_up.to(device=device)
+                if use_combine:
+                    self.input_mix_weight_down_block_inject.to(device=device)
+                else:
+                    self.input_mix_weight_down.to(device=device)
 
     @classmethod
     def from_config(
@@ -184,6 +219,8 @@ class Qwen4ExpHyperConnection(nn.Module):
         use_combine: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
+        mapping: Optional[Mapping] = None,
+        use_cute_dsl_bf16_gemm: bool = False,
     ) -> "Qwen4ExpHyperConnection":
         """Build from a ``Qwen4ExpTextConfig``-like object (reads ``hc_count``,
         ``hidden_size``, ``hc_lowrank``, ``rms_norm_eps``). Qwen4-Exp always uses
@@ -198,6 +235,8 @@ class Qwen4ExpHyperConnection(nn.Module):
             use_mix=use_mix,
             use_combine=use_combine,
             device=device,
+            mapping=mapping,
+            use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
         )
 
     def _normed_bundle(self, hyper_input: torch.Tensor) -> torch.Tensor:
@@ -209,6 +248,50 @@ class Qwen4ExpHyperConnection(nn.Module):
         return self.hc_norm(hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))).flatten(
             -2
         )
+
+    def _packed_down_and_injection(self, normed: torch.Tensor) -> torch.Tensor:
+        """Run the packed HC down/injection projection.
+
+        The direct kernel is an opt-in decode optimization for CUDA-graph
+        deployments. Its Python launch path is slower than cuBLAS, while graph
+        replay is about twice as fast for the production ``M=1`` shape.
+        """
+        projection = self.input_mix_weight_down_block_inject
+        rows = normed.numel() // normed.shape[-1]
+        weight = projection.weight
+        direct_eligible = (
+            os.environ.get(_HC_DIRECT_SKINNY_GEMM_ENV, "0") == "1"
+            and not torch.is_grad_enabled()
+            and rows == 1
+            and normed.is_cuda
+            and weight.is_cuda
+            and normed.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and normed.is_contiguous()
+            and weight.is_contiguous()
+            and normed.shape[-1] % (128 * 8) == 0
+            and weight.shape[0] % 2 == 0
+        )
+        if not direct_eligible:
+            return projection(normed)
+
+        from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import DirectTactic, run_direct_dense
+        from ..flashinfer_utils import get_env_enable_pdl
+
+        input_2d = normed.view(1, normed.shape[-1])
+        output = torch.empty(
+            (1, weight.shape[0]),
+            dtype=torch.bfloat16,
+            device=normed.device,
+        )
+        run_direct_dense(
+            input_2d,
+            weight.t(),
+            output,
+            get_env_enable_pdl(),
+            DirectTactic(block_size=128, outputs_per_block=2, rows_per_block=1),
+        )
+        return output.view(*normed.shape[:-1], weight.shape[0])
 
     @staticmethod
     def _fused_cuda_eligible(*tensors: torch.Tensor) -> bool:
@@ -226,7 +309,18 @@ class Qwen4ExpHyperConnection(nn.Module):
     ) -> Tuple[torch.Tensor, HCResidual]:
         """Project a normalized HC bundle and retain its combine logits."""
         hc, hs = self.hc_count, self.hidden_size
-        gate = F.silu(self.input_mix_weight_down(normed) / hc)
+        if self.use_combine:
+            packed = self._packed_down_and_injection(normed)
+            down, injection_logits, _ = packed.split(
+                (self.hc_lowrank, hc, self.input_mix_padding), dim=-1
+            )
+        else:
+            down = self.input_mix_weight_down(normed)
+            injection_logits = None
+        if self._fused_cuda_eligible(down):
+            gate = hc_silu(down, hc)
+        else:
+            gate = F.silu(down / hc)
         gate = self.input_mix_weight_up(gate)
         if self._fused_cuda_eligible(normed, gate):
             mixed = hc_gate_mix(normed, gate, hc)
@@ -234,7 +328,6 @@ class Qwen4ExpHyperConnection(nn.Module):
             gate = torch.sigmoid(gate).unflatten(-1, (hc, hs))
             mixed = (gate * normed.unflatten(-1, (hc, hs))).mean(dim=-2)
 
-        injection_logits = self.block_inject_weight(normed) if self.use_combine else None
         return mixed.to(self.params_dtype), (hyper_input, normed, injection_logits)
 
     def mix(self, hyper_input: torch.Tensor) -> Tuple[torch.Tensor, HCResidual]:

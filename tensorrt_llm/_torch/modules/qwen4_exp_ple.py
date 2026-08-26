@@ -63,6 +63,8 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm.mapping import Mapping
 
+from .mamba.layernorm_gated import RMSNorm as TritonRMSNorm
+
 # --- splitmix64 constants (verbatim from the sglang reference) ---
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -205,8 +207,11 @@ class PLEMetadata:
             num_seq = lengths.shape[0]
             query_start_loc = torch.cat([lengths.new_zeros(1), torch.cumsum(lengths, dim=0)])
             req_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
-            if processed_tokens:
-                req_indices = req_indices.clamp(min=0, max=num_seq - 1)
+            # Keep this tensor-only: ``processed_tokens`` can be symbolic under
+            # torch.compile, and the empty-token assignment below is already a
+            # no-op. A Python truth-value guard would force a host-side data
+            # dependency and prevent Dynamo from compiling the model forward.
+            req_indices = req_indices.clamp(min=0, max=num_seq - 1)
             token_offsets = positions - query_start_loc.index_select(0, req_indices)
 
         num_seq = lengths.shape[0]
@@ -214,10 +219,9 @@ class PLEMetadata:
         state_indices = state_indices.to(device=device, dtype=torch.long)
 
         padded = input_ids.new_full((num_seq, row_width), eos_token_id)
-        if processed_tokens:
-            padded[req_indices, token_offsets] = torch.where(
-                valid_tokens, input_ids, input_ids.new_full((), eos_token_id)
-            )
+        padded[req_indices, token_offsets] = torch.where(
+            valid_tokens, input_ids, input_ids.new_full((), eos_token_id)
+        )
 
         return cls(
             is_decode=is_decode,
@@ -237,31 +241,38 @@ class PLEMetadata:
         )
 
 
-class Qwen4ExpPLEGroupedNorm(nn.Module):
+class Qwen4ExpPLEGroupedNorm(TritonRMSNorm):
     """Grouped Gemma (``weight + 1``) RMSNorm, computed per group in fp32.
 
     ``group_size`` groups the last dim into contiguous blocks (one per
     Hyper-Connection stream); ``group_size is None`` normalizes the whole last
-    dim. This is the native, non-fused fallback of the reference — the parity
-    target (the reference's optional CUDA JIT kernel is only a perf variant).
+    dim. CUDA tensors reuse TRT-LLM's fused grouped RMSNorm kernel; CPU tensors
+    retain the native reference path for construction and parity tests.
     """
 
     def __init__(
         self, hidden_size: int, eps: float = 1e-6, group_size: Optional[int] = None
     ) -> None:
-        super().__init__()
         if group_size is not None and hidden_size % group_size != 0:
             raise ValueError(
                 f"hidden_size ({hidden_size}) must be divisible by group_size ({group_size})"
             )
-        self.eps = eps
-        self.group_size = group_size
+        super().__init__(
+            hidden_size,
+            eps=eps,
+            group_size=group_size,
+            weight_is_delta=True,
+        )
+        # Gemma stores a delta around one. Construct a fresh tensor instead of
+        # mutating the meta-initialized parameter in place.
         self.weight = nn.Parameter(torch.zeros(hidden_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            return super().forward(x)
         compute_dtype = x.dtype
         x_float = x.float()
-        if self.group_size is None:
+        if self.group_size == self.hidden_size:
             variance = x_float.pow(2).mean(dim=-1, keepdim=True)
         else:
             group_shape = x_float.shape[:-1] + (-1, self.group_size)

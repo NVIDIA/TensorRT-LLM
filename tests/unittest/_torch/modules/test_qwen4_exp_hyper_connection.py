@@ -10,10 +10,15 @@ from tensorrt_llm._torch.modules.qwen4_exp_hyper_connection import Qwen4ExpHyper
 def _reference_mix(module, hyper_input):
     hc, hs = module.hc_count, module.hidden_size
     normed = module._normed_bundle(hyper_input)
-    gate = torch.nn.functional.silu(module.input_mix_weight_down(normed) / hc)
+    if module.use_combine:
+        packed = module.input_mix_weight_down_block_inject(normed)
+        down, injection, _ = packed.split((module.hc_lowrank, hc, module.input_mix_padding), dim=-1)
+    else:
+        down = module.input_mix_weight_down(normed)
+        injection = None
+    gate = torch.nn.functional.silu(down / hc)
     gate = torch.sigmoid(module.input_mix_weight_up(gate).float()).unflatten(-1, (hc, hs))
     mixed = (gate * normed.float().unflatten(-1, (hc, hs))).mean(dim=-2)
-    injection = module.block_inject_weight(normed) if module.use_combine else None
     return mixed.to(module.params_dtype), (hyper_input, normed, injection)
 
 
@@ -23,6 +28,13 @@ def _reference_combine(block_output, residual, hc_count, hidden_size):
     streams = hyper_input.float().unflatten(-1, (hc_count, hidden_size))
     gate = 2.0 * torch.sigmoid(injection.float() / hc_count)
     return (streams + block_output.float().unsqueeze(-2) * gate.unsqueeze(-1)).flatten(-2)
+
+
+def _initialize_test_weights(*modules):
+    """Initialize TRT-LLM Linear parameters that checkpoints normally populate."""
+    for module in modules:
+        for parameter in module.parameters():
+            torch.nn.init.uniform_(parameter, -0.01, 0.01)
 
 
 @pytest.mark.parametrize("rows", [0, 2])
@@ -41,6 +53,7 @@ def test_combine_and_mix_matches_unfused_reference_cpu(rows):
         lowrank,
         dtype=torch.float32,
     ).eval()
+    _initialize_test_weights(previous, current)
     hyper_input = torch.randn(rows, hc_count * hidden_size)
     block_output = torch.randn(rows, hidden_size)
 
@@ -66,7 +79,9 @@ def test_combine_and_mix_matches_unfused_reference_cpu(rows):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("rows", [1, 4, 16, 128])
-def test_fused_hyper_connection_matches_unfused_reference_and_graph(rows):
+@torch.inference_mode()
+def test_fused_hyper_connection_matches_unfused_reference_and_graph(rows, monkeypatch):
+    monkeypatch.setenv("TRTLLM_QWEN4_EXP_HC_DIRECT_SKINNY_GEMM", "1")
     torch.manual_seed(42)
     hc_count, hidden_size, lowrank = 4, 2560, 320
     previous = Qwen4ExpHyperConnection(
@@ -83,6 +98,7 @@ def test_fused_hyper_connection_matches_unfused_reference_and_graph(rows):
         dtype=torch.bfloat16,
         device=torch.device("cuda"),
     ).eval()
+    _initialize_test_weights(previous, current)
     hyper_input = torch.randn(
         rows,
         hc_count * hidden_size,
