@@ -1625,6 +1625,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             Since Cosmos3 embeds text internally, we pass token IDs via extra_tensors
             rather than through encoder_hidden_states.
             """
+            # Activation precision for this step. A pure function of step_index,
+            # so the conditional and unconditional CFG branches of one step
+            # always select the same path even though each calls this
+            # separately. No-op unless the checkpoint is static FP8.
+            self.transformer.set_denoising_step(
+                step_index=step_index, num_steps=len(self.scheduler.timesteps)
+            )
+
             current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
 
             result = self.transformer(
@@ -1693,6 +1701,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             ),
             scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
         )
+
+        # Hygiene: the set_denoising_step at each forward selects the precision,
+        # so this only stops per-request state outliving the request.
+        self.transformer.reset_denoising_step()
 
         if extra_streams is not None:
             latents, extra_latents = denoise_result

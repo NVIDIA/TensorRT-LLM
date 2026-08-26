@@ -29,6 +29,10 @@ from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
+    StepPrecisionController,
+    install_step_precision,
+)
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -966,6 +970,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         )
         pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
         self.recipe = resolve_arch_recipe(pretrained_config)
+        # Installed in post_load_weights when the checkpoint is static FP8.
+        self.step_precision_controller: Optional[StepPrecisionController] = None
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
         # Config fact only: the transformer never constructs action modules.
         self.has_action_weights = getattr(pretrained_config, "action_gen", False)
@@ -1749,3 +1755,49 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         for _, module in self.named_modules():
             if isinstance(module, (GatedMLP, Attention)):
                 module.post_load_weights()
+
+        self._maybe_install_step_precision()
+
+    def _maybe_install_step_precision(self) -> None:
+        """Wrap the static-FP8 linears for per-denoising-step activation precision.
+
+        Runs last: the wrapper only ever needs to dispatch ``apply``, and the
+        projections must already be finalized. Only static FP8 qualifies --
+        under dynamic quantization the scale is derived per call, so there is
+        no calibration mismatch for the outer steps to avoid.
+        """
+        config = getattr(self.model_config, "step_precision", None)
+        if config is None or not config.enable:
+            return
+        if not uses_static_fp8(self.model_config):
+            return
+
+        self.step_precision_controller = StepPrecisionController(
+            first_steps=config.first_steps,
+            last_steps=config.last_steps,
+        )
+        wrapped = install_step_precision(
+            [self.language_model.layers, self.gen_layers],
+            self.step_precision_controller,
+        )
+        if wrapped == 0:
+            logger.warning(
+                "Cosmos3 step precision is enabled and the checkpoint is static FP8, "
+                "but no FP8 linears were found to wrap; every step will run fully "
+                "quantized."
+            )
+            self.step_precision_controller = None
+
+    def set_denoising_step(self, step_index: int, num_steps: int) -> None:
+        """Select this step's activation precision, before any transformer call.
+
+        Called once per denoising step so a step's conditional and
+        unconditional CFG branches cannot disagree.
+        """
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.set_step(step_index, num_steps)
+
+    def reset_denoising_step(self) -> None:
+        """Drop per-request precision state so it cannot leak into the next request."""
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.reset()

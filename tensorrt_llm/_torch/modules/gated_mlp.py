@@ -251,7 +251,13 @@ class GatedMLP(nn.Module):
             raise NotImplementedError(
                 f"split_gate_up requires SwiGLU activation, got {self.activation}"
             )
-        if self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8:
+        # As in _shares_gate_up_quantization: a method running this call in
+        # higher precision needs a 16-bit activation, so do not emit FP8 for it.
+        down_proj_is_fp8 = (
+            self.down_proj.has_fp8_qdq
+            or self.down_proj.has_w4a8_nvfp4_fp8) and not getattr(
+                self.down_proj.quant_method, "high_precision", False)
+        if down_proj_is_fp8:
             return swiglu_2in(gate,
                               up,
                               quant_scale=self.down_proj.input_scale,
@@ -271,12 +277,20 @@ class GatedMLP(nn.Module):
         Dynamic quantization derives a scale per call, so differing calibrated
         scales are legitimate there rather than an error.
         """
-        return (self.split_gate_up and self.gate_proj.has_fp8_qdq
-                and self.up_proj.has_fp8_qdq
-                and not self.gate_proj.force_dynamic_quantization
-                and not self.up_proj.force_dynamic_quantization
-                and self.gate_proj.input_scale is not None
-                and self.up_proj.input_scale is not None)
+        return (
+            self.split_gate_up and self.gate_proj.has_fp8_qdq
+            and self.up_proj.has_fp8_qdq
+            and not self.gate_proj.force_dynamic_quantization
+            and not self.up_proj.force_dynamic_quantization
+            and self.gate_proj.input_scale is not None
+            and self.up_proj.input_scale is not None
+            # A quantization method may run a given call in higher
+            # precision than its checkpoint recipe -- Cosmos3 does this on
+            # the outer denoising steps -- by publishing ``high_precision``.
+            # Quantizing the shared activation here would hand such a call
+            # a tensor it must not receive, so leave it in its input dtype.
+            and
+            not getattr(self.gate_proj.quant_method, "high_precision", False))
 
     def _can_share_gate_up_quantization(self, x) -> bool:
         """Whether gate and up can consume one quantized activation.
