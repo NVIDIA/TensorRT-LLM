@@ -937,7 +937,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         import cutlass
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
-        import cutlass.utils as cutlass_utils
         from cutlass.cute.typing import AddressSpace
 
         from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4.sym_buffer import SymBufferHost
@@ -951,7 +950,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 cutlass.Uint8, t.data_ptr(), AddressSpace.gmem, assumed_align=assumed_align
             )
 
-        return to_cute, to_cute_ptr, SymBufferHost, cute, cutlass_utils
+        return to_cute, to_cute_ptr, SymBufferHost, cute
 
     def _evict_latched_tuning_workspaces() -> None:
         """Pop every tuning-latched local workspace and prune its fence keys.
@@ -2071,7 +2070,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # uint8 workspaces MUST be cute.Pointer, NOT cute.Tensor: the
             # 32-bit memref shape field overflows once shared_workspace passes
             # 2 GiB (the kernel addresses by raw base + Int64 byte offset).
-            _to_cute, _to_cute_ptr, SymBufferHost, cute, _ = _cute_launch_helpers()
+            _to_cute, _to_cute_ptr, SymBufferHost, cute = _cute_launch_helpers()
 
             # combine_output (max_T, 1, hidden) reshapes freely to 2D. Weights
             # present K stride-1 via a transpose VIEW (DLPack carries the

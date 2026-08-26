@@ -1027,7 +1027,7 @@ def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
 def test_megamoe_cutedsl_tactic_autotune_defaults_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Standard serving must not pay for the 36-tactic sweep by default.
+    # Standard serving must not pay for the curated tactic sweep by default.
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
     moe = _make_megamoe_cutedsl_for_ctor_test()
     assert moe.tactic_autotune is False
