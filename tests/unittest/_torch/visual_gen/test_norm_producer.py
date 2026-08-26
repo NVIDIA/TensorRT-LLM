@@ -662,3 +662,63 @@ def test_rejects_num_warps_above_warp_size() -> None:
     with pytest.raises(AssertionError, match="cta_reduce_sum"):
         NormProducer(D=16384, vec=8)  # 64 warps
     assert NormProducer(D=8192, vec=8).num_warps == WARP_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Staged (bulk-copy smem) path, wide-vec geometry, bf16 tables
+# ---------------------------------------------------------------------------
+def test_staged_bitwise_vs_unstaged() -> None:
+    """stage=True moves x/residual through a bulk-async smem prefetch but
+    performs identical arithmetic in identical order: every output must be
+    BITWISE identical to the unstaged path, for every store form."""
+    torch.manual_seed(13)
+    device = _require_sm100()
+    for hidden_size in (5120, 2048):
+        x = _make((2, 130, hidden_size))
+        res = _make((2, 130, hidden_size))
+        rows = _make((2, hidden_size))
+        roww = torch.randn(2, hidden_size, dtype=torch.float32, device=device)
+        w = torch.randn(hidden_size, dtype=torch.float32, device=device)
+        b = torch.randn(hidden_size, dtype=torch.float32, device=device)
+        gs = torch.tensor([0.8], dtype=torch.float32, device=device)
+        cases = [
+            dict(shift=rows, scale=rows),
+            dict(weight=w, bias=b),
+            dict(residual=res, gate=roww, weight=w, bias=b),
+            dict(
+                residual=res, gate=rows, shift=rows, scale=rows, norm_type="rms", math_mode="bf16"
+            ),
+            dict(shift=rows, scale=rows, store="nvfp4_static", global_scale=gs),
+            dict(shift=rows, scale=rows, store="nvfp4_deferred"),
+        ]
+        for kw in cases:
+            ref = fused_norm_producer(x, stage=False, **kw)
+            got = fused_norm_producer(x, stage=True, **kw)
+            for a, c in zip(ref, got):
+                assert torch.equal(a, c), f"staged output differs: D={hidden_size} {sorted(kw)}"
+
+
+def test_vec40_geometry() -> None:
+    """vec=40 (128-thread CTAs at D=5120, the fusedAdaptiveLayerNorm
+    geometry) - numerics within the standard gate, staged form bitwise
+    vs unstaged."""
+    torch.manual_seed(14)
+    x = _make((2, 65, 5120))
+    rows = _make((2, 5120))
+    (y40,) = fused_norm_producer(x, shift=rows, scale=rows, vec=40)
+    oracle32, _ = _oracle_fp32(x, shift=rows, scale=rows)
+    torch.testing.assert_close(y40, oracle32.to(x.dtype), atol=2e-2, rtol=2e-2)
+    (y40s,) = fused_norm_producer(x, shift=rows, scale=rows, vec=40, stage=True)
+    assert torch.equal(y40s, y40)
+
+
+def test_bf16_affine_tables() -> None:
+    """bf16 [D] weight/bias (the fused_adaptive_layernorm numerics class,
+    pre-narrowed weights) vs the matching bf16-weight oracle."""
+    torch.manual_seed(15)
+    x = _make((2, 65, 1024))
+    w16 = _make((1024,))
+    b16 = _make((1024,))
+    ref = F.layer_norm(x.float(), (1024,), w16.float(), b16.float(), _EPS).to(x.dtype)
+    (y,) = fused_norm_producer(x, weight=w16, bias=b16)
+    torch.testing.assert_close(y, ref, atol=2e-2, rtol=2e-2)

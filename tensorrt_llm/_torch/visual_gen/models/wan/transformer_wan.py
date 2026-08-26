@@ -45,14 +45,15 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 try:
-    # Unified norm-site producer (CuTe DSL, SM100): fuses the residual
-    # prologue INTO the norm3 site of the per-batch (temb.ndim == 3) path,
-    # which today runs an add kernel in front of the fused LN kernel
-    # (kernel-level A/B: one-kernel 533.6/556.1 us vs route 557.3/576.3 us
-    # bf16/fp4 at [2, 32760, 5120], B200). norm1 (plain) and norm2 (the
-    # gate+resid route measured a tie, 553 vs 564 us) keep the in-tree
-    # fused_adaptive_layernorm paths - rows the incumbent wins are never
-    # wired (fallback rule).
+    # Unified norm-site producer (CuTe DSL, SM100): fuses the gate/residual
+    # prologues INTO the norm2/norm3 sites of the per-batch (temb.ndim == 3)
+    # path, which today run compiled gate/resid + add chains in front of the
+    # fused LN kernels. Kernel-level A/B at [2, 32760, 5120] on B200:
+    # norm2 one-kernel 400.9 us vs 549.4 us route (455.9 us fp4-static);
+    # norm3 one-kernel 522.4/569-579 us vs 557.3/576.3 us route (bf16/fp4).
+    # norm1 (plain, no prologue) keeps fused_adaptive_layernorm - the
+    # incumbent wins that row and rows the incumbent wins are never wired
+    # (fallback rule).
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.norm_producer import (
         fused_norm_producer as _fused_norm_producer,
     )
@@ -416,6 +417,11 @@ class WanBlock(nn.Module):
         self._norm1_fp4_scale: Optional[torch.Tensor] = None
         self._norm2_fp4_scale: Optional[torch.Tensor] = None
         self._norm3_fp4_scale: Optional[torch.Tensor] = None
+        # bf16 copies of the norm2 affine tables for the norm-producer path
+        # (the replaced route's own pre-narrowed numerics class), cached at
+        # first forward.
+        self._norm2_w16: Optional[torch.Tensor] = None
+        self._norm2_b16: Optional[torch.Tensor] = None
         self._fused_ln_supported = hidden_size == 5120
         # gate+resid norm sites (norm2/norm3) route to the unified norm
         # producer; norm1 (no prologue) keeps fused_adaptive_layernorm.
@@ -636,9 +642,50 @@ class WanBlock(nn.Module):
         else:
             if pertoken_adaln is not None:
                 gate_msa = self._pertoken_adaln.self_attention_gate(pertoken_adaln)
-            x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
-
             if (
+                self._use_norm_producer
+                and _norm_producer_available()
+                and isinstance(self.norm2, LayerNorm)
+                and self.norm2.weight is not None
+            ):
+                # One kernel for gate+resid + affine LN (+ optional NVFP4
+                # store), replacing the compiled gate/resid chain AND the
+                # fused affine-LN kernel (kernel A/B: 400.9 vs 549.4 us
+                # bf16 / 455.9 us fp4 at [2, 32760, 5120], B200). Weights
+                # pass as bf16 [D] tables - the SAME pre-narrowed numerics
+                # class the replaced fused_adaptive_layernorm route uses.
+                # residual_out stays bit-identical to the eager
+                # `(x.float() + attn1_out.float() * gate).to(dtype)`.
+                if self._norm2_w16 is None:
+                    self._norm2_w16 = self.norm2.weight.to(x.dtype)
+                    self._norm2_b16 = self.norm2.bias.to(x.dtype)
+                x = x.contiguous()
+                attn1_out = attn1_out.contiguous()
+                if self._norm2_fp4_scale is not None and x.shape[0] * x.shape[1] >= 128:
+                    _q4, _sf, x = _fused_norm_producer(
+                        attn1_out,
+                        residual=x,
+                        gate=gate_msa,
+                        weight=self._norm2_w16,
+                        bias=self._norm2_b16,
+                        store="nvfp4_static",
+                        global_scale=self._norm2_fp4_scale,
+                        eps=self.norm2.variance_epsilon,
+                    )
+                    norm_x = Fp4QuantizedTensor(_q4, _sf)
+                else:
+                    norm_x, x = _fused_norm_producer(
+                        attn1_out,
+                        residual=x,
+                        gate=gate_msa,
+                        weight=self._norm2_w16,
+                        bias=self._norm2_b16,
+                        eps=self.norm2.variance_epsilon,
+                    )
+            else:
+                x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
+                norm_x = None
+            if norm_x is None and (
                 self._fused_ln_supported
                 and isinstance(self.norm2, LayerNorm)
                 and self.norm2.weight is not None
@@ -652,7 +699,7 @@ class WanBlock(nn.Module):
                     eps=self.norm2.variance_epsilon,
                 )
                 norm_x = self._reshape_fused_output(norm_x, x.shape)
-            else:
+            elif norm_x is None:
                 norm_x = self.norm2(x.float()).to(x.dtype)
 
         # I2V: Split encoder_hidden_states into image and text parts if needed

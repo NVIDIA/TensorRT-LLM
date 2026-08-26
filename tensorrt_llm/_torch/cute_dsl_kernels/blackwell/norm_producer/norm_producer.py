@@ -111,7 +111,11 @@ STORE_FORMS = ("bf16", "nvfp4_static", "nvfp4_deferred")
 # ILP per thread, shorter reduce tree, more registers). The NVFP4 store
 # forms accept 8 (16-element group amax via adjacent-lane pairing) or
 # 16/32 (whole groups in-thread); the group amax is exactly associative so
-# every scale and payload byte is bitwise-identical across vec.
+# every scale and payload byte is bitwise-identical across vec. vec=0 (the
+# op default) resolves to 16 wherever legal - the measured winner across
+# every production D (5120/4096/3072/2048/1536) and form - falling back to
+# 8 when D % 512 != 0 or on cutlass-dsl < 4.6 with fp32 modulator/affine
+# operands (the segfault class).
 DEFAULT_VEC = 8
 
 # CuTe DSL specialization requires the tensor-or-scalar-sentinel operands in
@@ -191,16 +195,41 @@ def _div_full_f32(a, b, *, loc=None, ip=None):
     return cutlass.Float32(res)
 
 
+@cute.arch.dsl_user_op
+def _cp_async_bulk_g2s(dst_smem, src_gmem, size_bytes, mbar, *, loc=None, ip=None):
+    """Descriptor-free 1-D bulk async copy GMEM -> SMEM with mbarrier
+    completion (the load-side twin of mega_moe_nvfp4/ptx_helpers.py's
+    cp_async_bulk_s2g; the same instruction the fusedAdaptiveLayerNorm CUDA
+    kernel uses to prefetch its x row)."""
+    _llvm.inline_asm(
+        None,
+        [
+            dst_smem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            src_gmem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(size_bytes).ir_value(loc=loc, ip=ip),
+            mbar.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+        "r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
-def cta_reduce_multi(vals, num_warps: cutlass.Constexpr, tidx: cutlass.Int32):
+def cta_reduce_multi(vals, num_warps: cutlass.Constexpr, tidx: cutlass.Int32, acc):
     """CTA-reduce N fp32 values in a SINGLE barrier round (the N-value
     analogue of reduce.py's cta_reduce_sum): one smem trip + two syncs for
     all sums instead of two syncs per sum. N is a trace-time constant (the
-    python tuple length)."""
+    python tuple length); ``acc`` is a caller-allocated fp32 smem tensor of
+    at least n*(num_warps+1) elements (single-allocator discipline - the
+    kernel owns ALL smem so the staging buffers and this scratch never
+    alias)."""
     n = len(vals)
     stride = num_warps + 1
-    smem = cutlass.utils.SmemAllocator()
-    acc = smem.allocate_tensor(cutlass.Float32, n * stride)
     warp_id = tidx >> 5
     lane_id = tidx & 31
     if lane_id == 0:
@@ -425,6 +454,7 @@ class NormProducer:
         store: str = "bf16",
         rows: int = 1,
         min_blocks: int = 0,
+        stage: bool = False,
         use_pdl: bool = TRTLLM_ENABLE_PDL,
     ) -> None:
         assert D % (WARP_SIZE * vec) == 0, f"D={D} must be a multiple of {WARP_SIZE * vec}"
@@ -443,6 +473,7 @@ class NormProducer:
         self.store = store
         self.rows = rows
         self.min_blocks = min_blocks
+        self.stage = stage
         self.use_pdl = use_pdl
         self.num_warps = D // (WARP_SIZE * vec)
         # cta_reduce_sum gathers the per-warp partials with a SINGLE warp
@@ -618,6 +649,32 @@ class NormProducer:
                 cute.autovec_copy(src, dst)
 
         fp32_mode = cutlass.const_expr(self.math_mode == "fp32")
+        has_resid = isinstance(mRes, cute.Tensor)
+
+        @cute.jit
+        def row_view(mV, bx, by):
+            """(D,) gmem row view of a [B, S, D] tensor (contiguous along
+            D; the bulk-copy source and the unstaged partition base)."""
+            gV = cute.local_tile(mV, tiler=(1, 1, self.D), coord=(bx, by, 0))
+            return gV[0, 0, None]
+
+        # Single smem allocator (single-allocator discipline: the reduction
+        # scratch and the staging buffers must never alias).
+        n_red = (2 * R) if self.norm_type == "layer" else R
+        smem_alloc = cutlass.utils.SmemAllocator()
+        red_acc = smem_alloc.allocate_tensor(cutlass.Float32, n_red * (self.num_warps + 1))
+        if cutlass.const_expr(self.stage):
+            # x (+ residual) rows prefetched into smem via descriptor-free
+            # bulk-1d async copies (the fusedAdaptiveLayerNorm structure):
+            # the row never occupies registers across the reduction
+            # barriers - stats and normalize re-read it from smem.
+            mbar = smem_alloc.allocate_array(cutlass.Int64, 1)
+            sX = [smem_alloc.allocate_tensor(cutlass.BFloat16, self.D, 128) for _ in range(R)]
+            sRes = (
+                [smem_alloc.allocate_tensor(cutlass.BFloat16, self.D, 128) for _ in range(R)]
+                if has_resid
+                else [0] * R
+            )
 
         # Shared [D] table operands: sliced/loaded once for all R rows.
         tWg, tWr = slice_at(mWeight, 0, 0)
@@ -628,9 +685,22 @@ class NormProducer:
         tTSH2g, tTSH2r = slice_at(mTShift2, 0, 0)
         tTSC2g, tTSC2r = slice_at(mTScale2, 0, 0)
 
-        # Per-row operands.
-        pX = [slice_at(mX, bxs[r], bys[r]) for r in range(R)]
-        pResid = [slice_at(mRes, bxs[r], bys[r]) for r in range(R)]
+        # Per-row operands. x/residual: smem partitions (staged) or gmem
+        # partition + rmem fragment (unstaged).
+        if cutlass.const_expr(self.stage):
+            gXrows = [row_view(mX, bxs[r], bys[r]) for r in range(R)]
+            gResRows = [row_view(mRes, bxs[r], bys[r]) for r in range(R)] if has_resid else [0] * R
+            xs = [thr_copy.partition_S(sX[r]) for r in range(R)]
+            rs = [thr_copy.partition_S(sRes[r]) for r in range(R)] if has_resid else [mRes] * R
+            xs_g = [0] * R
+            rs_g = [0] * R
+        else:
+            _pX = [slice_at(mX, bxs[r], bys[r]) for r in range(R)]
+            _pR = [slice_at(mRes, bxs[r], bys[r]) for r in range(R)]
+            xs = [_pX[r][1] for r in range(R)]
+            rs = [_pR[r][1] for r in range(R)]
+            xs_g = [_pX[r][0] for r in range(R)]
+            rs_g = [_pR[r][0] for r in range(R)]
         pG = [slice_at(mGateC, bxs[r], bys[r]) for r in range(R)]
         pSH = [slice_at(mShiftC, bxs[r], bys[r]) for r in range(R)]
         pSC = [slice_at(mScaleC, bxs[r], bys[r]) for r in range(R)]
@@ -640,7 +710,7 @@ class NormProducer:
         pY = [slice_at(mY, bxs[r], bys[r]) for r in range(R)]
         pY2 = [slice_at(mY2, bxs[r], bys[r]) for r in range(R)]
 
-        frag_t = pX[0][1]  # layout template for fp32 scratch fragments
+        frag_t = xs[0]  # per-thread layout template for scratch fragments
 
         @cute.jit
         def round_narrow(v):
@@ -675,12 +745,29 @@ class NormProducer:
                 return tCr.load().to(cutlass.Float32)
             return tTr.load().to(cutlass.Float32)
 
-        # Issue ALL gmem loads up front: x/residual rows first (they feed
-        # the reductions), then the L2-resident modulator rows and tables,
-        # so every load overlaps the stats reductions.
-        for r in cutlass.range_constexpr(R):
-            copy_if(*pX[r])
-            copy_if(*pResid[r])
+        # Issue ALL gmem loads up front. Staged: one mbarrier + bulk-1d
+        # async copies for the x/residual rows, issued by lane 0 while every
+        # thread's modulator LDGs go out in parallel; the wait lands just
+        # before first use. Unstaged: 128-bit LDGs into fragments.
+        if cutlass.const_expr(self.stage):
+            if tidx == 0:
+                cute.arch.mbarrier_init(mbar, 1)
+                cute.arch.mbarrier_init_fence()
+            cute.arch.sync_threads()
+            if tidx == 0:
+                nbytes = R * self.D * 2 * (2 if has_resid else 1)
+                # arrive AND expect: with init count 1 the phase completes
+                # only after this thread's arrival plus nbytes of bulk tx
+                # (expect_tx alone never completes - measured hang).
+                cute.arch.mbarrier_arrive_and_expect_tx(mbar, nbytes)
+                for r in cutlass.range_constexpr(R):
+                    _cp_async_bulk_g2s(sX[r], gXrows[r], self.D * 2, mbar)
+                    if cutlass.const_expr(has_resid):
+                        _cp_async_bulk_g2s(sRes[r], gResRows[r], self.D * 2, mbar)
+        else:
+            for r in cutlass.range_constexpr(R):
+                copy_if(xs_g[r], xs[r])
+                copy_if(rs_g[r], rs[r])
         for r in cutlass.range_constexpr(R):
             copy_if(*pG[r])
             copy_if(*pSH[r])
@@ -694,15 +781,18 @@ class NormProducer:
         copy_if(tTSCg, tTSCr)
         copy_if(tTSH2g, tTSH2r)
         copy_if(tTSC2g, tTSC2r)
+        if cutlass.const_expr(self.stage):
+            cute.arch.mbarrier_wait(mbar, phase=0)
 
         # Optional gate + residual prologue per row. fp32 mode: accumulate
         # in fp32, ONE rounding to the residual dtype (matches the eager
         # `.to(x.dtype)` before the norm). bf16 mode: replay the eager bf16
         # narrows after the gate multiply and after the residual add.
         ln_srcs = []
+        ln_in_smem = []
         for r in cutlass.range_constexpr(R):
-            tXrX = pX[r][1]
-            tRrR = pResid[r][1]
+            tXrX = xs[r]
+            tRrR = rs[r]
             tGrG = pG[r][1]
             if cutlass.const_expr(isinstance(tRrR, cute.Tensor)):
                 v = tXrX.load().to(cutlass.Float32)
@@ -726,28 +816,38 @@ class NormProducer:
                 tROrRO.store(v.to(tROrRO.element_type))
                 copy_if(tROrRO, pRO[r][0])
                 ln_srcs.append(tROrRO)  # norm reads the ROUNDED residual
+                ln_in_smem.append(False)
             else:
                 ln_srcs.append(tXrX)
+                ln_in_smem.append(bool(self.stage))
 
-        # Stats for all R rows in ONE CTA-reduction round.
+        # Stats for all R rows in ONE CTA-reduction round. Smem-staged
+        # sources go through a TRANSIENT fragment (vectorized LDS whose
+        # liveness ends at the reduction barrier - the whole point of
+        # staging is that no row survives the barrier in registers).
         partials = []
         for r in cutlass.range_constexpr(R):
+            src_r = ln_srcs[r]
+            if cutlass.const_expr(ln_in_smem[r]):
+                tmp_r = cute.make_fragment_like(frag_t, mX.element_type)
+                cute.autovec_copy(ln_srcs[r], tmp_r)
+                src_r = tmp_r
             if cutlass.const_expr(self.norm_type == "layer"):
                 s = cute.Float32(0.0)
                 ss = cute.Float32(0.0)
-                for idx in range(cute.size(ln_srcs[r])):
-                    xf = ln_srcs[r][idx].to(cutlass.Float32)
+                for idx in range(cute.size(src_r)):
+                    xf = src_r[idx].to(cutlass.Float32)
                     s += xf
                     ss += xf * xf
                 partials.append(warp_reduce_sum(s))
                 partials.append(warp_reduce_sum(ss))
             else:
                 ss = cute.Float32(0.0)
-                for idx in range(cute.size(ln_srcs[r])):
-                    xf = ln_srcs[r][idx].to(cutlass.Float32)
+                for idx in range(cute.size(src_r)):
+                    xf = src_r[idx].to(cutlass.Float32)
                     ss += xf * xf
                 partials.append(warp_reduce_sum(ss))
-        totals = cta_reduce_multi(tuple(partials), self.num_warps, tidx)
+        totals = cta_reduce_multi(tuple(partials), self.num_warps, tidx, red_acc)
         stats = []
         for r in cutlass.range_constexpr(R):
             if cutlass.const_expr(self.norm_type == "layer"):
@@ -872,10 +972,13 @@ def _validate_bsd(
 
 
 def _validate_table(t: Optional[torch.Tensor], D: int, name: str, device: torch.device) -> None:
+    """[D] table rows: fp32 (the eager-model numerics class - WAN law) or
+    bf16 (the fused_adaptive_layernorm numerics class, which consumes
+    pre-narrowed weights; halves the per-CTA L2 broadcast traffic)."""
     if t is None:
         return
-    if t.dtype != torch.float32:
-        raise ValueError(f"{name}: expected fp32, got {t.dtype}")
+    if t.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"{name}: expected fp32 or bf16, got {t.dtype}")
     if not t.is_cuda or t.device != device:
         raise ValueError(f"{name}: expected device {device}, got {t.device}")
     if t.shape != (D,):
@@ -932,8 +1035,8 @@ def _normalize_ts(
 
 
 def _check_d(D: int, vec: int) -> None:
-    if vec not in (8, 16, 32):
-        raise ValueError(f"vec={vec} not supported: expected 8, 16 or 32")
+    if vec not in (8, 16, 32, 40):
+        raise ValueError(f"vec={vec} not supported: expected 8, 16, 32 or 40")
     if D <= 0 or D % 256 != 0 or D > 8192:
         raise ValueError(f"D={D} not supported: must be a multiple of 256 and <= 8192")
     if D % (WARP_SIZE * vec) != 0:
@@ -949,6 +1052,7 @@ def _launch(
     store: str,
     rows: int,
     mb: int,
+    stage: bool,
     eps: float,
     device: torch.device,
 ) -> None:
@@ -962,13 +1066,16 @@ def _launch(
             store,
             rows,
             mb,
+            stage,
             *NormProducer.make_hash_key(*torch_tensors),
         )
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
             if torch.cuda.get_device_capability(device) != (10, 0):
                 raise ValueError("fused_norm_producer requires an SM100 GPU")
-            kernel = NormProducer(D, vec, norm_type, math_mode, store, rows, min_blocks=mb)
+            kernel = NormProducer(
+                D, vec, norm_type, math_mode, store, rows, min_blocks=mb, stage=stage
+            )
             fake_sig_args = [_to_fake_cute_arg(t) for t in torch_tensors]
             compiled_fn = cute.compile(kernel, *fake_sig_args, options="--enable-tvm-ffi")
             _COMPILE_CACHE[hash_key] = compiled_fn
@@ -1000,9 +1107,10 @@ def fused_norm_producer(
     math_mode: str = "fp32",
     store: str = "bf16",
     eps: float = 1e-6,
-    vec: int = DEFAULT_VEC,
+    vec: int = 0,
     rows_per_cta: int = 1,
     min_blocks: int = 0,
+    stage: bool = False,
 ) -> List[torch.Tensor]:
     """Unified DiT norm-site producer.
 
@@ -1054,21 +1162,30 @@ def fused_norm_producer(
     divisible by D, 32-byte aligned; D a multiple of 256, <= 8192;
     vec in (8, 16, 32) with D % (32*vec) == 0.
 
-    Tuning knobs (compile-time; the defaults are safe everywhere and the
-    tuned values are per-(D, form) measurements - see the PR bench table):
+    Tuning knobs (compile-time; defaults auto-resolve to the measured
+    winners - see the PR bench table for the full sweep):
 
-    - ``vec``: elements per thread. vec=16 with min_blocks=4 measured best
-      for D=5120 forms (283 us vs 334 default at M=65520); vec=8 default is
-      within ~1.5% for the gate+resid forms. NOTE: vec=16/32 with fp32
-      modulator/affine operands requires nvidia-cutlass-dsl >= 4.6 (the
-      in-tree pin) - 4.5.x segfaults compiling those configs (guarded).
-    - ``rows_per_cta``: token rows per CTA (1, 2, 4; must divide B*S).
-      R>1 amortizes the CTA-reduction barriers but raises register
-      pressure; measured a regression for bf16 D=5120 and a small win for
-      some NVFP4 forms - keep 1 unless a bench says otherwise.
-    - ``min_blocks``: min CTAs/SM hint (0 = auto: 3 for NVFP4 stores per
-      the measured 3->2 CTA/SM occupancy cliff, else 1). min_blocks=4 at
-      vec=16 is the measured D=5120 sweet spot; 5+ spills.
+    - ``vec`` (0 = auto): elements per thread. Auto picks 16 wherever legal
+      (the measured winner across D in {5120, 4096, 3072, 2048} and every
+      form; D=1536 measured faster at 8), falling back to 8 on
+      cutlass-dsl < 4.6 with fp32 modulator/affine operands (4.5.x
+      segfaults compiling those configs - guarded). vec=40 (128-thread
+      CTAs, the fusedAdaptiveLayerNorm geometry) is bf16-store-only.
+    - ``min_blocks`` (0 = auto): CTAs/SM floor for the register allocator;
+      auto = 4 whenever 4*threads <= 2048 (283 vs 334 us at D=5120 vec=16),
+      3 for NVFP4 stores at wider blocks (the measured 3->2 CTA/SM DRAM
+      cliff), else 1. 5+ spills unstaged; staged forms tolerate higher
+      (affine D=5120 best = vec16 mb6 staged).
+    - ``stage``: prefetch x/residual rows into smem via descriptor-free
+      bulk-1d async copies (mbarrier-completed) and re-read them from smem
+      per pass, so no row survives the reduction barriers in registers.
+      Bitwise-identical outputs. Wins the plain-AdaLN and affine D=5120
+      rows (256.6/256.0 us vs the CUDA kernel's 269.7/262.2 at M=65520);
+      measured neutral-to-negative for gate+resid forms (their res_out
+      fragment is live anyway) - off by default.
+    - ``rows_per_cta``: R token rows per CTA (barrier/modulator
+      amortization); measured a regression for the register-resident bf16
+      forms - keep 1 unless a bench says otherwise.
     """
     if x.ndim != 3:
         raise ValueError(f"x: expected a 3D [B, S, D] tensor, got {x.ndim}D")
@@ -1081,10 +1198,38 @@ def fused_norm_producer(
         raise ValueError(f"math_mode must be one of {MATH_MODES}, got {math_mode!r}")
     if store not in STORE_FORMS:
         raise ValueError(f"store must be one of {STORE_FORMS}, got {store!r}")
+    if vec == 0:
+        # Auto vec: 16 is the measured-best geometry across the production
+        # matrix (see the PR bench table); guard the pre-4.6 fp32-operand
+        # segfault class by falling back to 8 there.
+        has_f32_operand = any(
+            t is not None and t.dtype == torch.float32
+            for t in (
+                gate_table,
+                weight,
+                bias,
+                shift_table,
+                scale_table,
+                shift2_table,
+                scale2_table,
+                gate,
+                shift,
+                scale,
+                shift2,
+                scale2,
+            )
+        )
+        vec = (
+            16
+            if (D % 512 == 0 and D >= 2048 and not (_CUTLASS_DSL_PRE_46 and has_f32_operand))
+            else 8
+        )  # D=1536 measured faster at vec=8 (79.3 vs 81.1 us)
     if rows_per_cta not in (1, 2, 4):
         raise ValueError(f"rows_per_cta={rows_per_cta} not supported (1, 2 or 4)")
     if not 0 <= min_blocks <= 32:
         raise ValueError(f"min_blocks={min_blocks} out of range [0, 32] (0 = auto)")
+    if stage and rows_per_cta * D * 2 * (2 if residual is not None else 1) > 200 * 1024:
+        raise ValueError("stage=True: staged rows exceed the smem budget")
     if vec != 8 and _CUTLASS_DSL_PRE_46:
         has_f32_row = any(
             t is not None and t.dtype == torch.float32
@@ -1215,7 +1360,17 @@ def fused_norm_producer(
         0 if scale2_table is None else scale2_table,
     ]
     _launch(
-        torch_tensors, D, vec, norm_type, math_mode, store, rows_per_cta, min_blocks, eps, x.device
+        torch_tensors,
+        D,
+        vec,
+        norm_type,
+        math_mode,
+        store,
+        rows_per_cta,
+        min_blocks,
+        stage,
+        eps,
+        x.device,
     )
     return outputs
 
@@ -1241,9 +1396,10 @@ def _fused_norm_producer_fake(
     math_mode: str = "fp32",
     store: str = "bf16",
     eps: float = 1e-6,
-    vec: int = DEFAULT_VEC,
+    vec: int = 0,
     rows_per_cta: int = 1,
     min_blocks: int = 0,
+    stage: bool = False,
 ) -> List[torch.Tensor]:
     B, S, D = x.shape
     M = B * S
