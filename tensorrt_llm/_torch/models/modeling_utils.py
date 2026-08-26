@@ -958,6 +958,35 @@ def register_auto_model(name: str):
     return decorator
 
 
+# Architectures contributed from outside the built-in zoo (--custom_module_dirs,
+# user modules). The static index cannot know them, so a driver propagates them to
+# its workers as module names; see export_external_model_modules.
+_EXTERNAL_ARCH_TO_MODULE: Dict[str, str] = {}
+
+
+def export_external_model_modules() -> Dict[str, str]:
+    """Architectures a fresh process could not discover on its own.
+
+    Maps architecture -> providing module for externally registered classes only; a
+    built-in is already reachable through the static index. Naming the module rather
+    than handing over the class keeps the receiver's zoo lazy: it imports one module
+    when that architecture is looked up, instead of every module the sender happened
+    to have imported.
+    """
+    external = {
+        arch: cls.__module__
+        for arch, cls in MODEL_CLASS_MAPPING.items()
+        if not _is_builtin_model_class(cls)
+    }
+    external.update(_EXTERNAL_ARCH_TO_MODULE)
+    return external
+
+
+def register_external_model_modules(arch_to_module: Dict[str, str]) -> None:
+    """Record where externally registered architectures live, importing nothing."""
+    _EXTERNAL_ARCH_TO_MODULE.update(arch_to_module)
+
+
 def _ensure_model_registered(model_arch: str) -> None:
     """Import the module that provides ``model_arch``, if it isn't loaded yet.
 
@@ -978,10 +1007,12 @@ def _ensure_model_registered(model_arch: str) -> None:
     registration decorator; the import itself is idempotent via
     ``sys.modules``.
     """
-    module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
-    if module_name is None:
-        return
-    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    if full_name is None:
+        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+        if module_name is None:
+            return
+        full_name = f"tensorrt_llm._torch.models.{module_name}"
     try:
         importlib.import_module(full_name)
     except ModuleNotFoundError as e:
@@ -990,7 +1021,7 @@ def _ensure_model_registered(model_arch: str) -> None:
         # and must not be masked as "unknown architecture".
         if e.name != full_name:
             raise
-        logger.warning(f"Lazy import of {module_name} for architecture "
+        logger.warning(f"Lazy import of {full_name} for architecture "
                        f"{model_arch} failed: {e!r}")
 
 

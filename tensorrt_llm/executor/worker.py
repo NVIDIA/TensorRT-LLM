@@ -178,7 +178,7 @@ def worker_main(
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
     worker_cls: type = GenerationExecutorWorker,
     tracer_init_kwargs: Optional[dict] = None,
-    _torch_model_class_mapping: Optional[dict] = None,
+    _torch_external_model_modules: Optional[dict] = None,
     postproc_worker_config: Optional[PostprocWorkerConfig] = None,
     ready_signal: Optional[str] = None,
     worker_process_identities_signal: Optional[bytes] = None,
@@ -238,10 +238,14 @@ def worker_main(
         tracer.start()
         set_global_tracer(tracer)
 
-    if _torch_model_class_mapping is not None:
+    if _torch_external_model_modules:
+        # Architectures the driver registered from outside the built-in zoo, as
+        # module names. Recording them leaves this process's zoo lazy: the one
+        # module behind an architecture is imported when that architecture is
+        # looked up, not because the driver happened to have imported it.
         from tensorrt_llm._torch.models.modeling_utils import \
-            MODEL_CLASS_MAPPING
-        MODEL_CLASS_MAPPING.update(**_torch_model_class_mapping)
+            register_external_model_modules
+        register_external_model_modules(_torch_external_model_modules)
 
     set_mpi_session_cpp(mpi_comm())
 
