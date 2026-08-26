@@ -54,8 +54,8 @@ intended model-specific runtime path executed.
 | Image-language inference | **Validated with constraints** | **Validated with constraints** | Aggregate serving with a local encoder is validated for BF16 TP4 and block-FP8 TP1. Both precisions passed single-image, ordered multi-image, sequential, and concurrent semantic checks. A separate multimodal encoder-to-prefill handoff is not claimed. |
 | QSA sparse attention | **Validated** | **Validated** | Both exact and fused paged sparse paths are exercised above the configured sparse threshold. Dense full attention is not used as substitute acceptance evidence. |
 | Gated DeltaNet | **Validated** | **Validated** | Prefill, decode, chunk continuation, cache compaction, request reuse, and speculative-state promotion are covered. |
-| Hyper-Connections | **Validated** | **Validated** | Multi-stream residual mixing and topology-specific reductions are part of the accepted end-to-end paths. |
-| PLE | **Validated** | **Validated** | Token and short-convolution state are managed per request and participate in reuse, offload, MTP promotion, and text disaggregation where applicable. |
+| Hyper-Connections | **Validated** | **Validated** | Multi-stream residual mixing and topology-specific reductions are part of the accepted end-to-end paths. CUDA execution fuses gated stream reduction, residual injection, and the combine-to-grouped-RMSNorm boundary. |
+| PLE | **Validated** | **Validated** | Token and short-convolution state are managed per request and participate in reuse, offload, MTP promotion, and text disaggregation where applicable. The n-gram table is row-sharded across TP ranks; ADP preserves rank-local token ownership with gather and reduce-scatter collectives. |
 | QSA/GDN/PLE state with KV cache manager V2 | **Validated** | **Validated** | KV cache manager V2 is the required lifecycle owner for the model-specific auxiliary state. |
 | General DSA backend | **Not applicable** | **Not applicable** | Qwen3.8-Flash-Next uses QSA. General DSA is not a replacement for the model-defined QSA semantics. |
 
@@ -203,6 +203,7 @@ separate encoder-to-prefill handoff.
 | Block-FP8 TP1 capacity | Approximately 221 GiB model-profile peak on a GB300 with approximately 277 GiB usable memory; approximately 51 GiB remained for cache and runtime allocations. | The complete checkpoint fits functionally on one GB300. This is not a concurrency recommendation. |
 | DeepGEMM MoE | All 48 routed-expert layers resolved to `DeepGemmFusedMoE` with no fallback; endpoint, concurrency, repeat-output, and 8/8 GSM8K semantic checks passed. | The block-FP8 TP1 DeepGEMM path is validated on SM103. |
 | QSA | Exact and fused paged sparse execution ran above the sparse threshold. | Dense full attention was not accepted as substitute evidence. |
+| PLE table sharding | BF16 TEP4 and ADP4 loaded only the locally owned n-gram embedding rows and passed semantic checks. | Four-way sharding avoids approximately 71.5 GiB of replicated PLE weight storage per rank. |
 | MTP state lifecycle | Draft depth 3, GDN replay, and accepted-prefix promotion of QSA, GDN, and PLE state were observed with semantic output checks. | MTP3 state promotion is validated; other draft depths are not claimed. |
 | Text disaggregation | NIXL setup and transfer of KV, QSA index state, Gated DeltaNet state, and PLE side state were observed across context and generation workers. | Text prefill/decode disaggregation is validated. |
 | Combined serving features | CUDA graph padding, chunked prefill, overlap scheduling, QSA, and FP8 KV cache ran together with semantic checks. | Feature coexistence is validated; no isolated performance gain is claimed. |
@@ -290,7 +291,6 @@ disable_overlap_scheduler: false
 
 moe_config:
   backend: CUTLASS
-  disable_finalize_fusion: true
 
 sparse_attention_config:
   algorithm: qsa
@@ -323,7 +323,6 @@ disable_overlap_scheduler: false
 
 moe_config:
   backend: TRTLLM
-  disable_finalize_fusion: true
 
 sparse_attention_config:
   algorithm: qsa
@@ -355,7 +354,6 @@ cuda_graph_config: null
 moe_config:
   backend: DEEPGEMM  # TRTLLM is also validated for this topology
   max_num_tokens: 2048
-  disable_finalize_fusion: true
 
 sparse_attention_config:
   algorithm: qsa
@@ -388,7 +386,6 @@ disable_overlap_scheduler: false
 
 moe_config:
   backend: TRTLLM
-  disable_finalize_fusion: true
 
 sparse_attention_config:
   algorithm: qsa
@@ -396,6 +393,24 @@ sparse_attention_config:
 kv_cache_config:
   use_kv_cache_manager_v2: true
 ```
+
+#### MoE finalize fusion and repeatability
+
+BF16 CUTLASS MoE uses the fused FC2 finalization path by default. At the
+model's 512-expert, top-10 routing shape, this removes a standalone routing
+finalization launch and improved CUDA-graph MoE latency across the validated
+decode batch sizes. Aggregate BF16 TEP4 semantic validation passed with the
+fusion enabled.
+
+The fused parallel reduction is numerically valid but is not bitwise
+deterministic. Small BF16 rounding differences can therefore change a later
+greedy token. Deployments that require exact run-to-run output replay may set
+`moe_config.disable_finalize_fusion: true`; doing so uses the separate
+deterministic FP32 finalization path and can reduce performance.
+
+This option controls the CUTLASS BF16 path. The validated block-FP8 TRTLLM and
+DeepGEMM backends use their own finalization paths and do not require this
+setting.
 
 ### Feature overlays
 
@@ -485,7 +500,6 @@ cuda_graph_config: null
 
 moe_config:
   backend: CUTLASS
-  disable_finalize_fusion: true
 
 sparse_attention_config:
   algorithm: qsa
@@ -525,7 +539,6 @@ cuda_graph_config: null
 
 moe_config:
   backend: CUTLASS
-  disable_finalize_fusion: true
 
 sparse_attention_config:
   algorithm: qsa
@@ -625,7 +638,6 @@ cuda_graph_config: null
 
 moe_config:
   backend: TRTLLM
-  disable_finalize_fusion: true
 
 sparse_attention_config:
   algorithm: qsa
@@ -697,7 +709,6 @@ cuda_graph_config: null
 
 moe_config:
   backend: CUTLASS
-  disable_finalize_fusion: true
 
 sparse_attention_config:
   algorithm: qsa
@@ -722,7 +733,6 @@ enable_attention_dp: false
 moe_config:
   backend: TRTLLM
   max_num_tokens: 8192
-  disable_finalize_fusion: true
 ```
 
 Keep the multimodal, QSA, cache-manager, batching, and scheduler fields from the
@@ -806,7 +816,8 @@ both passed this contract.
 - Block-FP8 checkpoint mapping:
   [`qwen4_exp_weight_mapper.py`](../../../tensorrt_llm/_torch/models/checkpoints/hf/qwen4_exp_weight_mapper.py)
 - Hyper-Connections and PLE:
-  [`qwen4_exp_hyper_connection.py`](../../../tensorrt_llm/_torch/modules/qwen4_exp_hyper_connection.py)
+  [`qwen4_exp_hyper_connection.py`](../../../tensorrt_llm/_torch/modules/qwen4_exp_hyper_connection.py),
+  [`qwen4_exp_hyper_connection_kernels.py`](../../../tensorrt_llm/_torch/modules/qwen4_exp_hyper_connection_kernels.py),
   and [`qwen4_exp_ple.py`](../../../tensorrt_llm/_torch/modules/qwen4_exp_ple.py)
 - MoE backend resolution and kernels:
   [`moe_resolution.py`](../../../tensorrt_llm/_torch/modules/fused_moe/moe_resolution.py),
